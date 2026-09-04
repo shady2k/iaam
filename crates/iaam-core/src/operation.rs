@@ -61,9 +61,41 @@ pub enum OperationKey {
     ///
     /// Named here because a caveat offers it: an account the owner retired that
     /// still shows a figure in the asset snapshot is a disagreement between his
-    /// statement and the journal, and withdrawing the statement is one of the
-    /// two ways the disagreement ends.
+    /// statement and the journal, and **withdrawing** the statement is one of
+    /// the three ways the disagreement ends. The route carries both directions,
+    /// which is why one key serves for both — and why the caveat that names it
+    /// has to say which direction it means: recording a second retirement over
+    /// one that stands is refused, so the remedy is the withdrawal and never a
+    /// repetition of the act that produced the caveat.
     RecordAccountRetirement,
+    /// Record operations directly into the journal, one fact each.
+    ///
+    /// **The only key in this vocabulary that writes a business fact without a
+    /// session behind it**, and that is the whole of its case for existing
+    /// separately. [`Self::OpenImportSession`] begins an import: rows are held
+    /// out of the journal, questioned, and become facts at a commit. This
+    /// records what the caller already knows to be true, at once — which is the
+    /// shape of a §10.7 reconstructed opening, the owner's statement of what an
+    /// account held before his journal begins. There is no document to open a
+    /// session for and no row to question; there is one fact, and this is the
+    /// call that puts it in.
+    ///
+    /// Not [`Self::RecordOwnerBalance`], and the difference is what a caveat
+    /// naming the wrong one costs. A control assertion has no legs: it is
+    /// checked against the fold and never summed into it, so it changes how a
+    /// cash figure is *spelled* — `crate::reconciliation::OpeningAnchors` reads
+    /// it and the figure becomes a balance — and moves no number. A
+    /// reconstructed opening is an event with legs, and it is what makes the
+    /// movements on an account sum to what the account actually held.
+    ///
+    /// Not [`Self::SubmitCorrections`] either: a correction is addressed to an
+    /// event the owner names, and the state this key answers is one where the
+    /// event is *absent*.
+    ///
+    /// Its absence is `iaam-bhu3`. The register offered the two calls above for
+    /// a retired account that still shows a figure, and the mapping was choosing
+    /// from a list that did not contain the answer.
+    SubmitOperations,
     /// Open the import session a document's rows are held in before commit.
     ///
     /// The first of the two ways into an account that holds nothing, and the one
@@ -109,10 +141,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a sixteenth variant to
+    /// The declared length is the only thing holding a seventeenth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -122,6 +154,7 @@ impl OperationKey {
         Self::RecordAccountTransferPartners,
         Self::RecordAccountScope,
         Self::RecordAccountRetirement,
+        Self::SubmitOperations,
         Self::OpenImportSession,
         Self::SyncBroker,
         Self::AnswerImportQuestion,
@@ -143,6 +176,7 @@ impl OperationKey {
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
             Self::RecordAccountScope => "record_account_scope",
             Self::RecordAccountRetirement => "record_account_retirement",
+            Self::SubmitOperations => "ingest_operations",
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",
             Self::AnswerImportQuestion => "answer_import_question",

@@ -352,9 +352,22 @@ something on it.
 The usual cause is that the deposit's principal predates the months that were
 imported. The account's cash figure is then movement from an unknown start rather
 than a balance, the recorded movements do not sum to zero, and the row is right to
-stand — the missing principal is a real hole in his cash total. What closes it is
-recording the reconstructed opening (see «What to assert for a reconstructed
-opening»); the retirement then removes the row on its own.
+stand — the missing principal is a real hole in his cash total.
+
+**The caveat names its own remedies now, in the order to consider them: read
+`closed_by` rather than this paragraph.** The first of the three is the
+reconstructed opening (see «What to assert for a reconstructed opening»), because
+that is the ordinary cause; the retirement then removes the row on its own. The
+same three calls, each with the body it wants, are also an outstanding-work item
+of kind `retired_account_not_empty`, and that item disappears once the account's
+figures are zero — whoever brought them there and however. Nobody has to report
+the work done.
+
+One thing the structure cannot warn you about: the same account usually carries
+`running_cash_sum` as well, and **its** remedy is not this one's. An owner-balance
+assertion is checked against the fold rather than added to it, so recording one
+here would relabel a figure of minus the principal as a balance instead of
+removing it.
 
 **Never propose ruling the account outside every contour to tidy this up.** That
 is the scope decision, it says his money does not belong in the report at all, and

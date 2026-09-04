@@ -11800,8 +11800,12 @@ async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
         .find(|caveat| caveat["kind"] == "retired_account_not_empty")
         .unwrap_or_else(|| panic!("the row stands and nothing says why: {snapshot}"));
     assert_eq!(caveat["subject"]["id"], json!(term), "{snapshot}");
-    // The two sides of the disagreement, both addressable: withdraw the
-    // statement, or rule on the journal.
+    // The three readings of the disagreement, all addressable, ordinary answer
+    // first: the journal is short of the opening the movements were measured
+    // from, or a fact on the account should stop counting, or the product had
+    // not in fact ceased. `iaam-bhu3` is the order as much as the set — the
+    // withdrawal used to be first, and a client that had just retired the
+    // account read it as an instruction to retire it again.
     let remedies: Vec<&str> = caveat["closed_by"]
         .as_array()
         .expect("remedies")
@@ -11810,7 +11814,18 @@ async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
         .collect();
     assert_eq!(
         remedies,
-        vec!["record_account_retirement", "submit_corrections"],
+        vec![
+            "ingest_operations",
+            "submit_corrections",
+            "record_account_retirement"
+        ],
+        "{snapshot}"
+    );
+    // Addressed, not merely named: the reconstructed opening is a call a client
+    // can copy rather than compose.
+    assert_eq!(caveat["closed_by"][0]["method"], "POST", "{snapshot}");
+    assert_eq!(
+        caveat["closed_by"][0]["path"], "/v1/ingest/operations",
         "{snapshot}"
     );
 }
@@ -12905,6 +12920,828 @@ fn every_remedy_the_register_names_is_a_call_the_contract_publishes() {
             );
         }
     }
+}
+
+/// Whether a caveat kind's remedies are invoked here, and what the alternative
+/// answer means.
+///
+/// The declaration is a **table over the enum**, not a hand-written list of the
+/// kinds somebody remembered. `iaam-2heu` is the trap that shape avoids: a list
+/// assembled by hand drifts from the enum exactly where the next mistake is, and
+/// a coverage claim that has drifted is worse than no claim, because it reads as
+/// a promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemedyCoverage {
+    /// The state is reached below, every call `closed_by` names is invoked, and
+    /// the caveat is observed gone afterwards.
+    Invoked,
+    /// `closed_by` is empty, so there is no call to invoke. The decision that it
+    /// is empty is pinned in the core beside the table that makes it.
+    NothingCloses,
+}
+
+/// What this file promises about each kind, kind by kind.
+///
+/// Exhaustive on purpose. A thirteenth `CaveatKind` does not compile until
+/// somebody has answered, here, whether its remedy is exercised — which is what
+/// `iaam-3nqt` is about: the register's `closed_by` was guarded for existence
+/// only, so `retired_account_not_empty` could name two calls that do nothing for
+/// the reader and pass every gate in the workspace.
+fn remedy_coverage(kind: CaveatKind) -> RemedyCoverage {
+    match kind {
+        // Every one of these is reached from an empty owner in a handful of
+        // calls, and every operation the register names for them is sent below.
+        CaveatKind::AccountInNoScope
+        | CaveatKind::AccountInAnotherScope
+        | CaveatKind::AccountRuledOutside
+        | CaveatKind::RunningCashSum
+        | CaveatKind::UndecomposedMovements
+        | CaveatKind::RetiredAccountNotEmpty => RemedyCoverage::Invoked,
+        // Nothing in this API closes these, and that is a decision rather than
+        // an omission: §11's refusal has no call that asserts a classification,
+        // a residual names no event for a correction to be addressed to, a
+        // holding is not valued by accepting a number for it, and the two
+        // refused figures are absent because something they are derived from is.
+        CaveatKind::PeriodReportsRefused
+        | CaveatKind::UnexplainedCashChange
+        | CaveatKind::UnpricedPosition
+        | CaveatKind::HoldingNotValued
+        | CaveatKind::TerminalValueNotComputed
+        | CaveatKind::ReturnNotComputed => RemedyCoverage::NothingCloses,
+    }
+}
+
+/// The kinds of caveat one report currently carries.
+fn caveat_kinds(report: &Value) -> Vec<String> {
+    report["confidence"]["caveats"]
+        .as_array()
+        .expect("caveat register")
+        .iter()
+        .map(|caveat| caveat["kind"].as_str().expect("kind").to_owned())
+        .collect()
+}
+
+/// One of the owner's accounts, created through the API.
+async fn make_account(harness: &Harness, title: &str) -> String {
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": title, "institution": "Northline" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    created["id"].as_str().expect("account id").to_owned()
+}
+
+/// A contour over exactly these accounts.
+async fn make_contour(harness: &Harness, title: &str, accounts: &[&str]) -> String {
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": title, "accounts": accounts }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    created["contour"].as_str().expect("contour id").to_owned()
+}
+
+async fn balances_of(harness: &Harness, contour: &str, as_of: &str) -> Value {
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour}&as_of={as_of}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+async fn assets_of(harness: &Harness, contour: &str, as_of: &str) -> Value {
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour}&as_of={as_of}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+async fn flow_of(harness: &Harness, contour: &str, from: &str, to: &str) -> Value {
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour}&from={from}&to={to}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// A retired product with a figure still on it, and the contour that reports it.
+///
+/// The journal holds one movement out and nothing that says what was there
+/// before it, which is the shape of the case the caveat exists for: a product
+/// whose opening predates the imported months. The fold is not zero, so the row
+/// stands and the register says why.
+async fn a_retired_product_still_holding_something(harness: &Harness) -> (String, String, Uuid) {
+    let term = make_account(harness, "Term").await;
+    let contour = make_contour(harness, "Household", &[term.as_str()]).await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": term,
+                    "type": "withdrawal",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-12-10" },
+                    "idempotency_key": "remedy-term-closed"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let event = verdicts[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("the movement's event identifier");
+
+    let (status, retired) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{term}/retirement"),
+            &harness.owner_token,
+            &json!({ "state": "retired", "effective_on": "2025-12-10" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retired}");
+
+    let snapshot = assets_of(harness, &contour, "2025-12-31").await;
+    assert!(
+        caveat_kinds(&snapshot).contains(&"retired_account_not_empty".to_owned()),
+        "the fixture did not reach the state: {snapshot}"
+    );
+    (term, contour, event)
+}
+
+/// Every remedy the register names removes the caveat it is named for.
+///
+/// **This is `iaam-3nqt`, and it is the half of the promise nothing checked.**
+/// `closed_by` was guarded for existence — a contract test asserts every
+/// operation the register names is a call the contract publishes — and existence
+/// is not the promise the field makes. `retired_account_not_empty` named
+/// `record_account_retirement` and `submit_corrections`; both exist, both
+/// resolve, neither brings in the movements the journal is short of, and the
+/// field passed every gate in the workspace while telling a client to repeat the
+/// act that produced the caveat.
+///
+/// So the assertion is behavioural: reach the state, send what the field names,
+/// ask again, and find the caveat gone. Each remedy gets its own harness,
+/// because two remedies for one state are alternatives and applying both would
+/// prove only that the pair works.
+///
+/// What it does **not** promise is that one call empties a whole caveat kind: a
+/// caveat is one line per account, currency or instrument, and `closed_by`'s own
+/// documentation says the narrower thing. Each scenario below closes the one
+/// line it raised.
+///
+/// [`remedy_coverage`] is the table of what is exercised and what is not, and it
+/// is exhaustive over `CaveatKind` so that the claim cannot go stale.
+#[tokio::test]
+async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
+    let mut exercised: BTreeSet<CaveatKind> = BTreeSet::new();
+
+    // --- account_in_no_scope: both ways out ---------------------------------
+    //
+    // The two the register offers in the order the queue offers them. The
+    // second closes this line by producing a different one — the disposition it
+    // records moves the account to `account_ruled_outside` — and the promise is
+    // about this line, so the assertion is about this kind.
+    for remedy in ["add_contour_version", "record_account_scope"] {
+        let harness = harness();
+        let brokerage = harness.account.inner().to_string();
+        let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
+        let savings = make_account(&harness, "Savings").await;
+
+        let before = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            caveat_kinds(&before).contains(&"account_in_no_scope".to_owned()),
+            "{before}"
+        );
+
+        let (status, done) = match remedy {
+            "add_contour_version" => {
+                call(
+                    &harness.router,
+                    post(
+                        &format!("/v1/contours/{reported}/versions"),
+                        &harness.owner_token,
+                        &json!({ "accounts": [harness.account.inner(), savings] }),
+                    ),
+                )
+                .await
+            }
+            _ => {
+                call(
+                    &harness.router,
+                    post(
+                        &format!("/v1/accounts/{savings}/scope"),
+                        &harness.owner_token,
+                        &json!({
+                            "disposition": "outside",
+                            "reason": "Not the owner's money.",
+                        }),
+                    ),
+                )
+                .await
+            }
+        };
+        assert!(status.is_success(), "{remedy}: {done}");
+
+        let after = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"account_in_no_scope".to_owned()),
+            "{remedy} left the caveat standing: {after}"
+        );
+    }
+    exercised.insert(CaveatKind::AccountInNoScope);
+
+    // --- account_in_another_scope -------------------------------------------
+    {
+        let harness = harness();
+        let brokerage = harness.account.inner().to_string();
+        let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
+        let savings = make_account(&harness, "Savings").await;
+        make_contour(&harness, "Elsewhere", &[savings.as_str()]).await;
+
+        let before = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            caveat_kinds(&before).contains(&"account_in_another_scope".to_owned()),
+            "{before}"
+        );
+
+        let (status, done) = call(
+            &harness.router,
+            post(
+                &format!("/v1/contours/{reported}/versions"),
+                &harness.owner_token,
+                &json!({ "accounts": [harness.account.inner(), savings] }),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{done}");
+
+        let after = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"account_in_another_scope".to_owned()),
+            "{after}"
+        );
+        exercised.insert(CaveatKind::AccountInAnotherScope);
+    }
+
+    // --- account_ruled_outside ----------------------------------------------
+    //
+    // The one remedy, read from the other end: the owner has already ruled, so
+    // the scope call has nothing left to record and the only call that puts this
+    // account's money into these figures is membership. Naming it is not advice
+    // that he should, and nothing clears the exclusion — membership outranks it.
+    {
+        let harness = harness();
+        let brokerage = harness.account.inner().to_string();
+        let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
+        let savings = make_account(&harness, "Savings").await;
+        let (status, ruled) = call(
+            &harness.router,
+            post(
+                &format!("/v1/accounts/{savings}/scope"),
+                &harness.owner_token,
+                &json!({ "disposition": "outside", "reason": "Not the owner's money." }),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{ruled}");
+
+        let before = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            caveat_kinds(&before).contains(&"account_ruled_outside".to_owned()),
+            "{before}"
+        );
+
+        let (status, done) = call(
+            &harness.router,
+            post(
+                &format!("/v1/contours/{reported}/versions"),
+                &harness.owner_token,
+                &json!({ "accounts": [harness.account.inner(), savings] }),
+            ),
+        )
+        .await;
+        assert!(status.is_success(), "{done}");
+
+        let after = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"account_ruled_outside".to_owned()),
+            "{after}"
+        );
+        exercised.insert(CaveatKind::AccountRuledOutside);
+    }
+
+    // --- running_cash_sum ---------------------------------------------------
+    //
+    // The opening control assertion, which is what turns the figure from a
+    // movement into a balance. It moves no number and is not asked to: this
+    // caveat is about how the figure may be read, and that is exactly what the
+    // assertion changes.
+    {
+        let harness = harness();
+        let brokerage = harness.account.inner().to_string();
+        let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
+        let (status, verdicts) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "operations": [{
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "3000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-05" },
+                        "idempotency_key": "remedy-running-sum"
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+        let before = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            caveat_kinds(&before).contains(&"running_cash_sum".to_owned()),
+            "{before}"
+        );
+
+        let (status, recorded) = call(
+            &harness.router,
+            post(
+                "/v1/reconciliation/balance",
+                &harness.owner_token,
+                &json!({
+                    "account": harness.account.inner(),
+                    "from": "2026-01-01",
+                    "to": "2026-01-31",
+                    "at": "opening",
+                    "cash": { "currency": "RUB", "amount": "0.00" },
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{recorded}");
+
+        let after = balances_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"running_cash_sum".to_owned()),
+            "{after}"
+        );
+        exercised.insert(CaveatKind::RunningCashSum);
+    }
+
+    // --- undecomposed_movements ---------------------------------------------
+    //
+    // A category rule, and it reaches only the half of the state a rule can
+    // reach: category assignment is never consulted for a transfer that left the
+    // contour, so the fixture is an outflow the source labelled — the rows a
+    // rule is for.
+    {
+        let harness = harness();
+        let brokerage = harness.account.inner().to_string();
+        let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
+        let (status, verdicts) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "operations": [{
+                        "account": harness.account.inner(),
+                        "type": "withdrawal",
+                        "amount": "500.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-06" },
+                        "source_category": "Shop One",
+                        "idempotency_key": "remedy-undecomposed"
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+        let before = flow_of(&harness, &reported, "2026-01-01", "2026-01-31").await;
+        assert!(
+            caveat_kinds(&before).contains(&"undecomposed_movements".to_owned()),
+            "{before}"
+        );
+
+        let (status, group) = call(
+            &harness.router,
+            post(
+                "/v1/category-groups",
+                &harness.owner_token,
+                &json!({ "title": "Usual Expenses" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{group}");
+        let (status, category) = call(
+            &harness.router,
+            post(
+                "/v1/categories",
+                &harness.owner_token,
+                &json!({ "group": group["id"], "title": "Food" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{category}");
+        let (status, rule) = call(
+            &harness.router,
+            post(
+                "/v1/category-rules",
+                &harness.owner_token,
+                &json!({
+                    "matcher": { "kind": "source_category", "value": "Shop One" },
+                    "category": category["id"],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{rule}");
+
+        let after = flow_of(&harness, &reported, "2026-01-01", "2026-01-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"undecomposed_movements".to_owned()),
+            "{after}"
+        );
+        exercised.insert(CaveatKind::UndecomposedMovements);
+    }
+
+    // --- retired_account_not_empty: all three ways out ----------------------
+    //
+    // `iaam-bhu3` in the form that would have caught it. The first is the
+    // ordinary answer and is the one the vocabulary had no word for: recording
+    // the reconstructed opening makes the movements sum to zero, and the
+    // retirement then removes the row on its own.
+    {
+        let harness = harness();
+        let (term, contour, _event) = a_retired_product_still_holding_something(&harness).await;
+        let (status, recorded) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "operations": [{
+                        "account": term,
+                        "type": "opening_cash",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-12-01" },
+                        "idempotency_key": "remedy-term-opening"
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{recorded}");
+
+        let after = assets_of(&harness, &contour, "2025-12-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"retired_account_not_empty".to_owned()),
+            "the reconstructed opening did not empty the account: {after}"
+        );
+    }
+    // The second: a fact on the account that should stop counting.
+    {
+        let harness = harness();
+        let (_term, contour, event) = a_retired_product_still_holding_something(&harness).await;
+        let (status, verdicts) = call(
+            &harness.router,
+            post(
+                "/v1/corrections",
+                &harness.owner_token,
+                &json!({
+                    "acknowledge_retraction": true,
+                    "corrections": [{ "relation": "reversal", "target": event }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+        let after = assets_of(&harness, &contour, "2025-12-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"retired_account_not_empty".to_owned()),
+            "{after}"
+        );
+    }
+    // The third: the product had not in fact ceased, so the statement goes.
+    // The route carries both directions and only one of them is the remedy —
+    // sending `retired` again is refused over a statement that stands.
+    {
+        let harness = harness();
+        let (term, contour, _event) = a_retired_product_still_holding_something(&harness).await;
+        let (status, again) = call(
+            &harness.router,
+            post(
+                &format!("/v1/accounts/{term}/retirement"),
+                &harness.owner_token,
+                &json!({ "state": "retired", "effective_on": "2025-12-11" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a second retirement is refused, so the remedy can only be the withdrawal: {again}"
+        );
+
+        let (status, withdrawn) = call(
+            &harness.router,
+            post(
+                &format!("/v1/accounts/{term}/retirement"),
+                &harness.owner_token,
+                &json!({ "state": "in_use" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{withdrawn}");
+
+        let after = assets_of(&harness, &contour, "2025-12-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"retired_account_not_empty".to_owned()),
+            "{after}"
+        );
+    }
+    exercised.insert(CaveatKind::RetiredAccountNotEmpty);
+
+    // The declaration and the work agree, in both directions. A kind declared
+    // `Invoked` and never reached would be the promise going stale silently,
+    // which is the whole defect; a kind exercised without being declared would
+    // mean the table has stopped describing this file.
+    let declared: BTreeSet<CaveatKind> = CaveatKind::ALL
+        .into_iter()
+        .filter(|kind| remedy_coverage(*kind) == RemedyCoverage::Invoked)
+        .collect();
+    assert_eq!(
+        exercised, declared,
+        "the coverage table and the scenarios below it disagree"
+    );
+
+    // And the other answer means what it says: nothing to invoke, because
+    // nothing is named.
+    for kind in CaveatKind::ALL {
+        match remedy_coverage(kind) {
+            RemedyCoverage::Invoked => assert!(
+                !kind.closed_by().is_empty(),
+                "{} is declared exercised and names no call",
+                kind.code()
+            ),
+            RemedyCoverage::NothingCloses => assert!(
+                kind.closed_by().is_empty(),
+                "{} names a call and nothing here sends it",
+                kind.code()
+            ),
+        }
+    }
+}
+
+/// The queue says something about a retirement the journal has not caught up
+/// with (`iaam-xnhu`).
+///
+/// **The defect this pins.** `retired_account_not_empty` was published in a
+/// report's `confidence` and nowhere else. This endpoint is the system's answer
+/// to "what should I do next", and it was silent, so an owner whose retirement
+/// had not taken effect learned it only by asking for the snapshot again and
+/// reading the register — which is `iaam-4hcy`'s shape exactly: a state reported
+/// truthfully with its act published somewhere a caller does not look for acts.
+///
+/// The two decisions the item rests on are both asserted below. Its completion
+/// is read from the world — the item goes when the account's figures are zero,
+/// and the retirement it was raised for is still standing when it does. And its
+/// `missing` is not preset: the amount of a reconstructed opening is what the
+/// account held before this system knew anything about it, and no guess belongs
+/// in the one call whose purpose is to state a real figure.
+#[tokio::test]
+async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
+    let harness = harness();
+    let (term, contour, _event) = a_retired_product_still_holding_something(&harness).await;
+
+    let queue = |token: &str| get("/v1/actions", Some(token));
+    let (status, actions) = call(&harness.router, queue(&harness.owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    let item = actions
+        .as_array()
+        .expect("the queue")
+        .iter()
+        .find(|action| action["kind"] == "retired_account_not_empty")
+        .unwrap_or_else(|| panic!("the queue is silent about a standing retirement: {actions}"))
+        .clone();
+
+    // The item names the account, and it names it in the typed subject rather
+    // than only inside the sentence.
+    assert_eq!(item["subject"]["type"], "account", "{item}");
+    assert_eq!(item["subject"]["id"], json!(term), "{item}");
+    assert_eq!(item["subject"]["title"], "Term", "{item}");
+
+    // Required for exactly the goal whose register carries the caveat, and for
+    // no other: a retirement is read in the asset snapshot's row suppression and
+    // nowhere else, so flow, returns and reconciliation are the same numbers
+    // with or without the declaration.
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["goals"], json!(["asset_snapshot"]), "{item}");
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(item["required_scope"], "owner", "{item}");
+
+    // Three ways out, addressed, in the register's order. The two lists are one
+    // vocabulary, so this compares the queue against the snapshot rather than
+    // restating either.
+    let snapshot = assets_of(&harness, &contour, "2025-12-31").await;
+    let caveat = snapshot["confidence"]["caveats"]
+        .as_array()
+        .expect("register")
+        .iter()
+        .find(|caveat| caveat["kind"] == "retired_account_not_empty")
+        .expect("the caveat the fixture raised")
+        .clone();
+    let options = item["target"]["options"]
+        .as_array()
+        .unwrap_or_else(|| panic!("three ways out, published as options: {item}"));
+    assert_eq!(item["target"]["type"], "options", "{item}");
+    let offered: Vec<&str> = options
+        .iter()
+        .map(|option| option["operationId"].as_str().expect("operation"))
+        .collect();
+    let named: Vec<&str> = caveat["closed_by"]
+        .as_array()
+        .expect("remedies")
+        .iter()
+        .map(|entry| entry["operationId"].as_str().expect("operation"))
+        .collect();
+    assert_eq!(
+        offered, named,
+        "the queue and the register disagree: {item}"
+    );
+    assert_eq!(
+        offered,
+        vec![
+            "ingest_operations",
+            "submit_corrections",
+            "record_account_retirement"
+        ],
+        "{item}"
+    );
+
+    // What the queue adds over the register is the request each call wants.
+    // The reconstructed opening knows the account and the kind of row, and asks
+    // the owner for the figure — the value that exists nowhere in this system,
+    // which is what `owner` means in that vocabulary.
+    let opening = &options[0];
+    assert_eq!(
+        opening["request"]["preset"]["operations"],
+        json!([{ "account": term, "type": "opening_cash" }]),
+        "{opening}"
+    );
+    let asked: Vec<(&str, &str)> = opening["request"]["missing"]
+        .as_array()
+        .expect("missing inputs")
+        .iter()
+        .map(|input| {
+            (
+                input["pointer"].as_str().expect("pointer"),
+                input["provided_by"].as_str().expect("provided_by"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        vec![
+            ("/operations/0/amount", "owner"),
+            ("/operations/0/currency", "owner"),
+            ("/operations/0/dates/cash_posted", "owner"),
+            ("/operations/0/idempotency_key", "caller"),
+        ],
+        "{opening}"
+    );
+
+    // The withdrawal is written out, and it is the withdrawal: the route carries
+    // both directions and only one of them is a way out of this state.
+    let withdrawal = &options[2];
+    assert_eq!(
+        withdrawal["request"]["preset"]["state"], "in_use",
+        "{withdrawal}"
+    );
+    assert_eq!(
+        withdrawal["request"]["preset"]["id"],
+        json!(term),
+        "{withdrawal}"
+    );
+
+    // --- the completion is read from the world ------------------------------
+    //
+    // The figure is supplied and the account comes to zero. Nothing tells the
+    // queue that the item is done; it asks the journal the same question again
+    // and gets a different answer.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": term,
+                    "type": "opening_cash",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-12-01" },
+                    "idempotency_key": "queue-term-opening"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, actions) = call(&harness.router, queue(&harness.owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    assert!(
+        actions
+            .as_array()
+            .expect("the queue")
+            .iter()
+            .all(|action| action["kind"] != "retired_account_not_empty"),
+        "an item whose goal is met is an item the owner learns to ignore: {actions}"
+    );
+
+    // And the declaration is untouched by the thing that closed the item. The
+    // completion is the journal's answer, not a withdrawal of his statement.
+    let (status, standing) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts/{term}/retirement"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{standing}");
+    assert_eq!(standing["state"], "retired", "{standing}");
+    assert_eq!(standing["effective_on"], "2025-12-10", "{standing}");
+}
+
+/// An owner who has retired nothing pays nothing for the item existing.
+///
+/// The queue folds the journal to decide whether a ceased product still holds
+/// anything, and that fold is the most expensive thing it does. It is reached
+/// only through a declaration, so the ordinary owner — who has retired nothing —
+/// is answered from the cheap reads alone. Asserted through the endpoint rather
+/// than by counting store calls: what a client must be able to rely on is that
+/// the queue answers, and answers without an item nobody is owed.
+#[tokio::test]
+async fn a_queue_for_an_owner_who_has_retired_nothing_carries_no_such_item() {
+    let harness = harness();
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    assert!(
+        actions
+            .as_array()
+            .expect("the queue")
+            .iter()
+            .all(|action| action["kind"] != "retired_account_not_empty"),
+        "{actions}"
+    );
 }
 
 /// A caveat carries the call that closes it, and says so when nothing does.

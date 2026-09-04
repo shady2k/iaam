@@ -101,7 +101,9 @@ pub enum CaveatKind {
     /// It is a caveat and not a refusal, because the two facts it sits between
     /// are both legitimate: the owner says the product ceased, and the journal
     /// says something is still on it. Which of the two is wrong is his to
-    /// decide, and [`Self::closed_by`] names one call for each side.
+    /// decide — and the usual answer is that neither is, because the journal is
+    /// merely short of the opening the movements were measured from.
+    /// [`Self::closed_by`] names a call for each of those three readings.
     RetiredAccountNotEmpty,
     /// The portfolio value at the report date could not be computed.
     TerminalValueNotComputed,
@@ -221,7 +223,18 @@ impl CaveatKind {
     ///   say no call reaches it.
     /// - `RunningCashSum` — the opening control assertion, which is exactly
     ///   what turns the figure from a movement into a balance. The queue's
-    ///   `provide_control_assertion` names the same operation.
+    ///   `provide_control_assertion` names the same operation. It is **not**
+    ///   also listed under `RetiredAccountNotEmpty` below, and the reason is the
+    ///   one thing an assertion cannot do: `record_owner_balance` writes a
+    ///   `ControlAssertion`, which has no legs, so
+    ///   [`crate::reconciliation::OpeningAnchors`] reads it and the figure is
+    ///   respelled a balance while the number itself does not move. On the
+    ///   deposit whose principal was never imported that is worse than the
+    ///   movement it replaced: the row stops saying «this is a sum from an
+    ///   unknown start» and starts asserting a balance of minus the principal.
+    ///   The two caveats appear together on exactly that account, so a reader
+    ///   who took the neighbour's remedy for this one's would reach for the
+    ///   call that hardens the wrong figure.
     /// - `UndecomposedMovements` — a category rule. It is the only operation
     ///   addressed to this state and it does not reach all of it: category
     ///   assignment is never consulted for a transfer that left the contour, so
@@ -241,18 +254,33 @@ impl CaveatKind {
     ///   rather than accepting a value for a holding; a call that let one be
     ///   supplied to close a caveat would be the invented number the whole
     ///   register exists to refuse.
-    /// - `RetiredAccountNotEmpty` — the two sides of one disagreement, in the
-    ///   order the owner should read them. `record_account_retirement`
-    ///   withdraws the statement, which is the answer where the product had not
-    ///   in fact ceased on the date he named; `submit_corrections` rules on the
-    ///   journal, which is the answer where it had and a fact on the account
-    ///   should stop counting. Neither is advice about which is right: this
-    ///   column answers "what call reaches this line", and a state with two
-    ///   legitimate resolutions names both, as `account_in_no_scope` does.
-    ///   What is **not** here is an import: bringing in the movements that
-    ///   emptied the account would also close the line, and no operation key
-    ///   names "record the rows that were missing" — the two above are the
-    ///   calls addressed to this state rather than to the journal in general.
+    /// - `RetiredAccountNotEmpty` — three, in the order the owner should read
+    ///   them, and each one is a different thing being untrue.
+    ///
+    ///   `ingest_operations` is first because it is the ordinary answer: the
+    ///   journal is **short**. A deposit whose principal predates the imported
+    ///   months has movements that do not sum to zero, and what makes them sum
+    ///   to zero is a §10.7 reconstructed opening — an `opening_cash` operation
+    ///   recorded through this call. The retirement then removes the row on its
+    ///   own, because the suppression is unconditional over an all-zero row.
+    ///
+    ///   `submit_corrections` is second: the journal is **wrong**, and a fact
+    ///   recorded on the account should stop counting. It acts on an event the
+    ///   owner names, which is why it cannot be first — in the ordinary case
+    ///   the event that would settle this is the one that is missing.
+    ///
+    ///   `record_account_retirement` is last, and it is here as the
+    ///   **withdrawal**: the product had not in fact ceased on the date he
+    ///   named. Recording a second retirement over one that stands is refused,
+    ///   so this key can only mean the other direction of its route — and
+    ///   `iaam-bhu3` is what happens when that is not said. This entry stood
+    ///   first for a wave, and an agent that had just retired an account read it
+    ///   as «do that again».
+    ///
+    ///   None of the three is advice about which is right: this column answers
+    ///   "what call reaches this line", and a state with three legitimate
+    ///   resolutions names all three, as `account_in_no_scope` names both of
+    ///   its two.
     /// - `TerminalValueNotComputed`, `ReturnNotComputed` — nothing, for the
     ///   reason above: both are absent *because* something they are derived
     ///   from is, and the caveat for that thing stands beside them.
@@ -268,8 +296,9 @@ impl CaveatKind {
             }
             Self::RunningCashSum => &[OperationKey::RecordOwnerBalance],
             Self::RetiredAccountNotEmpty => &[
-                OperationKey::RecordAccountRetirement,
+                OperationKey::SubmitOperations,
                 OperationKey::SubmitCorrections,
+                OperationKey::RecordAccountRetirement,
             ],
             Self::UndecomposedMovements => &[OperationKey::CreateCategoryRule],
             Self::PeriodReportsRefused
@@ -614,6 +643,55 @@ mod tests {
                 OperationKey::AddContourVersion,
                 OperationKey::RecordAccountScope
             ]
+        );
+    }
+
+    /// `iaam-bhu3`, pinned where the mistake was made.
+    ///
+    /// The register named `record_account_retirement` and `submit_corrections`
+    /// for a retired account that still shows a figure. Neither brings in the
+    /// movements the journal is short of, which is the ordinary cause, and the
+    /// first of them reads as «retire it again» to a client that has just
+    /// retired it. The ordinary answer comes first now, and the order is part of
+    /// the promise: a caller acting on `closed_by[0]` must be acting on the
+    /// remedy for the usual case.
+    #[test]
+    fn a_retired_account_that_still_holds_something_offers_the_import_first() {
+        let caveat = Caveat::new(
+            CaveatKind::RetiredAccountNotEmpty,
+            CaveatSubject::Account(AccountId(uuid::Uuid::from_u128(2))),
+        );
+        assert_eq!(
+            caveat.closed_by(),
+            &[
+                OperationKey::SubmitOperations,
+                OperationKey::SubmitCorrections,
+                OperationKey::RecordAccountRetirement,
+            ]
+        );
+    }
+
+    /// The remedy for the caveat next door is not a remedy for this one.
+    ///
+    /// Both caveats land on the same account in the case that motivated the
+    /// register — a deposit whose principal was never imported is both an
+    /// unanchored sum and a retirement that did not take effect — and
+    /// `record_owner_balance` writes a control assertion, which has no legs. It
+    /// respells the figure and moves no number, so offering it here would send
+    /// the owner to assert a balance of minus the principal. `RunningCashSum`
+    /// keeps it, because respelling the figure is exactly its own question.
+    #[test]
+    fn an_owner_balance_closes_the_unanchored_sum_and_not_the_standing_row() {
+        assert!(
+            CaveatKind::RunningCashSum
+                .closed_by()
+                .contains(&OperationKey::RecordOwnerBalance)
+        );
+        assert!(
+            !CaveatKind::RetiredAccountNotEmpty
+                .closed_by()
+                .contains(&OperationKey::RecordOwnerBalance),
+            "an assertion with no legs cannot empty an account"
         );
     }
 }

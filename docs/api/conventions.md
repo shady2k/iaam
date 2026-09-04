@@ -714,14 +714,41 @@ account's own retirement resource. From that date on:
 
 Where a retired account's figures are not all zero, the row stands, its class
 membership stands, and `confidence` carries `retired_account_not_empty` naming
-the account. The caveat's `closed_by` names the two sides of the disagreement:
-withdraw the statement, or rule on the journal.
+the account. The caveat's `closed_by` names three calls, in the order they should
+be considered, because there are three things that can be untrue here.
 
-The common cause is a deposit whose principal predates the imported interval.
-Its cash figure is then movement from an unknown start rather than a balance, the
-movements do not sum to zero, and the row is right to stand — the missing
-principal is a real hole in the owner's cash total. Recording the reconstructed
-opening is what closes it, and the retirement then removes the row.
+The common cause is a deposit whose principal predates the imported interval, and
+that is why `POST /v1/ingest/operations` is named first. Its cash figure is then
+movement from an unknown start rather than a balance, the movements do not sum to
+zero, and the row is right to stand — the missing principal is a real hole in the
+owner's cash total. Recording the reconstructed opening (an `opening_cash`
+operation, §10.7) is what closes it, and the retirement then removes the row on
+its own. Second is `POST /v1/corrections`, for a fact recorded on the account
+that should never have counted. Third is `POST /v1/accounts/{id}/retirement`,
+and it is there as the **withdrawal**: the product had not in fact ceased on the
+date the owner named. A second retirement over one that stands is refused (§6.5),
+so the retirement route can only mean the other direction of itself here.
+
+For a wave the field named only the last two, and the withdrawal came first. Both
+calls exist and both resolve, so nothing in the workspace noticed; what a client
+holding the register saw was an instruction to repeat the act that had produced
+the caveat. `closed_by` is a machine-readable field and clients are told to
+prefer it over prose, so its **order** is part of what it promises: the first
+entry is the remedy for the ordinary case.
+
+The same state is also an item in the action queue, kind
+`retired_account_not_empty`, one per retired account the journal still shows a
+figure on. It carries the same three calls in the same order, and adds the
+request each of them wants. It is required for the asset snapshot and for no
+other goal — a retirement is read in the snapshot's row suppression and nowhere
+else — and its state is `needs_owner_input`, because the amount of a
+reconstructed opening is what the account held before this system knew anything
+about it and no guess belongs there.
+
+The item's completion is read from the journal, not from the declaration and not
+from the caveat: it disappears when the account's figures are zero, whoever
+brought them to zero and however. The retirement is untouched by that, and stays
+standing.
 
 ### 6.5 What refuses
 

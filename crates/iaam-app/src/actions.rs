@@ -9,9 +9,12 @@ use crate::ports::{
 use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
 use crate::scenarios::import_session::{self, Generalisation};
 use crate::scenarios::reports::MoneyFlowReport;
+use iaam_core::event::correction::resolve;
 use iaam_core::event::source_row::RowName;
 use iaam_core::ids::{AccountId, EventId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money};
+use iaam_core::projection::ProjectionError;
+use iaam_core::projection::balances::Balances;
 use iaam_core::projection::money_flow::UndecomposedCause;
 use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue, Discrepancy};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
@@ -20,6 +23,7 @@ use iaam_ingest::Verdict;
 use iaam_ingest::classification::{
     Classification, ClassificationRule, ClassificationSubject, Question, RuleMatcher,
 };
+use time::Date;
 
 /// The policy-visible kind of an outstanding action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,6 +36,15 @@ pub enum ActionKind {
     ResolveTransferRelationships,
     StartAccountImport,
     ProvideControlAssertion,
+    /// The owner retired a product and the journal still shows a figure on it,
+    /// so the row he asked to have removed is still in the asset snapshot.
+    ///
+    /// Declared straight after the control assertion, and emitted there, because
+    /// the two are the same shortfall seen from two ends: the account's history
+    /// begins mid-way, so the fold is a movement from an unknown start and it
+    /// does not come to zero. The frontier's kinds must stay non-decreasing in
+    /// this enum's order.
+    RetiredAccountNotEmpty,
     /// A row the source described without a settled direction or counterparty
     /// is held in an import session, and the owner has not said what it was.
     ///
@@ -66,6 +79,12 @@ impl ActionKind {
             Self::ResolveTransferRelationships => "resolve_transfer_relationships",
             Self::StartAccountImport => "start_account_import",
             Self::ProvideControlAssertion => "provide_control_assertion",
+            // The same code the caveat register carries for the same state, and
+            // deliberately so: a client holding a snapshot with
+            // `retired_account_not_empty` in its `confidence` and a queue with
+            // an item of this kind is holding one fact twice, and the two names
+            // agreeing is what lets it say so.
+            Self::RetiredAccountNotEmpty => "retired_account_not_empty",
             Self::AnswerClassificationQuestion => "answer_classification_question",
             Self::AdoptClassificationRule => "adopt_classification_rule",
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
@@ -79,13 +98,14 @@ impl ActionKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::CreateFirstAccount,
         Self::CreateFirstContour,
         Self::AccountScopeUndecided,
         Self::ResolveTransferRelationships,
         Self::StartAccountImport,
         Self::ProvideControlAssertion,
+        Self::RetiredAccountNotEmpty,
         Self::AnswerClassificationQuestion,
         Self::AdoptClassificationRule,
         Self::CoverageGapUnrepaired,
@@ -110,8 +130,9 @@ impl ActionKind {
     /// what it blocks fails at construction rather than publishing a required
     /// item that names nothing.
     ///
-    /// Exhaustive on purpose. A sixteenth kind cannot compile until someone has
-    /// answered, for that kind, the question this whole type exists to answer.
+    /// Exhaustive on purpose. A seventeenth kind cannot compile until someone
+    /// has answered, for that kind, the question this whole type exists to
+    /// answer.
     ///
     /// Each entry is what the code does, not what the item's prose suggests:
     ///
@@ -145,6 +166,15 @@ impl ActionKind {
     /// - `PossibleDuplicateUndecided` — `DedupDecision::records_the_row` is true
     ///   for a possible duplicate, so the row **is** in the journal and may be
     ///   the same money counted twice. That is wrong in every report.
+    /// - `RetiredAccountNotEmpty` — **the asset snapshot and nothing else**, and
+    ///   the boundary is exact rather than cautious: a retirement is read in one
+    ///   place, `iaam_core::report::assets::asset_snapshot`, where an all-zero
+    ///   row of a ceased product is dropped. `contour::classify` never sees it,
+    ///   so flow and returns are the same numbers with or without the
+    ///   declaration, and `reconciliation::report` takes an account and never
+    ///   asks whether the product still exists. The one goal it names is the one
+    ///   whose register carries the caveat for the same state, which is what
+    ///   makes the two joinable.
     #[must_use]
     pub const fn goals(self) -> ReportGoals {
         use ReportGoal::{AssetSnapshot, MoneyFlow, Reconciliation, Returns};
@@ -159,6 +189,7 @@ impl ActionKind {
             | Self::AnswerClassificationQuestion
             | Self::PossibleDuplicateUndecided => ReportGoals::ALL,
             Self::ProvideControlAssertion => ReportGoals::of(&[AssetSnapshot, Reconciliation]),
+            Self::RetiredAccountNotEmpty => ReportGoals::of(&[AssetSnapshot]),
             Self::CoverageGapUnrepaired
             | Self::IndependentConfirmationMissing
             | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
@@ -934,6 +965,10 @@ pub struct ClassificationQuestion {
 /// closes an item publishes an item that never closes. A queue the owner learns
 /// to ignore is the failure this whole module is written against, so the second
 /// read is the price of the item existing at all.
+///
+/// Since `iaam-xnhu` the same argument buys a **fold of the journal**, and it is
+/// the most expensive thing this function does. See [`retired_products`] for
+/// what it costs, when it is paid, and why nothing cheaper answers the question.
 pub async fn frontier(
     owner: OwnerId,
     store: &dyn Store,
@@ -973,6 +1008,7 @@ pub async fn frontier(
         }
     }
     let rules = standing_rules(owner, rules).await?;
+    let retired = retired_products(owner, store).await?;
     let mut assertions = Vec::new();
     for account in activity
         .iter()
@@ -991,9 +1027,80 @@ pub async fn frontier(
         transfers: &transfers,
         activity: &activity,
         assertions: &assertions,
+        retired: &retired,
         questions: &questions,
         rules: &rules,
     })
+}
+
+/// The owner's ceased products, each with the journal's verdict on it.
+///
+/// **A journal read, and it is paid for only where it can produce an item.** The
+/// declarations are fetched first, and an owner who has retired nothing — which
+/// is where most owners are, most of the time — costs one cheap query and no
+/// fold at all. This is the same bargain the question loop above strikes when it
+/// skips the observations of a session that asked nothing.
+///
+/// Where he has retired something, the fold is unavoidable and no cheaper read
+/// stands in for it: the item's completion is «the account holds nothing», that
+/// is a property of the journal, and the alternatives — asking the declaration,
+/// or asking a report's caveat — are the two answers `iaam-4hcy` established
+/// must not be used, because one of them is the act that raised the item and the
+/// other is the report that reports it.
+///
+/// `Date::MAX` rather than a clock reading, and the choice is deliberate: the
+/// question is "does this account hold anything, as the journal now stands", and
+/// a fold bounded by today would answer «no» for an account emptied by a
+/// movement the owner recorded with a later effective date. See
+/// [`retired_account_completion`] for what this asks and what it does not.
+///
+/// A journal that will not fold **fails the queue**, and that is the opposite of
+/// what [`standing_rules`] does with a rule it cannot read. The difference is
+/// what degrading would have to invent. A skipped rule costs one duplicate
+/// proposal; a guessed `emptied` is either an item the owner does not owe or a
+/// silence about one he does, and there is no third value to publish. The state
+/// it fails in is one where the asset snapshot fails too — the same fold, the
+/// same events — so the queue is not going silent while the reports still work.
+async fn retired_products(
+    owner: OwnerId,
+    store: &dyn Store,
+) -> Result<Vec<RetiredProduct>, AppError> {
+    let declared = store.list_account_retirements(owner).await?;
+    if declared.statements.is_empty() {
+        return Ok(Vec::new());
+    }
+    let events = store.load_events_through(owner, Date::MAX).await?;
+    // The **effective** set, as every other fold in this workspace reads it: a
+    // retracted movement is not on the account any more, and a retirement whose
+    // row was emptied by a retraction has to read as emptied here too.
+    let effective = resolve(&events).map_err(AppError::Correction)?;
+    let mut balances = Balances::new();
+    for event in &effective {
+        balances
+            .apply(event)
+            .map_err(ProjectionError::from)
+            .map_err(AppError::from_projection)?;
+    }
+    Ok(declared
+        .statements
+        .iter()
+        .map(|statement| RetiredProduct {
+            account: statement.account,
+            effective_on: statement.effective_on,
+            // The same two tests `iaam_core::report::assets::retired_and_empty`
+            // makes, over the same fold: cash in every currency and every
+            // position quantity. Stated as one predicate here because the queue
+            // has no rows to suppress — it has one question per account.
+            emptied: balances
+                .iter_cash()
+                .filter(|(account, _)| *account == statement.account)
+                .all(|(_, money)| money.is_zero())
+                && balances
+                    .iter_positions()
+                    .filter(|(key, _)| key.account == statement.account)
+                    .all(|(_, quantity)| quantity.0.is_zero()),
+        })
+        .collect())
 }
 
 /// The owner's active classification rules, in the classifier's own vocabulary.
@@ -1705,6 +1812,11 @@ struct OwnerState<'a> {
     transfers: &'a [AccountTransferStatementView],
     activity: &'a [AccountActivityView],
     assertions: &'a [ControlAssertionView],
+    /// The owner's products that have ceased, each with the journal's verdict on
+    /// whether anything is still on it. Empty is «he has retired nothing», which
+    /// is where most owners stay, and it is also what spares [`frontier`] the
+    /// journal read this field is folded from.
+    retired: &'a [RetiredProduct],
     questions: &'a [ClassificationQuestion],
     /// The owner's standing classification rules, as the classifier reads them.
     ///
@@ -1726,12 +1838,13 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
         transfers,
         activity,
         assertions,
+        retired,
         questions,
         rules,
     } = *state;
     let names = AccountNames::new(accounts);
     let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
-    actions.reserve(activity.len() + assertions.len() + questions.len());
+    actions.reserve(activity.len() + assertions.len() + retired.len() + questions.len());
     for account in activity
         .iter()
         .filter(|activity| account_import_eligibility(activity) && account_import_gap(activity))
@@ -1763,6 +1876,16 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
                 point,
             ));
         }
+    }
+    // After the control assertions, because the kind is declared after theirs
+    // and the frontier's order must be non-decreasing in that order. The two
+    // belong together for a better reason than the ordering: both are what an
+    // account whose history begins mid-way produces.
+    for product in retired
+        .iter()
+        .filter(|product| retired_account_eligibility(product) && retired_account_gap(product))
+    {
+        actions.push(retired_account_action(names.get(product.account)?, product));
     }
     // Last, so the frontier's kinds stay non-decreasing in `ActionKind`'s own
     // order: this kind is declared after the control assertion.
@@ -2710,6 +2833,204 @@ fn provide_control_assertion_action(
     .expect("control assertion action has an operation target")
 }
 
+/// One product the owner has retired, and whether the journal agrees.
+///
+/// A derived view rather than a store projection: `emptied` is a fold over the
+/// owner's effective journal, and it is computed in [`frontier`] so that
+/// [`actions_from_state`] stays a pure function of what it is handed — the same
+/// arrangement as [`ClassificationQuestion`], whose generalisation is derived
+/// from the session's observations before the policy sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredProduct {
+    pub account: AccountId,
+    /// The date the owner said the product ceased.
+    pub effective_on: Date,
+    /// Every cash and position figure the journal now holds on this account is
+    /// zero.
+    ///
+    /// Read from the journal and never from the declaration: see
+    /// [`retired_account_completion`].
+    pub emptied: bool,
+}
+
+/// A retirement the owner has not withdrawn is eligible to be asked about.
+///
+/// Kept as a named function beside the gap and the completion, as the three
+/// other goals in this module are. The eligibility is not vacuous: only
+/// retirements **in force** reach here, because
+/// [`crate::ports::AccountRetirementsView`] holds only those — an account whose
+/// latest statement withdrew its retirement is absent from it, exactly as one
+/// never retired is. So withdrawing the statement removes the item by way of
+/// this predicate, and the item is right to disappear: there is no longer a
+/// declaration for the journal to disagree with.
+const fn retired_account_eligibility(_retired: &RetiredProduct) -> bool {
+    true
+}
+
+fn retired_account_gap(retired: &RetiredProduct) -> bool {
+    !retired_account_completion(retired)
+}
+
+/// The goal: the product the owner says has ceased holds nothing.
+///
+/// **Read from the journal, not from the caveat and not from the declaration.**
+/// This is `iaam-4hcy`'s rule applied to a second state. The declaration cannot
+/// close the item — recording it is what raised the item — and the asset
+/// snapshot's caveat cannot either, because a caveat is a per-report statement
+/// at one `as_of` and the queue has no `as_of` to take. What has an answer is
+/// the account's own figures: **whoever brought them to zero and however**, the
+/// disagreement between his statement and the journal is over. A reconstructed
+/// opening recorded through the ingest route closes it; so does retracting an
+/// event that should never have counted; so does an ordinary import that
+/// happened to bring in the missing outflow, with no item consulted at all.
+///
+/// The fold is the whole journal rather than a window, and the honesty of that
+/// is worth stating: this asks «does the account hold anything now», while the
+/// snapshot asks «did it hold anything on the day this report is taken». A
+/// snapshot taken at a date the fold had not yet reached zero still carries its
+/// caveat, and the queue does not repeat itself per date because a queue with
+/// one item per possible report date is not a list anyone reads.
+fn retired_account_completion(retired: &RetiredProduct) -> bool {
+    retired.emptied
+}
+
+/// A retirement the journal has not caught up with (`iaam-xnhu`).
+///
+/// **The state was reported truthfully and its acts were published where a
+/// caller does not look for acts.** `retired_account_not_empty` lives in a
+/// report's `confidence`; this endpoint is the system's answer to "what should I
+/// do next", and it said nothing — so the owner learned that his retirement had
+/// not taken effect only by asking for the snapshot again and reading the
+/// register. That is the shape `iaam-4hcy` solved once already, and this is the
+/// same fix: the act belongs in the queue, and its completion is read from the
+/// world.
+///
+/// **Three ways out, in the register's order and for the register's reasons.**
+/// The queue and `CaveatKind::closed_by` name one set of calls because they are
+/// one vocabulary; what the queue adds is the request each of them wants. The
+/// ordinary answer comes first — the journal is short of the opening the
+/// movements were measured from — then the correction for a journal that is
+/// wrong, then the withdrawal for a statement that is.
+///
+/// **`NeedsOwnerInput`, and the missing field is why.** The amount of a
+/// reconstructed opening is what the account held before this system knew
+/// anything about it. Nothing here holds that figure, nothing can derive it, and
+/// presetting a guess would put an invented number into the one call whose whole
+/// purpose is to state a real one. So it is published as missing, marked
+/// [`ProvidedBy::Owner`] — the word for «a figure that exists nowhere else, and
+/// no document and no client can supply it on his behalf». That word is right
+/// even where he happens to read the number off an old statement, and
+/// [`ProvidedBy`] says why: the axis is who holds the value, not what it cost to
+/// get. The precedent is one type up — `provide_control_assertion_action` marks
+/// `/cash` the same way, and a control assertion's figure is commonly printed on
+/// a document too.
+///
+/// **`Scope::Owner`, though one of the three ways out admits an agent.** The
+/// ingest route checks `may_submit`, which an agent token satisfies; the
+/// correction route and the retirement route are owner-only. One field cannot
+/// say two things, and the honest single answer is the authority the *item*
+/// needs: an agent cannot close this on its own under any of the three
+/// readings, and it could not supply the figure for the one route it may call.
+fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Action {
+    // The reconstructed opening. Preset is exactly what the policy knows: the
+    // account this row is on, and that the row is an opening. The figure, the
+    // currency and the date the opening speaks about are the owner's. The date
+    // is asked for rather than derived from the retirement: a reconstruction
+    // states what was there before *itself*, not before the journal —
+    // `iaam_core::reconciliation::OpeningAnchors` compares it against the
+    // account's first movement — so a date invented here could anchor nothing
+    // and still look like an answer.
+    let mut opening_preset = BTreeMap::new();
+    opening_preset.insert(
+        "operations".to_owned(),
+        serde_json::json!([{
+            "account": account.id.inner().to_string(),
+            "type": "opening_cash",
+        }]),
+    );
+    let opening = ResolutionOption {
+        operation: OperationKey::SubmitOperations,
+        request: RequestPlan {
+            preset: opening_preset,
+            missing: vec![
+                MissingInput::plain("/operations/0/amount", ProvidedBy::Owner),
+                MissingInput::plain("/operations/0/currency", ProvidedBy::Owner),
+                MissingInput::plain("/operations/0/dates/cash_posted", ProvidedBy::Owner),
+                // A name for the fact so that sending it twice records it once.
+                // The caller's, not the owner's: it says which transmission this
+                // is and asks him nothing.
+                MissingInput::plain("/operations/0/idempotency_key", ProvidedBy::Caller),
+            ],
+        },
+    };
+
+    // Ruling on the journal. Nothing is preset, and that is not an omission: a
+    // correction is addressed to an event the caller names, and which of this
+    // account's events should stop counting is exactly the judgement the item
+    // cannot make for him.
+    let correction = ResolutionOption {
+        operation: OperationKey::SubmitCorrections,
+        request: RequestPlan {
+            preset: BTreeMap::new(),
+            missing: vec![
+                MissingInput::plain("/corrections", ProvidedBy::Owner),
+                MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+            ],
+        },
+    };
+
+    // Withdrawing the statement. Fully written out, and the state is preset
+    // rather than asked for: recording a second retirement over one that stands
+    // is refused, so `in_use` is the only thing this option can mean, and an
+    // option that left the word to the caller would publish the route that
+    // produced the caveat as the way out of it.
+    let mut withdrawal_preset = BTreeMap::new();
+    withdrawal_preset.insert("id".to_owned(), account.id.inner().to_string().into());
+    withdrawal_preset.insert("state".to_owned(), "in_use".into());
+    let withdrawal = ResolutionOption {
+        operation: OperationKey::RecordAccountRetirement,
+        request: RequestPlan {
+            preset: withdrawal_preset,
+            missing: Vec::new(),
+        },
+    };
+
+    Action::new(
+        ActionFacts {
+            // One identity per account, as every other per-account item has: two
+            // retired products that both still hold something are two items, and
+            // an agent deduplicating by id must not collapse them.
+            id: format!(
+                "{}:{}",
+                ActionKind::RetiredAccountNotEmpty.id(),
+                account.id.inner()
+            ),
+            kind: ActionKind::RetiredAccountNotEmpty,
+            category: ActionCategory::required_for(ActionKind::RetiredAccountNotEmpty),
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
+        },
+        format!(
+            "Account {} ({}) is recorded as having ceased on {}, and the journal still shows \
+             a figure on it, so the asset snapshot keeps its row and its class membership. \
+             A retirement never hides money: the row is dropped only where every one of its \
+             figures is zero. The usual cause is that the product's opening predates the \
+             months that were imported, so the recorded movements do not sum to zero — \
+             record the reconstructed opening and the retirement then removes the row on its \
+             own. If instead a fact on this account should never have counted, rule on that \
+             event. If the product had not in fact ceased on that date, withdraw the \
+             statement. Do not rule the account outside the perimeter to tidy this up: that \
+             is the other axis, and it takes the interest and the closing movement with it.",
+            account.id.inner(),
+            account.title,
+            retired.effective_on,
+        ),
+        ActionTarget::from_options(vec![opening, correction, withdrawal]),
+    )
+    .expect("the retired-account item publishes three resolutions")
+}
+
 fn first_account_action() -> Action {
     Action::new(
         ActionFacts {
@@ -2949,6 +3270,7 @@ mod tests {
     use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
     use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
+    use iaam_core::report::confidence::CaveatKind;
     use iaam_ingest::classification::{Answer, Counterparty, FarSide};
     use iaam_store::SqliteStore;
     use std::collections::BTreeSet;
@@ -2974,7 +3296,7 @@ mod tests {
             "two kinds share an identity, or one is listed twice: {:?}",
             ActionKind::ALL.map(ActionKind::id)
         );
-        assert_eq!(ActionKind::ALL.len(), 15, "a kind was added without a goal");
+        assert_eq!(ActionKind::ALL.len(), 16, "a kind was added without a goal");
     }
 
     /// Every kind graded `RequiredForGoal` names at least one goal, and every
@@ -2986,7 +3308,7 @@ mod tests {
     /// the mapping, written a second time, from what the reports actually read.
     ///
     /// The `match` is exhaustive on purpose, and that is what keeps this from
-    /// going stale. A fifteenth kind does not slip through — it stops the test
+    /// going stale. A seventeenth kind does not slip through — it stops the test
     /// from compiling, so whoever adds it answers, here, which reports their new
     /// item stands in the way of, before the queue can publish an item that
     /// names none.
@@ -3029,6 +3351,11 @@ mod tests {
                 // and currency. It has no legs, so it moves no number in flow or
                 // returns.
                 ActionKind::ProvideControlAssertion => &[AssetSnapshot, Reconciliation],
+                // A retirement is read in one place — the asset snapshot's row
+                // suppression. `contour::classify` never sees it, so flow and
+                // returns are unchanged by it, and `reconciliation::report`
+                // never asks whether a product still exists.
+                ActionKind::RetiredAccountNotEmpty => &[AssetSnapshot],
                 // All three are about whether a period is confirmed.
                 ActionKind::CoverageGapUnrepaired
                 | ActionKind::IndependentConfirmationMissing
@@ -3808,6 +4135,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(account.id)],
             assertions: &[],
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -3877,6 +4205,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(first), no_facts(second)],
             assertions: &[],
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -4140,6 +4469,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(main.id), no_facts(savings.id)],
             assertions: &[],
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -4210,6 +4540,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(account.id)],
             assertions: &[],
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -4315,6 +4646,7 @@ mod tests {
             transfers: &[],
             activity: std::slice::from_ref(&activity),
             assertions: &[],
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -4344,6 +4676,7 @@ mod tests {
                 transfers: &[],
                 activity: &[completed],
                 assertions: &[],
+                retired: &[],
                 questions: &[],
                 rules: &[],
             })
@@ -4372,6 +4705,7 @@ mod tests {
             transfers: &[],
             activity: std::slice::from_ref(&activity),
             assertions: recorded,
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -4541,6 +4875,7 @@ mod tests {
             transfers: &[],
             activity: &activity,
             assertions: &[],
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -4570,6 +4905,7 @@ mod tests {
             transfers: &[],
             activity: &[activity],
             assertions: &[],
+            retired: &[],
             questions: &[],
             rules: &[],
         })
@@ -4587,6 +4923,7 @@ mod tests {
                 transfers: &[],
                 activity: &[],
                 assertions: &[],
+                retired: &[],
                 questions: &[],
                 rules: &[],
             })
@@ -5695,6 +6032,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -5734,6 +6072,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -5767,6 +6106,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -5808,6 +6148,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -5835,6 +6176,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -5885,6 +6227,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -5914,6 +6257,7 @@ mod tests {
                 transfers: &[],
                 activity: &[],
                 assertions: &[],
+                retired: &[],
                 questions: std::slice::from_ref(&question),
                 rules: &[],
             })
@@ -5945,6 +6289,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: &[first.clone(), second.clone()],
             rules: &[],
         })
@@ -6100,6 +6445,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
+            retired: &[],
             questions: std::slice::from_ref(question),
             rules,
         })
@@ -6289,5 +6635,200 @@ mod tests {
         question.session_state = ImportSessionState::Committed;
 
         assert_eq!(adopt_items(&queue_for(&main, &question, &[])).len(), 1);
+    }
+
+    // --- A retirement the journal has not caught up with (iaam-xnhu) ---------
+    //
+    // The defect these cover: `retired_account_not_empty` was published in a
+    // report's `confidence` and nowhere else, so the queue — the answer to
+    // "what should I do next" — was silent about a retirement that had not
+    // taken effect, and the owner found out by asking for the snapshot again.
+
+    fn ceased(account: AccountId, emptied: bool) -> RetiredProduct {
+        RetiredProduct {
+            account,
+            effective_on: date!(2026 - 01 - 10),
+            emptied,
+        }
+    }
+
+    fn retired_items(actions: &[Action]) -> Vec<&Action> {
+        actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::RetiredAccountNotEmpty)
+            .collect()
+    }
+
+    fn queue_for_retirement(account: &AccountView, retired: &[RetiredProduct]) -> Vec<Action> {
+        actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            retired,
+            questions: &[],
+            rules: &[],
+        })
+        .expect("actions from state")
+    }
+
+    /// The item exists, and it publishes every call that reaches the state.
+    ///
+    /// The order is asserted, not merely the set: the ordinary cause is a
+    /// journal that is short of the opening, and a client acting on the first
+    /// resolution must be acting on the remedy for the ordinary cause. It was
+    /// the other way round in the register for a wave, and an agent that had
+    /// just retired the account read the first entry as «retire it again».
+    #[test]
+    fn a_retirement_the_journal_disagrees_with_is_queued_with_its_three_ways_out() {
+        let term = named("Term");
+        let actions = queue_for_retirement(&term, &[ceased(term.id, false)]);
+        let items = retired_items(&actions);
+        assert_eq!(items.len(), 1, "{actions:?}");
+
+        let published: Vec<OperationKey> = items[0]
+            .target()
+            .resolutions()
+            .into_iter()
+            .map(|(operation, _)| operation)
+            .collect();
+        assert_eq!(
+            published,
+            vec![
+                OperationKey::SubmitOperations,
+                OperationKey::SubmitCorrections,
+                OperationKey::RecordAccountRetirement,
+            ]
+        );
+        // The same calls the register names for the same state, and in the same
+        // order. Two lists that must agree are one list, so this compares them
+        // rather than restating either.
+        assert_eq!(
+            published,
+            CaveatKind::RetiredAccountNotEmpty.closed_by().to_vec()
+        );
+        assert_eq!(
+            items[0].kind().id(),
+            CaveatKind::RetiredAccountNotEmpty.code()
+        );
+    }
+
+    /// The completion is the journal, not the declaration and not the caveat.
+    ///
+    /// `iaam-4hcy`'s rule on a second state: whoever emptied the account and
+    /// however — a reconstructed opening, a retraction, an ordinary import that
+    /// happened to carry the missing outflow — the disagreement is over and the
+    /// item goes. The retirement itself still stands and is not withdrawn.
+    #[test]
+    fn an_emptied_product_leaves_the_queue_with_its_retirement_still_standing() {
+        let term = named("Term");
+        assert!(
+            retired_items(&queue_for_retirement(&term, &[ceased(term.id, true)])).is_empty(),
+            "an item whose goal is met is an item the owner learns to ignore"
+        );
+        assert!(retired_account_completion(&ceased(term.id, true)));
+        assert!(!retired_account_completion(&ceased(term.id, false)));
+    }
+
+    /// A withdrawn retirement removes the item through the eligibility, not the
+    /// goal: the store returns only the statements in force, so there is no
+    /// declaration left for the journal to disagree with.
+    #[test]
+    fn withdrawing_the_statement_removes_the_item_without_emptying_anything() {
+        let term = named("Term");
+        assert!(retired_items(&queue_for_retirement(&term, &[])).is_empty());
+    }
+
+    /// The figure is the owner's and nothing here holds it.
+    ///
+    /// The opening amount is what the account held before this system knew
+    /// anything about it. Presetting a guess would put an invented number into
+    /// the one call whose purpose is to state a real one, so it is published as
+    /// missing and attributed to the only source that has it.
+    #[test]
+    fn the_opening_it_offers_asks_the_owner_for_the_amount_and_presets_the_rest() {
+        let term = named("Term");
+        let actions = queue_for_retirement(&term, &[ceased(term.id, false)]);
+        let items = retired_items(&actions);
+        let resolutions = items[0].target().resolutions();
+        let (operation, plan) = resolutions[0];
+        assert_eq!(operation, OperationKey::SubmitOperations);
+
+        assert_eq!(
+            plan.preset.get("operations"),
+            Some(&serde_json::json!([{
+                "account": term.id.inner().to_string(),
+                "type": "opening_cash",
+            }])),
+            "the account and the kind of row are the whole of what the policy knows"
+        );
+        let asked: Vec<(&str, ProvidedBy)> = plan
+            .missing
+            .iter()
+            .map(|input| (input.pointer.as_str(), input.provided_by))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                ("/operations/0/amount", ProvidedBy::Owner),
+                ("/operations/0/currency", ProvidedBy::Owner),
+                ("/operations/0/dates/cash_posted", ProvidedBy::Owner),
+                ("/operations/0/idempotency_key", ProvidedBy::Caller),
+            ]
+        );
+    }
+
+    /// The withdrawal names the direction rather than leaving the word open.
+    ///
+    /// Recording a second retirement over one that stands is refused, so an
+    /// option that asked the caller for `state` would publish the act that
+    /// produced the item as the way out of it — which is `iaam-bhu3` restated
+    /// one layer up.
+    #[test]
+    fn the_withdrawal_it_offers_is_written_out_and_asks_for_nothing() {
+        let term = named("Term");
+        let actions = queue_for_retirement(&term, &[ceased(term.id, false)]);
+        let items = retired_items(&actions);
+        let resolutions = items[0].target().resolutions();
+        let (operation, plan) = resolutions[2];
+
+        assert_eq!(operation, OperationKey::RecordAccountRetirement);
+        assert_eq!(
+            plan.preset.get("state"),
+            Some(&serde_json::Value::from("in_use"))
+        );
+        assert_eq!(
+            plan.preset.get("id"),
+            Some(&serde_json::Value::from(term.id.inner().to_string()))
+        );
+        assert!(plan.missing.is_empty(), "{plan:?}");
+    }
+
+    /// Two ceased products that both still hold something are two items.
+    #[test]
+    fn two_retired_products_that_still_hold_something_get_distinct_identities() {
+        let first = named("Term");
+        let second = named("Savings");
+        let actions = actions_from_state(&OwnerState {
+            accounts: &[first.clone(), second.clone()],
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            retired: &[ceased(first.id, false), ceased(second.id, false)],
+            questions: &[],
+            rules: &[],
+        })
+        .expect("actions from state");
+
+        let identities: Vec<&str> = retired_items(&actions)
+            .into_iter()
+            .map(Action::id)
+            .collect();
+        assert_eq!(identities.len(), 2);
+        assert_ne!(identities[0], identities[1]);
     }
 }

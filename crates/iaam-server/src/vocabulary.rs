@@ -304,7 +304,11 @@ mod tests {
         // The three `provided_by` codes were literals in the transport before
         // they were a vocabulary, and the strings a caller reads had to survive
         // being given a type.
-        for source in [ProvidedBy::Owner, ProvidedBy::ExternalDocument, ProvidedBy::Caller] {
+        for source in [
+            ProvidedBy::Owner,
+            ProvidedBy::ExternalDocument,
+            ProvidedBy::Caller,
+        ] {
             assert_eq!(ProvidedByDto::from_domain(&source).code(), source.code());
             assert_eq!(
                 serde_json::to_value(ProvidedByDto::from_domain(&source)).expect("serialisation"),

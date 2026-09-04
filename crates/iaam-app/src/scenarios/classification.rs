@@ -165,6 +165,41 @@ pub fn matcher_json(matcher: &RuleMatcher) -> Value {
     })
 }
 
+/// The condition, in the form a request body carries it.
+///
+/// The same three fields as [`matcher_json`] and deliberately not the same
+/// shape: what a rule is **stored** as states every key, so a reader of the
+/// store sees what the rule does not ask about; what a rule is **sent** as is
+/// the shape `RuleMatcherDto` publishes, which omits an absent field, and that
+/// is what the schema a caller validates against describes.
+///
+/// Both exist because the action queue presets a body. A preset that carried
+/// the storage shape would publish one rule twice in two shapes — once as the
+/// proposal on the question it came from and once as the body to send — and
+/// nothing would ever compare them, which is how they come to disagree.
+/// `optional_string` reads a missing key and an explicit `null` identically, so
+/// the two forms mean the same thing to everything that parses them.
+#[must_use]
+pub fn matcher_request_json(matcher: &RuleMatcher) -> Value {
+    let mut object = serde_json::Map::new();
+    for (field, value) in [
+        (
+            "counterparty_account",
+            matcher.counterparty_account.as_ref(),
+        ),
+        (
+            "description_contains",
+            matcher.description_contains.as_ref(),
+        ),
+        ("kind", matcher.kind.as_ref()),
+    ] {
+        if let Some(value) = value {
+            object.insert(field.to_owned(), Value::String(value.clone()));
+        }
+    }
+    Value::Object(object)
+}
+
 /// A classification, in the form the rule store keeps it in.
 ///
 /// The inverse of [`parse_outcome`], and it must stay so: a rule written in

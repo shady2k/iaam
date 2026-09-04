@@ -6,7 +6,7 @@ use crate::ports::{
     ClassificationRuleStore, ContourView, ControlAssertionView, ImportQuestionView,
     ImportSessionState, Scope, Store,
 };
-use crate::scenarios::classification::{matcher_json, outcome_json, rule_from_view};
+use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
 use crate::scenarios::import_session::{self, Generalisation};
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::source_row::RowName;
@@ -1710,6 +1710,7 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
         activity,
         assertions,
         questions,
+        rules,
     } = *state;
     let names = AccountNames::new(accounts);
     let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
@@ -2059,11 +2060,14 @@ fn adopt_classification_rule_action(
     outcome: Classification,
 ) -> Action {
     let mut preset = BTreeMap::new();
-    // Written through the same two encoders the rule store is written with, not
-    // assembled here. A second writer of the rule format would drift from the
-    // one reader of it, and the owner would post a body this build composed and
-    // the classifier cannot read back.
-    preset.insert("matcher".to_owned(), matcher_json(matcher));
+    // Written through the encoders beside the one reader of the rule format, not
+    // assembled here. A second writer would drift from that reader, and the
+    // owner would post a body this build composed and the classifier cannot read
+    // back. The matcher goes in its request shape rather than its storage one:
+    // this preset and the proposal published on the question it came from are
+    // one rule, and a rule published twice in two shapes is two that nothing
+    // compares.
+    preset.insert("matcher".to_owned(), matcher_request_json(matcher));
     preset.insert("outcome".to_owned(), outcome_json(outcome));
 
     Action::new(

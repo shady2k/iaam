@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use iaam_core::event::provenance::ParserVersion;
 
 pub use catalogue::{Installed, Origin, ProfileCatalogue, Refused};
-pub use engine::{DocumentReading, ReadContext, ReadOutcome, read};
+pub use engine::{DocumentReading, ReadContext, ReadOutcome, UnresolvedAccountName, read};
 pub use load::ProfileError;
 
 /// The schema version this build implements.

@@ -18,7 +18,7 @@ use crate::ports::{
     CustodyView, Declared, DocumentToKeep, ImportObservationView, ImportQuestionView,
     ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
     InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, NewImportQuestion, Principal,
-    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -41,6 +41,7 @@ use iaam_core::reconciliation::claim::AssertionPeriod;
 use iaam_core::retirement::{AccountRetirement, RetirementRevision};
 use iaam_core::rules::LotRuleVersion;
 use iaam_ingest::dedup::IdentityScope;
+use iaam_ingest::profile::UnresolvedAccountName;
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::{NewBrokerAccess, SoleOwner as StoredSoleOwner};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
@@ -893,6 +894,53 @@ impl Store for SqliteAdapter {
                 .load_document_by_hash(owner, &document_hash)
                 .map(|found| found.map(|document| document.body))
                 .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn record_unresolved_accounts(
+        &self,
+        owner: OwnerId,
+        document_hash: RawHash,
+        session: ImportSessionId,
+        names: Vec<UnresolvedAccountName>,
+    ) -> Result<(), AppError> {
+        // Flattened to the pair the store writes, here rather than in the store:
+        // the reading's own type belongs to the engine that produced it, and a
+        // store that took it would be a second crate depending on the shape of
+        // a parse result.
+        let rows: Vec<(String, u32)> = names
+            .into_iter()
+            .map(|name| {
+                (
+                    name.printed,
+                    u32::try_from(name.records).unwrap_or(u32::MAX),
+                )
+            })
+            .collect();
+        self.blocking(move |store| {
+            store
+                .record_unresolved_accounts(owner, &document_hash, session.inner(), &rows)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_unresolved_accounts(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<UnresolvedAccountView>, AppError> {
+        self.blocking(move |store| {
+            let records = store.list_unresolved_accounts(owner).map_err(store_error)?;
+            Ok(records
+                .into_iter()
+                .map(|record| UnresolvedAccountView {
+                    session: ImportSessionId(record.import_session),
+                    document_hash: record.document_hash.as_str().to_owned(),
+                    printed: record.printed,
+                    records: record.records,
+                })
+                .collect())
         })
         .await
     }

@@ -433,7 +433,7 @@ $ curl -sS http://127.0.0.1:8080/v1/health
 {"status":"ok","schema_version":12,"projection_version":8}
 
 $ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/actions
-[{"id":"create_first_account","kind":"create_first_account","category":"blocking","goals":[],"state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered.","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","requiredScope":"owner","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}]
+[{"id":"create_first_account","kind":"create_first_account","category":"blocking","goals":[],"state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered. Which accounts to create is a question this instance answers rather than guesses at, …","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","requiredScope":"owner","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}]
 ```
 
 The first call is the discovery document (RFC 9727) and the entry point for an

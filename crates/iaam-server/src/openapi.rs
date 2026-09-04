@@ -66,6 +66,8 @@ use crate::dto::{
     ReadingProfileDto, RefusedProfileDto, SourceDocumentDto, SourceDocumentRowDto,
     SourceProfileCatalogueDto, SourceProfileDto,
 };
+// Wave U's types, in a block of their own for the reason the block above gives.
+use crate::dto::UnresolvedAccountDto;
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -292,6 +294,7 @@ impl Modify for BearerSecurity {
         SourceProfileCatalogueDto,
         ReadingProfileDto,
         SourceDocumentRowDto,
+        UnresolvedAccountDto,
         SourceDocumentDto,
         // The published vocabularies: every code the API can return, each with
         // the sentence that explains it (§13).

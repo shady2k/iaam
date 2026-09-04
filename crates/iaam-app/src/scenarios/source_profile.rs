@@ -32,7 +32,9 @@ use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, ImportSessionId, SourceId};
 use iaam_ingest::Rejection;
 use iaam_ingest::observation::Intake;
-use iaam_ingest::profile::{Installed, ProfileCatalogue, ReadContext, ReadOutcome, engine};
+use iaam_ingest::profile::{
+    Installed, ProfileCatalogue, ReadContext, ReadOutcome, UnresolvedAccountName, engine,
+};
 
 use crate::AppServices;
 use crate::error::AppError;
@@ -102,6 +104,22 @@ pub struct DocumentImport {
     pub document_hash: String,
     pub profile: ProfileIdentity,
     pub rows: Vec<DocumentRow>,
+    /// The account names this document printed that the owner's directory
+    /// resolved to no single account, once each, in the order the document
+    /// first printed them, with the number of its records that printed each.
+    ///
+    /// **The same refusals, said once per name instead of once per record.**
+    /// Every one of these records is refused individually in [`Self::rows`],
+    /// which is the contract and stays the contract; this is what makes the
+    /// answer readable when one unknown account accounts for two hundred rows.
+    /// It states nothing the rows do not: no account is proposed, none is
+    /// created, and no name is interpreted.
+    ///
+    /// Recorded beside the kept document as well, because it is the only place
+    /// these names survive — a refused record never reaches the session — and
+    /// because recovering them means reading the document again, which the
+    /// outstanding-work queue must not do per document on every reading.
+    pub unresolved_accounts: Vec<UnresolvedAccountName>,
 }
 
 /// The catalogue this instance publishes.
@@ -208,7 +226,7 @@ pub async fn read_into_session(
             broker: installed.profile.issuer().to_owned(),
             format: installed.profile.id().to_owned(),
             parser_version: installed.profile.parser_version(),
-            document_hash,
+            document_hash: document_hash.clone(),
             body: bytes.to_vec(),
         })
         .await?;
@@ -250,12 +268,36 @@ pub async fn read_into_session(
     // comparing the response with the file it sent should not have to sort.
     rows.sort_by_key(DocumentRow::locator);
 
+    // What this reading could not place, kept as an instance fact.
+    //
+    // Written after the rows have been fed, so that a reading which failed to
+    // reach the session leaves no record claiming it happened; and written even
+    // when the list is empty, because an empty list is the statement that this
+    // reading placed every account the document named — which is what clears
+    // what an earlier reading of the same document recorded.
+    //
+    // Nothing is appended to the journal here, and nothing could be: the
+    // records these names came from were refused, so there is no movement to
+    // record and no provenance to hang a name on. Decision 0024 says why the
+    // fact is the instance's and why the queue reads it here rather than
+    // re-reading every kept document.
+    services
+        .store
+        .record_unresolved_accounts(
+            principal.owner,
+            document_hash,
+            session,
+            reading.unresolved_accounts.clone(),
+        )
+        .await?;
+
     Ok(DocumentImport {
         session,
         source,
         document_hash: reading.digest,
         profile: ProfileIdentity::of(installed),
         rows,
+        unresolved_accounts: reading.unresolved_accounts,
     })
 }
 

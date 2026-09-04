@@ -49,7 +49,7 @@ use iaam_ingest::dedup::IdentityScope;
 use crate::ports::{
     AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, ContourView,
     ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
-    ImportSessionView, NewImportQuestion, Principal, Recorded,
+    ImportSessionView, NewImportQuestion, Principal, Recorded, UnresolvedAccountView,
 };
 use crate::scenarios::classification::{matcher_json, outcome_json};
 use crate::scenarios::coverage_gap;
@@ -1998,6 +1998,29 @@ pub struct AccountResolution {
     /// Reported rather than resolved: picking one is the guess the whole module
     /// refuses.
     pub conflicting: Vec<String>,
+    /// Account names a document of this session printed that the owner's
+    /// directory resolves to no single account.
+    ///
+    /// **A fourth field and not a widening of `missing`** (decision 0024). The
+    /// three above it are answers about a row this session holds: `missing`
+    /// names accounts a row named **by identifier** and the directory does not
+    /// hold, and it is a list of identifiers because that is what such a row
+    /// carried. A printed string that matched nothing has no identifier at all —
+    /// there is nothing to put in that list, and putting the string there under
+    /// a union type would be two facts sharing one slot, which is exactly how
+    /// `iaam-p683` happened one field over.
+    ///
+    /// It is also quantified differently, and that is the second reason it is
+    /// its own field: these names come from records that **were refused**, so
+    /// this session holds no row for any of them. Every other section here is a
+    /// statement about rows the commit would write; this one is a statement
+    /// about rows that were never held, and reading it as the first would say
+    /// the import is about to record something it will not.
+    ///
+    /// In the order the documents printed them, deduplicated, and filtered
+    /// through the directory as it now stands: a name the owner has since
+    /// created an account for is not listed, because it is no longer true.
+    pub unrecognised: Vec<String>,
 }
 
 /// Where each account the rows name stands relative to the reporting perimeter.
@@ -2505,7 +2528,33 @@ pub async fn plan_session(
     }
 
     let source_inventory = inventory(&contents, &read_rows);
-    let account_resolution = account_resolution(&resolver, &read_rows);
+    // What the readings of this session's documents could not place. Narrowed to
+    // this session's documents and not left at the owner's whole set: the
+    // assessment answers for this import, and a name another import's document
+    // printed is that import's question.
+    //
+    // Two tests, because neither alone is the set. A reading records the session
+    // it was read into, which is the ordinary tie — and it is the only tie there
+    // is when *every* record of the document was refused, because then the
+    // session holds no row naming that document. And a record is kept per
+    // document, so the remedy of §5 — retract, then read the same bytes into a
+    // fresh session — moves the record to the newer session while this one still
+    // holds rows out of that document; the inventory's own digests are what keep
+    // this assessment answering for them.
+    let recorded_names: Vec<UnresolvedAccountView> = services
+        .store
+        .list_unresolved_accounts(principal.owner)
+        .await?
+        .into_iter()
+        .filter(|name| {
+            name.session == session
+                || source_inventory
+                    .documents
+                    .iter()
+                    .any(|document| *document == name.document_hash)
+        })
+        .collect();
+    let account_resolution = account_resolution(&resolver, &read_rows, &recorded_names);
     let scope_assessment = scope_assessment(&source_inventory.accounts, &contours, &exclusions);
     let open_questions: Vec<OpenQuestion> = contents
         .questions
@@ -2961,7 +3010,23 @@ fn inventory(contents: &SessionContents, rows: &[ReadRow]) -> SourceInventory {
     }
 }
 
-fn account_resolution(resolver: &Resolver, rows: &[ReadRow]) -> AccountResolution {
+/// What the rows' accounts resolved to, and what the documents asked for.
+///
+/// `recorded` is what the readings of this session's documents could not place,
+/// as the instance kept it (decision 0024). It is read here rather than
+/// recomputed because the records it came from are not in the session: a record
+/// whose account name resolved to nothing was refused and never became a row,
+/// so no fold over `rows` can see it, however carefully it is written.
+///
+/// Every one of those names is asked again, against the directory this
+/// assessment was built with. The stored fact is a transcription — this document
+/// printed this string — and stays true; the verdict on it is not stored, and is
+/// this call.
+fn account_resolution(
+    resolver: &Resolver,
+    rows: &[ReadRow],
+    recorded: &[UnresolvedAccountView],
+) -> AccountResolution {
     let mut resolved: Vec<AccountId> = Vec::new();
     let mut missing: Vec<AccountId> = Vec::new();
     let mut conflicting: Vec<String> = Vec::new();
@@ -2985,10 +3050,20 @@ fn account_resolution(resolver: &Resolver, rows: &[ReadRow]) -> AccountResolutio
             conflicting.push(name.to_owned());
         }
     }
+    let known = resolver.directory.names();
+    let mut unrecognised: Vec<String> = Vec::new();
+    for name in recorded {
+        if known.resolve(&name.printed).is_err()
+            && !unrecognised.iter().any(|seen| seen == &name.printed)
+        {
+            unrecognised.push(name.printed.clone());
+        }
+    }
     AccountResolution {
         resolved,
         missing,
         conflicting,
+        unrecognised,
     }
 }
 
@@ -3167,6 +3242,16 @@ fn fingerprint(
             .map(|id| id.inner())
             .collect::<Vec<_>>(),
         accounts.conflicting
+    );
+    // The fourth section of the account resolution, on its own line rather than
+    // appended to the one above: the stamp must change when it changes — an
+    // account created between the reading and the commit removes a name from it
+    // — and a line per field is what keeps two sections from colliding into one
+    // rendering.
+    let _ = writeln!(
+        rendered,
+        "accounts unrecognised {:?}",
+        accounts.unrecognised
     );
     let _ = writeln!(
         rendered,
@@ -4632,6 +4717,85 @@ mod tests {
             valid_to,
         });
         view
+    }
+
+    // --- The names a document asked for and the directory does not hold ------
+    //
+    // `missing` is a list of identifiers, and a printed string that matched
+    // nothing has none — so the section that answers «which accounts did these
+    // rows name» could not answer it in the one case where the answer decides
+    // what the owner does next (iaam-x9ls, decision 0024 §2).
+
+    fn recorded(session: ImportSessionId, printed: &str, records: u32) -> UnresolvedAccountView {
+        UnresolvedAccountView {
+            session,
+            document_hash: "f".repeat(64),
+            printed: printed.to_owned(),
+            records,
+        }
+    }
+
+    /// The assessment names an account no row of it could carry.
+    ///
+    /// The records that printed these strings were refused when the document was
+    /// read, so this session holds no row for any of them and no fold over its
+    /// rows can see them. Read off what the reading recorded instead.
+    #[test]
+    fn the_assessment_names_the_accounts_the_documents_asked_for() {
+        let session = ImportSessionId::new_random();
+        let resolution = account_resolution(
+            &resolver(vec![detail(account(1), "Main")]),
+            &[],
+            &[
+                recorded(session, "Shop One", 3),
+                recorded(session, "Shop Two", 1),
+            ],
+        );
+
+        assert_eq!(
+            resolution.unrecognised,
+            vec!["Shop One".to_owned(), "Shop Two".to_owned()]
+        );
+        // And nowhere else: the three lists above it are about rows this session
+        // holds, and it holds none of these.
+        assert!(resolution.missing.is_empty());
+        assert!(resolution.resolved.is_empty());
+        assert!(resolution.conflicting.is_empty());
+    }
+
+    /// A name the directory now places is not listed.
+    ///
+    /// The stored fact is a transcription — this document printed this string —
+    /// and the verdict on it is recomputed here, against the directory this
+    /// assessment was built with. So an account created after the reading drops
+    /// out without the document being read again, and it drops out through the
+    /// identity tier rather than the title tier.
+    #[test]
+    fn an_account_created_since_the_reading_is_not_listed() {
+        let session = ImportSessionId::new_random();
+        let resolution = account_resolution(
+            &resolver(vec![with_identity(detail(account(1), "Main"), "Shop One")]),
+            &[],
+            &[
+                recorded(session, "Shop One", 3),
+                recorded(session, "Shop Two", 1),
+            ],
+        );
+        assert_eq!(resolution.unrecognised, vec!["Shop Two".to_owned()]);
+    }
+
+    /// One name, however many documents printed it.
+    #[test]
+    fn a_name_two_documents_printed_is_listed_once() {
+        let session = ImportSessionId::new_random();
+        let mut second = recorded(session, "Shop One", 2);
+        second.document_hash = "a".repeat(64);
+        let resolution = account_resolution(
+            &resolver(vec![detail(account(1), "Main")]),
+            &[],
+            &[recorded(session, "Shop One", 3), second],
+        );
+        assert_eq!(resolution.unrecognised, vec!["Shop One".to_owned()]);
     }
 
     fn resolver(accounts: Vec<AccountDetailView>) -> Resolver {

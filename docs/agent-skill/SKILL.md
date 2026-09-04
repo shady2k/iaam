@@ -116,6 +116,23 @@ poorer to him: ask him for the values, submit them as what the source stated —
 the shape is the next section — and conclude nothing on his behalf. Every row
 that no rule of his already matches becomes a question he has to answer.
 
+**An empty instance does not know his accounts, and it will tell you which it
+needs.** A statement names the account each record is on in the institution's own
+words, and a name this instance holds no account for refuses that record. So the
+first import into a fresh instance looks like a wall of refusals, and it is not:
+convey the document to a session that declares no account, and the response
+summarises those refusals as the distinct account names the document asked for,
+each with the number of records it accounts for. Create an account for each,
+giving it the printed string as the identifier its source prints for it — not as
+the title, which is his and which he may change — and convey the same document
+again. The row keys are over the document and the line, so nothing imports twice.
+The outstanding-work queue publishes the same names once a document has been
+read, so you need not provoke the refusals a second time.
+
+You do not have to guess a name and you must not. Creating an account whose title
+you invented does not make the records import; it makes a second account he did
+not ask for.
+
 **Never a credential but your own**, whatever the document is. No broker token,
 no encryption key. An import that would need you to fetch the statement out of
 the institution yourself is not one you can do.

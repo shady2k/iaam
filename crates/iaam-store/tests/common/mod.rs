@@ -27,6 +27,8 @@ pub fn apply_migrations_through(conn: &Connection, through: u32) {
         include_str!("../../migrations/0020_account_external_identity.sql"),
         include_str!("../../migrations/0021_account_negative_balance_expectation.sql"),
         include_str!("../../migrations/0022_import_control_figures.sql"),
+        include_str!("../../migrations/0023_event_import_session.sql"),
+        include_str!("../../migrations/0024_import_session_account.sql"),
     ];
     assert!(
         through <= migrations.len() as u32,

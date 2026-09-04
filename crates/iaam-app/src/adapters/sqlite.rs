@@ -10,15 +10,15 @@ use std::sync::{Arc, Mutex};
 use crate::error::AppError;
 use crate::ports::{
     AccountActivityView, AccountAliasView, AccountCreated, AccountDeclarations,
-    AccountDeclarationsRecorded, AccountDetailView, AccountIdentityView, AccountScopeExclusionView,
-    AccountTransferStatementView, AccountView, AliasUpsert, AliasView, BrokerAccessView,
-    BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault, CategoryGroupView,
-    CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView, ClassificationRuleStore,
-    ClassificationRuleView, ContourView, ControlAssertionView, CustodyView, Declared,
-    DocumentToKeep, ImportObservationView, ImportQuestionView, ImportSessionState,
-    ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
-    JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin,
-    TokenView,
+    AccountDeclarationsRecorded, AccountDetailView, AccountIdentityView, AccountRetirementsView,
+    AccountScopeExclusionView, AccountTransferStatementView, AccountView, AliasUpsert, AliasView,
+    BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
+    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
+    ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
+    CustodyView, Declared, DocumentToKeep, ImportObservationView, ImportQuestionView,
+    ImportSessionState, ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView,
+    IssuedToken, JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store,
+    TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -38,6 +38,7 @@ use iaam_core::instrument::{AliasInterval, AliasNamespace};
 use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::claim::AssertionPeriod;
+use iaam_core::retirement::{AccountRetirement, RetirementRevision};
 use iaam_core::rules::LotRuleVersion;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_store::SqliteStore;
@@ -709,6 +710,46 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .clear_account_scope_exclusion(owner, account)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_account_retirements(
+        &self,
+        owner: OwnerId,
+    ) -> Result<AccountRetirementsView, AppError> {
+        self.blocking(move |store| {
+            let held = store.list_account_retirements(owner).map_err(store_error)?;
+            Ok(AccountRetirementsView {
+                revision: held.revision,
+                statements: held.statements,
+            })
+        })
+        .await
+    }
+
+    async fn record_account_retirement(
+        &self,
+        owner: OwnerId,
+        retirement: AccountRetirement,
+    ) -> Result<RetirementRevision, AppError> {
+        self.blocking(move |store| {
+            store
+                .record_account_retirement(owner, &retirement)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn withdraw_account_retirement(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<RetirementRevision, AppError> {
+        self.blocking(move |store| {
+            store
+                .withdraw_account_retirement(owner, account)
                 .map_err(store_error)
         })
         .await

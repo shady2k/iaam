@@ -293,6 +293,87 @@ A contour has a **version**. A report always returns the version it computed
 against. Two figures computed against different contour versions must not be
 compared.
 
+## A closed product is retired, never dropped from the contour
+
+The owner closes a term deposit. The bank prints two interest accruals and then a
+row moving the whole balance to another of his accounts, and the product stops
+existing. He asks for it to stop showing up in what he holds.
+
+**The obvious move is the wrong one.** Making a new contour version without that
+account does remove it from the asset report — and it destroys two answers on the
+way. A report resolves one contour composition and applies it to every event; it
+never looks membership up by an event's date. So under the narrower composition
+the closing movement now has one end outside the perimeter, and the deposit's
+principal is reported as money arriving from outside; and the interest, which is
+a movement inside an account the composition no longer names, is not folded at
+all. Not misclassified — absent. A month the owner has already read changes
+underneath him, and the two figures he most cared about are the ones that change.
+
+**What to do instead** is record a retirement on the account: the date the
+product ceased. The account stays inside the contour, which is what keeps the
+interest an earning and the movement that emptied it internal, and the asset
+report stops carrying its row.
+
+Read the two as what they are. A contour says **whose money is in the figures**.
+A retirement says **whether the product is still there**. They are different
+questions about one account, and the second is never answered with the first.
+
+### What the retirement changes, and what it does not
+
+From the date the product ceased:
+
+- the asset snapshot stops publishing that account's row, and its membership of
+  its cash class — **but only where every one of its figures is zero**;
+- every report's `population` goes on naming the account, its `standing`
+  unchanged, with the date in `covered[].retirement`;
+- `population.retirement_revision` advances. That field is the second coordinate
+  of an answer, beside `contour_version`: two asset snapshots over one contour
+  version are answers to the same question when their retirement revisions match.
+
+It changes nothing else. No figure moves — only an all-zero row may be dropped,
+and such a row adds zero to every total. No classification changes, ever. A
+snapshot taken while the product was still open is untouched. The balances answer
+keeps the account's row, because that answer is what the journal holds per
+account and is what a statement is reconciled against.
+
+Nothing hides a retired account from the account list or from the outstanding-work
+queue. Its money is still in every report over a period the product existed in,
+so a question about it still changes a reported number. If the owner asks which of
+his products still exist, read any report's `population` and keep the entries with
+no `retirement`.
+
+### A retirement never hides money
+
+Where a retired account's figures are not all zero, the row stands, and the
+report's `confidence` carries `retired_account_not_empty` naming the account.
+Report that as what it is: he says the product ceased, and the journal still shows
+something on it.
+
+The usual cause is that the deposit's principal predates the months that were
+imported. The account's cash figure is then movement from an unknown start rather
+than a balance, the recorded movements do not sum to zero, and the row is right to
+stand — the missing principal is a real hole in his cash total. What closes it is
+recording the reconstructed opening (see «What to assert for a reconstructed
+opening»); the retirement then removes the row on its own.
+
+**Never propose ruling the account outside every contour to tidy this up.** That
+is the scope decision, it says his money does not belong in the report at all, and
+it takes the interest and the closing movement with it.
+
+### What is refused
+
+- a second retirement over one that already stands. Withdraw the first, then
+  record the new one, so the change is a revision a reader can see rather than a
+  date moved silently under snapshots already taken;
+- withdrawing when nothing stands. Every accepted call advances the revision, and
+  a revision that changed nothing would be a coordinate that means nothing;
+- a date later than today;
+- an account the owner does not hold.
+
+Retiring an account that still holds money is **not** refused. It is his
+statement about his product, and the report says where it disagrees rather than
+refusing his word.
+
 ## What a category is, and what it cannot change
 
 A contour says which accounts are the owner's. A **category** says what his
@@ -680,6 +761,12 @@ title and institution so the owner can be asked about it by name:
   weaker than the line above and must not be reported as the same thing.
 - `outside_undecided` — no scope claims it and he has ruled nothing. Nobody has
   decided whether its money belongs in these figures.
+
+Each entry also carries `retirement` where the owner has said the product ceased.
+It is a **second axis and not a fifth standing**: a closed term deposit is
+normally `covered` *and* retired, because it stays inside the contour so that the
+interest it paid keeps counting as an earning. Never report a retirement as an
+exclusion, and never report a retired account as one the figures left out.
 
 A deliberate exclusion never makes the population `whole`. `whole` says the
 figures cover every account the system knows of; money he ruled out is still

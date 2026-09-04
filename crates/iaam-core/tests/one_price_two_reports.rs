@@ -218,11 +218,13 @@ fn balances_from(state: &LedgerState, fixture: &Fixture) -> BalancesReport {
         population: ReportPopulation {
             contour: fixture.contour.id(),
             version: fixture.contour.version(),
+            retirement_revision: iaam_core::retirement::RetirementRevision::NONE,
             accounts: vec![PopulationAccount {
                 account: fixture.account,
                 title: "Brokerage".to_owned(),
                 institution: None,
                 standing: AccountStanding::Covered,
+                retirement: None,
             }],
         },
     }

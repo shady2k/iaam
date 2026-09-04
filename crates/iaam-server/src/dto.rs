@@ -2635,6 +2635,18 @@ pub struct PopulationDto {
     /// Always present: an empty array says the report covered everything known,
     /// while an absent key is indistinguishable from a report that never asked.
     pub outside: Vec<PopulationAccountDto>,
+    /// Which state of the owner's retirement declarations these figures were
+    /// computed under.
+    ///
+    /// The second coordinate of the answer, beside `contour_version`, and it is
+    /// here for the same reason: a retirement suppresses a row in the asset
+    /// snapshot, so two runs of one report over one contour version can differ,
+    /// and the pair says whether two answers are comparable. `0` is «he has
+    /// retired nothing», which is a real coordinate and where every owner
+    /// starts. It advances on every accepted declaration and withdrawal, over
+    /// all of his accounts at once — one number for the whole axis, exactly as
+    /// one contour version names a whole membership.
+    pub retirement_revision: u32,
 }
 
 /// One account in a report's population.
@@ -2657,6 +2669,29 @@ pub struct PopulationAccountDto {
     /// **nobody has ruled on whether it belongs**, which is a different
     /// statement from a deliberate omission and must not be read as one.
     pub standing: String,
+    /// The date the owner said this product ceased to exist, when he has said.
+    ///
+    /// **A second axis, not a fifth standing.** A closed term deposit is
+    /// normally `covered` *and* retired: it stays inside the contour so that
+    /// the interest it paid keeps counting as an earning and the movement that
+    /// returned its balance stays internal. Read the two fields separately, and
+    /// never report a retirement as an exclusion.
+    ///
+    /// This is also the explanation for a row that is not in `accounts[]`: from
+    /// this date on, the asset snapshot drops a retired account's row where all
+    /// of its figures are zero. Where a figure is not zero the row stands, and
+    /// `confidence` carries `retired_account_not_empty` for it — a retirement
+    /// never hides money.
+    ///
+    /// Absent is «he has not said». It is never inferred from a balance that
+    /// reached zero or from an account that stopped moving.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub retirement: Option<Date>,
 }
 
 impl PopulationDto {
@@ -2674,6 +2709,7 @@ impl PopulationDto {
                 .outside()
                 .map(PopulationAccountDto::from_domain)
                 .collect(),
+            retirement_revision: population.retirement_revision.0,
         }
     }
 }
@@ -2685,6 +2721,7 @@ impl PopulationAccountDto {
             title: entry.title.clone(),
             institution: entry.institution.clone(),
             standing: entry.standing.code().to_owned(),
+            retirement: entry.retirement,
         }
     }
 }
@@ -4193,6 +4230,86 @@ pub struct RecordAccountScopeRequest {
     /// without a reason is indistinguishable, a year later, from an oversight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Whether one of the owner's products still exists.
+///
+/// **A second axis beside [`AccountScopeDispositionDto`], and not a fourth
+/// value of it.** A scope disposition says whether an account's money belongs
+/// in a report; this says whether the product is still there. A term deposit
+/// that closed is `retired` and normally stays **inside** a contour, because
+/// that is what keeps the interest it paid counting as an earning and the
+/// movement that returned its balance internal — so a client that reached for
+/// the scope route to record a closure would destroy the answer it was trying
+/// to tidy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountRetirementStateDto {
+    /// The owner has not said the product ceased. Every account starts here.
+    InUse,
+    /// He has said it ceased, on `effective_on`.
+    Retired,
+}
+
+/// What the owner has said about whether one product still exists.
+///
+/// `title` and `institution` travel with `account` under the naming rule in
+/// `docs/api/conventions.md` §3.
+///
+/// `revision` is the coordinate the whole of this axis stands at for this
+/// owner, and it is the same number a report publishes as
+/// `population.retirement_revision`. It is here so that a client can say which
+/// state of the declarations a report it holds was computed under: a retirement
+/// changes what an asset snapshot prints, and without a coordinate two runs of
+/// one report over one contour version could differ with nothing to say why.
+/// It advances on **every** accepted call, including a withdrawal, and never on
+/// a call that changed nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AccountRetirementDto {
+    pub account: Uuid,
+    /// What the owner calls this account.
+    pub title: String,
+    /// The institution he said holds it, when he said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
+    pub state: AccountRetirementStateDto,
+    /// The date the product ceased. Present exactly when `state` is `retired`.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub effective_on: Option<Date>,
+    pub revision: u32,
+}
+
+/// Recording, or withdrawing, that statement for one account.
+///
+/// The state is named rather than inferred from whether `effective_on` is
+/// present, so «he ceased it» and «take that back» are two words a client
+/// writes on purpose. A body carrying neither would otherwise mean a withdrawal
+/// by omission, and an omission is the one thing a client makes by accident.
+///
+/// A date after today is refused: a product that has not ceased yet has not
+/// ceased, and accepting the statement would arm a change to the asset snapshot
+/// that begins on a day nobody revisits.
+///
+/// A second `retired` over a standing one is refused too, and the remedy is two
+/// calls — withdraw, then record. Replacing the date in place would silently
+/// move the boundary under every snapshot already taken between the two dates,
+/// which is the retroactivity the revision exists to make visible.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordAccountRetirementRequest {
+    pub state: AccountRetirementStateDto,
+    /// Required for `retired` and refused for `in_use`.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub effective_on: Option<Date>,
 }
 
 /// The owner's statement about which of his accounts money moves between.

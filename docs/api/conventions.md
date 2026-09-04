@@ -297,6 +297,7 @@ Every published type that prints an identifier of a thing the owner named.
 | `AccountCandidateDto` | `id` | `title`, `institution` |
 | `ActionSubjectDto::Account` | `id` | `title`, `institution` |
 | `AccountScopeDto` | `account` | `title`, `institution` |
+| `AccountRetirementDto` | `account` | `title`, `institution` |
 | `PopulationAccountDto` | `account` | `title` |
 | `ImportQuestionDto` | in `prompt`, and `accounts[].id` | the titles, in the sentence; `title` and `institution` on each candidate |
 | `ContourDto` | `contour` | `title` |
@@ -398,7 +399,7 @@ Ask what the act does to decisions the owner has made or will have to live with.
   abandoning a session.
 - **It states a standing decision that will apply to things nobody has looked
   at.** Owner. A classification rule, a category rule, a contour version, an
-  account and its declarations, a token.
+  account and its declarations, a retirement, a token.
 - **It rules on what is already in the journal — which of the owner's facts
   should stop counting, or what should have stood instead.** Owner.
 - **It returns the journal to the state before the caller acted, reversing no
@@ -425,6 +426,7 @@ Read-only is the absence of all four.
 | Confirm a transfer pairing (writes two corrections) | yes | no | no |
 | Record a control balance | yes | no | no |
 | Write classification, category and account rules | yes | no | no |
+| Record or withdraw a product's retirement | yes | **no** | no |
 | Create accounts, contours, categories, instruments | yes | no | no |
 | Issue and revoke tokens and broker access | yes | no | no |
 
@@ -638,3 +640,101 @@ accepted — the asymmetry is in what the two sides *say*, and a client that
 follows the specification writes a shape it will never read back. Straightening
 it means choosing one spelling of a category matcher and retiring the other six,
 which is its own decision about breaking a client and is not made here.
+
+---
+
+## 6. Two axes: what a report folds, and what still exists
+
+> **A contour says whose money is in the figures. A retirement says whether the
+> product is still there. They are two questions about one account, and a client
+> that answers the second with the first destroys the first's answer.**
+
+### 6.1 The fork, before you walk into it
+
+The case is a term deposit that was closed, its balance returned to another
+account of the owner's, and the product then gone. Three things are wanted at
+once:
+
+1. the interest counted as what the capital earned, not as money arriving from
+   outside;
+2. the returned principal counted as a movement between his own accounts;
+3. the closed product no longer listed among what he holds.
+
+**Keeping the account in the contour** gives the first two — the closing movement
+has both accounts inside the perimeter, so it is internal, and the interest is
+folded as an earning — and leaves a row for the account in every asset snapshot
+for ever, with every figure zero.
+
+**Dropping the account from a new contour version** removes the row and destroys
+both of the others. A report resolves **one** contour definition and hands it to
+every event; nothing looks membership up by an event's date. So the closing
+transfer becomes money arriving from outside the perimeter and its principal
+lands in `came_in`, and the interest, which is a movement within a non-member
+account, is not folded at all — not misclassified, absent.
+
+That second behaviour is not a bug. Asking for a contour version means "restate
+that history through this perimeter", and every report states the version it
+answered under. It is simply the wrong tool for "this product no longer exists".
+
+### 6.2 What a retirement changes
+
+A retirement is recorded per account with the date the product ceased, on the
+account's own retirement resource. From that date on:
+
+- the asset snapshot **stops publishing the account's row**, and with it the
+  account's membership of its cash class — but **only where every one of the
+  account's figures is zero**. Such a row adds zero to every total, so the
+  suppression removes a line and never moves a number;
+- every report's `population` goes on naming the account, with `standing`
+  unchanged and the date in `covered[].retirement`;
+- `population.retirement_revision` advances. It is the second coordinate of an
+  answer, beside `contour_version`: two asset snapshots over one contour version
+  are comparable when their retirement revisions match.
+
+### 6.3 What it deliberately does not change
+
+- **Classification.** A retired account stays a contour member. The closing
+  transfer stays internal and the interest stays an earning, whenever the report
+  is run. Nothing on this axis is ever read while an event is classified.
+- **Any figure.** Only an all-zero row may be suppressed. If a client sees a
+  total change after a retirement, that is a defect, not the feature.
+- **A period before the effective date.** A snapshot taken while the product was
+  open is unchanged.
+- **The balances answer.** It states what the journal holds per account, and a
+  reader reconciling it against a statement needs the account there. Only the
+  asset snapshot drops the row.
+- **The account list and the outstanding-work queue.** Neither hides a retired
+  account. Its money is still in every report over a period the product existed
+  in, so a question about it still changes a reported number. A client that wants
+  only currently-existing products reads any report's `population` and filters on
+  `retirement` — there is no separate inventory route, on purpose, because the
+  population must go on naming every account the fold covered.
+
+### 6.4 A retirement never hides money
+
+Where a retired account's figures are not all zero, the row stands, its class
+membership stands, and `confidence` carries `retired_account_not_empty` naming
+the account. The caveat's `closed_by` names the two sides of the disagreement:
+withdraw the statement, or rule on the journal.
+
+The common cause is a deposit whose principal predates the imported interval.
+Its cash figure is then movement from an unknown start rather than a balance, the
+movements do not sum to zero, and the row is right to stand — the missing
+principal is a real hole in the owner's cash total. Recording the reconstructed
+opening is what closes it, and the retirement then removes the row.
+
+### 6.5 What refuses
+
+- a second retirement over one that stands — withdraw first, so that the change
+  is a revision a reader can see, rather than a date silently moved under
+  snapshots already taken;
+- a withdrawal when nothing stands — every accepted call mints a revision, and a
+  revision that changed nothing is a coordinate that means nothing;
+- an effective date after today;
+- an account the owner does not hold — not found, because an identifier is not an
+  access right.
+
+Retiring an account that still holds money is **not** refused. It is his
+statement about his product, and refusing it because a fold disagrees would make
+his word conditional on how much of his history has been imported. §6.4 is what
+makes that safe.

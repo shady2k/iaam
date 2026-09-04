@@ -50,6 +50,9 @@ is how you match a term in them to the code.
 | владелец | owner | |
 | контур | contour | |
 | периметр | perimeter | |
+| прекращение счёта | account retirement | `AccountRetirement`; the owner's statement that one product ceased to exist on a date. **A second axis, not a contour decision**: a retired account normally stays a contour member, so that the interest it paid keeps counting as an earning and the movement that emptied it stays internal (decision 0014). Never «closure» and never «archival» |
+| дата прекращения | retirement effective date | `effective_on`; the date in the owner's own history, not the moment he told the system |
+| ревизия прекращений | retirement revision | `RetirementRevision`; one monotone coordinate per owner over all of his retirement declarations, stated by every report so that two answers can be compared |
 | платёжный инструмент | payment instrument | a card or other means of paying against an account; **not** an account of its own — two of them over one account are one account with two aliases (decision 0004) |
 | график выплат | schedule | `BondSchedule` |
 | оферта | offer | the right itself is `offer right` |

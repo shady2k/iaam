@@ -14,6 +14,7 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::SourceChannel;
+use iaam_core::retirement::{AccountRetirement, RetirementRevision};
 use iaam_core::rules::LotRuleVersion;
 use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
@@ -302,6 +303,43 @@ pub struct ContourView {
 pub struct AccountScopeExclusionView {
     pub account: AccountId,
     pub reason: String,
+}
+
+/// The owner's retirements in force, and the revision they stand at.
+///
+/// The two are one view because they are read in one call: a caller that
+/// fetched the statements and then the coordinate would publish a number that
+/// does not name the state it published, and the number exists precisely so
+/// that two reports are comparable.
+///
+/// **Two axes, not one.** [`AccountScopeExclusionView`] one type up says an
+/// account's money does not belong in any report; this says the product no
+/// longer exists. A closed term deposit is retired and stays *inside* the
+/// contour, because that is what keeps the interest it paid an earning and the
+/// movement that returned its balance internal — so reaching for the scope
+/// exclusion instead is the mistake this type exists to make impossible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRetirementsView {
+    pub revision: RetirementRevision,
+    /// Only the retirements in force. An account whose latest statement
+    /// withdraws its retirement is absent, exactly as one never retired is;
+    /// what tells the two apart is the revision and the history behind it.
+    pub statements: Vec<AccountRetirement>,
+}
+
+impl AccountRetirementsView {
+    /// The date the owner said one product ceased, if he has said.
+    ///
+    /// A lookup rather than a map field: the set is one entry per closed
+    /// product and is read once per report, and a map would make the caller
+    /// choose a key ordering that the report does not need.
+    #[must_use]
+    pub fn effective_on(&self, account: AccountId) -> Option<Date> {
+        self.statements
+            .iter()
+            .find(|statement| statement.account == account)
+            .map(|statement| statement.effective_on)
+    }
 }
 
 /// The owner's statement about which of his accounts money moves between.
@@ -625,6 +663,44 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         account: AccountId,
     ) -> Result<(), AppError>;
+
+    /// The products the owner has said ceased to exist, and the revision his
+    /// declarations stand at (`iaam-gua5`).
+    ///
+    /// Read by the reports beside [`Self::list_account_scope_exclusions`] and
+    /// never instead of it: the two answer different questions about the same
+    /// account, and a retired account is normally still a contour member.
+    async fn list_account_retirements(
+        &self,
+        owner: OwnerId,
+    ) -> Result<AccountRetirementsView, AppError>;
+
+    /// Record that one product ceased to exist on a date.
+    ///
+    /// Returns the revision the declaration minted. The caller publishes it;
+    /// deriving it from a second read would be a second answer to what this
+    /// call did.
+    ///
+    /// **Whether it may be recorded at all is not decided here.** A second
+    /// statement over a standing one is refused by
+    /// [`iaam_core::retirement::accept_retirement`], because the rule is about
+    /// what the owner has already said and about the clock, and both belong
+    /// where they can be tested without a database.
+    async fn record_account_retirement(
+        &self,
+        owner: OwnerId,
+        retirement: AccountRetirement,
+    ) -> Result<RetirementRevision, AppError>;
+
+    /// Withdraw that statement, returning the account to «he has not said».
+    ///
+    /// A further revision and not an erasure: a report published at an earlier
+    /// revision still names the state that was in force when it was computed.
+    async fn withdraw_account_retirement(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<RetirementRevision, AppError>;
 
     /// Every account the owner has stated the transfer partners of.
     async fn list_account_transfer_statements(

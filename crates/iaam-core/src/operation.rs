@@ -47,6 +47,23 @@ pub enum OperationKey {
     /// is a contour's composition, and «this account is deliberately not in any
     /// of them» is a fact about the account itself.
     RecordAccountScope,
+    /// Record, or withdraw, the owner's statement that a product ceased to
+    /// exist on a date (`iaam-gua5`).
+    ///
+    /// A **second axis** beside [`Self::RecordAccountScope`], and the two must
+    /// not be read as spellings of one act. A scope decision says whether an
+    /// account's money belongs in a report; a retirement says whether the
+    /// product still exists. The closed term deposit that motivated it stays
+    /// inside the contour precisely so that the interest it paid keeps counting
+    /// as an earning and the movement that returned its balance stays internal
+    /// — so the call that would have been reached for, ruling it outside the
+    /// perimeter, is the one that destroys the answer.
+    ///
+    /// Named here because a caveat offers it: an account the owner retired that
+    /// still shows a figure in the asset snapshot is a disagreement between his
+    /// statement and the journal, and withdrawing the statement is one of the
+    /// two ways the disagreement ends.
+    RecordAccountRetirement,
     /// Open the import session a document's rows are held in before commit.
     ///
     /// The first of the two ways into an account that holds nothing, and the one
@@ -92,10 +109,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a fifteenth variant to
+    /// The declared length is the only thing holding a sixteenth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -104,6 +121,7 @@ impl OperationKey {
         Self::CreateClassificationRule,
         Self::RecordAccountTransferPartners,
         Self::RecordAccountScope,
+        Self::RecordAccountRetirement,
         Self::OpenImportSession,
         Self::SyncBroker,
         Self::AnswerImportQuestion,
@@ -124,6 +142,7 @@ impl OperationKey {
             Self::CreateClassificationRule => "create_classification_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
             Self::RecordAccountScope => "record_account_scope",
+            Self::RecordAccountRetirement => "record_account_retirement",
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",
             Self::AnswerImportQuestion => "answer_import_question",

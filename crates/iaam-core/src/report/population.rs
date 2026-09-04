@@ -6,8 +6,11 @@
 //! [`crate::report::confidence`] is derived from them, and a summary computed
 //! outside the core can disagree with the report it summarises.
 
+use time::Date;
+
 use crate::contour::{ContourId, ContourVersion};
 use crate::ids::AccountId;
+use crate::retirement::RetirementRevision;
 
 use super::confidence::{Caveat, CaveatKind, CaveatSubject};
 
@@ -95,12 +98,48 @@ impl AccountStanding {
 /// where it is held" and is never filled in — an invented institution would
 /// tell two accounts apart by a fiction, which is worse than not telling them
 /// apart at all.
+///
+/// The retirement is a **second axis and not a fifth standing**, and keeping
+/// them apart is the whole of `iaam-gua5`. A standing says whether this report
+/// folded the account; a retirement says whether the product still exists.
+/// Every combination of the two occurs — a closed deposit stays inside the
+/// contour so that its interest keeps counting as an earning and its closing
+/// movement stays internal, and an account outside every contour may be alive
+/// and busy — so a fifth standing would have had to answer both questions with
+/// one word and would have got one of them wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PopulationAccount {
     pub account: AccountId,
     pub title: String,
     pub institution: Option<String>,
     pub standing: AccountStanding,
+    /// The date the owner said this product ceased to exist, if he has said.
+    ///
+    /// **Stated here rather than expressed by an absence**, and that is the
+    /// bound the design is held to: an account the calculation still folds is
+    /// one the population must still name. Dropping a retired account from the
+    /// manifest would make the report's own name table incomplete — the table
+    /// `docs/api/conventions.md` §3.5 sends a client to for every account named
+    /// anywhere in the same response — and would do it for exactly the accounts
+    /// whose rows the snapshot suppresses, so the one reader who needed the
+    /// entry would be the one who did not get it.
+    ///
+    /// `None` is «he has not said», never «it is still open»: nothing infers a
+    /// retirement from a balance that reached zero or from an account that
+    /// stopped moving.
+    pub retirement: Option<Date>,
+}
+
+impl PopulationAccount {
+    /// Whether the product had ceased by the date a report is taken at.
+    ///
+    /// The one predicate the asset fold consults, so the fold and the manifest
+    /// cannot read one date two ways.
+    #[must_use]
+    pub fn retired_by(&self, as_of: Date) -> bool {
+        self.retirement
+            .is_some_and(|effective_on| effective_on <= as_of)
+    }
 }
 
 /// How much of what the system knows about one report answered about.
@@ -173,6 +212,17 @@ impl KnownAccountCoverage {
 pub struct ReportPopulation {
     pub contour: ContourId,
     pub version: ContourVersion,
+    /// The state of the owner's retirement declarations these entries were read
+    /// at.
+    ///
+    /// Beside the contour version because it is the same kind of fact about the
+    /// same answer: a coordinate that has to be stated for the figures to be
+    /// reproducible. A retirement suppresses a row in the asset snapshot, so
+    /// two runs of one report over one contour version can differ; the pair
+    /// «contour version, retirement revision» is what makes them comparable
+    /// again. See [`RetirementRevision`] for why the coordinate is one number
+    /// per owner rather than one per account.
+    pub retirement_revision: RetirementRevision,
     pub accounts: Vec<PopulationAccount>,
 }
 
@@ -270,12 +320,14 @@ impl ReportPopulation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::macros::date;
     use uuid::Uuid;
 
     fn population(standings: &[AccountStanding]) -> ReportPopulation {
         ReportPopulation {
             contour: ContourId(Uuid::from_u128(1)),
             version: ContourVersion(1),
+            retirement_revision: RetirementRevision::NONE,
             accounts: standings
                 .iter()
                 .enumerate()
@@ -284,6 +336,7 @@ mod tests {
                     title: format!("Account {index}"),
                     institution: None,
                     standing: *standing,
+                    retirement: None,
                 })
                 .collect(),
         }
@@ -331,6 +384,63 @@ mod tests {
         assert_eq!(KnownAccountCoverage::Whole.code(), "whole");
         assert_eq!(KnownAccountCoverage::Bounded.code(), "bounded");
         assert_eq!(KnownAccountCoverage::Undecided.code(), "undecided");
+    }
+
+    /// A retirement is not an omission, so it adds no caveat and does not make
+    /// a whole population partial.
+    ///
+    /// The temptation is to treat a closed product as one more reason the
+    /// figures are incomplete. It is the opposite: the account is covered, its
+    /// money is in the figures, and the retirement says only that no more will
+    /// arrive. A caveat here would tell the owner his report was short of
+    /// something for every product he has ever closed.
+    #[test]
+    fn retiring_a_covered_account_does_not_make_the_report_partial() {
+        let mut population = population(&[AccountStanding::Covered]);
+        population.accounts[0].retirement = Some(date!(2026 - 03 - 10));
+        assert_eq!(
+            population.known_account_coverage(),
+            KnownAccountCoverage::Whole
+        );
+        assert_eq!(population.caveats(), Vec::new());
+        assert_eq!(population.covered().count(), 1);
+    }
+
+    /// The two axes are read separately, and each of the four standings can
+    /// carry a retirement.
+    ///
+    /// The case the design turns on is the first row: a term deposit that was
+    /// closed stays **inside** the contour, so that the interest it paid keeps
+    /// counting as an earning and the movement that returned its balance stays
+    /// internal. A model that made «retired» a standing would have had to place
+    /// that account outside the report to say it had closed.
+    #[test]
+    fn a_retirement_does_not_change_where_an_account_stands() {
+        for standing in [
+            AccountStanding::Covered,
+            AccountStanding::OutsideByDecision,
+            AccountStanding::OutsidePlacedElsewhere,
+            AccountStanding::OutsideUndecided,
+        ] {
+            let mut population = population(&[standing]);
+            let before = population.caveats();
+            population.accounts[0].retirement = Some(date!(2026 - 03 - 10));
+            assert_eq!(population.accounts[0].standing, standing);
+            assert_eq!(population.caveats(), before, "{standing:?}");
+        }
+    }
+
+    /// The boundary the asset fold consults, asked of the manifest so that the
+    /// two cannot read one date two ways.
+    #[test]
+    fn an_account_is_retired_only_on_and_after_the_date_the_owner_named() {
+        let mut population = population(&[AccountStanding::Covered]);
+        let entry = &mut population.accounts[0];
+        assert!(!entry.retired_by(date!(2026 - 03 - 10)));
+        entry.retirement = Some(date!(2026 - 03 - 10));
+        assert!(!entry.retired_by(date!(2026 - 03 - 09)));
+        assert!(entry.retired_by(date!(2026 - 03 - 10)));
+        assert!(entry.retired_by(date!(2026 - 12 - 31)));
     }
 
     #[test]

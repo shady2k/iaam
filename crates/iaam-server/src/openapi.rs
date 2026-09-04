@@ -59,6 +59,8 @@ use crate::dto::{
 // these belong to changes made in parallel, and merging them into the wrapped
 // list would reflow lines nobody touched.
 use crate::dto::{IntervalFitDto, OwnerBalanceOutcomeDto, QuestionGeneralisationDto};
+// Wave O's types, in a block of their own for the reason the block above gives.
+use crate::dto::{AccountRetirementDto, AccountRetirementStateDto, RecordAccountRetirementRequest};
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -107,6 +109,9 @@ impl Modify for BearerSecurity {
         AccountScopeDto,
         AccountScopeDispositionDto,
         RecordAccountScopeRequest,
+        AccountRetirementDto,
+        AccountRetirementStateDto,
+        RecordAccountRetirementRequest,
         ActionTargetDto,
         ResolutionOptionDto,
         InputAlternativeDto,

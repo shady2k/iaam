@@ -109,17 +109,27 @@ use crate::dto::{
 // states: this file is edited by several changes at once, and merging one name
 // into a wrapped list reflows lines nothing else touched.
 use crate::dto::OwnerBalanceOutcomeDto;
+// Types added by wave O, in a block of their own for the same reason.
+use crate::dto::{AccountRetirementDto, AccountRetirementStateDto, RecordAccountRetirementRequest};
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use crate::vocabulary::ProvidedByDto;
 use iaam_app::scenarios::documents::UploadedDocument;
 use iaam_app::scenarios::import_session::{AccountDirectory, AnswerableQuestion, SessionRevision};
+use iaam_app::scenarios::retirement::{
+    AccountRetirementOutcome, account_retirement,
+    record_account_retirement as record_account_retirement_statement, withdraw_account_retirement,
+};
 use iaam_core::batch::ControlSection;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
+/// The second axis. Named apart from the scope operation because the two decide
+/// different things about one account, and the report that motivated both needs
+/// a closed product to stay *inside* the perimeter.
+pub const RECORD_ACCOUNT_RETIREMENT_OPERATION_ID: &str = "record_account_retirement";
 pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
 pub const REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID: &str = "replace_account_declarations";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
@@ -2104,6 +2114,120 @@ pub async fn record_account_scope(
     }
 
     Ok(Json(account_scope_dto(&state, &principal, &named).await?))
+}
+
+/// Whether one of the owner's products still exists.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{id}/retirement",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "What the owner has said about this product", body = AccountRetirementDto),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_account_retirement(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountRetirementDto>, ApiFailure> {
+    let named = owned_account(&state, &principal, AccountId(id)).await?;
+    let outcome = account_retirement(&state.services, &principal, named.id).await?;
+    Ok(Json(account_retirement_dto(&named, &outcome)))
+}
+
+/// Record, or withdraw, the owner's statement that a product ceased to exist.
+///
+/// **The second axis, and the reason it is not the scope route.** A closed term
+/// deposit must stay inside the contour: that is what keeps the interest it
+/// paid counting as an earning and the movement that returned its balance
+/// internal. Ruling it outside the perimeter instead — the call a client
+/// reaches for first — removes the zero-balance row from the asset report by
+/// destroying both of those answers. This route removes the row and changes no
+/// figure: nothing here is ever read by contour classification.
+///
+/// The owner's, not the agent's. It states a standing decision that changes
+/// what every later asset snapshot prints, which is the line
+/// `docs/api/conventions.md` §4.2 draws.
+#[utoipa::path(
+    post,
+    path = "/v1/accounts/{id}/retirement",
+    operation_id = RECORD_ACCOUNT_RETIREMENT_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = RecordAccountRetirementRequest,
+    responses(
+        (status = 200, description = "Statement recorded or withdrawn", body = AccountRetirementDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 409, description = "A statement already stands, or none does to withdraw", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_retirement(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<RecordAccountRetirementRequest>,
+) -> Result<Json<AccountRetirementDto>, ApiFailure> {
+    require_admin(&principal)?;
+    let named = owned_account(&state, &principal, AccountId(id)).await?;
+
+    let outcome = match request.state {
+        AccountRetirementStateDto::Retired => {
+            let effective_on = request.effective_on.ok_or_else(|| {
+                unprocessable(
+                    "effective_on",
+                    "the date the product ceased",
+                    "nothing",
+                    "a retirement without a date says nothing an asset snapshot can act on: \
+                     the report it changes is taken as of a date, and the declaration has to \
+                     answer at the same granularity",
+                )
+            })?;
+            record_account_retirement_statement(&state.services, &principal, named.id, effective_on)
+                .await?
+        }
+        AccountRetirementStateDto::InUse => {
+            if request.effective_on.is_some() {
+                return Err(unprocessable(
+                    "effective_on",
+                    "no date",
+                    "a date",
+                    "withdrawing the statement leaves nothing for a date to be the date of",
+                ));
+            }
+            withdraw_account_retirement(&state.services, &principal, named.id).await?
+        }
+    };
+    Ok(Json(account_retirement_dto(&named, &outcome)))
+}
+
+/// The answer both routes above return.
+///
+/// Built here from the account the transport already resolved and the outcome
+/// the scenario produced, so the title beside the identifier comes from the same
+/// read that authorised the call rather than from a second one.
+fn account_retirement_dto(
+    account: &AccountView,
+    outcome: &AccountRetirementOutcome,
+) -> AccountRetirementDto {
+    AccountRetirementDto {
+        account: outcome.account.inner(),
+        title: account.title.clone(),
+        institution: account.institution.clone(),
+        state: match outcome.effective_on {
+            Some(_) => AccountRetirementStateDto::Retired,
+            None => AccountRetirementStateDto::InUse,
+        },
+        effective_on: outcome.effective_on,
+        revision: outcome.revision.0,
+    }
 }
 
 /// An account's stated transfer partners.

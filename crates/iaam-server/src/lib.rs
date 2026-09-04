@@ -78,6 +78,10 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             routes::get_account_scope,
             routes::record_account_scope
         ))
+        .routes(routes!(
+            routes::get_account_retirement,
+            routes::record_account_retirement
+        ))
         .routes(routes!(routes::replace_account_aliases))
         .routes(routes!(routes::replace_account_declarations))
         .routes(routes!(

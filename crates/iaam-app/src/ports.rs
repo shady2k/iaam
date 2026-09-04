@@ -104,7 +104,7 @@ impl Scope {
 /// disagrees with itself, which is the defect `iaam-3nqt` recorded for
 /// `closed_by`: the queue told an agent it could not make a call the server
 /// would have accepted. So this is the only statement. `iaam_server::routes`
-/// gates each of these sixteen routes by asking this function, and
+/// gates every one of these routes by asking this function, and
 /// `iaam_app::actions` publishes what it answers; there is nothing left for the
 /// two to disagree about.
 ///
@@ -131,8 +131,8 @@ impl Scope {
 /// caller the route will not refuse *for its scope*; it may still refuse for
 /// what the request says or for what the journal holds.
 ///
-/// Exhaustive on purpose, like [`crate::actions::ActionKind::goals`]: a
-/// seventeenth [`OperationKey`] cannot compile until someone has said what
+/// Exhaustive on purpose, like [`crate::actions::ActionKind::goals`]: an
+/// eighteenth [`OperationKey`] cannot compile until someone has said what
 /// authority its call demands.
 #[must_use]
 pub const fn required_scope(operation: OperationKey) -> Scope {
@@ -161,9 +161,18 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         // else changes» — §4.2, first bullet. Recording a row, opening and
         // feeding a session, settling one row, ending a session either way,
         // and synchronising a channel are all mechanics.
+        //
+        // Reading an institution's export into a session is the same bullet and
+        // not a wider one, which is decision 0022's line: the caller conveys a
+        // document and interprets none of it. The profile that reads it is the
+        // deployment's, not the request's — no route installs one — and what
+        // each row turns out to be is settled afterwards, by the owner's
+        // directory, by a standing rule of his, or by his answer. Nothing
+        // reaches the journal until a commit, which has this same floor.
         OperationKey::SubmitOperations
         | OperationKey::OpenImportSession
         | OperationKey::SyncBroker
+        | OperationKey::ReadImportDocument
         | OperationKey::AnswerImportQuestion
         | OperationKey::CommitImportSession
         | OperationKey::AbandonImportSession => Scope::Agent,
@@ -1848,6 +1857,7 @@ mod tests {
             OperationKey::SubmitOperations,
             OperationKey::OpenImportSession,
             OperationKey::SyncBroker,
+            OperationKey::ReadImportDocument,
             OperationKey::AnswerImportQuestion,
             OperationKey::CommitImportSession,
             OperationKey::AbandonImportSession,
@@ -1860,6 +1870,30 @@ mod tests {
             );
         }
     }
+
+    /// The two lists above are the whole vocabulary, not the part somebody
+    /// remembered.
+    ///
+    /// They are written out by hand on purpose — moving a call across the line
+    /// should be a deliberate edit — and a hand-written list drifts from the
+    /// enum exactly where the next mistake is. So the count is pinned: an
+    /// eighteenth key added to `ALL` and to neither list would otherwise pass
+    /// the table test by not appearing in it.
+    #[test]
+    fn the_table_above_covers_every_operation() {
+        let owner = OperationKey::ALL
+            .iter()
+            .filter(|operation| required_scope(**operation) == Scope::Owner)
+            .count();
+        let agent = OperationKey::ALL
+            .iter()
+            .filter(|operation| required_scope(**operation) == Scope::Agent)
+            .count();
+        assert_eq!(owner, 10, "the owner-only half of §4.3");
+        assert_eq!(agent, 7, "the half an agent reaches, §4.3");
+        assert_eq!(owner + agent, OperationKey::ALL.len());
+    }
+
     /// The port must be object-safe: the composition root holds
     /// adapters behind `Arc<dyn ...>`, and adapter selection must not be
     /// reflected in types at compile time (§3.2).

@@ -446,8 +446,8 @@ Read-only is the absence of all four.
 
 | Act | Owner | Agent | Read-only |
 |---|---|---|---|
-| Read any report, the journal, the action queue | yes | yes | yes |
-| Submit rows, open and feed an import session | yes | yes | no |
+| Read any report, the journal, the action queue, the profile catalogue | yes | yes | yes |
+| Submit rows, open and feed an import session — by row or by export | yes | yes | no |
 | Settle one row by answering its question | yes | yes | no |
 | Generalise that answer into a standing rule | yes | **no** | no |
 | Commit or abandon an import session | yes | yes | no |

@@ -15,6 +15,17 @@
 //! knows the name and nothing else about the call, in the same way
 //! [`crate::report::confidence::CaveatKind::see`] knows the name of a field in
 //! a response it never builds.
+//!
+//! **A key is a call that changes something, and only such a call gets one.**
+//! Both readers of this list point at a call the same way: a resolution's
+//! target is what would settle the item, and a caveat's remedy is what would
+//! close the gap. A read settles and closes nothing, so naming one here would
+//! put an entry in the queue that a client could follow to the end and find the
+//! journal exactly as it was. The catalogue of source profiles an instance
+//! reads exports with is the standing example — a caller choosing a profile
+//! needs it, and it is still not a key. What such a caller needs is a link
+//! where it already looks, which is how the assessment of an import session is
+//! published: on the session, not as a target.
 
 /// A symbolic operation identifier resolved by a transport layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,6 +118,34 @@ pub enum OperationKey {
     /// and records in a single call, which is why it is a remedy entire rather
     /// than the first step of one.
     SyncBroker,
+    /// Read one institution's own export into an open session, through a source
+    /// profile (decision 0019).
+    ///
+    /// **The step between opening a session and the session holding anything**,
+    /// and that is its case for being a name of its own. Not
+    /// [`Self::OpenImportSession`]: opening declares a session — an account, a
+    /// channel, a label — and the session it makes is empty. An import stopped
+    /// there records no movement, so an item that offered only the opening
+    /// would send a caller to a call that leaves the account as empty as it
+    /// found it. This is the call that puts the statement in, and for a cash
+    /// account it is the ordinary way a history arrives at all.
+    ///
+    /// Not [`Self::SubmitOperations`] either, and the difference is what the
+    /// caller claims to know. That key records facts the caller has already
+    /// concluded, one each, straight into the journal. This one conveys a
+    /// document nobody has interpreted: the profile says which column carries
+    /// which cell and translates the source's own words into iaam's, and what
+    /// each row **is** stays open — settled afterwards by the owner's
+    /// directory, by a standing rule of his, or by his answer to a question the
+    /// session raises. That is decision 0022's line, between conveying a
+    /// document and interpreting one, and it is why the two are separate names
+    /// for what a client could otherwise read as one act of «sending rows».
+    ///
+    /// Named here because it was reachable and unpublishable (`iaam-1tij`). A
+    /// resolution's target is an [`OperationKey`], so while this channel had no
+    /// key no item could offer it, and an agent learned the ordinary way to
+    /// import a statement from a document or not at all.
+    ReadImportDocument,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
     /// Write everything one import session holds into the journal, once.
@@ -141,10 +180,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a seventeenth variant to
+    /// The declared length is the only thing holding an eighteenth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -157,6 +196,7 @@ impl OperationKey {
         Self::SubmitOperations,
         Self::OpenImportSession,
         Self::SyncBroker,
+        Self::ReadImportDocument,
         Self::AnswerImportQuestion,
         Self::CommitImportSession,
         Self::AbandonImportSession,
@@ -179,6 +219,7 @@ impl OperationKey {
             Self::SubmitOperations => "ingest_operations",
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",
+            Self::ReadImportDocument => "read_import_document",
             Self::AnswerImportQuestion => "answer_import_question",
             Self::CommitImportSession => "commit_import_session",
             Self::AbandonImportSession => "abandon_import_session",

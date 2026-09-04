@@ -3425,6 +3425,12 @@ pub async fn add_import_rows(
 /// operation kind to write a conclusion into. `GET /v1/source-profiles` is the
 /// catalogue this instance reads with.
 ///
+/// The floor is the one `iaam_app::ports::required_scope` states for
+/// [`OperationKey::ReadImportDocument`], and an agent token reaches it: what
+/// the caller does here is convey a document, not interpret one (decision
+/// 0022). Nothing reaches the journal until the session is committed, and that
+/// call keeps the same floor.
+///
 /// Two things the reader deliberately leaves open, because no export contains
 /// them: which printed counterparty is an account of the owner's somewhere
 /// else, and whether a positive row is money somebody sent or a merchant giving
@@ -3464,6 +3470,11 @@ pub async fn read_import_document(
     ApiQuery(params): ApiQuery<SourceDocumentParams>,
     ApiBytes(body): ApiBytes,
 ) -> Result<Json<SourceDocumentDto>, ApiFailure> {
+    // Before the body is looked at and before the store is touched. A caller
+    // who may not submit must not learn from the refusal whether a document
+    // with this hash exists, which is why the check is here and not inside the
+    // scenario the `document` parameter reaches.
+    require(&principal, OperationKey::ReadImportDocument)?;
     // An empty body means «read the one you kept», exactly as the report
     // channel's reparse does. Both at once is refused rather than resolved by
     // precedence: two documents in one request name two readings, and picking
@@ -3525,6 +3536,15 @@ pub async fn read_import_document(
 /// instance would not load is named here with the reason — otherwise an
 /// operator's own profile fails to load and his export is simply "not
 /// recognised" a month later.
+///
+/// **This is deliberately not an [`OperationKey`].** A key is a call an item or
+/// a caveat can point at as the way out, and this one changes nothing: a client
+/// that followed it to the end would find the journal exactly as it was. The
+/// call that wants a profile is `read_import_document`, which is a key, and the
+/// list a caller chooses from is a read it makes on the way there — so the
+/// catalogue belongs in the contract every client already resolves, not in the
+/// vocabulary of acts. Adding it would put an entry in the outstanding-work
+/// queue that can never be outstanding.
 #[utoipa::path(
     get,
     path = "/v1/source-profiles",
@@ -5215,11 +5235,11 @@ mod tests {
     /// extractors run in: on most of these routes the body is parsed before the
     /// handler is entered, so an agent token sent with an empty body is refused
     /// for the body and not for the scope. A behavioural sweep would therefore
-    /// have to construct a valid request for sixteen routes to observe one bit
-    /// each, and every one of those bodies would be a second fixture to keep
-    /// current. What has to be guarded is narrower than that: that no route the
-    /// queue offers states its own authority instead of reading the one it
-    /// publishes.
+    /// have to construct a valid request for every one of those routes to
+    /// observe one bit each, and every one of those bodies would be a second
+    /// fixture to keep current. What has to be guarded is narrower than that:
+    /// that no route the queue offers states its own authority instead of
+    /// reading the one it publishes.
     const SOURCE: &str = include_str!("routes.rs");
 
     struct Handler<'a> {

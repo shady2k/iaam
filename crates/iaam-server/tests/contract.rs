@@ -23572,3 +23572,181 @@ async fn a_document_no_profile_recognises_is_refused_by_name() {
         "the refusal lists what this instance reads: {refusal}"
     );
 }
+
+/// The document channel is an operation the contract publishes, and it resolves
+/// (`iaam-1tij`).
+///
+/// It was a write route that was not an `OperationKey`, which cost two things.
+/// It sat outside `every_offered_route_is_gated_by_the_floor_it_publishes`, so
+/// it stated its own authority with nothing checking it; and no resolution
+/// could point at it, because a target is an `OperationKey` — so the ordinary
+/// way a cash account's statement arrives could not appear in the queue at all,
+/// and an agent learned the channel existed from a document or not at all.
+///
+/// The identifier is the handler's own name: utoipa defaults `operation_id` to
+/// the function it documents, and this route declares none. That default is
+/// what the catalogue resolves against, so it is pinned here together with the
+/// address it resolves to.
+#[test]
+fn the_document_channel_resolves_to_the_route_that_answers_it() {
+    let harness = harness();
+    let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
+    let resolved = catalog.operation(OperationKey::ReadImportDocument);
+
+    assert_eq!(resolved.operation_id, "read_import_document");
+    assert_eq!(resolved.method, "POST");
+    assert_eq!(resolved.path, "/v1/import-sessions/{session}/document");
+    // The floor an agent token reaches: conveying a document is not
+    // interpreting one (decision 0022), and it is stated in exactly one place.
+    assert_eq!(resolved.required_scope, iaam_app::ports::Scope::Agent);
+    // The body is an institution's export as it prints it, not a JSON document,
+    // so there is no component schema to name — and the key registers anyway.
+    // `request_schema` being an `Option` is what makes that so: the catalogue
+    // requires the identifier to resolve and nothing more.
+    assert_eq!(resolved.request_schema, None, "{resolved:?}");
+}
+
+/// Reading the catalogue of profiles is a read, and a read gets no key.
+///
+/// A target is a call that changes something: a resolution names what would
+/// settle the item, and a caveat names what would close the gap. A client that
+/// followed this one to the end would find the journal exactly as it was, so an
+/// entry in the queue for it could never stop being outstanding. It is
+/// published where every read is — in the contract — and a caller choosing a
+/// profile reaches it on the way to `read_import_document`, which is the key.
+#[tokio::test]
+async fn the_profile_catalogue_is_a_read_and_gets_no_operation_key() {
+    assert!(
+        OperationKey::ALL
+            .iter()
+            .all(|key| key.as_str() != "list_source_profiles"),
+        "a target is a call that changes something"
+    );
+
+    let harness = harness();
+    let (status, catalogue) = call(
+        &harness.router,
+        get("/v1/source-profiles", Some(&harness.readonly_token)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-only token reads what this instance reads with: {catalogue}"
+    );
+}
+
+/// A read-only token is refused the document channel by the floor, before
+/// anything is read.
+///
+/// The second half is what used to be only a comment. The refusal must not
+/// depend on the document: a caller who may not submit must not learn from it
+/// whether a document with a given hash was ever kept (§14). The check moved
+/// out of the scenario and onto the route precisely so that it happens before
+/// either reading is chosen — the stored-document branch looks the hash up as
+/// its first act.
+///
+/// The refusal is also the one the contract declares for this route. While the
+/// gate lived in the scenario it came back as an invalid-field answer about
+/// `scope`, and the route's own documented refusal was never produced.
+#[tokio::test]
+async fn a_read_only_token_may_not_read_a_document_into_a_session() {
+    let harness = harness();
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let sent = Request::builder()
+        .uri(format!("/v1/import-sessions/{id}/document"))
+        .method("POST")
+        .header(
+            "Authorization",
+            format!("Bearer {}", harness.readonly_token),
+        )
+        .header("Content-Type", "text/csv")
+        .body(Body::from(
+            include_bytes!("../../../tools/tbank-csv-import/fixtures/synthetic-export.csv")
+                .as_slice(),
+        ))
+        .expect("request");
+    let (status, refusal) = call(&harness.router, sent).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert_eq!(refusal["code"], "forbidden", "{refusal}");
+
+    // A hash this instance never kept is answered identically: the refusal is
+    // about the token and says nothing about what is stored.
+    let probe = Request::builder()
+        .uri(format!(
+            "/v1/import-sessions/{id}/document?document={}",
+            "0".repeat(64)
+        ))
+        .method("POST")
+        .header(
+            "Authorization",
+            format!("Bearer {}", harness.readonly_token),
+        )
+        .body(Body::empty())
+        .expect("request");
+    let (status, hidden) = call(&harness.router, probe).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{hidden}");
+    assert_eq!(hidden["code"], "forbidden", "{hidden}");
+    assert_eq!(
+        hidden, refusal,
+        "the refusal must not vary with the document a caller names"
+    );
+}
+
+/// An agent token reads an institution's export into a session.
+///
+/// The floor did not change when the statement of it moved: an agent may convey
+/// a document and may not interpret one (decision 0022), and this is the half
+/// of that sentence the route has to keep admitting. Asserted through the
+/// transport rather than against the function, because what a client depends on
+/// is the answer the route gives.
+#[tokio::test]
+async fn an_agent_token_reads_an_institution_s_export_into_a_session() {
+    let harness = harness();
+    for title in ["Main", "Savings"] {
+        let (status, account) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({ "title": title }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+    }
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.agent_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let request = Request::builder()
+        .uri(format!("/v1/import-sessions/{id}/document"))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.agent_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from(
+            include_bytes!("../../../tools/tbank-csv-import/fixtures/synthetic-export.csv")
+                .as_slice(),
+        ))
+        .expect("request");
+    let (status, read) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["profile"]["id"], "tbank-operations-csv", "{read}");
+    assert_eq!(read["session"], id, "{read}");
+    assert!(
+        read["rows"].as_array().is_some_and(|rows| !rows.is_empty()),
+        "{read}"
+    );
+}

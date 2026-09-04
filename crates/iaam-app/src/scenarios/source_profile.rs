@@ -128,6 +128,14 @@ pub fn catalogue(services: &AppServices) -> &ProfileCatalogue {
 /// one account's statement and does not print which. Where the caller names
 /// none, the session's own declared account stands in, because that is the same
 /// statement made once at the session rather than once per document.
+///
+/// **The scope gate is not here** (`iaam-1tij`). The authority this call
+/// demands is `required_scope(OperationKey::ReadImportDocument)`, and the route
+/// is gated by asking that function before it enters this module — so what an
+/// agent may convey is stated once, where every other call in this API states
+/// it, and the queue that offers this call reads the same statement. A
+/// `may_submit` test written back in here would be the second statement
+/// decision 0021 exists to remove.
 pub async fn read_into_session(
     services: &AppServices,
     principal: &Principal,
@@ -136,13 +144,6 @@ pub async fn read_into_session(
     profile: Option<&str>,
     account: Option<AccountId>,
 ) -> Result<DocumentImport, AppError> {
-    if !principal.scope.may_submit() {
-        return Err(AppError::Invalid {
-            field: "scope".into(),
-            expected: "permission to submit operations".into(),
-            actual: principal.scope.code().to_owned(),
-        });
-    }
     let catalogue = catalogue(services);
     let installed = match profile {
         None => catalogue.recognise(bytes).map_err(rejected)?,
@@ -274,9 +275,13 @@ pub async fn read_into_session(
 /// profile version into the key would let both imports stand at once and double
 /// a month of movements while the owner read a green response.
 ///
-/// The scope is checked before the store is touched, and not only inside
-/// [`read_into_session`]: a caller who may not submit must not learn from the
-/// refusal whether a document with this hash exists (§14).
+/// A caller who may not submit must not learn from the refusal whether a
+/// document with this hash exists (§14), which is why the scope is settled
+/// before this function is entered at all: the route asks
+/// `required_scope(OperationKey::ReadImportDocument)` before it decides which
+/// of the two readings the request names. This function looks the document up
+/// as its first act, so a gate placed inside it — here or in
+/// [`read_into_session`] — would be the thing that has to be got right twice.
 pub async fn reread_into_session(
     services: &AppServices,
     principal: &Principal,
@@ -285,13 +290,6 @@ pub async fn reread_into_session(
     profile: Option<&str>,
     account: Option<AccountId>,
 ) -> Result<DocumentImport, AppError> {
-    if !principal.scope.may_submit() {
-        return Err(AppError::Invalid {
-            field: "scope".into(),
-            expected: "permission to submit operations".into(),
-            actual: principal.scope.code().to_owned(),
-        });
-    }
     let Some(requested) = RawHash::parse(document_hash) else {
         return Err(AppError::Invalid {
             field: "document".into(),

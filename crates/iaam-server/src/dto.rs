@@ -38,6 +38,9 @@ use iaam_app::scenarios::import_session::{
 // into the list above: this file is edited by several changes at once, and one
 // name added to a wrapped list reflows every line of it.
 use iaam_app::scenarios::import_session::Generalisation;
+// Why a question stopped waiting without an answer (`iaam-m2oi`), in a block of
+// its own for the reason the block above gives.
+use iaam_app::scenarios::import_session::QuestionSettlement;
 // Wave T's own names, in a block of their own for the reason the block above
 // gives: this file is edited by several changes at once.
 use iaam_app::ingest::profile::ProfileCatalogue;
@@ -8891,6 +8894,66 @@ pub struct ImportQuestionDto {
     /// and these were decided with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_settled: Vec<AlsoSettledDto>,
+    /// What settled this row without the owner ever answering the question.
+    ///
+    /// **Absent means the question is his to answer, or he answered it**
+    /// (`iaam-m2oi`). Which of the two is said by `answered_at`, and this field
+    /// deliberately does not repeat it: the two ways a question stops waiting
+    /// are «he spoke» and «something else settled it», and only the second needs
+    /// a word, because the first is what a reader already assumes.
+    ///
+    /// **Why it is published at all.** `answered_at` was the only thing a client
+    /// had to go on, and it says whether he answered — not whether anything
+    /// still needs him to. A standing rule of his settles the row and writes
+    /// nothing on the question, so a client that read the absence of
+    /// `answered_at` as work outstanding put a decision to him that his own
+    /// earlier decision had already made. That is the wall the offered rule
+    /// exists to pull down, still standing after he pulled it down.
+    ///
+    /// A client showing the owner what is left to do shows the questions with no
+    /// `answered_at` **and** no `settled_without_answer`; `unanswered` on the
+    /// session counts exactly those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_without_answer: Option<QuestionSettlementDto>,
+}
+
+/// Why a question stopped waiting on the owner without him answering it.
+///
+/// **The word is the same word the assessment puts on the row** — a standing
+/// rule of his, his account directory, the source's own assertion, or another
+/// row of this session that already records the movement — and it is deliberately
+/// not a vocabulary of this surface's own. `settled_by` on a planned fact and
+/// `reason` on a settled row publish the same codes from the same two
+/// enumerations, so a caller that reads a session's questions and its assessment
+/// reads one determination twice rather than two that can disagree about the
+/// same row.
+///
+/// `explanation` carries it in words, because a code is an identifier and
+/// decision 0035 has anything published to be read out to him carry what he can
+/// read beside one.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QuestionSettlementDto {
+    /// `rule`, `directory`, `source_asserted`, `one_account_two_instruments`
+    /// or `second_leg_of_one_movement`.
+    ///
+    /// The two other words those enumerations can say do not reach here, and
+    /// neither is a gap. `answered` is what a question with an `answered_at`
+    /// says about itself, and this field exists for the questions that have
+    /// none; `concluded` is a row whose caller submitted a finished operation,
+    /// which raises no question to settle.
+    pub code: String,
+    /// The same determination in a sentence, to be read out to the owner.
+    pub explanation: String,
+}
+
+impl QuestionSettlementDto {
+    #[must_use]
+    pub fn from_domain(settlement: &QuestionSettlement) -> Self {
+        Self {
+            code: settlement.code().to_owned(),
+            explanation: settlement.describe().to_owned(),
+        }
+    }
 }
 
 /// One row an answer reached beyond the question it was asked about.
@@ -8929,7 +8992,11 @@ pub struct AlsoSettledDto {
 /// - `impossible` — no rule can be built from this row under any token. A
 ///   matcher that asks nothing matches nothing, and an "everything" rule would
 ///   silently reclassify the portfolio. There is no call that changes this;
-/// - `unanswered` — the question is still open, so nothing generalises yet.
+/// - `unanswered` — he has not answered it, so there is no answer to generalise.
+///   Not the same as «it is still waiting on him»: a standing rule of his may
+///   have settled the row already, which `settled_without_answer` says and this
+///   word does not, because a rule that settles a row is not something the row
+///   generalised into.
 ///
 /// `available` carrying the rule rather than only the word is the point. An
 /// agent that settles a hundred rows correctly and leaves the owner to
@@ -9035,6 +9102,10 @@ impl ImportQuestionDto {
             // Empty here and filled only by [`Self::from_answered`]: reading a
             // question back says nothing about which call settled it.
             also_settled: Vec::new(),
+            settled_without_answer: asked
+                .settled_without_answer
+                .as_ref()
+                .map(QuestionSettlementDto::from_domain),
         }
     }
 }
@@ -9064,6 +9135,15 @@ pub struct ImportSessionContentsDto {
     pub questions: Vec<ImportQuestionDto>,
     /// How many are still waiting on the owner. Commit refuses while this is
     /// not zero.
+    ///
+    /// **Not the number of questions with no answer recorded** (`iaam-m2oi`).
+    /// That is what it used to count, and the two came apart the moment the
+    /// owner adopted a rule the session offered him: the rule settled the rows,
+    /// the questions kept their empty `answered_at`, and this figure went on
+    /// naming a wall that was no longer there while the commit went on refusing
+    /// over it. It counts the questions this session's own reading cannot settle
+    /// — the ones with no `answered_at` and no `settled_without_answer` — which
+    /// is the set the commit actually refuses over.
     pub unanswered: usize,
     /// The control sections the source printed, as the session holds them.
     ///
@@ -11835,9 +11915,61 @@ mod question_publishers {
             },
             accounts: Vec::new(),
             generalisation: Generalisation::Unanswered,
+            settled_without_answer: None,
         };
         let published = ImportQuestionDto::from_domain(&asked);
         assert!(published.also_settled.is_empty());
         assert_eq!(codes(&published.alternatives), vec!["fee", "paid"]);
+    }
+
+    /// A question a standing rule settled says so, in the words the assessment
+    /// uses about the same row.
+    ///
+    /// `answered_at` is absent and always will be — he never answered it — so
+    /// this field is the only thing between a caller and putting a decision to
+    /// him that his own earlier decision already made (`iaam-m2oi`).
+    #[test]
+    fn a_question_a_rule_settled_publishes_what_settled_it_and_not_an_answer() {
+        let asked = AnswerableQuestion {
+            view: ImportQuestionView {
+                id: ImportQuestionId(Uuid::new_v4()),
+                session: ImportSessionId(Uuid::new_v4()),
+                row: 1,
+                question: serde_json::to_string(&Question::IsOutflowAFee {
+                    account: AccountId(Uuid::new_v4()),
+                })
+                .expect("a question"),
+                alternatives: "[\"fee\",\"paid\"]".to_owned(),
+                prompt: "Was it a fee, or a payment out?".to_owned(),
+                asked_at: "2026-03-01T00:00:00Z".to_owned(),
+                answered_at: None,
+                answer: None,
+                rule: None,
+            },
+            accounts: Vec::new(),
+            generalisation: Generalisation::Unanswered,
+            settled_without_answer: Some(QuestionSettlement::Fact {
+                basis: FactBasis::Rule {
+                    rule: Uuid::new_v4().to_string(),
+                    version: 1,
+                },
+            }),
+        };
+        let published = ImportQuestionDto::from_domain(&asked);
+        let settled = published
+            .settled_without_answer
+            .expect("a question a rule settled says so");
+        assert_eq!(
+            settled.code, "rule",
+            "the same word the assessment puts on the row it settled"
+        );
+        assert!(
+            !settled.explanation.is_empty(),
+            "and a sentence to read out beside it, which decision 0035 requires"
+        );
+        assert!(
+            published.answered_at.is_none(),
+            "settled is not answered: he never spoke about this row"
+        );
     }
 }

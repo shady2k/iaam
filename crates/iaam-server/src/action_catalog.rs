@@ -4,6 +4,7 @@ use thiserror::Error;
 use utoipa::openapi::{OpenApi, RefOr, path::Operation};
 
 use iaam_app::actions::OperationKey;
+use iaam_app::ports::{Scope, required_scope};
 
 /// A route address resolved from the completed OpenAPI document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,22 @@ pub struct ActionOperation {
     /// body for it so that a catalogue would accept it. The route was the first
     /// to need addressing when a refusal began offering it as a way out.
     pub request_schema: Option<String>,
+    /// The narrowest token scope the route lets through to this call.
+    ///
+    /// **Not resolved from the document, and it is the only field here that is
+    /// not.** The completed contract states a method, a path and a request
+    /// schema, and this catalogue reads all three off it; it does not state an
+    /// authority. Every route declares the same `security(("bearer" = []))`,
+    /// and the prose beside the 403 already disagrees with the handlers.
+    /// So the floor is taken from `iaam_app::ports::required_scope`, which is
+    /// the same statement `iaam_server::routes` gates the route by — see that
+    /// function for why the fact is not written into the document instead.
+    ///
+    /// It is carried here rather than looked up at each use for the reason the
+    /// address is: an action's target, a caveat's remedy and a refusal's way
+    /// out are all built from an [`ActionOperation`], and a second lookup
+    /// beside one of them is a second answer.
+    pub required_scope: Scope,
 }
 
 /// The operation addresses advertised by computed actions.
@@ -98,6 +115,7 @@ impl ActionCatalog {
                     method: method.clone(),
                     path: path.clone(),
                     request_schema: request_schema(operation),
+                    required_scope: required_scope(key),
                 },
             );
         }

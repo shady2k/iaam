@@ -9,6 +9,7 @@ use iaam_core::ids::{
     AccountId, CategoryGroupId, CategoryId, CategoryRuleId, CustodyId, ImportId, ImportQuestionId,
     ImportSessionId, InstrumentId, OwnerId, SourceId,
 };
+use iaam_core::operation::OperationKey;
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::ControlClaim;
@@ -72,6 +73,100 @@ impl Scope {
             Self::Agent => "agent",
             Self::ReadOnly => "read_only",
         }
+    }
+
+    /// Whether a token of this scope reaches a call whose floor is `required`.
+    ///
+    /// Derived from the two predicates above rather than from an ordering of
+    /// its own. A third statement of «owner is wider than agent» is a third
+    /// place the ordering can be got wrong, and the two predicates already say
+    /// it: everything an agent may submit an owner may submit too.
+    #[must_use]
+    pub const fn admits(self, required: Self) -> bool {
+        match required {
+            Self::Owner => self.may_administer(),
+            Self::Agent => self.may_submit(),
+            // Nothing demands read-only, and the arm is not dead: it says that
+            // a call demanding nothing is reachable by every token, which is
+            // what makes `admits` total over the enum rather than over a
+            // subset a caller has to know about.
+            Self::ReadOnly => true,
+        }
+    }
+}
+
+/// The floor a call keeps: the narrowest scope the transport lets through to it.
+///
+/// **One statement, and the route enforces from it.** The authority a call
+/// demands used to be written twice — once in the handler, as `require_admin`
+/// or a `may_submit` test, and once by hand beside every queue item that
+/// offered the call. Two statements of one fact are a fact that eventually
+/// disagrees with itself, which is the defect `iaam-3nqt` recorded for
+/// `closed_by`: the queue told an agent it could not make a call the server
+/// would have accepted. So this is the only statement. `iaam_server::routes`
+/// gates each of these sixteen routes by asking this function, and
+/// `iaam_app::actions` publishes what it answers; there is nothing left for the
+/// two to disagree about.
+///
+/// **Not resolved from the contract, and the reason is that the contract does
+/// not state it.** `ActionCatalog::from_openapi` resolves a key's method, path
+/// and request schema from the completed OpenAPI document because the document
+/// carries them. It carries no authority: every route declares the same
+/// `security(("bearer" = []))`, and the prose beside the 403 already disagrees
+/// with the handlers — `create_account` says «Insufficient permissions» and
+/// `record_owner_balance` says «Owner only», and both call `require_admin`.
+/// OpenAPI 3.1 does permit role names in a non-OAuth security requirement, but
+/// `utoipa::openapi::security::SecurityRequirement` keeps its map private, so a
+/// role written into the document could not be read back out of it in the
+/// typed form the catalogue resolves everything else in. A fact written into
+/// the contract that nothing reads back is a second hand-maintained statement,
+/// which is the thing being removed here. See ADR-0021.
+///
+/// **A floor, not a promise.** `docs/api/conventions.md` §4.7 is explicit that
+/// the transport keeps only the scope that cannot be right under any journal,
+/// and §4.4 that one route may perform two acts of different consequence and
+/// gate them separately inside. `answer_import_question` is the standing
+/// example: its floor is [`Scope::Agent`], and an agent's answer settles the
+/// row and writes no standing rule. A caller that this function admits is a
+/// caller the route will not refuse *for its scope*; it may still refuse for
+/// what the request says or for what the journal holds.
+///
+/// Exhaustive on purpose, like [`crate::actions::ActionKind::goals`]: a
+/// seventeenth [`OperationKey`] cannot compile until someone has said what
+/// authority its call demands.
+#[must_use]
+pub const fn required_scope(operation: OperationKey) -> Scope {
+    match operation {
+        // «It states a standing decision that will apply to things nobody has
+        // looked at» — conventions §4.2, second bullet. An account, a contour
+        // version, a category rule, a classification rule, a statement about
+        // an account's transfer partners, a scope exclusion and a retirement
+        // are all decisions the owner will have to live with, applied to rows
+        // no one has seen yet.
+        OperationKey::CreateAccount
+        | OperationKey::CreateContour
+        | OperationKey::AddContourVersion
+        | OperationKey::CreateCategoryRule
+        | OperationKey::CreateClassificationRule
+        | OperationKey::RecordAccountTransferPartners
+        | OperationKey::RecordAccountScope
+        | OperationKey::RecordAccountRetirement => Scope::Owner,
+        // A control balance is the owner's own statement of what an account
+        // held, and reconciliation is computed against it: conventions §4.3,
+        // «Record a control balance».
+        OperationKey::RecordOwnerBalance => Scope::Owner,
+        // «It rules on what is already in the journal» — §4.2, third bullet.
+        OperationKey::SubmitCorrections => Scope::Owner,
+        // «It disposes of something the caller itself submitted, and nothing
+        // else changes» — §4.2, first bullet. Recording a row, opening and
+        // feeding a session, settling one row, ending a session either way,
+        // and synchronising a channel are all mechanics.
+        OperationKey::SubmitOperations
+        | OperationKey::OpenImportSession
+        | OperationKey::SyncBroker
+        | OperationKey::AnswerImportQuestion
+        | OperationKey::CommitImportSession
+        | OperationKey::AbandonImportSession => Scope::Agent,
     }
 }
 
@@ -1674,6 +1769,96 @@ mod tests {
         assert_eq!(Scope::Owner.code(), "owner");
         assert_eq!(Scope::Agent.code(), "agent");
         assert_eq!(Scope::ReadOnly.code(), "read_only");
+    }
+
+    /// `admits` is the reading side of the two predicates above, and it must
+    /// agree with them in every combination rather than in the ones a caller
+    /// happened to try.
+    #[test]
+    fn a_scope_admits_exactly_the_floors_its_predicates_reach() {
+        for scope in [Scope::Owner, Scope::Agent, Scope::ReadOnly] {
+            assert_eq!(scope.admits(Scope::Owner), scope.may_administer());
+            assert_eq!(scope.admits(Scope::Agent), scope.may_submit());
+            assert!(
+                scope.admits(Scope::ReadOnly),
+                "a call demanding nothing is reachable by every token"
+            );
+        }
+        // The ordering the two predicates imply, spelled once so that a change
+        // to either of them shows up as a failure here and not as a queue that
+        // quietly offers an agent a call it cannot make.
+        assert!(Scope::Owner.admits(Scope::Agent));
+        assert!(!Scope::Agent.admits(Scope::Owner));
+    }
+
+    /// Every operation names a floor, and none of them names read-only.
+    ///
+    /// A call that demanded read-only would be a write reachable by a token
+    /// that may not write, and the exhaustive match is what makes the sweep
+    /// meaningful: it runs over `OperationKey::ALL`, which is the same list the
+    /// transport resolves against the contract.
+    #[test]
+    fn every_operation_states_a_floor_and_none_of_them_is_read_only() {
+        for operation in OperationKey::ALL {
+            let floor = required_scope(operation);
+            assert_ne!(
+                floor,
+                Scope::ReadOnly,
+                "{} is a write and must not be reachable by a read-only token",
+                operation.as_str()
+            );
+            assert!(
+                Scope::Owner.admits(floor),
+                "{} must be reachable by the owner",
+                operation.as_str()
+            );
+        }
+    }
+
+    /// The split the queue publishes, named operation by operation.
+    ///
+    /// Not a restatement of the match: this is the table
+    /// `docs/api/conventions.md` §4.3 states in prose, written out so that
+    /// moving a call across the line is a deliberate edit here as well as
+    /// there. `iaam-woeh` is what it is for — `ingest_operations` admitting an
+    /// agent while `submit_corrections` and `record_account_retirement` do not
+    /// is the whole of the finding.
+    #[test]
+    fn the_floor_of_each_operation_is_the_one_conventions_states() {
+        for operation in [
+            OperationKey::CreateAccount,
+            OperationKey::CreateContour,
+            OperationKey::AddContourVersion,
+            OperationKey::RecordOwnerBalance,
+            OperationKey::CreateCategoryRule,
+            OperationKey::CreateClassificationRule,
+            OperationKey::RecordAccountTransferPartners,
+            OperationKey::RecordAccountScope,
+            OperationKey::RecordAccountRetirement,
+            OperationKey::SubmitCorrections,
+        ] {
+            assert_eq!(
+                required_scope(operation),
+                Scope::Owner,
+                "{} states a standing decision or rules on the journal",
+                operation.as_str()
+            );
+        }
+        for operation in [
+            OperationKey::SubmitOperations,
+            OperationKey::OpenImportSession,
+            OperationKey::SyncBroker,
+            OperationKey::AnswerImportQuestion,
+            OperationKey::CommitImportSession,
+            OperationKey::AbandonImportSession,
+        ] {
+            assert_eq!(
+                required_scope(operation),
+                Scope::Agent,
+                "{} disposes of what the caller itself submitted",
+                operation.as_str()
+            );
+        }
     }
     /// The port must be object-safe: the composition root holds
     /// adapters behind `Arc<dyn ...>`, and adapter selection must not be

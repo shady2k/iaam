@@ -268,6 +268,14 @@ one sentence of your own, and do not decide that some of them are obvious: the
 whole reason the effect is published per alternative is that the choice between
 two of them is not a wording preference.
 
+You will find those words wherever a question is published, and that now includes
+the session's own assessment — the one place you read to work through a session.
+It used to carry the sentence alone, so the words that answer it had to be
+fetched from somewhere else, and an agent went looking for them down a route that
+does not exist. Whatever surface you are reading, the words and their effects
+travel with the question; if you find yourself hunting for them, you are reading
+something stale.
+
 Where an answer names one of the owner's own accounts, the question carries the
 accounts it may name, each with his own title for it and the institution holding
 it. Show him those and send back the identifier of the one he picks. You never
@@ -319,6 +327,61 @@ settle one wrongly, and only he can weigh that.
 
 A rule the owner does write is kept in his own vocabulary, and he can see it,
 change it, and retire it afterwards like any other.
+
+### One decision, many lines
+
+A statement names one shop on thirty lines and every one of them is the same
+question. The session's assessment says so: each unanswered question lists the
+other rows of that session raising **the same decision**, so you never have to
+work the grouping out by reading the prompts. Empty means the decision is asked
+once.
+
+Two rows are the same decision only when the source also said the money ran the
+same way. That is not a technicality: your answer states a direction of its own
+and the journal records that one, so carrying an answer meant for a payment onto
+a line where the money arrived would file an arrival as a departure — in the very
+figure his report is read for. The system will not group those two, and neither
+should you.
+
+An answer can be told to reach all of them. Say so on the answer, and every
+question still open in that session which is the same decision is settled with
+it, in one call. The response names the other rows it settled, and telling him
+which row he decided and which rows were decided with it is your job, not the
+response's.
+
+**Read what that does and does not claim.** It settles rows already in one
+session — rows he reads in the assessment before anything is committed, and which
+he can abandon whole, leaving his journal exactly as it was. It writes no
+standing rule and it says nothing about next month; that is still his to write,
+and it is still the thing your credential cannot do. If a single row of the ones
+it would reach cannot take the answer, nothing is written at all and the refusal
+names that row. The commonest cause is an answer naming one of his own accounts
+that one of those rows is itself on, and it means what it says: that row was never
+the same decision.
+
+### What a first import can settle without asking him about every line
+
+A statement he has never imported has no rules of his behind it, so nearly every
+line naming a party becomes a question. Most of those questions have the same
+answer, and the document itself already says so: institutions file their own rows
+under their own words, and there are a dozen of those words where there are
+hundreds of counterparties.
+
+The assessment publishes them. Per word the institution filed still-unanswered
+rows under, it gives the count, the rows, and the question to put to him — in two
+parts, what he is asked and what his answer changes. Read both to him: the second
+half is where the risk is, because one answer settles every line filed that way,
+this month's and every later one.
+
+What it publishes is the **condition** and never the outcome. What the lines have
+in common is a fact about his document; what they *are* is his decision, and it
+is one only he can send. Do not fill it in, and do not read the institution's own
+word to him as though it were an answer — a bank calling something a transfer is
+a hint he may map or override, not a ruling on what his money did.
+
+A document whose reader transcribes no such word offers nothing here, and the
+list is simply empty. That is the truthful answer, not a failure: the reader
+names that column or it does not exist.
 
 ## An import can be held open before it is committed
 

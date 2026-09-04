@@ -20094,14 +20094,32 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
         .expect("retained rows");
     assert_eq!(retained.len(), 1, "one row cannot be written yet: {plan}");
     assert_eq!(retained[0]["reason"], "unanswered", "{plan}");
-    assert_eq!(
-        plan["interpretation"]["open_questions"]
-            .as_array()
-            .expect("open questions")
-            .len(),
-        1,
-        "{plan}"
-    );
+    let open = plan["interpretation"]["open_questions"]
+        .as_array()
+        .expect("open questions");
+    assert_eq!(open.len(), 1, "{plan}");
+    // The assessment publishes the words that answer the question it publishes
+    // (iaam-ulib, decision 0029). This is the surface an agent reads to work
+    // through a session, and it used to carry the sentence and not the words —
+    // so the alternatives had to be fetched from a different response, and one
+    // agent went looking for them down a route that does not exist.
+    let alternatives = open[0]["alternatives"]
+        .as_array()
+        .expect("the words that answer it");
+    assert!(!alternatives.is_empty(), "{plan}");
+    for alternative in alternatives {
+        assert!(alternative["answer"].is_string(), "{plan}");
+        assert!(alternative["needs_account"].is_boolean(), "{plan}");
+        assert!(
+            alternative["consequence"]
+                .as_str()
+                .is_some_and(|sentence| !sentence.is_empty()),
+            "every word says what answering it decides: {plan}"
+        );
+    }
+    // One question, so nothing is a repeat of it, and the field says so by
+    // being absent rather than by naming this row as its own repeat.
+    assert!(open[0]["alike"].is_null(), "{plan}");
     assert_eq!(plan["readiness"], "requires_owner_decision", "{plan}");
 
     // Reading the assessment wrote nothing, which is the other half of the

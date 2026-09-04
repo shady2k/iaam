@@ -595,6 +595,81 @@ impl Question {
     pub fn admits(&self, answer: &Answer) -> bool {
         self.alternatives().contains(&answer.shape())
     }
+
+    /// The decision this question puts, paired with what the source said about
+    /// the row's direction.
+    ///
+    /// `stated` is [`ClassificationSubject::movement`] for the row that raised
+    /// it — what the **source** said, never what an answer would say. See
+    /// [`QuestionSubject`] for why the pair and not the question alone, and for
+    /// why a caller that has the row is the only one who can build this.
+    #[must_use]
+    pub fn about(&self, stated: Option<Movement>) -> QuestionSubject {
+        QuestionSubject {
+            question: self.clone(),
+            stated,
+        }
+    }
+}
+
+/// What a question is a question **about**, so that the same decision put twice
+/// is recognisable as one decision.
+///
+/// **Not [`Question`] itself, and the ingredient it is missing is the direction
+/// the source stated** (`iaam-q5og`). Two rows naming one counterparty raise
+/// equal [`Question::IsTransferInternal`] values whichever way each of them
+/// ran: [`question_for`] builds that variant for `(Named(_), Some(_))` without
+/// reading which `Some` it was, deliberately, because the owner may contradict
+/// the source and the alternatives point both ways. An [`Answer`] then states a
+/// direction of its own and `ObservedRow::resolve_with` records **that** one —
+/// so one answer carried across two equal questions would record an arrival as
+/// a departure, silently, in the one figure a money-flow report is read for.
+/// The stated direction is therefore part of the identity, and two rows the
+/// source disagreed about are two decisions.
+///
+/// The other three variants need no such ingredient, and are not given one for
+/// symmetry: [`Question::IsOutflowAFee`] and [`Question::IsInflowIncome`] are
+/// each asked only where the direction is settled, and settled the opposite
+/// way, so they already differ by variant; [`Question::UnresolvedDirection`] is
+/// asked only where the source stated none, so the field is `None` on every row
+/// that raises it. The field is carried regardless rather than matched on per
+/// variant, because a per-variant rule is a claim about which questions exist
+/// and this type should not have to be revisited when a fifth one does.
+///
+/// **This is not a rule and says nothing about next month.** Equality here
+/// settles rows already fed to one session, which the owner reads in that
+/// session's assessment before anything is committed and can abandon whole. A
+/// [`ClassificationRule`] classifies rows nobody has looked at, including rows
+/// from months not yet imported. Decision 0029 keeps the two apart, and
+/// `may_generalise` is untouched by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionSubject {
+    question: Question,
+    stated: Option<Movement>,
+}
+
+impl QuestionSubject {
+    /// The question every row with this subject raised.
+    ///
+    /// One question and not one per row, which is the point: a caller putting
+    /// the decision to the owner once shows him this, and the rows are what it
+    /// covers. The row-by-row wording lives on the stored prompt, because that
+    /// one names its row (decision 0012) and this one names none.
+    #[must_use]
+    pub const fn question(&self) -> &Question {
+        &self.question
+    }
+
+    /// What the source said about the direction of the rows this covers.
+    ///
+    /// `None` means the source stated none — which is a statement about the
+    /// rows, not a wildcard: a subject with `None` is unequal to one carrying a
+    /// direction, so an answer given for a directionless row does not reach a
+    /// row whose direction the source printed.
+    #[must_use]
+    pub const fn stated(&self) -> Option<Movement> {
+        self.stated
+    }
 }
 
 /// One alternative a question offers, without the value it needs.

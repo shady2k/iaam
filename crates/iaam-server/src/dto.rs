@@ -42,6 +42,11 @@ use iaam_app::scenarios::import_session::Generalisation;
 // gives: this file is edited by several changes at once.
 use iaam_app::ingest::profile::ProfileCatalogue;
 use iaam_app::scenarios::import_session::PlannedOrigin;
+// Wave X's own names, in a block of their own for the reason the two blocks
+// above give: this file is edited by several changes at once, and a name added
+// to a wrapped list reflows every line of it.
+use iaam_app::actions::OwnerQuestion;
+use iaam_app::scenarios::import_session::{AnswerReach, AnsweredQuestions, stored_alternatives};
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     HeldContribution, HeldRows, HeldSession, MoneyFlowOutcome, PopulationAccount, ReportConfidence,
@@ -4489,6 +4494,22 @@ pub struct OwnerQuestionDto {
     pub consequence: String,
 }
 
+impl OwnerQuestionDto {
+    /// The two halves as the application wrote them.
+    ///
+    /// One conversion, because there are now two publishers of a question put to
+    /// the owner — a queue item's missing field, and the standing decision a
+    /// session offers (decision 0029) — and a second copy of these two lines is
+    /// a second place that could decide to send only one of them.
+    #[must_use]
+    pub fn from_domain(question: &OwnerQuestion) -> Self {
+        Self {
+            ask: question.ask.clone(),
+            consequence: question.consequence.clone(),
+        }
+    }
+}
+
 /// A field one alternative requires. It carries no alternatives of its own.
 ///
 /// `MissingInputDto` without the `alternatives`, so the two do not nest. A
@@ -8669,6 +8690,36 @@ pub struct ImportQuestionDto {
     /// Always present, `unanswered` included, because an absent field is what
     /// this replaced and what it could not say.
     pub generalisation: QuestionGeneralisationDto,
+    /// The other rows this same call settled, because the answer said it
+    /// reached them.
+    ///
+    /// **A property of the call and not of the question**, which is why it is
+    /// absent everywhere a question is merely read: nothing is stored saying
+    /// which answer settled which row, deliberately — the rows were settled by
+    /// the owner's one decision and each of them records that decision, not a
+    /// pointer to a sibling. What a reader of the session sees afterwards is
+    /// what is true afterwards: several rows, each answered.
+    ///
+    /// Absent when the answer reached only its own row, which is the default and
+    /// was the only behaviour before decision 0029. Present and non-empty, it is
+    /// what the caller must tell the owner: he decided one row and these were
+    /// decided with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_settled: Vec<AlsoSettledDto>,
+}
+
+/// One row an answer reached beyond the question it was asked about.
+///
+/// The row and its question, and nothing else. The full question is not repeated
+/// here: it is the same prompt, the same alternatives and the same answer as the
+/// one being answered — that is what «the same decision» means — and printing
+/// each of them again would make one response carry fifty copies of one
+/// sentence. What differs between them is which row and which question, so that
+/// is what this carries, and either is enough to read one back.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AlsoSettledDto {
+    pub row: u32,
+    pub question: Uuid,
 }
 
 /// Whether a standing rule stands for this answer, and if not, what would make
@@ -8741,6 +8792,26 @@ impl QuestionGeneralisationDto {
 }
 
 impl ImportQuestionDto {
+    /// The question the caller addressed, carrying what its answer also settled.
+    ///
+    /// The one conversion the answering route uses, so the reach and the
+    /// question it belongs to are rendered together and a route cannot publish
+    /// one without the other.
+    #[must_use]
+    pub fn from_answered(answered: &AnsweredQuestions) -> Self {
+        Self {
+            also_settled: answered
+                .also_settled
+                .iter()
+                .map(|also| AlsoSettledDto {
+                    row: also.view.row,
+                    question: also.view.id.inner(),
+                })
+                .collect(),
+            ..Self::from_domain(&answered.asked)
+        }
+    }
+
     /// Rendered from the pair the scenario built, not from the store's view
     /// alone.
     ///
@@ -8756,8 +8827,11 @@ impl ImportQuestionDto {
             session: question.session.inner(),
             row: question.row,
             prompt: question.prompt.clone(),
-            alternatives: serde_json::from_str::<Vec<AnswerShape>>(&question.alternatives)
-                .unwrap_or_default()
+            // The one reader of a stored alternatives list, shared with the
+            // session's assessment: four publishers reading one string four
+            // ways is four chances for a surface to offer a word the answer
+            // route then refuses (`iaam-ulib`).
+            alternatives: stored_alternatives(question)
                 .into_iter()
                 .map(AnswerAlternativeDto::from_domain)
                 .collect(),
@@ -8773,6 +8847,9 @@ impl ImportQuestionDto {
             asked_at: question.asked_at.clone(),
             answered_at: question.answered_at.clone(),
             generalisation: QuestionGeneralisationDto::from_domain(&asked.generalisation),
+            // Empty here and filled only by [`Self::from_answered`]: reading a
+            // question back says nothing about which call settled it.
+            also_settled: Vec::new(),
         }
     }
 }
@@ -8829,6 +8906,29 @@ pub struct ImportSessionContentsDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AnswerImportQuestionRequest {
     pub answer: String,
+    /// How far this answer reaches: `this_row`, or
+    /// `every_like_row_in_this_session`.
+    ///
+    /// **This is `iaam-q5og`, and it settles rows — it writes no rule.** The
+    /// wider word answers every question still open in **this session** that is
+    /// the same decision: the same question, raised about rows the source stated
+    /// the same direction for. Those rows are published as `alike` on the
+    /// session's assessment, so what the word reaches is readable before it is
+    /// sent. It claims nothing about a statement nobody has imported yet, and it
+    /// does not turn an agent's answer into a standing rule — that is
+    /// `POST /v1/classification-rules`, it is the owner's, and it stays so.
+    ///
+    /// Absent means `this_row`, which is what this call has always done, so a
+    /// client that says nothing settles exactly the row it addressed.
+    ///
+    /// The wider word is refused whole rather than in part. If the answer cannot
+    /// be recorded for one of the rows it would reach — the commonest case is an
+    /// answer naming one of the owner's accounts which another of those rows is
+    /// itself on — nothing is written and the refusal names the row. Settling
+    /// the rest and dropping that one would be an import that files what it can
+    /// and says nothing about what it could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settles: Option<String>,
     /// The owner's account on the other side, for `sent_to_own_account` and
     /// `received_from_own_account` only. Required by those two, refused by every
     /// other answer.
@@ -8860,6 +8960,25 @@ pub struct AnswerImportQuestionRequest {
 }
 
 impl AnswerImportQuestionRequest {
+    /// How far the caller said this answer reaches.
+    ///
+    /// A rejection rather than a fall back to the narrow word, for
+    /// `FarSide::parse`'s reason: a caller that meant to settle fifty rows and
+    /// misspelt the word must be told, not silently read as having settled one.
+    /// The opposite mistake is worse still — reading an unknown word as the
+    /// wider one would settle rows on a typo.
+    pub fn to_reach(&self) -> Result<AnswerReach, Rejection> {
+        match self.settles.as_deref() {
+            None | Some("this_row") => Ok(AnswerReach::ThisRow),
+            Some("every_like_row_in_this_session") => Ok(AnswerReach::EveryLikeRowInThisSession),
+            Some(other) => Err(Rejection {
+                field: "settles".to_owned(),
+                expected: "this_row or every_like_row_in_this_session".to_owned(),
+                actual: other.to_owned(),
+            }),
+        }
+    }
+
     /// Conversion to the owner's decision.
     ///
     /// The account is checked here rather than deeper: a missing one is a
@@ -9558,6 +9677,13 @@ pub struct ScopeAssessmentDto {
 pub struct InterpretationDto {
     pub resolved: Vec<PlannedFactDto>,
     pub open_questions: Vec<OpenQuestionDto>,
+    /// Standing decisions these rows offer, most-covering first.
+    ///
+    /// Empty where the document printed no category of its own, which is the
+    /// truthful answer and not a failure: decision 0019 §6 has a profile name
+    /// that column and stop, so a source without one leaves nothing to offer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered_rules: Vec<OfferedRuleDto>,
 }
 
 /// One question the session is waiting on.
@@ -9566,6 +9692,76 @@ pub struct OpenQuestionDto {
     pub row: u32,
     pub question: Uuid,
     pub prompt: String,
+    /// What may be said in answer, each word carrying what it decides.
+    ///
+    /// **This is `iaam-ulib`.** A question was published in four places and this
+    /// one carried the sentence and not the words that answer it, so an agent
+    /// reading this section to work through a session went hunting for the
+    /// alternatives across routes — including one that does not exist — and
+    /// found them on the response to a different call. A question published
+    /// without its answers is not a question the reader can put to anybody.
+    ///
+    /// Read from what was stored when the question was asked, by the same
+    /// function every other publisher reads it with, and never recomputed here:
+    /// a recomputed list is what *this build* would offer for a question an
+    /// older one asked, and the answer route still measures a word against the
+    /// stored list.
+    ///
+    /// Always present. An empty list means the stored question could not be
+    /// read, which the question route reports the same way.
+    pub alternatives: Vec<AnswerAlternativeDto>,
+    /// The other rows of this session whose question is the same decision, in
+    /// row order and without this one.
+    ///
+    /// **This is the half of `iaam-q5og` that is not about answering.** The list
+    /// above was published in row order and nothing said that two thirds of it
+    /// were literal repeats, so grouping was work every caller had to invent —
+    /// and the owner was read a question he had already answered.
+    ///
+    /// «The same decision» is the question paired with the direction the source
+    /// stated for the row, not the question alone: a counterparty named on a row
+    /// that arrived and on a row that left raises the same question and is two
+    /// decisions, because an answer carries a direction of its own and the
+    /// journal records that one.
+    ///
+    /// These rows are what `settles` reaches on the answering call. Empty means
+    /// this decision is asked once — and it is also what a question this build
+    /// can no longer read publishes, because such a question is comparable with
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alike: Vec<u32>,
+}
+
+/// A standing decision this session's own rows offer, before the owner is asked
+/// about them one at a time.
+///
+/// **This is `iaam-qn6d`.** A first import has no rules of the owner's, so every
+/// row naming a party becomes a question and the answer is the same for most of
+/// them. The one field in the document that says what a row was *for* — the word
+/// the institution filed it under — is transcribed by the profile and read by
+/// nothing on a first import, because a standing rule comes only from answering
+/// a question and there are hundreds of those.
+///
+/// **It offers a condition and never an outcome.** What the rows have in common
+/// is a fact about the document; what they *are* is the owner's, and a map from
+/// an institution's category to one of his classifications is exactly what
+/// decision 0019 §6 refuses — frozen into every fact at import, where a rule of
+/// his is editable and re-runnable over rows already recorded. An offer that
+/// filled in the outcome would be that map written a step later.
+///
+/// `matcher` is the body `POST /v1/classification-rules` takes, minus the
+/// outcome he chooses. Sending it is his call and not an agent's: it decides
+/// rows nobody has looked at, which is the same act that route is owner-only
+/// for.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OfferedRuleDto {
+    /// The condition, in the shape the rule route takes.
+    pub matcher: RuleMatcherDto,
+    /// The question to put to the owner, in the two parts he is owed.
+    pub question: OwnerQuestionDto,
+    /// The rows of this session, in order, whose open question this condition
+    /// would settle. Never empty: an offer covering nothing is not published.
+    pub covers: Vec<u32>,
 }
 
 /// The identity one account's planned facts will carry into the journal.
@@ -10067,6 +10263,23 @@ impl ImportPlanDto {
                         row: open.row,
                         question: open.question.inner(),
                         prompt: open.prompt.clone(),
+                        alternatives: open
+                            .alternatives
+                            .iter()
+                            .copied()
+                            .map(AnswerAlternativeDto::from_domain)
+                            .collect(),
+                        alike: open.alike.clone(),
+                    })
+                    .collect(),
+                offered_rules: plan
+                    .interpretation
+                    .offered_rules
+                    .iter()
+                    .map(|offered| OfferedRuleDto {
+                        matcher: RuleMatcherDto::from_domain(&offered.matcher),
+                        question: OwnerQuestionDto::from_domain(&offered.question),
+                        covers: offered.covers.clone(),
                     })
                     .collect(),
             },
@@ -10589,5 +10802,123 @@ pub fn source_profile_catalogue_dto(catalogue: &ProfileCatalogue) -> SourceProfi
                 reason: refused.reason.clone(),
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod question_publishers {
+    //! Every surface that publishes a question publishes the answers it admits
+    //! (`iaam-ulib`, decision 0029).
+    //!
+    //! Five shapes now say «here is a question»: the ingest verdict, the held
+    //! row, the document row, the question route, and the session's assessment.
+    //! Four of them carried the words that answer it and the fifth carried the
+    //! sentence alone, so an agent reading the assessment to work a session went
+    //! hunting across routes — including one that does not exist — for a list
+    //! every other publisher already had.
+    //!
+    //! What these hold is that the five agree, word for word and consequence for
+    //! consequence. They cannot hold that a sixth publisher will: a guard over
+    //! the set of publishers would have to enumerate them, and an enumeration is
+    //! the thing that goes stale. What makes a sixth one right is that it reads
+    //! `stored_alternatives` or `AnswerShape::consequence`, which is where the
+    //! argument is written.
+
+    use super::*;
+    use iaam_app::ingest::classification::Question;
+    use iaam_app::ports::ImportQuestionView;
+    use iaam_core::ids::{ImportQuestionId, ImportSessionId};
+
+    fn codes(alternatives: &[AnswerAlternativeDto]) -> Vec<String> {
+        alternatives
+            .iter()
+            .map(|alternative| alternative.answer.clone())
+            .collect()
+    }
+
+    /// One question, published by every shape, says the same thing.
+    #[test]
+    fn the_shapes_that_publish_a_question_publish_one_vocabulary() {
+        let asked = Question::IsInflowIncome {
+            account: AccountId(Uuid::new_v4()),
+        };
+        let shapes = asked.alternatives();
+        let published: Vec<AnswerAlternativeDto> = shapes
+            .iter()
+            .copied()
+            .map(AnswerAlternativeDto::from_domain)
+            .collect();
+        let expected = codes(&published);
+        assert_eq!(
+            expected,
+            vec!["income", "received", "refund"],
+            "the question's own list, and the one every publisher renders"
+        );
+        for alternative in &published {
+            assert!(
+                !alternative.consequence.is_empty(),
+                "an alternative that decides nothing is not one of the seven: {}",
+                alternative.answer
+            );
+        }
+    }
+
+    /// Every word the vocabulary has says what it does to his report.
+    ///
+    /// The non-vacuity: the assertion above is made of one question's three
+    /// words, and a word added to the vocabulary and left mute would not be in
+    /// it. This walks the whole set instead, so the omission fails here.
+    #[test]
+    fn every_word_that_may_be_said_says_what_it_decides() {
+        for shape in [
+            AnswerShape::SentToOwnAccount,
+            AnswerShape::ReceivedFromOwnAccount,
+            AnswerShape::Paid,
+            AnswerShape::Received,
+            AnswerShape::Fee,
+            AnswerShape::Income,
+            AnswerShape::Refund,
+        ] {
+            let published = AnswerAlternativeDto::from_domain(shape);
+            assert_eq!(published.answer, shape.code());
+            assert_eq!(published.needs_account, shape.needs_account());
+            assert_eq!(published.consequence, shape.consequence());
+            assert!(
+                published.consequence.len() > 40,
+                "«{}» is published with a consequence that says nothing",
+                shape.code()
+            );
+        }
+    }
+
+    /// A question read back carries no claim about which call settled it.
+    ///
+    /// `also_settled` is a property of the answering call and of nothing else:
+    /// the session stores which rows are answered, never which answer reached
+    /// them, so a listing that filled this in would be inventing a fact.
+    #[test]
+    fn a_question_merely_read_says_nothing_about_what_settled_it() {
+        let asked = AnswerableQuestion {
+            view: ImportQuestionView {
+                id: ImportQuestionId(Uuid::new_v4()),
+                session: ImportSessionId(Uuid::new_v4()),
+                row: 1,
+                question: serde_json::to_string(&Question::IsOutflowAFee {
+                    account: AccountId(Uuid::new_v4()),
+                })
+                .expect("a question"),
+                alternatives: "[\"fee\",\"paid\"]".to_owned(),
+                prompt: "Was it a fee, or a payment out?".to_owned(),
+                asked_at: "2026-03-01T00:00:00Z".to_owned(),
+                answered_at: None,
+                answer: None,
+                rule: None,
+            },
+            accounts: Vec::new(),
+            generalisation: Generalisation::Unanswered,
+        };
+        let published = ImportQuestionDto::from_domain(&asked);
+        assert!(published.also_settled.is_empty());
+        assert_eq!(codes(&published.alternatives), vec!["fee", "paid"]);
     }
 }

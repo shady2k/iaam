@@ -31,3 +31,4 @@
 | [0026](0026-a-rule-may-ask-what-the-source-filed-the-row-under.md) | A rule may ask what the source filed the row under, and it is not scoped to a source | 2026-09-04 | proposed | `iaam-93lz` |
 | [0027](0027-a-field-the-owner-fills-in-carries-the-question-to-put-to-him.md) | A field the owner fills in carries the question to put to him | 2026-09-04 | proposed | `iaam-ytvf` |
 | [0028](0028-a-profile-transcribes-what-the-source-claims-and-the-engine-decides.md) | A profile transcribes what the source claims about a row, and the engine decides what follows | 2026-09-04 | proposed | `iaam-b0r0`, `iaam-rdya`, `iaam-2hq0` |
+| [0029](0029-one-answer-per-decision-and-a-question-published-with-its-answers.md) | One answer per decision, and a question published with the answers it admits | 2026-09-04 | proposed | `iaam-qn6d` |

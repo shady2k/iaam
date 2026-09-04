@@ -14015,6 +14015,15 @@ async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
     )
     .await;
     let before = journal_rows(&harness).await;
+    let directory_size = {
+        let (status, accounts) = call(
+            &harness.router,
+            get("/v1/accounts", Some(&harness.owner_token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accounts}");
+        accounts.as_array().expect("accounts").len()
+    };
 
     let (status, verdicts) = call(
         &harness.router,
@@ -14046,19 +14055,21 @@ async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
     );
 
     // And the account it landed on is the one the identifier names, not a
-    // second account minted from the string.
+    // second account minted from the string. Counted rather than listed: the
+    // harness seeds an account of its own, so what says nothing was minted is
+    // that the directory is the size it was, with the named account still in it.
     let (status, accounts) = call(
         &harness.router,
         get("/v1/accounts", Some(&harness.owner_token)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{accounts}");
-    assert_eq!(
-        accounts.as_array().expect("accounts").len(),
-        1,
-        "{accounts}"
+    let accounts = accounts.as_array().expect("accounts");
+    assert_eq!(accounts.len(), directory_size, "{accounts:?}");
+    assert!(
+        accounts.iter().any(|account| account["id"] == created),
+        "the identifier reached the account it names: {accounts:?}"
     );
-    assert_eq!(accounts[0]["id"], created, "{accounts}");
 }
 
 /// A row naming no account of the owner's is one rejected row, not a rejected
@@ -18483,7 +18494,13 @@ async fn a_rejected_classification_outcome_publishes_the_words_it_admits() {
         .collect();
     assert_eq!(
         admitted,
-        ["internal_transfer", "external_flow", "refund", "income", "fee"],
+        [
+            "internal_transfer",
+            "external_flow",
+            "refund",
+            "income",
+            "fee"
+        ],
         "{body}"
     );
 }

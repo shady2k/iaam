@@ -5017,6 +5017,265 @@ async fn an_offer_settlement_is_recorded_through_the_journal_route() {
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
 }
 
+/// One amortisation, submitted with or without a declaration.
+///
+/// Written as a helper because the tests below submit the same fact twice and
+/// vary nothing but what is declared about it: the whole claim is that the
+/// declaration, and only the declaration, decides what the fact can be named by
+/// afterwards.
+async fn post_amortisation(
+    harness: &Harness,
+    label: Option<&str>,
+    idempotency_key: &str,
+    record_date: &str,
+    effective_date: &str,
+) -> (StatusCode, Value) {
+    let mut body = json!({
+        "events": [{
+            "account": harness.account.inner(),
+            "type": "corporate_action",
+            "idempotency_key": idempotency_key,
+            "action": {
+                "type": "partial_redemption",
+                "instrument": harness.instrument.inner(),
+                "custody": harness.custody.inner(),
+                "quantity": "10",
+                "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                "compensation": { "amount": "1000.00", "currency": "RUB" },
+                "effective_date": effective_date,
+                "record_date": record_date
+            }
+        }]
+    });
+    if let Some(label) = label {
+        body["source"] = json!({
+            "account": harness.account.inner(),
+            "channel": "paste",
+            "label": label,
+        });
+    }
+    call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await
+}
+
+/// Retract what one label brought in through the journal-fact route.
+///
+/// The declaration is rebuilt out of nothing but what the caller already knew —
+/// the account it named, the channel it chose and the label it submitted under.
+/// That is the whole of the claim being tested, so the test states it by
+/// re-deriving the identity rather than by reading one back.
+async fn retract_journal_import(harness: &Harness, label: &str) -> (StatusCode, Value) {
+    call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": {
+                    "account": harness.account.inner(),
+                    "channel": "paste",
+                    "label": label,
+                },
+            }),
+        ),
+    )
+    .await
+}
+
+/// A journal fact the caller declared a source for is a fact it can take back.
+///
+/// The defect: the route opened with `SourceId::new_random()`, one fresh source
+/// per request, so every corporate action and offer it recorded was stamped
+/// with an identity nothing would ever name again. It is the pair iaam-ewcl and
+/// iaam-0f8f found on the CSV route, on a third route: retraction names a
+/// source or an import, this one published neither back to the caller, and a
+/// source minted per request leaves no group to name even if it had — so these
+/// facts were reachable one event at a time and never as the batch they
+/// arrived in.
+///
+/// Two labels are two imports, so retracting one leaves the other in force.
+/// Every amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn journal_facts_are_retractable_as_the_import_they_were_declared_under() {
+    let harness = harness();
+    let (status, body) = post_amortisation(
+        &harness,
+        Some("may"),
+        "amortisation-may",
+        "2026-05-18",
+        "2026-05-20",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let (status, body) = post_amortisation(
+        &harness,
+        Some("june"),
+        "amortisation-june",
+        "2026-06-18",
+        "2026-06-20",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let (status, retracted) = retract_journal_import(&harness, "may").await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(
+        retracted["affected"], 1,
+        "a source minted per request would have been reached by nothing: {retracted}"
+    );
+    assert_eq!(retracted["written"], 1, "{retracted}");
+
+    let (status, other) = retract_journal_import(&harness, "june").await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    assert_eq!(
+        other["affected"], 1,
+        "one label retracted does not carry off another: {other}"
+    );
+}
+
+/// A declaration is a statement about every fact in the batch, or it is nothing.
+///
+/// The refusal covers the whole call rather than the offending fact, unlike an
+/// unreadable one: a fact this build cannot read is one fact the caller got
+/// wrong and its neighbours still stand, while a fact for another account
+/// contradicts the statement the caller made over all of them — and writing the
+/// agreeing half would leave a half-import recorded under an identity naming
+/// the wrong account.
+#[tokio::test]
+async fn a_declared_batch_of_journal_facts_refuses_a_fact_for_another_account() {
+    let harness = harness();
+    let elsewhere = another_account(&harness, "Savings").await;
+    let body = json!({
+        "source": {
+            "account": harness.account.inner(),
+            "channel": "paste",
+            "label": "may",
+        },
+        "events": [
+            {
+                "account": harness.account.inner(),
+                "type": "corporate_action",
+                "action": {
+                    "type": "partial_redemption",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                    "compensation": { "amount": "1000.00", "currency": "RUB" },
+                    "effective_date": "2026-05-20",
+                    "record_date": "2026-05-18"
+                }
+            },
+            {
+                "account": elsewhere,
+                "type": "corporate_action",
+                "action": {
+                    "type": "partial_redemption",
+                    "instrument": harness.instrument.inner(),
+                    "custody": harness.custody.inner(),
+                    "quantity": "10",
+                    "principal_returned_per_unit": { "amount": "100", "currency": "RUB" },
+                    "compensation": { "amount": "1000.00", "currency": "RUB" },
+                    "effective_date": "2026-05-21",
+                    "record_date": "2026-05-18"
+                }
+            }
+        ]
+    });
+    let (status, refusal) = call(
+        &harness.router,
+        post("/v1/ingest/journal-events", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    assert_eq!(refusal["code"], "invalid_request", "{refusal}");
+    assert_eq!(refusal["field"], "events[1].account", "{refusal}");
+    assert_eq!(
+        refusal["expected"],
+        harness.account.inner().to_string(),
+        "{refusal}"
+    );
+    assert_eq!(refusal["actual"], elsewhere.to_string(), "{refusal}");
+
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(
+        page["rows"].as_array().expect("rows").is_empty(),
+        "the agreeing half was not written either: {page}"
+    );
+}
+
+/// An undeclared batch still records, and that is the decision, not an oversight.
+///
+/// The neighbouring conclusive route answers an omitted declaration by minting a
+/// source for the request, so that every caller written before declarations
+/// existed keeps working; this route answers it the same way. What the caller
+/// gives up by omitting it is stated where the field is documented, and is what
+/// this test pins: the facts land, and no import names them.
+#[tokio::test]
+async fn an_undeclared_journal_fact_is_still_recorded_and_names_no_import() {
+    let harness = harness();
+    let (status, body) = post_amortisation(
+        &harness,
+        None,
+        "amortisation-undeclared",
+        "2026-05-18",
+        "2026-05-20",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{page}");
+    assert!(
+        rows[0].get("import").is_none(),
+        "an undeclared submission names no import: {page}"
+    );
+}
+
+/// The journal-fact request publishes the declaration and not the dead label.
+///
+/// `source_label` was free text that reached no production path: a caller
+/// writing «manual entry» into it named nothing, and the request nonetheless
+/// required it. It is the same field the conclusive route removed, for the same
+/// reason — a field accepted and ignored reads like the answer to «where did
+/// these come from» and is not — and it is removed here in the change that
+/// gives this route a declaration that does answer it.
+#[tokio::test]
+async fn the_journal_fact_request_declares_a_source_and_no_longer_a_bare_label() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let request = &spec["components"]["schemas"]["SubmitJournalEventsRequest"]["properties"];
+    assert!(
+        request["source_label"].is_null(),
+        "the ignored source_label is still published: {spec}"
+    );
+    assert!(
+        request["source"].is_object(),
+        "the journal-fact request publishes no declaration: {spec}"
+    );
+}
+
 /// One unrecognised fact does not invalidate an adjacent one (§10.1) — and the line number
 /// in the response identifies the exact fact that was rejected.
 #[tokio::test]
@@ -9762,6 +10021,124 @@ async fn a_journal_row_names_the_import_session_that_committed_it() {
             .collect::<Vec<_>>(),
         vec![json!("committed-by-a-session")],
         "the filter answers what that one import put in: {page}"
+    );
+}
+
+/// A row names the import a retraction would have to take.
+///
+/// The defect: an event has recorded its import since imports could be named,
+/// and the journal's read model published the source and not the import. The
+/// two are not interchangeable — the source answers «which channel of which
+/// account», which covers every import that ever arrived that way, while the
+/// import answers «which submission», and it is the import that
+/// `POST /v1/corrections/imports` decides on when a label was declared. A
+/// client reading a row back could see the channel and still not know whether
+/// taking that row back would take one statement or a year of them.
+///
+/// What is pinned is not merely that a field is present: the value the journal
+/// publishes is compared against the one the retraction reports for the same
+/// declaration, because a published identifier that names a different group
+/// from the one the destructive call takes would be worse than none.
+///
+/// Every amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_journal_row_names_the_import_that_carried_it() {
+    let harness = harness();
+    let labelled = json!({
+        "source": {
+            "account": harness.account.inner(),
+            "channel": "file",
+            "label": "march",
+        },
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "1000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-03-01" },
+            "idempotency_key": "named-by-a-label",
+        }],
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &labelled),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    // The same account and the same channel, and no label. These rows belong to
+    // no named import, which is a different answer from «not yet recorded».
+    let unlabelled = json!({
+        "source": { "account": harness.account.inner(), "channel": "file" },
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "2000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-03-02" },
+            "idempotency_key": "named-by-no-label",
+        }],
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &unlabelled),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    let by_key = |key: &str| {
+        rows.iter()
+            .find(|row| row["idempotency_key"] == key)
+            .unwrap_or_else(|| panic!("{key} is in the journal: {page}"))
+            .clone()
+    };
+    let published = by_key("named-by-a-label")["import"]
+        .as_str()
+        .expect("a labelled row names its import")
+        .to_owned();
+    assert!(
+        by_key("named-by-no-label").get("import").is_none(),
+        "a submission that named no import invents none: {page}"
+    );
+    // Both rows arrived through one declared source, so the source cannot tell
+    // them apart. The import can.
+    assert_eq!(
+        by_key("named-by-a-label")["source"],
+        by_key("named-by-no-label")["source"],
+        "one account and one channel is one source: {page}"
+    );
+
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": {
+                    "account": harness.account.inner(),
+                    "channel": "file",
+                    "label": "march",
+                },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(
+        retracted["import"], published,
+        "the journal publishes the identity the retraction is keyed on: {retracted}"
+    );
+    assert_eq!(
+        retracted["affected"], 1,
+        "the unlabelled row is a different group: {retracted}"
     );
 }
 #[tokio::test]
@@ -16598,6 +16975,145 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
     assert_eq!(duplicates[0]["account"], json!(main.to_string()), "{plan}");
     assert_eq!(duplicates[0]["debit"], "400.00", "{plan}");
     assert_eq!(duplicates[0]["rows"], 1, "{plan}");
+}
+
+/// A plan says which provenance it will write its facts under.
+///
+/// The defect: `commit_delta` published what a commit would append and nothing
+/// about the identity it would append it under, so a client reviewing an import
+/// before committing it — which is what a pre-commit assessment exists for —
+/// could not tell in advance what a later retraction would have to name. The
+/// information was there all along: the commit derives it from the very same
+/// call.
+///
+/// The session declares nothing, and that is as much the point as the
+/// publishing is. An undeclared session derives its identity **per account**, so
+/// a batch spanning two accounts has two origins, and one source at the top of
+/// the plan would be untrue of exactly the sessions that need it most — an
+/// export covering a whole institution is one session, not one per account.
+///
+/// What is pinned last is the part a published field could otherwise get wrong:
+/// the rows the commit actually writes carry the source and the import the plan
+/// said they would.
+///
+/// Every amount and account here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_plan_names_the_provenance_its_facts_will_be_written_under() {
+    let harness = harness();
+    let main = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    {
+                        "account": main,
+                        "type": "deposit",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-03" },
+                        "idempotency_key": "origin-main",
+                    },
+                    {
+                        "account": savings,
+                        "type": "deposit",
+                        "amount": "60.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-05" },
+                        "idempotency_key": "origin-savings",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+
+    let origins = plan["commit_delta"]["fact_origins"]
+        .as_array()
+        .expect("fact origins");
+    assert_eq!(origins.len(), 2, "one origin per account: {plan}");
+    let origin_of = |account: Uuid| {
+        origins
+            .iter()
+            .find(|origin| origin["account"] == json!(account.to_string()))
+            .unwrap_or_else(|| panic!("an origin for {account}: {plan}"))
+            .clone()
+    };
+    let on_main = origin_of(main);
+    let on_savings = origin_of(savings);
+    assert_ne!(
+        on_main["source"], on_savings["source"],
+        "a source is keyed on one account, so two accounts are two sources: {plan}"
+    );
+    // A session that declared nothing still names an import, derived from the
+    // session identifier the caller has held since it opened it. Without one
+    // there would be nothing for a retraction to take but the whole channel.
+    for origin in [&on_main, &on_savings] {
+        assert!(
+            origin["import"].is_string(),
+            "an undeclared session still names the import it will write: {plan}"
+        );
+    }
+    assert_ne!(on_main["import"], on_savings["import"], "{plan}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    let by_key = |key: &str| {
+        rows.iter()
+            .find(|row| row["idempotency_key"] == key)
+            .unwrap_or_else(|| panic!("{key} is in the journal: {page}"))
+            .clone()
+    };
+    for (key, origin) in [("origin-main", &on_main), ("origin-savings", &on_savings)] {
+        let row = by_key(key);
+        assert_eq!(
+            row["source"], origin["source"],
+            "the commit wrote {key} under the source the plan named: {page}"
+        );
+        assert_eq!(
+            row["import"], origin["import"],
+            "the commit wrote {key} under the import the plan named: {page}"
+        );
+    }
 }
 
 /// An import says what it will and will not record, before it records it.

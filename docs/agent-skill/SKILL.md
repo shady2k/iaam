@@ -277,6 +277,17 @@ a limit of rights, not an absence of the capability. What the agent may properly
 do is find what went wrong, tell the owner exactly which facts are affected, and
 prepare the request for him to send.
 
+**Declare a source on everything you submit, corporate actions and offers
+included.** A submission that declares nothing is recorded under an identity
+nobody was ever told the name of, and nothing can name it again: the facts land,
+and the only handle left on them is one event at a time. A declaration is the
+account, the way the rows arrived, and a label naming this batch — a statement
+period, an export file name, a run identifier. Two submissions under one label
+are one import; two labels are two imports. It costs one object in the request,
+and it is the whole difference between an import you can take back and one you
+cannot. Corporate actions and offers had no way to declare it at all until
+recently; they do now.
+
 **Undoing your own import is yours.** An import you declared and committed —
 your account, your channel, your label — you may retract, and you should, the
 moment a control total tells you it was wrong. That is not a ruling on the

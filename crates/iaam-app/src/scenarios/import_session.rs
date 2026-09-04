@@ -1822,6 +1822,31 @@ pub struct CommitDelta {
     pub duplicates: Vec<PlannedFact>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRow>,
+    /// The provenance each account's `facts` will be written under.
+    ///
+    /// **Per account, because that is where the answer is true.** The origin is
+    /// `session_origin`'s, derived from the owner, the session and the account
+    /// a row names, and a session that declared nothing may hold rows for
+    /// several accounts — which is what a free session is for, since an export
+    /// covering a whole institution is one session and not one per account. A
+    /// single source at the top of the plan would therefore be a lie for
+    /// exactly the sessions that need it most. The grouping is the one
+    /// [`CommitDelta::fact_totals`] already uses, minus the currency, which
+    /// nothing about a source depends on.
+    ///
+    /// **Facts only, not duplicates.** A duplicate appends nothing, so there is
+    /// no provenance it will be written under; the row it collides with was
+    /// written by some earlier submission, quite possibly under another import
+    /// entirely, and publishing this session's identity for it would name a
+    /// group a retraction here would not take.
+    ///
+    /// It is published because a plan that says what will be written and not
+    /// what it will be written under cannot be checked against the one question
+    /// a pre-commit review exists to settle: if this turns out to be wrong,
+    /// what does taking it back have to name. The information was there all
+    /// along — the commit derives it from the very same call — and only the
+    /// publishing was missing.
+    pub fact_origins: Vec<PlannedOrigin>,
     /// What `facts` come to, per account and currency.
     pub fact_totals: Vec<BatchTotal>,
     /// What `duplicates` come to, per account and currency.
@@ -1832,6 +1857,29 @@ pub struct CommitDelta {
     /// is the figure that explains a statement whose turnover exceeds what the
     /// import adds. Summed together they would be neither.
     pub duplicate_totals: Vec<BatchTotal>,
+}
+
+/// The identity one account's planned facts will carry into the journal.
+///
+/// Both halves travel together for [`RowOrigin`]'s reason, and they answer two
+/// different questions: the source says which channel of which account these
+/// rows come from and is what deduplication is scoped by, and the import says
+/// which submission carried them and is what a retraction is keyed on. A plan
+/// that published only the first would let a reader work out the channel and
+/// still not know whether taking this import back would take one statement or
+/// every statement that account ever arrived by.
+///
+/// `import` is `None` where the session declared a source without a label:
+/// those rows are retracted together with every other unlabelled row of the
+/// same account and channel, and that is what naming no label means, not an
+/// identity still to be assigned. A session that declared nothing at all always
+/// has one, because `session_origin` derives it from the session identifier —
+/// which the caller has held since it opened the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedOrigin {
+    pub account: AccountId,
+    pub source: SourceId,
+    pub import: Option<ImportId>,
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -2119,6 +2167,7 @@ pub async fn plan_session(
     let cross_source_matching = transfer_pairing::propose(&legs);
 
     let commit_delta = CommitDelta {
+        fact_origins: fact_origins(principal.owner, &contents.session, &facts),
         fact_totals: batch_totals(&facts)?,
         duplicate_totals: batch_totals(&duplicates)?,
         facts,
@@ -2369,6 +2418,41 @@ fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact 
     }
 }
 
+/// The provenance each account's planned facts will be written under.
+///
+/// Derived here from [`session_origin`] rather than carried out of the
+/// normalisation above, and that is deliberate: the same function decides what
+/// the commit stamps, so the plan cannot describe an origin the commit does not
+/// use — which is the whole reason a session's origin is derived and not stored
+/// (iaam-zv54). Reading it back off the built candidates would be a second
+/// answer to a question that already has one owner.
+///
+/// Keyed on [`PlannedFact::account`] — the account the published fact names —
+/// so that a reader can join the two by the value in front of him rather than
+/// by one this function chose and did not print.
+///
+/// Sorted and deduplicated by account, so that two plans of an unchanged session
+/// are the same plan: the row order the facts arrive in is the session's, and a
+/// list that inherited it would make the revision stamp depend on it.
+fn fact_origins(
+    owner: OwnerId,
+    session: &ImportSessionView,
+    facts: &[PlannedFact],
+) -> Vec<PlannedOrigin> {
+    let accounts: BTreeSet<AccountId> = facts.iter().map(|fact| fact.account).collect();
+    accounts
+        .into_iter()
+        .map(|account| {
+            let origin = session_origin(owner, session, account);
+            PlannedOrigin {
+                account,
+                source: origin.source,
+                import: origin.import,
+            }
+        })
+        .collect()
+}
+
 /// What a list of planned facts comes to, per account and currency.
 ///
 /// The fold itself is [`iaam_core::batch::total`]: summing money is arithmetic,
@@ -2526,6 +2610,9 @@ fn fingerprint(
     // that it covers everything the plan says, and a section left out because it
     // «cannot disagree» is the section that will, the day someone changes how it
     // is folded.
+    for origin in &delta.fact_origins {
+        let _ = writeln!(rendered, "fact origin {origin:?}");
+    }
     for total in &delta.fact_totals {
         let _ = writeln!(rendered, "fact total {total:?}");
     }

@@ -3690,6 +3690,29 @@ fn session_contents_dto(
 }
 
 /// Journal fact ingestion: corporate actions and offers.
+///
+/// **Every fact is retractable, once the caller says under what.** The source
+/// was `SourceId::new_random()`, minted per request, and the pair of
+/// consequences was `POST /v1/ingest/csv`'s exactly (iaam-ewcl, iaam-0f8f):
+/// `POST /v1/corrections/imports` is keyed on a declaration a caller can
+/// re-derive, and a source nobody was ever told the name of is one no caller
+/// can re-derive — so an amortisation recorded here was reachable one event at
+/// a time and never as the batch it arrived in; and deduplication is scoped by
+/// the source (§10.6), so two calls carrying the same facts were two sources
+/// and the second could not see the first's rows as its own.
+///
+/// The declaration is the neighbouring conclusive route's, unchanged, and so is
+/// the fallback: an undeclared call still mints a random source, because that is
+/// what every caller written before this had and none of them should break on an
+/// upgrade. Choosing differently here from `POST /v1/ingest/operations` would
+/// mean two routes that take one declaration object answering the same omission
+/// two ways.
+///
+/// What differs from that route is only where the account comes from. There a
+/// row names its account by whatever identifier its source prints and the
+/// declaration is compared against what that resolved to; a journal fact names
+/// its account by iaam's own identifier and nothing else, so the comparison is
+/// direct.
 #[utoipa::path(
     post,
     path = "/v1/ingest/journal-events",
@@ -3700,7 +3723,7 @@ fn session_contents_dto(
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 422, description = "Request could not be read", body = ApiError)
+        (status = 422, description = "Request could not be read, or a fact names an account the declaration does not", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -3712,7 +3735,41 @@ pub async fn ingest_journal_events(
     if !principal.scope.may_submit() {
         return Err(ApiFailure::forbidden(principal.scope.code()));
     }
-    let source = SourceId::new_random();
+    // Resolved once for the whole request, for the reason `declared_account`
+    // gives: the source and the import are both keyed on the account, and
+    // resolving it twice is how two keys for one import get written.
+    let declared = match &request.source {
+        Some(declared) => Some((
+            declared,
+            declared_account(&state, &principal, declared).await?.id,
+        )),
+        None => None,
+    };
+    let (source, import) = match declared {
+        Some((declared, account)) => (
+            declared_source(principal.owner, account, declared)?,
+            declared_import(principal.owner, account, declared)?,
+        ),
+        // No declaration: today's behaviour, so existing callers keep working.
+        None => (SourceId::new_random(), None),
+    };
+
+    // The declaration says whose facts these are, and the facts must say the
+    // same. Checked before anything is written, and refusing the whole batch
+    // rather than the fact, for the reason `SubmitJournalEventsRequest::source`
+    // states: a fact for another account contradicts a statement the caller made
+    // over all of them.
+    if let Some((_, account)) = declared {
+        for (index, event) in request.events.iter().enumerate() {
+            if AccountId(event.account) != account {
+                return Err(invalid_field(
+                    format!("events[{index}].account"),
+                    &account.inner().to_string(),
+                    event.account.to_string(),
+                ));
+            }
+        }
+    }
 
     // Parsing the DTO yields a verdict for each element: one unrecognised fact
     // does not invalidate the others (§10.1). Response order — batch order,
@@ -3731,7 +3788,8 @@ pub async fn ingest_journal_events(
 
     let domain: Vec<SubmittedJournalEvent> =
         accepted.iter().map(|(_, event)| event.clone()).collect();
-    let outcomes = submit_journal_events(&state.services, &principal, source, &domain).await?;
+    let outcomes =
+        submit_journal_events(&state.services, &principal, source, import, &domain).await?;
     for ((row, _), verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }

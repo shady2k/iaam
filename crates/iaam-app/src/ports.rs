@@ -1109,6 +1109,19 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<ImportSessionSummaryView>, AppError>;
 
     /// Add one submitted line, or return the row it already occupies.
+    ///
+    /// **The row number is the session's own counter, and it is not a line of
+    /// any file** (`iaam-f6y4`). It is one more than the highest this session
+    /// has issued, so it is the row's position among what the session was
+    /// handed, in submission order. Two properties follow and both are relied
+    /// on: it is stable across a re-reading, because a line already taken under
+    /// the same key returns the row it took rather than being given a second
+    /// one; and it counts nothing the session did not take, so a record the
+    /// reader refused advances the document's line and not this number.
+    ///
+    /// A caller wanting the line of the owner's file wants the `locator`
+    /// published beside this row when a document is read, not this value. See
+    /// decision 0035 §4.
     async fn add_import_observation(
         &self,
         owner: OwnerId,

@@ -20186,6 +20186,20 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
     // engine's own prose.
     let printed = &open[0]["printed"];
     assert_eq!(printed["account"], json!(account.to_string()), "{plan}");
+    // And it names that account as the owner names it (iaam-6jsj, decision
+    // 0035). The identifier was the whole of it, and `answer_accounts` below
+    // deliberately does not narrow to the account the row is on — so the title
+    // of the account a question was about could not be got from this response at
+    // all, and the agent relaying it read the identifier out to him.
+    assert_eq!(
+        printed["title"], "Brokerage",
+        "the identifier is what the answering call takes; this is what he reads: {plan}"
+    );
+    assert!(
+        printed["institution"].is_null(),
+        "he has not said where it is held, and an invented one would tell two \
+         accounts apart by a fiction: {plan}"
+    );
     assert_eq!(printed["amount"], "2500.00", "{plan}");
     assert_eq!(printed["currency"], "RUB", "{plan}");
     assert_eq!(printed["date"], "2025-03-18", "{plan}");
@@ -24043,6 +24057,32 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
         .collect();
     positions.sort_unstable();
     assert_eq!(positions, (1..=11).collect::<Vec<u64>>());
+
+    // The two numbers are two counters over one document, and this object is
+    // the only place they are published together (iaam-f6y4). `locator` is the
+    // line of the file; `row` is the position the record took in the session,
+    // and a refused record occupies a line and takes no row — so from the first
+    // refusal the two differ by the number of refusals above it, which reads as
+    // a reordering and is not one. A caller matching question rows against the
+    // lines of the owner's file saw the first few agree and lost a long stretch
+    // of work to the rest.
+    let mut refused_above = 0_u64;
+    for row in rows {
+        let locator = row["locator"].as_u64().expect("a locator");
+        match row["row"].as_u64() {
+            None => refused_above += 1,
+            Some(position) => assert_eq!(
+                locator - position,
+                refused_above + 1,
+                "the header line, plus every record refused above this one: {row}"
+            ),
+        }
+    }
+    assert!(
+        refused_above > 0,
+        "the fixture has to contain a refusal, or the two counters never diverge \
+         and this proves nothing: {read}"
+    );
 
     // Nothing is in the journal: the rows are held, and the questions a cash
     // statement raises are what this channel exists to raise.

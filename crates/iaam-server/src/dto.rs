@@ -4029,10 +4029,10 @@ impl ReturnsReportDto {
 
 /// Account.
 ///
-/// The three fields decision 0004 adds are absent from an account that carries
-/// none of them, which is every account created before it. Absent is the honest
-/// wire shape for "the owner has not said", and it keeps every client written
-/// against the old response working unchanged.
+/// Every optional field here is **absent** rather than null where the owner has
+/// not said, and an account recorded before a field existed carries none of it.
+/// Absent is the honest wire shape for "the owner has not said", and it keeps
+/// every client written against an earlier response working unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccountDto {
     pub id: Uuid,
@@ -4085,10 +4085,10 @@ pub struct AccountAliasDto {
 ///
 /// **A grouping label, and nothing branches on it.** Report grouping reads it to
 /// render a heading; no rule, no projection, no classification, no validation
-/// and no refusal reads it (decision 0004 §3). In particular it must not be used
-/// to decide which negative balances are impossible — that is a separate need
-/// with a separate declaration, and deriving it here is the branch `iaam-d41s`
-/// refuses.
+/// and no refusal reads it. In particular it must not be used to decide which
+/// negative balances are impossible — that is a separate need with a separate
+/// declaration, `negative_balance_expectation`, and deriving either from the
+/// other is a branch this API deliberately does not make.
 ///
 /// Cash only: `brokerage` and `security_position` are deliberately not values,
 /// because a position on an instrument is what the journal records and needs no
@@ -4127,18 +4127,18 @@ impl CashAssetClassDto {
 
 /// What the owner expects a negative balance on an account to mean.
 ///
-/// **A warning, never a constraint.** A first draft of `iaam-d41s` had the
-/// owner record that an account *cannot be overdrawn*, and he corrected it: a
-/// technical overdraft on a debit card is real and ordinary. Nothing in iaam
+/// **A warning, never a constraint.** An earlier draft had the owner record that
+/// an account *cannot be overdrawn*, and he corrected it: a technical overdraft
+/// on a debit card is real and ordinary. Nothing in iaam
 /// refuses a request, drops a row, suppresses a figure or fails a check on this
 /// value. The only thing it does is set `contradicts_expectation` beside a
 /// figure the report states either way.
 ///
 /// **It is not derived from `cash_class`, and `cash_class` is not derived from
-/// it.** Decision 0004 §3 forbids that merge by name — «a savings account
-/// cannot be overdrawn, therefore warn» is wrong on the first ordinary
-/// technical overdraft. Two values, two consumers: the class reaches a report
-/// heading, this reaches a warning.
+/// it.** Merging them by name — «a savings account cannot be overdrawn,
+/// therefore warn» — is wrong on the first ordinary technical overdraft. Two
+/// values, two consumers: the class reaches a report heading, this reaches a
+/// warning.
 ///
 /// The field's absence is «the owner has not said», which is a third state and
 /// is never filled in by inference from a title, a class or a transaction
@@ -4897,8 +4897,8 @@ pub struct AccountTransferPartnersBatchDto {
 
 /// Account creation.
 ///
-/// Every field decision 0004 adds is optional, and a request that omits them all
-/// is exactly the request this endpoint accepted before it.
+/// Every field but `title` is optional, and a request that omits them all is
+/// exactly the request this endpoint accepted before they existed.
 ///
 /// Sending `provider` and `provider_account_id` makes the call an upsert by
 /// external identity: a create repeating an identity already recorded returns
@@ -4912,12 +4912,11 @@ pub struct CreateAccountRequest {
     /// report and list prints back to him.
     ///
     /// **The one field here a person fills in, and it was the only one with no
-    /// description at all** (`iaam-ytvf`). Every field below carries one because
-    /// the machinery needs explaining; this one carries none because it seemed
-    /// obvious, and an agent putting the question to the owner built it out of
-    /// the nearest prose there was — decision 0004's paragraph about
-    /// `provider_account_id` — and asked him about printed identifiers instead
-    /// of about the name he will read.
+    /// description at all.** Every field below carries one because the machinery
+    /// needs explaining; this one carried none because it seemed obvious, and an
+    /// agent putting the question to the owner built it out of the nearest prose
+    /// there was — the paragraph about `provider_account_id` — and asked him
+    /// about printed identifiers instead of about the name he will read.
     ///
     /// It is not an identifier and nothing is scoped by it. It does take part in
     /// resolving which account a statement line names, and only where nothing
@@ -5089,10 +5088,10 @@ pub struct AccountDeclarationsDto {
 pub struct AccountIdentityRepointedDto {
     /// The identity the account answered to until this call.
     ///
-    /// Returned rather than withheld, for the reason decision 0004 §1 gives for
-    /// storing what a source prints at all: a mismatched import is debuggable by
-    /// reading the value, and an owner who has just re-pointed an account needs
-    /// to see which identity he displaced.
+    /// Returned rather than withheld, for the same reason what a source prints
+    /// is stored at all: a mismatched import is debuggable by reading the value,
+    /// and an owner who has just re-pointed an account needs to see which
+    /// identity he displaced.
     pub previous: AccountIdentityStatedDto,
     /// Whether the journal holds any business fact recorded against this
     /// account.
@@ -8858,9 +8857,9 @@ pub struct ImportQuestionDto {
     /// what is true afterwards: several rows, each answered.
     ///
     /// Absent when the answer reached only its own row, which is the default and
-    /// was the only behaviour before decision 0029. Present and non-empty, it is
-    /// what the caller must tell the owner: he decided one row and these were
-    /// decided with it.
+    /// was the only behaviour before one answer could reach a set. Present and
+    /// non-empty, it is what the caller must tell the owner: he decided one row
+    /// and these were decided with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_settled: Vec<AlsoSettledDto>,
 }
@@ -9317,7 +9316,12 @@ impl RecordedEventDto {
 /// from the row. A held row will be written, at commit and at no other moment.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportRowDto {
-    /// The row's position in the session, one-based.
+    /// The row's position in the session, one-based, in submission order.
+    ///
+    /// **Not a line of any file** (`iaam-f6y4`). The session counts what it was
+    /// handed; a document's own line is `locator`, published beside this number
+    /// on every record when a document is read, and a record the reader refused
+    /// advances the line and not this. See `SourceDocumentRowDto.row`.
     pub row: u32,
     /// `held`, `needs_classification`, `settled` or `rejected`.
     pub state: String,
@@ -9801,9 +9805,8 @@ pub struct AccountResolutionDto {
     /// Account names a document of this session printed that name no single
     /// account of the owner's.
     ///
-    /// A fourth field rather than a widening of `missing` (decision 0024).
-    /// `missing` is a list of identifiers because a row that named an account
-    /// carried one; a string a document printed and the directory did not
+    /// A fourth field rather than a widening of `missing`. `missing` is a list
+    /// of identifiers because a row that named an account carried one; a string a document printed and the directory did not
     /// recognise has no identifier at all. Widening `missing` to hold both would
     /// put two kinds of thing in one slot, distinguishable only by which half of
     /// a union is filled — and a caller that reads `missing` as identifiers
@@ -9837,10 +9840,10 @@ pub struct InterpretationDto {
     /// Standing decisions these rows offer, most-covering first.
     ///
     /// Empty where the document printed no category of its own, which is the
-    /// truthful answer and not a failure: decision 0019 §6 has a profile name
-    /// that column and stop, so a source without one leaves nothing to offer.
+    /// truthful answer and not a failure: a profile names that column and stops
+    /// there, so a source that prints no such column leaves nothing to offer.
     ///
-    /// **Every entry here is safe to put to the owner** (decision 0032). A word
+    /// **Every entry here is safe to put to the owner.** A word
     /// whose rows are not one thing is in `withheld_offers` instead and never
     /// here, so a client that walks this list and relays what it finds cannot
     /// relay an offer that would file most of what it matches wrongly.
@@ -9849,8 +9852,8 @@ pub struct InterpretationDto {
     /// Words the source filed rows under that no rule is offered on, and what
     /// each of them turned out to hold. Most-covering first.
     ///
-    /// **This is `iaam-xchm`, and it is a second list rather than a flag on the
-    /// first.** One word of a real export covered a large share of the document
+    /// **A second list rather than a flag on the first.** One word of a real
+    /// export covered a large share of the document
     /// and held movements between the owner's own accounts, payments to a
     /// person, payments to a company and others at once. A rule on that word
     /// would have been wrong for most of what it matched, and the offer said
@@ -9864,10 +9867,9 @@ pub struct InterpretationDto {
     /// offer on the word that covers half my statement», which silence answers
     /// wrongly.
     ///
-    /// The group is **not** narrowed to the direction instead, and decision 0032
-    /// argues it: a classification rule carries no direction on purpose, so a
-    /// group narrowed to one would publish a `covers` list its own `matcher`
-    /// does not agree with.
+    /// The group is **not** narrowed to the direction instead: a classification
+    /// rule carries no direction on purpose, so a group narrowed to one would
+    /// publish a `covers` list its own `matcher` does not agree with.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withheld_offers: Vec<WithheldOfferDto>,
     /// The owner's accounts an answer that names one may name, once for the
@@ -9905,6 +9907,16 @@ pub struct InterpretationDto {
 /// One question the session is waiting on.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OpenQuestionDto {
+    /// The row this question is about — its position in the session, which is
+    /// what the answering call takes.
+    ///
+    /// **Not the line of the owner's file.** It counts what the session was
+    /// handed, in submission order, and a record the reader refused takes a line
+    /// of the document and no row here — so matching these numbers against the
+    /// lines of a statement agrees until the first refusal and silently does not
+    /// afterwards. The line is `locator`, published beside the row it became
+    /// when the document was read. It is not repeated here, because a session
+    /// also holds rows fed as a batch, which came from no file and have none.
     pub row: u32,
     pub question: Uuid,
     pub prompt: String,
@@ -9974,7 +9986,7 @@ pub struct OpenQuestionDto {
     /// nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alike: Vec<u32>,
-    /// The identifier this question shares with the other leg of one movement.
+    /// The other leg of one movement, where this row is one of the two.
     ///
     /// **Not `alike`, and the difference decides what an answer does.** Alike
     /// rows are the same decision about different money — twenty payments to one
@@ -9993,27 +10005,51 @@ pub struct OpenQuestionDto {
     /// suppressed or recorded because this field is present.
     ///
     /// Absent where this row's question stands alone, which is the ordinary
-    /// case. The value is stable across readings of an unchanged session.
+    /// case. The identifier is stable across readings of an unchanged session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pair: Option<Uuid>,
+    pub pair: Option<MirroredPairDto>,
+}
+
+/// The other leg of one movement, and the identifier the two questions share.
+///
+/// **Both halves, because either alone is half of what a client can say.** The
+/// identifier states that two questions are one decision and does not state
+/// which two, so a client that wanted to put the decision once — «rows 4 and 9
+/// are the two sides of one movement» — had to scan every other open question
+/// for a matching value before it could name the other row. `alike` beside it,
+/// the larger relation, publishes its rows outright.
+///
+/// An object rather than two flat fields: the identifier and the row are one
+/// statement about one relation, and splitting them across two optional fields
+/// would let a client read one without the other and let a response carry half
+/// of it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct MirroredPairDto {
+    /// The identifier both questions of this pair carry, and no other question
+    /// of the session carries. Derived from the session and the two row numbers,
+    /// so two readings of an unchanged session publish the same one.
+    pub id: Uuid,
+    /// The other row of the pair — never this question's own row. It is a row of
+    /// this session, so it addresses the answering call exactly as `row` does,
+    /// and its own question is in `open_questions` beside this one.
+    pub row: u32,
 }
 
 /// A standing decision this session's own rows offer, before the owner is asked
 /// about them one at a time.
 ///
-/// **This is `iaam-qn6d`.** A first import has no rules of the owner's, so every
-/// row naming a party becomes a question and the answer is the same for most of
-/// them. The one field in the document that says what a row was *for* — the word
+/// A first import has no rules of the owner's, so every row naming a party
+/// becomes a question and the answer is the same for most of them. The one field in the document that says what a row was *for* — the word
 /// the institution filed it under — is transcribed by the profile and read by
 /// nothing on a first import, because a standing rule comes only from answering
 /// a question and there are hundreds of those.
 ///
 /// **It offers a condition and never an outcome.** What the rows have in common
-/// is a fact about the document; what they *are* is the owner's, and a map from
-/// an institution's category to one of his classifications is exactly what
-/// decision 0019 §6 refuses — frozen into every fact at import, where a rule of
-/// his is editable and re-runnable over rows already recorded. An offer that
-/// filled in the outcome would be that map written a step later.
+/// is a fact about the document; what they *are* is the owner's. A map from an
+/// institution's category to one of his classifications is refused throughout
+/// this API: such a map is frozen into every fact at import, where a rule of his
+/// is editable and re-runnable over rows already recorded. An offer that filled
+/// in the outcome would be that map written a step later.
 ///
 /// `matcher` is the body `POST /v1/classification-rules` takes, minus the
 /// outcome he chooses. Sending it is his call and not an agent's: it decides
@@ -10035,8 +10071,8 @@ pub struct OfferedRuleDto {
     pub covers: Vec<u32>,
     /// What those rows are, as far as the source said — one shape, always.
     ///
-    /// **An offer is only made where the group is one thing** (`iaam-xchm`,
-    /// decision 0032), and this is the claim being made rather than a decoration:
+    /// **An offer is only made where the group is one thing**, and this is the
+    /// claim being made rather than a decoration:
     /// a client can show the owner what he is deciding about without expanding
     /// the group itself, and can check the claim instead of taking it. A word
     /// whose rows disagree is in `withheld_offers`, where this field is a list.
@@ -10076,8 +10112,8 @@ pub struct WithheldOfferDto {
     /// **A statement and not a question**, so it has one part where
     /// `OwnerQuestionDto` has two: nothing is being asked and no answer of his
     /// changes anything, so a `consequence` would have to be invented — and an
-    /// invented one is exactly the sentence that reads as finished which
-    /// decision 0027 exists to prevent.
+    /// invented one is exactly the sentence that reads as finished while saying
+    /// nothing that turns on the answer.
     pub reason: String,
 }
 
@@ -10125,6 +10161,36 @@ pub struct PrintedRowDto {
     /// what is being asked about. It is also the one entry of
     /// `interpretation.answer_accounts` that is wrong for this question.
     pub account: Uuid,
+    /// What the owner calls that account.
+    ///
+    /// **Read this to him, and send `account` back.** The question is published
+    /// to be put to a person, and an account he is asked about and cannot name
+    /// is one he cannot rule on. The title never replaces the identifier: that
+    /// is what the answering call takes, and no call here accepts an account by
+    /// name.
+    ///
+    /// **`interpretation.answer_accounts` is not the join table for this.** It
+    /// is published only where some open question admits an answer that names an
+    /// account — a session whose questions are all «was this a fee?» publishes
+    /// none of it — and it is the owner's whole directory rather than this
+    /// session's accounts, so it holds nothing for a row on an account the
+    /// directory does not hold.
+    ///
+    /// Absent for exactly that account: one a row named by identifier which the
+    /// owner's directory does not hold, which `account_resolution.missing`
+    /// publishes and which this section must still be able to ask about. Absent
+    /// is never the identifier printed where a name belongs — do not fall back
+    /// to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The institution he said holds that account, when he said.
+    ///
+    /// Beside `title` because a title alone does not always settle it: two
+    /// accounts he calls `Savings`, at two banks, are one word apart in a list
+    /// and are not the same question. Absent means he has not said, never that
+    /// the account is held nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
     /// The amount as a decimal string, **with the sign the source printed**.
     ///
     /// Not made positive and not normalised into what the journal would post:
@@ -10709,7 +10775,10 @@ impl ImportPlanDto {
                             .map(AnswerAlternativeDto::from_domain)
                             .collect(),
                         alike: open.alike.clone(),
-                        pair: open.pair,
+                        pair: open.pair.map(|pair| MirroredPairDto {
+                            id: pair.id,
+                            row: pair.row,
+                        }),
                     })
                     .collect(),
                 offered_rules: plan
@@ -10849,6 +10918,12 @@ impl PrintedRowDto {
     pub fn from_domain(printed: &PrintedRow) -> Self {
         Self {
             account: printed.account.inner(),
+            // Copied, never looked up. The pair is built where the plan is
+            // built, out of the directory every row of it was resolved against
+            // (§3.4): a name joined here would be a second reading of the store
+            // and could name one account two ways in one response.
+            title: printed.title.clone(),
+            institution: printed.institution.clone(),
             // `minor_amount`, as every other amount this API publishes: a JSON
             // number would stop being the fact it states. The sign it carries is
             // the source's, unaltered.
@@ -11097,9 +11172,43 @@ pub struct ReadingProfileDto {
 /// session position for it would name something that does not exist.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SourceDocumentRowDto {
-    /// The record's one-based position in the document, header row included.
+    /// The record's one-based position in the document, header row included —
+    /// the number an operator counts to in his own file.
+    ///
+    /// Counted in newline bytes up to the byte the record begins at, so a
+    /// newline **inside a quoted field** does not shift it: the line this names
+    /// is the line the record starts on, and a record spanning three lines is
+    /// named by the first.
+    ///
+    /// This is the number that addresses the owner's file, and `row` below is
+    /// not (`iaam-f6y4`). Where a caller must show him the raw lines behind a
+    /// set of questions, this is the field to keep.
     pub locator: u64,
     /// The row's position in the session, where the session holds it.
+    ///
+    /// **It is not `locator` and it is not the document's line.** It is the
+    /// position this record took among what the session was handed, in
+    /// submission order, assigned by the session as one more than the highest it
+    /// had issued. Two numbers, two counters: a record the reader **refused**
+    /// occupies a line of the document and takes no row of the session, so from
+    /// the first refusal onwards the two differ by the number of refusals above,
+    /// and nothing is reordered to make them differ. A caller that matched
+    /// question rows against the lines of the owner's file therefore saw the
+    /// first few agree and the rest drift, and concluded — twice, wrongly —
+    /// that the reading had reordered the document.
+    ///
+    /// **This object is the bridge, and it is the only one published.** Every
+    /// row the session took is named here by both numbers at once, so keep this
+    /// response if the owner's own lines will be wanted: a question carries
+    /// `row`, and no read turns a `row` back into a `locator`. A caller that did
+    /// not keep it need not hold the file either — reading a kept document into
+    /// the same session again returns the rows it already took, with their
+    /// locators, and writes nothing, because a row is idempotent under its own
+    /// key.
+    ///
+    /// Absent for a record the reader could not read at all: such a record never
+    /// became a row of the session, and reporting a session position for it
+    /// would name something that does not exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<u32>,
     /// `held`, `needs_classification`, `settled`, `rejected`, or `unreadable`

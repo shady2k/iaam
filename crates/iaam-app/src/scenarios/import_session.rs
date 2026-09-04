@@ -2375,6 +2375,22 @@ pub struct Interpretation {
 /// [`PrintedRow::amount_minor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenQuestion {
+    /// The row's position **in this session**, which is what the answering call
+    /// takes.
+    ///
+    /// **Not the line of any file** (`iaam-f6y4`). It is the position the row
+    /// occupies among what this session was handed, in submission order — see
+    /// [`crate::ports::Store::add_import_observation`], which assigns it — and a
+    /// record the reader refused occupies a line of the document and takes no
+    /// row here, so from the first refusal the two numbers differ by however
+    /// many records have been refused above. A caller that matched these
+    /// numbers against the lines of the owner's file agreed for a while and then
+    /// silently did not.
+    ///
+    /// The line is the `locator` published for every record when a document is
+    /// read, on the same object as the row it became; nothing here turns a row
+    /// back into one, and decision 0035 §4 says why the question does not carry
+    /// it.
     pub row: u32,
     pub question: ImportQuestionId,
     pub prompt: String,
@@ -2422,7 +2438,7 @@ pub struct OpenQuestion {
     /// and on a row that left raises the *same* question and is two decisions,
     /// because an answer carries a direction of its own.
     pub alike: Vec<u32>,
-    /// The identifier this question shares with the other leg of one movement
+    /// The other leg of one movement, where this row is one of the two
     /// (`iaam-3qsq`, decision 0031).
     ///
     /// **This is not [`Self::alike`] and the two must never be read as degrees
@@ -2449,7 +2465,12 @@ pub struct OpenQuestion {
     /// two readings of an unchanged session publish the same one — a random
     /// value here would move the session's revision stamp under a session
     /// nobody touched.
-    pub pair: Option<Uuid>,
+    ///
+    /// It carries the other row as well as the identifier ([`MirroredPair`],
+    /// `iaam-6jsj`): a caller that can say «rows 4 and 9 are the two sides of
+    /// one movement» can put the decision once, and one holding only a shared
+    /// uuid had to scan the list to find out what to say.
+    pub pair: Option<MirroredPair>,
 }
 
 /// The row one open question is about, as the source printed it.
@@ -2474,6 +2495,40 @@ pub struct PrintedRow {
     /// makes [`Interpretation::answer_accounts`] usable: the one account that
     /// list must not offer for this question is this one.
     pub account: AccountId,
+    /// What the owner calls that account, where his directory holds it
+    /// (`iaam-6jsj`, decision 0035).
+    ///
+    /// **The identifier was the whole of it, and a caller working a real import
+    /// printed the identifier.** A question is published in order to be put to a
+    /// person, and an account he is asked about and cannot name is an account he
+    /// cannot rule on — which is `docs/api/conventions.md` §3 in the one place
+    /// on this path that had not kept it. The title never replaces
+    /// [`Self::account`] and could not: the identifier is what the answering
+    /// call takes, and §3.2 refuses a name as input.
+    ///
+    /// **It is not recoverable from [`Interpretation::answer_accounts`], which
+    /// is why it is a field and not a join.** That list is published only where
+    /// some open question admits an answer that names an account, so a session
+    /// whose questions are all about a fee publishes none of it; and it is the
+    /// owner's directory rather than this session's accounts, so it says nothing
+    /// about a row on an account the directory does not hold.
+    ///
+    /// `None` is that account and nothing else: one a row named by identifier
+    /// which the directory does not hold, published by
+    /// [`AccountResolution::missing`] and exactly the case this section must
+    /// still be able to ask a question about. It is never the identifier
+    /// rendered as a name — [`AccountNames::title`] falls back that way for a
+    /// refusal an operator reads, and a fallback that prints a uuid where a
+    /// title belongs is the defect this field was added for.
+    pub title: Option<String>,
+    /// The institution he said holds that account, when he said.
+    ///
+    /// Beside the title for §3.1's reason and not by symmetry: two accounts he
+    /// calls `Savings`, at two banks, are one word apart in a list and are not
+    /// the same question. `None` is «he has not said», never «it is held
+    /// nowhere», and never a guess — an invented institution would tell two
+    /// accounts apart by a fiction.
+    pub institution: Option<String>,
     /// The amount **with the sign the source printed**.
     ///
     /// [`ObservedRow::amount_minor`] unchanged. Not made positive and not
@@ -3223,7 +3278,12 @@ pub async fn plan_session(
     // whose movement another row already settled is not published at all
     // (0031), and the offers below are folded over what is genuinely still
     // open rather than over both halves of one movement.
-    let open_questions = open_questions(&contents.observations, &contents.questions, &mirrors);
+    let open_questions = open_questions(
+        &resolver.directory,
+        &contents.observations,
+        &contents.questions,
+        &mirrors,
+    );
     let offers = offers(&contents.observations, &open_questions);
     // The directory the resolution already read, in the shape an answer names an
     // account by. No second read of the store: `Resolver::load` holds the very
@@ -4958,6 +5018,21 @@ impl AccountDirectory {
     fn title(&self, account: AccountId) -> String {
         self.names.title(account)
     }
+
+    /// The owner's own words for one account, where this directory holds it.
+    ///
+    /// **Not [`Self::title`], and the difference is the whole point**
+    /// (`iaam-6jsj`). That function falls back to the identifier so that a
+    /// refusal an operator reads is never empty; a *published* title that can
+    /// come out as a uuid is the defect decision 0035 was written against, so
+    /// this one says `None` instead and lets the reader publish the absence.
+    ///
+    /// `None` is an account this directory does not hold. That is not an error
+    /// here: a row may name an account by identifier that the owner's directory
+    /// has never held, which is what [`AccountResolution::missing`] is for.
+    fn held(&self, account: AccountId) -> Option<&AccountDetailView> {
+        self.accounts.iter().find(|known| known.id == account)
+    }
 }
 
 impl Resolver {
@@ -5354,14 +5429,49 @@ struct MirroredRows {
     open: Vec<(u32, u32, Uuid)>,
 }
 
+/// The other leg of one movement, and the identifier the two questions share.
+///
+/// **Both, because either alone is half of what a caller has to say**
+/// (`iaam-6jsj`). The identifier states that two questions are one decision and
+/// does not state *which* two; the row states which row and cannot state that
+/// the relation is a pair rather than [`OpenQuestion::alike`]. A caller holding
+/// only the identifier had to scan every other open question for a match before
+/// it could name the other row to anybody — and [`OpenQuestion::alike`], the
+/// larger relation, has published its rows outright since it existed. The
+/// smaller one published our correlation key instead, which is decision 0035's
+/// third rule: an identifier this system minted for its own bookkeeping is not
+/// a fact about the owner's money and does not stand in for one.
+///
+/// Neither half is derived from the other. The identifier is derived from the
+/// session and both row numbers, so it is stable across readings of an unchanged
+/// session; the row is read off the same tuple, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirroredPair {
+    /// The identifier both questions of this pair carry, and no other question
+    /// of the session does.
+    pub id: Uuid,
+    /// The other row of the pair. A row of this session, so it addresses the
+    /// answering call exactly as [`OpenQuestion::row`] does.
+    pub row: u32,
+}
+
 impl MirroredRows {
-    /// The identifier this row's question shares with its partner's, if it has
-    /// one.
-    fn pair_of(&self, row: u32) -> Option<Uuid> {
+    /// The pair this row's question belongs to, if it belongs to one.
+    fn pair_of(&self, row: u32) -> Option<MirroredPair> {
         self.open
             .iter()
             .find(|(outgoing, incoming, _)| *outgoing == row || *incoming == row)
-            .map(|(_, _, pair)| *pair)
+            .map(|(outgoing, incoming, id)| MirroredPair {
+                id: *id,
+                // The *other* row, which is why the tuple is read rather than
+                // the identifier alone: read from the side the caller asked
+                // about, each of the two questions names the one it is not.
+                row: if *outgoing == row {
+                    *incoming
+                } else {
+                    *outgoing
+                },
+            })
     }
 }
 
@@ -5527,7 +5637,13 @@ fn mirror_side(read: &ReadRow, questioned: bool) -> Option<MirrorSide> {
 /// **not** collapsed into groups here: the assessment's unit is a row, decision
 /// 0012 has a question name its row, and publishing groups instead would take
 /// away the one identifier the answering call takes.
+/// The directory is taken rather than read here, and taken as an argument rather
+/// than reached for: the account named beside a question must be the account the
+/// row was resolved against, and a second reading of the store could name one
+/// account two ways in one response (§3.4). It is the same reading
+/// [`answer_accounts`] is folded over, one line below the call.
 fn open_questions(
+    directory: &AccountDirectory,
     observations: &[ImportObservationView],
     questions: &[ImportQuestionView],
     mirrors: &MirroredRows,
@@ -5565,7 +5681,7 @@ fn open_questions(
             row: question.row,
             question: question.id,
             prompt: question.prompt.clone(),
-            printed: row.as_ref().map(printed_row),
+            printed: row.as_ref().map(|row| printed_row(directory, row)),
             alternatives: stored_alternatives(question),
             alike: subject.as_ref().map_or_else(Vec::new, |subject| {
                 open.iter()
@@ -5587,9 +5703,18 @@ fn open_questions(
 /// observation as the source stated it, so that the one transition this makes —
 /// a minor amount into the decimal string the transport prints — happens at the
 /// wire and not here.
-fn printed_row(row: &ObservedRow) -> PrintedRow {
+///
+/// The one thing not read off the observation is the account's title, which no
+/// observation carries: it is read out of the directory this plan already
+/// loaded, so the name printed beside a question comes from the same reading the
+/// row was resolved against. A second read of the store here could name one
+/// account two ways in one response, which is `docs/api/conventions.md` §3.4.
+fn printed_row(directory: &AccountDirectory, row: &ObservedRow) -> PrintedRow {
+    let held = directory.held(row.account);
     PrintedRow {
         account: row.account,
+        title: held.map(|account| account.title.clone()),
+        institution: held.and_then(|account| account.institution.clone()),
         amount_minor: row.amount_minor,
         currency: row.currency,
         date: row.dates.effective_date(),
@@ -6124,6 +6249,16 @@ mod tests {
             negative_balance_expectation: None,
             aliases: Vec::new(),
         }
+    }
+
+    /// A directory holding nothing, for a test that asks about something else.
+    ///
+    /// An empty directory is a real state and not a stub: a row may name an
+    /// account by identifier that the owner's directory has never held, which is
+    /// what `AccountResolution::missing` publishes. A question about such a row
+    /// publishes no title, and the tests that assert that say so by name.
+    fn no_accounts() -> AccountDirectory {
+        AccountDirectory::from_accounts(Vec::new())
     }
 
     fn with_identity(mut view: AccountDetailView, printed: &str) -> AccountDetailView {
@@ -7008,7 +7143,12 @@ mod tests {
             stored_question_about(1, &asked),
             stored_question_about(2, &asked),
         ];
-        let open = open_questions(&observations, &questions, &MirroredRows::default());
+        let open = open_questions(
+            &no_accounts(),
+            &observations,
+            &questions,
+            &MirroredRows::default(),
+        );
         assert_eq!(open[0].alike, vec![2]);
         assert_eq!(open[1].alike, vec![1]);
         assert!(
@@ -7040,7 +7180,12 @@ mod tests {
             stored_question_about(2, &asked),
         ];
         assert_eq!(questions[0].question, questions[1].question);
-        let open = open_questions(&observations, &questions, &MirroredRows::default());
+        let open = open_questions(
+            &no_accounts(),
+            &observations,
+            &questions,
+            &MirroredRows::default(),
+        );
         assert!(open[0].alike.is_empty(), "{open:?}");
         assert!(open[1].alike.is_empty(), "{open:?}");
     }
@@ -7069,7 +7214,12 @@ mod tests {
                 },
             ),
         ];
-        let open = open_questions(&observations, &questions, &MirroredRows::default());
+        let open = open_questions(
+            &no_accounts(),
+            &observations,
+            &questions,
+            &MirroredRows::default(),
+        );
         assert!(open[0].alike.is_empty());
         assert!(open[1].alike.is_empty());
     }
@@ -7092,7 +7242,12 @@ mod tests {
         ];
         questions[0].answered_at = Some("2026-03-02T00:00:00Z".to_owned());
         questions[0].answer = Some(serde_json::to_string(&Answer::Paid).expect("an answer"));
-        let open = open_questions(&observations, &questions, &MirroredRows::default());
+        let open = open_questions(
+            &no_accounts(),
+            &observations,
+            &questions,
+            &MirroredRows::default(),
+        );
         assert_eq!(open.len(), 1, "{open:?}");
         assert!(open[0].alike.is_empty(), "{open:?}");
     }
@@ -7120,7 +7275,12 @@ mod tests {
             stored_question_about(2, &asked),
         ];
         questions[0].question = "{\"question\":\"a word this build has never had\"}".to_owned();
-        let open = open_questions(&observations, &questions, &MirroredRows::default());
+        let open = open_questions(
+            &no_accounts(),
+            &observations,
+            &questions,
+            &MirroredRows::default(),
+        );
         assert!(open[0].alike.is_empty(), "{open:?}");
         assert!(
             open[1].alike.is_empty(),
@@ -7242,7 +7402,7 @@ mod tests {
         assert_eq!(mirrors.settled.get(&2), Some(&1));
         let observations = vec![stored_row(2, &arrival)];
         assert!(
-            open_questions(&observations, &questions, &mirrors).is_empty(),
+            open_questions(&no_accounts(), &observations, &questions, &mirrors).is_empty(),
             "the answer to the other leg is the answer to this row"
         );
     }
@@ -7265,13 +7425,21 @@ mod tests {
             "a shape is not an answer, so nothing is recorded and nothing is suppressed"
         );
         let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
-        let open = open_questions(&observations, &questions, &mirrors);
+        let open = open_questions(&no_accounts(), &observations, &questions, &mirrors);
         assert_eq!(open.len(), 2);
+        let (first, second) = (
+            open[0].pair.expect("the departure is one side of a pair"),
+            open[1].pair.expect("the arrival is the other"),
+        );
         assert_eq!(
-            open[0].pair, open[1].pair,
+            first.id, second.id,
             "and the two carry one identifier, so the decision can be put once"
         );
-        assert!(open[0].pair.is_some());
+        assert_eq!(
+            (first.row, second.row),
+            (open[1].row, open[0].row),
+            "each naming the row it is not, so the decision can be put in words"
+        );
     }
 
     /// The pair is a hypothesis, and the answer is how it is refused.
@@ -7294,7 +7462,7 @@ mod tests {
         assert!(mirrors.settled.is_empty(), "{mirrors:?}");
         let observations = vec![stored_row(2, &arrival)];
         assert_eq!(
-            open_questions(&observations, &questions, &mirrors).len(),
+            open_questions(&no_accounts(), &observations, &questions, &mirrors).len(),
             1,
             "and the arrival still has to be answered on its own"
         );
@@ -7748,7 +7916,12 @@ mod tests {
             &filed_under(row(main, "Shop One", Some(day)), "Transfer"),
         )];
         let questions = vec![stored_question_about(1, &asked)];
-        let open = open_questions(&observations, &questions, &MirroredRows::default());
+        let open = open_questions(
+            &no_accounts(),
+            &observations,
+            &questions,
+            &MirroredRows::default(),
+        );
         let printed = open[0].printed.as_ref().expect("the row it is about");
         assert_eq!(printed.account, main);
         assert_eq!(printed.date, Some(day));
@@ -7779,6 +7952,7 @@ mod tests {
         let observed = directionless(anonymous(row(main, "Shop One", None), -1_000));
         assert!(observed.amount_minor > 0);
         let open = open_questions(
+            &no_accounts(),
             &[stored_row(1, &observed)],
             &[stored_question_about(1, &asked)],
             &MirroredRows::default(),
@@ -7805,6 +7979,7 @@ mod tests {
         let mut stored = stored_row(1, &row(main, "Shop One", None));
         stored.payload = "{\"not\":\"an intake\"}".to_owned();
         let open = open_questions(
+            &no_accounts(),
             &[stored],
             &[stored_question_about(1, &asked)],
             &MirroredRows::default(),
@@ -7844,7 +8019,12 @@ mod tests {
             stored_question_about(1, &asked),
             stored_question_about(2, &asked),
         ];
-        let open = open_questions(&observations, &questions, &MirroredRows::default());
+        let open = open_questions(
+            &directory,
+            &observations,
+            &questions,
+            &MirroredRows::default(),
+        );
         let accounts = answer_accounts(&directory, &open);
         assert_eq!(accounts.len(), 2, "{accounts:?}");
         assert!(
@@ -7873,6 +8053,7 @@ mod tests {
         ]);
         let asked = Question::IsOutflowAFee { account: main };
         let open = open_questions(
+            &directory,
             &[stored_row(
                 1,
                 &anonymous(row(main, "Shop One", None), -1_000),
@@ -7889,6 +8070,108 @@ mod tests {
             "the premise: no word this question admits names an account"
         );
         assert!(answer_accounts(&directory, &open).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // A question names its account in the owner's words (iaam-6jsj, 0035)
+    // -----------------------------------------------------------------------
+
+    /// The account a question is about is published as he calls it.
+    ///
+    /// The complaint: an agent working a real import read account identifiers
+    /// out to him, because the identifier was the only thing beside the
+    /// question — `answer_accounts` deliberately does not narrow to the account
+    /// the row is on, so the title of the account a question is about could not
+    /// be got from the assessment at all.
+    #[test]
+    fn a_question_names_the_account_it_is_about_in_the_owners_own_words() {
+        let main = account(1);
+        let mut held = detail(main, "Main");
+        held.institution = Some("Bank One".to_owned());
+        let directory = AccountDirectory::from_accounts(vec![held]);
+        let asked = Question::IsOutflowAFee { account: main };
+        let open = open_questions(
+            &directory,
+            &[stored_row(1, &row(main, "Shop One", None))],
+            &[stored_question_about(1, &asked)],
+            &MirroredRows::default(),
+        );
+        let printed = open[0].printed.as_ref().expect("the row it is about");
+        assert_eq!(
+            printed.account, main,
+            "the identifier stays, because it is what the answering call takes"
+        );
+        assert_eq!(printed.title.as_deref(), Some("Main"));
+        assert_eq!(
+            printed.institution.as_deref(),
+            Some("Bank One"),
+            "two accounts he calls one word apart are not one question"
+        );
+    }
+
+    /// An account his directory does not hold publishes no name, and not a uuid.
+    ///
+    /// The falsification. `AccountNames::title` answers this case with the
+    /// identifier as a string, which is legible in a refusal and is exactly the
+    /// defect here — a title a reader would read out that is not a name at all.
+    /// A row may name an account by identifier that the directory has never
+    /// held; `AccountResolution::missing` publishes it, and a question about it
+    /// is still a question.
+    #[test]
+    fn a_row_on_an_account_the_directory_does_not_hold_publishes_no_title() {
+        let main = account(1);
+        let asked = Question::IsOutflowAFee { account: main };
+        let open = open_questions(
+            &no_accounts(),
+            &[stored_row(1, &row(main, "Shop One", None))],
+            &[stored_question_about(1, &asked)],
+            &MirroredRows::default(),
+        );
+        let printed = open[0].printed.as_ref().expect("the row it is about");
+        assert_eq!(printed.account, main, "which is still addressable");
+        assert_eq!(printed.title, None);
+        assert_ne!(
+            printed.title.as_deref(),
+            Some(main.inner().to_string().as_str()),
+            "an absence, never the identifier rendered where a name belongs"
+        );
+        assert_eq!(printed.institution, None);
+    }
+
+    /// A pair says which two rows it is, and not only that it is a pair.
+    ///
+    /// The complaint: the identifier states that two questions are one decision
+    /// and states nothing about which two, so a caller that wanted to put the
+    /// decision once had to scan every other open question for a matching uuid
+    /// before it could name the other row to anybody. `alike`, the larger
+    /// relation, has published its rows outright since it existed.
+    #[test]
+    fn each_leg_of_one_movement_names_the_other_row_and_not_only_the_shared_identifier() {
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let rows = vec![read_row(1, &departure, None), read_row(2, &arrival, None)];
+        let questions = vec![
+            stored_question_about(1, &Question::IsOutflowAFee { account: main }),
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+        let mirrors = mirrored_rows(ImportSessionId::new_random(), &rows, &questions);
+        let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
+        let open = open_questions(&no_accounts(), &observations, &questions, &mirrors);
+        let (first, second) = (
+            open[0].pair.expect("the departure is one side"),
+            open[1].pair.expect("the arrival is the other"),
+        );
+        assert_eq!(first.id, second.id, "one decision, so one identifier");
+        assert_eq!(
+            first.row, open[1].row,
+            "and each names the row it is not, so the decision can be put in words"
+        );
+        assert_eq!(second.row, open[0].row);
+        assert_ne!(
+            first.row, open[0].row,
+            "never its own row, which would say a row pairs with itself"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -6161,8 +6161,12 @@ fn row_groups(
     }
     let mut pairs: BTreeMap<Uuid, Vec<u32>> = BTreeMap::new();
     for question in open {
-        if let Some(pair) = question.pair {
-            pairs.entry(pair).or_default().push(question.row);
+        if let Some(pair) = &question.pair {
+            // Keyed by the pair's own identifier and not by the pair: the other
+            // row it names differs between the two questions of one pair, which
+            // is the point of publishing it, and would put each leg in a group
+            // of its own.
+            pairs.entry(pair.id).or_default().push(question.row);
         }
     }
     for mut rows in pairs.into_values() {
@@ -9372,9 +9376,15 @@ mod tests {
     }
 
     /// One open question that is a leg of the movement `pair` names.
-    fn open_paired(row: u32, pair: Uuid) -> OpenQuestion {
+    ///
+    /// `other` is the row on the far side, which a real pair always names and
+    /// which the grouping deliberately does not key on.
+    fn open_paired(row: u32, pair: Uuid, other: u32) -> OpenQuestion {
         OpenQuestion {
-            pair: Some(pair),
+            pair: Some(MirroredPair {
+                id: pair,
+                row: other,
+            }),
             ..open_about(row)
         }
     }
@@ -9528,7 +9538,7 @@ mod tests {
         assert!(
             row_groups(
                 &observations,
-                &[open_paired(1, Uuid::from_bytes([7; 16]))],
+                &[open_paired(1, Uuid::from_bytes([7; 16]), 2)],
                 &directory
             )
             .is_empty(),
@@ -9560,8 +9570,8 @@ mod tests {
         let open = vec![
             open_alike(1, vec![2]),
             open_alike(2, vec![1]),
-            open_paired(3, pair),
-            open_paired(4, pair),
+            open_paired(3, pair, 4),
+            open_paired(4, pair, 3),
         ];
         let groups = row_groups(
             &observations,

@@ -49,3 +49,6 @@ lcov.info
 # ignoring it keeps repowise opt-in per clone. The other five hooks there are
 # beads' own and stay tracked.
 .beads/hooks/post-commit
+
+# repowise API keys (local)
+.repowise/.env

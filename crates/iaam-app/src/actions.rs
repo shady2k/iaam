@@ -5479,15 +5479,17 @@ mod tests {
             }
         }
         // The witness this sweep keeps is the item that once got the state
-        // wrong. It is no longer blocked — two operations begin an import — so
+        // wrong. It is no longer blocked — four operations begin an import — so
         // what it witnesses now is the other half of the same rule: an item that
-        // names operations must not say `blocked`.
+        // names operations must not say `blocked`. The count is pinned rather
+        // than merely non-zero: this item is the one every wave adds a
+        // resolution to, and a sweep that stopped counting would stop noticing.
         let import = actions
             .iter()
             .find(|action| action.kind() == ActionKind::StartAccountImport)
             .expect("account import action");
         assert_ne!(import.state(), ActionState::Blocked);
-        assert_eq!(import.target().resolutions().len(), 2);
+        assert_eq!(import.target().resolutions().len(), 4);
         assert_eq!(
             import.subject().and_then(ActionSubject::account),
             Some(account.id)

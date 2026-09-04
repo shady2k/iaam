@@ -17,7 +17,7 @@
 use iaam_core::dates::EventDates;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::{Confidence, Relation};
-use iaam_core::ids::{AccountId, EventId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, EventId, ImportId, ImportSessionId, OwnerId, SourceId};
 use time::{Date, Time};
 
 use crate::error::AppError;
@@ -111,6 +111,21 @@ pub struct JournalEventView {
     pub confidence: Confidence,
     pub idempotency_key: Option<String>,
     pub source: SourceId,
+    /// The import this fact arrived in, when the submission named one.
+    ///
+    /// Published beside the source because it is the narrower of the two and
+    /// the one a retraction actually takes: `POST /v1/corrections/imports`
+    /// decides on the import when a label was declared and on the source only
+    /// when none was. A caller shown the source alone can see which channel of
+    /// which account a fact came through and still cannot tell whether taking
+    /// it back would take one statement or every statement ever imported that
+    /// way.
+    ///
+    /// `None` means the submission named no import — rows from a channel that
+    /// declares no source at all, and rows recorded before imports could be
+    /// named. They are retracted as the one unnamed group they are, and a
+    /// reader must not read the absence as «this import has no name yet».
+    pub import: Option<ImportId>,
     pub source_operation_id: Option<String>,
     /// The category the source itself put on the row. Evidence, never a verdict.
     pub source_category: Option<String>,
@@ -209,6 +224,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
         source: event.provenance.source(),
+        import: event.provenance.import(),
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),
         source_category: event.provenance.source_category().map(str::to_owned),
         description: event.provenance.description().map(str::to_owned),

@@ -48,6 +48,16 @@ so the retraction is the ordinary one — that account, channel `csv`, and the
 no `idempotency_key` is identified by the document's digest and its own line
 number, so re-sending one document writes nothing the second time.
 
+**Corporate actions and offers are declared the same way.** The journal-fact
+channel had no declaration at all: it minted a source per request, so what it
+recorded was reachable one event at a time and never as the batch it arrived in,
+and a resubmission of the same facts was a second source rather than the same
+rows. It now takes the declaration the conclusive route takes — account, channel,
+label — and refuses a batch whose facts do not all name the declared account, so
+a batch spanning two accounts is two calls. Omitting the declaration still
+records the facts under a source minted for the request; that is what every
+caller written before had, and it is not a default worth choosing.
+
 **A session is not a second vocabulary.** `AddImportRowsRequest` carries the
 same `OperationDto` the conclusive route takes. The difference between the two
 channels is *when* the fact is written, not *what* a row may say. So anything

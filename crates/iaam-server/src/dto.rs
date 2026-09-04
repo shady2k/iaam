@@ -38,6 +38,7 @@ use iaam_app::scenarios::import_session::{
 // into the list above: this file is edited by several changes at once, and one
 // name added to a wrapped list reflows every line of it.
 use iaam_app::scenarios::import_session::Generalisation;
+use iaam_app::scenarios::import_session::PlannedOrigin;
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
@@ -7415,10 +7416,41 @@ impl JournalEventDto {
 }
 
 /// Request to ingest journal facts.
+///
+/// The free-text `source_label` this request used to carry is gone, and it is
+/// the same removal [`SubmitOperationsRequest`] made: it reached no production
+/// path, so a caller writing `manual entry` into it was naming nothing, and a
+/// field accepted and ignored is worse than one that is absent — it reads like
+/// the answer to «where did these come from» and is not. What answers that
+/// question is `source`, and it is the same declaration every other channel
+/// takes. Unknown members are ignored, so a caller still sending the old field
+/// is answered exactly as it was.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubmitJournalEventsRequest {
-    /// Source label: manual entry, a specific agent, a specific file.
-    pub source_label: String,
+    /// The source these facts arrive under, and the import within it.
+    ///
+    /// **One declaration for the batch, not one per fact**, and that follows
+    /// from what a source is: it is keyed on one account, and every fact here
+    /// already names an account of its own. A declaration is therefore a
+    /// statement about all of them, and a fact naming another account is
+    /// refused before anything is written — the whole batch, not the row. An
+    /// unreadable fact is one fact the caller got wrong and its neighbours
+    /// stand; a fact for another account contradicts the declaration the caller
+    /// made over all of them, and writing the agreeing half would record a
+    /// half-import under an identity that names the wrong account. A batch that
+    /// genuinely spans two accounts is two calls, exactly as it is on
+    /// `POST /v1/ingest/operations`.
+    ///
+    /// Omitting it is still allowed and still means what it always meant: the
+    /// facts arrive under a source minted for this request, which nothing can
+    /// name again. Such facts cannot be retracted as a group, and a
+    /// resubmission that identifies them only by what its source printed is
+    /// recorded a second time — §10.6 scopes that identifier to the source, and
+    /// the second call is a second source. That is the behaviour every caller
+    /// written before this field had, kept so that none of them breaks; it is
+    /// not a default worth choosing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<DeclaredSourceDto>,
     pub events: Vec<JournalEventDto>,
 }
 
@@ -7474,6 +7506,31 @@ pub struct JournalEventReadDto {
     /// the account and the channel when the caller declared a source, and
     /// minted per request when it did not.
     pub source: Uuid,
+    /// The import this row arrived in, when the submission that carried it
+    /// named one.
+    ///
+    /// The identifier a retraction is decided on, and the reason it is
+    /// published beside `source` rather than left to be derived: `source`
+    /// answers «which channel of which account», which covers every import that
+    /// ever arrived that way, and `POST /v1/corrections/imports` takes the
+    /// whole of that when the caller names no label. A client reading a row
+    /// back could see the channel and still not know whether taking this row
+    /// back would take one statement or a year of them.
+    ///
+    /// It is not an address the way `import_session` is — nothing accepts it as
+    /// a path segment, because an import is derived from a declaration rather
+    /// than minted, and the way to name it again is to repeat the account,
+    /// channel and label it was declared with. What it is good for is
+    /// comparison: two rows carrying the same value are one import, and that is
+    /// the group a retraction takes.
+    ///
+    /// Absent for every row whose submission declared no label — including
+    /// every row of a channel that declares no source at all — and for
+    /// everything recorded before imports could be named. The two are not
+    /// distinguishable, so absence is «no import is recorded», never «this row
+    /// belongs to no import».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_operation_id: Option<String>,
     /// The category the source itself put on the row. Evidence about what the
@@ -7686,6 +7743,7 @@ impl JournalEventReadDto {
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
             source: view.source.inner(),
+            import: view.import.map(|import| import.inner()),
             source_operation_id: view.source_operation_id.clone(),
             source_category: view.source_category.clone(),
             description: view.description.clone(),
@@ -8769,6 +8827,41 @@ pub struct OpenQuestionDto {
     pub prompt: String,
 }
 
+/// The identity one account's planned facts will carry into the journal.
+///
+/// An object rather than two identifiers flattened onto the delta or joined into
+/// a string (conventions §5): the pair is a structure, and printing it as one
+/// keeps the account, the source and the import together the way the commit
+/// applies them.
+///
+/// The account is a bare identifier, on the same grounds `BatchTotalDto`'s is
+/// (conventions §3.5): the assessment this sits in carries `account_resolution`,
+/// which names every account these rows are on and says which of them the
+/// owner's directory holds, computed by the same fold — and an origin for rows
+/// on an account the directory has never heard of is exactly what this section
+/// must be able to publish.
+///
+/// No event identifier and no row number: an origin belongs to an account's
+/// whole share of the batch, and every planned fact on that account carries the
+/// same one. Repeating it per row would invite a reader to believe two facts on
+/// one account could differ in it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlannedOriginDto {
+    pub account: Uuid,
+    /// The source these facts will be recorded under: which channel of which
+    /// account they arrive by, and what deduplication is scoped by.
+    pub source: Uuid,
+    /// The import a retraction would be keyed on, when this session names one.
+    ///
+    /// Absent where the session declared a source and no label: those rows are
+    /// retracted together with every other unlabelled row of the same account
+    /// and channel, which is what declaring no label means. A session that
+    /// declared nothing at all always names one, derived from its own
+    /// identifier — the handle the caller has held since it opened the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<Uuid>,
+}
+
 /// One fact the commit would write.
 ///
 /// No event identifier: it is minted at commit, and naming one here would name a
@@ -8798,6 +8891,20 @@ pub struct CommitDeltaDto {
     pub duplicates: Vec<PlannedFactDto>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRowDto>,
+    /// The provenance `facts` will be written under, per account.
+    ///
+    /// Without it a plan says what a commit will write and not what it will be
+    /// written under, so a client reviewing an import before committing it
+    /// cannot answer the question the review exists for: if this is wrong, what
+    /// does taking it back have to name. Per account rather than once, because a
+    /// session that declared nothing derives its identity from the account each
+    /// row is on — one source at the top of the plan would be untrue of any
+    /// session covering two accounts, and covering several is what a free
+    /// session is for.
+    ///
+    /// Facts only. A duplicate appends nothing, so no provenance here would be
+    /// the one it was written under.
+    pub fact_origins: Vec<PlannedOriginDto>,
     /// What `facts` come to, per account and currency.
     ///
     /// One number to compare with one number. Without it a client checking a
@@ -9138,6 +9245,12 @@ impl ImportPlanDto {
                     .iter()
                     .map(RetainedRowDto::from_domain)
                     .collect(),
+                fact_origins: plan
+                    .commit_delta
+                    .fact_origins
+                    .iter()
+                    .map(PlannedOriginDto::from_domain)
+                    .collect(),
                 fact_totals: plan
                     .commit_delta
                     .fact_totals
@@ -9156,6 +9269,17 @@ impl ImportPlanDto {
             ),
             readiness: readiness.to_owned(),
             readiness_detail,
+        }
+    }
+}
+
+impl PlannedOriginDto {
+    #[must_use]
+    pub fn from_domain(origin: &PlannedOrigin) -> Self {
+        Self {
+            account: origin.account.inner(),
+            source: origin.source.inner(),
+            import: origin.import.map(|import| import.inner()),
         }
     }
 }

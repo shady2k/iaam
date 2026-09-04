@@ -30,9 +30,11 @@ source's format sits for each.
 | `POST /v1/ingest/operations` | either | already-converted rows | outside the repository |
 | `POST /v1/import-sessions` … `/commit` | either | already-converted rows | outside the repository |
 | `POST /v1/ingest/journal-events` | owner | corporate actions and offers | — |
-| a document read by a **source profile** | agent or owner | an institution's own export | `crates/iaam-ingest/schema/source-profile-v1.json` and one profile per document type, in tree or beside the deployment |
+| `POST /v1/import-sessions/{session}/document` | agent or owner | an institution's own export, as it prints it | `crates/iaam-ingest/schema/source-profile-v1.json` and one profile per document type — `crates/iaam-ingest/profiles/`, in tree and in the image, or beside the deployment under `IAAM_SOURCE_PROFILES` |
 
 The last row is the one this document used to say was not a route. Decision
+`GET /v1/source-profiles` publishes what this instance reads with, and what it
+refused and why. Decision
 0019 settles what a source profile is and what it may say, decision 0022 settles
 who may hand such a document over, and the channel that carries it lands beside
 this change; §9 below is what the row means.

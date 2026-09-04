@@ -249,7 +249,23 @@ fn decode(bytes: &[u8], encoding: Encoding) -> Result<String, Rejection> {
         expected: format!("bytes this document's profile can read as {code}"),
         actual: "bytes that are not text in that encoding".to_owned(),
     };
+    // A byte-order mark is refused here rather than left to the reader, and the
+    // reason is that the reader does not leave it: the `csv` crate strips a
+    // leading mark whatever the profile said, so a profile describing a
+    // document without one would silently read one that has it. The two spellings
+    // would then be a distinction the schema offers and the engine cannot make.
+    // A mark is not an unreadable byte — it is a different document from the one
+    // this profile describes, and the refusal says so in those words.
+    let marked = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
     match encoding {
+        Encoding::Utf8 if marked => Err(Rejection {
+            field: "document".to_owned(),
+            expected: "a document with no byte-order mark, which is what this profile \
+                       describes; a profile for a document that carries one names the \
+                       encoding utf-8-bom"
+                .to_owned(),
+            actual: "a leading byte-order mark".to_owned(),
+        }),
         Encoding::Utf8 => std::str::from_utf8(bytes)
             .map(ToOwned::to_owned)
             .map_err(|_| unreadable("utf-8")),

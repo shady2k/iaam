@@ -3366,7 +3366,14 @@ mod tests {
         //        it may now meet a fact it cannot place: one whose far side is
         //        an account of the owner's that no contour can prove it holds,
         //        and one that posts no leg at all.
-        assert_eq!(SCHEMA_VERSION, 13);
+        // 13 → 14: added the optional source operation word in `Provenance`,
+        //        beside the source category it used to be written through
+        //        (iaam-p683). Older facts stay readable because the field
+        //        defaults to absent, and nothing rewrites them: a fact below
+        //        this version whose `source_category` holds an operation word
+        //        keeps it, because a repair would be this software guessing
+        //        what a source said.
+        assert_eq!(SCHEMA_VERSION, 14);
     }
 
     #[test]

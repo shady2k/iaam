@@ -883,6 +883,7 @@ mod tests {
     };
     use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
     use iaam_core::event::kind::{EventKind, IncomeKind};
+    use iaam_core::event::provenance::ParserVersion;
     use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
     use iaam_core::projection::{ProjectionContext, project};
     use iaam_core::reconciliation::{Dimension, claim::ControlClaim};

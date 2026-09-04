@@ -1,10 +1,15 @@
 //! CSV parsing (§10.1).
 //!
 //! A line is a parsing unit: an unrecognized line receives a verdict, and
-//! document parsing continues. Account and instrument are specified by
-//! human-readable names and resolved through the reference directory: UUIDs
-//! in a file filled in by a human are a way to guarantee
-//! errors.
+//! document parsing continues. An instrument and a place of custody are named
+//! by a human-readable name and resolved through the reference directory: UUIDs
+//! in a file filled in by a human are a way to guarantee errors.
+//!
+//! An **account** is not one of those. Its cell goes through the tiering of
+//! decision 0004 — iaam's own identifier, then the identifier the source prints
+//! for the account, then the owner's title for it — because the same question
+//! is asked of a JSON batch, and one flow that answered it in two vocabularies
+//! taught a caller a rule the other half of the flow did not keep (iaam-w49n).
 //!
 //! Amounts are recorded as decimal numbers. A number with greater precision,
 //! than the currency's minimum unit is **rejected**, not rounded:
@@ -28,6 +33,10 @@ use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_min
 use crate::verdict::Rejection;
 
 /// Name directory. Populated by a wrapper from account and instrument tables.
+///
+/// Three tables, and only one of them is tiered: see [`AccountNames`] for why
+/// an account is not looked up by name, and `lookup_custody` for why a place of
+/// custody still is.
 #[derive(Debug, Clone, Default)]
 pub struct Directory {
     pub accounts: AccountNames,
@@ -37,8 +46,258 @@ pub struct Directory {
     pub default_custody: Option<CustodyId>,
 }
 
-/// Account names, preserving all matches.
-pub type AccountNames = BTreeMap<String, Vec<AccountId>>;
+/// The owner's accounts, in every vocabulary a document may name one by.
+///
+/// This was a `BTreeMap<String, Vec<AccountId>>` keyed on the account's title,
+/// and a map is the wrong shape for the question (iaam-w49n). A map pools every
+/// vocabulary into one key space, so it cannot say *which* vocabulary matched,
+/// and therefore cannot let one beat another; and where two vocabularies happen
+/// to agree on a string — an account whose title is another account's printed
+/// identifier — the map turns the agreement into a collision and refuses the
+/// document. Decision 0004 wants an identity to win over a title rather than
+/// tie with it, so the vocabularies are searched in order, and a list is what
+/// can be searched in order.
+#[derive(Debug, Clone, Default)]
+pub struct AccountNames {
+    entries: Vec<AccountEntry>,
+}
+
+/// One account, and every string that names it.
+///
+/// Filled by whoever read the account out of the store, because this crate
+/// knows nothing about a store. What a builder must **not** do is decide
+/// anything while filling it: which vocabulary outranks which is
+/// [`AccountNames::candidates`]'s decision alone, and a builder that dropped a
+/// title, or wrote a printed identifier into the title field to make it
+/// resolve, would be a second and invisible copy of that decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountEntry {
+    pub id: AccountId,
+    /// What a source prints for this account: the identity of decision 0004,
+    /// and the aliases that reach the same account — a card among them.
+    ///
+    /// `None` for an interval is an identifier with no dated life, which is what
+    /// `provider_account_id` is: the owner stated it for the account, not for a
+    /// stretch of its history. A card carries its own interval, and two cards
+    /// over one underlying account are two entries here and one account.
+    pub printed: Vec<(String, Option<AliasInterval>)>,
+    /// The owner's own name for the account.
+    pub title: String,
+}
+
+impl AccountEntry {
+    /// An account known by nothing but the owner's name for it.
+    ///
+    /// Every account that existed before decision 0004 is one of these, which
+    /// is why the constructor exists rather than being spelled out at each call
+    /// site: the empty `printed` is the normal case, not a stub.
+    #[must_use]
+    pub fn titled(title: impl Into<String>, id: AccountId) -> Self {
+        Self {
+            id,
+            printed: Vec::new(),
+            title: title.into(),
+        }
+    }
+
+    /// Whether one of the identifiers this account's source prints is `printed`.
+    ///
+    /// The identity and the aliases are compared **verbatim**: decision 0004
+    /// defines `provider_account_id` as opaque to iaam, and equality is the
+    /// whole contract. Case-folding it would be a claim about what the value
+    /// means, and the first rule that depended on that claim would be depending
+    /// on a parse. The title tier below folds case; this one must not, and the
+    /// difference is the point.
+    ///
+    /// An alias is read against the day of the row where there is one, so a card
+    /// whose interval has closed stops recognising rows posted after it. Where
+    /// the row carries no date the interval is not consulted: refusing the alias
+    /// anyway would be a conclusion drawn from a field the row does not have —
+    /// see [`AccountNames::resolve`] for why a document has no such day.
+    fn identifies(&self, printed: &str, on: Option<Date>) -> bool {
+        self.printed.iter().any(|(value, interval)| {
+            value == printed
+                && match interval {
+                    None => true,
+                    Some(interval) => on.is_none_or(|day| interval.covers(day)),
+                }
+        })
+    }
+}
+
+impl FromIterator<AccountEntry> for AccountNames {
+    fn from_iter<I: IntoIterator<Item = AccountEntry>>(entries: I) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
+        }
+    }
+}
+
+impl AccountNames {
+    /// Add one account to the directory.
+    pub fn insert(&mut self, entry: AccountEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Every account a printed string could be, from the strongest kind of
+    /// evidence that recognised anything.
+    ///
+    /// Three tiers, tried in order, and the search stops at the first that
+    /// matches at all rather than pooling them:
+    ///
+    /// 1. **iaam's own account identifier**, printed verbatim.
+    /// 2. **The identity the source prints** for the account, and the aliases
+    ///    that reach the same account — a card among them (decision 0004). An
+    ///    alias is read against the day of the row where the row carries one.
+    /// 3. **The account's title**, trimmed and case-insensitively.
+    ///
+    /// The order is the decision. A title is what the owner reads and may
+    /// rename at any moment; an identity is what a source repeats. So an
+    /// identity must not merely tie with a title — a rename would otherwise
+    /// silently re-point a resolution, which is the defect decision 0004 was
+    /// written about. Stopping at the first tier that matched is what makes it
+    /// beat rather than tie: an identity naming one account is not diluted by
+    /// another account whose title happens to agree, and — the other way round —
+    /// a title shared by two accounts is not settled by an identity somewhere
+    /// below it, because nothing below is consulted.
+    ///
+    /// **The title tier stays**, deliberately. Every account that existed before
+    /// decision 0004 states no identity and has no aliases, and dropping the
+    /// tier would stop recognising their transfers until each is back-filled —
+    /// and, on a document, would refuse every row of every CSV written before
+    /// this change. That is a silent behaviour change bought for no
+    /// correctness. Its one failure mode is a collision, and a collision is
+    /// refused here rather than guessed at.
+    #[must_use]
+    pub fn candidates(&self, name: &str, on: Option<Date>) -> Vec<AccountId> {
+        let printed = name.trim();
+
+        if let Ok(id) = uuid::Uuid::parse_str(printed) {
+            let own: Vec<AccountId> = self
+                .entries
+                .iter()
+                .filter(|account| account.id.inner() == id)
+                .map(|account| account.id)
+                .collect();
+            if !own.is_empty() {
+                return own;
+            }
+        }
+
+        let identified: Vec<AccountId> = self
+            .entries
+            .iter()
+            .filter(|account| account.identifies(printed, on))
+            .map(|account| account.id)
+            .collect();
+        if !identified.is_empty() {
+            return identified;
+        }
+
+        let wanted = printed.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|account| account.title.trim().to_lowercase() == wanted)
+            .map(|account| account.id)
+            .collect()
+    }
+
+    /// The one account a printed string names, or why it names none.
+    ///
+    /// **No date is asked for, and an alias therefore matches over its whole
+    /// life.** A document is a file, not a day: its rows may span a card
+    /// replacement, so requiring the identifier to be valid on the row's own
+    /// date would refuse the very statement that shows the change. The interval
+    /// still decides where it can decide something — on a row's *counterparty*,
+    /// which is a guess about a printed string rather than the account whose
+    /// statement the row is on.
+    ///
+    /// The refusal is worded here and nowhere else, so that every field in every
+    /// format refuses an identifier in the same words. Two wordings would
+    /// eventually describe two different rules, and the caller reading one of
+    /// them would have learned a rule the other route does not keep — which is
+    /// precisely the defect this replaced: a row's account was refused with
+    /// `directory name`, a sentence naming no vocabulary at all, while the same
+    /// question asked over JSON named two.
+    ///
+    /// **The title tier is resolved but not offered.** [`Self::candidates`]
+    /// still matches a title, so no document written before this change stops
+    /// parsing; the refusal names only the two identifiers, because
+    /// `docs/api/conventions.md` §3.2 is that a name is not an identity, and a
+    /// caller told "send the title" has been told to depend on a string the
+    /// owner may rename tomorrow.
+    pub fn resolve(&self, printed: &str) -> Result<AccountId, UnresolvedAccount> {
+        let matched = self.candidates(printed, None);
+        let [only] = matched[..] else {
+            return Err(UnresolvedAccount {
+                expected: if matched.is_empty() {
+                    "an account of the owner's, named by its iaam identifier or \
+                     by the identifier its source prints for it"
+                        .to_owned()
+                } else {
+                    "an identifier naming exactly one account: name one of them \
+                     by its iaam identifier, or give exactly one of them the \
+                     identifier this source prints (provider, provider_account_id)"
+                        .to_owned()
+                },
+                actual: if matched.is_empty() {
+                    format!("«{printed}» names none of the owner's accounts")
+                } else {
+                    format!(
+                        "«{printed}» names {} of the owner's accounts: {}",
+                        matched.len(),
+                        matched
+                            .iter()
+                            .map(|id| format!("{} ({})", self.title(*id), id.inner()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+            });
+        };
+        Ok(only)
+    }
+
+    /// The owner's name for an account, for a refusal he has to read.
+    ///
+    /// Falls back to the identifier for an account this directory does not hold,
+    /// which cannot happen for a candidate it produced itself; the fallback is
+    /// there so that a caller passing an unrelated identifier gets a legible
+    /// string rather than a panic.
+    #[must_use]
+    pub fn title(&self, account: AccountId) -> String {
+        self.entries
+            .iter()
+            .find(|known| known.id == account)
+            .map_or_else(|| account.inner().to_string(), |known| known.title.clone())
+    }
+}
+
+/// Why a printed identifier named no single account, before a field name is put
+/// on it.
+///
+/// The two halves of a refusal that do not depend on where the identifier was
+/// written: what the field admits, and what arrived. The field itself is added
+/// by the caller, because one failure is `source.account` on a declaration,
+/// `account` on a row of iaam's own CSV, `counterparty_account` on the far side
+/// of a transfer, and a sheet's own column in a broker report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAccount {
+    pub expected: String,
+    pub actual: String,
+}
+
+impl UnresolvedAccount {
+    /// The same refusal, pointed at the column that carried the string.
+    #[must_use]
+    pub fn into_rejection(self, field: &str) -> Rejection {
+        Rejection {
+            field: field.to_owned(),
+            expected: self.expected,
+            actual: self.actual,
+        }
+    }
+}
 
 /// Custody location names, preserving all matches.
 pub type CustodyNames = BTreeMap<String, Vec<CustodyId>>;
@@ -328,7 +587,7 @@ pub fn parse(content: &str, directory: &Directory) -> Vec<ParsedRow> {
 fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperation, Rejection> {
     let date = parse_date(&row.date)?;
     let currency = parse_currency(&row.currency)?;
-    let account = lookup(&directory.accounts, &row.account, "account", "account")?;
+    let account = resolve_named_account(&row.account, directory, "account")?;
     let kind = build_kind(row, directory, currency, date)?;
 
     Ok(SubmittedOperation {
@@ -364,11 +623,10 @@ fn build_kind(
             currency,
         }),
         "transfer" => Ok(OperationKind::Transfer {
-            to: lookup(
-                &directory.accounts,
+            to: resolve_named_account(
                 row.counterparty_account.as_deref().unwrap_or_default(),
+                directory,
                 "counterparty_account",
-                "account",
             )?,
             amount_minor: minor(row.amount.as_deref(), "amount", currency)?,
             currency,
@@ -423,17 +681,31 @@ fn resolve_custody(name: Option<&str>, directory: &Directory) -> Result<CustodyI
         Some(name) if !name.is_empty() => resolve_named_custody(name, directory, "custody"),
         _ => directory.default_custody.ok_or_else(|| Rejection {
             field: "custody".into(),
-            expected: "known storage location or default value".into(),
+            expected: "a place of custody of the owner's, or a default one for \
+                       this account"
+                .into(),
             actual: "not specified".into(),
         }),
     }
 }
+
+/// The account a column names, refused in the vocabulary the whole system
+/// refuses one in.
+///
+/// Every format's account column comes through here — iaam's own CSV, both
+/// broker reports — so that a caller who learned on one what iaam accepts has
+/// learned it for all of them. The field name is the only thing that differs,
+/// and it is a parameter for exactly that reason: the caller must be sent to
+/// the cell it actually wrote.
 pub(crate) fn resolve_named_account(
     name: &str,
     directory: &Directory,
     field: &'static str,
 ) -> Result<AccountId, Rejection> {
-    lookup(&directory.accounts, name, field, "account")
+    directory
+        .accounts
+        .resolve(name)
+        .map_err(|refusal| refusal.into_rejection(field))
 }
 
 pub(crate) fn resolve_named_custody(
@@ -441,7 +713,7 @@ pub(crate) fn resolve_named_custody(
     directory: &Directory,
     field: &'static str,
 ) -> Result<CustodyId, Rejection> {
-    lookup(&directory.custodies, name, field, "storage location")
+    lookup_custody(&directory.custodies, name, field)
 }
 
 fn build_trade(
@@ -490,31 +762,42 @@ fn build_trade(
     }
 }
 
-fn lookup<T: Copy>(
-    table: &BTreeMap<String, Vec<T>>,
+/// The place of custody a name reaches, or a refusal saying what was wanted.
+///
+/// This used to be generic and served the account table too, and both refusals
+/// then read `directory name` — a sentence that names no vocabulary, and the
+/// *same* sentence for two different questions, so a caller could not tell from
+/// it whether iaam had failed to find an account or a depository (iaam-w49n).
+/// Accounts left through [`AccountNames::resolve`]; one table is left, and a
+/// refusal about one table can say which one it is about.
+///
+/// **There is no tiering here, and that is not an omission.** A place of custody
+/// has exactly one vocabulary: the title the owner gave it. No source prints an
+/// identity for it, so there is nothing for a title to lose to, and a tier
+/// structure over a single vocabulary would be a decision that never applies
+/// while looking like one that does.
+fn lookup_custody(
+    table: &CustodyNames,
     name: &str,
     field: &'static str,
-    entity: &'static str,
-) -> Result<T, Rejection> {
+) -> Result<CustodyId, Rejection> {
+    const EXPECTED: &str = "a place of custody of the owner's, named by the title he gave it";
+    let unknown = || Rejection {
+        field: field.to_owned(),
+        expected: EXPECTED.to_owned(),
+        actual: name.to_owned(),
+    };
     let Some(candidates) = table.get(name) else {
-        return Err(Rejection {
-            field: field.to_owned(),
-            expected: "directory name".into(),
-            actual: name.to_owned(),
-        });
+        return Err(unknown());
     };
     match candidates.as_slice() {
         [single] => Ok(*single),
-        [] => Err(Rejection {
-            field: field.to_owned(),
-            expected: "directory name".into(),
-            actual: name.to_owned(),
-        }),
+        [] => Err(unknown()),
         _ => Err(Rejection {
             field: field.to_owned(),
-            expected: "unambiguous name from the directory".into(),
+            expected: "a title naming exactly one place of custody".into(),
             actual: format!(
-                "{name}: {entity} name is ambiguous: {} {entity}s",
+                "{name}: the title is ambiguous: it names {} places of custody",
                 candidates.len()
             ),
         }),
@@ -576,6 +859,90 @@ fn optional_minor(
 mod tests {
     use super::*;
     use time::macros::date;
+
+    /// An account named by the identifier its source prints resolves, and the
+    /// identity beats a title rather than tying with it.
+    ///
+    /// The tiering used to live above this crate, so a document's `account`
+    /// column reached a title map and nothing else (iaam-w49n). The collision
+    /// is the part worth pinning: two accounts, one of which is *called* what
+    /// the other's source *prints*, is the case a flat name table cannot tell
+    /// apart, and the case a rename would silently re-point.
+    #[test]
+    fn a_printed_identifier_names_an_account_and_outranks_a_title_that_agrees() {
+        let identified = AccountId::new_random();
+        let namesake = AccountId::new_random();
+        let names: AccountNames = [
+            AccountEntry {
+                id: identified,
+                printed: vec![("ACC-1".to_owned(), None)],
+                title: "Main".to_owned(),
+            },
+            AccountEntry::titled("ACC-1", namesake),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            names.resolve("ACC-1").expect("the identity settles it"),
+            identified,
+            "an identity is not diluted by an account whose title agrees with it"
+        );
+        assert_eq!(
+            names.resolve("Main").expect("the title still resolves"),
+            identified,
+            "the title tier stays, or every document written before this stops \
+             parsing"
+        );
+        assert_eq!(
+            names
+                .resolve(&namesake.inner().to_string())
+                .expect("iaam's own identifier is the first tier"),
+            namesake,
+        );
+    }
+
+    /// A string naming none of the owner's accounts is refused in the sentence
+    /// the whole system refuses one in.
+    ///
+    /// `expected` used to read `directory name`: it named no vocabulary, so a
+    /// caller holding a statement could not tell an unknown account from an
+    /// account named the wrong way. The title tier is deliberately absent from
+    /// the sentence — it resolves for compatibility and is not offered, per
+    /// `docs/api/conventions.md` §3.2.
+    #[test]
+    fn an_unresolvable_account_is_refused_in_the_vocabularies_it_would_accept() {
+        let names: AccountNames = [AccountEntry::titled("Main", AccountId::new_random())]
+            .into_iter()
+            .collect();
+
+        let refused = names
+            .resolve("acct-9")
+            .expect_err("no account answers to it");
+
+        assert_eq!(
+            refused.expected,
+            "an account of the owner's, named by its iaam identifier or by the \
+             identifier its source prints for it"
+        );
+        assert!(
+            refused.actual.contains("acct-9"),
+            "the refusal quotes what arrived: {}",
+            refused.actual
+        );
+        assert!(
+            !refused.expected.contains("title"),
+            "a title resolves but is never offered: a caller told to send one \
+             has been told to depend on a string the owner may rename: {}",
+            refused.expected
+        );
+        assert_eq!(
+            refused.into_rejection("counterparty_account").field,
+            "counterparty_account",
+            "the field is the caller's, because one failure is written in four \
+             different columns"
+        );
+    }
 
     #[test]
     fn an_instrument_named_by_code_is_resolved_on_the_row_date() {
@@ -1021,7 +1388,11 @@ mod tests {
             resolve_named_custody("НРД", &directory, "custody").expect_err("empty custody history");
 
         assert_eq!(refused.field, "custody");
-        assert_eq!(refused.expected, "directory name");
+        assert_eq!(
+            refused.expected, "a place of custody of the owner's, named by the title he gave it",
+            "the refusal names the vocabulary this column accepts, and names the \
+             kind of thing it is about: a place of custody is not an account"
+        );
         assert_eq!(refused.actual, "НРД");
     }
 }

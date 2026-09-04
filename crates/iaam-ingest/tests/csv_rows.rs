@@ -2,7 +2,7 @@
 
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId};
 use iaam_core::instrument::AliasInterval;
-use iaam_ingest::csv_source::{Directory, ParsedRow, parse};
+use iaam_ingest::csv_source::{AccountEntry, Directory, ParsedRow, parse};
 use iaam_ingest::operation::OperationKind;
 use time::macros::date;
 
@@ -14,9 +14,7 @@ fn directory() -> (Directory, AccountId, InstrumentId) {
         ..Directory::default()
     };
     dir.accounts
-        .entry("Брокерский".into())
-        .or_default()
-        .push(account);
+        .insert(AccountEntry::titled("Брокерский", account));
     dir.instruments.insert(
         "SBER".into(),
         vec![(
@@ -84,13 +82,9 @@ fn ambiguous_account_name_is_rejected_only_in_referencing_row() {
     let duplicate = AccountId::new_random();
     let unique = AccountId::new_random();
     dir.accounts
-        .entry("Брокерский".into())
-        .or_default()
-        .push(duplicate);
+        .insert(AccountEntry::titled("Брокерский", duplicate));
     dir.accounts
-        .entry("Однозначный".into())
-        .or_default()
-        .push(unique);
+        .insert(AccountEntry::titled("Однозначный", unique));
 
     let document = format!(
         "{HEADER}\n\
@@ -103,9 +97,18 @@ fn ambiguous_account_name_is_rejected_only_in_referencing_row() {
         panic!("ambiguous name must be rejected: {:?}", rows[0]);
     };
     assert_eq!(rejection.field, "account");
-    assert_eq!(
-        rejection.actual,
-        "Брокерский: account name is ambiguous: 2 accounts"
+    assert!(
+        rejection.actual.contains("Брокерский")
+            && rejection.actual.contains("names 2 of the owner's accounts")
+            && rejection.actual.contains(&duplicate.inner().to_string()),
+        "an ambiguity the owner cannot see is one he cannot clear, so the \
+         refusal names both accounts it reached: {}",
+        rejection.actual
+    );
+    assert!(
+        rejection.expected.contains("provider_account_id"),
+        "and it says what would settle it: {}",
+        rejection.expected
     );
 
     let ParsedRow::Operation(operation) = &rows[1] else {

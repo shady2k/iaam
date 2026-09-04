@@ -2570,9 +2570,19 @@ async fn each_verdict_names_the_row_it_belongs_to() {
     assert_eq!(body[3]["verdict"], "provisional");
 }
 
+/// A document resolves its `account` column against the owner's directory, and
+/// refuses a cell that reaches nothing in words that name what it would accept.
+///
+/// The refusal used to read `directory name` — a sentence that names no
+/// vocabulary, on a route that in fact accepted exactly one: the account's
+/// title. `POST /v1/ingest/operations` answered the same question and named
+/// two, so a caller that had learned the printed identifier works sent it here
+/// and read back a refusal that sounds like the account does not exist
+/// (iaam-w49n). Both flows now resolve through one tiering and refuse in one
+/// sentence.
 #[tokio::test]
 async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
-    // The name lookup is built from the owner's accounts. An empty lookup
+    // The directory is built from the owner's accounts. An empty one
     // would reject the entire document on the account field, and «no account was set up»
     // would become indistinguishable from «the lookup failed».
     let harness = harness();
@@ -2602,16 +2612,22 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
     assert_eq!(verdicts[2]["verdict"], "provisional");
 
     // The refusal is pinned in all three of its fields, not just the one that
-    // says which column failed. This route resolves an account by the title the
-    // document prints and nothing else, so `expected` is the whole of what tells
-    // a caller holding a statement that a number will not do here — and it is
-    // deliberately not the wording `POST /v1/ingest/operations` refuses a row
-    // with, which offers the identifier the source prints as well.
+    // says which column failed. `expected` is what tells a caller holding a
+    // statement what to send instead, and it is deliberately word for word the
+    // sentence `POST /v1/ingest/operations` refuses a row with: one question
+    // asked of one system answers in one vocabulary.
     assert_eq!(verdicts[1]["verdict"], "rejected");
     assert_eq!(verdicts[1]["field"], "account");
-    assert_eq!(verdicts[1]["expected"], "directory name", "{verdicts:?}");
     assert_eq!(
-        verdicts[1]["actual"], "No such account",
+        verdicts[1]["expected"],
+        "an account of the owner's, named by its iaam identifier or by the \
+         identifier its source prints for it",
+        "{verdicts:?}"
+    );
+    assert!(
+        verdicts[1]["actual"]
+            .as_str()
+            .is_some_and(|actual| actual.contains("No such account")),
         "the refusal quotes the name the document printed, so the owner can see \
          which cell reached nothing: {verdicts:?}"
     );
@@ -2639,6 +2655,136 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
     assert!(
         !journal_keys(&harness).await.contains(&"csv-2".to_owned()),
         "a rejected row records nothing under its key: {recorded:?}"
+    );
+}
+
+/// A document names an account the way its source prints it, and lands on the
+/// same account the owner's own title would have reached.
+///
+/// This is the case the bug was filed for. `POST /v1/ingest/operations` has
+/// resolved a row's account through the tiering of decision 0004 since
+/// `iaam-varx` — iaam's identifier, then the identifier the source prints, then
+/// the title — while a document resolved the title and nothing else. An agent
+/// that had learned on one route that the printed identifier works sent it to
+/// the other and had every row refused, in words that sounded like the account
+/// did not exist (iaam-w49n).
+///
+/// All three vocabularies are sent in one document rather than in three,
+/// because the claim is that they are one question: three documents could each
+/// pass while the three answers disagreed about which account they reached, and
+/// the journal is read back per row to state that they did not.
+#[tokio::test]
+async fn a_document_names_an_account_by_the_identifier_its_source_prints() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+    let before = journal_rows(&harness).await;
+
+    let document = format!(
+        "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
+         2025-04-01,deposit,acct-1,,,,,100.00,,,RUB,by-printed-identifier\n\
+         2025-04-02,deposit,{created},,,,,200.00,,,RUB,by-iaam-identifier\n\
+         2025-04-03,deposit,Main,,,,,300.00,,,RUB,by-title\n"
+    );
+    let (status, verdicts) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    for verdict in verdicts.as_array().expect("verdicts") {
+        assert_eq!(
+            verdict["verdict"], "provisional",
+            "every vocabulary the flow accepts is accepted here too: {verdicts}"
+        );
+    }
+
+    // And what each row resolved to is read out of the journal, not taken from
+    // the verdict word: three `provisional` verdicts would say exactly this much
+    // even if the three rows had landed on three different accounts.
+    assert_eq!(
+        journal_rows(&harness).await,
+        before + 3,
+        "all three rows were recorded: {verdicts}"
+    );
+    let recorded = journal_events(&harness).await;
+    for key in ["by-printed-identifier", "by-iaam-identifier", "by-title"] {
+        let row = recorded
+            .iter()
+            .find(|row| row["idempotency_key"] == key)
+            .unwrap_or_else(|| panic!("{key} is in the journal: {recorded:?}"));
+        assert_eq!(
+            row["account"].as_str(),
+            Some(created.as_str()),
+            "«{key}» named the one account three ways and reached it three \
+             times: {row}"
+        );
+    }
+}
+
+/// Both flows refuse an account they cannot find in the same sentence.
+///
+/// The defect was not only that a document accepted less than a JSON batch: it
+/// was that neither refusal said which vocabularies it accepted, so a caller
+/// could not learn the difference from the response that failed. Asserting the
+/// two strings against each other rather than against a literal is the point —
+/// a later change that reworded one refusal and not the other reopens the trap
+/// even if both wordings are individually good.
+#[tokio::test]
+async fn a_document_and_a_batch_refuse_an_unknown_account_in_the_same_words() {
+    let harness = harness();
+    let stranger = "an-account-he-never-declared";
+
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-04-01,deposit,{stranger},,,,,100.00,,,RUB\n"
+    );
+    let (status, from_document) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{from_document}");
+
+    let (status, from_batch) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    {
+                        "account": stranger,
+                        "type": "deposit",
+                        "amount": "100.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-04-01" },
+                        "idempotency_key": "stranger",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{from_batch}");
+
+    assert_eq!(from_document[0]["verdict"], "rejected", "{from_document}");
+    assert_eq!(from_batch[0]["verdict"], "rejected", "{from_batch}");
+    assert_eq!(
+        from_document[0]["field"], from_batch[0]["field"],
+        "one question is refused against one field name"
+    );
+    assert_eq!(
+        from_document[0]["expected"], from_batch[0]["expected"],
+        "and in one vocabulary: a caller that learned what to send from one \
+         refusal has learned it for the other"
+    );
+    assert!(
+        from_document[0]["expected"]
+            .as_str()
+            .is_some_and(|expected| expected.contains("iaam identifier")
+                && expected.contains("its source prints")),
+        "and the sentence names the vocabularies rather than pointing at a \
+         directory: {from_document}"
     );
 }
 
@@ -2898,7 +3044,18 @@ async fn ambiguous_account_name_is_rejected_when_resolving_row() {
     assert_eq!(body[0]["verdict"], "rejected");
     assert_eq!(body[0]["field"], "account");
     let actual = body[0]["actual"].as_str().expect("reason for rejection");
-    assert_eq!(actual, "Brokerage: account name is ambiguous: 2 accounts");
+    assert!(
+        actual.contains("Brokerage") && actual.contains("names 2 of the owner's accounts"),
+        "an ambiguity the owner cannot see is one he cannot clear, so the \
+         refusal names the accounts the title reached: {actual}"
+    );
+    assert!(
+        body[0]["expected"]
+            .as_str()
+            .is_some_and(|expected| expected.contains("provider_account_id")),
+        "and says what would settle it — giving exactly one of them the \
+         identifier its source prints: {body}"
+    );
     assert_eq!(body[1]["verdict"], "provisional");
 
     drop(harness);

@@ -49,6 +49,11 @@ expression: report
     },
     "status": "mixed"
   },
+  "held_rows": {
+    "requested": "none",
+    "retained_unrecorded": 0,
+    "sessions": []
+  },
   "history_starts": "2025-01-01",
   "liquidation_value_before_exit_costs_and_tax": {
     "accrued_interest_payable_on_termination": {

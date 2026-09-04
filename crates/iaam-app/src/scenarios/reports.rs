@@ -318,8 +318,8 @@ async fn held_facts(
             .list_import_sessions(principal.owner)
             .await?
             .into_iter()
-            .filter(|view| view.state == ImportSessionState::Open)
-            .map(|view| view.id)
+            .filter(|view| view.session.state == ImportSessionState::Open)
+            .map(|view| view.session.id)
             .collect(),
         HeldScope::Named(named) => {
             // A session named twice would be planned twice and folded twice,
@@ -1748,6 +1748,7 @@ mod tests {
             report_currency: CurrencyCode::Rub,
             fx: FxTable::new(FxSource::OwnerSupplied),
             lot_rule: LotRuleVersion(1),
+            held: HeldScope::None,
         };
         let report = report_from_projection(
             &projection,

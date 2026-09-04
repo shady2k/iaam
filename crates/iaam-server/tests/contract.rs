@@ -22494,7 +22494,7 @@ async fn the_verdict_vocabulary_publishes_the_settled_row_and_says_what_it_means
 
 /// Open a session on the harness account, feed it `operations`, and hand back
 /// the identifier.
-async fn session_holding(harness: &Harness, label: &str, operations: Value) -> String {
+async fn population_session_holding(harness: &Harness, label: &str, operations: Value) -> String {
     let (status, session) = call(
         &harness.router,
         post(
@@ -22575,7 +22575,7 @@ async fn balances_over(harness: &Harness, contour: &str, held: Option<&str>) -> 
 async fn a_report_reads_the_journal_alone_until_the_request_names_a_session() {
     let harness = harness();
     let contour = contour_over_the_account(&harness, "March").await;
-    let session = session_holding(
+    let session = population_session_holding(
         &harness,
         "march",
         json!([held_deposit(harness.account.inner(), "held-one", "1000.00")]),
@@ -22627,7 +22627,7 @@ async fn a_figure_over_held_rows_publishes_the_rows_it_could_not_include() {
     let harness = harness();
     let account = harness.account.inner();
     let contour = contour_over_the_account(&harness, "March").await;
-    let session = session_holding(
+    let session = population_session_holding(
         &harness,
         "march",
         json!([
@@ -22668,7 +22668,7 @@ async fn a_figure_over_held_rows_publishes_the_rows_it_could_not_include() {
 async fn a_committed_session_is_named_and_folded_once() {
     let harness = harness();
     let contour = contour_over_the_account(&harness, "March").await;
-    let session = session_holding(
+    let session = population_session_holding(
         &harness,
         "march",
         json!([held_deposit(
@@ -22726,7 +22726,7 @@ async fn a_committed_session_is_named_and_folded_once() {
 async fn the_figure_over_a_held_session_is_the_figure_it_commits_to() {
     let harness = harness();
     let contour = contour_over_the_account(&harness, "March").await;
-    let session = session_holding(
+    let session = population_session_holding(
         &harness,
         "march",
         json!([
@@ -22772,13 +22772,13 @@ async fn everything_held_names_every_open_session_and_echoes_the_quantifier() {
     let harness = harness();
     let account = harness.account.inner();
     let contour = contour_over_the_account(&harness, "March").await;
-    let first = session_holding(
+    let first = population_session_holding(
         &harness,
         "march-one",
         json!([held_deposit(account, "all-one", "1000.00")]),
     )
     .await;
-    let second = session_holding(
+    let second = population_session_holding(
         &harness,
         "march-two",
         json!([held_deposit(account, "all-two", "250.00")]),
@@ -22810,7 +22810,7 @@ async fn everything_held_names_every_open_session_and_echoes_the_quantifier() {
 async fn a_session_named_twice_is_refused() {
     let harness = harness();
     let contour = contour_over_the_account(&harness, "March").await;
-    let session = session_holding(
+    let session = population_session_holding(
         &harness,
         "march",
         json!([held_deposit(harness.account.inner(), "twice", "1000.00")]),
@@ -22895,7 +22895,7 @@ async fn a_population_naming_an_unknown_session_is_not_found() {
 async fn every_report_states_its_population_and_the_journal_page_states_none() {
     let harness = harness();
     let contour = contour_over_the_account(&harness, "March").await;
-    let session = session_holding(
+    let session = population_session_holding(
         &harness,
         "march",
         json!([held_deposit(harness.account.inner(), "surface", "1000.00")]),
@@ -22961,7 +22961,7 @@ async fn every_report_states_its_population_and_the_journal_page_states_none() {
 async fn a_projection_folded_over_held_rows_is_never_saved() {
     let (harness, path) = harness_on_disk();
     let contour = contour_over_the_account(&harness, "Held").await;
-    let session = session_holding(
+    let session = population_session_holding(
         &harness,
         "held",
         json!([held_deposit(

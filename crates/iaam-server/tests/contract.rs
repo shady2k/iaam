@@ -2238,6 +2238,52 @@ async fn the_openapi_document_enumerates_and_explains_where_a_missing_input_come
     );
 }
 
+/// The document says which half of a request plan is for a person.
+///
+/// **The second half of `iaam-ytvf`, and the cheaper half.** `preset` is a map
+/// of wire name to value and stays one: it is the shape the write route accepts,
+/// so a client copies it into the body unchanged, and wrapping each entry in an
+/// object carrying a reason would oblige every client to unwrap it for prose
+/// nobody is meant to read out. What was missing was never a structure — it was
+/// the sentence saying that a preset value is the request already filled in and
+/// is not a question. An agent that lacked it read one out to the owner.
+#[tokio::test]
+async fn the_openapi_document_says_which_fields_are_put_to_the_owner() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for schema in ["MissingInputDto", "RequiredInputDto"] {
+        let property = &spec["components"]["schemas"][schema]["properties"]["prompt"];
+        assert!(
+            refers_to(property, "OwnerQuestionDto"),
+            "{schema}.prompt must point at the question type: {property}"
+        );
+    }
+
+    // Two parts, and the second is the one the owner had to ask for twice: what
+    // is different depending on how he answers.
+    let question = &spec["components"]["schemas"]["OwnerQuestionDto"]["properties"];
+    for part in ["ask", "consequence"] {
+        assert!(
+            question[part]["description"]
+                .as_str()
+                .is_some_and(|described| !described.is_empty()),
+            "OwnerQuestionDto.{part} is published without a word about it"
+        );
+    }
+
+    let preset =
+        spec["components"]["schemas"]["RequestPlanDto"]["properties"]["preset"]["description"]
+            .as_str()
+            .expect("the preset must say what it is");
+    assert!(
+        preset.contains("never shown to the owner"),
+        "`preset` must say it is the request already filled in and not a \
+         question: {preset}"
+    );
+}
+
 #[tokio::test]
 async fn a_published_code_is_the_code_the_response_carries() {
     // The vocabularies enumerate; they must enumerate what actually arrives.
@@ -8305,6 +8351,85 @@ async fn actions_endpoint_is_authenticated_and_reports_the_empty_owner_frontier(
         items[0]["target"]["request"]["missing"][0]["provided_by"],
         "owner"
     );
+}
+
+/// Every field the published queue asks the owner for carries his question.
+///
+/// The field report `iaam-ytvf` was filed on is a client-visible one: an agent
+/// relaying an item to the owner had the pointer and this document's own field
+/// descriptions, which are written for whoever implements a client, so it showed
+/// him `provider_account_id`. This asserts what a client now gets instead, over
+/// the whole queue rather than one item, and it asserts the shape of it — the
+/// question **and** what turns on the answer, because a question that says only
+/// what is being asked is the state the owner rejected a second time.
+#[tokio::test]
+async fn every_field_the_queue_asks_the_owner_for_arrives_with_the_question_to_put_to_him() {
+    let mut asked: BTreeSet<String> = BTreeSet::new();
+    let populated = harness();
+    let empty = empty_owner_harness();
+    for owner in [&populated, &empty] {
+        let (status, body) =
+            call(&owner.router, get("/v1/actions", Some(&owner.owner_token))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        for item in body.as_array().expect("action items") {
+            let mut plans = vec![&item["target"]["request"]];
+            if let Some(options) = item["target"]["options"].as_array() {
+                plans.extend(options.iter().map(|option| &option["request"]));
+            }
+            for plan in plans {
+                let Some(missing) = plan["missing"].as_array() else {
+                    continue;
+                };
+                for input in missing {
+                    if input["provided_by"] != "owner" {
+                        assert!(
+                            input["prompt"].is_null(),
+                            "nobody is asked about {input}, so there is nothing to ask"
+                        );
+                        continue;
+                    }
+                    // `/provider` is the one field published without a question,
+                    // and on purpose: whether a person should be asked to invent
+                    // a label whose only property is that it differs between
+                    // sources is `iaam-9i83`'s, not a phrasing debt.
+                    if input["pointer"] == "/provider" {
+                        continue;
+                    }
+                    asked.insert(
+                        input["pointer"]
+                            .as_str()
+                            .expect("every missing input names its field")
+                            .to_owned(),
+                    );
+                    let ask = input["prompt"]["ask"].as_str().unwrap_or_else(|| {
+                        panic!("{input} asks the owner for a field and gives no question")
+                    });
+                    let consequence =
+                        input["prompt"]["consequence"].as_str().unwrap_or_else(|| {
+                            panic!("{input} asks a question and does not say what turns on it")
+                        });
+                    for shown in [ask, consequence] {
+                        assert!(
+                            !shown.contains('_') && !shown.contains('/'),
+                            "the owner is shown a wire name in {shown}"
+                        );
+                    }
+                    assert!(ask.contains('?'), "{ask} asks him nothing");
+                }
+            }
+        }
+    }
+    // Named rather than counted: a sweep that found nothing would satisfy a
+    // count of zero, and one that found only the fields of a single item would
+    // report the whole queue covered. These are two items on two different
+    // routes, in two different states of the same instance.
+    for field in ["/title", "/accounts"] {
+        assert!(
+            asked.contains(field),
+            "the sweep never reached {field}, so it proved nothing about it: {asked:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -23722,6 +23847,42 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
             .is_some_and(|reason| reason.contains("Outside")),
         "{queue}"
     );
+
+    // And it publishes the question to put to the owner, which is the item this
+    // whole surface was reported against (`iaam-ytvf`): an agent relaying it had
+    // the pointers and this contract's field descriptions, so it showed him
+    // `provider_account_id`. The printed string is in the question, because the
+    // question is about *that* account — and the consequence says what a rename
+    // costs here, which is nothing, because the identity tier already holds the
+    // printed string and beats a title.
+    let asked = &wanted[0]["target"]["request"]["missing"];
+    let title = asked
+        .as_array()
+        .expect("missing inputs")
+        .iter()
+        .find(|input| input["pointer"] == "/title")
+        .expect("the title is asked for");
+    let ask = title["prompt"]["ask"].as_str().expect("a question");
+    assert!(ask.contains("Outside") && ask.contains('?'), "{title}");
+    assert!(
+        title["prompt"]["consequence"]
+            .as_str()
+            .is_some_and(|turns| turns.contains("Outside")),
+        "the owner is owed what his answer changes, and here it turns on the \
+         printed string being kept: {title}"
+    );
+
+    // `provider` carries none, and that is the register entry rather than an
+    // omission: whether a person should be asked to invent a label whose only
+    // property is that it differs between sources is `iaam-9i83`'s question.
+    let provider = asked
+        .as_array()
+        .expect("missing inputs")
+        .iter()
+        .find(|input| input["pointer"] == "/provider")
+        .expect("the provider is asked for");
+    assert_eq!(provider["provided_by"], "owner", "{provider}");
+    assert!(provider["prompt"].is_null(), "{provider}");
 
     // The document was kept under the profile that read it, so the remedy for a
     // corrected profile is to read the stored document again rather than to

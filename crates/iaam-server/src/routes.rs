@@ -16,7 +16,8 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
     AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
-    ActionTarget, InputAlternative, MissingInput, OperationKey, RequestPlan, account_scope,
+    ActionTarget, InputAlternative, MissingInput, OperationKey, OwnerPrompt, RequestPlan,
+    account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
 use iaam_app::ingest::observation::Intake;
@@ -90,8 +91,8 @@ use crate::dto::{
     JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
     MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
     MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
-    OwnerBalanceRequest, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
-    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    OwnerBalanceRequest, OwnerQuestionDto, QuotationBasisDto, QuotationBasisStatusDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
     RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
     RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
     ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
@@ -270,12 +271,27 @@ fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
     MissingInputDto {
         pointer: missing.pointer.clone(),
         provided_by: ProvidedByDto::from_domain(&missing.provided_by),
+        // Rendered from the same value `pointer` was derived from, so the field
+        // and the question cannot name two different things.
+        prompt: missing.prompt.as_ref().map(owner_question_dto),
         candidates: missing.candidates.as_deref().map(account_candidate_dtos),
         alternatives: missing
             .alternatives
             .iter()
             .map(input_alternative_dto)
             .collect(),
+    }
+}
+
+/// The question put to the owner about one field, in the two parts he is owed.
+///
+/// Rendered from the same value the pointer was derived from, so the field and
+/// the question cannot name two different things.
+fn owner_question_dto(prompt: &OwnerPrompt) -> OwnerQuestionDto {
+    let question = prompt.question();
+    OwnerQuestionDto {
+        ask: question.ask,
+        consequence: question.consequence,
     }
 }
 
@@ -294,6 +310,7 @@ pub(crate) fn input_alternative_dto(alternative: &InputAlternative) -> InputAlte
             .map(|required| RequiredInputDto {
                 pointer: required.pointer.clone(),
                 provided_by: ProvidedByDto::from_domain(&required.provided_by),
+                prompt: required.prompt.as_ref().map(owner_question_dto),
                 candidates: required.candidates.as_deref().map(account_candidate_dtos),
             })
             .collect(),

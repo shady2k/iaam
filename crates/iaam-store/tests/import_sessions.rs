@@ -257,16 +257,28 @@ fn an_answer_reaches_both_the_question_and_the_row_it_is_about() {
     assert_eq!(question.id, again.id);
 
     let answered = store
-        .answer_import_question(
-            owner,
-            session,
-            question.id,
-            r#"{"answer":"paid"}"#,
-            Some("rule-1"),
-        )
+        .answer_import_question(owner, session, question.id, r#"{"answer":"paid"}"#)
         .expect("answer recorded");
     assert!(!answered.is_open());
-    assert_eq!(answered.rule.as_deref(), Some("rule-1"));
+    assert_eq!(
+        answered.rule, None,
+        "the answer is written first and names no rule: the rule is a different \
+         port's fact and does not exist yet (iaam-77hk)"
+    );
+
+    // Naming the rule is a second write, and it is the one that may fail without
+    // taking the answer with it.
+    let generalised = store
+        .attach_import_question_rule(owner, session, question.id, "rule-1")
+        .expect("rule attached");
+    assert_eq!(generalised.rule.as_deref(), Some("rule-1"));
+    assert!(
+        store
+            .attach_import_question_rule(owner, session, question.id, "rule-2")
+            .is_err(),
+        "a question already naming a rule is not renamed: the second write would \
+         orphan the first rule silently"
+    );
 
     let rows = store.list_import_observations(session).expect("rows");
     assert_eq!(
@@ -279,13 +291,7 @@ fn an_answer_reaches_both_the_question_and_the_row_it_is_about() {
     // their mind is a different act, carried by the rule the first answer made.
     assert!(
         store
-            .answer_import_question(
-                owner,
-                session,
-                question.id,
-                r#"{"answer":"received"}"#,
-                None
-            )
+            .answer_import_question(owner, session, question.id, r#"{"answer":"received"}"#)
             .is_err()
     );
 }
@@ -387,6 +393,34 @@ fn a_payload_that_is_not_json_is_refused() {
     );
 }
 
+/// A rule for an answer nobody gave would be a generalisation of nothing.
+///
+/// The ordering `iaam-77hk` introduced writes the answer first, so an open
+/// question is one no rule has been derived from yet, and this refusal is what
+/// keeps the two writes in that order rather than merely inviting it.
+#[test]
+fn an_open_question_cannot_be_told_which_rule_it_made() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let row = store
+        .add_import_observation(owner, session, Some("row/1"), false, "{}")
+        .expect("row added")
+        .row;
+    let question = store
+        .record_import_question(owner, session, row, &asking())
+        .expect("question recorded");
+
+    assert!(
+        store
+            .attach_import_question_rule(owner, session, question.id, "rule-1")
+            .is_err()
+    );
+}
+
 #[test]
 fn a_question_that_does_not_exist_cannot_be_answered() {
     let mut store = store();
@@ -402,8 +436,7 @@ fn a_question_that_does_not_exist_cannot_be_answered() {
                 owner,
                 session,
                 ImportQuestionId::new_random(),
-                r#"{"answer":"paid"}"#,
-                None
+                r#"{"answer":"paid"}"#
             )
             .is_err()
     );

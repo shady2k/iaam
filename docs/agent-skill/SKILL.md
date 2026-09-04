@@ -170,6 +170,24 @@ record, so he can adopt it as it stands instead of reconstructing it from the
 row. When you notice a question you have relayed before, that is the thing to
 say: which rule is waiting to be adopted, not a second guess at the answer.
 
+You do not have to remember which ones are waiting. **Every rule an answer could
+not write is an item in the outstanding-work queue**, one per question, kind
+`adopt_classification_rule`, carrying the rule already filled in as the body of
+the call that writes it. It is a recommendation rather than required work — the
+row it came from is settled and no report is short of anything — and it names the
+owner as the one who may send it, which you cannot. Read that item to him. The
+item disappears once a standing rule of his settles a row like that one, whether
+he sent the proposal as it stood or narrowed it first, so the queue is a list of
+decisions still open rather than a list you have to keep yourself.
+
+The condition a proposal asks about is **one thing**: the counterparty the row
+named, or failing that the word the source used for the operation, or failing
+both the description. Not all three at once — a condition joining every field the
+row printed recognises that row and almost nothing else, which is a standing
+decision that decides nothing. Tell him what the condition asks, because it is
+the part he may want to change: a wider one settles more rows next month and can
+settle one wrongly, and only he can weigh that.
+
 A rule the owner does write is kept in his own vocabulary, and he can see it,
 change it, and retire it afterwards like any other.
 

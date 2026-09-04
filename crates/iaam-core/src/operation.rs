@@ -30,6 +30,15 @@ pub enum OperationKey {
     AddContourVersion,
     RecordOwnerBalance,
     CreateCategoryRule,
+    /// Write a standing classification rule: what a row matching a condition is.
+    ///
+    /// Named here because the queue offers it. An answered import question whose
+    /// answer wrote no rule — the answerer held a token that may not generalise
+    /// — publishes the rule it would have made, and this is the call that makes
+    /// it stand. Distinct from [`Self::CreateCategoryRule`], which files a
+    /// journal event under one of the owner's categories: this one decides what
+    /// the row **is**.
+    CreateClassificationRule,
     /// Record the owner's statement about one account's transfer partners.
     RecordAccountTransferPartners,
     /// Rule an account outside the reporting perimeter, with a reason.
@@ -83,15 +92,16 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a fourteenth variant to
+    /// The declared length is the only thing holding a fifteenth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
         Self::RecordOwnerBalance,
         Self::CreateCategoryRule,
+        Self::CreateClassificationRule,
         Self::RecordAccountTransferPartners,
         Self::RecordAccountScope,
         Self::OpenImportSession,
@@ -111,6 +121,7 @@ impl OperationKey {
             Self::AddContourVersion => "add_contour_version",
             Self::RecordOwnerBalance => "record_owner_balance",
             Self::CreateCategoryRule => "create_category_rule",
+            Self::CreateClassificationRule => "create_classification_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
             Self::RecordAccountScope => "record_account_scope",
             Self::OpenImportSession => "open_import_session",

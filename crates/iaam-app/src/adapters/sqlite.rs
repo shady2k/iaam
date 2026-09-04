@@ -1006,11 +1006,26 @@ impl Store for SqliteAdapter {
         session: ImportSessionId,
         question: ImportQuestionId,
         answer: String,
-        rule: Option<String>,
     ) -> Result<ImportQuestionView, AppError> {
         self.blocking(move |store| {
             store
-                .answer_import_question(owner, session, question, &answer, rule.as_deref())
+                .answer_import_question(owner, session, question, &answer)
+                .map(import_question_view)
+                .map_err(import_session_error)
+        })
+        .await
+    }
+
+    async fn attach_import_question_rule(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        rule: String,
+    ) -> Result<ImportQuestionView, AppError> {
+        self.blocking(move |store| {
+            store
+                .attach_import_question_rule(owner, session, question, &rule)
                 .map(import_question_view)
                 .map_err(import_session_error)
         })

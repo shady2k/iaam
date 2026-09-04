@@ -19552,6 +19552,172 @@ async fn an_answer_that_could_not_generalise_publishes_the_rule_it_would_have_ma
     assert_eq!(classification_rule_count(&harness).await, 1);
 }
 
+/// The proposal is also a queued act, and not only a field on a session
+/// (iaam-4hcy).
+///
+/// The defect: `available` was honest and unreachable. A client could read that
+/// a rule was possible and that none had been written, and the action queue —
+/// the one surface that tells the owner what only he can do — said nothing about
+/// it. He had to know the field existed, know which session held it, and go and
+/// read it.
+///
+/// The item points at the route that already writes classification rules, with
+/// the proposal preset as the body. Posting the preset unedited is what this
+/// test does, and it is the same object the question publishes: a preset that
+/// merely described the body would fail here.
+#[tokio::test]
+async fn a_rule_an_answer_could_not_write_is_queued_for_the_owner_to_adopt() {
+    let harness = harness();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (session, question) = ask_one_question(&harness, &harness.agent_token, "queue-adopt").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(
+        answered["generalisation"]["state"], "available",
+        "{answered}"
+    );
+    let proposal = answered["generalisation"]["proposal"].clone();
+
+    let items = adopt_rule_items(&harness).await;
+    assert_eq!(items.len(), 1, "one proposal, one item: {items:?}");
+    let item = items[0].clone();
+
+    assert_eq!(item["kind"], "adopt_classification_rule", "{item}");
+    // The row is settled and in the session; no report is short of anything
+    // while the rule stands unwritten. What it costs is the same question again.
+    assert_eq!(item["category"], "recommended", "{item}");
+    assert_eq!(
+        item["goals"],
+        json!([]),
+        "a recommendation names no goal: {item}"
+    );
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(
+        item["required_scope"], "owner",
+        "generalising is owner-only wherever it is reached from: {item}"
+    );
+    assert_eq!(item["subject"]["type"], "account", "{item}");
+
+    let target = &item["target"];
+    assert_eq!(target["type"], "operation", "{item}");
+    assert_eq!(
+        target["operationId"], "create_classification_rule",
+        "the act is the route that already writes rules, not one invented for \
+         the occasion: {item}"
+    );
+    assert_eq!(target["method"], "POST", "{item}");
+    assert_eq!(target["path"], "/v1/classification-rules", "{item}");
+    assert_eq!(
+        target["request"]["missing"],
+        json!([]),
+        "every field is filled; what is missing is his decision: {item}"
+    );
+    assert_eq!(
+        target["request"]["preset"]["matcher"], proposal["matcher"],
+        "the queue offers the rule the answer would have made: {item}"
+    );
+    assert_eq!(
+        target["request"]["preset"]["outcome"], proposal["outcome"],
+        "{item}"
+    );
+
+    // The preset is the body. Sent as it stands, under the owner's token.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &target["request"]["preset"],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(classification_rule_count(&harness).await, 1);
+
+    // And the item goes away, which is the half that makes it an item rather
+    // than a notice. The question still reports `available` — the rule is his
+    // act, not the import's — so the queue reads his rules instead.
+    assert!(
+        adopt_rule_items(&harness).await.is_empty(),
+        "a queue that cannot see the act closing an item publishes one that \
+         never closes"
+    );
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["questions"][0]["generalisation"]["state"], "available",
+        "the question says what *this answer* wrote, and it wrote nothing: \
+         {contents}"
+    );
+}
+
+/// An agent may not be told to do what only the owner may.
+///
+/// The queue is read by both, and an item marked `owner` that an agent could
+/// send would make the gate on `POST /v1/classification-rules` protect nothing.
+#[tokio::test]
+async fn the_agent_is_refused_the_rule_the_queue_offers_the_owner() {
+    let harness = harness();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (session, question) =
+        ask_one_question(&harness, &harness.agent_token, "queue-refuse").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let items = adopt_rule_items(&harness).await;
+    assert_eq!(items.len(), 1, "the proposal is queued: {items:?}");
+    let preset = items[0]["target"]["request"]["preset"].clone();
+    let (status, refused) = call(
+        &harness.router,
+        post("/v1/classification-rules", &harness.agent_token, &preset),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(classification_rule_count(&harness).await, 0);
+}
+
+/// Every queued proposal the owner can adopt, read from the queue itself.
+async fn adopt_rule_items(harness: &Harness) -> Vec<Value> {
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    actions
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "adopt_classification_rule")
+        .cloned()
+        .collect()
+}
+
 /// A question waiting on an answer says so, rather than looking like an answer
 /// that generalised nothing.
 #[tokio::test]

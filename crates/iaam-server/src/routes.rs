@@ -143,8 +143,12 @@ pub async fn list_actions(
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
 ) -> Result<Json<Vec<ActionDto>>, ApiFailure> {
-    let actions =
-        iaam_app::actions::frontier(principal.owner, state.services.store.as_ref()).await?;
+    let actions = iaam_app::actions::frontier(
+        principal.owner,
+        state.services.store.as_ref(),
+        state.services.rules.as_ref(),
+    )
+    .await?;
     Ok(Json(
         actions
             .iter()

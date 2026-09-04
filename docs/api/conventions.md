@@ -69,7 +69,7 @@ would read as an answer about all of it.
 
 So `population` is exactly the kind of fact the wrapper exists for.
 
-### 1.4a A wrapper that turned out to hold nothing: `GET /v1/actions`
+### 1.4a A wrapper emptied, and the fact that filled it again: `GET /v1/actions`
 
 `GET /v1/actions` wrapped, and it was cited here as the clearest case: the items
 are computed under a policy, and a policy has a version, so `policy_version` sat
@@ -84,12 +84,41 @@ evidence of anything. The three other responses that carry the same items — th
 reconciliation answer, the broker sync outcome, the money-flow report — carried
 no version at all, so the promise was not even made consistently.
 
-The route is a bare array now. This is §1 working rather than an exception to
-it: the question in §1.5 is whether there is a fact about the answer as a whole
-that no item can carry, and the honest answer for this route was no. A
-`policy_version` may come back, and if it does it comes back derived from
-something that moves and published everywhere `ActionDto` is published — not
-beside one of the four.
+The route was a bare array for exactly as long as that stayed true. This is §1
+working rather than an exception to it: the question in §1.5 is whether there is
+a fact about the answer as a whole that no item can carry, and the honest answer
+for this route was no. A `policy_version` may come back, and if it does it comes
+back derived from something that moves and published everywhere `ActionDto` is
+published — not beside one of the four.
+
+**The fact arrived, and it is not a version.** Every required item declares which
+of the four reports its outstanding work stands between the owner and. Nobody
+published the inverse, so a client holding the queue could say how many things
+were outstanding and could not say which questions about his money this instance
+was able to answer today. The route now returns `{"items": […], "reports": […]}`,
+where `reports` is those same four names with the items standing in the way of
+each — folded from the items in the same response, in the same reading, so the
+two halves cannot describe two states of the instance.
+
+It is §1.5's question answered the other way, and it is the *absence* that makes
+it one: a report with nothing outstanding is stated by no item appearing, and an
+absence is the one thing an item cannot carry. Compare `population` in §1.4 —
+there too the fact is about the rows that are not there.
+
+**It is on this route and on no other.** Three responses embed `Vec<ActionDto>`
+bound to what was asked of them — the reconciliation answer's account and range,
+the broker sync outcome's own verdicts, the money-flow report's own diagnostics.
+A standing folded out of one of those slices would say "nothing stands in the way
+of this report" on the strength of a slice that was never the queue, which is the
+one sentence this surface must not produce by accident. So `reports` is published
+where the queue is published whole, and the three slices are unchanged.
+
+**`items` and not `actions`.** §1.3 asks for the name the list deserves, and the
+other three call theirs `actions` because they sit inside a response about
+something else, where `items` would name nothing. Here the response *is* the
+queue, `actions.actions` says the word twice, and `items` is §1.3's default. It
+is also the key the emptied wrapper used, so a client written against that
+wrapper reads the list where it always was.
 
 ### 1.4b A count is named as a count
 
@@ -169,7 +198,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/broker-access` | `[BrokerAccessDto]` | bare array | whole list, revoked included |
 | `GET /v1/contours` | `[ContourDto]` | bare array | whole list; each contour carries its own version |
 | `GET /v1/import-sessions` | `[ImportSessionSummaryDto]` | bare array | whole list, newest first; each entry carries `row_count` and `unanswered` beside the header, so «which import is still waiting on me» is one request rather than one per session |
-| `GET /v1/actions` | `[ActionDto]` | bare array | the whole queue; nothing true of the set that is not true of each item (§1.4a) |
+| `GET /v1/actions` | `ActionsResponseDto` | object, `items` | `reports` — where each of the four reports stands, which is stated for an unobstructed one by the absence of items and so can be carried by none of them (§1.4a) |
 | `GET /v1/journal/events` | `JournalPageDto` | object, `rows` | `next` — the position to resume the page from |
 | `GET /v1/market/prices` | `MarketPriceSeriesDto` | object, `rows` | `complete_through` — how far the series is known |
 | `GET /v1/market/fx` | `MarketFxSeriesDto` | object, `rows` | `complete_through` |

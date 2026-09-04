@@ -40,3 +40,4 @@
 | [0035](0035-a-value-published-to-be-read-out-carries-what-he-can-read.md) | A value published to be read out to him carries what he can read | 2026-09-05 | proposed | `iaam-6jsj`, `iaam-f6y4` |
 | [0036](0036-a-state-for-an-item-that-wants-nothing-and-a-relay-in-his-voice.md) | A state for an item that wants nothing, and a relay in the owner's voice | 2026-09-05 | proposed | `iaam-c143`, `iaam-09tn` |
 | [0037](0037-the-skill-keeps-the-process-and-the-reference-moves-beside-it.md) | The skill keeps the process, and the reference moves beside it | 2026-09-05 | proposed | `iaam-arad` |
+| [0039](0039-the-queue-says-which-reports-it-leaves-unobstructed.md) | The queue says which reports it leaves unobstructed, and names what stands in the way of the rest | 2026-09-05 | proposed | `iaam-i3nx` |

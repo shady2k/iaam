@@ -57,6 +57,8 @@ use crate::dto::{
     BatchTotalDto, ControlCheckDto, ControlComparisonDto, ControlReconciliationDto,
     ControlSectionDto, RecordedEventDto, StateImportControlFiguresRequest, StatedControlFiguresDto,
 };
+// Wave AB's own two, in a block of their own for the same reason.
+use crate::dto::{ActionsResponseDto, ReportStandingDto};
 // Wave K's own names, in a block of their own for the reason stated above:
 // these belong to changes made in parallel, and merging them into the wrapped
 // list would reflow lines nobody touched.
@@ -113,6 +115,8 @@ impl Modify for BearerSecurity {
     components(schemas(
         AccountDto,
         AccountCandidateDto,
+        ActionsResponseDto,
+        ReportStandingDto,
         ActionDto,
         ActionSubjectDto,
         AccountScopeDto,

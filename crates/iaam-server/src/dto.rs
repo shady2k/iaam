@@ -45,7 +45,7 @@ use iaam_app::scenarios::import_session::PlannedOrigin;
 // Wave X's own names, in a block of their own for the reason the two blocks
 // above give: this file is edited by several changes at once, and a name added
 // to a wrapped list reflows every line of it.
-use iaam_app::actions::OwnerQuestion;
+use iaam_app::actions::{OwnerQuestion, ReportStanding};
 use iaam_app::scenarios::import_session::{AnswerReach, AnsweredQuestions, stored_alternatives};
 // Wave Y's own names, in a block of their own for the reason the blocks above
 // give: this file is edited by several changes at once, and a name added to a
@@ -4174,26 +4174,95 @@ impl NegativeBalanceExpectationDto {
     }
 }
 
-/// The computed action policy returned for an owner.
+/// The outstanding-work queue, and where each of the four reports stands
+/// because of it.
+///
+/// An object rather than a bare array of items, and the second field is the
+/// whole reason: which reports nothing outstanding stands in the way of is
+/// stated by the **absence** of items, and an absence is the one thing no item
+/// can state. A client that wants only the queue reads `items` and is where it
+/// was.
+///
+/// The two fields are the same computation read in two directions. Every item
+/// under `items` declares which reports its work stands in the way of; `reports`
+/// is that mapping folded the other way, over exactly these items, so the two
+/// cannot disagree.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ActionsResponseDto {
-    pub policy_version: u32,
+    /// Everything outstanding for this owner, most urgent first.
     pub items: Vec<ActionDto>,
+    /// The four reports this API computes, each with what stands between the
+    /// owner and it. Always all four, in the order `asset_snapshot`,
+    /// `money_flow`, `returns`, `reconciliation` — a client enumerating them
+    /// never has to ask whether a missing report was answerable or forgotten.
+    pub reports: Vec<ReportStandingDto>,
+}
+
+/// One of the four reports, and the outstanding items standing between the
+/// owner and it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReportStandingDto {
+    /// Which report: one of `asset_snapshot`, `money_flow`, `returns`,
+    /// `reconciliation`. The same four names each item's `goals` is drawn from
+    /// and each report's confidence register publishes for itself, so a client
+    /// joins the three on them.
+    pub goal: String,
+    /// What this report answers, in one line.
+    ///
+    /// Published beside the code because the code is this system's word and not
+    /// a reader's: a caller showing a person which reports it can produce for
+    /// him cannot show him `money_flow`. It fixes what has to be conveyed and
+    /// not the words to convey it in — a caller that says this in his language
+    /// and his register is using the sentence correctly, not ignoring it.
+    pub answers: String,
+    /// The `id` of every item under `items` standing between the owner and this
+    /// report, in the same order they appear there, so the first named is the
+    /// most urgent.
+    ///
+    /// Named rather than counted. A client told that two items stand in the way,
+    /// and not which two, has to scan the queue for them — and the identifiers
+    /// are in the same response already. For the same reason there is no
+    /// separate flag saying the report is unobstructed: it would be this list's
+    /// own emptiness published a second time, and the two could then disagree.
+    ///
+    /// Always present, empty array included. **Empty means nothing in this queue
+    /// stands in the way of this report, and it means only that.** It is not a
+    /// promise that the report will answer him fully: a report publishes what it
+    /// is silent or partial about in its own confidence register, which this
+    /// queue neither reads nor summarises. A caller relaying an empty list says
+    /// that nothing outstanding stands in the way of this one — never that this
+    /// one is ready.
+    ///
+    /// An item that blocks the queue outright stands in the way of all four and
+    /// appears in all four lists, even though its own `goals` is empty. The two
+    /// fields answer different questions: `goals` says which reports an item's
+    /// work is required for, and a blocking item stops the next call rather than
+    /// any one report — so it stands in the way of every report by standing in
+    /// the way of everything.
+    pub blocked_by: Vec<String>,
+}
+
+impl ReportStandingDto {
+    #[must_use]
+    pub fn from_domain(standing: &ReportStanding) -> Self {
+        Self {
+            goal: standing.goal().code().to_owned(),
+            answers: standing.goal().answers().to_owned(),
+            blocked_by: standing.blocked_by().to_vec(),
+        }
+    }
 }
 
 /// One computed action.
 ///
-/// `GET /v1/actions` returns a bare array of these, and there is no envelope
-/// around it. There was one, holding a `policy_version`, and §1.5 of
-/// `docs/api/conventions.md` asks the question that removed it: is there a fact
-/// about the answer as a whole that no item can carry? The version would have
-/// been such a fact if anything moved it, and nothing did — it was the literal
-/// `1`, written at the one place the response was built, derived from nothing
-/// and bumped by nothing. A client invited to branch on it would have branched
-/// never. Three further responses already embed `Vec<ActionDto>` with no version
-/// beside it — the reconciliation answer, the broker sync outcome, the money-flow
-/// report — so the field was also absent from three quarters of the surface that
-/// publishes these items.
+/// `GET /v1/actions` returns these under `items`, beside the fold of them that
+/// says where each of the four reports stands. The envelope holds no version of
+/// the policy the items were computed under: there was such a field, it was the
+/// literal `1` written at the one place the response was built, derived from
+/// nothing and bumped by nothing, and a client invited to branch on it would
+/// have branched never. Three further responses embed these items with no
+/// version beside them — the reconciliation answer, the broker sync outcome, the
+/// money-flow report — so the promise was not made consistently either.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ActionDto {
     pub id: String,
@@ -4225,6 +4294,11 @@ pub struct ActionDto {
     /// bug, while `[]` says this item stands in the way of no report at all —
     /// which is a fact about a blocking item, and one a client should be able
     /// to read rather than infer.
+    ///
+    /// The fold the other way — which of the four reports the whole queue leaves
+    /// unobstructed, and which items stand in the way of the rest — is published
+    /// once beside these items, under `reports`. A blocking item is the one case
+    /// where the two do not line up field for field, and `blocked_by` says why.
     #[serde(default)]
     pub goals: Vec<String>,
     pub state: String,

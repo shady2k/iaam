@@ -88,6 +88,7 @@ fn proposal() -> (RuleMatcher, Classification) {
             counterparty_account: None,
             description_contains: Some("Shop One".to_owned()),
             kind: None,
+            source_category: None,
         },
         Classification::ExternalFlow,
     )

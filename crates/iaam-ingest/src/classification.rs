@@ -9,7 +9,8 @@
 //!
 //! Therefore, it is not the constructed operation that is classified, but the row's attributes,
 //! visible **before** choosing the type: the counterparty account, the payment purpose,
-//! and the word the source used to name the operation.
+//! the word the source used to name the operation, and the category the source
+//! filed the row under.
 //!
 //! **History recalculation means new facts, not editing old ones.** Editing a
 //! rule produces a plan of reversal and replacement; the journal remains
@@ -122,6 +123,29 @@ pub struct ClassificationSubject {
     /// What the source called the operation. An open set: each
     /// broker uses its own words, so this is a string, not an enum.
     pub source_kind: Option<String>,
+    /// What the source filed the row under, verbatim.
+    ///
+    /// The source's word for what the movement was **for**, where
+    /// [`Self::source_kind`] above it is the source's word for what the
+    /// movement **was**. Two facts, two fields, and never one slot — that is
+    /// decision 0020 §2, and the state before it is what made a category rule
+    /// written on a category match an operation word instead.
+    ///
+    /// **The same string `iaam_core::category::CategoryMatcher::SourceCategory`
+    /// matches**, read out of the same place: `Provenance::source_category` for
+    /// a fact already recorded, [`crate::observation::ObservedRow::source_category`]
+    /// for a row still being read. The two rule vocabularies ask different
+    /// questions of it — a category rule asks which of the owner's categories
+    /// the row belongs in, a [`RuleMatcher`] asks what the row *is* — and the
+    /// field they ask it of is one field with one meaning. It is matched
+    /// exactly in both, because it is a value out of a controlled vocabulary
+    /// one source prints and not prose.
+    ///
+    /// **Evidence, never a decision.** Nothing concludes anything from the word
+    /// on its own: a profile transcribes it and stops (decision 0019 §6), and
+    /// the only thing that turns it into a classification is a rule the owner
+    /// wrote — which he can read back, retire, and replan.
+    pub source_category: Option<String>,
     /// Which way the money went, when the source said.
     ///
     /// `None` is not a default and not a missing field: it means the source
@@ -140,11 +164,55 @@ pub struct ClassificationSubject {
 }
 
 /// Rule condition. Specified fields are joined with “and”.
+///
+/// **This is the vocabulary of «what the row is», and it is not the vocabulary
+/// of «which category the row is filed under».** The other one is
+/// `iaam_core::category::CategoryMatcher`, and the two must never come to mean
+/// different things by one word. Where they name the same field they read the
+/// same string out of the same place and compare it the same way: [`Self::kind`]
+/// and [`Self::source_category`] are both exact comparisons against a
+/// vocabulary one source controls, exactly as `CategoryMatcher::SourceCategory`
+/// is. What differs is the question asked — *is this a fee?* against *is this
+/// groceries?* — and what a matching rule then decides, which is the whole
+/// reason there are two types and not one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleMatcher {
     pub counterparty_account: Option<String>,
     pub description_contains: Option<String>,
+    /// The word the source used for the operation, matched exactly, against
+    /// [`ClassificationSubject::source_kind`].
+    ///
+    /// Named `kind` rather than `source_kind` because that is what the field has
+    /// been called in every stored rule and every published body since the type
+    /// existed; renaming it would make every rule the owner has written
+    /// unreadable to gain a consistency the doc comment can state instead.
     pub kind: Option<String>,
+    /// The category the source filed the row under, matched exactly, against
+    /// [`ClassificationSubject::source_category`].
+    ///
+    /// **The fourth arm, and the one the channel that ships needs most**
+    /// (`iaam-93lz`). Decision 0019 §6 has a profile transcribe the source's own
+    /// category and never map it, on the ground that the owner's rules do the
+    /// mapping — they are his, editable, and re-runnable over rows already
+    /// recorded, where a map baked into a profile is frozen into every fact at
+    /// import. That argument needs the owner's rules to be able to *read* the
+    /// field, and this vocabulary could not: the first profile prints no
+    /// operation-type word at all, so [`Self::kind`] is `None` on every one of
+    /// its rows and «a row the institution filed under this category is
+    /// interest» could not be written as a standing rule at all.
+    ///
+    /// **Not scoped to a source, and that is argued rather than skipped** —
+    /// decision 0026. The journal holds no handle that names an institution:
+    /// `SourceId` is derived from owner, account and channel, so a rule scoped
+    /// by it would have to be rewritten for every account the same bank's
+    /// exports arrive on, and a `ParserVersion` names a profile *and its
+    /// version*, so a rule scoped by it would stop firing the day the profile is
+    /// corrected. The bound on a rule that is too wide is the one every other
+    /// arm of this matcher already relies on: the fields join with «and», so a
+    /// category condition can be narrowed by a counterparty or a description
+    /// beside it, and a rule that fires wrongly is one the owner retires, which
+    /// replans what it classified.
+    pub source_category: Option<String>,
 }
 
 impl RuleMatcher {
@@ -157,6 +225,7 @@ impl RuleMatcher {
         self.counterparty_account.is_none()
             && self.description_contains.is_none()
             && self.kind.is_none()
+            && self.source_category.is_none()
     }
 
     /// Whether the condition matches the row.
@@ -181,7 +250,17 @@ impl RuleMatcher {
             .kind
             .as_deref()
             .is_none_or(|wanted| subject.source_kind.as_deref() == Some(wanted));
-        by_counterparty && by_description && by_kind
+        // Exactly, and against the category field alone. A source's category is
+        // a value out of a vocabulary that source controls, so a substring test
+        // would match one word inside another the institution means differently,
+        // and reading it from `source_kind` as well would put the two words back
+        // in one slot — which is the defect decision 0020 §2 took them apart to
+        // end.
+        let by_source_category = self
+            .source_category
+            .as_deref()
+            .is_none_or(|wanted| subject.source_category.as_deref() == Some(wanted));
+        by_counterparty && by_description && by_kind && by_source_category
     }
 }
 
@@ -337,6 +416,9 @@ impl ClassificationRule {
         }
         if let Some(kind) = &self.matcher.kind {
             conditions.push(format!("source called the operation «{kind}»"));
+        }
+        if let Some(category) = &self.matcher.source_category {
+            conditions.push(format!("source filed the row under «{category}»"));
         }
         let conditions = if conditions.is_empty() {
             "no conditions, so the rule does not apply".to_owned()

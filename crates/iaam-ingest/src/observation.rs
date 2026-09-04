@@ -195,8 +195,15 @@ pub struct ObservedRow {
     ///
     /// The source's word for what the movement was **for**, and a different
     /// fact from [`Self::source_kind`] above it. Both are transcribed and
-    /// neither is mapped: the owner's own category rules match this one, and
-    /// they are his, editable, and re-runnable over rows already recorded.
+    /// neither is mapped: the owner's own rules match this one, and they are
+    /// his, editable, and re-runnable over rows already recorded.
+    ///
+    /// **Two of his rule vocabularies read it, and they read one field.**
+    /// `CategoryMatcher::SourceCategory` asks which of his categories the row
+    /// belongs in; [`crate::classification::RuleMatcher::source_category`] asks
+    /// what the row *is*. The second was missing until `iaam-93lz`, so a
+    /// profile transcribing a category the way decision 0019 §6 requires
+    /// produced a field no classification rule could name.
     ///
     /// This field did not exist while the observation path carried
     /// `source_kind` in the operation's `source_category` slot, so a category
@@ -237,6 +244,12 @@ impl ObservedRow {
             },
             description: self.description.clone(),
             source_kind: self.source_kind.clone(),
+            // Carried into the subject rather than kept for the envelope alone.
+            // The field arrived with `iaam-p683` and nothing read it here, so
+            // the owner could transcribe a source's category through the whole
+            // channel and still not write a rule on it — which is the half of
+            // decision 0019 §6 that was missing (`iaam-93lz`).
+            source_category: self.source_category.clone(),
             movement: self.movement(),
             far_side: self.far_side,
         }

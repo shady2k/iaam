@@ -119,6 +119,8 @@ is how you match a term in them to the code.
 | передача документа | conveying | an agent moving a document of the owner's to his own instance, **unread**. Permitted, and the ordinary way an import starts (decision 0022). Never «uploading», which says nothing about who read it |
 | истолкование документа | interpreting | producing from a document a claim about what it says: parsing it, summarising its rows, or deciding what a row was. Never an agent's act — the engine reads and the session asks (decision 0022) |
 | каталог профилей | profile catalogue | what an instance publishes about the profiles it holds: id, version, digest, origin, and the reason any was refused |
+| категория источника | source category | `source_category`; the word the source filed the row under — what the money was **for**. Transcribed verbatim and never mapped (decision 0019 §6); the owner's own rules read it, and two of them do — a category rule files the row under one of his categories, a classification rule says what the row is |
+| слово источника об операции | source operation word | `source_kind`; the word the source printed for what the operation **was** — its operation-type cell. A different fact from the source category beside it, and never written through the same slot (decision 0020 §2) |
 | карта слов | token map | a profile's mapping from a literal the source prints to one of iaam's own words. Total over the source's vocabulary, with no catch-all: an unmapped word rejects the row |
 | ключ строки | row key | the stable identity that makes a re-import idempotent |
 | нога (перевода) | leg | one of the two rows an internal transfer produces |

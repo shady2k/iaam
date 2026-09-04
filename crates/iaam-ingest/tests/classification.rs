@@ -32,6 +32,17 @@ fn matcher(
         counterparty_account: counterparty.map(str::to_owned),
         description_contains: description.map(str::to_owned),
         kind: kind.map(str::to_owned),
+        source_category: None,
+    }
+}
+
+/// A condition asking only about the category the source filed the row under.
+fn filed_under(category: &str) -> RuleMatcher {
+    RuleMatcher {
+        counterparty_account: None,
+        description_contains: None,
+        kind: None,
+        source_category: Some(category.to_owned()),
     }
 }
 
@@ -50,6 +61,7 @@ fn transfer_to(name: &str, account: AccountId) -> ClassificationSubject {
         counterparty: Counterparty::Named(name.to_owned()),
         description: Some("Перевод по номеру счёта".to_owned()),
         source_kind: Some("Перевод".to_owned()),
+        source_category: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     }
@@ -66,6 +78,7 @@ fn a_transfer_to_an_own_account_needs_no_rule() {
         counterparty: Counterparty::OwnAccount(other),
         description: None,
         source_kind: None,
+        source_category: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     };
@@ -179,6 +192,7 @@ fn the_description_matcher_ignores_letter_case() {
         counterparty: Counterparty::Unknown,
         description: Some("КОМИССИЯ ЗА ОБСЛУЖИВАНИЕ".to_owned()),
         source_kind: None,
+        source_category: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     };
@@ -252,6 +266,7 @@ fn an_outflow_without_a_counterparty_asks_fee_or_withdrawal() {
         counterparty: Counterparty::Unknown,
         description: None,
         source_kind: None,
+        source_category: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     };
@@ -272,6 +287,7 @@ fn an_inflow_without_a_counterparty_asks_income_or_return() {
         counterparty: Counterparty::Unknown,
         description: None,
         source_kind: None,
+        source_category: None,
         movement: Some(Movement::In),
         far_side: FarSide::Unstated,
     };
@@ -618,6 +634,175 @@ fn a_settled_offer_carries_no_classification_either() {
     assert_eq!(classification_of(&event), None);
 }
 
+// --- the category the source filed the row under (iaam-93lz) ----------------
+
+/// A row an institution filed under a category and named nothing else by.
+///
+/// This is the shape the first source profile produces: the export prints no
+/// operation-type column at all, so `source_kind` is `None` on every row, and
+/// the category is the only word the source contributes.
+fn filed_only(account: AccountId, category: &str, movement: Movement) -> ClassificationSubject {
+    ClassificationSubject {
+        account,
+        counterparty: Counterparty::Unknown,
+        description: None,
+        source_kind: None,
+        source_category: Some(category.to_owned()),
+        movement: Some(movement),
+        far_side: FarSide::Unstated,
+    }
+}
+
+#[test]
+fn a_row_the_source_filed_under_a_category_is_a_question_until_a_rule_reads_it() {
+    // The falsification for the arm below: without the rule the row is asked
+    // about, so a rule that settles it is settling something that was open.
+    let mine = AccountId::new_random();
+    let subject = filed_only(mine, "Bank interest", Movement::In);
+
+    assert_eq!(
+        classify(&subject, &[]),
+        ClassificationResult::Ambiguous {
+            question: Question::IsInflowIncome { account: mine },
+        }
+    );
+}
+
+#[test]
+fn a_standing_rule_on_the_sources_category_settles_a_row_naming_no_operation_word() {
+    // The whole of iaam-93lz. Decision 0019 §6 has a profile transcribe the
+    // source's category and never map it, because the owner's rules do that job
+    // — and this vocabulary had no arm for the field, so «a row this institution
+    // filed under this category is interest on a balance» could not be written
+    // as a standing rule at all. For the profile that ships it could not be
+    // written any other way either: the export names no operation word.
+    let mine = AccountId::new_random();
+    let subject = filed_only(mine, "Bank interest", Movement::In);
+    let standing = rule(
+        1,
+        filed_under("Bank interest"),
+        Classification::Income {
+            kind: Some(iaam_core::event::kind::IncomeKind::DepositInterest),
+        },
+    );
+
+    assert_eq!(
+        classify(&subject, std::slice::from_ref(&standing)),
+        ClassificationResult::Resolved {
+            classification: Classification::Income {
+                kind: Some(iaam_core::event::kind::IncomeKind::DepositInterest),
+            },
+            basis: Basis::Rule {
+                rule: standing.id,
+                version: 1,
+            },
+        }
+    );
+}
+
+#[test]
+fn a_condition_on_the_category_does_not_fire_on_the_operation_word() {
+    // The two words are two fields end to end (decision 0020 §2), and this is
+    // the vocabulary keeping its half of that. A source that calls the
+    // *operation* by the same string the owner wrote a *category* rule about
+    // must not have the rule fire on it, and the reverse must hold too — the
+    // pair used to travel through one slot, and everything round-tripped while
+    // meaning the wrong thing.
+    let mine = AccountId::new_random();
+    let by_category = filed_under("Bank interest");
+    let by_word = matcher(None, None, Some("Bank interest"));
+
+    let filed = filed_only(mine, "Bank interest", Movement::In);
+    let named = ClassificationSubject {
+        source_kind: Some("Bank interest".to_owned()),
+        source_category: None,
+        ..filed_only(mine, "Bank interest", Movement::In)
+    };
+
+    assert!(by_category.matches(&filed));
+    assert!(
+        !by_category.matches(&named),
+        "a category is not an operation word"
+    );
+    assert!(by_word.matches(&named));
+    assert!(
+        !by_word.matches(&filed),
+        "an operation word is not a category"
+    );
+}
+
+#[test]
+fn a_category_is_matched_whole_and_not_as_a_substring() {
+    // A source's category is a value out of a vocabulary that source controls,
+    // like the operation word beside it and unlike the payment purpose. A
+    // substring test would let a rule about one of an institution's categories
+    // reach every other category whose name contains it.
+    let mine = AccountId::new_random();
+    let subject = filed_only(mine, "Bank interest", Movement::In);
+
+    assert!(!filed_under("Bank").matches(&subject));
+    assert!(!filed_under("bank interest").matches(&subject));
+    assert!(filed_under("Bank interest").matches(&subject));
+}
+
+#[test]
+fn a_condition_naming_only_the_category_still_asks_about_something() {
+    // `asks_nothing` is the guard against an «everything» rule, and a fourth
+    // field it did not know about would make a perfectly ordinary rule read as
+    // one that asks nothing and match nothing — the defect that makes a matcher
+    // unable to fire.
+    assert!(!filed_under("Bank interest").asks_nothing());
+    assert!(matcher(None, None, None).asks_nothing());
+}
+
+#[test]
+fn the_fields_of_one_condition_are_joined_with_and() {
+    // How a rule written on one institution's vocabulary is kept off another's:
+    // the category condition is narrowed by a counterparty beside it, and both
+    // must hold. Decision 0026 rests on this — it is why the matcher is not
+    // scoped to a source.
+    let mine = AccountId::new_random();
+    let both = RuleMatcher {
+        counterparty_account: Some("Shop One".to_owned()),
+        description_contains: None,
+        kind: None,
+        source_category: Some("Bank interest".to_owned()),
+    };
+    let category_only = filed_only(mine, "Bank interest", Movement::Out);
+    let with_counterparty = ClassificationSubject {
+        counterparty: Counterparty::Named("Shop One".to_owned()),
+        ..filed_only(mine, "Bank interest", Movement::Out)
+    };
+
+    assert!(
+        !both.matches(&category_only),
+        "the counterparty is required too"
+    );
+    assert!(both.matches(&with_counterparty));
+}
+
+#[test]
+fn a_rule_reads_back_every_condition_it_was_written_with() {
+    // Without wording there is nothing to explain a past classification with
+    // (§10.4), and a condition missing from the wording is a rule the owner
+    // reads as narrower than it is.
+    let written = ClassificationRule {
+        id: ClassificationRuleId::new_random(),
+        version: 3,
+        matcher: RuleMatcher {
+            counterparty_account: None,
+            description_contains: None,
+            kind: Some("credit".to_owned()),
+            source_category: Some("Bank interest".to_owned()),
+        },
+        outcome: Classification::Income { kind: None },
+    };
+
+    let wording = written.describe();
+    assert!(wording.contains("«credit»"), "{wording}");
+    assert!(wording.contains("«Bank interest»"), "{wording}");
+}
+
 // --- what the source says about the far side (iaam-cp94) --------------------
 
 /// A row whose source asserted the far side is the owner's, naming nobody and
@@ -628,6 +813,7 @@ fn asserted_own(account: AccountId) -> ClassificationSubject {
         counterparty: Counterparty::Unknown,
         description: None,
         source_kind: Some("INNER".to_owned()),
+        source_category: None,
         movement: None,
         far_side: FarSide::OwnAccount,
     }
@@ -668,6 +854,7 @@ fn a_rule_the_owner_wrote_beats_the_word_the_source_printed() {
             counterparty_account: None,
             description_contains: None,
             kind: Some("INNER".to_owned()),
+            source_category: None,
         },
         outcome: Classification::ExternalFlow,
     };

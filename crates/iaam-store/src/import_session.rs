@@ -175,10 +175,14 @@ impl SqliteStore {
     /// `account` is stored and nothing here derives from it, and it is stored
     /// **as well as** `source` and `import` rather than instead of them: those
     /// two are what the journal is stamped with, and both are one-way hashes of
-    /// this account together with the channel and the label. A reused session
-    /// keeps the account it was opened with, which cannot disagree with the one
-    /// passed here: an import identity is derived from an account, so two calls
-    /// naming one import name one account.
+    /// this account together with the channel and the label.
+    ///
+    /// A reused session keeps the account it was opened with and **this
+    /// argument is dropped**. What makes that sound is not a property of the
+    /// import path or of the source path but of what it takes to be a key at
+    /// all, so it is stated once on `standing_session`, the dispatch that
+    /// chooses between them — including the single case where it is a tolerance
+    /// rather than an equality.
     pub fn open_import_session(
         &mut self,
         owner: OwnerId,
@@ -730,6 +734,36 @@ fn open_session_for_source(
 /// declaration naming an import is recognised by it; one naming only a source
 /// is recognised by that; one naming neither is recognised by nothing, which is
 /// the honest answer and not an oversight.
+///
+/// **What every arm here relies on: a key names an account.**
+/// [`SqliteStore::open_import_session`] hands back the session this function
+/// finds and drops the account it was given, which is only safe while two calls
+/// producing one key cannot have named two accounts. Both keys carry that:
+/// `SourceId::declared` hashes owner, account and channel, and
+/// `ImportId::declared` hashes owner, account, channel and label, so one key is
+/// one account. The same rule seen from the other side: a key derived from no
+/// account — `SourceId::new_random()`, which the undeclared ingest path mints
+/// per request — is a fresh value on every call, matches no stored session, and
+/// therefore reuses nothing.
+///
+/// Stated on the dispatch and not once per arm on purpose. The import arm and
+/// the source arm satisfy this for two different reasons that read like two
+/// local arguments, and a third arm added below would have neither of them to
+/// copy; what it has to satisfy is this one sentence, and reuse keyed on
+/// anything that is not derived from an account would hand a caller a session
+/// opened for a different one.
+///
+/// **One exception, and it is deliberate.** A session opened before
+/// `0024_import_session_account.sql` stored no account, so this function can
+/// hand a NULL-account session to a caller that did declare one — a caller that
+/// followed the new rule reaching a session which structurally cannot check its
+/// rows against an account, because the check is against what the session
+/// recorded and it recorded nothing. That is the tolerance the migration chose:
+/// such a session «keeps exactly the behaviour it was opened under rather than
+/// acquiring a rule it never agreed to». It is bounded — the set of such
+/// sessions is fixed and drains as they commit or are abandoned — and the
+/// alternative is refusing an import over when the session it names happened to
+/// be opened.
 pub(crate) fn standing_session(
     conn: &Connection,
     owner: OwnerId,

@@ -32,6 +32,7 @@ use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule,
     ClassificationSubject, Movement, Question, RuleMatcher, classify,
 };
+use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
 use iaam_ingest::observation::{Intake, ObservedRow};
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Rejection, SubmittedOperation, Verdict, normalize};
@@ -3170,14 +3171,30 @@ enum Assessment {
 /// and a classifier that branched on it is the failure decision 0004 asks a
 /// reviewer to check for.
 ///
-/// Split out of [`Resolver`] so that the tiering below has exactly one
+/// Split out of [`Resolver`] so that the tiering has exactly one
 /// implementation. A row's counterparty and a batch's declared account are the
 /// same question asked at two moments — «which of the owner's accounts does
 /// this printed string name» — and two implementations of it could come to
 /// disagree, which is how a batch gets declared against one account while its
 /// rows resolve against another.
+///
+/// **The tiering itself lives one crate down**, in
+/// [`iaam_ingest::csv_source::AccountNames`], and this type holds one and asks
+/// it. It moved there when a document's `account` column had to ask the same
+/// question (iaam-w49n): a CSV is parsed in `iaam-ingest`, which cannot see this
+/// crate, so leaving the tiering here would have meant a second copy of it in
+/// the parser — and the copy that already existed answered in a different
+/// vocabulary and refused in words that named none. The views stay here because
+/// a declaration is answered with one, and `AccountDetailView` is this crate's
+/// type; what goes down is the question, not the store.
 pub struct AccountDirectory {
     accounts: Vec<AccountDetailView>,
+    /// The same accounts, in the shape the tiering searches.
+    ///
+    /// Held rather than rebuilt per row: a batch of two hundred rows asks the
+    /// same question two hundred times, and rebuilding the table each time
+    /// would allocate the owner's whole directory per row.
+    names: AccountNames,
 }
 
 /// The owner's accounts, his statements about them, and his rules, loaded once
@@ -3206,23 +3223,11 @@ impl Resolver {
             rules.push(crate::scenarios::classification::rule_from_view(rule)?);
         }
         Ok(Self {
-            directory: AccountDirectory { accounts },
+            directory: AccountDirectory::from_accounts(accounts),
             statements,
             rules,
         })
     }
-}
-
-/// Why a printed identifier named no single account, before a field name is put
-/// on it.
-///
-/// The two halves of a refusal that do not depend on where the identifier was
-/// written: what the field admits and what arrived. The field itself is added by
-/// the caller, because the same failure is `source.account` on a declaration and
-/// `account` on a row.
-struct UnresolvedAccount {
-    expected: String,
-    actual: String,
 }
 
 impl AccountDirectory {
@@ -3246,68 +3251,32 @@ impl AccountDirectory {
     /// directory as it was and have its rows judged against the directory as it
     /// became.
     #[must_use]
-    pub const fn from_accounts(accounts: Vec<AccountDetailView>) -> Self {
-        Self { accounts }
+    pub fn from_accounts(accounts: Vec<AccountDetailView>) -> Self {
+        let names = accounts.iter().map(entry_for).collect();
+        Self { accounts, names }
+    }
+
+    /// The same accounts, as a document's parser reads them.
+    ///
+    /// A parser is handed this rather than being handed the account views and
+    /// left to build the table itself, because the translation from a view to a
+    /// vocabulary — which field is an identity, which is a title, which carries
+    /// an interval — is a decision, and a second copy of it in the server layer
+    /// is a place the two answers could drift apart.
+    #[must_use]
+    pub fn names(&self) -> AccountNames {
+        self.names.clone()
     }
 
     /// Every account a printed counterparty could be, from the strongest kind of
     /// evidence that recognised anything.
     ///
-    /// Three tiers, tried in order, and the search stops at the first that
-    /// matches at all rather than pooling them:
-    ///
-    /// 1. **iaam's own account identifier**, printed verbatim.
-    /// 2. **The identity the source prints** for the account, and the aliases
-    ///    that reach the same account — a card among them (decision 0004). An
-    ///    alias is read against the day of the row where the row carries one.
-    /// 3. **The account's title**, trimmed and case-insensitively.
-    ///
-    /// The order is the decision. A title is what the owner reads and may
-    /// rename at any moment; an identity is what a source repeats. So an
-    /// identity must not merely tie with a title — a rename would otherwise
-    /// silently re-point a resolution, which is the defect decision 0004 was
-    /// written about. Stopping at the first tier that matched is what makes it
-    /// beat rather than tie: an identity naming one account is not diluted by
-    /// another account whose title happens to agree, and — the other way round —
-    /// a title shared by two accounts is not settled by an identity somewhere
-    /// below it, because nothing below is consulted.
-    ///
-    /// **The title tier stays**, deliberately. Every account that existed before
-    /// decision 0004 states no identity and has no aliases, and dropping the
-    /// tier would stop recognising their transfers until each is back-filled —
-    /// a silent behaviour change bought for no correctness. Its one failure mode
-    /// is a collision, and a collision is refused here rather than guessed at.
+    /// The tiering is [`AccountNames::candidates`], one crate down, and this is
+    /// the whole of what happens here: a row's counterparty, a batch's
+    /// declaration and a document's `account` column all reach that one
+    /// function, so none of them can come to answer differently.
     fn candidates(&self, name: &str, on: Option<time::Date>) -> Vec<AccountId> {
-        let printed = name.trim();
-
-        if let Ok(id) = uuid::Uuid::parse_str(printed) {
-            let own: Vec<AccountId> = self
-                .accounts
-                .iter()
-                .filter(|account| account.id.inner() == id)
-                .map(|account| account.id)
-                .collect();
-            if !own.is_empty() {
-                return own;
-            }
-        }
-
-        let identified: Vec<AccountId> = self
-            .accounts
-            .iter()
-            .filter(|account| identifies(account, printed, on))
-            .map(|account| account.id)
-            .collect();
-        if !identified.is_empty() {
-            return identified;
-        }
-
-        let wanted = printed.to_lowercase();
-        self.accounts
-            .iter()
-            .filter(|account| account.title.trim().to_lowercase() == wanted)
-            .map(|account| account.id)
-            .collect()
+        self.names.candidates(name, on)
     }
 
     /// The account a declaration names, or a refusal saying why it names none.
@@ -3363,50 +3332,22 @@ impl AccountDirectory {
     /// can decide something: on a row's counterparty, in
     /// [`Resolver::resolve_counterparty`].
     pub fn resolve_row(&self, printed: &str) -> Result<AccountId, Rejection> {
-        match self.resolve(printed) {
-            Ok(account) => Ok(account.id),
-            Err(refusal) => Err(Rejection {
-                field: "account".to_owned(),
-                expected: refusal.expected,
-                actual: refusal.actual,
-            }),
-        }
+        self.resolve(printed)
+            .map(|account| account.id)
+            .map_err(|refusal| refusal.into_rejection("account"))
     }
 
     /// The one account a printed identifier names, or why it names none.
     ///
-    /// The refusal is built here and worded once, so the declaration and the row
-    /// refuse an identifier in the same words under two different field names.
-    /// Two wordings would eventually describe two different rules.
+    /// The refusal is worded in [`AccountNames::resolve`] and nowhere else, so
+    /// that a declaration, a row of a JSON batch and the `account` column of a
+    /// document refuse an identifier in the same words under three different
+    /// field names. Two wordings would eventually describe two different rules,
+    /// and one of them did: the document's column refused with `directory name`
+    /// and accepted only a title, while this one named two identifiers
+    /// (iaam-w49n).
     fn resolve(&self, printed: &str) -> Result<AccountDetailView, UnresolvedAccount> {
-        let matched = self.candidates(printed, None);
-        let [only] = matched[..] else {
-            return Err(UnresolvedAccount {
-                expected: if matched.is_empty() {
-                    "an account of the owner's, named by its iaam identifier or \
-                     by the identifier its source prints for it"
-                        .to_owned()
-                } else {
-                    "an identifier naming exactly one account: name one of them \
-                     by its iaam identifier, or give exactly one of them the \
-                     identifier this source prints (provider, provider_account_id)"
-                        .to_owned()
-                },
-                actual: if matched.is_empty() {
-                    format!("«{printed}» names none of the owner's accounts")
-                } else {
-                    format!(
-                        "«{printed}» names {} of the owner's accounts: {}",
-                        matched.len(),
-                        matched
-                            .iter()
-                            .map(|id| format!("{} ({})", self.title(*id), id.inner()))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                },
-            });
-        };
+        let only = self.names.resolve(printed)?;
         Ok(self
             .accounts
             .iter()
@@ -3416,10 +3357,7 @@ impl AccountDirectory {
     }
 
     fn title(&self, account: AccountId) -> String {
-        self.accounts
-            .iter()
-            .find(|known| known.id == account)
-            .map_or_else(|| account.inner().to_string(), |known| known.title.clone())
+        self.names.title(account)
     }
 }
 
@@ -3601,27 +3539,35 @@ impl Resolver {
     }
 }
 
-/// Whether an account is the one a source printed this identifier for.
+/// One account as the tiering reads it.
 ///
-/// The identity and the aliases are compared **verbatim**: decision 0004 defines
-/// `provider_account_id` as opaque to iaam, and equality is the whole contract.
-/// Case-folding it would be a claim about what the value means, and the first
-/// rule that depended on that claim would be depending on a parse.
+/// The one translation from a stored view to a vocabulary, and the reason
+/// [`AccountDirectory::names`] hands out a built table rather than the views: a
+/// second place deciding that `provider_account_id` is an identity and `title`
+/// is a name is a second place that could decide otherwise.
 ///
-/// An alias is read against the day of the row where there is one, so a card
-/// whose interval has closed stops recognising rows posted after it. Where the
-/// row carries no date the interval is not consulted: refusing the alias anyway
-/// would be a conclusion drawn from a field the row does not have.
-fn identifies(account: &AccountDetailView, printed: &str, on: Option<time::Date>) -> bool {
-    if account.provider_account_id.as_deref() == Some(printed) {
-        return true;
+/// `provider_account_id` carries no interval because the owner stated it for the
+/// account, not for a stretch of its history; an alias carries its own, which is
+/// how two cards over one underlying account stay one account.
+fn entry_for(account: &AccountDetailView) -> AccountEntry {
+    AccountEntry {
+        id: account.id,
+        printed: account
+            .provider_account_id
+            .iter()
+            .map(|value| (value.clone(), None))
+            .chain(account.aliases.iter().map(|alias| {
+                (
+                    alias.value.clone(),
+                    Some(iaam_core::instrument::AliasInterval {
+                        valid_from: alias.valid_from,
+                        valid_to: alias.valid_to,
+                    }),
+                )
+            }))
+            .collect(),
+        title: account.title.clone(),
     }
-    account.aliases.iter().any(|alias| {
-        alias.value == printed
-            && on.is_none_or(|day| {
-                day >= alias.valid_from && alias.valid_to.is_none_or(|until| day < until)
-            })
-    })
 }
 
 /// Which way the money went, when anything says so.
@@ -3898,7 +3844,7 @@ mod tests {
 
     fn resolver(accounts: Vec<AccountDetailView>) -> Resolver {
         Resolver {
-            directory: AccountDirectory { accounts },
+            directory: AccountDirectory::from_accounts(accounts),
             statements: Vec::new(),
             rules: Vec::new(),
         }
@@ -3907,7 +3853,7 @@ mod tests {
     /// A resolver holding rules the owner has already written.
     fn ruled(accounts: Vec<AccountDetailView>, rules: Vec<ClassificationRule>) -> Resolver {
         Resolver {
-            directory: AccountDirectory { accounts },
+            directory: AccountDirectory::from_accounts(accounts),
             statements: Vec::new(),
             rules,
         }
@@ -3918,7 +3864,7 @@ mod tests {
         statements: Vec<(AccountId, Vec<AccountId>)>,
     ) -> Resolver {
         Resolver {
-            directory: AccountDirectory { accounts },
+            directory: AccountDirectory::from_accounts(accounts),
             statements: statements
                 .into_iter()
                 .map(|(account, partners)| AccountTransferStatementView { account, partners })
@@ -4113,12 +4059,10 @@ mod tests {
     #[test]
     fn a_declaration_is_read_by_the_identifier_its_source_prints() {
         let main = account(1);
-        let directory = AccountDirectory {
-            accounts: vec![
-                with_identity(detail(main, "Main"), "ACC-1"),
-                detail(account(2), "Savings"),
-            ],
-        };
+        let directory = AccountDirectory::from_accounts(vec![
+            with_identity(detail(main, "Main"), "ACC-1"),
+            detail(account(2), "Savings"),
+        ]);
         assert_eq!(
             directory
                 .resolve_declared("ACC-1")
@@ -4143,14 +4087,12 @@ mod tests {
         // date, and refusing the file would refuse the very export that shows
         // the change.
         let main = account(1);
-        let directory = AccountDirectory {
-            accounts: vec![with_alias(
-                detail(main, "Main"),
-                "CARD-1",
-                date!(2026 - 01 - 01),
-                Some(date!(2026 - 03 - 01)),
-            )],
-        };
+        let directory = AccountDirectory::from_accounts(vec![with_alias(
+            detail(main, "Main"),
+            "CARD-1",
+            date!(2026 - 01 - 01),
+            Some(date!(2026 - 03 - 01)),
+        )]);
         assert_eq!(
             directory
                 .resolve_declared("CARD-1")
@@ -4162,17 +4104,15 @@ mod tests {
 
     #[test]
     fn a_declaration_naming_two_accounts_is_refused_and_says_which() {
-        let directory = AccountDirectory {
-            accounts: vec![
-                with_identity(detail(account(1), "Main"), "ACC-1"),
-                with_alias(
-                    detail(account(2), "Savings"),
-                    "ACC-1",
-                    date!(2026 - 01 - 01),
-                    None,
-                ),
-            ],
-        };
+        let directory = AccountDirectory::from_accounts(vec![
+            with_identity(detail(account(1), "Main"), "ACC-1"),
+            with_alias(
+                detail(account(2), "Savings"),
+                "ACC-1",
+                date!(2026 - 01 - 01),
+                None,
+            ),
+        ]);
         let error = directory
             .resolve_declared("ACC-1")
             .expect_err("two accounts answer to it");
@@ -4201,9 +4141,7 @@ mod tests {
 
     #[test]
     fn a_declaration_naming_nothing_is_refused_as_a_stranger() {
-        let directory = AccountDirectory {
-            accounts: vec![detail(account(1), "Main")],
-        };
+        let directory = AccountDirectory::from_accounts(vec![detail(account(1), "Main")]);
         let error = directory
             .resolve_declared("ACC-9")
             .expect_err("no account answers to it");

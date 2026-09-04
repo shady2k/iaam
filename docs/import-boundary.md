@@ -33,12 +33,16 @@ source's format sits for each.
 Two of those rows are read wrongly often enough to be worth naming.
 
 **`POST /v1/ingest/csv` does not accept a bank's export.** Its columns are
-iaam's — `date`, `type`, `account`, `currency` and the optional rest — and its
-accounts are resolved by *name* through the directory. It is a hand-writable
-format, not a bridge from anybody's institution. Sending a bank export to it
-does not half-work; it rejects every row. The path is what invites the mistake:
-`csv` is the file extension of every statement any institution emits, and the
-name says nothing about whose columns are expected.
+iaam's — `date`, `type`, `account`, `currency` and the optional rest. Its
+`account` and `counterparty_account` cells are resolved through the same tiering
+`POST /v1/ingest/operations` resolves a row's account with — iaam's own
+identifier, then the identifier the account's source prints for it, then the
+owner's title (decision 0010). It used to resolve the title and nothing else,
+which made one flow answer «which account is this» in two vocabularies. It is a
+hand-writable format, not a bridge from anybody's institution. Sending a bank
+export to it does not half-work; it rejects every row. The path is what invites
+the mistake: `csv` is the file extension of every statement any institution
+emits, and the name says nothing about whose columns are expected.
 
 Its rows **are** retractable, since iaam-0f8f. They used to arrive under a
 source minted for one request, which `POST /v1/corrections/imports` could never

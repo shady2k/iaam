@@ -340,11 +340,44 @@ is what is reconciled against, not a second proof: agreement gives
 confirmed. The difference is not cosmetic — the owner usually remembers the
 balance from the same application the statement came from.
 
+## An account is named by an identifier, and every channel reads the same ones
+
+Wherever a row you submit names one of the owner's accounts — the account the
+row is on, the far side of a transfer between two of his own, the account a
+batch is declared for — the string is read the same way, whichever channel
+carried the row and whether it arrived as a document or as a request body.
+Three vocabularies, tried in that order:
+
+1. **iaam's own identifier for the account**, exactly as a response printed it.
+2. **The identifier the account's source prints** for it: what the institution
+   writes on the statement, together with the cards and other identifiers the
+   owner has attached to that same account, each read as of the row's own date.
+3. **The owner's title** for the account.
+
+Send the first where you have it, and the second where the file you are reading
+prints it. Do not send the third. It resolves, and it resolves only so that
+documents written before the other two existed keep parsing — a title is a
+string the owner may change tomorrow, and two of his accounts may carry one
+title, which is refused rather than guessed at. A file that worked last month
+can stop working on a rename; an identifier cannot.
+
+The order is not a preference, it is a rule about ties: the search stops at the
+first vocabulary that recognises anything, so an identifier is never diluted by
+an account whose title happens to agree with it.
+
+A string naming none of his accounts is refused in a sentence that says which
+vocabularies the field would have taken; a string naming two is refused with
+both accounts in it, so he can see the collision he has to clear. That sentence
+is the same across every channel — learn it from one refusal and you have
+learned it for all of them.
+
 ## An instrument's external code resolves as of a date
 
 An instrument is named by an **external code**, not by an identifier. An ISIN,
 a ticker, a MOEX `SECID`, a FIGI and a broker's internal code all serve. The
-place of custody is named by a name from the owner's directory.
+place of custody is named by the owner's own title for it, and nothing else
+names one: no source prints an identity for a depository, so there is no second
+vocabulary there to prefer.
 
 A code resolves **as of the operation's date**, and this is not a formality. An
 ISIN changes through a corporate action: the report for last year arrives with
@@ -661,13 +694,36 @@ and do not report each date to the owner separately.
 **Never call `provisional` an error.** It means no independent confirmation has
 arrived yet, which is an ordinary state of a correct journal.
 
-**And never wait for `accepted`.** The verdict vocabulary publishes the word and
-nothing produces it, which its own published sentence now says. A verdict answers
-one write, while whether reconciliation matched is a property of an account, a
+**And never wait for a reconciliation verdict.** Three of the ten codes —
+`accepted`, `discrepancy` and `needs_reconciliation` — are published and produced
+by nothing, which each one's own published sentence now says. The three are not a
+backlog: they are the reconciliation ones, and the boundary is the point. A
+verdict answers one write, while reconciliation is a property of an account, a
 dimension and an interval, folded when a report is read and moved by evidence
-that arrives later. Confirmation is read from the data quality block, as
-`accepted_internal` or `accepted_independent`; the absence of `accepted` from a
-row's verdict says nothing about it either way.
+that arrives later. The seven codes you will actually see are the ones about a
+row.
+
+Read each of the three where it is answered, and never from a row's verdict:
+
+- **`accepted`** — confirmation is in the data quality block, as
+  `accepted_internal` or `accepted_independent`. The absence of `accepted` from
+  a row's verdict says nothing about it either way.
+- **`discrepancy`** — a batch that disagrees with the control section its own
+  source printed is named figure by figure, with both numbers and the
+  difference, in the assessment an import session publishes; read it before you
+  commit, and read it before you override the disagreement, because overriding
+  is a sentence you are only entitled to write after reading them. A
+  disagreement the journal holds is reported by the data quality block as
+  `discrepant` and by the action queue as `discrepancy_unresolved`, which
+  carries what settles it.
+- **`needs_reconciliation`** — nothing is ever declined because the owner has
+  not named a balance. Rows are recorded, and the need for the figure is derived
+  from them afterwards. Ask for it from the action queue's
+  `provide_control_assertion`, which names the account, the interval and which
+  end of it the balance is wanted at — and answer the opening point before the
+  closing one, because a closing balance compared against a sum accumulated from
+  an unasserted start reports a discrepancy that is only the missing opening
+  balance.
 
 ## A fact can be quoted, a derived value cannot
 

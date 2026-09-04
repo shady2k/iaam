@@ -223,10 +223,15 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
             .iter()
             .map(|goal| goal.code().to_owned())
             .collect(),
+        // `settled` is the fourth word, and it is the one a caller must not read
+        // as a quieter «needs_owner_input»: nothing is wanted of anybody, and
+        // the only call published is the withdrawal of the owner's own decision
+        // (`iaam-c143`).
         state: match action.state() {
             ActionState::Ready => "ready",
             ActionState::NeedsOwnerInput => "needs_owner_input",
             ActionState::Blocked => "blocked",
+            ActionState::Settled => "settled",
         }
         .to_owned(),
         reason: action.reason().to_owned(),

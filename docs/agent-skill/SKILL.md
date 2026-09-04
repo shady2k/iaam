@@ -7,11 +7,10 @@ description: IAAM personal accounting over a contour the owner draws. Works with
 
 ## Bootstrap
 
-This file explains **meaning**. It deliberately names no route, no method and no
-status code, and a guard refuses it if one appears. What a running instance
-serves is answered by the instance; a document that answers instead goes stale
-silently, and this one did — it told agents that implemented routes were
-unimplemented, and work the system could do went undone.
+This file explains **meaning**, and holds no address of any kind. What a running
+instance serves is answered by the instance and never from here: this file once
+claimed implemented routes were unimplemented, and work the system could do went
+undone.
 
 Three steps, in order:
 
@@ -19,63 +18,62 @@ Three steps, in order:
    `service-desc` link addresses the machine-readable contract; its `status`
    link addresses the health resource. Its `related` links address the rest of
    the way in: the outstanding-work queue, the scopes a report is computed over,
-   and the four questions this system answers about money — each of those four
-   tagged with the `goal` name that the queue's items and every report's
-   confidence register also use, so a caveat naming a goal leads to the resource
-   that answers it. Take addresses from that document, never from this file,
-   which deliberately holds none.
+   and the four questions this system answers about money — each tagged with the
+   `goal` name the queue's items and every report's confidence register also use,
+   so a caveat naming a goal leads to the resource that answers it. Take
+   addresses from that document, never from this file, which holds none.
 2. The document behind `service-desc` is the contract: the routes, methods,
-   request and response schemas and status codes this instance actually serves,
-   generated from its handlers. Read it instead of asking a human which routes
-   exist, which fields are required, or what a refusal will look like.
+   request and response schemas and status codes this instance actually serves.
+   Read it instead of asking a human which routes exist, which fields are
+   required, or what a refusal will look like.
 3. The actions operation declared in that contract answers what **this**
    instance needs next, computed from its own state. Each item carries the
    operation to call, its address resolved from the same contract, the fields
    already decided, and the fields still missing together with who must supply
    each. Work that queue; do not reconstruct an order of setup from memory.
 
-   **Read `requiredScope` on the resolution, not only on the item.** An item
-   with several ways out publishes a `requiredScope` for each of them, and they
-   need not agree: an item may offer one call your credential reaches and two it
-   does not. The item's own `requiredScope` is the narrowest of them — it says
-   «there is at least one call here you may make», never «you may make them
-   all». Filter the queue by the item's, then choose among the resolutions by
-   theirs. It is a floor and not a promise: a call you may make can still be
-   refused for what the request says or for what the journal holds, and
-   `providedBy` on a missing field is a separate question — who holds the value,
-   not who may transmit it.
+   **An item whose `state` is `settled` wants nothing, and it is not work.** The
+   owner decided something; the item says what his decision left standing — the
+   records it keeps out of every report, and why — and the only call it publishes
+   is the withdrawal of that decision, which is his to send. Show such an item
+   when he asks what has been decided. Do not raise it as work, do not collect a
+   field for it, and do not go looking for what it is holding up: nothing is. It
+   is not the word for «no call in this API touches this», which publishes no way
+   out at all.
+
+   **Read `requiredScope` on the resolution, not only on the item.** An item with
+   several ways out publishes one per resolution, and they need not agree. The
+   item's own is the narrowest — «there is at least one call here you may make»,
+   never «you may make them all» — so filter the queue by the item's and choose
+   among the resolutions by theirs. It is a floor and not a promise: a call you
+   may make can still be refused for what the request says or for what the
+   journal holds. `providedBy` on a missing field is a separate question — who
+   holds the value, not who may transmit it.
 
    **A field the owner must fill in arrives with the question to put to him, and
    that question is the whole of what you show him.** Each missing field marked
-   as his carries a `prompt` with two parts: `ask`, which is what he is being
-   asked and why, and `consequence`, which is what is different depending on how
-   he answers. Relay both. Do not put the field's pointer to him, and do not
-   read him the field descriptions out of the contract — those are written for
-   whoever implements a client, and an agent that showed him one showed him a
-   wire field name and left him asking what the question even was.
+   as his carries a `prompt` with two parts: `ask`, what he is being asked and
+   why, and `consequence`, what is different depending on how he answers. Relay
+   both. Never put the field's pointer to him, and never read him the contract's
+   field descriptions: those are written for whoever implements a client.
 
    A missing field of his that carries no `prompt` is not an invitation to
-   compose one. It means this instance has not decided whether a person should
-   be asked for that field at all; ask the owner about the fields that do carry
-   one, and leave that field to him or to whoever runs the instance. There is at
-   present no such field, and the one there was is instructive: it asked him for
-   a label whose only property was that it differs between sources, which is a
-   value nobody can answer well and this instance can work out. It now works it
-   out, and asks him instead where the account is held.
+   compose one. It means this instance has not decided whether a person should be
+   asked for that field at all; ask about the fields that do carry one, and leave
+   that one to him or to whoever runs the instance. There is at present no such
+   field.
 
    **Never read a `preset` value out to him.** `preset` is the request already
    filled in from what the instance worked out — an address in the route, a
    composition, an identifier a document printed — and none of it is a question.
    Send it as it stands.
 
-   **The fields of one call may be put to him in one breath.** Each field keeps
-   its own question — that is what stops four questions being written as one
-   sentence you then have to take apart — but its own question is not its own
-   exchange. `missing` is one call's fields, in the order to ask them, and you
-   hold all of it before you say anything to him. Show them together and send one
-   request. Asking them one after another is not more careful; it is the same
-   conversation made twice as long, and on an item asking two fields per account
-   it doubles a first import.
+   **The fields of one call may be put to him in one breath.** `missing` is one
+   call's fields, in the order to ask them, and you hold all of it before you say
+   anything to him: show them together and send one request. Each keeps its own
+   question — do not fuse them into one sentence you then have to take apart —
+   but its own question is not its own exchange. Asking them one after another is
+   not more careful, only twice as long.
 
    **A field the call is accepted without says so, and you offer him a way past
    it.** Read `optional` beside every missing field. Where it is set, the call
@@ -83,25 +81,18 @@ Three steps, in order:
    what leaving it out costs — put both to him, so that «I don't know» and «skip
    it» are answers he can give. Where it is not set, the call is refused without
    the field and there is nothing to offer: that is not a field to invent a value
-   for. Optional does not mean unimportant. The one such field today is where an
-   account is held: no figure reads it, and in a year it is the only thing that
-   will say where the account was.
+   for. Optional does not mean unimportant.
 
    **An item may carry an answer he can give once for several of them.** A
    missing field may publish a `proposal`: a value this instance worked out, the
    question to put to him about the whole set, and `covers` — the items that one
-   answer fills. Read the question out and treat the value as a proposal, because
-   that is what it is: nothing is recorded until he agrees, and if he does not,
-   the field's own question is what you ask him instead, item by item. If he
+   answer fills. Read the question out; nothing is recorded until he agrees, and
+   if he does not, you ask the field's own question item by item instead. If he
    agrees, send one call per item named in `covers`, each with **its own**
-   `value`: one decision does not mean one value, and «call them what the
-   statement calls them» writes a different name into each request.
-
-   `covers` is the whole set and it is complete. An item that cannot take the
-   answer is not in it, so do not carry the answer to an item the offer does not
-   name — you would be answering for something he was never asked about. Two
-   institutions' names are two sets and two questions, and the second question is
-   worth asking: the alternative is one sentence that is wrong about half of it.
+   `value`: one decision does not mean one value. `covers` is complete — an item
+   that cannot take the answer is not in it, so never carry the answer to an item
+   the offer does not name. Two institutions' names are two sets and two
+   questions.
 
 A credential is not obtained through the API. It is issued at the console by
 whoever runs the instance and handed to you; no call produces one. If a call is
@@ -128,10 +119,9 @@ not write to the journal directly: a record is the outcome of passing ingest,
 not a separate action. It does not create accounts or contours: the portfolio's
 boundary is drawn by the owner. It does not rule on what is already recorded —
 retracting a fact the owner holds is his act, and his credential is what the
-system will accept for it. The one exception proves the rule rather than
-softening it: an agent may take back an import it declared itself, while nothing
-has been built on it, because that is not a ruling on the owner's history but a
-return to the state before the agent acted. And it does not **read** the owner's
+system will accept for it. The one exception is narrow and is set out under «A
+mistake is retracted, not erased»: an agent may take back an import it declared,
+while nothing has been built on it. And it does not **read** the owner's
 statements. It may carry one to his instance, which is the ordinary way an import
 starts; what reads it is the instance, and what the agent knows about the
 contents is what the API answered.
@@ -142,17 +132,56 @@ has reached the journal is indistinguishable from a fact — every report will
 read it as one, and only the owner, who knows what actually happened, can
 retract it.
 
+## What is published is what to convey; the words are yours
+
+Everything this system publishes for the owner — a field's question and what
+turns on the answer, an alternative and what it does to his report, an item's
+reason — is **source material and not a script**. It fixes what must reach him:
+what is being decided, what it is for, and what is different depending on how he
+answers. The wording is yours, and it is owed to him: his language, his register,
+and no suggestion that a machine is speaking. This file is written in English
+because everything written down about this system is; it says nothing about the
+language you speak to a person in.
+
+**A relay is one sentence.** Name what is being decided, in his words, with what
+turns on it — and stop, ready to say more if he asks. Not a transcript, not a
+status report, and not our sentence in quotation marks. Quoting is the failure at
+one end and composing a question of your own is the failure at the other: the
+obligations are the content and the freedom is only the wording, so a relay that
+drops what the choice changes has failed in whatever language it was written.
+
+**One sentence per decision, not per line of his statement.** Thirty lines naming
+one shop are one decision, and what is the same decision is published beside the
+question rather than left to you to work out. Put it to him once.
+
+**Nothing of the machinery reaches him.** Not the words an answer is sent as, not
+an item's state or its urgency, not a value already filled in, not the fact that
+a field is optional — tell him instead that he can leave it and what leaving it
+costs — and not the numbers this project files its own decisions under. A
+client's control flow is not a conversation.
+
+**Do not narrate what you did to find out.** Which state an item is in, how
+something is classified now, whether anything is blocked: that is your work, and
+never the answer to a question he asked. Tell him what you found, or ask him what
+you could not work out.
+
+**And the line the freedom stops at.** The wording is yours; the decision is not.
+Never answer in his place, never read silence as a value, and never narrow what
+he is being asked because a shorter sentence reads better — where two answers
+land in different figures of his year, he hears both. Rendering a question is
+yours and answering it is his, which is the same boundary as an agent conveying a
+document it may not interpret, one level up.
+
 ## Where an import begins: carry the document, do not read it
 
 An import begins with a document the owner has — a statement, an export, a file
 his institution gave him. There are two acts you can perform on it, and the
 difference between them is the whole rule.
 
-**You may convey it.** Handing that document to his own instance is an ordinary
-act and is the way an import normally starts. The contract names the operation
-and says what it takes. The instance reads the document itself, through a profile
-written for that institution and that document type, and what you get back is a
-session holding rows.
+**You may convey it.** Handing the document to his own instance is the ordinary
+way an import starts; the contract names the operation. The instance reads it
+through a profile written for that institution and document type, and what you
+get back is a session holding rows.
 
 **You may not interpret it.** Do not parse it, do not summarise its rows, do not
 tabulate it, and do not decide what a row was — not its direction, not its kind,
@@ -162,82 +191,67 @@ through the assessment and through every question the session raises. It is a
 rule about a format having one reader. A reading of your own is a second
 implementation of that institution's rules, it does not fail loudly, and what it
 produces is an import that files the wrong operations with nothing saying so.
-
-Which reader read a row is recorded on the fact, so rows you converted yourself
-are marked as such for as long as they exist. That is not a trap. It is what
-makes the permission above safe to give.
+Which reader read a row is recorded on the fact, for as long as the fact exists.
 
 **If you cannot reach the document, say so.** An agent that does not run on the
-machine holding the file cannot convey it, and there is no reading of this that
-lets you interpret it instead. What is left is poorer, and you should name it as
-poorer to him: ask him for the values, submit them as what the source stated —
-the shape is the next section — and conclude nothing on his behalf. Every row
-that no rule of his already matches becomes a question he has to answer.
+machine holding the file cannot convey it, and no reading of this lets you
+interpret it instead. What is left is poorer and you name it as poorer to him:
+ask him for the values, submit them as what the source stated — the shape is the
+next section — and conclude nothing on his behalf. Every row that no rule of his
+already matches becomes a question he has to answer.
 
 **An empty instance does not know his accounts, and it will tell you which it
 needs.** A statement names the account each record is on in the institution's own
-words, and a name this instance holds no account for refuses that record. So the
-first import into a fresh instance looks like a wall of refusals, and it is not:
-convey the document to a session that declares no account, and the response
-summarises those refusals as the distinct account names the document asked for,
-each with the number of records it accounts for. Create an account for each,
-giving it the printed string as the identifier its source prints for it — not as
-the title, which is his and which he may change — and convey the same document
-again. The row keys are over the document and the line, so nothing imports twice.
-The outstanding-work queue publishes the same names once a document has been
-read, so you need not provoke the refusals a second time.
+words, and a name this instance holds no account for refuses that record — so a
+first import looks like a wall of refusals and is not. Convey the document to a
+session that declares no account, and the response summarises those refusals as
+the distinct account names the document asked for, each with the number of
+records it accounts for. Create an account for each, giving it the printed string
+as the identifier its source prints for it — not as the title, which is his and
+which he may change — and convey the same document again. The row keys are over
+the document and the line, so nothing imports twice. The outstanding-work queue
+publishes the same names once a document has been read, so you need not provoke
+the refusals again.
 
 You do not have to guess a name and you must not. Creating an account whose title
 you invented does not make the records import; it makes a second account he did
 not ask for.
 
-**But do not ask him seven times over what he can answer once.** Every one of
-those names is its own item, because an account created for one of them settles
-no other — and the items that came from one institution's documents carry, on
-each of the two fields they ask, one answer he may give for all of them: they are
-all held at the institution that printed them, and they are called what the
-statement calls them. Put those two questions first, in his words, and what is
-left is whatever he wants to say differently. Seven names asked field by field is
-around fifteen exchanges; two confirmations and the exceptions is what it should
-cost, and the reason the offer exists is that he had to say so himself, in the
-middle of the eleventh question.
+**But do not ask him name by name what he can answer once.** Each name is its own
+item, because an account created for one settles no other — and the items from
+one institution's documents carry, on each of the two fields they ask, one answer
+he may give for all of them: they are all held at the institution that printed
+them, and they are called what the statement calls them. That is the `proposal`
+of the bootstrap section. Put those two questions first, and what is left is
+whatever he wants to say differently.
 
-**And some of those names are not his accounts at all.** A statement prints the
-account each record is on, and it also prints names that belong to somebody else
-— a party he paid, an account that is not his. For those, creating an account is
-the wrong act and it is not one you may take on his behalf. The queue's item for
-such a name offers two ways out and not one: create the account, or record his
-statement that the name is nobody's account of his, with the reason he gives you.
-Put both to him. What you must not do is leave the item standing because neither
-looked like something you could act on: while it stands it is graded as work
-between him and every report he asks for, it says nothing about which of the two
-he decided, and it will be there again next month with the same name on it.
+**And some of those names are not his accounts at all** — a party he paid, an
+account that is not his. For those, creating an account is the wrong act and not
+one you may take on his behalf. The queue's item offers two ways out and not one:
+create the account, or record his statement that the name is nobody's account of
+his, with the reason he gives you. Put both to him. Do not leave the item
+standing because neither looked like something you could act on: while it stands
+it is graded as work between him and every report he asks for, and it will be
+there again next month with the same name on it.
 
 **Never a credential but your own**, whatever the document is. No broker token,
 no encryption key. An import that would need you to fetch the statement out of
 the institution yourself is not one you can do.
 
-`docs/import-boundary.md` is the map: which channel writes what, who runs each,
-what an agent may do with a document, and why the line is drawn where it is. Read
-it before extending an import, not before running one.
-
 ## A row you cannot classify is submitted as such
 
-The rule above — a missing value is asked of the owner, not filled in — used to
-have no way of being obeyed at intake. Every operation kind stated a conclusion:
-two of them asserted which way the money went, and the third demanded the
-account on the other side. A bank row printed as an amount and a word meaning
-"internal to this institution" is none of those, and the only shapes on offer
-forced a guess. One was made, a withdrawal was recorded as a deposit, and it had
-to be retracted afterwards.
+Every operation kind states a conclusion: two assert which way the money went,
+and the third demands the account on the other side. A bank row printed as an
+amount and a word meaning "internal to this institution" is none of those, and
+submitting it as one is the guess that recorded a withdrawal as a deposit.
 
-There is now a shape for the row itself. It states what the source stated and
-nothing more: the account the statement is for, the source's own direction word
-including the one that resolves to no direction, the amount **with the sign the
-source printed**, the party the source named if it named one, the word the
-source used for the operation, and the identifiers of the document and the row.
-Where the source said nothing, the shape says so explicitly; absence is a
-statement, not a default.
+There is a shape for the row itself. It states what the source stated and nothing
+more: the account the statement is for, the source's own direction word including
+the one that resolves to no direction, the amount **with the sign the source
+printed**, the party the source named if it named one, the word the source used
+for the operation, and the identifiers of the document and the row. Where the
+source said nothing, the shape says so explicitly; absence is a statement, not a
+default.
 
 **Use it whenever you have not concluded, and do not use it when you have.** A
 row you can read is submitted as what it is, and should be — the shape is not a
@@ -254,22 +268,20 @@ question.
 
 ### When the source says whose account the far side is
 
-Some statements file a row as a movement between the owner's own accounts and
-say nothing else about it: no direction, no counterparty. That claim has a field
-of its own on the observation shape, beside the direction word and beside the
-counterparty, and it takes two values — the source asserted the far side is one
-of the owner's accounts, or it said nothing about it.
-
-It is **stronger** than the direction word that means «internal to this
-institution», which is equally true of a payment to a stranger who banks there,
-and **weaker** than naming the account, which such a row does not do.
+Some statements file a row as a movement between the owner's own accounts and say
+nothing else: no direction, no counterparty. That claim has a field of its own on
+the observation shape, taking two values — the source asserted the far side is
+one of the owner's accounts, or it said nothing about it. It is **stronger** than
+the direction word meaning «internal to this institution», which is equally true
+of a payment to a stranger who banks there, and **weaker** than naming the
+account, which such a row does not do.
 
 Three things follow, and the third is the one to get right.
 
 - **Set it only where the export says so in words.** It is a transcription, like
   the direction. Deciding that a counterparty is one of the owner's accounts is
-  a conclusion, it is reached against his directory on the server, and you must
-  not reach it for him. A row where you set this because it seemed likely is a
+  a conclusion, reached against his own directory of accounts, and you must not
+  reach it for him. A row where you set this because it seemed likely is a
   movement that will never appear as spending and never leave the perimeter.
 - **It carries no direction, and none is inferred from it.** A row that asserts
   it and states no direction is recorded as a movement between the owner's own
@@ -286,15 +298,15 @@ second identifier recorded as an alias. Money moving between them changes no
 balance and has no second leg, so the honest record is **no fact at all**.
 
 Where the identifier the source printed for the far side resolves to the very
-account the row is on, that determination is made without asking anything, and
-it is reported in its own words: the row is `settled` when you feed it, it
-appears in the plan's list of rows settled without a fact, and its commit
-verdict is `no_fact` with the determination's code beside it.
+account the row is on, that is determined without asking anything and reported in
+its own words: the row is `settled` when you feed it, it appears in the plan's
+list of rows settled without a fact, and its commit verdict is `no_fact` with the
+determination's code beside it.
 
 **Do not read that as a failure and do not retry it.** It is not `quarantined`,
 which means a fact could not be written; nothing was written because nothing
-should have been. The one thing it does explain is a batch total that is short
-of the statement's own turnover with nothing wrong.
+should have been. It does explain a batch total short of the statement's own
+turnover with nothing wrong.
 
 ## A question is a thing, not a sentence
 
@@ -309,134 +321,109 @@ money went and whose account was on the other side are facts about the owner's
 affairs; you may show him the question and the alternatives, and relay what he
 says.
 
-**Show him the sentence, not a summary of it.** The wording names the row by the
-day the source dated it and the amount the source printed, with the sign the
-source printed. That is there because it is what a person recognises a line on a
-statement by: several rows of one month can carry the same word, name nobody,
-and be described identically in every other respect, and an owner matching
-questions to rows by counting down a list will eventually be off by one. A wrong
-answer is not caught later — it settles the row, it may become a standing rule,
-and nothing asks again. The row number beside the question is what you send
-back; the day and the sum are what he reads.
+**Name the row by the day the source dated it and the amount the source printed,
+with the sign it printed.** That is what a person recognises a line on a
+statement by: several rows of one month can carry the same word, name nobody, and
+be described identically in every other respect, and an owner matching questions
+to rows by counting down a list will eventually be off by one. A wrong answer is
+not caught later — it settles the row, it may become a standing rule, and nothing
+asks again. The row number beside the question is what you send back; the day and
+the sum are what he reads.
 
 **Every alternative says what answering it does to his money-flow report, and
 you relay that too.** Two of these words are one keystroke apart and land in
 different figures of his year: money that came in from outside is not the same
 line as money of his own moving between his own accounts, and a return a
 counterparty made is subtracted from what he spent rather than added to what he
-received. Read him the effect beside the word. Do not compress the seven into
-one sentence of your own, and do not decide that some of them are obvious: the
-whole reason the effect is published per alternative is that the choice between
-two of them is not a wording preference.
+received. Read him the effect beside the word. Do not compress the seven into one
+sentence of your own, and do not decide that some of them are obvious.
 
-You will find those words wherever a question is published, and that now includes
-the session's own assessment — the one place you read to work through a session.
-It used to carry the sentence alone, so the words that answer it had to be
-fetched from somewhere else, and an agent went looking for them down a route that
-does not exist. Whatever surface you are reading, the words and their effects
-travel with the question; if you find yourself hunting for them, you are reading
-something stale.
+The words and their effects travel with the question on every surface that
+publishes one, the session's own assessment included. If you find yourself
+hunting for them elsewhere, you are reading something stale.
 
 Where an answer names one of the owner's own accounts, the accounts it may name
 travel with the question — each with his own title for it and the institution
 holding it. Show him those and send back the identifier of the one he picks. You
 never look an account up to answer a question, and you never compose an
 identifier: the one you send came with the question you are answering. In a
-session's assessment the list is published once for the whole assessment rather
-than once per question, because it is the same list every time. What to drop
-from it for the row in front of you is below, under what a first import can
-settle.
+session's assessment the list is published once for the whole assessment, not per
+question; what to drop from it for the row in front of you is below.
 
-**An answer you relay settles the row and nothing beyond it.** Answering has two
-halves. Disposing of the line in front of you is import mechanics, and it is
-yours to do. Turning that disposal into a standing classification rule decides
-rows nobody has looked at yet — including months not yet imported, and including
-rows that will never be shown to anyone, because a row a rule matches is never
-asked about. That second half is the owner's, it is the same act as writing a
-rule directly, and under your credential the system now does only the first.
-Nothing is refused and nothing goes wrong: the answer comes back saying in a
-word that no rule stands, and carrying the rule it would have made, the row is
-settled, and the import goes on.
+**An answer you relay settles the row and nothing beyond it.** Disposing of the
+line in front of you is import mechanics and is yours to do. Turning that
+disposal into a standing classification rule decides rows nobody has looked at
+yet, including months not yet imported and rows that will never be shown to
+anyone, because a row a rule matches is never asked about. That half is the
+owner's, and under your credential the system does only the first. Nothing is
+refused: the answer comes back saying in a word that no rule stands and carrying
+the rule it would have made, the row is settled, and the import goes on.
 
-That word is worth reading, because it distinguishes two things an absent rule
-used to hide. A rule may have been impossible — the row named no counterparty,
-carried no description and printed no word of its own, and a condition that asks
-nothing matches nothing, so there is no rule for anyone to write. Or a rule was
-perfectly possible and simply is not yours to write. Only the second is worth
-telling the owner about, and only the second comes with the rule attached.
-
-Say it, and hand him the remedy with it. The same counterparty will be asked
+Read that word. A rule may have been **impossible** — the row named no
+counterparty, carried no description and printed no word of its own, and a
+condition that asks nothing matches nothing. Or a rule was perfectly possible and
+simply is **not yours to write**. Only the second is worth telling him about, and
+only the second comes with the rule attached: the same counterparty will be asked
 about again next month, once per import, until he records the decision with his
-own credential — and the answer you relayed already holds exactly what he would
-record, so he can adopt it as it stands instead of reconstructing it from the
-row. When you notice a question you have relayed before, that is the thing to
-say: which rule is waiting to be adopted, not a second guess at the answer.
+own credential, and the answer you relayed already holds what he would record.
 
 You do not have to remember which ones are waiting. **Every rule an answer could
 not write is an item in the outstanding-work queue**, one per question, kind
 `adopt_classification_rule`, carrying the rule already filled in as the body of
 the call that writes it. It is a recommendation rather than required work — the
 row it came from is settled and no report is short of anything — and it names the
-owner as the one who may send it, which you cannot. Read that item to him. The
-item disappears once a standing rule of his settles a row like that one, whether
-he sent the proposal as it stood or narrowed it first, so the queue is a list of
-decisions still open rather than a list you have to keep yourself.
+owner as the one who may send it, which you cannot. Read that item to him. It
+disappears once a standing rule of his settles a row like that one, however he
+worded it.
 
 The condition a proposal asks about is **one thing**: the counterparty the row
 named, or failing that the word the source used for the operation, or failing
 both the description. Not all three at once — a condition joining every field the
-row printed recognises that row and almost nothing else, which is a standing
-decision that decides nothing. Tell him what the condition asks, because it is
-the part he may want to change: a wider one settles more rows next month and can
-settle one wrongly, and only he can weigh that.
-
-A rule the owner does write is kept in his own vocabulary, and he can see it,
-change it, and retire it afterwards like any other.
+row printed recognises that row and almost nothing else. Tell him what the
+condition asks, because it is the part he may want to change: a wider one settles
+more rows next month and can settle one wrongly, and only he can weigh that. A
+rule he does write is kept in his own vocabulary, and he can see, change and
+retire it afterwards.
 
 ### One decision, many lines
 
-A statement names one shop on thirty lines and every one of them is the same
-question. The session's assessment says so: each unanswered question lists the
-other rows of that session raising **the same decision**, so you never have to
-work the grouping out by reading the prompts. Empty means the decision is asked
-once.
+A statement names one shop on thirty lines and every one is the same question.
+Each unanswered question lists the other rows of that session raising **the same
+decision**, so you never work the grouping out by reading the prompts. Empty
+means the decision is asked once.
 
 Two rows are the same decision only when the source also said the money ran the
-same way. That is not a technicality: your answer states a direction of its own
-and the journal records that one, so carrying an answer meant for a payment onto
-a line where the money arrived would file an arrival as a departure — in the very
-figure his report is read for. The system will not group those two, and neither
-should you.
+same way. Your answer states a direction and the journal records it, so carrying
+an answer meant for a payment onto a line where the money arrived files an
+arrival as a departure — in the very figure his report is read for. The system
+will not group those two, and neither should you.
 
 An answer can be told to reach all of them. Say so on the answer, and every
 question still open in that session which is the same decision is settled with
-it, in one call. The response names the other rows it settled, and telling him
-which row he decided and which rows were decided with it is your job, not the
-response's.
+it, in one call. The response names the other rows it settled; telling him which
+row he decided and which were decided with it is your job, not the response's.
 
 **Read what that does and does not claim.** It settles rows already in one
 session — rows he reads in the assessment before anything is committed, and which
-he can abandon whole, leaving his journal exactly as it was. It writes no
-standing rule and it says nothing about next month; that is still his to write,
-and it is still the thing your credential cannot do. If a single row of the ones
-it would reach cannot take the answer, nothing is written at all and the refusal
-names that row. The commonest cause is an answer naming one of his own accounts
-that one of those rows is itself on, and it means what it says: that row was never
-the same decision.
+he can abandon whole. It writes no standing rule and says nothing about next
+month; that is still his to write. If a single row of the ones it would reach
+cannot take the answer, nothing is written at all and the refusal names that row.
+The commonest cause is an answer naming one of his own accounts that one of those
+rows is itself on, and it means what it says: that row was never the same
+decision.
 
 ### What a first import can settle without asking him about every line
 
 A statement he has never imported has no rules of his behind it, so nearly every
-line naming a party becomes a question. Most of those questions have the same
-answer, and the document itself already says so: institutions file their own rows
-under their own words, and there are a dozen of those words where there are
-hundreds of counterparties.
+line naming a party becomes a question. Most have the same answer, and the
+document says so: an institution files hundreds of counterparties under a dozen
+of its own words.
 
-The assessment publishes them, in `offered_rules`. Per word the institution filed
+The assessment publishes them in `offered_rules`. Per word the institution filed
 still-unanswered rows under, it gives the count, the rows, and the question to
-put to him — in two parts, what he is asked and what his answer changes. Read
-both to him: the second half is where the risk is, because one answer settles
-every line filed that way, this month's and every later one.
+put to him in two parts. Read both to him: the second is where the risk is,
+because one answer settles every line filed that way, this month's and every
+later one.
 
 What it publishes is the **condition** and never the outcome. What the lines have
 in common is a fact about his document; what they *are* is his decision, and it
@@ -456,44 +443,36 @@ in `withheld_offers` instead, with what the word covers and one sentence saying
 why it was held back, and offers nothing that could be sent as it stands.
 
 That is what makes the other list safe. **A word missing from `offered_rules` is
-not an oversight**, and you do not have to audit the two lists against each other
-before relaying: what is offered is offered because its rows are one decision, and
-what is withheld is named. Read the withheld ones to him as what they are — a
-word his bank uses for more than one thing — and work them through their shapes
-with an answer that reaches every like row of the session, which is the mechanism
-two sections above. That settles what is alike without claiming next month.
+not an oversight**, and you need not audit the two lists against each other: what
+is offered is offered because its rows are one decision, and what is withheld is
+named. Read the withheld ones to him as what they are — a word his bank uses for
+more than one thing — and work them through with an answer that reaches every
+like row of the session, which is the mechanism two sections above.
 
 **Each open question carries its row as values, not only as a sentence.**
 `printed` beside the question holds the account the row is on, the amount with
 the sign the source printed, the currency, the date, the direction, the
-counterparty and the word the source filed it under. Use those. **Do not recover
-them from the prose**: an agent in the field was pulling amounts and parties out
-of the wording with regular expressions, which is reading a format nobody
-guaranteed — the same act forbidden one level down, where a statement has one
-reader — and that wording is prose being rewritten, so anything that parses it is
-already stale. Show him the sentence, and take every value you act on from
-`printed`.
+counterparty and the word the source filed it under. Take every value you act on
+from there. **Do not recover them from the prose**: that wording is prose and is
+rewritten, so anything parsing it is already stale — and parsing a format nobody
+guaranteed is the act forbidden one level down.
 
 **And the accounts an answer may name are published once for the whole
 assessment.** `interpretation.answer_accounts` is the list, with his own title for
 each and where it is held; it does not change from question to question, so
-fetching it per question is a call per question for an answer that was already in
-your hand. The one thing that does change is per question and you can derive it:
-an account is not the other side of itself, so drop the one `printed.account`
-names before showing him the rest.
+fetching it per question buys nothing. What does change you can derive: an
+account is not the other side of itself, so drop the one `printed.account` names
+before showing him the rest.
 
 ## An import can be held open before it is committed
 
 Rows can also be accumulated in an **import session** instead of being recorded
 one at a time. A session is opened, fed rows from one or more sources,
-questioned, answered, and then either committed or abandoned.
+questioned, answered, and then either committed or abandoned. It is not a
+database transaction: answering a question can take the owner days, nothing is
+held open in the machine meanwhile, and what is durable is the session itself.
 
-It is not a database transaction, and the difference matters: answering a
-question can take the owner days, and nothing is held open in the machine
-meanwhile. What is durable is the session itself.
-
-Two properties are worth stating plainly, because everything else follows from
-them:
+Everything else follows from two properties:
 
 - **Nothing in a session is in the journal, and nothing in the journal is
   provisional.** A session's rows are not facts yet. They become facts at
@@ -509,23 +488,17 @@ refusal is the point of it: committing with a question open records exactly the
 guess the question exists to prevent.
 
 **A session you opened and did not end is not finished, and you do not have to
-remember it.** A session that holds rows and has been neither committed nor
+remember it.** A session holding rows that has been neither committed nor
 abandoned is an item in the outstanding-work queue, kind
-`import_session_unfinished`, one per session, naming both of the calls that end
-one. It is required work rather than a recommendation, because the rows it
-holds are in no journal and therefore in no report, with nothing on any figure
-saying so.
+`import_session_unfinished`, one per session, naming both calls that end one. It
+is required work rather than a recommendation, because the rows it holds are in
+no journal and therefore in no report, with nothing on any figure saying so.
 
-Read that item rather than concluding from a quiet queue that the import
-landed. That conclusion is the mistake this item exists to make impossible: the
-rows sat where nobody could see them, and the next act was to import the same
-statement a second time. The queue's item and the session listing both say how
-much is held and how much is still unanswered, so neither costs you a request
-per session.
-
-Abandoning closes the item as completely as committing. They are different acts
-— one records the rows, the other says they were never facts — and both end the
-session, which is what the item is about.
+Read that item rather than concluding from a quiet queue that the import landed —
+that conclusion is how the same statement gets imported twice. The item and the
+session listing both say how much is held and how much is unanswered, so neither
+costs a request per session. Abandoning closes the item as completely as
+committing: both end the session, which is what the item is about.
 
 A report can still be asked what the answer would look like with a session's
 rows in it, and it will not do so unless asked. Every report takes a `held`
@@ -536,8 +509,7 @@ reading of each one it folded, and how many held rows produced no fact at all.
 
 Read that last count before quoting any figure computed this way. A row whose
 question is unanswered becomes nothing, so such a figure is short by exactly the
-rows nobody has ruled on — and those are the ones whose amounts are least
-predictable. Quote it beside the number, never instead of it.
+rows nobody has ruled on. Quote the count beside the number, never instead of it.
 
 Naming a session that has already committed is allowed and changes nothing: its
 rows are in the journal, so the answer says `already_in_journal` and counts them
@@ -557,28 +529,25 @@ compared.
 
 ## A closed product is retired, never dropped from the contour
 
-The owner closes a term deposit. The bank prints two interest accruals and then a
-row moving the whole balance to another of his accounts, and the product stops
-existing. He asks for it to stop showing up in what he holds.
+The owner closes a term deposit and asks for it to stop showing up in what he
+holds.
 
-**The obvious move is the wrong one.** Making a new contour version without that
-account does remove it from the asset report — and it destroys two answers on the
-way. A report resolves one contour composition and applies it to every event; it
-never looks membership up by an event's date. So under the narrower composition
-the closing movement now has one end outside the perimeter, and the deposit's
-principal is reported as money arriving from outside; and the interest, which is
-a movement inside an account the composition no longer names, is not folded at
-all. Not misclassified — absent. A month the owner has already read changes
-underneath him, and the two figures he most cared about are the ones that change.
+**The obvious move is the wrong one.** A new contour version without that account
+does remove it from the asset report, and destroys two answers on the way: a
+report resolves one contour composition and applies it to every event, never
+looking membership up by an event's date. Under the narrower composition the
+closing movement has one end outside the perimeter, so the deposit's principal is
+reported as money arriving from outside; and the interest, inside an account the
+composition no longer names, is not folded at all — absent, not misclassified. A
+month he has already read changes underneath him.
 
 **What to do instead** is record a retirement on the account: the date the
-product ceased. The account stays inside the contour, which is what keeps the
-interest an earning and the movement that emptied it internal, and the asset
-report stops carrying its row.
+product ceased. The account stays inside the contour, which keeps the interest an
+earning and the movement that emptied it internal, and the asset report stops
+carrying its row.
 
-Read the two as what they are. A contour says **whose money is in the figures**.
-A retirement says **whether the product is still there**. They are different
-questions about one account, and the second is never answered with the first.
+A contour says **whose money is in the figures**. A retirement says **whether the
+product is still there**. The second is never answered with the first.
 
 ### What the retirement changes, and what it does not
 
@@ -592,17 +561,13 @@ From the date the product ceased:
   of an answer, beside `contour_version`: two asset snapshots over one contour
   version are answers to the same question when their retirement revisions match.
 
-It changes nothing else. No figure moves — only an all-zero row may be dropped,
-and such a row adds zero to every total. No classification changes, ever. A
-snapshot taken while the product was still open is untouched. The balances answer
-keeps the account's row, because that answer is what the journal holds per
-account and is what a statement is reconciled against.
-
-Nothing hides a retired account from the account list or from the outstanding-work
-queue. Its money is still in every report over a period the product existed in,
-so a question about it still changes a reported number. If the owner asks which of
-his products still exist, read any report's `population` and keep the entries with
-no `retirement`.
+It changes nothing else. No figure moves — only an all-zero row may be dropped.
+No classification changes, ever. A snapshot taken while the product was still
+open is untouched. The balances answer keeps the account's row, because that
+answer is what the journal holds per account and is what a statement is
+reconciled against. Nothing hides a retired account from the account list or from
+the outstanding-work queue. If the owner asks which of his products still exist,
+read any report's `population` and keep the entries with no `retirement`.
 
 ### A retirement never hides money
 
@@ -612,35 +577,30 @@ Report that as what it is: he says the product ceased, and the journal still sho
 something on it.
 
 The usual cause is that the deposit's principal predates the months that were
-imported. The account's cash figure is then movement from an unknown start rather
-than a balance, the recorded movements do not sum to zero, and the row is right to
-stand — the missing principal is a real hole in his cash total.
+imported: the account's cash figure is then movement from an unknown start rather
+than a balance, and the row is right to stand.
 
-**The caveat names its own remedies now, in the order to consider them: read
-`closed_by` rather than this paragraph.** The first of the three is the
-reconstructed opening (see «What to assert for a reconstructed opening»), because
-that is the ordinary cause; the retirement then removes the row on its own. The
-same three calls, each with the body it wants, are also an outstanding-work item
-of kind `retired_account_not_empty`, and that item disappears once the account's
-figures are zero — whoever brought them there and however. Nobody has to report
-the work done.
+**The caveat names its own remedies, in the order to consider them: read
+`closed_by` rather than this paragraph.** The first is the reconstructed opening
+(see «What to assert for a reconstructed opening»), because that is the ordinary
+cause; the retirement then removes the row on its own. The same three calls, each
+with the body it wants, are also an outstanding-work item of kind
+`retired_account_not_empty`, which disappears once the account's figures are
+zero, however they got there.
 
 **If instead the queue carries `retirement_not_assessed`, nobody could work out
-whether the retirement took effect.** The item means what it says: his effective
-journal does not fold, so the question «does this product still hold anything»
-has no answer this reading, and the item that would have carried the answer is
-absent because it could not be computed — not because there is nothing
-outstanding. The asset snapshot is folded from the same facts and refuses for
-the same reason. Do not report the retirement as done and do not report it as
+whether the retirement took effect.** His effective journal does not fold, so the
+item that would have carried the answer is absent because it could not be
+computed — not because there is nothing outstanding. The asset snapshot refuses
+for the same reason. Do not report the retirement as done and do not report it as
 outstanding; report that it could not be checked, quote what the item says
-refused, and put the correction it names to him. He is the only one who can say
-which fact should stop counting.
+refused, and put the correction it names to him.
 
 One thing the structure cannot warn you about: the same account usually carries
 `running_cash_sum` as well, and **its** remedy is not this one's. An owner-balance
 assertion is checked against the fold rather than added to it, so recording one
-here would relabel a figure of minus the principal as a balance instead of
-removing it.
+here relabels a figure of minus the principal as a balance instead of removing
+it.
 
 **Never propose ruling the account outside every contour to tidy this up.** That
 is the scope decision, it says his money does not belong in the report at all, and
@@ -667,12 +627,11 @@ money was for. They answer different questions over the same journal, and
 confusing them is the mistake this section exists to prevent.
 
 A category is the owner's explanation, derived when a report is built from
-versioned rules over a row's identity, the source's own category, its
-description and its date. **The source's category is evidence, not a verdict.**
-Never invent a category, a rule, or the interval a rule is valid over: that is
-the owner's judgement, and a guess that has reached a report is
-indistinguishable from his decision. A row no rule matches stays explicitly
-undecomposed, and the report says so — never put it in a catch-all.
+versioned rules over a row's identity, the source's own category, its description
+and its date. **The source's category is evidence, not a verdict.** Never invent
+a category, a rule, or the interval a rule is valid over. A row no rule matches
+stays explicitly undecomposed, and the report says so — never put it in a
+catch-all.
 
 Categories reach spending, refunds and kinds of income; a transfer carries none
 at all. A refund is subtracted from the category the money was spent in rather
@@ -696,15 +655,12 @@ of change that must go back through the channel the fact arrived by.
 
 ## Two channels of fact, and what makes a confirmation independent
 
-IAAM has two independent channels through which facts arrive: parsing a broker
-report, and operations received from the broker's API. Parsing API answers
-lives separately from the report parsers, and that is not duplication but the
-condition of independence: two reports parsed by one and the same parser do not
-become a second source — the parser's error is reproduced, the fact is not
-confirmed. Agreement between two different channels raises the dimension's
-status to `accepted_independent`.
-
-Both channels write facts into one append-only journal.
+Facts arrive through two independent channels: a broker report that is parsed,
+and operations received from the broker's API. Only agreement **between** the two
+raises a dimension's status to `accepted_independent`. Two reports read the same
+way are not a second source — the same error is reproduced, and the fact is not
+confirmed, so never report a reloaded statement as confirmation. Both channels
+write into one append-only journal.
 
 ## A mistake is retracted, not erased
 
@@ -719,51 +675,45 @@ stood instead.
 
 Four things follow, and each of them is a way an agent gets this wrong.
 
-**Correcting the owner's history is his act.** Naming a fact of his and saying
-it should stop counting is a judgement about what he knows; ask him, and do not
-attempt it. The system refuses an agent's credential for it, and that refusal is
-a limit of rights, not an absence of the capability. What the agent may properly
-do is find what went wrong, tell the owner exactly which facts are affected, and
-prepare the request for him to send.
+**Correcting the owner's history is his act.** Naming a fact of his and saying it
+should stop counting is a judgement about what he knows; ask him, and do not
+attempt it. The system refuses an agent's credential for it — a limit of rights,
+not an absence of the capability. What the agent may properly do is find what
+went wrong, tell the owner exactly which facts are affected, and prepare the
+request for him to send.
 
 **Declare a source on everything you submit, corporate actions and offers
 included.** A submission that declares nothing is recorded under an identity
-nobody was ever told the name of, and nothing can name it again: the facts land,
-and the only handle left on them is one event at a time. A declaration is the
-account, the way the rows arrived, and a label naming this batch — a statement
-period, an export file name, a run identifier. Two submissions under one label
-are one import; two labels are two imports. It costs one object in the request,
-and it is the whole difference between an import you can take back and one you
-cannot. Corporate actions and offers had no way to declare it at all until
-recently; they do now.
+nobody was told the name of, and the only handle left on those facts is one event
+at a time. A declaration is the account, the way the rows arrived, and a label
+naming this batch — a statement period, an export file name, a run identifier.
+Two submissions under one label are one import; two labels are two imports. It
+costs one object in the request, and it is the whole difference between an import
+you can take back and one you cannot.
 
 **Undoing your own import is yours.** An import you declared and committed —
 your account, your channel, your label — you may retract, and you should, the
 moment a control total tells you it was wrong. That is not a ruling on the
-owner's history: it returns the journal to the state before you acted, and
-nothing the owner decided is reversed by it. You still acknowledge that the rows
-will stop counting, and the retraction is a journal fact like any other, so he
-can see what you did.
+owner's history: it returns the journal to the state before you acted. You still
+acknowledge that the rows will stop counting, and the retraction is a journal
+fact like any other, so he can see what you did.
 
-The bound is narrow and it is checked, not trusted. It is your import, under the
-label you submitted it under; every row of it is still in force; and nothing has
-been built on it — no row reversed or replaced by anyone, and no balance of the
-owner's reconciled against the interval those rows fall in. Anything wider is
-his, and a refusal will say which of those conditions failed. Retracting twice
-is refused too: the second attempt reports that the rows are already reversed,
-which is also the answer to "did the first one land".
+The bound is narrow and is checked, not trusted: your import, under the label you
+submitted it under; every row still in force; and nothing built on it — no row
+reversed or replaced by anyone, and no balance of the owner's reconciled against
+the interval those rows fall in. Anything wider is his, and a refusal says which
+condition failed. Retracting twice is refused too, and the second attempt
+reporting the rows already reversed is also the answer to "did the first land".
 
-**Retracting does not free a repeat import.** Duplicate detection reads the
-whole journal, and a retracted fact is still in it, so re-importing the same
-rows with the mapping corrected returns `duplicate` and writes nothing. It is
-the replacement, not the reversal, that re-states a row where it belonged.
-Advising the owner to "just import it again" after a retraction wastes his
-afternoon.
+**Retracting does not free a repeat import.** Duplicate detection reads the whole
+journal and a retracted fact is still in it, so re-importing the same rows with
+the mapping corrected returns `duplicate` and writes nothing. It is the
+replacement, not the reversal, that re-states a row where it belonged.
 
-**Diagnose before proposing.** The journal can be read back per row, so the
-facts a correction would affect are knowable before anything is retracted rather
-than after. Name them to the owner. A correction proposed from a report's
-aggregate is a guess about which rows are wrong.
+**Diagnose before proposing.** The journal can be read back per row, so the facts
+a correction would affect are knowable before anything is retracted. Name them to
+the owner: a correction proposed from a report's aggregate is a guess about which
+rows are wrong.
 
 **An assertion by the owner is not an independent source.** A balance he names
 is what is reconciled against, not a second proof: agreement gives
@@ -786,15 +736,14 @@ Three vocabularies, tried in that order:
 3. **The owner's title** for the account.
 
 Send the first where you have it, and the second where the file you are reading
-prints it. Do not send the third. It resolves, and it resolves only so that
-documents written before the other two existed keep parsing — a title is a
-string the owner may change tomorrow, and two of his accounts may carry one
-title, which is refused rather than guessed at. A file that worked last month
-can stop working on a rename; an identifier cannot.
+prints it. Do not send the third. It resolves only so that documents written
+before the other two existed keep parsing — a title is a string the owner may
+change tomorrow, and two of his accounts may carry one title, which is refused
+rather than guessed at.
 
-The order is not a preference, it is a rule about ties: the search stops at the
-first vocabulary that recognises anything, so an identifier is never diluted by
-an account whose title happens to agree with it.
+The order is a rule about ties, not a preference: the search stops at the first
+vocabulary that recognises anything, so an identifier is never diluted by an
+account whose title happens to agree with it.
 
 A string naming none of his accounts is refused in a sentence that says which
 vocabularies the field would have taken; a string naming two is refused with
@@ -811,10 +760,9 @@ names one: no source prints an identity for a depository, so there is no second
 vocabulary there to prefer.
 
 A code resolves **as of the operation's date**, and this is not a formality. An
-ISIN changes through a corporate action: the report for last year arrives with
-the old code, the exchange's export with the new one, and both are obliged to
-converge on one instrument. So there is no "current" answer to the question of
-which security stands behind a code — the answer exists only as of a date.
+ISIN changes through a corporate action: last year's report arrives with the old
+code, the exchange's export with the new one, and both must converge on one
+instrument. There is no "current" answer to which security stands behind a code.
 
 Two different refusals follow from this, and they must not be confused:
 
@@ -823,14 +771,13 @@ Two different refusals follow from this, and they must not be confused:
 | the code is unknown | there is no such security in the catalogue | create the instrument — that is the owner's work; the agent is forbidden to write to the catalogue |
 | the code is known, but not on this date | the code exists, but its interval of validity does not cover the document's date | check the **document's date**: it is more likely to be wrong than the security is |
 
-The second case is almost always a sign of corrupted data rather than of a gap
-in the catalogue. A new code in a document dated before the change means that
-the document, or its date, was assembled wrongly.
+The second case is almost always corrupted data rather than a gap in the
+catalogue: a new code in a document dated before the change means the document,
+or its date, was assembled wrongly.
 
-The instrument catalogue is **shared across all owners**: a bond issue is one
-and the same for everyone, and a corrupted record will corrupt data beyond your
-owner's. Writing to it with an agent token is therefore forbidden, and that is
-a restriction of rights, not an absence of the capability in the system.
+The instrument catalogue is **shared across all owners**, so a corrupted record
+corrupts data beyond your owner's. Writing to it with an agent token is
+forbidden — a restriction of rights, not an absence of the capability.
 
 An instrument has three currencies, and they differ: the denomination currency,
 the settlement currency and the quote currency. On replacement bonds they
@@ -859,15 +806,14 @@ arrived at, and it is **submitted once, from the sending side**. The system
 writes both movements from that single row: the sending account is debited and
 the receiving account is credited, in one fact that holds both accounts.
 
-There is deliberately no way to state the receiving half on its own, and the
-consequence is the mistake that costs an import. When two banks each print the
-movement — an outgoing row in one statement, an incoming row in the other — a
-row per printed side records **two transfers**, not the two halves of one. Both
-accounts then move by twice the sum, and it multiplies again with every export
-that overlaps. Import the sending side and drop the receiving row.
+There is deliberately no way to state the receiving half on its own. When two
+banks each print the movement — an outgoing row in one statement, an incoming row
+in the other — a row per printed side records **two transfers**, not the two
+halves of one, and both accounts move by twice the sum. Import the sending side
+and drop the receiving row.
 
-Three properties follow, and each of them has been got wrong by a model that
-still produced plausible output:
+Three properties follow, each got wrong before by a model that still produced
+plausible output:
 
 - **The amount is positive, like every other amount.** A negative amount is
   refused, not read as "the outgoing leg". Direction is carried by the two
@@ -899,11 +845,9 @@ answer looks like success. Re-sending is not a retraction — nothing on the
 import path retracts anything, so it is a no-op rather than a
 retract-and-add.
 
-A fact that turned out wrong is **corrected, never resent.** The correction is
-a replacement: it retracts the recorded fact and states what should have stood
-instead. It is the owner's act, not yours — find the affected events, tell him
-what is wrong, and prepare the request. Advising him to "send it again with the
-right numbers" wastes the afternoon and leaves the journal exactly as it was.
+A fact that turned out wrong is **corrected, never resent** — see «A mistake is
+retracted, not erased». Advising him to "send it again with the right numbers"
+leaves the journal exactly as it was.
 
 Keys are scoped to the **owner**, not to the account or the import. Two
 unrelated statements whose rows are both keyed `row-1` are one fact as far as
@@ -912,15 +856,14 @@ document and the row within it, never from the row alone.
 
 ## What to assert for a reconstructed opening
 
-A position-opening operation has an optional block of assertions — what the
-owner asserts about a position that existed before the journal began. The set
-of fields and their permitted values are described in the contract; what
-matters here is something else.
+A position-opening operation has an optional block of assertions — what the owner
+asserts about a position that existed before the journal began. The fields and
+their permitted values are in the contract.
 
-An absent block means the owner asserted nothing. That is a legitimate state,
-not a gap in the request: do not fill it with guesses. By default every field
-stands at its most ignorant value. The default preserves ignorance; it does not
-derive confidence from the fact that the neighbouring fields are filled in.
+An absent block means the owner asserted nothing. That is a legitimate state, not
+a gap in the request: do not fill it with guesses. Every field defaults to its
+most ignorant value, and the default does not derive confidence from the
+neighbouring fields being filled in.
 
 What is asserted here reaches the reconciliation of postings. Without an
 acquisition date there is nothing to draw the ownership boundary with, and
@@ -943,10 +886,9 @@ carries a `movement`; there is no field called `amount` on any of them. A
 report cannot be skimmed for cash figures and turned into holdings, because the
 holdings figure is only there when the anchor is.
 
-This is the trap the shape closes: after a first import most of the figures look
-ordinary and one may look impossible. They are equally unfounded. The
-ordinary-looking ones merely passed a plausibility check the reader happened to
-have, and reporting them as balances while flagging only the strange one
+This is the trap the shape closes: after a first import most figures look
+ordinary and one may look impossible, and they are equally unfounded. Reporting
+the ordinary-looking ones as balances while flagging only the strange one
 endorses four errors to catch one.
 
 **A total does not average the two away.** On the asset snapshot, a class total
@@ -960,43 +902,39 @@ state, and both halves above it still say everything they know.
 
 **Reconciliation says the same thing in its own words.** A source's balance
 assertion over a fold nothing anchors is `not_comparable` with the reason
-`opening_not_asserted` — not `discrepant`. The distinction matters because the
-two are opposite instructions: `discrepant` means the figures disagree and one
-of them is wrong; `opening_not_asserted` means there is no baseline to hold the
-figure against, and nothing the owner stated is being contradicted. Never
-report the second as an error he made. What lifts it is an opening assertion
-reaching back to the start of the recorded history, or the import of the
-history before it.
+`opening_not_asserted` — not `discrepant`. The two are opposite instructions:
+`discrepant` means the figures disagree and one of them is wrong;
+`opening_not_asserted` means there is no baseline to hold the figure against, and
+nothing the owner stated is being contradicted. Never report the second as an
+error he made. What lifts it is an opening assertion reaching back to the start
+of the recorded history, or the import of the history before it.
 
-**A balance can be checked without being known.** Where nothing anchors the
-start of a history, the system cannot say what an account holds — but between
-two balances a source stated it can say whether the recorded movements account
-for the distance. Such an outcome carries `compared` =
-`change_since_stated_balance` and the date it is measured from. A `matched`
-there is a statement about the interval, not about the holding: report it as
-"the movements since that date add up", never as "the balance is confirmed".
-A `discrepant` there is the strongest finding reconciliation makes over an
-unanchored history, and it means the two stated balances and the movements
-between them do not join. It is a discrepancy and not a correction: a later
-statement does not overwrite an earlier one, and correcting a recorded
-assertion is an explicit act with its own operation.
+**A balance can be checked without being known.** Between two balances a source
+stated, the system can say whether the recorded movements account for the
+distance even where nothing anchors the start. Such an outcome carries `compared`
+= `change_since_stated_balance` and the date it is measured from. A `matched`
+there is a statement about the interval, not the holding: report it as "the
+movements since that date add up", never as "the balance is confirmed". A
+`discrepant` there means the two stated balances and the movements between them
+do not join. It is a discrepancy and not a correction: a later statement does not
+overwrite an earlier one, and correcting a recorded assertion is an explicit act
+with its own operation.
 
 **Never reconstruct what the system compared.** Every reconciliation outcome
-carries a `basis`: how many of the account's events were folded into the
-observed figure, the first and last dates folded, and what the fold started
-from. Read it before reporting anything about the outcome. The window is the
-account's recorded history reaching into the interval, not the interval that
-was asked about, and a balance folded over one imported month is not the
-evidence a balance folded over four years is. Do not add up the owner's
-operations yourself to work out what the number was made of — that is the work
-this field exists to end.
+carries a `basis`: how many of the account's events were folded into the observed
+figure, the first and last dates folded, and what the fold started from. Read it
+before reporting anything about the outcome. The window is the account's recorded
+history reaching into the interval, not the interval that was asked about, and a
+balance folded over one imported month is not the evidence one folded over four
+years is. Do not add up the owner's operations yourself to work out what the
+number was made of.
 
-A negative cash figure is reported as a fact and is never refused or hidden. It
-is not by itself an error: a margin account is legitimately negative, and a card
-can carry a technical overdraft. On an account where the owner would not expect
-one it is a sign to check — most often a sign of exactly the missing anchor
-above, since spending money that arrived before the journal began produces a
-negative sum out of nothing wrong.
+A negative cash figure is reported as a fact and never refused or hidden. It is
+not by itself an error: a margin account is legitimately negative, and a card can
+carry a technical overdraft. On an account where the owner would not expect one
+it is a sign to check — most often of the missing anchor above, since spending
+money that arrived before the journal began produces a negative sum out of
+nothing wrong.
 
 **Read the classification, not the sign.** A negative figure arrives with the
 dates it opened and closed on and with the system's reading of why: a temporary
@@ -1004,13 +942,12 @@ settlement deficit, which is ordinary and settles; financing from outside the
 perimeter, which the system knows it does not reconstruct; or unclassified,
 which means the reason is unknown and not that money is missing.
 
-The last two carry a consequence, and it is the one an agent misreports. For
-that account, and **only** that account, the period's tax and financial reports
-are refused: the system will not compute what it cannot ground. The balance is
-still there and still stated. So the refusal is about a calculation, not about
-the figure, and it is not about the rest of the portfolio — every other account
-in the scope is calculated as usual. Saying "the report failed" or "the balance
-is unavailable" describes neither.
+The last two carry a consequence agents misreport. For that account, and **only**
+that account, the period's tax and financial reports are refused: the system will
+not compute what it cannot ground. The balance is still there and still stated.
+The refusal is about a calculation, not about the figure, and not about the rest
+of the portfolio — every other account in the scope is calculated as usual.
+Saying "the report failed" or "the balance is unavailable" describes neither.
 
 ## A report answers about a population, and names it
 
@@ -1020,11 +957,8 @@ knows about that were outside it.
 
 Read it before reading any figure. The report's own quality fields —
 `data_quality`, uncovered positions, unproven bases — are about defects **inside**
-the calculation. They can every one be clean while the wrong accounts were
-selected, because selection happens before the calculation and nothing in it can
-see what was left out. Completeness of a calculation and coverage of its
-population are two statements, and only the second one says whose money was
-counted.
+the calculation, and can every one be clean while the wrong accounts were
+selected. Only the population says whose money was counted.
 
 `population.known_account_coverage` is the summary:
 
@@ -1033,12 +967,12 @@ counted.
   them.
 - `undecided` — accounts are outside it that he has not ruled on at all.
 
-**`undecided` is not a milder `bounded`.** "Four accounts are outside this report
-and nobody has decided whether they belong" is a different sentence from "four
-accounts are outside this report on purpose", and only the second makes the
-figures an answer about a boundary the owner chose. Each entry in
-`population.outside` carries the distinction per account, with the account's
-title and institution so the owner can be asked about it by name:
+**`undecided` is not a milder `bounded`.** "Accounts are outside this report and
+nobody has decided whether they belong" is a different sentence from "accounts
+are outside this report on purpose", and only the second makes the figures an
+answer about a boundary the owner chose. Each entry in `population.outside`
+carries the distinction per account, with title and institution so he can be
+asked about it by name:
 
 - `outside_by_decision` — he ruled the account outside every scope and gave a
   reason. Report it as a boundary he drew, and do not ask him again.
@@ -1070,15 +1004,11 @@ denominator is the accounts this instance has been told about — `covered` and
 the owner's that was never created here is in neither list, and it is not
 reported as missing: it is invisible to the fold, not omitted by it.
 
-This is not a defect that a field could fix. Where an import sends the rows a
-client chose to send, the system never sees the document behind them, so a
-statement of what that document held would be the client's word republished as
-the system's knowledge — and a client that silently dropped three accounts is the
-same client that would supply the total. A document the system reads itself is
-better evidence about its own rows and still says nothing about an account it
-never mentions. The one place the system does compare both sides is a channel it
-fetched itself, and there it records the shortfall as a fact of its own: a
-coverage gap, naming the refused rows and the dimensions they would have moved.
+No field can fix this: the system never sees what a client chose not to send, and
+a document it reads itself still says nothing about an account that document
+never mentions. The one place it compares both sides is a channel it fetched
+itself, where it records the shortfall as a coverage gap naming the refused rows
+and the dimensions they would have moved.
 
 So the check belongs to whoever holds the source, and it is a comparison, not a
 lookup:
@@ -1115,31 +1045,27 @@ alike.
 
 **A payment was not confirmed** — the owner did hold the security that day, the
 waiting period has expired, and no crediting fact is in the journal. That is a
-defect: tell the owner the date, the instrument, the account and the kind of
-payment — a coupon or a return of principal — and ask him to load the statement
-for that period.
+defect: tell him the date, the instrument, the account and the kind of payment —
+a coupon or a return of principal — and ask him to load the statement for that
+period.
 
 **There is nothing to reconcile with** — no conclusion is possible because the
-evidence is missing. **This is not a claim that money went missing.** Where the
-reason is simply that the journal begins later, it is not a defect at all:
-there is nothing to load.
+evidence is missing. **This is not a claim that money went missing**, and where
+the journal simply begins later it is not a defect at all.
 
 Several equally unprovable payments for one account-and-instrument pair collapse
-into a single problem carrying a count and date bounds, because a cause at the
-level of the source is repaired by one action. Do not expand it back into a list
-and do not report each date to the owner separately.
+into a single problem carrying a count and date bounds, because one action
+repairs the cause. Do not expand it back into a list of dates for the owner.
 
 **Never call `provisional` an error.** It means no independent confirmation has
 arrived yet, which is an ordinary state of a correct journal.
 
 **And never wait for a reconciliation verdict.** Three of the eleven codes —
 `accepted`, `discrepancy` and `needs_reconciliation` — are published and produced
-by nothing, which each one's own published sentence now says. The three are not a
-backlog: they are the reconciliation ones, and the boundary is the point. A
-verdict answers one write, while reconciliation is a property of an account, a
-dimension and an interval, folded when a report is read and moved by evidence
-that arrives later. The eight codes you will actually see are the ones about a
-row.
+by nothing, which each one's own sentence says. They are not a backlog: a verdict
+answers one write, while reconciliation is a property of an account, a dimension
+and an interval, folded when a report is read and moved by later evidence. The
+eight codes you will actually see are the ones about a row.
 
 Read each of the three where it is answered, and never from a row's verdict:
 
@@ -1149,11 +1075,9 @@ Read each of the three where it is answered, and never from a row's verdict:
 - **`discrepancy`** — a batch that disagrees with the control section its own
   source printed is named figure by figure, with both numbers and the
   difference, in the assessment an import session publishes; read it before you
-  commit, and read it before you override the disagreement, because overriding
-  is a sentence you are only entitled to write after reading them. A
-  disagreement the journal holds is reported by the data quality block as
-  `discrepant` and by the action queue as `discrepancy_unresolved`, which
-  carries what settles it.
+  commit, and before you override the disagreement. A disagreement the journal
+  holds is reported by the data quality block as `discrepant` and by the action
+  queue as `discrepancy_unresolved`, which carries what settles it.
 - **`needs_reconciliation`** — nothing is ever declined because the owner has
   not named a balance. Rows are recorded, and the need for the figure is derived
   from them afterwards. Ask for it from the action queue's
@@ -1170,13 +1094,12 @@ facts: every row carries the value, the date or the interval's boundaries, the
 source, the observation moment and the quality. Such a row can be quoted to the
 owner verbatim.
 
-The **completeness boundary** is carried by the answer, not by a row, because it
-is one fact about the whole answer rather than a property each row could differ
-in. That is what lets an answer with no rows still say something: an empty series
-whose boundary is a date means the instance has this series and nothing to report
-in the interval you asked about, and an empty series whose boundary is absent
-means it holds nothing for the series at all. Those are different situations and
-must not be reported alike — the second is not evidence that no rate existed.
+The **completeness boundary** is carried by the answer, not by a row, which is
+what lets an answer with no rows still say something: an empty series whose
+boundary is a date means the instance has this series and nothing to report in
+the interval you asked about, and an empty series whose boundary is absent means
+it holds nothing for the series at all. The second is not evidence that no rate
+existed.
 
 Adding them up, recomputing them and deriving a return from them is not
 allowed. Any derived quantity is taken from the report whole — otherwise it
@@ -1191,20 +1114,6 @@ effective date fell between them.
 
 When the API refuses because of request frequency, lower the frequency rather
 than repeating immediately.
-
-## What here is checked
-
-The eleven verdict codes and the "is the fact recorded" rule are fixed in
-`crates/iaam-ingest/src/verdict.rs` and its tests. The grounds of independence,
-the statuses by dimension, the four shares of `nav_coverage`, the recomputation
-of history and the §11 perimeter are checked by the `iaam-core` tests in
-`reconciliation_grounds.rs`, `reconciliation_ledger.rs`, `data_quality.rs`,
-`perimeter.rs` and the golden scenarios.
-
-What is not here is checked by its absence:
-`scripts/check-agent-skill.sh` refuses if a route, a method or an HTTP status
-code appears in this file. A claim about availability that cannot be written
-down cannot go stale.
 
 ## What the system does not do
 

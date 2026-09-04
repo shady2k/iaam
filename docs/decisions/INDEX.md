@@ -36,3 +36,4 @@
 | [0031](0031-one-movement-a-document-printed-twice-is-one-fact.md) | One movement a document printed twice is one fact | 2026-09-04 | proposed | `iaam-3qsq`, `iaam-9ck1`, `iaam-rdya` |
 | [0032](0032-a-question-carries-its-row-and-an-offer-carries-what-it-covers.md) | A question carries its row, and an offer carries what it covers | 2026-09-04 | proposed | `iaam-pm4w`, `iaam-briy`, `iaam-7iyg`, `iaam-xchm` |
 | [0033](0033-one-answer-over-a-set-and-a-question-he-may-decline-to-answer.md) | One answer over a set, the fields of one call together, and a question he may decline to answer | 2026-09-04 | proposed | `iaam-hdr7`, `iaam-zxc6`, `iaam-4fsw` |
+| [0036](0036-a-state-for-an-item-that-wants-nothing-and-a-relay-in-his-voice.md) | A state for an item that wants nothing, and a relay in the owner's voice | 2026-09-05 | proposed | `iaam-c143`, `iaam-09tn` |

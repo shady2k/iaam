@@ -68,6 +68,11 @@ pub(crate) fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> 
         | OperationKind::Withdrawal { .. }
         | OperationKind::Refund { .. }
         | OperationKind::Transfer { .. }
+        // Cash, and only cash, whichever way it turns out to have run: the
+        // dimension a row could have confirmed does not depend on a direction,
+        // and an unresolved own-account movement moves the same dimension as a
+        // resolved one.
+        | OperationKind::OwnAccountMovement { .. }
         | OperationKind::Fee { .. }
         | OperationKind::Tax { .. }
         | OperationKind::OpeningCash { .. } => [Dimension::Cash].into_iter().collect(),

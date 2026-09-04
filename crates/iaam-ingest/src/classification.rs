@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 
 /// Where the money is moving. Needed so that the question asked of the owner is relevant:
 /// debits and credits have different branches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Movement {
     In,
     Out,
@@ -41,6 +42,75 @@ pub enum Counterparty {
     Named(String),
     /// No party is named at all.
     Unknown,
+}
+
+/// What the source said about **whose** account is on the far side.
+///
+/// Two values and neither is a default. This is not a direction: the claim says
+/// nothing about which way the money ran, and a source that makes it commonly
+/// says nothing about direction at all — that pairing is what
+/// `iaam-cp94` was filed about. Nor is it a counterparty: there is no name in
+/// it, which is exactly why it needed a place of its own.
+///
+/// **Why a field beside [`Counterparty`] and not a variant of it.** The two
+/// answer independent questions — «who» and «whose» — and a source can answer
+/// either without the other. A `Counterparty::OwnAccountUnidentified` variant
+/// would make them exclusive, so a row that both asserts the far side is the
+/// owner's *and* prints a string for it would have to drop one of them; the
+/// string is what [`RuleMatcher`] matches on and what the directory resolves,
+/// so dropping it would throw away the only thing that could name which
+/// account. Read [`Counterparty::OwnAccount`] beside this: that variant is a
+/// **conclusion the directory reached**, and this is a **claim the source
+/// made**, and the first is strictly stronger because it names an account.
+///
+/// **Why not a `bool`.** [`Self::Unstated`] means the source said nothing about
+/// the far side, which is not the same as saying the far side is somebody
+/// else's — §4.9's distinction, and the one a `false` would quietly erase. No
+/// source states the negative, so there is deliberately no third value for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FarSide {
+    /// The source said nothing about whose account is on the other side.
+    #[default]
+    Unstated,
+    /// The source asserted the other side is one of the owner's own accounts,
+    /// and did not say which one.
+    OwnAccount,
+}
+
+impl FarSide {
+    /// Parse the word a caller sent.
+    ///
+    /// A rejection rather than a fallback to [`Self::Unstated`], for
+    /// `ObservedDirection::parse`'s reason: a caller that meant to relay the
+    /// source's assertion and misspelt it must be told, not silently read as
+    /// having relayed nothing.
+    pub fn parse(value: &str) -> Result<Self, crate::verdict::Rejection> {
+        match value {
+            "unstated" => Ok(Self::Unstated),
+            "own_account" => Ok(Self::OwnAccount),
+            other => Err(crate::verdict::Rejection {
+                field: "far_side".to_owned(),
+                expected: "own_account or unstated".to_owned(),
+                actual: other.to_owned(),
+            }),
+        }
+    }
+
+    /// Wire code. One place, so the transport cannot spell it differently.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unstated => "unstated",
+            Self::OwnAccount => "own_account",
+        }
+    }
+
+    /// Whether the source asserted the far side is the owner's.
+    #[must_use]
+    pub const fn is_own_account(self) -> bool {
+        matches!(self, Self::OwnAccount)
+    }
 }
 
 /// Row attributes used to determine the operation type.
@@ -60,6 +130,13 @@ pub struct ClassificationSubject {
     /// identical once a direction has been supplied, and supplying one is the
     /// guess this type exists to refuse.
     pub movement: Option<Movement>,
+    /// What the source said about whose account is on the far side.
+    ///
+    /// Beside `counterparty` rather than inside it, and beside `movement`
+    /// rather than inside that: see [`FarSide`]. It is read after the rules,
+    /// not before them, because a rule the owner wrote about this counterparty
+    /// is a stronger statement than a word the source printed.
+    pub far_side: FarSide,
 }
 
 /// Rule condition. Specified fields are joined with “and”.
@@ -165,6 +242,28 @@ pub enum Classification {
     Income {
         kind: Option<IncomeKind>,
     },
+    /// A movement between the owner's own accounts whose far side is **not**
+    /// named.
+    ///
+    /// The sixth outcome, and the weaker sibling of [`Self::InternalTransfer`]
+    /// rather than a shade of [`Self::ExternalFlow`]. The two internal outcomes
+    /// differ by one thing and it is the thing that decides the journal shape:
+    /// `InternalTransfer` names the account on the far side, so the fact can be
+    /// a complete `CashTransfer` carrying both; this one does not, so the fact
+    /// carries one endpoint and says the other is the owner's and unnamed.
+    ///
+    /// It is in the rule vocabulary and not only on [`Answer`], for decision
+    /// 0006's reason: «anything the source calls this is a movement between my
+    /// own accounts» is a claim about every row a matcher matches, which is
+    /// exactly what a rule is for, and it is the one standing decision that
+    /// makes a statement full of such rows import without a question each.
+    ///
+    /// It carries no direction, and [`Self::implied_movement`] answers `None`
+    /// for it. That is not a gap to be filled later: the journal has a shape
+    /// for this movement **with** a direction and a shape for it **without**
+    /// one, so a row that states no direction is recorded rather than asked
+    /// about.
+    OwnAccountMovement,
 }
 
 impl Classification {
@@ -208,7 +307,7 @@ impl Classification {
         match self {
             Self::Fee { .. } => Some(Movement::Out),
             Self::Income { .. } | Self::Refund => Some(Movement::In),
-            Self::InternalTransfer { .. } | Self::ExternalFlow => None,
+            Self::InternalTransfer { .. } | Self::ExternalFlow | Self::OwnAccountMovement => None,
         }
     }
 }
@@ -261,6 +360,9 @@ impl ClassificationRule {
 fn describe_outcome(outcome: Classification) -> &'static str {
     match outcome {
         Classification::InternalTransfer { .. } => "this is a transfer between own accounts",
+        Classification::OwnAccountMovement => {
+            "this is a movement between own accounts, and the source names no far side"
+        }
         Classification::ExternalFlow => "this is movement outside the portfolio",
         Classification::Fee { .. } => "this is a fee",
         Classification::Refund => "this is money a counterparty returned",
@@ -450,6 +552,82 @@ impl AnswerShape {
     pub const fn needs_account(self) -> bool {
         matches!(self, Self::SentToOwnAccount | Self::ReceivedFromOwnAccount)
     }
+
+    /// What choosing this alternative does to the owner's money-flow report.
+    ///
+    /// **Why this is a sentence per alternative and not a longer question.**
+    /// The prompt asks what the row was; this says what each answer to it
+    /// decides. Put in the prompt, the seven consequences would be one string
+    /// holding a mapping from a word to its effect — a structure sent as prose,
+    /// which `docs/api/conventions.md` §5 refuses for the reason that a client
+    /// composing an answer has to parse it back out. Put here, the consequence
+    /// travels **attached to the word it belongs to**, in the same list the
+    /// caller already reads to find out what may be said, and a caller that
+    /// shows the owner one alternative shows him its effect with it.
+    ///
+    /// **Why static text and not a computed projection.** Every sentence below
+    /// is a claim about `MoneyFlow::absorb` in `iaam-core`, reached through
+    /// [`Self`] → [`Answer::classification`] → `ObservedRow::resolve` →
+    /// `normalize` → `EventKind`. The projection cannot be run here — there is
+    /// no journal, no contour and no category index at the moment a question is
+    /// asked — so the link is pinned by test instead: `tests/observation.rs`
+    /// walks that chain for the pair the owner is most likely to confuse and
+    /// asserts the two land in different quantities.
+    ///
+    /// **Why the money-flow report and not the returns path.** They disagree
+    /// about one member, and the disagreement is recorded on
+    /// `EventKind::flow_endpoints`: a refund is `InboundFromOutside` for the
+    /// contour classifier, because a returns calculation must see the cash
+    /// cross the boundary, while the household report subtracts it from
+    /// spending. Naming both in one sentence would make every alternative read
+    /// as a caveat; the household report is the one the owner reads a month of
+    /// statements against, so it is the one named, and the sentence for
+    /// `Refund` says which report it is talking about.
+    #[must_use]
+    pub const fn consequence(self) -> &'static str {
+        match self {
+            Self::SentToOwnAccount => {
+                "The money left this account for the account you name, and both accounts get \
+                 a leg. The money-flow report counts it under transfers between your own \
+                 accounts and as neither money that came in nor money that went out — unless \
+                 the account you name is outside the contour, where it counts as money that \
+                 went out that no category explains."
+            }
+            Self::ReceivedFromOwnAccount => {
+                "The money arrived at this account from the account you name, and both \
+                 accounts get a leg; the operation is recorded from the sending side. The \
+                 money-flow report counts it under transfers between your own accounts and as \
+                 neither money that came in nor money that went out — unless the account you \
+                 name is outside the contour, where the money did cross the boundary and \
+                 counts as money that came in."
+            }
+            Self::Paid => {
+                "The money left the perimeter. The money-flow report counts it as money that \
+                 went out, under the category your rules give the row, or as an outflow \
+                 nothing explains where no rule matches it."
+            }
+            Self::Received => {
+                "The money came into the perimeter from outside. The money-flow report counts \
+                 it as money that came in — the same line as new money you added — and not as \
+                 anything the capital earned and not as money of your own coming back."
+            }
+            Self::Fee => {
+                "The money left as a cost charged against the account, on a fee leg of its \
+                 own. The money-flow report counts it under fees and not under what went out \
+                 on purchases, so no spending category is asked for."
+            }
+            Self::Income => {
+                "The money is what the capital earned. The money-flow report counts it under \
+                 earnings, attributed to this account — a cash statement row names no \
+                 security, so none is recorded — and not as money that came in from outside."
+            }
+            Self::Refund => {
+                "A counterparty gave back an earlier outflow. The money-flow report subtracts \
+                 it from what went out, in the category the money was spent in, \
+                 rather than adding it to what came in or to what the capital earned."
+            }
+        }
+    }
 }
 
 /// The owner's answer to one question.
@@ -572,17 +750,31 @@ pub fn classify(
         .iter()
         .filter(|rule| rule.matcher.matches(subject))
         .max_by_key(|rule| rule.version);
-    match chosen {
-        Some(rule) => ClassificationResult::Resolved {
+    if let Some(rule) = chosen {
+        return ClassificationResult::Resolved {
             classification: rule.outcome,
             basis: Basis::Rule {
                 rule: rule.id,
                 version: rule.version,
             },
-        },
-        None => ClassificationResult::Ambiguous {
-            question: question_for(subject),
-        },
+        };
+    }
+    // **After** the rules and **before** the question. After, because a rule is
+    // the owner's own standing decision about this counterparty and the word
+    // here is the source's; a rule that says «this name is a shop» must win
+    // over a bank that files the row as internal to itself. Before the
+    // question, because there is nothing left to ask: the source has said what
+    // the row is, and the only thing still open — which of his accounts — is
+    // what no answer of his makes the row wait for, since the journal can
+    // record the movement without it.
+    if subject.far_side.is_own_account() {
+        return ClassificationResult::Resolved {
+            classification: Classification::OwnAccountMovement,
+            basis: Basis::Derived,
+        };
+    }
+    ClassificationResult::Ambiguous {
+        question: question_for(subject),
     }
 }
 
@@ -634,6 +826,14 @@ fn question_for(subject: &ClassificationSubject) -> Question {
 pub const fn classification_of(event: &Event) -> Option<Classification> {
     match event.kind {
         EventKind::CashTransfer { to, .. } => Some(Classification::InternalTransfer { to }),
+        // Both read back as what they are. Reading them as `ExternalFlow` — the
+        // only outcome that used to exist for them — would make every such fact
+        // in the journal look to `recompute_plan` like a row still waiting to
+        // be corrected into an outflow, which is the correction that put the
+        // amount in «spent» in the first place.
+        EventKind::OwnAccountMovement { .. } | EventKind::UnresolvedOwnAccountMovement { .. } => {
+            Some(Classification::OwnAccountMovement)
+        }
         EventKind::CashIn { .. } | EventKind::CashOut { .. } => Some(Classification::ExternalFlow),
         // A recorded refund reads back as a refund, not as the external flow it
         // used to read back as. The two were the same answer while the

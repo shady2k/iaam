@@ -101,6 +101,8 @@ pub fn active_instruments(
             | EventKind::Refund { .. }
             | EventKind::CashOut { .. }
             | EventKind::CashTransfer { .. }
+            | EventKind::OwnAccountMovement { .. }
+            | EventKind::UnresolvedOwnAccountMovement { .. }
             | EventKind::Income { .. }
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }

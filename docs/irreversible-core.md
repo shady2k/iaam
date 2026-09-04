@@ -251,11 +251,62 @@ the index itself. And the repair's «can this be restored» test asks only
 whether the owner holds any unrevoked broker access — a revoked access's
 `SourceId` cannot be matched to the facts it recorded.
 
+## E5, continued: a movement whose far side is the owner's and unnamed
+
+Schema version 13 adds `EventKind::OwnAccountMovement` and
+`EventKind::UnresolvedOwnAccountMovement`, and a fifth `FlowClass`. Decision 0013
+carries the argument; what is irreversible is listed here.
+
+| Requirement | Where implemented |
+|---|---|
+| What a source said about **whose** account the far side is, kept apart from what it said about the institution and about the direction | `iaam_ingest::classification::FarSide`, beside `ObservedDirection::Inner` |
+| A movement with one known endpoint and one endpoint known only to be the owner's | `EventKind::OwnAccountMovement` — signed amount, one cash leg on the event's own account |
+| The same movement with no direction stated posts nothing | `EventKind::UnresolvedOwnAccountMovement` — a magnitude and no legs, refused by `validate_structure` if it carries one |
+| «An account of the owner's» is not «inside this contour», for any contour | `FlowEndpoints::OwnAccountUnnamed` → `FlowClass::Indeterminate`, and the table test over every membership |
+| An unplaceable amount is reported rather than absorbed | `FlowLog::indeterminate`, `MoneyFlow::indeterminate` (inside the identity) and `MoneyFlow::unstated` (outside it) |
+| A row read, understood and correctly producing no fact is not a refusal | `Verdict::NoFact`, `RowResolution::NoFact`, `NoFactReason::OneAccountTwoInstruments` |
+
+Cannot change without a migration:
+
+- The meaning of the two kinds, and which of them carries a leg. Both are in the
+  journal under `own_account_movement` and `unresolved_own_account_movement`, and
+  a build that posted a leg for the second would retroactively give a direction
+  to movements recorded because nobody stated one.
+- That an unnamed owned endpoint classifies as `Indeterminate` and never as
+  `Internal`. Every return already computed over such a journal left these
+  movements out of the flow series; calling them internal later would not change
+  the number, and calling them external would change one on evidence that was
+  never there.
+- That `MoneyFlow::unstated` stays outside the identity. It is a magnitude the
+  journal declined to post; folding it in would open a residual of exactly that
+  amount on every account carrying one.
+- The code `no_fact` and what it means: the row was read and no fact **should**
+  have been written. It is not `quarantined`, whose meaning is that no fact
+  *could* be, and which is what `ImportCoverageGap` is computed from — a settled
+  row leaves no gap, because it moves no dimension.
+- `NoFactReason::OneAccountTwoInstruments` and the evidence it rests on: the far
+  side's printed identifier resolving, through decision 0004's tiering, to the
+  account the row is already on. Widening it would retroactively settle rows
+  that were asked about; narrowing it would reopen questions already answered by
+  silence.
+
+Two limits are worth stating because they look like defects otherwise. The
+transfer-pairing matcher does **not** take these as legs, so two unresolved
+movements printed by two banks for one economic movement are not proposed as a
+pair — `propose` matches an outgoing leg against an incoming one and neither
+carries a direction; decision 0013 §5 has the argument. And a commit whose rows
+were settled without a fact disagrees with the control section its source
+printed on the turnover side, because those rows contribute no movement: the
+plan names each of them and why, and the disagreement is real rather than a
+defect of the comparison.
+
 ## Что менять нельзя без миграции
 
 - Состав и семантику `EventDates` — от них зависит налоговый период.
 - Порядок полей `EffectiveOrder` — от него зависит детерминизм сортировки.
 - Значения `EventKind::discriminant()` — они попадают в хранилище.
+- Состав `FlowClass` и место `Indeterminate` в нём — по нему решается, какие
+  движения вообще попадают в ряд потоков доходности.
 - Семантику `flow_endpoints()` и состав `CashTransfer` — от них зависит
   вся доходность.
 - Требование `Provenance` — восстановить происхождение задним числом
@@ -293,7 +344,8 @@ whether the owner holds any unrevoked broker access — a revoked access's
 - **Мутационный заслон почти слеп на `contour::classify`
   и `EventKind::flow_endpoints`.** Исчерпывающий `match`, возвращающий
   `enum` без `Default`, даёт единственный нежизнеспособный мутант.
-  Гарантию даёт табличный тест на все шестнадцать сочетаний.
+  Гарантию даёт табличный тест на все сочетания формы движения и
+  принадлежности счетов — шесть форм на четыре контура после схемы 13.
 - **Свойство сохранения стоимости не ловит неверное разнесение.**
   Невыбывшая часть считается от того же значения, которое вернуло
   разнесение. Величину ловит только детерминированный тест

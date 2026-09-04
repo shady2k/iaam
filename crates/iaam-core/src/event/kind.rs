@@ -191,6 +191,54 @@ pub enum EventKind {
         to: AccountId,
         amount: Money,
     },
+    /// Money moved between this account and another account of the owner's
+    /// that the source asserted and did not name, and the source said which way
+    /// it ran here.
+    ///
+    /// **Not [`Self::CashOut`] or [`Self::CashIn`].** Those say the money
+    /// crossed the boundary of whatever contour holds this account, and the
+    /// money-flow projection counts a `CashOut` as money spent. A source that
+    /// says the far side is an account of the owner's has said the opposite —
+    /// and has *not* said which of his accounts, so the movement cannot be a
+    /// [`Self::CashTransfer`] either: that variant is a complete fact and holds
+    /// both accounts because contour classification needs both.
+    ///
+    /// So this is the third thing, and the honest one: one leg is known, the
+    /// other endpoint is known to be the owner's and is unidentified.
+    /// [`Self::flow_endpoints`] answers `OwnAccountUnnamed`, and the contour
+    /// classifier turns that into `Indeterminate` rather than `Internal` — see
+    /// [`crate::contour::classify`] for why an account of the owner's is not
+    /// the same claim as an account inside this contour.
+    ///
+    /// `amount` is **signed**, as [`Self::OpeningCash`]'s is: the sign is the
+    /// direction on this account, negative for money that left. Two variants
+    /// `…In`/`…Out` were considered and refused — the pair would double every
+    /// arm below for a distinction the single cash leg already carries and
+    /// `validate_structure` already checks against the leg.
+    OwnAccountMovement { amount: Money },
+    /// The same movement, with the direction the source never stated.
+    ///
+    /// **A separate variant rather than an `Option<Movement>` on the one
+    /// above.** The difference between the two is not a flag: it is whether the
+    /// fact has a leg. This one has none and can have none — the journal cannot
+    /// debit or credit an account on a movement whose direction nobody stated,
+    /// and a variant that carried a signed leg beside `direction: None` would
+    /// let a caller construct exactly the fabrication this shape exists to
+    /// refuse. Legs against no legs is the sharpest line in this journal:
+    /// `validate_structure`, `Balances`, `perimeter::assess` and
+    /// `projection::flows` all read it, and a single variant would put it
+    /// inside a payload for each of them to rediscover.
+    ///
+    /// `amount` is the magnitude the source printed, and is positive. It is not
+    /// a movement of money in this journal — nothing here is posted anywhere —
+    /// it is the record that the source stated one and said too little for it
+    /// to be posted. That is what makes it correctable: when a later pass
+    /// supplies the far side, this event is **replaced** by a complete
+    /// [`Self::CashTransfer`], exactly as `confirm_journal_pairing` replaces a
+    /// leg it has paired. Without a fact here there would be nothing to
+    /// replace, and the row would have to live outside the journal in a second
+    /// notion of what is effective.
+    UnresolvedOwnAccountMovement { amount: Money },
     /// Coupon, dividend, or interest actually paid.
     Income {
         instrument: Option<InstrumentId>,
@@ -319,6 +367,8 @@ impl EventKind {
             Self::CashOut { .. } => "cash_out",
             Self::Refund { .. } => "refund",
             Self::CashTransfer { .. } => CASH_TRANSFER_KIND,
+            Self::OwnAccountMovement { .. } => "own_account_movement",
+            Self::UnresolvedOwnAccountMovement { .. } => "unresolved_own_account_movement",
             Self::Income { .. } => "income",
             Self::Fee { .. } => "fee",
             Self::Tax { .. } => "tax",
@@ -352,6 +402,15 @@ impl EventKind {
                 from: *from,
                 to: *to,
             },
+            // Both, and the unresolved one deliberately as well. It posts no
+            // leg, so nothing of it is summed anywhere; what the answer decides
+            // is whether a report may call the amount internal, and the answer
+            // is that it may not — for the same reason in both cases, that the
+            // far side is an account of the owner's and no contour can prove it
+            // holds every account he has.
+            Self::OwnAccountMovement { .. } | Self::UnresolvedOwnAccountMovement { .. } => {
+                FlowEndpoints::OwnAccountUnnamed
+            }
             Self::Trade { .. }
             | Self::Income { .. }
             | Self::Fee { .. }
@@ -381,6 +440,14 @@ pub enum FlowEndpoints {
     OutboundToOutside,
     /// Movement between two known accounts.
     BetweenAccounts { from: AccountId, to: AccountId },
+    /// Movement between the event's own account and an account the source
+    /// asserted is the owner's and did not name.
+    ///
+    /// No account is carried, for [`Self::InboundFromOutside`]'s reason: the
+    /// near side is `Event::account`, which the classifier already has, and
+    /// there is no far side to carry — that is the whole content of this
+    /// answer.
+    OwnAccountUnnamed,
     /// Movement within one account: purchase, coupon, fee.
     WithinAccount,
 }

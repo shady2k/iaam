@@ -589,6 +589,23 @@ pub struct InputAlternative {
     pub value: String,
     /// Fields that become required only if this alternative is chosen.
     pub requires: Vec<RequiredInput>,
+    /// What choosing this value does, where the value decides something the
+    /// caller cannot see from the word itself.
+    ///
+    /// `None` for a vocabulary whose words say what they mean — a channel, a
+    /// disposition, a currency. It is filled for the answers to an import
+    /// question (`iaam-pzm9`), where the seven words are `paid`, `received`,
+    /// `fee`, `income` and so on, and the difference between two of them is
+    /// which figure of the owner's money-flow report the row lands in. The
+    /// sentence is [`iaam_ingest::classification::AnswerShape::consequence`],
+    /// read from there rather than written here, so the queue and the session
+    /// publish the same words.
+    ///
+    /// Beside the value rather than in the parent's `reason`, for the reason
+    /// `requires` is beside the value: a consequence per alternative gathered
+    /// into one sentence is a mapping encoded as prose, and the caller that has
+    /// to show the owner one alternative would have to take it apart again.
+    pub consequence: Option<String>,
 }
 
 /// A field one alternative requires. It does not carry alternatives of its own.
@@ -2151,6 +2168,12 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
                 } else {
                     Vec::new()
                 },
+                // What answering this word does to the money-flow report. The
+                // queue item's `reason` carries the question's prompt, which
+                // says what the row leaves open; it does not say what each
+                // answer decides, and an agent that reads only the queue would
+                // otherwise be offering the owner seven words and no stakes.
+                consequence: Some(shape.consequence().to_owned()),
             })
             .collect(),
     }
@@ -2926,7 +2949,7 @@ mod tests {
     use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
     use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
-    use iaam_ingest::classification::{Answer, Counterparty};
+    use iaam_ingest::classification::{Answer, Counterparty, FarSide};
     use iaam_store::SqliteStore;
     use std::collections::BTreeSet;
     use time::macros::date;
@@ -6019,6 +6042,7 @@ mod tests {
             description: Some("card purchase 0001".to_owned()),
             source_kind: Some("card".to_owned()),
             movement: None,
+            far_side: FarSide::Unstated,
         }
     }
 

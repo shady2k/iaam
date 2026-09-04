@@ -16,3 +16,5 @@
 | [0009](0009-a-verdict-answers-a-write-and-confirmation-answers-a-read.md) | A verdict answers a write; confirmation answers a read | 2026-09-04 | proposed | `iaam-eio5` |
 | [0010](0010-a-document-names-an-account-the-way-a-batch-does.md) | A document names an account the way a batch does | 2026-09-04 | proposed | `iaam-w49n` |
 | [0011](0011-the-other-two-reconciliation-verdicts-and-why-they-differ.md) | The other two reconciliation verdicts, and why they differ | 2026-09-04 | proposed | `iaam-7b4t` |
+| [0012](0012-a-question-names-its-row-and-every-answer-names-its-price.md) | A question names its row, and every answer names its price | 2026-09-04 | proposed | `iaam-3ewp` |
+| [0013](0013-a-movement-whose-far-side-is-the-owners-and-unnamed.md) | A movement whose far side is the owner's and unnamed | 2026-09-04 | proposed | `iaam-fmih` |

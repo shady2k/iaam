@@ -196,7 +196,12 @@ pub struct Event {
 /// take back what its own caller declared must refuse a fact that names no
 /// declarer, so the number is what tells a reader that «no principal» means
 /// «written before anyone was recorded» rather than «written by nobody».
-pub const SCHEMA_VERSION: u32 = 12;
+/// Version 13 adds [`EventKind::OwnAccountMovement`] and
+/// [`EventKind::UnresolvedOwnAccountMovement`]: a movement whose far side the
+/// source asserted to be the owner's and did not name is neither an external
+/// flow nor a complete transfer, and until now it could be recorded only as one
+/// of those two lies.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
@@ -296,6 +301,12 @@ impl Event {
             }
             EventKind::Fee { amount, .. } => self.validate_fee(name, *amount),
             EventKind::Tax { amount, .. } => self.validate_tax(name, *amount),
+            EventKind::OwnAccountMovement { amount } => {
+                self.validate_own_account_movement(name, *amount)
+            }
+            EventKind::UnresolvedOwnAccountMovement { amount } => {
+                self.validate_unresolved_own_account_movement(name, *amount)
+            }
             EventKind::CashTransfer {
                 from, to, amount, ..
             } => self.validate_transfer(name, *from, *to, *amount),
@@ -406,6 +417,80 @@ impl Event {
             });
         }
         require_equal(name, money, declared)
+    }
+
+    /// An own-account movement: one monetary leg on the event's own account,
+    /// equal to the declared amount, and not zero.
+    ///
+    /// `Sign::Any`, as for `OpeningCash`, because the sign **is** the direction
+    /// here and both are ordinary. Zero is refused separately, because
+    /// `Sign::Any` admits it and a movement of nothing is not a movement — the
+    /// same reason `ObservedRow::magnitude` refuses a zero row rather than
+    /// recording a movement of zero.
+    ///
+    /// The leg's account is checked, unlike `CashIn` and `CashOut`, whose
+    /// single leg is unchecked because nothing else on those events names an
+    /// account to check it against. Here the whole claim is «this account moved
+    /// and the other side is unnamed», so a leg on some other account would
+    /// make the event say something no reader could recover.
+    fn validate_own_account_movement(
+        &self,
+        name: &'static str,
+        declared: Money,
+    ) -> Result<(), EventValidationError> {
+        if declared.amount().raw() == 0 {
+            return Err(EventValidationError::WrongSign {
+                kind: name,
+                amount: 0,
+                currency: declared.currency(),
+            });
+        }
+        self.expect_single_cash(name, declared, Sign::Any)?;
+        let legs = self.cash_legs();
+        let leg = legs.first().ok_or(EventValidationError::LegCount {
+            kind: name,
+            expected: "exactly one monetary leg",
+            found: 0,
+        })?;
+        if leg.account != self.account {
+            return Err(EventValidationError::WrongAccount {
+                expected: self.account,
+            });
+        }
+        Ok(())
+    }
+
+    /// An unresolved own-account movement: no legs at all, and a positive
+    /// magnitude.
+    ///
+    /// No legs is the variant's entire meaning, so it is checked first and
+    /// refused by count rather than by sign: an event that carried a leg would
+    /// be posting a direction the source never stated, which is the one thing
+    /// this variant exists so that nobody has to do.
+    ///
+    /// The magnitude is positive because it is a magnitude. A negative one
+    /// would be a direction stated in the only place this variant has left to
+    /// state one, and it would be stated where nothing reads it.
+    fn validate_unresolved_own_account_movement(
+        &self,
+        name: &'static str,
+        declared: Money,
+    ) -> Result<(), EventValidationError> {
+        if !self.legs.is_empty() {
+            return Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "no legs",
+                found: self.legs.len(),
+            });
+        }
+        if declared.amount().raw() <= 0 {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "amount",
+                value: declared.amount().raw().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Transfer: two opposing monetary legs on the declared accounts.
@@ -2172,6 +2257,114 @@ mod tests {
 
     // --- Transfer ---
 
+    // --- an own-account movement whose far side nobody named ---------------
+
+    #[test]
+    fn an_own_account_movement_carries_one_leg_on_its_own_account() {
+        let account = AccountId::new_random();
+        for amount in [rub(-250_000), rub(250_000)] {
+            let event = event(
+                EventKind::OwnAccountMovement { amount },
+                vec![Leg::cash(account, amount)],
+                account,
+            );
+            assert!(
+                event.validate_structure().is_ok(),
+                "both directions are ordinary: {amount:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_own_account_movement_of_zero_is_not_a_movement() {
+        // `Sign::Any` admits zero, and a movement of nothing is not a movement
+        // — the same refusal `ObservedRow::magnitude` makes one layer up.
+        let account = AccountId::new_random();
+        let event = event(
+            EventKind::OwnAccountMovement { amount: rub(0) },
+            vec![Leg::cash(account, rub(0))],
+            account,
+        );
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::WrongSign { .. })
+        ));
+    }
+
+    #[test]
+    fn an_own_account_movement_posted_on_another_account_is_refused() {
+        // The whole claim is «this account moved and the other side is
+        // unnamed». A leg somewhere else makes the event say something no
+        // reader could recover, because there is no second account on the fact
+        // to check it against.
+        let account = AccountId::new_random();
+        let elsewhere = AccountId::new_random();
+        let amount = rub(-250_000);
+        let event = event(
+            EventKind::OwnAccountMovement { amount },
+            vec![Leg::cash(elsewhere, amount)],
+            account,
+        );
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::WrongAccount { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unresolved_own_account_movement_posts_nothing() {
+        let account = AccountId::new_random();
+        let event = event(
+            EventKind::UnresolvedOwnAccountMovement {
+                amount: rub(250_000),
+            },
+            Vec::new(),
+            account,
+        );
+        assert!(event.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn an_unresolved_own_account_movement_with_a_leg_is_refused() {
+        // A leg here would be the journal asserting a direction the source
+        // never stated. That is the one thing this variant exists so that
+        // nobody has to do, so it is refused by the type's own validation
+        // rather than left to a convention.
+        let account = AccountId::new_random();
+        let event = event(
+            EventKind::UnresolvedOwnAccountMovement {
+                amount: rub(250_000),
+            },
+            vec![Leg::cash(account, rub(-250_000))],
+            account,
+        );
+        assert!(matches!(
+            event.validate_structure(),
+            Err(EventValidationError::LegCount { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unresolved_own_account_movement_states_a_magnitude() {
+        // Negative would be a direction smuggled into the only field left, and
+        // stated where nothing reads it.
+        let account = AccountId::new_random();
+        for amount in [rub(0), rub(-250_000)] {
+            let event = event(
+                EventKind::UnresolvedOwnAccountMovement { amount },
+                Vec::new(),
+                account,
+            );
+            assert!(
+                matches!(
+                    event.validate_structure(),
+                    Err(EventValidationError::NonPositive { .. })
+                ),
+                "{amount:?} is not a magnitude"
+            );
+        }
+    }
+
     #[test]
     fn transfer_requires_two_matching_sides() {
         let from = AccountId::new_random();
@@ -3156,7 +3349,14 @@ mod tests {
         //        import it declared, so a fact naming no declarer must refuse
         //        rather than be claimed. The number is what tells a reader that
         //        «no principal» means «written before anyone was recorded».
-        assert_eq!(SCHEMA_VERSION, 12);
+        // 12 → 13: added the variants `EventKind::OwnAccountMovement` and
+        //        `EventKind::UnresolvedOwnAccountMovement` (iaam-fmih). Older
+        //        facts stay readable — no existing variant changed shape — and
+        //        the number is what tells software that does not know them that
+        //        it may now meet a fact it cannot place: one whose far side is
+        //        an account of the owner's that no contour can prove it holds,
+        //        and one that posts no leg at all.
+        assert_eq!(SCHEMA_VERSION, 13);
     }
 
     #[test]

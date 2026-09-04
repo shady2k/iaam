@@ -456,6 +456,30 @@ Nothing links the adopted rule back to the question. `generalisation` says what
 proposal: the rule he created is his own act, and it is read back from
 `GET /v1/classification-rules` like any other.
 
+The proposal is also an item in the action queue, kind
+`adopt_classification_rule`, one per answered question that has one. A state the
+system reports truthfully with no act that resolves it is a dead end dressed as
+information, and `available` was one: the owner is the only principal who may
+generalise, the queue is where he is told what only he can do, and nothing in it
+mentioned the rule waiting for him. The item is `recommended` — the row it came
+from is settled and no report is short of anything — it names `owner` as the
+required scope, and its target is `POST /v1/classification-rules` with the
+proposal preset as the body and no missing field. What is missing is his
+decision, which is why the item's state is `needs_owner_input` rather than
+`ready`.
+
+Because the question goes on saying `available`, the item's completion is read
+from his rules instead: it disappears once a standing rule of his classifies a
+row like that one the way he answered — whether he sent the proposal as it stood,
+narrowed it first, or had written something covering it last month. An item whose
+completion could not be observed would never leave the queue, which is how a
+queue is learned to be ignored.
+
+The condition a proposal asks about is one field, not every field the row
+printed — see decision 0008. A client showing the proposal to the owner should
+show him that condition, because it is the part he may want to change before he
+sends it.
+
 ### 4.5 Retracting an import, and retracting anything else
 
 Retracting an import the caller declared is a return to the state before it

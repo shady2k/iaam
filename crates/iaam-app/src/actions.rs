@@ -3,8 +3,11 @@ use std::collections::BTreeMap;
 use crate::error::AppError;
 use crate::ports::{
     AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
-    ContourView, ControlAssertionView, ImportQuestionView, ImportSessionState, Scope, Store,
+    ClassificationRuleStore, ContourView, ControlAssertionView, ImportQuestionView,
+    ImportSessionState, Scope, Store,
 };
+use crate::scenarios::classification::{matcher_json, outcome_json, rule_from_view};
+use crate::scenarios::import_session::{self, Generalisation};
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::source_row::RowName;
 use iaam_core::ids::{AccountId, EventId, OwnerId};
@@ -14,7 +17,9 @@ use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue, Discrepancy};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger, Taint};
 use iaam_ingest::Verdict;
-use iaam_ingest::classification::Question;
+use iaam_ingest::classification::{
+    Classification, ClassificationRule, ClassificationSubject, Question, RuleMatcher,
+};
 
 /// The policy-visible kind of an outstanding action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,6 +39,13 @@ pub enum ActionKind {
     /// [`frontier`] emits its items last and one of its tests requires the
     /// frontier's order to be non-decreasing in this enum's order.
     AnswerClassificationQuestion,
+    /// A question the owner answered wrote no standing rule, and one was
+    /// possible. He is the only one who can make it stand.
+    ///
+    /// Declared straight after the question it comes out of, because
+    /// [`actions_from_state`] emits it there and the frontier's order must be
+    /// non-decreasing in this enum's order.
+    AdoptClassificationRule,
     CoverageGapUnrepaired,
     IndependentConfirmationMissing,
     DiscrepancyUnresolved,
@@ -55,6 +67,7 @@ impl ActionKind {
             Self::StartAccountImport => "start_account_import",
             Self::ProvideControlAssertion => "provide_control_assertion",
             Self::AnswerClassificationQuestion => "answer_classification_question",
+            Self::AdoptClassificationRule => "adopt_classification_rule",
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
             Self::IndependentConfirmationMissing => "independent_confirmation_missing",
             Self::DiscrepancyUnresolved => "discrepancy_unresolved",
@@ -66,7 +79,7 @@ impl ActionKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CreateFirstAccount,
         Self::CreateFirstContour,
         Self::AccountScopeUndecided,
@@ -74,6 +87,7 @@ impl ActionKind {
         Self::StartAccountImport,
         Self::ProvideControlAssertion,
         Self::AnswerClassificationQuestion,
+        Self::AdoptClassificationRule,
         Self::CoverageGapUnrepaired,
         Self::IndependentConfirmationMissing,
         Self::DiscrepancyUnresolved,
@@ -90,13 +104,13 @@ impl ActionKind {
     /// required category, so a kind cannot be graded required for one set of
     /// goals in one branch and another set in the next.
     ///
-    /// Empty for the four kinds the queue never grades required — a blocking
-    /// item, a recommendation, two statements of fact — and empty is refused by
+    /// Empty for the five kinds the queue never grades required — a blocking
+    /// item, two recommendations, two statements of fact — and empty is refused by
     /// [`Action::new`], so an attempt to promote one of them without deciding
     /// what it blocks fails at construction rather than publishing a required
     /// item that names nothing.
     ///
-    /// Exhaustive on purpose. A fifteenth kind cannot compile until someone has
+    /// Exhaustive on purpose. A sixteenth kind cannot compile until someone has
     /// answered, for that kind, the question this whole type exists to answer.
     ///
     /// Each entry is what the code does, not what the item's prose suggests:
@@ -149,7 +163,15 @@ impl ActionKind {
             | Self::IndependentConfirmationMissing
             | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
             // Recommended and informational: never required, so no goal.
-            Self::UndecomposedOutflows
+            //
+            // `AdoptClassificationRule` is here and not beside the question it
+            // comes from, and the difference is the whole of its grading. The
+            // question holds a row out of the journal, so every report is short
+            // of it; the rule changes nothing already imported — the row it came
+            // from is settled — and only decides what happens to rows nobody has
+            // submitted yet. No report the owner can run today is waiting on it.
+            Self::AdoptClassificationRule
+            | Self::UndecomposedOutflows
             | Self::ExternalTransfersUncategorised
             | Self::UnexplainedResidual => ReportGoals::NONE,
         }
@@ -812,10 +834,38 @@ pub struct ClassificationQuestion {
     pub session_state: ImportSessionState,
     /// The typed question, read from [`ImportQuestionView::question`].
     pub asked: Question,
+    /// What the answer did, or could still do, to the standing rules.
+    ///
+    /// Read through [`import_session::generalisation_of`] and not derived again
+    /// here. The scenario owns that derivation — it is the same function the
+    /// answering route's response is built with — and a second one would be a
+    /// second answer to what one answer generalised into, published on two
+    /// surfaces that would eventually disagree.
+    pub generalisation: Generalisation,
+    /// The row the question is about, as the classifier asks about it.
+    ///
+    /// Carried beside the generalisation rather than folded into it, because the
+    /// two answer different questions: the generalisation says what rule the
+    /// answer **would** write, and this is what the owner's existing rules are
+    /// tested against to find out whether one already does. `None` where this
+    /// build cannot read the row, which is the same row the generalisation calls
+    /// `Impossible`.
+    pub subject: Option<ClassificationSubject>,
 }
 
 /// Compute every currently outstanding setup action for an owner.
-pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, AppError> {
+///
+/// Two ports, not one, since `iaam-4hcy`. The rule store is read because one
+/// item the queue publishes — «adopt the rule this answer would have written» —
+/// is closed by a rule appearing in it, and a queue that cannot see the act that
+/// closes an item publishes an item that never closes. A queue the owner learns
+/// to ignore is the failure this whole module is written against, so the second
+/// read is the price of the item existing at all.
+pub async fn frontier(
+    owner: OwnerId,
+    store: &dyn Store,
+    rules: &dyn ClassificationRuleStore,
+) -> Result<Vec<Action>, AppError> {
     let accounts = store.list_accounts(owner).await?;
     let contours = store.list_contours(owner).await?;
     let exclusions = store.list_account_scope_exclusions(owner).await?;
@@ -827,17 +877,29 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
     // narrowing what is loaded.
     let mut questions = Vec::new();
     for session in store.list_import_sessions(owner).await? {
-        for view in store.list_import_questions(owner, session.id).await? {
+        let held = store.list_import_questions(owner, session.id).await?;
+        if held.is_empty() {
+            // The observations are read only to derive what a question's answer
+            // generalised into, so a session that raised none is not read at
+            // all. Every import the owner ever ran is listed here, and most of
+            // them asked nothing.
+            continue;
+        }
+        let observations = store.list_import_observations(owner, session.id).await?;
+        for view in held {
             let asked = serde_json::from_str(&view.question).map_err(|error| {
                 AppError::Store(format!("stored import question could not be read: {error}"))
             })?;
             questions.push(ClassificationQuestion {
+                generalisation: import_session::generalisation_of(&observations, &view),
+                subject: import_session::subject_of(&observations, &view),
                 view,
                 session_state: session.state,
                 asked,
             });
         }
     }
+    let rules = standing_rules(owner, rules).await?;
     let mut assertions = Vec::new();
     for account in activity
         .iter()
@@ -857,7 +919,32 @@ pub async fn frontier(owner: OwnerId, store: &dyn Store) -> Result<Vec<Action>, 
         activity: &activity,
         assertions: &assertions,
         questions: &questions,
+        rules: &rules,
     })
+}
+
+/// The owner's active classification rules, in the classifier's own vocabulary.
+///
+/// A rule this build cannot read is skipped rather than failing the queue, and
+/// that is the opposite of what `create_rule` does with the same rule — on
+/// purpose. There the unreadable rule is the reason to refuse, because the write
+/// about to happen would be recomputed against it. Here the queue is the surface
+/// the owner recovers *from*, and refusing to publish any outstanding work
+/// because one stored rule is malformed takes away the only list that would tell
+/// him what to do about it. What a skipped rule costs is exact: one item may go
+/// on offering a proposal that a rule nobody can read already covers, which is a
+/// duplicate rule at worst.
+async fn standing_rules(
+    owner: OwnerId,
+    rules: &dyn ClassificationRuleStore,
+) -> Result<Vec<ClassificationRule>, AppError> {
+    Ok(rules
+        .list_rules(owner)
+        .await?
+        .into_iter()
+        .filter(|rule| rule.retired_at.is_none())
+        .filter_map(|rule| rule_from_view(rule).ok())
+        .collect())
 }
 
 /// Find every unresolved or informational fact in a reconciliation ledger.
@@ -1546,6 +1633,12 @@ struct OwnerState<'a> {
     activity: &'a [AccountActivityView],
     assertions: &'a [ControlAssertionView],
     questions: &'a [ClassificationQuestion],
+    /// The owner's standing classification rules, as the classifier reads them.
+    ///
+    /// Read for one purpose: to find out whether a proposal the queue would
+    /// offer has already been adopted. Nothing else here consults them, and an
+    /// empty slice is «he has written none», never «they were not fetched».
+    rules: &'a [ClassificationRule],
 }
 
 /// Fallible for one reason: every item about an account publishes what the
@@ -1607,6 +1700,21 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
             names.get(question.asked.account())?,
             accounts,
         ));
+    }
+    // After them, for the same reason and in the same order: an answered
+    // question's rule is declared after the question it comes out of.
+    for question in questions {
+        let Some((matcher, outcome)) = adopt_classification_rule_eligibility(question) else {
+            continue;
+        };
+        if adopt_classification_rule_gap(rules, question.subject.as_ref(), outcome) {
+            actions.push(adopt_classification_rule_action(
+                question,
+                names.get(question.asked.account())?,
+                matcher,
+                outcome,
+            ));
+        }
     }
     Ok(actions)
 }
@@ -1774,6 +1882,172 @@ fn answer_classification_question_action(
         },
     )
     .expect("classification question action has an operation target")
+}
+
+/// Which answered questions have a rule the owner could still adopt.
+///
+/// Returns the proposal itself, in the manner of
+/// [`control_assertion_eligibility`]: the caller needs the matcher and the
+/// outcome to decide the gap and to build the item, and computing eligibility as
+/// a bare `bool` would mean destructuring the same state a second time to get
+/// them.
+///
+/// Two conditions, and each removes work the owner cannot do.
+///
+/// The generalisation must be [`Generalisation::Available`]. The other three
+/// states offer nothing to adopt: `Recorded` means the answer already wrote the
+/// rule, `Unanswered` means there is no decision to generalise yet, and
+/// `Impossible` means the row prints nothing a matcher could ask about — the one
+/// state of the four that no call of anybody's can change, which is why it is
+/// stated in the enum and why nothing is queued for it.
+///
+/// And the session must not be abandoned. An abandoned session's rows were never
+/// facts — [`crate::scenarios::import_session::abandon_session`] neither reads
+/// nor writes the journal — and offering the owner a standing decision learned
+/// from a row he threw away would generalise from evidence he withdrew. A
+/// **committed** session is not excluded, and deliberately: its rows are in the
+/// journal, the answer stands, and the rule is exactly as useful the day after
+/// the commit as the day before it.
+fn adopt_classification_rule_eligibility(
+    question: &ClassificationQuestion,
+) -> Option<(&RuleMatcher, Classification)> {
+    if matches!(question.session_state, ImportSessionState::Abandoned) {
+        return None;
+    }
+    match &question.generalisation {
+        Generalisation::Available { matcher, outcome } => Some((matcher, *outcome)),
+        Generalisation::Recorded { .. }
+        | Generalisation::Unanswered
+        | Generalisation::Impossible => None,
+    }
+}
+
+fn adopt_classification_rule_gap(
+    rules: &[ClassificationRule],
+    subject: Option<&ClassificationSubject>,
+    outcome: Classification,
+) -> bool {
+    !adopt_classification_rule_completion(rules, subject, outcome)
+}
+
+/// The goal: a row like this one settles by itself next time.
+///
+/// **Read from the owner's rules, not from the question.** The question goes on
+/// reporting `available` after he adopts the proposal — that is decided where
+/// [`Generalisation::Available`] is documented, and for a good reason: the rule
+/// he creates is his own act, recorded in his rule listing, and claiming the
+/// question wrote it would attribute his decision to the import. But an item
+/// whose completion cannot be observed is an item that never leaves the queue,
+/// and a queue with a permanent entry in it is one the owner learns to ignore.
+/// So the queue asks the other question — «does a standing rule of his now
+/// settle this row the way he answered?» — and that one has an answer.
+///
+/// **Matching, not equality with the proposal.** He may narrow the matcher
+/// before he sends it, or broaden it, or have written a rule of his own last
+/// month that happens to cover the row; all three mean the work is done. Field
+/// equality would close the item for exactly one of them and go on nagging about
+/// the rest, which is the same defect one comparison further in.
+///
+/// The subject is the row read **without** resolving its counterparty against
+/// the directory — see [`crate::scenarios::import_session::subject_of`] — which
+/// is the only reading a stored matcher can be tested under. `None` there is a
+/// row this build cannot read; such a row generalises into `Impossible` and is
+/// never eligible, so the absence answers «not complete» and is never reached.
+fn adopt_classification_rule_completion(
+    rules: &[ClassificationRule],
+    subject: Option<&ClassificationSubject>,
+    outcome: Classification,
+) -> bool {
+    subject.is_some_and(|subject| {
+        rules
+            .iter()
+            .any(|rule| rule.outcome == outcome && rule.matcher.matches(subject))
+    })
+}
+
+/// The rule an answer would have written, offered to the one who may write it.
+///
+/// **This is `iaam-4hcy`.** `Generalisation::Available` was honest and
+/// unreachable: a client could read that a rule was possible and that none was
+/// written, and no queued act turned it into one. A state the system reports
+/// truthfully with no act that resolves it is a dead end dressed as information,
+/// and the owner — the only principal who may generalise — was the one reading
+/// it.
+///
+/// **`create_classification_rule`, and no new route.** The proposal is already
+/// published in the exact body `POST /v1/classification-rules` takes; the route
+/// exists, it is owner-only, and it is the same act. What was missing was its
+/// name in [`OperationKey`], so the queue could address it. A route of its own —
+/// «adopt the rule of question N» — would have been a second way to write a
+/// classification rule, and it would have had to decide whether the rule it
+/// created belongs to the question, which is the one thing
+/// [`Generalisation::Available`] says it must not.
+///
+/// **`Recommended`, not required for any goal.** The row this was learned from
+/// is already settled and already in the journal; nothing the owner can run
+/// today is short of anything while the rule stands unwritten. What it costs him
+/// is the same question again next month.
+///
+/// **`NeedsOwnerInput` with nothing missing, which is not a contradiction.**
+/// Every field of the request is preset — the matcher and the outcome are
+/// derived from the row and the answer, and `replaces` is absent because a
+/// proposal supersedes nothing. What is missing is not a value; it is his
+/// decision, and [`ActionState::Ready`] means «may be invoked without asking the
+/// owner», which this must never be. `Scope::Owner`, because generalising is the
+/// administer decision arriving by another door — the same gate
+/// `may_generalise` reads when it declines to write the rule in the first place.
+fn adopt_classification_rule_action(
+    question: &ClassificationQuestion,
+    account: &AccountView,
+    matcher: &RuleMatcher,
+    outcome: Classification,
+) -> Action {
+    let mut preset = BTreeMap::new();
+    // Written through the same two encoders the rule store is written with, not
+    // assembled here. A second writer of the rule format would drift from the
+    // one reader of it, and the owner would post a body this build composed and
+    // the classifier cannot read back.
+    preset.insert("matcher".to_owned(), matcher_json(matcher));
+    preset.insert("outcome".to_owned(), outcome_json(outcome));
+
+    Action::new(
+        ActionFacts {
+            // One identity per question, as the answering item has: two answered
+            // questions are two proposals, and an agent deduplicating by id must
+            // not collapse them into one.
+            id: format!(
+                "{}:{}",
+                ActionKind::AdoptClassificationRule.id(),
+                question.view.id.inner()
+            ),
+            kind: ActionKind::AdoptClassificationRule,
+            category: ActionCategory::Recommended,
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Owner),
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
+        },
+        format!(
+            "Row {} of import session {} on account {} ({}) was answered, and the answer \
+             wrote no standing rule: whoever answered it may settle a row but may not \
+             generalise. The rule it would have made is presented here as the body to \
+             send. Nothing already imported changes if you send it; what changes is that \
+             the next row it matches settles without asking. Read the condition before you \
+             do — you may narrow it or widen it, and a rule you adopt is one you can \
+             retire, which replans whatever it classified.",
+            question.view.row,
+            question.view.session.inner(),
+            account.id.inner(),
+            account.title,
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::CreateClassificationRule,
+            request: RequestPlan {
+                preset,
+                missing: Vec::new(),
+            },
+        },
+    )
+    .expect("adopt classification rule action has an operation target")
 }
 
 /// The `/answer` field, carrying the shapes **this** question admits.
@@ -2592,7 +2866,7 @@ mod tests {
     use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
     use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
-    use iaam_ingest::classification::Answer;
+    use iaam_ingest::classification::{Answer, Counterparty};
     use iaam_store::SqliteStore;
     use std::collections::BTreeSet;
     use time::macros::date;
@@ -2617,7 +2891,7 @@ mod tests {
             "two kinds share an identity, or one is listed twice: {:?}",
             ActionKind::ALL.map(ActionKind::id)
         );
-        assert_eq!(ActionKind::ALL.len(), 14, "a kind was added without a goal");
+        assert_eq!(ActionKind::ALL.len(), 15, "a kind was added without a goal");
     }
 
     /// Every kind graded `RequiredForGoal` names at least one goal, and every
@@ -2676,8 +2950,12 @@ mod tests {
                 ActionKind::CoverageGapUnrepaired
                 | ActionKind::IndependentConfirmationMissing
                 | ActionKind::DiscrepancyUnresolved => &[Reconciliation],
-                // Recommended and informational: never required work.
-                ActionKind::UndecomposedOutflows
+                // Recommended and informational: never required work. The
+                // adopted rule decides rows nobody has submitted yet; the row it
+                // was learned from is already settled, so no report is short of
+                // anything while it stands unwritten.
+                ActionKind::AdoptClassificationRule
+                | ActionKind::UndecomposedOutflows
                 | ActionKind::ExternalTransfersUncategorised
                 | ActionKind::UnexplainedResidual => &[],
             };
@@ -2869,7 +3147,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_owner_isoffered_the_first_account_action() {
         let owner = OwnerId::new_random();
-        let actions = frontier(owner, &store()).await.expect("frontier");
+        let store = store();
+        let actions = frontier(owner, &store, &store).await.expect("frontier");
 
         assert_eq!(actions.len(), 1);
         let action = &actions[0];
@@ -2901,7 +3180,7 @@ mod tests {
         assert!(!accounts.is_empty());
         assert!(account_completion(&accounts));
         assert!(
-            frontier(owner, &store)
+            frontier(owner, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -2919,7 +3198,7 @@ mod tests {
             .await
             .expect("account");
 
-        let actions = frontier(owner, &store).await.expect("frontier");
+        let actions = frontier(owner, &store, &store).await.expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::CreateFirstContour)
@@ -2982,7 +3261,7 @@ mod tests {
         assert!(!contours.is_empty());
         assert!(contour_completion(&contours));
         assert!(
-            frontier(owner, &store)
+            frontier(owner, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -3022,7 +3301,7 @@ mod tests {
                 .expect("contour");
         }
 
-        let actions = frontier(owner, &store).await.expect("frontier");
+        let actions = frontier(owner, &store, &store).await.expect("frontier");
         assert!(
             actions.iter().any(|action| action
                 .target()
@@ -3121,7 +3400,7 @@ mod tests {
             .await
             .expect("contour");
 
-        let actions = frontier(owner, &store).await.expect("frontier");
+        let actions = frontier(owner, &store, &store).await.expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
@@ -3185,7 +3464,7 @@ mod tests {
             .await
             .expect("contour");
 
-        let actions = frontier(owner, &store).await.expect("frontier");
+        let actions = frontier(owner, &store, &store).await.expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
@@ -3263,7 +3542,7 @@ mod tests {
             .await
             .expect("contour");
         assert!(
-            frontier(owner, &store)
+            frontier(owner, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -3277,7 +3556,7 @@ mod tests {
             .await
             .expect("account");
 
-        let reopened = frontier(owner, &store).await.expect("frontier");
+        let reopened = frontier(owner, &store, &store).await.expect("frontier");
         assert_eq!(
             reopened
                 .iter()
@@ -3323,7 +3602,7 @@ mod tests {
             .await
             .expect("exclusion");
 
-        let actions = frontier(owner, &store).await.expect("frontier");
+        let actions = frontier(owner, &store, &store).await.expect("frontier");
         assert!(
             actions
                 .iter()
@@ -3338,7 +3617,7 @@ mod tests {
             .await
             .expect("cleared");
         assert_eq!(
-            frontier(owner, &store)
+            frontier(owner, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -3447,6 +3726,7 @@ mod tests {
             activity: &[no_facts(account.id)],
             assertions: &[],
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -3515,6 +3795,7 @@ mod tests {
             activity: &[no_facts(first), no_facts(second)],
             assertions: &[],
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -3777,6 +4058,7 @@ mod tests {
             activity: &[no_facts(main.id), no_facts(savings.id)],
             assertions: &[],
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state");
         let mut sorted = actions;
@@ -3820,8 +4102,8 @@ mod tests {
             .await
             .expect("account");
 
-        let first = frontier(owner, &store).await.expect("frontier");
-        let second = frontier(owner, &store).await.expect("frontier");
+        let first = frontier(owner, &store, &store).await.expect("frontier");
+        let second = frontier(owner, &store, &store).await.expect("frontier");
         assert_eq!(first, second);
         assert!(
             first
@@ -3846,6 +4128,7 @@ mod tests {
             activity: &[no_facts(account.id)],
             assertions: &[],
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state");
         let import = actions
@@ -3950,6 +4233,7 @@ mod tests {
             activity: std::slice::from_ref(&activity),
             assertions: &[],
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state");
         // What this test is about is the gap and its closing. The target is
@@ -3977,7 +4261,8 @@ mod tests {
                 transfers: &[],
                 activity: &[completed],
                 assertions: &[],
-                questions: &[]
+                questions: &[],
+                rules: &[],
             })
             .expect("actions from state")
             .iter()
@@ -4005,6 +4290,7 @@ mod tests {
             activity: std::slice::from_ref(&activity),
             assertions: recorded,
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state")
     }
@@ -4173,6 +4459,7 @@ mod tests {
             activity: &activity,
             assertions: &[],
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state");
         let ids: Vec<_> = actions
@@ -4201,6 +4488,7 @@ mod tests {
             activity: &[activity],
             assertions: &[],
             questions: &[],
+            rules: &[],
         })
         .expect("actions from state");
         assert!(
@@ -4216,7 +4504,8 @@ mod tests {
                 transfers: &[],
                 activity: &[],
                 assertions: &[],
-                questions: &[]
+                questions: &[],
+                rules: &[],
             })
             .expect("actions from state")
             .iter()
@@ -5282,6 +5571,10 @@ mod tests {
             },
             session_state: ImportSessionState::Open,
             asked: question,
+            // An open question has generalised nothing yet, and the row it is
+            // about is not consulted while that is true.
+            generalisation: Generalisation::Unanswered,
+            subject: None,
         }
     }
 
@@ -5320,6 +5613,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -5358,6 +5652,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -5390,6 +5685,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -5430,6 +5726,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -5456,6 +5753,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -5505,6 +5803,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: std::slice::from_ref(&question),
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -5533,6 +5832,7 @@ mod tests {
                 activity: &[],
                 assertions: &[],
                 questions: std::slice::from_ref(&question),
+                rules: &[],
             })
             .expect("actions from state");
             assert!(
@@ -5563,6 +5863,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             questions: &[first.clone(), second.clone()],
+            rules: &[],
         })
         .expect("actions from state");
 
@@ -5613,7 +5914,7 @@ mod tests {
             .await
             .expect("question recorded");
 
-        let actions = frontier(owner, &store).await.expect("frontier");
+        let actions = frontier(owner, &store, &store).await.expect("frontier");
         let item = only_question_item(&actions);
         assert_eq!(
             item.id(),
@@ -5630,17 +5931,279 @@ mod tests {
                 session.id,
                 recorded.id,
                 serde_json::to_string(&Answer::Paid).expect("answer json"),
-                None,
             )
             .await
             .expect("answered");
 
-        let after = frontier(owner, &store).await.expect("frontier");
+        let after = frontier(owner, &store, &store).await.expect("frontier");
         assert!(
             after
                 .iter()
                 .all(|action| action.kind() != ActionKind::AnswerClassificationQuestion),
             "answering removes the item: {after:?}"
         );
+    }
+
+    // --- Adopting the rule an answer would have written (iaam-4hcy) ---------
+    //
+    // The defect these cover: `Generalisation::Available` said a rule was
+    // possible and none was written, and no item in the queue turned it into
+    // one. The owner is the only principal who may, and the queue is where he is
+    // told what only he can do.
+
+    /// The row a proposal was learned from, as a rule is tested against it.
+    fn shop_row(account: AccountId) -> ClassificationSubject {
+        ClassificationSubject {
+            account,
+            counterparty: Counterparty::Named("Shop One".to_owned()),
+            description: Some("card purchase 0001".to_owned()),
+            source_kind: Some("card".to_owned()),
+            movement: None,
+        }
+    }
+
+    /// The condition that proposal asks about: one field, per decision 0008.
+    fn shop_matcher() -> RuleMatcher {
+        RuleMatcher {
+            counterparty_account: Some("Shop One".to_owned()),
+            description_contains: None,
+            kind: None,
+        }
+    }
+
+    /// A question the owner answered under a token that could not generalise.
+    fn answered_without_a_rule(
+        session: ImportSessionId,
+        account: AccountId,
+        row: u32,
+    ) -> ClassificationQuestion {
+        let mut question = asked(session, account, row);
+        question.view.answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        question.view.answer = Some(serde_json::to_string(&Answer::Paid).expect("answer json"));
+        question.generalisation = Generalisation::Available {
+            matcher: shop_matcher(),
+            outcome: Classification::ExternalFlow,
+        };
+        question.subject = Some(shop_row(account));
+        question
+    }
+
+    fn standing(matcher: RuleMatcher, outcome: Classification) -> ClassificationRule {
+        ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher,
+            outcome,
+        }
+    }
+
+    fn adopt_items(actions: &[Action]) -> Vec<&Action> {
+        actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::AdoptClassificationRule)
+            .collect()
+    }
+
+    fn queue_for(
+        account: &AccountView,
+        question: &ClassificationQuestion,
+        rules: &[ClassificationRule],
+    ) -> Vec<Action> {
+        actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            questions: std::slice::from_ref(question),
+            rules,
+        })
+        .expect("actions from state")
+    }
+
+    /// The defect, in one test: the state was reported and no act resolved it.
+    #[test]
+    fn an_available_generalisation_is_an_item_the_owner_can_act_on() {
+        let main = named("Main");
+        let session = ImportSessionId::new_random();
+        let question = answered_without_a_rule(session, main.id, 3);
+
+        let actions = queue_for(&main, &question, &[]);
+        let items = adopt_items(&actions);
+        assert_eq!(items.len(), 1, "{actions:?}");
+        let item = items[0];
+
+        assert_eq!(
+            item.id(),
+            format!("adopt_classification_rule:{}", question.view.id.inner()),
+            "one identity per question, so two proposals never collapse into one"
+        );
+        assert_eq!(
+            item.category(),
+            ActionCategory::Recommended,
+            "the row is settled and in the journal; no report is waiting on this"
+        );
+        assert_eq!(
+            item.state(),
+            ActionState::NeedsOwnerInput,
+            "every field is filled; what is missing is the owner's decision"
+        );
+        assert_eq!(
+            item.required_scope(),
+            Some(Scope::Owner),
+            "generalising is the administer decision arriving by another door"
+        );
+        assert_eq!(
+            item.subject().and_then(ActionSubject::account),
+            Some(main.id)
+        );
+    }
+
+    /// The act is a call that exists, addressed by the vocabulary the catalogue
+    /// resolves — not a route invented for the occasion.
+    #[test]
+    fn the_item_offers_the_rule_route_with_the_proposal_already_filled_in() {
+        let main = named("Main");
+        let question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        let actions = queue_for(&main, &question, &[]);
+        let item = adopt_items(&actions)[0];
+
+        let ActionTarget::Operation { operation, request } = item.target() else {
+            panic!("adopting a rule names one operation");
+        };
+        assert_eq!(*operation, OperationKey::CreateClassificationRule);
+        assert!(
+            request.missing.is_empty(),
+            "nothing is missing from the request: {:?}",
+            request.missing
+        );
+        assert_eq!(
+            request.preset["matcher"]["counterparty_account"],
+            serde_json::json!("Shop One")
+        );
+        assert_eq!(
+            request.preset["outcome"]["kind"],
+            serde_json::json!("external_flow")
+        );
+        assert!(
+            !request.preset.contains_key("replaces"),
+            "a rule that would have been written for one answer replaces nothing"
+        );
+    }
+
+    /// The completion, and the reason the item terminates at all.
+    ///
+    /// The question goes on reporting `available` after the owner adopts the
+    /// proposal — that is deliberate and it is why the queue reads his rules
+    /// instead of the question. Without this the item would never leave the
+    /// queue, which is how a queue is learned to be ignored.
+    #[test]
+    fn a_standing_rule_that_settles_the_row_takes_the_item_away() {
+        let main = named("Main");
+        let question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        let adopted = standing(shop_matcher(), Classification::ExternalFlow);
+
+        assert!(
+            adopt_items(&queue_for(&main, &question, &[adopted])).is_empty(),
+            "the rule now settles a row like this one, which is the whole goal"
+        );
+    }
+
+    /// And it closes on what the rule does, not on how it is spelled.
+    ///
+    /// A matcher he narrowed before sending — or one he wrote himself last month
+    /// — still settles the row. Comparing the stored rule field for field with
+    /// the proposal would close the item for exactly one spelling and go on
+    /// nagging about every other.
+    #[test]
+    fn a_rule_he_worded_differently_still_takes_the_item_away() {
+        let main = named("Main");
+        let question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        let narrowed = standing(
+            RuleMatcher {
+                counterparty_account: Some("Shop One".to_owned()),
+                description_contains: Some("card purchase".to_owned()),
+                kind: None,
+            },
+            Classification::ExternalFlow,
+        );
+
+        assert!(adopt_items(&queue_for(&main, &question, &[narrowed])).is_empty());
+    }
+
+    /// A rule that matches the row and says something else settles nothing.
+    #[test]
+    fn a_rule_reaching_the_row_with_another_outcome_leaves_the_item_standing() {
+        let main = named("Main");
+        let question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        let other = standing(shop_matcher(), Classification::Refund);
+
+        assert_eq!(
+            adopt_items(&queue_for(&main, &question, &[other])).len(),
+            1,
+            "the owner answered «paid»; a refund rule is not that decision"
+        );
+    }
+
+    /// An answer that did write a rule has nothing left to adopt.
+    #[test]
+    fn an_answer_that_already_wrote_its_rule_queues_nothing() {
+        let main = named("Main");
+        let mut question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        question.generalisation = Generalisation::Recorded {
+            rule: "11111111-1111-4111-8111-111111111111".to_owned(),
+        };
+
+        assert!(adopt_items(&queue_for(&main, &question, &[])).is_empty());
+    }
+
+    /// The one state no call of anybody's can change stays out of the queue.
+    #[test]
+    fn a_row_that_can_never_make_a_rule_queues_nothing() {
+        let main = named("Main");
+        let mut question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        question.generalisation = Generalisation::Impossible;
+
+        assert!(
+            adopt_items(&queue_for(&main, &question, &[])).is_empty(),
+            "«no rule can be built from this row» is a statement, not work"
+        );
+    }
+
+    /// An open question generalises nothing yet, so it offers nothing to adopt —
+    /// and it still offers the answering item, which is the work that is real.
+    #[test]
+    fn an_unanswered_question_offers_an_answer_and_not_a_rule() {
+        let main = named("Main");
+        let question = asked(ImportSessionId::new_random(), main.id, 3);
+        let actions = queue_for(&main, &question, &[]);
+
+        assert!(adopt_items(&actions).is_empty());
+        assert_eq!(
+            only_question_item(&actions).kind(),
+            ActionKind::AnswerClassificationQuestion
+        );
+    }
+
+    /// A row the owner threw away is not evidence to generalise from.
+    #[test]
+    fn an_abandoned_session_proposes_no_rule_from_the_rows_it_discarded() {
+        let main = named("Main");
+        let mut question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        question.session_state = ImportSessionState::Abandoned;
+
+        assert!(adopt_items(&queue_for(&main, &question, &[])).is_empty());
+    }
+
+    /// A committed session is not an abandoned one. Its rows are in the journal
+    /// and the rule is exactly as useful the day after the commit.
+    #[test]
+    fn a_committed_session_still_offers_the_rule_its_answer_would_have_written() {
+        let main = named("Main");
+        let mut question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
+        question.session_state = ImportSessionState::Committed;
+
+        assert_eq!(adopt_items(&queue_for(&main, &question, &[])).len(), 1);
     }
 }

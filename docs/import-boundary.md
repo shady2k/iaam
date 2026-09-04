@@ -244,10 +244,14 @@ second half is decision 0005, and it is done.
   settled `refund` and the income kind and deliberately left this one standing:
   `classification_of` answers `None` for a recorded tax, so admitting `Tax` here
   would overturn that in passing rather than by decision.
-- What a rule minted from an answer should generalise on. `matcher_for` fills
-  the counterparty, the whole description and the source's word at once, and
-  choosing which of the three a rule ought to ask about is the owner's decision,
-  not one this document can take.
+- ~~What a rule minted from an answer should generalise on~~ — taken by
+  decision 0008, and the answer is one field: the counterparty where the row
+  named one, failing that the word the source used, failing both the whole
+  description. Filling all three joined them with «and», so the rule recognised
+  the row it was learned from and practically nothing else. The decision is
+  proposed rather than accepted, because which of the three carries the
+  classification is still the owner's call and 0008 only writes down what the
+  code now does and why.
 - ~~Whether `--account-map` and `--counterparty-map` are retired against the
   identity decision 0004 gave an account~~ — settled by decision 0005, and the
   answer is that the two files are two different things. `--account-map` is

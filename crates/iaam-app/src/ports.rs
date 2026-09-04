@@ -779,13 +779,33 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<ImportQuestionView>, AppError>;
 
     /// Record the owner's answer on the question and on the row it is about.
+    ///
+    /// It takes no rule. The standing rule an answer generalises into is written
+    /// through a different port, and naming it here obliged the caller to create
+    /// it first — which is how a failure of this call came to leave the owner
+    /// holding a rule for an answer no session shows (`iaam-77hk`). What the
+    /// answer generalised into is named afterwards, by
+    /// [`Self::attach_import_question_rule`].
     async fn answer_import_question(
         &self,
         owner: OwnerId,
         session: ImportSessionId,
         question: ImportQuestionId,
         answer: String,
-        rule: Option<String>,
+    ) -> Result<ImportQuestionView, AppError>;
+
+    /// Name the standing rule an already-recorded answer was generalised into.
+    ///
+    /// Separate from the answer because the rule is a different port's fact and
+    /// no transaction spans the two. Refused for a question that is still open
+    /// or already names a rule: this may not invent a generalisation for an
+    /// unanswered question, and it may not overwrite one.
+    async fn attach_import_question_rule(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        rule: String,
     ) -> Result<ImportQuestionView, AppError>;
 
     /// Record the control figures the session's source printed about itself,

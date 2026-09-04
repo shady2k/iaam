@@ -33,8 +33,8 @@ use crate::verdict::Rejection;
 
 use super::{
     AccountSource, AmountSource, CsvShape, CurrencySource, DateField, DateFormat, DatedCell,
-    DecimalSeparator, DecimalShape, DirectionSource, DocumentShape, Encoding, GroupSeparator,
-    NegativeForm, SourceProfile, TimeFormat, TimeSource,
+    DecimalSeparator, DecimalShape, DirectionSource, DocumentShape, Encoding, FarSideSource,
+    GroupSeparator, NegativeForm, RowStatus, SourceProfile, StatusSource, TimeFormat, TimeSource,
 };
 
 /// Version of the derived row key's form.
@@ -529,6 +529,101 @@ impl Columns {
     }
 }
 
+/// Whether the source says this row is a movement it completed.
+///
+/// Nothing is returned: a status is the one thing a profile transcribes that no
+/// observation carries and no rule can read. It exists to refuse, and a status
+/// that survived into the journal would be a fact about the source's own
+/// workflow sitting beside facts about the owner's money.
+///
+/// **The refusal is the engine's and has no key** (`iaam-2hq0`). The profile
+/// said which of the source's words mean which of iaam's three and stopped;
+/// what follows a word that is not `completed` is decided here, once, for every
+/// profile — which is exactly where decision 0019 puts "what happens to a row".
+/// A profile with no status block reads every row as completed, because that is
+/// what a document printing no such column has said.
+fn status(
+    record: &Record,
+    columns: &Columns,
+    shape: Option<&StatusSource>,
+) -> Result<(), Rejection> {
+    let Some(source) = shape else {
+        return Ok(());
+    };
+    let printed = columns.cell(record, &source.column)?;
+    let word = printed.trim();
+    let status = source.tokens.get(word).copied().ok_or_else(|| Rejection {
+        field: "status".to_owned(),
+        expected: format!(
+            "one of the words this profile's status map carries: {}",
+            source.tokens.keys().cloned().collect::<Vec<_>>().join(", ")
+        ),
+        actual: format!("«{}»: «{word}»", source.column),
+    })?;
+    match status {
+        RowStatus::Completed => Ok(()),
+        // Named in the owner's own reading rather than in this vocabulary's,
+        // because he is who reads a refusal (ADR 0027): the word tells him what
+        // the source said and the sentence tells him what it means for him.
+        refused => Err(Rejection {
+            field: "status".to_owned(),
+            expected: "a movement the source states it has completed. A row it has not \
+                       is not a movement, and recording one would put money in the \
+                       journal that never moved"
+                .to_owned(),
+            actual: format!("«{}»: «{word}» — {}", source.column, refused.refusal()),
+        }),
+    }
+}
+
+/// What the source said about whose account is on the far side.
+///
+/// Two shapes, and which one this profile wrote was settled at load. The
+/// difference is the column: a closed vocabulary is mapped totally and a word
+/// outside the map rejects the row, while a free-text column is read for the
+/// sentences with which this source asserts the claim and says nothing on every
+/// other row (`iaam-b0r0`).
+///
+/// **The second shape cannot silence a question the first would have raised.**
+/// It has no way to say `unstated`, so a word it does not carry — misspelt,
+/// or gone stale because the institution reworded its own sentence — costs a
+/// question that gets asked and never one that stops being asked. That
+/// asymmetry is why it is admissible at all: `own_account` is the only value in
+/// this whole field that removes a question, and the only way to write it is to
+/// quote a sentence the source prints.
+fn far_side(
+    record: &Record,
+    columns: &Columns,
+    shape: Option<&FarSideSource>,
+) -> Result<FarSide, Rejection> {
+    let Some(source) = shape else {
+        return Ok(FarSide::Unstated);
+    };
+    let printed = columns.cell(record, source.column())?;
+    let word = printed.trim();
+    match source {
+        FarSideSource::Tokens { column, tokens } => {
+            tokens.get(word).copied().ok_or_else(|| Rejection {
+                field: "far_side".to_owned(),
+                expected: format!(
+                    "one of the words this profile's far-side map carries: {}",
+                    tokens.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+                actual: format!("«{column}»: «{word}»"),
+            })
+        }
+        // Equality after trimming, never a substring: a substring test is a
+        // predicate, decision 0019's second invariant admits none, and a
+        // counterparty whose printed name happened to contain the sentence
+        // would be filed as an account of the owner's.
+        FarSideSource::OwnAccountWords { words, .. } => Ok(if words.contains(word) {
+            FarSide::OwnAccount
+        } else {
+            FarSide::Unstated
+        }),
+    }
+}
+
 /// One record into one observation.
 fn row(
     record: &Record,
@@ -539,6 +634,13 @@ fn row(
     locator: u64,
 ) -> Result<ObservedRow, RowRefusal> {
     let shape = profile.row();
+    // **Before every other cell**, and the order is the point. A row the source
+    // states it has not completed is not a movement, so it is refused for the
+    // reason the source gave rather than for whatever else happens to be wrong
+    // with a cell nobody should be reading — and it is refused before the
+    // account is resolved, so a declined row never argues that an account the
+    // directory does not know is an account the owner wants (`iaam-2hq0`).
+    status(record, columns, shape.status.as_ref())?;
     let account = match &shape.account {
         AccountSource::Declaration => context.declared.ok_or_else(|| Rejection {
             field: "account".to_owned(),
@@ -568,20 +670,7 @@ fn row(
     let currency = currency(record, columns, &shape.currency)?;
     let amount_minor = amount(record, columns, shape, currency)?;
     let direction = direction(record, columns, &shape.direction, amount_minor)?;
-    let far_side = match &shape.far_side {
-        None => FarSide::Unstated,
-        Some(source) => {
-            let printed = columns.cell(record, &source.column)?;
-            *source.tokens.get(printed.trim()).ok_or_else(|| Rejection {
-                field: "far_side".to_owned(),
-                expected: format!(
-                    "one of the words this profile's far-side map carries: {}",
-                    source.tokens.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
-                actual: format!("«{}»: «{}»", source.column, printed.trim()),
-            })?
-        }
-    };
+    let far_side = far_side(record, columns, shape.far_side.as_ref())?;
 
     let (dates, source_time) = dates(record, columns, shape)?;
 
@@ -1639,6 +1728,151 @@ mod tests {
         assert_eq!(observed(&reading.rows[0]).far_side, FarSide::OwnAccount);
         assert_eq!(observed(&reading.rows[1]).far_side, FarSide::Unstated);
         assert_eq!(rejection(&reading.rows[2]).field, "far_side");
+    }
+
+    /// The claim a source makes inside its free-text column is read, and every
+    /// other row of that column says nothing.
+    ///
+    /// The sentence here is invented, as everything in this module is. The
+    /// shipped profile carries no such list precisely because nobody who has
+    /// read a real export has written this test's counterpart against one
+    /// (`iaam-b0r0`).
+    #[test]
+    fn a_far_side_sentence_in_a_free_text_column_is_read_and_the_other_rows_say_nothing() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "far_side": {
+                    "column": "Purpose",
+                    "own_account_words": ["Between your accounts"]
+                }
+            }
+        }));
+        let reading = read_with(
+            "Posted;Sum;Purpose\n2026-08-05;-1.00;Between your accounts\n\
+             2026-08-06;-2.00;Shop One, card 1\n2026-08-07;-3.00;   Between your accounts   \n",
+            &profile,
+        );
+        assert_eq!(observed(&reading.rows[0]).far_side, FarSide::OwnAccount);
+        // Not in the list, and that is a reading rather than a failure: the
+        // source made no claim about the far side on this row, which is what
+        // `unstated` says. Nothing is refused, so the row still becomes the
+        // question it always was.
+        assert_eq!(observed(&reading.rows[1]).far_side, FarSide::Unstated);
+        // Compared after trimming, as every literal in a profile is.
+        assert_eq!(observed(&reading.rows[2]).far_side, FarSide::OwnAccount);
+    }
+
+    /// The sentence is matched whole, and a cell that merely contains it is a
+    /// cell that says nothing.
+    ///
+    /// A substring test is a predicate and decision 0019's second invariant
+    /// admits none — and this is the case that would cost: a counterparty whose
+    /// printed name happens to carry the institution's own sentence would be
+    /// recorded as a movement between the owner's own accounts and raise no
+    /// question at all.
+    #[test]
+    fn a_far_side_sentence_is_matched_whole_and_never_as_part_of_a_longer_cell() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "far_side": {
+                    "column": "Purpose",
+                    "own_account_words": ["Between your accounts"]
+                }
+            }
+        }));
+        let reading = read_with(
+            "Posted;Sum;Purpose\n2026-08-05;-1.00;Not between your accounts\n\
+             2026-08-06;-2.00;Between your accounts and somebody else s\n",
+            &profile,
+        );
+        assert_eq!(observed(&reading.rows[0]).far_side, FarSide::Unstated);
+        assert_eq!(observed(&reading.rows[1]).far_side, FarSide::Unstated);
+    }
+
+    /// A row the source states it has not completed is refused by name, and its
+    /// neighbours are read.
+    ///
+    /// The refusal names the column and the word, and says what the word meant
+    /// for the owner rather than in this engine's vocabulary: a row the source
+    /// is still holding will be printed again once it has taken the money, and
+    /// a row it refused is money that never moved (`iaam-2hq0`).
+    #[test]
+    fn a_row_the_source_has_not_completed_is_refused_and_its_neighbours_are_read() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "status": {
+                    "column": "State",
+                    "tokens": {
+                        "Settled": "completed",
+                        "Authorised": "pending",
+                        "Refused": "declined"
+                    }
+                }
+            }
+        }));
+        let reading = read_with(
+            "Posted;Sum;State\n2026-08-05;-1.00;Settled\n2026-08-06;-2.00;Authorised\n\
+             2026-08-07;-3.00;Refused\n2026-08-08;-4.00;Settled\n",
+            &profile,
+        );
+        assert_eq!(observed(&reading.rows[0]).amount_minor, -100);
+        let pending = rejection(&reading.rows[1]);
+        assert_eq!(pending.field, "status");
+        assert!(pending.actual.contains("Authorised"), "{pending:?}");
+        assert!(pending.actual.contains("has not taken yet"), "{pending:?}");
+        let declined = rejection(&reading.rows[2]);
+        assert_eq!(declined.field, "status");
+        assert!(declined.actual.contains("No money moved"), "{declined:?}");
+        assert_eq!(observed(&reading.rows[3]).amount_minor, -400);
+    }
+
+    /// A status word the map does not carry rejects the row and names it, for
+    /// the direction map's reason — and a source that adds a status word
+    /// therefore costs a rejected row rather than a committed one.
+    #[test]
+    fn a_status_word_outside_the_map_rejects_the_row_and_names_it() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "status": { "column": "State", "tokens": { "Settled": "completed" } }
+            }
+        }));
+        let reading = read_with("Posted;Sum;State\n2026-08-05;-1.00;Reversed\n", &profile);
+        let refusal = rejection(&reading.rows[0]);
+        assert_eq!(refusal.field, "status");
+        assert!(refusal.actual.contains("Reversed"), "{refusal:?}");
+    }
+
+    /// The status is read before every other cell, so a row the source did not
+    /// complete is refused for the reason the source gave.
+    ///
+    /// Two things follow from the order and both are checked here: the refusal
+    /// names `status` rather than whichever other cell of a row nobody should be
+    /// reading happens to be malformed, and a declined row does not argue that
+    /// an account the directory does not know is an account the owner wants.
+    #[test]
+    fn a_row_the_source_declined_is_refused_before_any_other_cell_is_read() {
+        let (_, names) = account();
+        let profile = profile(serde_json::json!({
+            "row": {
+                "account": { "from": "column", "column": "Account" },
+                "status": {
+                    "column": "State",
+                    "tokens": { "Settled": "completed", "Refused": "declined" }
+                }
+            }
+        }));
+        let reading = read(
+            "Posted;Sum;State;Account\n2026-08-05;not a number;Refused;Nobody s account\n"
+                .as_bytes(),
+            &profile,
+            &ReadContext {
+                accounts: &names,
+                declared: None,
+            },
+        )
+        .expect("the document is readable");
+        assert_eq!(rejection(&reading.rows[0]).field, "status");
+        assert!(reading.unresolved_accounts.is_empty());
     }
 
     /// Bytes that are not text in the profile's encoding refuse the document,

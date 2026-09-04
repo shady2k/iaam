@@ -30,3 +30,4 @@
 | [0025](0025-a-write-route-is-an-operation-key-or-says-why-it-is-not.md) | A write route is an operation key, or says why it is not | 2026-09-04 | proposed | `iaam-ripl` |
 | [0026](0026-a-rule-may-ask-what-the-source-filed-the-row-under.md) | A rule may ask what the source filed the row under, and it is not scoped to a source | 2026-09-04 | proposed | `iaam-93lz` |
 | [0027](0027-a-field-the-owner-fills-in-carries-the-question-to-put-to-him.md) | A field the owner fills in carries the question to put to him | 2026-09-04 | proposed | `iaam-ytvf` |
+| [0028](0028-a-profile-transcribes-what-the-source-claims-and-the-engine-decides.md) | A profile transcribes what the source claims about a row, and the engine decides what follows | 2026-09-04 | proposed | `iaam-b0r0`, `iaam-rdya`, `iaam-2hq0` |

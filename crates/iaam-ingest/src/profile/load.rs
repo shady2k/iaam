@@ -28,7 +28,7 @@
 //! known. Those are asked of every row, by the engine, and a profile cannot
 //! change the answer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -39,8 +39,8 @@ use crate::observation::ObservedDirection;
 use super::{
     AccountSource, Amount, AmountSource, CsvShape, CurrencySource, DateField, DateFormat,
     DatedCell, Dates, DecimalSeparator, DecimalShape, Delimiter, DirectionSource, DocumentShape,
-    Encoding, FarSideSource, GroupSeparator, NegativeForm, RowShape, SCHEMA_VERSION, SourceProfile,
-    TimeFormat, TimeSource,
+    Encoding, FarSideSource, GroupSeparator, NegativeForm, RowShape, RowStatus, SCHEMA_VERSION,
+    SourceProfile, StatusSource, TimeFormat, TimeSource,
 };
 
 /// Why a file is not a profile.
@@ -238,6 +238,10 @@ fn row_shape(at: &str, value: Value) -> Result<RowShape, ProfileError> {
         None => None,
         Some(value) => Some(far_side(&object.path("far_side"), value)?),
     };
+    let status = match object.take("status") {
+        None => None,
+        Some(value) => Some(status(&object.path("status"), value)?),
+    };
     let counterparty = column_block(&mut object, "counterparty")?;
     let description = column_block(&mut object, "description")?;
     let source_kind = column_block(&mut object, "source_kind")?;
@@ -252,6 +256,7 @@ fn row_shape(at: &str, value: Value) -> Result<RowShape, ProfileError> {
         currency,
         direction,
         far_side,
+        status,
         counterparty,
         description,
         source_kind,
@@ -523,13 +528,69 @@ fn direction(at: &str, value: Value) -> Result<DirectionSource, ProfileError> {
     Ok(source)
 }
 
+/// The far side, in whichever of the two shapes the source's column allows.
+///
+/// The branch is chosen by the key the profile wrote, not by a `from` word, and
+/// writing both or neither is refused by name rather than resolved. Which one
+/// is right is a property of the column: a closed vocabulary takes the total
+/// map, a free-text column takes the list of asserting words, and a profile
+/// that mapped a description column totally would reject every row whose
+/// description the author had not met (`iaam-b0r0`).
 fn far_side(at: &str, value: Value) -> Result<FarSideSource, ProfileError> {
     let mut object = Object::open(at, value)?;
     let column = column(&object.path("column"), object.require("column")?)?;
-    let path = object.path("tokens");
-    let tokens = token_map(&path, object.require("tokens")?, FAR_SIDES, 128)?;
+    let tokens = object.take("tokens");
+    let words = object.take("own_account_words");
+    let source = match (tokens, words) {
+        (Some(tokens), None) => {
+            let path = object.path("tokens");
+            FarSideSource::Tokens {
+                column,
+                tokens: token_map(&path, tokens, FAR_SIDES, 128)?,
+            }
+        }
+        (None, Some(words)) => {
+            let path = object.path("own_account_words");
+            FarSideSource::OwnAccountWords {
+                column,
+                words: literal_list(&path, words, 32)?,
+            }
+        }
+        (Some(_), Some(_)) => {
+            return Err(ProfileError::new(
+                at,
+                "one of tokens or own_account_words. They read the same column two ways, \
+                 and a profile that wrote both would leave the reader to guess which of \
+                 them the engine obeyed",
+                "both",
+            ));
+        }
+        (None, None) => {
+            return Err(ProfileError::new(
+                at,
+                "tokens, for a column whose vocabulary is closed, or own_account_words, \
+                 for a free-text column in which this source prints a fixed sentence of \
+                 its own",
+                "neither",
+            ));
+        }
+    };
     object.close()?;
-    Ok(FarSideSource { column, tokens })
+    Ok(source)
+}
+
+/// Whether the source says the row is a movement it completed.
+///
+/// One shape only, and it is the direction map's: this profile says which of
+/// the source's words mean which of iaam's three, and stops. What the engine
+/// does with a word that is not `completed` has no key here (`iaam-2hq0`).
+fn status(at: &str, value: Value) -> Result<StatusSource, ProfileError> {
+    let mut object = Object::open(at, value)?;
+    let column = column(&object.path("column"), object.require("column")?)?;
+    let path = object.path("tokens");
+    let tokens = token_map(&path, object.require("tokens")?, ROW_STATUSES, 128)?;
+    object.close()?;
+    Ok(StatusSource { column, tokens })
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +662,12 @@ const DIRECTIONS: &[(&str, ObservedDirection)] = &[
 const FAR_SIDES: &[(&str, FarSide)] = &[
     ("unstated", FarSide::Unstated),
     ("own_account", FarSide::OwnAccount),
+];
+
+const ROW_STATUSES: &[(&str, RowStatus)] = &[
+    ("completed", RowStatus::Completed),
+    ("pending", RowStatus::Pending),
+    ("declined", RowStatus::Declined),
 ];
 
 // ---------------------------------------------------------------------------
@@ -842,6 +909,40 @@ fn literal_keyed(at: &str, value: Value, max: usize) -> Result<Vec<(String, Valu
     Ok(entries)
 }
 
+/// A list of the source's own printed text, each entry quoted once.
+///
+/// A sibling of [`literal_keyed`] and not a reuse of it: a map's keys carry a
+/// token each and these carry nothing, because the list *is* the claim. The
+/// duplicate check is the same one and for the same reason — two entries that
+/// differ only in whitespace trim to one, and one of them would then be a rule
+/// its author believed was in force.
+fn literal_list(at: &str, value: Value, max: usize) -> Result<BTreeSet<String>, ProfileError> {
+    let Value::Array(items) = value else {
+        return Err(ProfileError::new(at, "an array", kind_of(&value)));
+    };
+    if items.is_empty() || items.len() > max {
+        return Err(ProfileError::new(
+            at,
+            format!("between 1 and {max} entries"),
+            items.len().to_string(),
+        ));
+    }
+    let mut words = BTreeSet::new();
+    for (index, item) in items.into_iter().enumerate() {
+        let word = literal(&format!("{at}[{index}]"), item)?;
+        if !words.insert(word.clone()) {
+            return Err(ProfileError::new(
+                format!("{at}[{index}]"),
+                "text this list names once. Entries are compared after trimming, so two \
+                 spellings that differ only in whitespace are one entry and one of them \
+                 would be silently lost",
+                format!("«{word}»"),
+            ));
+        }
+    }
+    Ok(words)
+}
+
 fn token_map<T: Copy>(
     at: &str,
     value: Value,
@@ -902,6 +1003,10 @@ mod tests {
                 "far_side": {
                     "column": "Operation",
                     "tokens": { "Debit": "unstated", "Credit": "unstated", "Internal": "own_account" }
+                },
+                "status": {
+                    "column": "State",
+                    "tokens": { "Settled": "completed", "Authorised": "pending", "Refused": "declined" }
                 },
                 "counterparty": { "column": "Payee" },
                 "description": { "column": "Purpose" },
@@ -1031,6 +1136,24 @@ mod tests {
                 "row.counterparty.extract",
             ),
             (
+                "a status block that says what to do with a row it declines",
+                {
+                    let mut profile = complete();
+                    profile["row"]["status"]["on_pending"] = serde_json::json!("read anyway");
+                    profile
+                },
+                "row.status.on_pending",
+            ),
+            (
+                "a fourth status word for a reversal",
+                {
+                    let mut profile = complete();
+                    profile["row"]["status"]["tokens"]["Reversed"] = serde_json::json!("reversed");
+                    profile
+                },
+                "row.status.tokens.Reversed",
+            ),
+            (
                 "a count of trailing lines to ignore",
                 {
                     let mut profile = complete();
@@ -1095,6 +1218,65 @@ mod tests {
             "profile/example-bank-statement/1"
         );
         assert!(profile.columns().contains(&"Payee"));
+    }
+
+    /// A free-text column takes the list of asserting sentences, and the list
+    /// is not a map: it has no way to say `unstated`, because saying nothing is
+    /// what every cell outside it already says.
+    #[test]
+    fn a_far_side_stated_in_a_free_text_column_loads_as_a_list_of_words() {
+        let mut profile = complete();
+        profile["row"]["far_side"] = serde_json::json!({
+            "column": "Purpose",
+            "own_account_words": ["Between your accounts", "  Between your accounts at us  "]
+        });
+        let error = load(&profile).expect_err("one sentence written twice does not load");
+        assert!(
+            error.at.starts_with("row.far_side.own_account_words"),
+            "{error}"
+        );
+
+        profile["row"]["far_side"]["own_account_words"] =
+            serde_json::json!(["Between your accounts"]);
+        let loaded = load(&profile).expect("a list of sentences is a far-side block");
+        let super::FarSideSource::OwnAccountWords { column, words } =
+            loaded.row().far_side.as_ref().expect("a far-side block")
+        else {
+            panic!("the far side is stated in a free-text column");
+        };
+        assert_eq!(column, "Purpose");
+        assert!(words.contains("Between your accounts"));
+        assert!(loaded.columns().contains(&"Purpose"));
+    }
+
+    /// The two far-side shapes read the same column two ways, so a profile
+    /// writing both leaves a reader to guess which the engine obeyed — and one
+    /// writing neither has named a column and said nothing about it.
+    #[test]
+    fn a_far_side_block_naming_both_shapes_or_neither_is_refused() {
+        let mut both = complete();
+        both["row"]["far_side"]["own_account_words"] = serde_json::json!(["Internal"]);
+        let error = load(&both).expect_err("both shapes at once does not load");
+        assert_eq!(error.at, "row.far_side");
+        assert_eq!(error.actual, "both");
+
+        let mut neither = complete();
+        neither["row"]["far_side"] = serde_json::json!({ "column": "Operation" });
+        let error = load(&neither).expect_err("a column and no claim does not load");
+        assert_eq!(error.at, "row.far_side");
+        assert_eq!(error.actual, "neither");
+    }
+
+    /// The status block names the column it reads, so a document that does not
+    /// print it is refused as a document rather than row by row.
+    #[test]
+    fn a_status_block_names_a_column_the_document_must_print() {
+        let loaded = load(&complete()).expect("the complete profile loads");
+        assert!(loaded.columns().contains(&"State"));
+        let status = loaded.row().status.as_ref().expect("a status block");
+        assert_eq!(status.column, "State");
+        assert_eq!(status.tokens.get("Settled"), Some(&RowStatus::Completed));
+        assert_eq!(status.tokens.get("Refused"), Some(&RowStatus::Declined));
     }
 
     /// A key nobody defined is refused rather than ignored.

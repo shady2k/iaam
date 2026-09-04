@@ -186,6 +186,11 @@ pub struct AnswerableQuestion {
 /// failing the read. The same tolerance the transport already applies to a
 /// question's stored alternatives: what the session holds does not become
 /// unreadable because one row of it is.
+///
+/// A free function over what [`read_session`] already returned rather than a
+/// field on [`SessionContents`], because it decides nothing the session holds:
+/// it is a second view of the same rows, and the callers that need only the
+/// questions — the refusals, the commit planner — must not pay for it.
 pub async fn answerable_questions(
     services: &AppServices,
     principal: &Principal,
@@ -848,23 +853,17 @@ pub async fn add_rows(
     Ok(outcomes)
 }
 
-/// One question, and what its answer did — or could still do — to the owner's
-/// standing rules.
-///
-/// The pair exists because the rule identifier alone cannot say why it is
-/// absent, and since the answering scope narrowed (`iaam-hnod`) it has been
-/// absent for two unrelated reasons: the row offered nothing a matcher could
-/// match on, or the answer arrived under a token that may not generalise. A
-/// client can tell those apart, because it knows what token it holds. The owner
-/// reading the session back cannot — he sees a question answered and no rule —
-/// and he is the one for whom the difference is actionable.
-/// The pairing lives on [`AnswerableQuestion`], beside the accounts an answer
-/// may name: a caller reading a question reads one object, and one object
-/// assembled by one function is one reading of the answer.
-
 /// What became of the chance to turn one answer into a standing rule.
 ///
 /// Four states, and only three of them can be true of an answered question.
+///
+/// **Why four and not an `Option<rule>`.** The rule identifier alone cannot say
+/// why it is absent, and since the answering scope narrowed (`iaam-hnod`) it has
+/// been absent for two unrelated reasons: the row offered nothing a matcher
+/// could match on, or the answer arrived under a token that may not generalise.
+/// A client can tell those apart, because it knows what token it holds. The
+/// owner reading the session back cannot — he sees a question answered and no
+/// rule — and he is the one for whom the difference is actionable.
 ///
 /// **Why this and not a column on `import_questions`.** A column would record
 /// the reason at answer time, and the reason is not what the owner needs: he
@@ -929,14 +928,6 @@ impl Generalisation {
         }
     }
 }
-
-/// Every question the session holds, each with what its answer generalised into.
-///
-/// A free function over what [`read_session`] already returned rather than a
-/// field on [`SessionContents`], because it reads no store and decides nothing
-/// the session holds: it is a second view of the same rows, and the callers that
-/// need only the questions — the refusals, the commit planner — must not pay for
-/// it.
 
 /// What one question's answer did, or could still do, to the standing rules.
 ///
@@ -4311,6 +4302,7 @@ mod tests {
             session: ImportSessionView {
                 id: session,
                 state: ImportSessionState::Open,
+                account: None,
                 source: None,
                 import: None,
                 opened_at: "2026-03-01T00:00:00Z".to_owned(),

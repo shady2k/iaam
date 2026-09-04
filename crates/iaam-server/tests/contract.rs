@@ -8627,6 +8627,27 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
     );
 }
 
+/// The schema and the queue agree about which fields the call cannot do without.
+///
+/// **Both directions, and the second is `iaam-4fsw`.** The first is the one this
+/// sweep was written for: a field the schema requires is either preset or
+/// advertised, so a caller filling in everything the item names has a request
+/// the route will accept. The second is the one the owner paid for: an item may
+/// now say that a call is accepted **without** a field, and a field the schema
+/// requires must never say so — a caller offered a way past a field the route
+/// refuses without would take it and be refused, which is worse than the
+/// question it was trying to spare him.
+///
+/// **Only that half is checkable here, and the asymmetry is deliberate.** «The
+/// schema does not require it» does not imply «the route accepts it missing»: a
+/// reason is required for one disposition and refused for another, and a balance
+/// carrying neither cash nor positions is refused outright. Both are optional in
+/// the shape and neither is skippable, so a sweep insisting that every
+/// schema-optional field be advertised as optional would be demanding a lie.
+/// What the queue publishes is what the route does; decision 0033 says why, and
+/// the non-vacuity — that some field really is published as skippable — is in
+/// `iaam_app::actions`, where the queue is built from a state written out in the
+/// test.
 #[tokio::test]
 async fn every_action_request_schema_required_input_is_advertised_as_missing() {
     // The advertised list is read from the endpoint, not written here. An
@@ -8705,6 +8726,12 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
                              can only be a parameter it declares, and it \
                              declares {declared:?}: {resolution}"
                         );
+                        assert!(
+                            !entry["optional"].as_bool().unwrap_or(false),
+                            "{pointer} addresses the route itself, and a call with a \
+                             piece of its own address left out is not a call: \
+                             {resolution}"
+                        );
                     }
                     continue;
                 };
@@ -8741,6 +8768,34 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
                             || preset.is_some_and(|values| values.contains_key(name)),
                         "{schema_name} requires {pointer}, and the action neither presets \
                          it nor lists it as missing: {resolution}"
+                    );
+                }
+
+                // The other direction. A field the item says the call is
+                // accepted without has to be a field of this body that the
+                // schema does not require, or the way past it that a client
+                // offers the owner leads to a refusal.
+                for entry in resolution["request"]["missing"]
+                    .as_array()
+                    .expect("missing inputs")
+                {
+                    if !entry["optional"].as_bool().unwrap_or(false) {
+                        continue;
+                    }
+                    let pointer = entry["pointer"].as_str().expect("missing pointer");
+                    let name = pointer.trim_start_matches('/');
+                    assert!(
+                        !required.iter().any(|value| value == name),
+                        "{schema_name} requires {pointer}, and the action offers a way \
+                         past it: {resolution}"
+                    );
+                    assert!(
+                        body_of_spec["components"]["schemas"][&schema_name]["properties"]
+                            .get(name)
+                            .is_some_and(|schema| !schema.is_null()),
+                        "{pointer} is published as a field of {schema_name} the call is \
+                         accepted without, and {schema_name} has no such field: \
+                         {resolution}"
                     );
                 }
             }
@@ -23947,6 +24002,38 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
             .is_some_and(|ask| ask.contains('?')),
         "{institution}"
     );
+    // And it says the account is created whether or not he answers (`iaam-4fsw`).
+    // `institution` is optional on this request and no figure reads it; published
+    // beside the title with nothing to tell the two apart, it stopped him for a
+    // word an agent had just told him nothing depended on.
+    assert_eq!(
+        institution["optional"].as_bool(),
+        Some(true),
+        "{institution}"
+    );
+    assert!(
+        institution["prompt"]["consequence"]
+            .as_str()
+            .is_some_and(|turns| turns.contains("a year from now")),
+        "an optional question is put with what skipping it costs: {institution}"
+    );
+    assert!(
+        title["optional"].is_null(),
+        "an account with no name at all is not a call this route takes, and an \
+         absent flag is the safe reading of that: {title}"
+    );
+
+    // One printed name is a set of one, so no answer is offered over a set here
+    // (`iaam-hdr7`). The offer exists to let him decide once for several names —
+    // «they are all from that institution», «call them what the statement calls
+    // them» — and «here is a set of one» would be a set to take apart to find
+    // what the item already said.
+    for input in [title, institution] {
+        assert!(
+            input["proposal"].is_null(),
+            "one name is one question: {input}"
+        );
+    }
 
     // The other resolution says the name is nobody's account of his, and asks
     // for the one thing only he can supply: what it actually is. Everything else

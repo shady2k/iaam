@@ -4400,6 +4400,16 @@ pub struct RequestPlanDto {
 /// nothing of the sort: an agent relaying an item to the owner had the pointer
 /// and this schema's own descriptions, which are written for whoever implements
 /// a client, and so it showed him a wire field name (`iaam-ytvf`).
+///
+/// **The fields of one `request` may be put to the owner together, and a client
+/// that asks them one at a time is being slower than it has to be**
+/// (`iaam-zxc6`). Each field keeps its own words — that is what stops one
+/// sentence being written for four fields and then having to be taken apart
+/// again — and «its own words» is not «its own exchange». `missing` is one
+/// call's fields, in the order to ask them, and a client holds all of it before
+/// it says anything to him, so show them at once and send one request. Read
+/// `optional` while you do: a field the call is accepted without is offered with
+/// a way past it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MissingInputDto {
     pub pointer: String,
@@ -4431,6 +4441,78 @@ pub struct MissingInputDto {
     /// alternative is a value of this field itself.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alternatives: Vec<InputAlternativeDto>,
+    /// Whether this call is accepted with the field absent.
+    ///
+    /// Absent means `false`, which is the safe reading: the call is refused
+    /// without it. `true` is a statement about **this route** — it takes the
+    /// request with the field left out — and it is not the item saying the
+    /// answer does not matter. What leaving it out costs is in `prompt`'s
+    /// `consequence`, and an optional question is put to the owner with that
+    /// sentence and a way past it, never as a field he must fill before
+    /// anything can happen.
+    ///
+    /// The queue could say nothing of the sort, so a client put every field to
+    /// him as though the call would fail without it, and he was held up over one
+    /// that no figure anywhere reads (`iaam-4fsw`).
+    ///
+    /// **`false` is not «the schema requires it».** A route may refuse a request
+    /// for a field its own schema marks optional — a reason is required for one
+    /// disposition and refused for another — so this says what the route does
+    /// and the schema's `required` list says what the shape demands. Where they
+    /// differ, this one is the one to act on.
+    #[serde(default, skip_serializing_if = "is_not_set")]
+    pub optional: bool,
+    /// One answer this instance proposes for this field and every item like it.
+    ///
+    /// Absent where nothing is proposed. Present, it is a **question**, not a
+    /// filled-in field: read its `question` out to the owner, and write its
+    /// `value` into this request only if he agrees. Nothing is recorded until he
+    /// does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ProposedAnswerDto>,
+}
+
+/// Whether a flag was set, for `skip_serializing_if`.
+///
+/// So that a client reading the queue before this field existed reads exactly
+/// what it read before: an absent flag and a `false` one are the same statement,
+/// and the safe one.
+fn is_not_set(flag: &bool) -> bool {
+    !*flag
+}
+
+/// One answer the owner may give once, over every item it would fill.
+///
+/// **The unit of his decision is not the unit of the item** (`iaam-hdr7`). The
+/// queue raises one item per account, because an account created for one name
+/// does not settle another. But a person deciding about seven names printed by
+/// one bank makes one decision, not seven, and had no way to say so: he was put
+/// through two questions per name until he interrupted and answered all of them
+/// at once, twice over.
+///
+/// **This is a question and not a preset.** `preset` is the request already
+/// filled in and is never read out to him; a proposal exists to be read out.
+/// Show him `question` — both halves of it, as with any other — and write
+/// `value` into this field only if he agrees. If he does not, the field's own
+/// `prompt` is the question to ask him instead, one item at a time.
+///
+/// **`covers` names every item one answer fills, this one included, and it is
+/// complete.** An item that cannot take the answer is in no set rather than
+/// quietly left out of one, so applying this beyond the items named is going
+/// outside the offer. Where he agrees, send one call per item named, taking each
+/// item's own `value`: one decision does not mean one value — «call them what
+/// the statement calls them» writes a different string into each request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProposedAnswerDto {
+    /// What is proposed for **this** item's field. Write it only if he agrees.
+    pub value: String,
+    /// The one question to put to him about the whole set.
+    pub question: OwnerQuestionDto,
+    /// Every item this one answer fills this field of, by their action ids.
+    ///
+    /// Never fewer than two: one item is one question, and a set of one would be
+    /// a set to take apart to find what was already there.
+    pub covers: Vec<String>,
 }
 
 /// One admissible value of a missing input, and what choosing it then needs.

@@ -1078,7 +1078,10 @@ impl OwnerPrompt {
                  this system does not read it, and no statement is matched against it. It is \
                  read by you. It is what tells two accounts apart in a list when they are \
                  called something similar, and what says, a year from now, where the account a \
-                 report is about is actually kept."
+                 report is about is actually kept. Saying nothing is also an answer, and this \
+                 is one of the few places where it costs nothing today: the account is created \
+                 either way and every figure about it is the same. What it costs is later, and \
+                 it is exactly that — a year from now, nothing will say where this account is."
                     .to_owned(),
             ),
             Self::DeclinedNameReason => (
@@ -1121,6 +1124,215 @@ pub struct OwnerQuestion {
     /// about his choice. Where the honest answer is that nothing turns on it,
     /// it says so **and** names the one case where something would.
     pub consequence: String,
+}
+
+/// A value this instance works out for one field, put to the owner as one
+/// question over every item it would fill.
+///
+/// **The unit of his decision is not the unit of the item** (`iaam-hdr7`). The
+/// queue publishes one item per name a document printed, and that is right:
+/// completion is per name, and an account created for one string does not settle
+/// another. What was missing is a way to say «this answer, for these items».
+/// Reading seven printed names, an owner was put seven times through two
+/// questions apiece and interrupted the eleventh to answer all of them at once,
+/// twice: they are all from one institution, and call them what the statement
+/// calls them. Both answers were derivable from what the queue already held —
+/// the institution from the profile that read the document, the names from the
+/// strings that document printed — and neither was offered.
+///
+/// **A proposal is a question and not a guess.** It is published *as* the
+/// question, its value is read out, and nothing is recorded until he answers, so
+/// the agent skill's rule — a missing value is asked of the owner, not filled in
+/// — is kept rather than bent. That is [`matcher_for`]'s arrangement one surface
+/// over: a rule is proposed from a row and adopted by him, and until he adopts
+/// it there is no rule.
+///
+/// [`matcher_for`]: iaam_ingest::classification::matcher_for
+///
+/// **And a proposal is not a preset under another name.** A preset value is the
+/// request already filled in and is never read out to him (decision 0027 §4);
+/// publishing a proposal as a preset would hide the very question it exists to
+/// ask, which is the defect `iaam-9i83` closed on the field beside this one.
+/// Decision 0030 refused presetting the institution from the issuer for exactly
+/// that reason, and named the door it was leaving open: a value read out to him
+/// is not the value hidden from him.
+///
+/// **Refused whole, and the set is what it is refused over.** [`Self::covers`]
+/// names every item the one answer fills, and an item that cannot take it is in
+/// no set at all rather than quietly left out of one — which is `iaam-q5og`'s
+/// rule at the surface a publication has: a wider answer either reaches
+/// everything it names or is not offered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    /// What is proposed for this item, and the ground it stands on.
+    pub proposed: ProposedAnswer,
+    /// Every item this one answer fills this field of, this one included.
+    ///
+    /// **Never a set of one.** One item is one question, and «here is a set of
+    /// one» would make a caller take a set apart to find the fact it already
+    /// had — the argument [`ActionTarget::from_options`] makes about a list
+    /// holding one resolution, and it holds here for the same reason.
+    ///
+    /// It names the items and not their count, because the caller has to be
+    /// able to say to him *which* accounts he is answering for, and because an
+    /// answer applied beyond this list is visibly outside the offer rather than
+    /// plausibly inside it.
+    pub covers: Vec<String>,
+}
+
+impl Proposal {
+    /// The value proposed for **this** item's field.
+    ///
+    /// Per item, because one decision does not mean one value: «call them what
+    /// the statement calls them» is a single answer that writes a different
+    /// string into each request, and «they are all held at that institution» is
+    /// a single answer that writes the same one. A shape admitting only the
+    /// second would have covered the institution and left the names asked one
+    /// at a time, which is eight of the fifteen exchanges.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        self.proposed.value()
+    }
+
+    /// The one sentence put to him about the whole set.
+    ///
+    /// Rendered here and not written per item, which is decision 0027 §2's
+    /// arrangement: two publishers of one question eventually disagree about
+    /// it. The count is the set's own size rather than a datum an item carries,
+    /// so a question that named four accounts while covering seven is not a
+    /// state this type can be in.
+    #[must_use]
+    pub fn question(&self) -> OwnerQuestion {
+        self.proposed.question(self.covers.len())
+    }
+}
+
+/// What may be proposed for a field, and the ground each proposal stands on.
+///
+/// A closed vocabulary keyed by the field of the call, exactly as [`OwnerPrompt`]
+/// is and for the same reason. It is a **second** vocabulary and not two more
+/// variants of that one, because the sentences answer different questions: that
+/// one asks a person what a title is and what a rename costs, and this one asks
+/// him to confirm a value over a set. Folded together, the sweep that compares
+/// the questions this system asks with the fields the queue publishes would have
+/// to admit questions no field publishes, which is the half of decision 0027 §6
+/// that makes the sweep worth running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposedAnswer {
+    /// Every account these names were read under is held at the institution the
+    /// reading says printed them.
+    ///
+    /// **A join already recorded and not an inference.** The profile that read
+    /// the document declares the institution it is from, and that declaration is
+    /// what `provider` is minted from one field over (decision 0030 §1). What is
+    /// new here is only that it is read out to him: the institution is his word
+    /// for where the account is, the issuer is the profile's word for who
+    /// printed the document, and the two are the same thing often enough to be
+    /// worth proposing and different often enough that he must be the one to
+    /// say.
+    AccountInstitutionOfIssuer { issuer: String },
+    /// Every such account is called what the document prints for it.
+    ///
+    /// **Safe only because the identifier is preset**, and that is decision 0004
+    /// standing rather than being reversed. Presetting the printed string as the
+    /// *title* is refused there, because a title is renameable and a statement
+    /// that found its account by the title would stop importing on the first
+    /// rename. What the item presets is the identifier, so the printed string is
+    /// matched at the tier a rename does not move, and a title that happens to
+    /// equal it carries no weight at all. Where the reading could not say which
+    /// source printed the string, nothing is preset — and this proposal is not
+    /// offered either, because there the title would be the only thing a line
+    /// could find the account by.
+    AccountTitleAsPrinted { printed: String },
+}
+
+impl ProposedAnswer {
+    /// The question this proposal is an answer to.
+    ///
+    /// **Its words are not read from here**, and the shape it is built in says
+    /// so: [`OwnerPrompt::AccountTitle`] carries the string a document printed
+    /// and this hands it none, because what is wanted is the field and the call
+    /// and nothing else. The words for a set are this type's own, above; what
+    /// [`OwnerPrompt`] supplies is the identity of the field being answered, so
+    /// that a proposal cannot come to name a field or a call the question beside
+    /// it does not.
+    fn field(&self) -> OwnerPrompt {
+        match self {
+            Self::AccountInstitutionOfIssuer { .. } => OwnerPrompt::AccountInstitution,
+            Self::AccountTitleAsPrinted { .. } => OwnerPrompt::AccountTitle { printed: None },
+        }
+    }
+
+    /// The field this proposal fills, as a JSON pointer into the request.
+    #[must_use]
+    pub fn pointer(&self) -> &'static str {
+        self.field().pointer()
+    }
+
+    /// The call that field belongs to.
+    ///
+    /// A pointer is not an identity — `/title` is two questions — so the pair is
+    /// what a proposal is checked against, exactly as a question is.
+    #[must_use]
+    pub fn asked_by(&self) -> OperationKey {
+        self.field().asked_by()
+    }
+
+    /// The value this proposal puts in this item's field.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        match self {
+            Self::AccountInstitutionOfIssuer { issuer } => issuer,
+            Self::AccountTitleAsPrinted { printed } => printed,
+        }
+    }
+
+    /// The words put to him about the whole set: what is proposed, and what
+    /// turns on saying yes to it rather than answering one at a time.
+    ///
+    /// Decision 0027's two obligations are unchanged by the answer being wide.
+    /// What the consequence must now also carry is the cost of the width itself
+    /// — that one answer decides for every account named — because that is the
+    /// difference between this and the question beside it, and it is the half
+    /// he would otherwise discover afterwards.
+    #[must_use]
+    pub fn question(&self, covered: usize) -> OwnerQuestion {
+        let (ask, consequence): (String, String) = match self {
+            Self::AccountInstitutionOfIssuer { issuer } => (
+                format!(
+                    "Shall all {covered} of these accounts be recorded as held at «{issuer}»? \
+                     Every one of them was named on a document this system read as coming from \
+                     there, so one answer settles all {covered} — and if you would say the name \
+                     differently, say it your way and that is what is recorded."
+                ),
+                format!(
+                    "Nothing is worked out from the answer and no figure moves: it is a note you \
+                     read, and the only thing that will say a year from now where each of these \
+                     accounts is kept. What one answer buys is that you are not asked {covered} \
+                     times; what it costs is that any of the {covered} you would have answered \
+                     differently has to be corrected afterwards, which is the same act as \
+                     answering it now."
+                ),
+            ),
+            Self::AccountTitleAsPrinted { printed } => (
+                format!(
+                    "Shall each of these {covered} accounts be called exactly what your document \
+                     prints for it — this one «{printed}»? These are the names you will see on \
+                     every report and in every list this system shows you, and one answer names \
+                     all {covered}."
+                ),
+                format!(
+                    "The printed name is kept with each account as the identifier its source \
+                     prints, so whatever you call them the lines your statements print go on \
+                     finding the right account and no figure moves. What one answer buys is that \
+                     you are not asked {covered} times; what it costs is that a name you would \
+                     have written differently is one you have to rename afterwards, and renaming \
+                     moves only what you read."
+                ),
+            ),
+        };
+        OwnerQuestion { ask, consequence }
+    }
 }
 
 /// Fields the owner is asked for that carry no question, and the bead deciding
@@ -1180,6 +1392,39 @@ pub struct MissingInput {
     /// field itself, and choosing one may require further fields that choosing
     /// another does not.
     pub alternatives: Vec<InputAlternative>,
+    /// Whether the call this field belongs to is accepted without it.
+    ///
+    /// **The queue could not say a field was skippable, so every field stopped
+    /// him** (`iaam-4fsw`). `create_account` takes `institution` as an optional
+    /// field: the account is created without it and no figure anywhere reads it.
+    /// The item published it beside the title with nothing to tell the two
+    /// apart, and the owner was held up over a word he could have left out — by
+    /// an agent that had just told him, correctly, that no figure depends on it,
+    /// and asked anyway because the item gave it no way to offer skipping.
+    ///
+    /// **It is a fact about the call and not a grade of the question.** True
+    /// means the route accepts the request with the field absent. It does not
+    /// mean the field is unimportant and it is not the item saying it would
+    /// rather not know: what skipping costs is in the question's `consequence`,
+    /// where decision 0027's third obligation already puts it, and «nothing now,
+    /// and in a year you will not know where this account is» is exactly the
+    /// sentence that rule asks for.
+    ///
+    /// **False is not «the schema requires it».** A route may refuse a request
+    /// for a field its schema marks optional: `/reason` is required for one
+    /// disposition and refused for another, and `/cash` is refused on an
+    /// assertion carrying neither cash nor positions. Neither is skippable and
+    /// neither is marked here, which is why the guard over this checks one
+    /// direction and cannot check the other. Decision 0033.
+    pub optional: bool,
+    /// One answer this instance would put to him for this field and every item
+    /// like this one.
+    ///
+    /// `None` where nothing is proposed, which is every field but two and every
+    /// item that stands alone. Present, it carries the value and the whole set
+    /// of items that one answer fills — see [`Proposal`] for why it is a
+    /// question and not a preset, and why the set is refused whole.
+    pub proposal: Option<Proposal>,
 }
 
 /// One admissible value of a missing input, with what choosing it then needs.
@@ -1256,7 +1501,36 @@ impl MissingInput {
             prompt: Some(prompt),
             candidates: None,
             alternatives: Vec::new(),
+            optional: false,
+            proposal: None,
         }
+    }
+
+    /// The same, for a field the call is accepted without.
+    ///
+    /// A method rather than a parameter on every constructor: a field that
+    /// blocks the call is the ordinary case and the one a reader should not have
+    /// to spell out, and `.optional()` at the site is where the claim is
+    /// checkable — it sits beside the request schema a reader can go and look
+    /// at. See [`Self::optional`] for why this is narrower than «the schema does
+    /// not require it» (`iaam-4fsw`).
+    #[must_use]
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+
+    /// The same, carrying one answer that would fill this field on a set of
+    /// items.
+    ///
+    /// Built at the item, because only the item knows which of its neighbours
+    /// share the ground. The words are not built there: [`Proposal`] renders
+    /// them from its own vocabulary, so an item hands over a value and a set and
+    /// never a sentence (`iaam-hdr7`).
+    #[must_use]
+    pub fn proposing(mut self, proposal: Proposal) -> Self {
+        self.proposal = Some(proposal);
+        self
     }
 
     /// The same, for a field whose answer is one of the owner's own accounts.
@@ -1283,6 +1557,8 @@ impl MissingInput {
             prompt: None,
             candidates: None,
             alternatives: Vec::new(),
+            optional: false,
+            proposal: None,
         }
     }
 
@@ -1299,6 +1575,8 @@ impl MissingInput {
             prompt: None,
             candidates: None,
             alternatives: Vec::new(),
+            optional: false,
+            proposal: None,
         }
     }
 }
@@ -1328,6 +1606,26 @@ impl From<NobodyIsAsked> for ProvidedBy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestPlan {
     pub preset: BTreeMap<String, serde_json::Value>,
+    /// Every field of this one call still to be filled in, in the order to ask.
+    ///
+    /// **They may be put to the owner together, and nothing said so**
+    /// (`iaam-zxc6`). Decision 0027 gave every owner-facing field its own
+    /// question, and that is right: a question per field is what stops a mapping
+    /// from field to question being folded into one sentence the caller has to
+    /// take apart again, which is `iaam-tt71`'s finding and `docs/api/conventions.md`
+    /// §5. But «each field keeps its own words» is not «each field is a separate
+    /// exchange», and with only the first written down the safe reading was the
+    /// slow one: an agent relaying the item that asks what to call an account and
+    /// where it is held asked the two one after the other, and doubled the length
+    /// of a first import for nothing.
+    ///
+    /// The two obligations do not conflict — the words stay per field and the
+    /// fields are shown at once — and this list is already the published fact.
+    /// It is ordered, it is one call's, and a caller holds all of it before it
+    /// says anything to him. So what was missing was the sentence and not a
+    /// structure, and it is written here, on `MissingInputDto` where it reaches
+    /// the contract, and in the agent skill where it reaches the reader that was
+    /// serialising them.
     pub missing: Vec<MissingInput>,
 }
 
@@ -3514,7 +3812,10 @@ fn actions_from_views(
     // is «and the directory still does not place it», which needs the tiering
     // and therefore the accounts in the shape the tiering searches.
     for name in wanted {
-        actions.push(account_named_by_document_action(name));
+        // The whole slice, because an item has to be able to say which of its
+        // neighbours one answer would settle with it, and that is a fact about
+        // the set rather than about the name (`iaam-hdr7`).
+        actions.push(account_named_by_document_action(name, wanted));
     }
     if contour_eligibility && contour_gap {
         actions.push(first_contour_action(accounts));
@@ -4460,6 +4761,69 @@ pub struct AccountNamedByDocument {
     pub declined: Option<String>,
 }
 
+/// The identity of the item raised for one printed name.
+///
+/// Scoped to the name **and** to the institution that printed it: several may
+/// stand at once, and an unscoped id would give every one of them the identity
+/// an agent deduplicates by, which would publish one item for seven accounts.
+/// The institution is in it because it is in the fold key, and two items sharing
+/// an id would be worse than the two items being separate.
+///
+/// Lifted out of the item so that a proposal can name its neighbours
+/// (`iaam-hdr7`): a set that named items by rebuilding their ids a second way
+/// would eventually name items that do not exist.
+fn named_by_document_id(wanted: &AccountNamedByDocument) -> String {
+    format!(
+        "{}:{}:{}",
+        ActionKind::CreateAccountNamedByDocument.id(),
+        wanted.issuer.as_deref().unwrap_or_default(),
+        wanted.printed
+    )
+}
+
+/// The items one answer about a printed name would fill together, and the
+/// institution that is the ground for it.
+///
+/// **The set is the reading's institution, and the alternatives were weighed**
+/// (`iaam-hdr7`). Not the document: the fold above already merges two statements
+/// of one bank naming one unknown account into one item, so a set keyed on the
+/// reading would be a set an item belongs to twice. Not the item kind either: an
+/// owner who conveys two institutions' statements before working his queue would
+/// then be asked one question over both, and «they are all from that bank» would
+/// be false of half of it. What every member of this set has in common is the
+/// claim the proposal makes — these strings were printed by that institution —
+/// which is a fact the reading recorded and nobody has to guess at.
+///
+/// **A declined name is not a member, and it is not an exclusion.** It asks for
+/// neither field: the owner has said it is no account of his, so its item offers
+/// the withdrawal of that statement and nothing else. Membership is asking the
+/// field, not sharing the kind.
+///
+/// **Refused whole.** A name whose reading this instance can no longer place
+/// carries no institution, so there is no ground and it joins no set — rather
+/// than being folded into a neighbour's, which would put a claim about one
+/// bank's document to him over a name that came from nobody knows where. It is
+/// the same refusal decision 0030 makes one field over, where such an item
+/// presets neither half of an identity rather than one.
+///
+/// **Never a set of one**, for [`ActionTarget::from_options`]'s reason: one item
+/// is one question already, and «here is a set of one» would make a caller take
+/// a set apart to find what it had.
+fn shared_answer_set(
+    wanted: &AccountNamedByDocument,
+    every: &[AccountNamedByDocument],
+) -> Option<(String, Vec<String>)> {
+    let issuer = wanted.issuer.clone()?;
+    let covers: Vec<String> = every
+        .iter()
+        .filter(|other| {
+            other.declined.is_none() && other.issuer.as_deref() == Some(issuer.as_str())
+        })
+        .map(named_by_document_id)
+        .collect();
+    (covers.len() > 1).then_some((issuer, covers))
+}
+
 /// The account a document named that this instance cannot place.
 ///
 /// **The one item in this queue whose subject is a string.** Every other item
@@ -4524,22 +4888,39 @@ pub struct AccountNamedByDocument {
 /// The two are ordered and not ranked, and the account comes first: a name a
 /// document printed on the owner's own statement is usually one of his.
 ///
+/// **Two fields of one call, and they are asked in one breath** (`iaam-zxc6`).
+/// What he calls the account and where it is held are published together, in
+/// order, and nothing about decision 0027 obliges a caller to serialise them. It
+/// did anyway, because nothing said otherwise; the sentence is on
+/// [`RequestPlan::missing`] now.
+///
+/// **Where it is held may be left unanswered** (`iaam-4fsw`). `institution` is
+/// optional on the request, no figure reads it, and the account is created
+/// without it — so the item says so, and the question says what skipping costs.
+/// It was published as though the account could not exist without it, and the
+/// owner was stopped for a word by an agent that had just told him nothing
+/// depended on it.
+///
+/// **And both fields carry an answer he may give once for every name this
+/// reading printed** (`iaam-hdr7`). Seven printed names cost him roughly fifteen
+/// exchanges, and he ended them with two sentences: they are all from one
+/// institution, and call them what the statement calls them. Both were already
+/// derivable here — the institution from the profile that read the document, the
+/// names from the strings that document printed — and neither was offered,
+/// because nothing published these items as a set with a value and a ground for
+/// it. [`Proposal`] is that, and it is a question rather than a preset for the
+/// reason decision 0030 refused to preset the institution: a value read out to
+/// him is his answer, and a value hidden in the request is not.
+///
 /// **`NeedsOwnerInput`, with every field the queue can supply supplied.** Whether
 /// an account of his is meant by this string — and whether it is one account or
 /// two — is his judgement, exactly as the reporting perimeter is. A complete
 /// request does not change who may send it.
-fn account_named_by_document_action(wanted: &AccountNamedByDocument) -> Action {
-    // Scoped to the name **and** to the institution that printed it: several may
-    // stand at once, and an unscoped id would give every one of them the
-    // identity an agent deduplicates by, which would publish one item for seven
-    // accounts. The institution is in it because it is in the fold key, and two
-    // items sharing an id would be worse than the two items being separate.
-    let id = format!(
-        "{}:{}:{}",
-        ActionKind::CreateAccountNamedByDocument.id(),
-        wanted.issuer.as_deref().unwrap_or_default(),
-        wanted.printed
-    );
+fn account_named_by_document_action(
+    wanted: &AccountNamedByDocument,
+    every: &[AccountNamedByDocument],
+) -> Action {
+    let id = named_by_document_id(wanted);
     // Named in the sentence where it is known, because it is the fact that turns
     // «a document prints this» into «your bank prints this», and that is what
     // the owner recognises the account by.
@@ -4567,6 +4948,32 @@ fn account_named_by_document_action(wanted: &AccountNamedByDocument) -> Action {
             "provider_account_id".to_owned(),
             wanted.printed.clone().into(),
         );
+    }
+
+    // The two fields he may answer once for every name this reading printed.
+    // Both proposals are over the same set, because both stand on the same
+    // ground — the reading said which institution printed these strings — and
+    // an item that cannot say that is in no set and gets neither.
+    let shared = shared_answer_set(wanted, every);
+    let mut title = MissingInput::asked(OwnerPrompt::AccountTitle {
+        printed: Some(wanted.printed.clone()),
+    });
+    // `institution` is `Option<String>` on the request and no figure reads it,
+    // so the account is created whether he answers or not. Publishing it as
+    // though the account could not exist without it is what stopped him over a
+    // word he could have skipped (`iaam-4fsw`).
+    let mut institution = MissingInput::asked(OwnerPrompt::AccountInstitution).optional();
+    if let Some((issuer, covers)) = shared {
+        title = title.proposing(Proposal {
+            proposed: ProposedAnswer::AccountTitleAsPrinted {
+                printed: wanted.printed.clone(),
+            },
+            covers: covers.clone(),
+        });
+        institution = institution.proposing(Proposal {
+            proposed: ProposedAnswer::AccountInstitutionOfIssuer { issuer },
+            covers,
+        });
     }
 
     Action::new(
@@ -4604,20 +5011,17 @@ fn account_named_by_document_action(wanted: &AccountNamedByDocument) -> Action {
                 operation: OperationKey::CreateAccount,
                 request: RequestPlan {
                     preset,
-                    missing: vec![
-                        // The printed string travels *in the question*, not as a
-                        // second preset: what is preset is the identifier, and
-                        // saying so to the owner is what stops a caller showing
-                        // him the preset instead (`iaam-ytvf`).
-                        MissingInput::asked(OwnerPrompt::AccountTitle {
-                            printed: Some(wanted.printed.clone()),
-                        }),
-                        // The question that replaced `/provider`. What the label
-                        // scoping the printed identifier should be is worked out
-                        // above; where the account is held is asked here, and it
-                        // is the half a person can answer.
-                        MissingInput::asked(OwnerPrompt::AccountInstitution),
-                    ],
+                    // Two fields of one call, published together because they
+                    // may be put to him together (`iaam-zxc6`). The printed
+                    // string travels *in the question*, not as a second preset:
+                    // what is preset is the identifier, and saying so to the
+                    // owner is what stops a caller showing him the preset
+                    // instead (`iaam-ytvf`). The second is the question that
+                    // replaced `/provider` — what the label scoping the printed
+                    // identifier should be is worked out above; where the
+                    // account is held is asked here, and it is the half a person
+                    // can answer.
+                    missing: vec![title, institution],
                 },
             },
             declining_option(&wanted.printed),
@@ -5521,8 +5925,14 @@ mod tests {
         let term = named("Term");
         let mut items = Vec::new();
 
-        // Nothing described, and a document that named an account.
-        items.extend(queue_wanting(&[], &[wanted("Shop One", 3, 1)]));
+        // Nothing described, and two documents that named accounts. Two and not
+        // one, because one printed name is a set of one and publishes no
+        // proposal, so a heap holding one would let the sweeps run over a queue
+        // in which nothing was ever offered over a set (`iaam-hdr7`).
+        items.extend(queue_wanting(
+            &[],
+            &[wanted("Shop One", 3, 1), wanted("Shop Two", 5, 1)],
+        ));
 
         // One account, no perimeter, no facts: the first perimeter, the
         // transfer statement, and the routes that begin an import.
@@ -6173,6 +6583,443 @@ mod tests {
         assert!(
             QUESTIONS_UNDER_REVIEW.is_empty(),
             "a field is registered as unanswered: {QUESTIONS_UNDER_REVIEW:?}"
+        );
+    }
+
+    // --- One decision over a set, and a field he may skip (iaam-hdr7, iaam-4fsw,
+    // iaam-zxc6) ------------------------------------------------------------
+    //
+    // The observation, in one sentence: seven printed names became roughly
+    // fifteen exchanges, because each item asked its two fields one at a time
+    // and no item could say that its neighbours took the same answer.
+
+    /// Every item of one reading, with its two owner fields.
+    fn named_items(actions: &[Action]) -> Vec<&Action> {
+        actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .collect()
+    }
+
+    /// One field of the account this item would create.
+    fn account_field<'a>(action: &'a Action, pointer: &str) -> &'a MissingInput {
+        resolution(action, OperationKey::CreateAccount)
+            .missing
+            .iter()
+            .find(|missing| missing.pointer == pointer)
+            .unwrap_or_else(|| panic!("{} publishes no {pointer}", action.id()))
+    }
+
+    /// The field the call is accepted without says so, and its neighbour does not.
+    ///
+    /// **Both halves, because the flag is only worth having if it discriminates.**
+    /// A queue that marked every field optional would be as mute as one that
+    /// marked none, and the pair here is the pair the owner met: one field the
+    /// account cannot be created without, and one it can — published side by
+    /// side with nothing to tell them apart, so he was stopped for both.
+    ///
+    /// The consequence is asserted too, and it is the thing that makes the flag
+    /// an offer rather than a fact nobody can act on: an optional question is
+    /// put with a way past it, and what the way past costs is decision 0027's
+    /// third obligation, which for this field is «nothing now, and in a year
+    /// nothing will say where this account is».
+    #[test]
+    fn a_field_the_call_is_accepted_without_says_so_and_the_one_beside_it_does_not() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 3, 1)]);
+        let action = named_by_document(&actions);
+
+        assert!(
+            !account_field(action, "/title").optional,
+            "an account cannot be created with no name at all"
+        );
+        let institution = account_field(action, "/institution");
+        assert!(
+            institution.optional,
+            "the account is created whether or not he says where it is held"
+        );
+        let question = institution
+            .prompt
+            .as_ref()
+            .expect("the field he fills in carries its question")
+            .question();
+        assert!(
+            question.consequence.contains("a year from now"),
+            "an optional question is offered with what skipping it costs: {}",
+            question.consequence
+        );
+    }
+
+    /// One answer names every item it fills, and the value for this one.
+    ///
+    /// **The unit of his decision is not the unit of the item.** The items stay
+    /// one per printed name, because completion is per name; what is added is
+    /// that each of them says which of its neighbours the same answer settles,
+    /// and what that answer would be here. The two proposals differ in exactly
+    /// the way the shape has to admit: the institution is one value for all of
+    /// them, and the title is one decision writing a different string into each
+    /// request. A shape carrying only the first would have covered two of the
+    /// fifteen exchanges and left the names asked one at a time.
+    #[test]
+    fn an_answer_he_gives_once_names_every_item_it_fills_and_the_value_for_this_one() {
+        let actions = queue_wanting(
+            &[],
+            &[
+                wanted("Shop One", 3, 1),
+                wanted("Shop Two", 5, 1),
+                wanted("Shop Three", 7, 1),
+            ],
+        );
+        let items = named_items(&actions);
+        assert_eq!(items.len(), 3);
+        let every_id: Vec<&str> = items.iter().map(|action| action.id()).collect();
+
+        for action in &items {
+            for pointer in ["/title", "/institution"] {
+                let proposal = account_field(action, pointer)
+                    .proposal
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{} offers nothing for {pointer}", action.id()));
+                assert_eq!(
+                    proposal.covers,
+                    every_id,
+                    "{} answers for a set that is not the reading's",
+                    action.id()
+                );
+                assert!(
+                    proposal.covers.iter().any(|id| id == action.id()),
+                    "a set that does not hold the item publishing it is not this item's answer"
+                );
+            }
+        }
+
+        assert_eq!(
+            account_field(items[0], "/institution")
+                .proposal
+                .as_ref()
+                .map(Proposal::value),
+            Some("Example Bank"),
+            "one institution for all of them, read from what the profile said it read"
+        );
+        let titles: Vec<&str> = items
+            .iter()
+            .map(|action| {
+                account_field(action, "/title")
+                    .proposal
+                    .as_ref()
+                    .map(Proposal::value)
+                    .expect("a title is proposed")
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Shop One", "Shop Two", "Shop Three"],
+            "one decision, and a different string in each request"
+        );
+    }
+
+    /// The proposal is a question and never a filled-in field.
+    ///
+    /// The distinction decision 0030 turned on and this decision leans on: a
+    /// preset value is the request already answered and is never read out to
+    /// him, so a value hidden there would settle the question by hiding it —
+    /// which is the defect `iaam-9i83` closed. Both proposed values are
+    /// therefore asserted absent from `preset`, and the printed string that *is*
+    /// preset is asserted to be the identifier, exactly as decision 0004 wants
+    /// it.
+    #[test]
+    fn a_proposed_value_is_read_out_to_him_and_never_preset() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 3, 1), wanted("Shop Two", 5, 1)]);
+        let request = resolution(named_by_document(&actions), OperationKey::CreateAccount);
+
+        assert!(
+            !request.preset.contains_key("institution") && !request.preset.contains_key("title"),
+            "a proposal that reached the preset would be an answer he never saw: {:?}",
+            request.preset
+        );
+        assert_eq!(
+            request.preset.get("provider_account_id"),
+            Some(&serde_json::Value::String("Shop One".to_owned())),
+            "what is preset is the identifier the source prints, which is what makes the \
+             proposed title safe to propose"
+        );
+    }
+
+    /// One printed name is one question, and no set is published for it.
+    ///
+    /// `ActionTarget::from_options` normalises a set of one resolution away for
+    /// this reason, and it holds a level down: «here is a set of one» would make
+    /// a caller take a set apart to find the fact it already had, and would put
+    /// a sentence about several accounts to the owner about one.
+    #[test]
+    fn one_printed_name_is_offered_no_set_wide_answer() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 3, 1)]);
+        let action = named_by_document(&actions);
+
+        for pointer in ["/title", "/institution"] {
+            assert!(
+                account_field(action, pointer).proposal.is_none(),
+                "a set of one is not a set: {pointer}"
+            );
+        }
+    }
+
+    /// Two institutions' names are two sets, and neither answers for the other.
+    ///
+    /// The set is the reading's institution and not the item kind, and this is
+    /// the case that decides it: an owner who conveys two institutions'
+    /// statements before working his queue would otherwise be asked one question
+    /// over both, and «they are all from that bank» would be false of half of
+    /// it. Two sentences settling four names is the right answer; one sentence
+    /// that is wrong about two of them is not.
+    #[test]
+    fn two_institutions_are_two_sets_and_neither_answers_for_the_other() {
+        let broker = |printed: &str| AccountNamedByDocument {
+            issuer: Some("Example Broker".to_owned()),
+            ..wanted(printed, 2, 1)
+        };
+        let actions = queue_wanting(
+            &[],
+            &[
+                wanted("Shop One", 3, 1),
+                broker("0001"),
+                wanted("Shop Two", 5, 1),
+                broker("0002"),
+            ],
+        );
+        let items = named_items(&actions);
+        assert_eq!(items.len(), 4);
+
+        for action in &items {
+            let proposal = account_field(action, "/institution")
+                .proposal
+                .as_ref()
+                .expect("each of the four is in a set of two");
+            assert_eq!(proposal.covers.len(), 2, "{}", action.id());
+            for id in &proposal.covers {
+                assert!(
+                    id.contains(proposal.value()),
+                    "a set may only name items read as its own institution's: {id}"
+                );
+            }
+        }
+    }
+
+    /// A name with no institution behind it joins no set rather than a neighbour's.
+    ///
+    /// **Refused whole, and this is the shape it takes here.** The ground for
+    /// both proposals is that the reading said which institution printed the
+    /// string; a name whose kept document this instance can no longer place says
+    /// nothing of the sort. Folding it into a neighbour's set would put a claim
+    /// about one bank's document to him over a name that came from nobody knows
+    /// where, and would do it inside an answer he gives in one word. So it is in
+    /// no set, it gets no proposal, and it goes on being asked on its own —
+    /// which is also why nothing is preset on it, one field over.
+    #[test]
+    fn a_name_with_no_institution_behind_it_joins_no_set_rather_than_a_neighbours() {
+        let actions = queue_wanting(
+            &[],
+            &[
+                wanted("Shop One", 3, 1),
+                AccountNamedByDocument {
+                    issuer: None,
+                    ..wanted("Shop Two", 5, 1)
+                },
+                wanted("Shop Three", 7, 1),
+            ],
+        );
+        let items = named_items(&actions);
+        assert_eq!(items.len(), 3);
+
+        let orphan = items
+            .iter()
+            .find(|action| action.reason().contains("Shop Two"))
+            .expect("the name whose reading is gone is still an item");
+        assert!(
+            account_field(orphan, "/institution").proposal.is_none()
+                && account_field(orphan, "/title").proposal.is_none(),
+            "a name with no ground takes no answer given over one"
+        );
+
+        for action in items
+            .iter()
+            .filter(|action| !action.reason().contains("Shop Two"))
+        {
+            let proposal = account_field(action, "/institution")
+                .proposal
+                .as_ref()
+                .expect("the two the reading placed are a set");
+            assert_eq!(
+                proposal.covers.len(),
+                2,
+                "the set names the items it fills and no others"
+            );
+            assert!(
+                !proposal.covers.iter().any(|id| id.ends_with("Shop Two")),
+                "the item that cannot take the answer is not named as taking it"
+            );
+        }
+    }
+
+    /// A name he has declared is not his is in no set, because it asks for neither.
+    ///
+    /// Membership is asking the field and not sharing the kind. His statement
+    /// changed what the item offers — the withdrawal of that statement, and
+    /// nothing else — so there is no title and no institution on it for one
+    /// answer to fill, and a set that counted it would be telling him he was
+    /// answering for an account he had already said was not his.
+    #[test]
+    fn a_name_he_has_declared_is_not_his_is_in_no_set() {
+        let actions = queue_wanting(
+            &[],
+            &[
+                wanted("Shop One", 3, 1),
+                AccountNamedByDocument {
+                    declined: Some("a shop I pay".to_owned()),
+                    ..wanted("Shop Two", 5, 1)
+                },
+                wanted("Shop Three", 7, 1),
+            ],
+        );
+        let items = named_items(&actions);
+        assert_eq!(items.len(), 3);
+
+        let declared = items
+            .iter()
+            .find(|action| action.category() == ActionCategory::Informational)
+            .expect("the declared name is still in the queue, as a fact");
+        assert!(
+            declared
+                .target()
+                .resolutions()
+                .iter()
+                .all(|(operation, _)| *operation == OperationKey::RecordAccountNameDisposition),
+            "the declared name offers the withdrawal and nothing else"
+        );
+
+        for action in items
+            .iter()
+            .filter(|action| action.category() != ActionCategory::Informational)
+        {
+            let proposal = account_field(action, "/title")
+                .proposal
+                .as_ref()
+                .expect("the two still being asked about are a set");
+            assert_eq!(proposal.covers.len(), 2, "{}", action.id());
+        }
+    }
+
+    /// One of each proposal, in the shape [`specimens`] takes and for its reason.
+    fn proposal_specimens() -> Vec<ProposedAnswer> {
+        vec![
+            ProposedAnswer::AccountInstitutionOfIssuer {
+                issuer: "Example Bank".to_owned(),
+            },
+            ProposedAnswer::AccountTitleAsPrinted {
+                printed: "Shop One".to_owned(),
+            },
+        ]
+    }
+
+    /// The name of one proposal, and the `match` that keeps the list honest.
+    fn proposal_name(proposed: &ProposedAnswer) -> &'static str {
+        match proposed {
+            ProposedAnswer::AccountInstitutionOfIssuer { .. } => "AccountInstitutionOfIssuer",
+            ProposedAnswer::AccountTitleAsPrinted { .. } => "AccountTitleAsPrinted",
+        }
+    }
+
+    /// A proposal is put to him as a question, in the register the others are.
+    ///
+    /// **The whole reason a proposal is not a preset.** It exists to be read
+    /// out, so it answers to the owner's own rule exactly as every other
+    /// question does — no internal words, what it is for, and what turns on the
+    /// answer — and the same check is run over it rather than a laxer one
+    /// written for it. What its consequence has to carry that the others do not
+    /// is the cost of the width itself: one answer decides for every account
+    /// named, and that is the half he would otherwise find out afterwards.
+    #[test]
+    fn a_proposal_is_a_question_and_says_what_answering_it_once_decides() {
+        let mut asks: BTreeSet<String> = BTreeSet::new();
+        for proposed in proposal_specimens() {
+            let question = proposed.question(4);
+            assert_eq!(
+                puts_a_question_to_a_person(&question),
+                Ok(()),
+                "{} does not put a question to a person: {question:?}",
+                proposal_name(&proposed)
+            );
+            assert!(
+                !question.ask.contains(proposed.pointer())
+                    && !question.consequence.contains(proposed.pointer()),
+                "{} shows the owner the pointer it fills",
+                proposal_name(&proposed)
+            );
+            assert!(
+                question.ask.contains('4') && question.consequence.contains('4'),
+                "{} does not say how many accounts one answer decides for: {question:?}",
+                proposal_name(&proposed)
+            );
+            assert!(
+                asks.insert(question.ask.clone()),
+                "{} asks in another proposal's words",
+                proposal_name(&proposed)
+            );
+        }
+        assert_eq!(asks.len(), 2, "a proposal was added and is not swept");
+    }
+
+    /// A proposal names the field it fills and the call that field belongs to.
+    ///
+    /// The sweep decision 0027 runs over questions, run over proposals, and for
+    /// the same reason: a pointer is not an identity, so an answer offered for
+    /// `/title` of one call could be offered on a resolution that calls
+    /// something else and would be a value for a field that request does not
+    /// have. The set is checked here too, because a set is only refusable whole
+    /// if it names what it reaches: a proposal that did not name the item
+    /// publishing it, or that named one item, is not an answer given over a set.
+    #[test]
+    fn every_proposal_names_the_field_it_fills_and_the_items_it_reaches() {
+        let mut seen = 0_usize;
+        for action in every_queue_item() {
+            for (operation, request) in action.target().resolutions() {
+                for missing in &request.missing {
+                    let Some(proposal) = &missing.proposal else {
+                        continue;
+                    };
+                    seen += 1;
+                    assert_eq!(
+                        proposal.proposed.pointer(),
+                        missing.pointer,
+                        "{} offers an answer for {} on {}",
+                        action.id(),
+                        proposal.proposed.pointer(),
+                        missing.pointer
+                    );
+                    assert_eq!(
+                        proposal.proposed.asked_by(),
+                        operation,
+                        "{} offers an answer to {operation:?} for a field of {:?}",
+                        action.id(),
+                        proposal.proposed.asked_by()
+                    );
+                    assert!(
+                        missing.prompt.is_some(),
+                        "{} proposes a value for a field it puts no question about",
+                        action.id()
+                    );
+                    assert!(
+                        proposal.covers.len() > 1
+                            && proposal.covers.iter().any(|id| id == action.id()),
+                        "{} publishes a set that is not a set it belongs to: {:?}",
+                        action.id(),
+                        proposal.covers
+                    );
+                }
+            }
+        }
+        assert!(
+            seen > 0,
+            "the heap the sweep runs over offers nothing over a set, so this proved nothing"
         );
     }
 

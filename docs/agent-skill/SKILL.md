@@ -68,6 +68,41 @@ Three steps, in order:
    composition, an identifier a document printed — and none of it is a question.
    Send it as it stands.
 
+   **The fields of one call may be put to him in one breath.** Each field keeps
+   its own question — that is what stops four questions being written as one
+   sentence you then have to take apart — but its own question is not its own
+   exchange. `missing` is one call's fields, in the order to ask them, and you
+   hold all of it before you say anything to him. Show them together and send one
+   request. Asking them one after another is not more careful; it is the same
+   conversation made twice as long, and on an item asking two fields per account
+   it doubles a first import.
+
+   **A field the call is accepted without says so, and you offer him a way past
+   it.** Read `optional` beside every missing field. Where it is set, the call
+   goes through with the field left out, and the question's `consequence` says
+   what leaving it out costs — put both to him, so that «I don't know» and «skip
+   it» are answers he can give. Where it is not set, the call is refused without
+   the field and there is nothing to offer: that is not a field to invent a value
+   for. Optional does not mean unimportant. The one such field today is where an
+   account is held: no figure reads it, and in a year it is the only thing that
+   will say where the account was.
+
+   **An item may carry an answer he can give once for several of them.** A
+   missing field may publish a `proposal`: a value this instance worked out, the
+   question to put to him about the whole set, and `covers` — the items that one
+   answer fills. Read the question out and treat the value as a proposal, because
+   that is what it is: nothing is recorded until he agrees, and if he does not,
+   the field's own question is what you ask him instead, item by item. If he
+   agrees, send one call per item named in `covers`, each with **its own**
+   `value`: one decision does not mean one value, and «call them what the
+   statement calls them» writes a different name into each request.
+
+   `covers` is the whole set and it is complete. An item that cannot take the
+   answer is not in it, so do not carry the answer to an item the offer does not
+   name — you would be answering for something he was never asked about. Two
+   institutions' names are two sets and two questions, and the second question is
+   worth asking: the alternative is one sentence that is wrong about half of it.
+
 A credential is not obtained through the API. It is issued at the console by
 whoever runs the instance and handed to you; no call produces one. If a call is
 refused for want of one, say so — there is no other route to try.
@@ -155,6 +190,17 @@ read, so you need not provoke the refusals a second time.
 You do not have to guess a name and you must not. Creating an account whose title
 you invented does not make the records import; it makes a second account he did
 not ask for.
+
+**But do not ask him seven times over what he can answer once.** Every one of
+those names is its own item, because an account created for one of them settles
+no other — and the items that came from one institution's documents carry, on
+each of the two fields they ask, one answer he may give for all of them: they are
+all held at the institution that printed them, and they are called what the
+statement calls them. Put those two questions first, in his words, and what is
+left is whatever he wants to say differently. Seven names asked field by field is
+around fifteen exchanges; two confirmations and the exceptions is what it should
+cost, and the reason the offer exists is that he had to say so himself, in the
+middle of the eleventh question.
 
 **And some of those names are not his accounts at all.** A statement prints the
 account each record is on, and it also prints names that belong to somebody else
@@ -291,11 +337,15 @@ does not exist. Whatever surface you are reading, the words and their effects
 travel with the question; if you find yourself hunting for them, you are reading
 something stale.
 
-Where an answer names one of the owner's own accounts, the question carries the
-accounts it may name, each with his own title for it and the institution holding
-it. Show him those and send back the identifier of the one he picks. You never
-look an account up to answer a question, and you never compose an identifier: the
-one you send was in the question you are answering.
+Where an answer names one of the owner's own accounts, the accounts it may name
+travel with the question — each with his own title for it and the institution
+holding it. Show him those and send back the identifier of the one he picks. You
+never look an account up to answer a question, and you never compose an
+identifier: the one you send came with the question you are answering. In a
+session's assessment the list is published once for the whole assessment rather
+than once per question, because it is the same list every time. What to drop
+from it for the row in front of you is below, under what a first import can
+settle.
 
 **An answer you relay settles the row and nothing beyond it.** Answering has two
 halves. Disposing of the line in front of you is import mechanics, and it is
@@ -382,11 +432,11 @@ answer, and the document itself already says so: institutions file their own row
 under their own words, and there are a dozen of those words where there are
 hundreds of counterparties.
 
-The assessment publishes them. Per word the institution filed still-unanswered
-rows under, it gives the count, the rows, and the question to put to him — in two
-parts, what he is asked and what his answer changes. Read both to him: the second
-half is where the risk is, because one answer settles every line filed that way,
-this month's and every later one.
+The assessment publishes them, in `offered_rules`. Per word the institution filed
+still-unanswered rows under, it gives the count, the rows, and the question to
+put to him — in two parts, what he is asked and what his answer changes. Read
+both to him: the second half is where the risk is, because one answer settles
+every line filed that way, this month's and every later one.
 
 What it publishes is the **condition** and never the outcome. What the lines have
 in common is a fact about his document; what they *are* is his decision, and it
@@ -397,6 +447,40 @@ a hint he may map or override, not a ruling on what his money did.
 A document whose reader transcribes no such word offers nothing here, and the
 list is simply empty. That is the truthful answer, not a failure: the reader
 names that column or it does not exist.
+
+**A word whose rows are not one thing is withheld, and it says so.** Institutions
+file more than one kind of movement under a single word, and a rule on such a
+word would settle rows that are not the same decision — quietly, and for every
+month after this one. So the assessment does not offer a rule on it. It names it
+in `withheld_offers` instead, with what the word covers and one sentence saying
+why it was held back, and offers nothing that could be sent as it stands.
+
+That is what makes the other list safe. **A word missing from `offered_rules` is
+not an oversight**, and you do not have to audit the two lists against each other
+before relaying: what is offered is offered because its rows are one decision, and
+what is withheld is named. Read the withheld ones to him as what they are — a
+word his bank uses for more than one thing — and work them through their shapes
+with an answer that reaches every like row of the session, which is the mechanism
+two sections above. That settles what is alike without claiming next month.
+
+**Each open question carries its row as values, not only as a sentence.**
+`printed` beside the question holds the account the row is on, the amount with
+the sign the source printed, the currency, the date, the direction, the
+counterparty and the word the source filed it under. Use those. **Do not recover
+them from the prose**: an agent in the field was pulling amounts and parties out
+of the wording with regular expressions, which is reading a format nobody
+guaranteed — the same act forbidden one level down, where a statement has one
+reader — and that wording is prose being rewritten, so anything that parses it is
+already stale. Show him the sentence, and take every value you act on from
+`printed`.
+
+**And the accounts an answer may name are published once for the whole
+assessment.** `interpretation.answer_accounts` is the list, with his own title for
+each and where it is held; it does not change from question to question, so
+fetching it per question is a call per question for an answer that was already in
+your hand. The one thing that does change is per question and you can derive it:
+an account is not the other side of itself, so drop the one `printed.account`
+names before showing him the rest.
 
 ## An import can be held open before it is committed
 

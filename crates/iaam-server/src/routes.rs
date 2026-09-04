@@ -112,6 +112,11 @@ use crate::dto::{
 use crate::dto::OwnerBalanceOutcomeDto;
 // Types added by wave O, in a block of their own for the same reason.
 use crate::dto::{AccountRetirementDto, AccountRetirementStateDto, RecordAccountRetirementRequest};
+// Types added by wave T, in a block of their own for the same reason.
+use crate::dto::{
+    SourceDocumentDto, SourceDocumentParams, SourceProfileCatalogueDto,
+    source_profile_catalogue_dto,
+};
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use crate::vocabulary::ProvidedByDto;
@@ -3400,6 +3405,143 @@ pub async fn add_import_rows(
     let mut rows: Vec<ImportRowDto> = held.iter().map(ImportRowDto::from_domain).collect();
     rows.extend(rejected);
     Ok(Json(rows))
+}
+
+/// Read an institution's own export into this session, through a source profile.
+///
+/// **The body is the document's bytes and the output is a session, not facts.**
+/// That is the whole difference from `POST /v1/documents`: a broker report is a
+/// table of trades that need no classification, so that route records as it
+/// reads, while a cash statement is rows whose meaning is still open — was this
+/// outflow a fee, is this counterparty an account of his elsewhere, did this
+/// positive row bring money in or give it back. Both legs of one transfer have
+/// to be able to sit here before either is recorded, and the questions such a
+/// document raises are what this channel is for rather than a cost of it.
+///
+/// The format knowledge is a **source profile** — a reviewed JSON file naming
+/// which column carries which cell and translating the source's own words into
+/// iaam's own words. It computes nothing and concludes nothing, and it could
+/// not: what the reader emits is the row as its source stated it, which has no
+/// operation kind to write a conclusion into. `GET /v1/source-profiles` is the
+/// catalogue this instance reads with.
+///
+/// Two things the reader deliberately leaves open, because no export contains
+/// them: which printed counterparty is an account of the owner's somewhere
+/// else, and whether a positive row is money somebody sent or a merchant giving
+/// it back. The first is his directory's answer, the second is a question this
+/// session asks him — and either way the answer becomes a standing rule rather
+/// than a line in a file passed on every run.
+///
+/// The document is kept before its rows reach the session, so a corrected
+/// profile has something to read again: send the bytes, or — with an empty body
+/// — name a document this instance already kept in the `document` parameter, and
+/// it is read under whatever profile now reads it. Reading the same document a
+/// second time derives the same row keys and appends nothing until the first
+/// import is retracted, which is why the remedy for a wrong profile is retract
+/// and re-read rather than import again.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/document",
+    params(
+        ("session" = Uuid, Path, description = "Import session identifier"),
+        SourceDocumentParams
+    ),
+    request_body(content = String, description = "The institution's own export, as it prints it"),
+    responses(
+        (status = 200, description = "The profile that read it and the outcome for each record; nothing was recorded", body = SourceDocumentDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such open session", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 422, description = "No profile recognises the document, two do, or the named one does not", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn read_import_document(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiQuery(params): ApiQuery<SourceDocumentParams>,
+    ApiBytes(body): ApiBytes,
+) -> Result<Json<SourceDocumentDto>, ApiFailure> {
+    // An empty body means «read the one you kept», exactly as the report
+    // channel's reparse does. Both at once is refused rather than resolved by
+    // precedence: two documents in one request name two readings, and picking
+    // either silently would import a month the caller did not send.
+    let import = match (body.is_empty(), params.document.as_deref()) {
+        (false, None) => {
+            iaam_app::scenarios::source_profile::read_into_session(
+                &state.services,
+                &principal,
+                ImportSessionId(id),
+                &body,
+                params.profile.as_deref(),
+                params.account.map(AccountId),
+            )
+            .await?
+        }
+        (true, Some(document)) => {
+            iaam_app::scenarios::source_profile::reread_into_session(
+                &state.services,
+                &principal,
+                ImportSessionId(id),
+                document,
+                params.profile.as_deref(),
+                params.account.map(AccountId),
+            )
+            .await?
+        }
+        (false, Some(_)) => {
+            return Err(ApiFailure::from(iaam_app::error::AppError::Invalid {
+                field: "document".into(),
+                expected: "either the document's bytes in the body, or the hash of one \
+                           this instance kept, and not both"
+                    .into(),
+                actual: "a body and a document hash".into(),
+            }));
+        }
+        (true, None) => {
+            return Err(ApiFailure::from(iaam_app::error::AppError::Invalid {
+                field: "document".into(),
+                expected: "the document's bytes in the body, or the hash of one this \
+                           instance kept in the `document` parameter"
+                    .into(),
+                actual: "an empty body and no document named".into(),
+            }));
+        }
+    };
+    Ok(Json(SourceDocumentDto::from_domain(&import)))
+}
+
+/// The source profiles this instance reads institutions' exports with.
+///
+/// A property of the **deployment**, not of the journal: two instances of one
+/// image must read one institution's export the same way, which is why nothing
+/// installs a profile through this API. Bundled profiles ship in the build;
+/// local ones come from a directory the operator names.
+///
+/// The refused list is not an error report to be skimmed. A profile that is
+/// merely absent looks exactly like one that was never written, so a file this
+/// instance would not load is named here with the reason — otherwise an
+/// operator's own profile fails to load and his export is simply "not
+/// recognised" a month later.
+#[utoipa::path(
+    get,
+    path = "/v1/source-profiles",
+    operation_id = "list_source_profiles",
+    responses(
+        (status = 200, description = "What this instance reads, and what it refused", body = SourceProfileCatalogueDto),
+        (status = 401, description = "Authentication required", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_source_profiles(
+    State(state): State<ServerState>,
+    Extension(_principal): Extension<Principal>,
+) -> Result<Json<SourceProfileCatalogueDto>, ApiFailure> {
+    Ok(Json(source_profile_catalogue_dto(
+        iaam_app::scenarios::source_profile::catalogue(&state.services),
+    )))
 }
 
 /// Answer one of the session's questions.

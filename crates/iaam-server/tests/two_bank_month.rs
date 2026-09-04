@@ -90,6 +90,7 @@ fn harness() -> Harness {
         market_store: Arc::new(tokio::sync::Mutex::new(
             SqliteStore::open_in_memory().expect("market store"),
         )),
+        profiles: Arc::new(iaam_app::ingest::profile::ProfileCatalogue::bundled()),
     });
     let (router, _api) = build(ServerState::new(
         services,

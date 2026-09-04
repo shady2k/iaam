@@ -110,6 +110,8 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         ))
         .routes(routes!(routes::get_import_session))
         .routes(routes!(routes::add_import_rows))
+        .routes(routes!(routes::read_import_document))
+        .routes(routes!(routes::list_source_profiles))
         .routes(routes!(routes::answer_import_question))
         .routes(routes!(routes::state_import_control_figures))
         .routes(routes!(routes::assess_import_session))

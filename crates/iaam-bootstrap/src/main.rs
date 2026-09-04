@@ -11,6 +11,7 @@ use std::sync::Arc;
 use iaam_app::AppServices;
 use iaam_app::adapters::market::HttpOutbound;
 use iaam_app::adapters::sqlite::SqliteAdapter;
+use iaam_app::ingest::profile::ProfileCatalogue;
 use iaam_app::ports::{
     BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Scope, SoleOwner, SystemClock,
     TokenAdmin,
@@ -396,6 +397,13 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         http,
         broker_dictionary,
         market_store: Arc::new(tokio::sync::Mutex::new(market_store)),
+        // Assembled once, here, because the catalogue belongs to the
+        // deployment. Bundled profiles always; the operator's directory only
+        // where he named one, and never from a default path.
+        profiles: Arc::new(match &config.source_profiles {
+            Some(directory) => ProfileCatalogue::with_local(directory),
+            None => ProfileCatalogue::bundled(),
+        }),
     });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);

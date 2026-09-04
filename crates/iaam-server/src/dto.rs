@@ -38,12 +38,16 @@ use iaam_app::scenarios::import_session::{
 // into the list above: this file is edited by several changes at once, and one
 // name added to a wrapped list reflows every line of it.
 use iaam_app::scenarios::import_session::Generalisation;
+// Wave T's own names, in a block of their own for the reason the block above
+// gives: this file is edited by several changes at once.
+use iaam_app::ingest::profile::ProfileCatalogue;
 use iaam_app::scenarios::import_session::PlannedOrigin;
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     HeldContribution, HeldRows, HeldSession, MoneyFlowOutcome, PopulationAccount, ReportConfidence,
     ReportPopulation, ReturnsOutcome,
 };
+use iaam_app::scenarios::source_profile::{DocumentImport, DocumentRow};
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection, IntervalFit};
 use iaam_core::bond::offer::OfferChoice;
@@ -742,6 +746,14 @@ impl OperationDto {
                     idempotency_key: self.idempotency_key.clone(),
                 },
             }),
+            // The caller is the reader. This route takes rows as JSON, so
+            // nothing in this product read a document to produce them, and the
+            // fact will record `ingest/manual/1`. There is deliberately no DTO
+            // field behind this: a caller able to name its own reader could
+            // claim a source profile's version for rows it typed, and the rows
+            // one profile version wrote would stop being a set that can be
+            // found and retracted.
+            reader: None,
         })
     }
 
@@ -10092,4 +10104,272 @@ fn minor_amount(minor: i64, currency: CurrencyCode) -> String {
         .to_calc_dec()
         .inner()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Source profiles: the format catalogue, and a document read through one
+// (decision 0019)
+// ---------------------------------------------------------------------------
+
+/// One source profile this instance reads documents with.
+///
+/// The digest travels beside the id and the version because a version is a name
+/// for a **content**: without it, "which rows did version 3 read" is not a
+/// question with a set for an answer, and the facts a wrong profile wrote are
+/// not a group anything could retract.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourceProfileDto {
+    /// The profile's name within this instance, and the middle segment of the
+    /// `profile/<id>/<version>` every fact it produced records as its reader.
+    pub id: String,
+    pub version: u32,
+    /// SHA-256 of the profile file, in hexadecimal.
+    pub digest: String,
+    /// The institution that prints this document.
+    pub issuer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_label: Option<String>,
+    /// `bundled` for a profile this build ships, `local` for one the operator
+    /// supplied.
+    pub origin: String,
+    /// The file it was read from, for a human reading a catalogue.
+    pub file: String,
+    /// The header cells a document must all carry for this profile to
+    /// recognise it. Published because it is what an operator compares against
+    /// his own export when a document is refused as unrecognised.
+    pub recognised_by: Vec<String>,
+}
+
+/// One file this instance refused, and why.
+///
+/// Published rather than logged, and that is the point of it: a profile that is
+/// merely absent looks exactly like one that was never written, and the
+/// operator who mounted a directory of his own is the one person who can see
+/// the difference and fix it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RefusedProfileDto {
+    /// The id the file claimed, where it got far enough to claim one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub origin: String,
+    pub file: String,
+    /// What was wrong, naming the place in the file, what was admissible there,
+    /// and what was written.
+    pub reason: String,
+}
+
+/// The format catalogue of this deployment.
+///
+/// An object rather than a bare array because the answer carries two lists and
+/// neither is a property of the other: what this instance reads, and what it
+/// refused to read. A caller that saw only the first could not tell a profile
+/// nobody wrote from one that failed to load.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourceProfileCatalogueDto {
+    pub profiles: Vec<SourceProfileDto>,
+    pub refused: Vec<RefusedProfileDto>,
+}
+
+/// Which profile read a document, on the response that says so.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReadingProfileDto {
+    pub id: String,
+    pub version: u32,
+    pub digest: String,
+    pub issuer: String,
+    pub origin: String,
+    /// The reader every fact out of this document will record:
+    /// `profile/<id>/<version>`.
+    pub parser_version: String,
+}
+
+/// One record of the document, and what became of it.
+///
+/// The field names are [`ImportRowDto`]'s, deliberately, so that a client which
+/// already reads the outcome of a fed row reads this one too. Two things are
+/// different and both are the document's own: `locator` is the record's
+/// position in the **file**, which is what an operator counts to when a refusal
+/// names a line, and `row` is absent for a record the reader could not read at
+/// all — such a record never became a row of the session, and reporting a
+/// session position for it would name something that does not exist.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourceDocumentRowDto {
+    /// The record's one-based position in the document, header row included.
+    pub locator: u64,
+    /// The row's position in the session, where the session holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<u32>,
+    /// `held`, `needs_classification`, `settled`, `rejected`, or `unreadable`
+    /// for a record the reader could not read into a row.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternatives: Option<Vec<AnswerAlternativeDto>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+}
+
+impl SourceDocumentRowDto {
+    #[must_use]
+    fn from_domain(row: &DocumentRow) -> Self {
+        let base = Self {
+            locator: row.locator(),
+            row: None,
+            state: String::new(),
+            reason: None,
+            explanation: None,
+            question_id: None,
+            prompt: None,
+            alternatives: None,
+            field: None,
+            expected: None,
+            actual: None,
+        };
+        match row {
+            DocumentRow::Unreadable { rejection, .. } => Self {
+                state: "unreadable".to_owned(),
+                field: Some(rejection.field.clone()),
+                expected: Some(rejection.expected.clone()),
+                actual: Some(rejection.actual.clone()),
+                ..base
+            },
+            DocumentRow::Held { held, .. } => {
+                let held = ImportRowDto::from_domain(held);
+                Self {
+                    row: Some(held.row),
+                    state: held.state,
+                    reason: held.reason,
+                    explanation: held.explanation,
+                    question_id: held.question_id,
+                    prompt: held.prompt,
+                    alternatives: held.alternatives,
+                    field: held.field,
+                    expected: held.expected,
+                    actual: held.actual,
+                    ..base
+                }
+            }
+        }
+    }
+}
+
+/// What one document became.
+///
+/// An object with `rows` beside it, as `POST /v1/documents` answers: the
+/// document's own identity, the profile that read it and the version that
+/// identity will be recorded under are facts about the answer as a whole, and
+/// no row can carry them.
+///
+/// **Nothing here is in the journal.** The rows are held by the session named
+/// on this response, they will be written at commit and at no other moment, and
+/// the questions among them are what a cash statement raises and a broker
+/// report does not.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SourceDocumentDto {
+    pub session: Uuid,
+    /// The identifier the kept document is on record under, so it can be read
+    /// again under a later profile version without anybody holding the file a
+    /// second time.
+    pub source: Uuid,
+    /// SHA-256 of the document, in hexadecimal. Half of every derived row key,
+    /// so the same file read twice writes nothing the second time.
+    pub document_hash: String,
+    pub profile: ReadingProfileDto,
+    pub rows: Vec<SourceDocumentRowDto>,
+}
+
+impl SourceDocumentDto {
+    #[must_use]
+    pub fn from_domain(import: &DocumentImport) -> Self {
+        Self {
+            session: import.session.inner(),
+            source: import.source.inner(),
+            document_hash: import.document_hash.clone(),
+            profile: ReadingProfileDto {
+                id: import.profile.id.clone(),
+                version: import.profile.version,
+                digest: import.profile.digest.clone(),
+                issuer: import.profile.issuer.clone(),
+                origin: import.profile.origin.clone(),
+                parser_version: format!(
+                    "profile/{id}/{version}",
+                    id = import.profile.id,
+                    version = import.profile.version
+                ),
+            },
+            rows: import
+                .rows
+                .iter()
+                .map(SourceDocumentRowDto::from_domain)
+                .collect(),
+        }
+    }
+}
+
+/// Reading a document into a session. The route body is the document's bytes.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SourceDocumentParams {
+    /// The profile to read with. Omitted, the instance asks which of its
+    /// profiles recognises the document, and refuses one that two recognise
+    /// rather than choosing between them.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The account this document is a statement of, for a profile whose
+    /// document does not print one. Omitted, the session's own declared account
+    /// stands in.
+    #[serde(default)]
+    pub account: Option<Uuid>,
+    /// The SHA-256 of a document this instance already kept, to read again
+    /// **instead of** sending the bytes. Required when the body is empty, and
+    /// refused beside a body: two documents in one request name two different
+    /// readings and only one of them could happen.
+    ///
+    /// This is how a corrected profile reaches rows already imported: retract
+    /// the import, then read the stored document again. The owner does not have
+    /// to still hold the file, and the agent never holds it at all.
+    #[serde(default)]
+    pub document: Option<String>,
+}
+
+/// The catalogue, as the transport publishes it.
+#[must_use]
+pub fn source_profile_catalogue_dto(catalogue: &ProfileCatalogue) -> SourceProfileCatalogueDto {
+    SourceProfileCatalogueDto {
+        profiles: catalogue
+            .installed()
+            .iter()
+            .map(|installed| SourceProfileDto {
+                id: installed.profile.id().to_owned(),
+                version: installed.profile.version(),
+                digest: installed.profile.digest().to_owned(),
+                issuer: installed.profile.issuer().to_owned(),
+                document_label: installed.profile.document_label().map(ToOwned::to_owned),
+                origin: installed.origin.code().to_owned(),
+                file: installed.origin.file(),
+                recognised_by: installed.profile.recognised_by().to_vec(),
+            })
+            .collect(),
+        refused: catalogue
+            .refused()
+            .iter()
+            .map(|refused| RefusedProfileDto {
+                id: refused.id.clone(),
+                origin: refused.origin.code().to_owned(),
+                file: refused.origin.file(),
+                reason: refused.reason.clone(),
+            })
+            .collect(),
+    }
 }

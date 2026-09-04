@@ -16,6 +16,7 @@ pub mod dedup;
 pub mod journal_event;
 pub mod observation;
 pub mod operation;
+pub mod profile;
 pub mod report;
 pub mod verdict;
 
@@ -24,4 +25,5 @@ pub use journal_event::{
 };
 pub use observation::{ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity};
 pub use operation::{Normalized, OperationDates, OperationKind, SubmittedOperation, normalize};
+pub use profile::{ProfileCatalogue, SourceProfile};
 pub use verdict::{Rejection, Verdict};

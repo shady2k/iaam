@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "id": "tbank-operations-csv",
+  "version": 1,
+  "issuer": "T-Bank",
+  "document_label": "Operations export",
+  "document": {
+    "format": "csv",
+    "encoding": "utf-8-bom",
+    "delimiter": "semicolon",
+    "header_row": 1
+  },
+  "recognise": {
+    "header_cells": [
+      "Имя счёта",
+      "Номер карты",
+      "Дата операции",
+      "Сумма в валюте счёта",
+      "Валюта счёта",
+      "Категория по-умолчанию",
+      "Описание"
+    ]
+  },
+  "row": {
+    "account": {
+      "from": "column",
+      "column": "Имя счёта"
+    },
+    "dates": {
+      "trade": {
+        "column": "Дата операции",
+        "format": "day_month_year_dot"
+      }
+    },
+    "time": {
+      "from": "date_cell",
+      "date_field": "trade",
+      "format": "hour_minute_second"
+    },
+    "amount": {
+      "decimal": {
+        "decimal_separator": "comma",
+        "group_separator": "space",
+        "negative": "leading_minus"
+      },
+      "carried_by": {
+        "from": "signed_column",
+        "column": "Сумма в валюте счёта"
+      }
+    },
+    "currency": {
+      "from": "column",
+      "column": "Валюта счёта"
+    },
+    "direction": {
+      "from": "amount_sign"
+    },
+    "counterparty": {
+      "column": "Описание"
+    },
+    "description": {
+      "column": "Описание"
+    },
+    "source_category": {
+      "column": "Категория по-умолчанию"
+    }
+  }
+}

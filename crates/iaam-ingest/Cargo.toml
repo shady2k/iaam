@@ -11,6 +11,11 @@ iaam-core = { path = "../iaam-core", version = "0.1.0" }
 # формата: второй читатель означал бы второй способ прочитать число.
 calamine = "0.36"
 csv = "1"
+# Windows-1251 is one of the encodings a source profile may name, and a bank
+# export written in it is not text until something decodes it. One library,
+# already in this workspace's lock file, rather than a table of our own: a
+# hand-written codepage is a second way to read a byte.
+encoding_rs = "0.8"
 rust_decimal = { version = "1", default-features = false, features = ["std", "serde"] }
 serde = { version = "1", features = ["derive"] }
 # Каноническая форма отпечатка дедупликации (§10.6): JSON выделенной

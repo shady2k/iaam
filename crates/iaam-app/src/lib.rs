@@ -70,6 +70,16 @@ pub struct AppServices {
     /// Dedicated market connection; blocking operations are not performed
     /// directly in the async handler.
     pub market_store: Arc<tokio::sync::Mutex<MarketStore>>,
+    /// The source profiles this deployment reads institutions' exports with.
+    ///
+    /// Not a port and not a store: a profile catalogue is a property of the
+    /// **deployment**, not of the journal (decision 0019 §8). Two instances of
+    /// one image must read one institution's export the same way, and a
+    /// per-journal catalogue would make an export's reading depend on who
+    /// uploaded what and when. So it is assembled once by the composition root,
+    /// from what this build ships plus whatever directory the operator pointed
+    /// at, and it is read-only from here on.
+    pub profiles: Arc<iaam_ingest::profile::ProfileCatalogue>,
 }
 
 impl AppServices {
@@ -102,6 +112,11 @@ impl AppServices {
                 MarketStore::open_in_memory()
                     .expect("in-memory market store must be constructible"),
             )),
+            // What this build ships, and nothing of the operator's. A local
+            // directory has no default and cannot have one: a profile decides
+            // how every future row of a format is read, and one picked up from
+            // a known place would be one nobody chose.
+            profiles: Arc::new(iaam_ingest::profile::ProfileCatalogue::bundled()),
         }
     }
 }

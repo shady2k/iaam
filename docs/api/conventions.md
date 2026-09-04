@@ -188,6 +188,8 @@ things. Read it as the lookup table for §1.
 | `POST /v1/reconciliation/balance` | `OwnerBalanceOutcomeDto` | object, `statuses` | `control_assertions` — whether each claim reached the journal or was already held there, which no status row can say |
 | `POST /v1/import-sessions/{session}/rows` | `[ImportRowDto]` | bare array | one outcome per fed row; nothing was recorded |
 | `POST /v1/documents` | `DocumentDto` | object, `rows` | the document hash, source, parser version and period |
+| `POST /v1/import-sessions/{session}/document` | `SourceDocumentDto` | object, `rows` | the document hash, the source it is kept under, and which source profile read it — none of which a row can carry |
+| `GET /v1/source-profiles` | `SourceProfileCatalogueDto` | object, `profiles` | `refused` — the files this instance would not read and why, which no installed profile can say; a profile that merely failed to load is otherwise indistinguishable from one nobody wrote |
 | `POST /v1/brokers/{broker}/sync` | `SyncOutcomeDto` | object, `recorded` | the duplicate and assertion counts for the run, and `actions` |
 | `POST /v1/import-sessions/{session}/commit` | `ImportCommitDto` | object, `rows` | the session and the revision the commit was planned from |
 | `POST /v1/classification-rules` | `ClassificationRuleChangeDto` | object, `plan.corrections` | `applied: false` — that the plan was not carried out |

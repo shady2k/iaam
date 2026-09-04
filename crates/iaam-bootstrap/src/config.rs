@@ -30,6 +30,20 @@ pub struct Config {
     /// It has no default and cannot have one — a key “in a known place”
     /// would be known to everyone.
     pub broker_key: Option<PathBuf>,
+    /// A directory of source profiles the operator supplies himself.
+    ///
+    /// Optional, and with no default for the reason the key above has none: a
+    /// profile decides how every future row of one institution's format is
+    /// read, so one picked up from a known place would be one nobody chose.
+    /// Absent, the instance reads documents with the profiles this build ships
+    /// and no others — which is a complete catalogue, not a degraded one.
+    ///
+    /// The directory is read once, at start-up, and only `.json` files in it
+    /// are considered. A file that is not a valid profile, and a local profile
+    /// whose id collides with a bundled one, are **refused and published as
+    /// refused** rather than skipped: a profile that is merely absent looks
+    /// exactly like one that was never written.
+    pub source_profiles: Option<PathBuf>,
     pub listen: SocketAddr,
     pub rate_limit: u32,
     pub rate_window: Duration,
@@ -65,6 +79,7 @@ impl Config {
         Ok(Self {
             database: PathBuf::from(database),
             broker_key: get("IAAM_BROKER_KEY_FILE").map(PathBuf::from),
+            source_profiles: get("IAAM_SOURCE_PROFILES").map(PathBuf::from),
             listen,
             rate_limit,
             rate_window,

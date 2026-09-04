@@ -419,6 +419,7 @@ fn harness_with_factory_and_provisioning(
         http: Arc::new(UnavailableOutboundHttp),
         broker_dictionary,
         market_store: market_store.clone(),
+        profiles: Arc::new(iaam_app::ingest::profile::ProfileCatalogue::bundled()),
     });
     let state = ServerState::new(
         services,
@@ -23280,5 +23281,294 @@ async fn a_projection_folded_over_held_rows_is_never_saved() {
         1,
         "the ordinary read still saves one: the guard is the held rows, not \
          the date"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The source-profile channel (decision 0019)
+// ---------------------------------------------------------------------------
+
+/// The instance publishes what it reads exports with, and what it refused.
+///
+/// The refused list is the half that matters operationally: a profile that
+/// merely failed to load looks exactly like one nobody wrote, and the symptom a
+/// month later is an export answered "no profile recognises this document".
+#[tokio::test]
+async fn the_instance_publishes_the_source_profiles_it_reads_with() {
+    let harness = harness();
+    let (status, catalogue) = call(
+        &harness.router,
+        get("/v1/source-profiles", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{catalogue}");
+    let profiles = catalogue["profiles"].as_array().expect("profiles");
+    let tbank = profiles
+        .iter()
+        .find(|profile| profile["id"] == "tbank-operations-csv")
+        .unwrap_or_else(|| panic!("the bundled T-Bank profile is published: {catalogue}"));
+    assert_eq!(tbank["origin"], "bundled");
+    assert_eq!(tbank["issuer"], "T-Bank");
+    // A version is a name for a content, so the digest travels with it.
+    assert_eq!(
+        tbank["digest"].as_str().map(str::len),
+        Some(64),
+        "{catalogue}"
+    );
+    assert!(
+        !tbank["recognised_by"]
+            .as_array()
+            .expect("the header cells this profile matches on")
+            .is_empty()
+    );
+    assert_eq!(
+        catalogue["refused"].as_array().map(Vec::len),
+        Some(0),
+        "nothing this build ships fails to load: {catalogue}"
+    );
+}
+
+/// A bank's own export is read into a session through the profile that
+/// recognises it, and every line of it comes back named.
+///
+/// The fixture is the converter's own. Two of its accounts are declared here
+/// and a third is not, which is the arrangement every real import has: the rows
+/// on the owner's accounts are **held** by the session with their questions
+/// beside them, and the rows on an account he has not declared are **refused by
+/// name** — locator, field, expected, actual — rather than counted as "outside
+/// the contour" and dropped, which is a month of one account missing from a
+/// journal that looks complete.
+///
+/// The session is opened without a declaration on purpose: an institution's
+/// export spans its accounts, and a declared session takes rows for one account
+/// and no other.
+#[tokio::test]
+async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
+    let harness = harness();
+    for title in ["Main", "Savings"] {
+        let (status, account) = call(
+            &harness.router,
+            post(
+                "/v1/accounts",
+                &harness.owner_token,
+                &json!({ "title": title }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+    }
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let request = Request::builder()
+        .uri(format!("/v1/import-sessions/{id}/document"))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from(
+            include_bytes!("../../../tools/tbank-csv-import/fixtures/synthetic-export.csv")
+                .as_slice(),
+        ))
+        .expect("request");
+    let (status, read) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+
+    // The profile is named on the answer, with the reader every fact out of
+    // this document would record.
+    assert_eq!(read["profile"]["id"], "tbank-operations-csv");
+    assert_eq!(read["profile"]["version"], 1);
+    assert_eq!(read["profile"]["issuer"], "T-Bank");
+    assert_eq!(read["profile"]["origin"], "bundled");
+    assert_eq!(
+        read["profile"]["parser_version"],
+        "profile/tbank-operations-csv/1"
+    );
+    assert_eq!(read["profile"]["digest"].as_str().map(str::len), Some(64));
+    assert_eq!(read["session"], id);
+    // The bytes are kept, so a corrected profile has something to read again.
+    assert_eq!(read["document_hash"].as_str().map(str::len), Some(64));
+    assert!(read["source"].is_string(), "{read}");
+
+    let rows = read["rows"].as_array().expect("one outcome per line");
+    assert_eq!(rows.len(), 13, "{read}");
+    // Line 1 is the header, so the data begins at line 2 and the locators are
+    // the lines an operator counts to in his own file.
+    let locators: Vec<u64> = rows
+        .iter()
+        .map(|row| row["locator"].as_u64().expect("a locator"))
+        .collect();
+    assert_eq!(locators, (2..=14).collect::<Vec<u64>>());
+
+    let unreadable: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["state"] == "unreadable")
+        .collect();
+    assert_eq!(unreadable.len(), 2, "{read}");
+    for row in &unreadable {
+        assert_eq!(row["field"], "account", "{row}");
+        assert!(
+            row["actual"]
+                .as_str()
+                .is_some_and(|actual| actual.contains("Имя счёта")),
+            "the refusal names the cell the operator has to look at: {row}"
+        );
+        assert!(
+            row["row"].is_null(),
+            "a record that never became a row of the session has no position in it: {row}"
+        );
+    }
+
+    let held: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["state"] != "unreadable")
+        .collect();
+    assert_eq!(held.len(), 11, "{read}");
+    let mut positions: Vec<u64> = held
+        .iter()
+        .map(|row| row["row"].as_u64().expect("a position in the session"))
+        .collect();
+    positions.sort_unstable();
+    assert_eq!(positions, (1..=11).collect::<Vec<u64>>());
+
+    // Nothing is in the journal: the rows are held, and the questions a cash
+    // statement raises are what this channel exists to raise.
+    let questioned: Vec<&Value> = held
+        .iter()
+        .copied()
+        .filter(|row| row["state"] == "needs_classification")
+        .collect();
+    assert!(!questioned.is_empty(), "{read}");
+    for row in &questioned {
+        assert!(row["question_id"].is_string(), "{row}");
+        assert!(
+            row["prompt"]
+                .as_str()
+                .is_some_and(|prompt| !prompt.is_empty()),
+            "{row}"
+        );
+        assert!(
+            row["alternatives"]
+                .as_array()
+                .is_some_and(|alternatives| !alternatives.is_empty()),
+            "{row}"
+        );
+    }
+
+    // The document was kept under the profile that read it, so the remedy for a
+    // corrected profile is to read the stored document again rather than to
+    // still hold the file — and the agent driving the import never holds it at
+    // all. Into a fresh session, because that is the shape of the remedy:
+    // retract the import, then read the same bytes under the new version.
+    let hash = read["document_hash"].as_str().expect("a hash").to_owned();
+    let (status, second) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    let second = second["session"].as_str().expect("session").to_owned();
+    let (status, again) = call(
+        &harness.router,
+        Request::builder()
+            .uri(format!(
+                "/v1/import-sessions/{second}/document?document={hash}"
+            ))
+            .method("POST")
+            .header("Authorization", format!("Bearer {}", harness.owner_token))
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["document_hash"], hash, "{again}");
+    assert_eq!(again["session"], second, "{again}");
+    assert_eq!(again["rows"].as_array().map(Vec::len), Some(13), "{again}");
+    // The row keys are over the document and the line, so a re-read derives the
+    // same ones: the second import appends nothing until the first is
+    // retracted, which is what keeps a corrected profile from doubling a month.
+    assert_eq!(
+        again["profile"]["parser_version"],
+        "profile/tbank-operations-csv/1"
+    );
+}
+
+/// A document sent two ways at once is refused, and so is one sent no way at
+/// all.
+///
+/// Picking either silently would import a month the caller did not send.
+#[tokio::test]
+async fn a_document_named_twice_or_not_at_all_is_refused() {
+    let harness = harness();
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let both = Request::builder()
+        .uri(format!("/v1/import-sessions/{id}/document?document=abc"))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from("Posted;Sum\n"))
+        .expect("request");
+    let (status, refusal) = call(&harness.router, both).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    assert_eq!(refusal["field"], "document");
+    assert_eq!(refusal["actual"], "a body and a document hash");
+
+    let neither = Request::builder()
+        .uri(format!("/v1/import-sessions/{id}/document"))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .body(Body::empty())
+        .expect("request");
+    let (status, refusal) = call(&harness.router, neither).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    assert_eq!(refusal["field"], "document");
+    assert_eq!(refusal["actual"], "an empty body and no document named");
+}
+
+/// A document no profile recognises is refused, and the refusal says what this
+/// instance does read.
+#[tokio::test]
+async fn a_document_no_profile_recognises_is_refused_by_name() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "unknown" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let request = Request::builder()
+        .uri(format!("/v1/import-sessions/{id}/document"))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from("date;type;amount\n2026-01-01;deposit;1.00\n"))
+        .expect("request");
+    let (status, refusal) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    assert_eq!(refusal["field"], "document");
+    assert!(
+        refusal["expected"]
+            .as_str()
+            .is_some_and(|expected| expected.contains("tbank-operations-csv")),
+        "the refusal lists what this instance reads: {refusal}"
     );
 }

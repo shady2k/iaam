@@ -287,7 +287,7 @@ pub async fn submit_intake(
                 pending.push(None);
                 no_fact.push(None);
             }
-            Intake::Observed { row } => match resolver.assess(row) {
+            Intake::Observed { row, .. } => match resolver.assess(row) {
                 Assessment::Settled {
                     classification,
                     movement,
@@ -329,21 +329,23 @@ pub async fn submit_intake(
 
     let candidates: Vec<Result<iaam_core::event::Event, Rejection>> = settled
         .iter()
-        .flatten()
-        .map(|operation| {
+        .zip(rows)
+        .filter_map(|(settled, intake)| settled.as_ref().map(|operation| (operation, intake)))
+        .map(|(operation, intake)| {
             operation.clone().and_then(|operation| {
                 normalize(
                     &operation,
                     &NormalizationContext {
                         owner: principal.owner,
                         source,
-                        // The caller stated these rows itself: nothing in this
-                        // product read a document to produce them, whether the
-                        // caller concluded what they were or left that to the
-                        // resolver. A reader that does read one supplies its
-                        // own version here, and the field has no default so it
-                        // cannot be forgotten (`iaam-h69n`).
-                        parser_version: ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
+                        // What read the row, and not what submitted it. A
+                        // caller that stated the row itself is its reader and
+                        // records `ingest/manual/1`; a reader inside this
+                        // product — today, the source-profile engine — names
+                        // itself on the intake, and the fact records that
+                        // instead. The field has no default, so a reader that
+                        // forgets does not compile (`iaam-h69n`).
+                        parser_version: reader_of(intake),
                     },
                 )
                 .map(|normalized| {
@@ -432,7 +434,7 @@ async fn park(
     // conclusion is recorded, not questioned — so this is unreachable, and an
     // invariant refused in one line is one a later caller cannot break by
     // handing the wrong half of the pair along.
-    let Intake::Observed { row } = intake else {
+    let Intake::Observed { row, .. } = intake else {
         return Err(AppError::Store(
             "a concluded row reached the question path".to_owned(),
         ));
@@ -921,7 +923,7 @@ pub async fn add_rows(
                 })?,
             )
             .await?;
-        let Intake::Observed { row } = intake else {
+        let Intake::Observed { row, .. } = intake else {
             outcomes.push(HeldRow::Held {
                 row: observation.row,
             });
@@ -2451,6 +2453,17 @@ pub async fn plan_session(
         // commit declines is named in the coverage gap by what it would have
         // moved (iaam-bufs), and a candidate that failed to normalise no longer
         // says.
+        // What read this row, as its provenance will record it. Read off the
+        // intake rather than assumed, exactly as on the intake path above: a
+        // row the source-profile engine produced records
+        // `profile/<id>/<version>`, so the rows one profile version wrote are a
+        // query rather than an archaeology (decision 0019 §5). A row whose
+        // payload this build cannot parse at all has no reader to name and
+        // falls to the submitted version, which is what it would have carried.
+        let reader = intake.as_ref().map_or_else(
+            || ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
+            reader_of,
+        );
         let candidate = operation.clone().and_then(|operation| {
             let origin = session_origin(principal.owner, &contents.session, operation.account);
             normalize(
@@ -2458,9 +2471,7 @@ pub async fn plan_session(
                 &NormalizationContext {
                     owner: principal.owner,
                     source: origin.source,
-                    // As on the intake path above: the rows a session holds
-                    // are the rows a caller submitted to it.
-                    parser_version: ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
+                    parser_version: reader.clone(),
                 },
             )
             .map(|normalized| {
@@ -2896,7 +2907,7 @@ impl ReadRow {
     /// event it would become.
     fn stated_day(&self) -> Option<time::Date> {
         match self.intake.as_ref()? {
-            Intake::Observed { row } => row.dates.effective_date(),
+            Intake::Observed { row, .. } => row.dates.effective_date(),
             Intake::Concluded { operation } => operation.dates.effective_date(),
         }
     }
@@ -2904,7 +2915,7 @@ impl ReadRow {
     /// The document the row names, when it names one.
     fn document(&self) -> Option<&str> {
         match self.intake.as_ref()? {
-            Intake::Observed { row } => row.identity.document.as_deref(),
+            Intake::Observed { row, .. } => row.identity.document.as_deref(),
             Intake::Concluded { .. } => None,
         }
     }
@@ -2966,7 +2977,7 @@ fn account_resolution(resolver: &Resolver, rows: &[ReadRow]) -> AccountResolutio
                 bucket.push(account);
             }
         }
-        if let Some(Intake::Observed { row }) = read.intake.as_ref()
+        if let Some(Intake::Observed { row, .. }) = read.intake.as_ref()
             && let Some(name) = row.counterparty_name()
             && resolver.counterparty_matches(name, row.dates.effective_date()) > 1
             && !conflicting.iter().any(|seen| seen == name)
@@ -3284,6 +3295,22 @@ const CONTROL_PARSER_VERSION: &str = "import-control/1";
 /// it supplies its own version there and this constant stays what it says: the
 /// version for a row nothing here read.
 const SUBMITTED_PARSER_VERSION: &str = iaam_ingest::operation::PARSER_VERSION;
+
+/// What read one row, as its provenance will record it.
+///
+/// [`SUBMITTED_PARSER_VERSION`] unless the intake names a reader inside this
+/// product, which only a reader here can do: the DTO conversion never fills
+/// that field, so a caller cannot claim a source profile's version for rows it
+/// typed by hand. Written once rather than at each of the two `normalize`
+/// sites, because those two are the assessment and the commit and they must
+/// plan the same provenance — a difference between them would be invisible in
+/// the response and permanent in the journal.
+fn reader_of(intake: &Intake) -> ParserVersion {
+    intake
+        .reader()
+        .cloned()
+        .unwrap_or_else(|| ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()))
+}
 
 /// Version of the key one transcribed control assertion is written under.
 ///
@@ -4439,7 +4466,7 @@ fn observed_row(observations: &[ImportObservationView], row: u32) -> Result<Obse
             id: row.to_string(),
         })?;
     match parse_intake(&observation.payload)? {
-        Intake::Observed { row } => Ok(*row),
+        Intake::Observed { row, .. } => Ok(*row),
         Intake::Concluded { .. } => Err(AppError::Invalid {
             field: "question".to_owned(),
             expected: "a question about a row whose source stated no conclusion".to_owned(),
@@ -4469,7 +4496,7 @@ fn resolution_of(
         // write or a rejection to report. Nothing here second-guesses it into
         // producing nothing.
         Intake::Concluded { operation } => return Ok(RowResolution::Fact(operation)),
-        Intake::Observed { row } => *row,
+        Intake::Observed { row, .. } => *row,
     };
     if let Some(answer) = &observation.answer {
         let answer: Answer = serde_json::from_str(answer).map_err(|error| Rejection {
@@ -5355,6 +5382,7 @@ mod tests {
         let session = ImportSessionId::new_random();
         let intake = Intake::Observed {
             row: Box::new(observed),
+            reader: None,
         };
         let answered = answer.map(|answer| serde_json::to_string(&answer).expect("an answer"));
         SessionContents {

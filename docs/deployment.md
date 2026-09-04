@@ -63,6 +63,7 @@ Three rules follow, and they hold for every step below.
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
 | `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
 | `IAAM_RATE_WINDOW_SECONDS` | optional | `60` | `serve` |
+| `IAAM_SOURCE_PROFILES` | path to a read-only directory | none | `serve` |
 | `RUST_LOG` | optional | `info` | `serve` |
 
 `IAAM_BROKER_KEY_FILE` is optional for `serve` only in the sense that a service
@@ -73,6 +74,27 @@ decrypts — answer `{"code":"not_configured", …}` on a server started without
 and the fix is a restart with the key, not a different call.
 `GET /v1/broker-access` is not one of them: it lists metadata, decrypts nothing,
 and answers `200` with or without the key (§6.2).
+
+`IAAM_SOURCE_PROFILES` names a directory of **source profiles** — reviewed JSON
+files describing one institution's export, which the server reads a document
+through (`POST /v1/import-sessions/{session}/document`). It has no default and
+cannot have one: a profile decides how every future row of that format is read,
+and one picked up from a known place would be one nobody chose. Unset, the
+server reads with the profiles the image ships, which is a complete catalogue
+and not a degraded one.
+
+The directory is read **once, at start-up**, and only its `.json` files are
+considered; mount it read-only. Nothing is loaded into the server as code — a
+profile is data, it names columns and translates the source's own words, and it
+computes nothing. A file that is not a valid profile does not stop the server
+and does not take the other formats down with it: it is **published as refused**
+by `GET /v1/source-profiles`, with the place in the file and what was wrong. Read
+that list after changing the directory. A profile that merely failed to load
+looks exactly like one nobody wrote, and the symptom a month later is an export
+answered "no profile recognises this document".
+
+A local profile whose `id` matches one the image ships does **not** shadow it: it
+is refused, and published as refused, for the same reason.
 
 ### 2.2 Secrets
 

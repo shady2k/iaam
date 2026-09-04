@@ -12,6 +12,7 @@ pub mod market_reference;
 pub mod reports;
 pub mod retirement;
 pub mod schedule;
+pub mod source_profile;
 pub mod transfer_pairing;
 
 pub mod broker_dictionary;

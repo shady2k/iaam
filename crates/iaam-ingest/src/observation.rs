@@ -20,6 +20,7 @@
 //! by the owner answering.
 
 use iaam_core::event::kind::IncomeKind;
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::AccountId;
 use iaam_core::money::CurrencyCode;
 use serde::{Deserialize, Serialize};
@@ -526,7 +527,30 @@ pub enum Intake {
     /// The caller decided what the row is.
     Concluded { operation: Box<SubmittedOperation> },
     /// The caller reported what the source said and decided nothing.
-    Observed { row: Box<ObservedRow> },
+    Observed {
+        row: Box<ObservedRow>,
+        /// What read the row, where something inside this product did.
+        ///
+        /// `None` is the ordinary case and it is not a missing value: it means
+        /// the row arrived as JSON and nothing here read a document to produce
+        /// it, so the version the fact records is
+        /// [`crate::operation::PARSER_VERSION`] — the caller was the reader.
+        /// `Some` is a reader in this product saying so: the source-profile
+        /// engine writes `profile/<id>/<version>` here, and that is how a fact
+        /// comes to record what actually read it rather than the one value
+        /// `normalize` used to stamp on every channel alike (`iaam-h69n`).
+        ///
+        /// It is **not** a field of the published request shape, and the DTO
+        /// conversion never fills it. A caller that could name its own reader
+        /// could claim a profile's version for rows it typed by hand, and the
+        /// set of rows a buggy profile wrote would stop being a set.
+        ///
+        /// `#[serde(default)]` because a row stored by an earlier build carries
+        /// no such field, and what such a row carries is `None` — which is what
+        /// it meant.
+        #[serde(default)]
+        reader: Option<ParserVersion>,
+    },
 }
 
 impl Intake {
@@ -538,7 +562,21 @@ impl Intake {
                 .idempotency_key
                 .as_ref()
                 .map(|key| format!("idempotency/{key}")),
-            Self::Observed { row } => row.identity.key(),
+            Self::Observed { row, .. } => row.identity.key(),
+        }
+    }
+
+    /// What read this row, where something inside this product did.
+    ///
+    /// Asked once here rather than by each caller matching on the tag, which is
+    /// how the two arms come to be read differently. A conclusion answers
+    /// `None` and always will: a caller that concluded what a row was is the
+    /// reader of it, whatever produced the bytes it read.
+    #[must_use]
+    pub const fn reader(&self) -> Option<&ParserVersion> {
+        match self {
+            Self::Concluded { .. } => None,
+            Self::Observed { reader, .. } => reader.as_ref(),
         }
     }
 
@@ -565,7 +603,7 @@ impl Intake {
     pub const fn account(&self) -> AccountId {
         match self {
             Self::Concluded { operation } => operation.account,
-            Self::Observed { row } => row.account,
+            Self::Observed { row, .. } => row.account,
         }
     }
 }

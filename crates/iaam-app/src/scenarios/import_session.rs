@@ -1499,6 +1499,22 @@ pub enum AnswerReach {
     EveryLikeRowInThisSession,
 }
 
+impl AnswerReach {
+    /// The wire word for this reach.
+    ///
+    /// One place, so that what a group publishes as the reach that settles it
+    /// and what the answering call parses cannot come to be spelt differently.
+    /// Before `iaam-cixz` the two words existed only inside the transport's
+    /// parser, where nothing else could name them.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ThisRow => "this_row",
+            Self::EveryLikeRowInThisSession => "every_like_row_in_this_session",
+        }
+    }
+}
+
 /// What one call to [`answer_question`] settled.
 ///
 /// Two lists rather than one, and the split is the caller's own act: `asked` is
@@ -2347,6 +2363,30 @@ pub struct Interpretation {
     /// when the owner holds no accounts at all — both true statements about his
     /// directory rather than a lookup nobody made.
     pub answer_accounts: Vec<AccountCandidate>,
+    /// The sets these open rows form, each with what its members have in common
+    /// and the one answer that settles the whole of it.
+    ///
+    /// **This is `iaam-cixz`.** [`OpenQuestion::alike`] and
+    /// [`OpenQuestion::pair`] publish the relation from each row to the others;
+    /// nothing published the set. A caller asked what a set of rows actually was
+    /// therefore listed every member or invented a summary, and the one that
+    /// happened was neither — it read the owner's raw statement file. See
+    /// [`RowGroup`].
+    ///
+    /// **Once for the assessment, not once per question**, on
+    /// [`Self::answer_accounts`]' grounds: this response holds every open
+    /// question of the session, a group of twenty rows hung on each of its
+    /// members would be published twenty times, and the field that relates a
+    /// question to its group is already on the question. A caller going the
+    /// other way compares the row against [`RowGroup::rows`], which is one
+    /// comparison against a list published beside it.
+    ///
+    /// Largest first, then by the first row, so the group worth putting to him
+    /// first is first and the list does not reorder itself between two readings
+    /// of one session. Empty means every open question of this session stands
+    /// alone, which is a true statement about the document and not a fold nobody
+    /// made.
+    pub groups: Vec<RowGroup>,
 }
 
 /// One question the session is still waiting on.
@@ -2729,6 +2769,291 @@ pub struct RowShape {
     pub counterparty_named: bool,
     /// The rows of this shape, in order.
     pub rows: Vec<u32>,
+}
+
+/// A set of this session's open rows put to a person as **one** thing.
+///
+/// **This is `iaam-cixz`, and it is the wall wave Y left standing.** Every
+/// grouping this module publishes names its members and none of them publishes
+/// the group: [`OpenQuestion::alike`] names the other rows raising one decision,
+/// [`OfferedRule::covers`] names the rows one word covers, [`OpenQuestion::pair`]
+/// names the other leg. So a caller asked what a set of rows actually **was**
+/// had two moves and both are failures. It could read every member out to the
+/// owner — the wall those fields were added to end — or it could invent a
+/// summary of them, which is interpreting a document with this engine's own
+/// output as the document (`docs/import-boundary.md`). The owner watched a
+/// caller do neither and go to his raw statement file instead, which is this
+/// project's own boundary crossed for want of a view.
+///
+/// **His statement of what he wanted is the measure.** He does not need every
+/// record: show one of the group and ask what it was, because most of them share
+/// every attribute except the day, the time and the amount. So a group publishes
+/// what its members agree on, how many there are, how far the ones that differ
+/// run — and, because a group nobody can answer as one is the same wall in
+/// better clothes, the one sentence to put to him and the reach one answer must
+/// state to settle the whole of it.
+///
+/// **The count is [`Self::rows`]'s length and is not a field of its own.** A
+/// count beside the list of the things counted is one fact in two places, which
+/// this module refuses everywhere else, and the list is what a caller needs
+/// anyway: it is how it finds the members among
+/// [`Interpretation::open_questions`].
+///
+/// **No representative row, and it was the obvious carrier.** A real member is
+/// recognisable — the owner is matching it against a line in front of him — but
+/// it is also a particular: its day and its amount are true of it and of nothing
+/// else in the group, and a caller that shows it *as* the group shows him one
+/// line and takes an answer about twenty. Two things make the field unnecessary
+/// as well as unsafe. Every member is published in full beside this, keyed by
+/// row, so a caller that wants a line takes one out of [`Self::rows`]; and
+/// [`Self::question`] is written here out of the shared attributes, so the
+/// sentence put to him describes the group instead of standing in for it. A
+/// `representative` field would be `rows[0]` under a second name with a licence
+/// attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowGroup {
+    /// What makes these rows one group.
+    pub basis: GroupBasis,
+    /// The members, in row order. Never fewer than two.
+    ///
+    /// **Never a set of one**, which decision 0033 §2 settled one surface over
+    /// and which holds here for its reason: one row is one question already, a
+    /// group of one would make a caller take a group apart to find what it had,
+    /// and it would put a sentence about several lines to the owner about one.
+    pub rows: Vec<u32>,
+    /// What every member states alike.
+    pub common: SharedRow,
+    /// The days the members run between, over the members that state one.
+    ///
+    /// `None` where no member states a day. A member that states none is still
+    /// in [`Self::rows`] and outside this span: a date invented for it would be
+    /// the first invented value in a section whose whole point is that nothing
+    /// in it is invented, and that row's own [`PrintedRow::date`] says so.
+    pub days: Option<DaySpan>,
+    /// The smallest and largest amount among the members, with the signs the
+    /// source printed.
+    ///
+    /// Published only where [`SharedRow::currency`] is, and that is an invariant
+    /// rather than an accident: a range taken over two currencies is a pair of
+    /// numbers with no unit, and «from twelve to four hundred» read across two of
+    /// them tells a person something false.
+    pub amounts: Option<AmountSpan>,
+    /// The reach one answer must state to settle the whole group.
+    ///
+    /// **The half of this bead that is not about publishing.** `iaam-q5og` gave
+    /// the answering call a stated reach and made a wider answer refuse whole;
+    /// what was missing is that nothing said which reach settles which group, so
+    /// a caller reading a group still had to work out whether one call could
+    /// answer it.
+    ///
+    /// [`AnswerReach::EveryLikeRowInThisSession`] for
+    /// [`GroupBasis::OneDecision`], whose members are exactly one
+    /// `QuestionSubject` — which is what that reach is defined over, so the
+    /// group and the reach cannot disagree about who is in it.
+    /// [`AnswerReach::ThisRow`] for [`GroupBasis::OneMovement`], and that is not
+    /// the weaker answer: the two legs are one movement, so an answer naming the
+    /// other row's account settles both from either side (decision 0031), and a
+    /// wider reach would be claiming something about rows that are not this
+    /// movement.
+    pub settles: AnswerReach,
+    /// The one sentence to put to a person about the whole group, and what
+    /// answering it once decides.
+    ///
+    /// **Written here and not by the caller**, which is decision 0027's finding:
+    /// a surface that publishes typed fields and leaves the sentence to whoever
+    /// relays them gets a sentence composed out of field names. The members'
+    /// own sentences are on the members, one per row, and not one of them is
+    /// about the group — which is exactly what sent a caller to a file.
+    ///
+    /// It names what the source says about all of them and asks the decision
+    /// their questions raise. It does **not** quote the description, even where
+    /// [`SharedRow::description`] publishes one: [`row_mark`] argues at length
+    /// that a source's whole text has no place in a sentence a person is read,
+    /// and that argument is about sentences and is untouched by this.
+    pub question: OwnerQuestion,
+}
+
+/// What makes a set of this session's open rows one group.
+///
+/// **Two members and one shape, which is the answer to «which groupings get
+/// this».** Three groupings exist — the decision [`OpenQuestion::alike`] names,
+/// the movement [`OpenQuestion::pair`] names, and the word [`OfferedRule`]
+/// groups by — and three shapes for the three would be exactly the drift this
+/// module refuses everywhere else. Two of them are here under one shape, and the
+/// third is deliberately not, for a reason and not for want of effort.
+///
+/// **The word the source filed rows under is not a group of this kind, because
+/// nothing answers it as one.** It is a grouping for a *condition*: decision
+/// 0032 fixed the group as the word precisely because the condition and the
+/// group have to be the same question, and a word covering a single [`RowShape`]
+/// still covers a hundred parties — so its rows raise a hundred decisions and
+/// there is no one answer to put to him about them. The only call that acts on
+/// the word whole is the rule route, which decides rows nobody has looked at and
+/// leaves every question of this session where it was. Publishing the word in
+/// this shape would be publishing a group with no answer, which is the thing
+/// this bead exists to stop. What it gets instead is what it already had —
+/// [`OfferedRule`] and [`WithheldOffer`] — and the join costs one comparison: a
+/// group whose members agree on the word publishes it as
+/// [`SharedRow::source_category`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBasis {
+    /// Every member raises the same decision — `QuestionSubject` equality, which
+    /// is the relation [`OpenQuestion::alike`] publishes per question. Twenty
+    /// card payments to one party are one of these.
+    OneDecision,
+    /// The two legs of one movement the document printed twice, sharing
+    /// [`OpenQuestion::pair`]. Exactly two members, and a hypothesis until an
+    /// answer names the other side (decision 0031).
+    OneMovement,
+}
+
+impl GroupBasis {
+    /// Wire code. One place, so two publishers cannot spell it differently.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OneDecision => "one_decision",
+            Self::OneMovement => "one_movement",
+        }
+    }
+}
+
+/// What every member of a group states alike.
+///
+/// **Read off the members and never derived from what made them a group.** A
+/// decision group agrees about its account, the party the source named and the
+/// direction the source stated because `QuestionSubject` equality says so;
+/// whether it also agrees about the currency, the word it was filed under or its
+/// description is a fact about the document that has to be looked at. One fold
+/// answers for both, and that is what lets one shape carry a grouping whose
+/// members agree about nearly everything and one whose members agree about
+/// nearly nothing.
+///
+/// An absence here is «they do not all state the same thing». It is never «this
+/// system could not tell»: every field is a value the source printed, and every
+/// member publishes its own beside this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedRow {
+    /// The account every member's row is on, with the title the owner reads
+    /// beside the identifier a call takes.
+    ///
+    /// [`AccountCandidate`] and not a bare identifier, and not a second shape of
+    /// this module's own: an account published for a person to read is one shape
+    /// in this API (conventions §3.3), and a group that named an account by
+    /// identifier alone would be a group he cannot recognise.
+    ///
+    /// `None` where the members are on different accounts — which is what a
+    /// [`GroupBasis::OneMovement`] group is — and where this instance's
+    /// directory no longer holds the account they share, because a group named
+    /// by an identifier nobody can read is not a group anybody can be asked
+    /// about.
+    pub account: Option<AccountCandidate>,
+    /// The currency every member is in. `None` where they are not all in one,
+    /// which is also what makes [`RowGroup::amounts`] unpublishable.
+    pub currency: Option<CurrencyCode>,
+    /// What every member says about which way the money went.
+    pub movement: Option<SharedMovement>,
+    /// The party every member named, exactly as the source printed it.
+    ///
+    /// `None` where they did not all name one — **including** where none of them
+    /// named anybody, which is a real thing to have in common and is not spelt
+    /// as a third state here. A direction is a closed vocabulary of two words, so
+    /// [`SharedMovement`] can afford a third; a party is an open string, and any
+    /// sentinel put in this field would be a name somebody could have. What the
+    /// absence of a party means for the group is carried where it is decidable:
+    /// [`RowGroup::question`] is written from the fold that knows, and the
+    /// members' own [`PrintedRow::counterparty`] says it row by row.
+    pub counterparty: Option<String>,
+    /// The word the source filed every member under, verbatim.
+    ///
+    /// The join to [`OfferedRule`] and [`WithheldOffer`], which group by this
+    /// word and are not published in this shape — see [`GroupBasis`].
+    pub source_category: Option<String>,
+    /// The description every member carries, verbatim, where the source printed
+    /// one and printed the same one on all of them.
+    ///
+    /// **This is decision 0032's exclusion revisited here rather than
+    /// reversed.** That decision kept the description off [`PrintedRow`] on
+    /// [`row_mark`]'s grounds — the row's whole text, of unbounded length,
+    /// written by the source — and added a second ground of its own: every other
+    /// field it published was already inside some question's sentence, so those
+    /// fields disclosed nothing the prose did not. Both grounds are about **a
+    /// field beside every one of hundreds of questions**, both still hold there,
+    /// and nothing here puts one on a row.
+    ///
+    /// A description shared by every member of a group is a different object. It
+    /// is one string for a set rather than one per row; it is published only
+    /// where the source itself said the same thing about every member, so it is a
+    /// property of the group and not the text of any line in it; and a group is
+    /// never a set of one, so there is no group whose description is one row's
+    /// text under another name.
+    ///
+    /// **And the exclusion cost more disclosure than the inclusion does.** Asked
+    /// what a set of rows actually was, a caller holding no field that says could
+    /// not answer out of this API and read the owner's raw statement instead —
+    /// every description of every row, unbounded, read outside the system
+    /// altogether. This is the one field that answers «what were these», and
+    /// withholding it is what produced the larger reading.
+    ///
+    /// `None` where the source printed none and where the members' descriptions
+    /// differ in any character. It is a field and never a clause of
+    /// [`RowGroup::question`]: `row_mark`'s rule is about sentences a person is
+    /// read, and it stands.
+    pub description: Option<String>,
+}
+
+/// What every member of a group says about which way the money went.
+///
+/// **Three states and not `Option<Movement>`**, because a group can agree that
+/// the source stated no direction and a group can fail to agree at all, and
+/// those are different facts. `Option<Movement>` already means «the source stated
+/// none» everywhere on this path — [`PrintedRow::movement`] says so and
+/// [`RowShape::movement`] says it is not a wildcard — so spelling «they disagree»
+/// with the same `None` would collide the two on the one field that decides which
+/// sentence is put to him. The vocabulary is closed at two words, so a third
+/// costs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedMovement {
+    /// Every member states this direction.
+    Stated(Movement),
+    /// Every member states none — the condition `Question::UnresolvedDirection`
+    /// is asked under, and the whole identity of the group that raises it.
+    NoneStated,
+}
+
+/// The days a group's members run between.
+///
+/// **Two endpoints and not a list of days, and not the earliest alone.** The
+/// owner is placing a group on a statement he is looking at, and «between these
+/// two» tells him which page to open. `earliest == latest` is a group that
+/// happened on one day, and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaySpan {
+    /// The earliest day any member states.
+    pub earliest: time::Date,
+    /// The latest day any member states.
+    pub latest: time::Date,
+}
+
+/// The amounts a group's members run between, with the signs the source printed.
+///
+/// **Not made positive and not totalled.** The sign is the source's own statement
+/// about direction, exactly as on [`PrintedRow::amount_minor`], and a total would
+/// be a figure this section computed out of rows the commit has not planned —
+/// which is the second reading [`OpenQuestion`] argues at length it is not
+/// making.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmountSpan {
+    /// The smallest signed amount among the members.
+    ///
+    /// For a group of rows that left an account this is the **largest** sum that
+    /// left, because the source printed those negative. That is what «with the
+    /// signs the source printed» costs, and it is the cost of the alternative
+    /// that matters: a span made of absolute values would agree with no line on
+    /// his statement.
+    pub smallest_minor: i64,
+    /// The largest signed amount among the members.
+    pub largest_minor: i64,
 }
 
 /// One fact the commit would write, described without writing it.
@@ -3292,6 +3617,12 @@ pub async fn plan_session(
     // session whose questions are all about a fee that no account is the other
     // side of publishes none, which is what it means.
     let answer_accounts = answer_accounts(&resolver.directory, &open_questions);
+    // The sets those questions form, folded over the relations the questions
+    // above already publish rather than over a second reading of what makes two
+    // questions one decision. The directory is the same one every row of this
+    // plan was resolved against, because a group names its account the way the
+    // owner reads it.
+    let groups = row_groups(&contents.observations, &open_questions, &resolver.directory);
 
     let mut facts = Vec::new();
     let mut duplicates = Vec::new();
@@ -3489,6 +3820,7 @@ pub async fn plan_session(
         offered_rules: offers.offered,
         withheld_offers: offers.withheld,
         answer_accounts,
+        groups,
     };
     let revision = fingerprint(
         &contents.session,
@@ -4043,6 +4375,15 @@ fn fingerprint(
     // says. It is folded into a digest, so nothing the owner reads is retained.
     for candidate in &interpretation.answer_accounts {
         let _ = writeln!(rendered, "answer account {candidate:?}");
+    }
+    // The groups, for the same reason and no other (`iaam-cixz`): the members
+    // and the relation between them come out of the questions stamped above, but
+    // a group names its account with the title the owner reads, and he can rename
+    // an account without touching this session. Whole, like the line above it:
+    // the stamp's contract is that it covers everything the plan says, and the
+    // sentence put to him is part of what it says.
+    for group in &interpretation.groups {
+        let _ = writeln!(rendered, "group {group:?}");
     }
     for candidate in &matching.candidates {
         let _ = writeln!(
@@ -5767,6 +6108,397 @@ fn answer_accounts(directory: &AccountDirectory, open: &[OpenQuestion]) -> Vec<A
         .collect();
     candidates.sort_by_key(|candidate| candidate.id.inner());
     candidates
+}
+
+/// The sets this session's open rows form, each with what its members agree on
+/// and the one answer that settles the whole of it.
+///
+/// **Folded over the relations the questions already publish, and not over a
+/// second reading of them** (`iaam-cixz`). A decision group is
+/// `{row} ∪ alike` for a question whose [`OpenQuestion::alike`] is not empty; a
+/// movement group is the rows sharing one [`OpenQuestion::pair`]. Recomputing
+/// `QuestionSubject` here to find the same sets would be a second answer to
+/// «what makes two questions one decision», in a module whose whole argument for
+/// [`decision_of_read_row`] being one function is that two spellings of that rule
+/// both look right. Read this way, a group and the `alike` list beside it cannot
+/// disagree.
+///
+/// **A set of one is not a group**, which is decision 0033 §2 one surface down:
+/// a question already stands alone, and «here is a group of one» would make a
+/// caller take it apart to find that out. A pair whose other leg an answer has
+/// already settled is exactly that case — the settled leg is not among the open
+/// questions at all (decision 0031) — and it is published as one question again.
+///
+/// **The stored rows are read again, and they are read for one field.** Every
+/// other value a group publishes is on [`OpenQuestion::printed`] already; the
+/// description is on neither that nor the question, deliberately (decision 0032),
+/// and it is the one field that answers what a set of rows was. Reading it here
+/// rather than widening [`PrintedRow`] is what keeps it a property of the group:
+/// it is read for a set and published only where the set agrees on it. A group
+/// none of whose rows this build can read is published not at all, because a
+/// group is a claim about what its members have in common and there is nothing to
+/// make the claim out of.
+fn row_groups(
+    observations: &[ImportObservationView],
+    open: &[OpenQuestion],
+    directory: &AccountDirectory,
+) -> Vec<RowGroup> {
+    let mut sets: Vec<(GroupBasis, Vec<u32>)> = Vec::new();
+    let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
+    for question in open {
+        if question.alike.is_empty() {
+            continue;
+        }
+        let mut rows = question.alike.clone();
+        rows.push(question.row);
+        rows.sort_unstable();
+        rows.dedup();
+        // Every member of one decision group publishes the same set, so the
+        // first of them names it and the rest are the same set arriving again.
+        if seen.insert(rows.clone()) {
+            sets.push((GroupBasis::OneDecision, rows));
+        }
+    }
+    let mut pairs: BTreeMap<Uuid, Vec<u32>> = BTreeMap::new();
+    for question in open {
+        if let Some(pair) = question.pair {
+            pairs.entry(pair).or_default().push(question.row);
+        }
+    }
+    for mut rows in pairs.into_values() {
+        // In row order like every other member list here, rather than in the
+        // order the questions happened to arrive: a group's members are read
+        // beside the rows they name, and two readings of one session must list
+        // them the same way.
+        rows.sort_unstable();
+        if rows.len() > 1 {
+            sets.push((GroupBasis::OneMovement, rows));
+        }
+    }
+    let mut groups: Vec<RowGroup> = Vec::new();
+    for (basis, rows) in sets {
+        let Some(members) = rows
+            .iter()
+            .map(|row| observed_row(observations, *row).ok())
+            .collect::<Option<Vec<ObservedRow>>>()
+        else {
+            continue;
+        };
+        let common = shared_row(&members, directory);
+        let days = day_span(&members);
+        // The invariant `AmountSpan` states: a span over two currencies is a pair
+        // of numbers with no unit.
+        let amounts = common.currency.and_then(|_| amount_span(&members));
+        let question = match basis {
+            GroupBasis::OneDecision => {
+                decision_group_question(rows.len(), &common, days.as_ref(), amounts.as_ref())
+            }
+            GroupBasis::OneMovement => movement_group_question(&members, directory),
+        };
+        groups.push(RowGroup {
+            basis,
+            rows,
+            common,
+            days,
+            amounts,
+            settles: match basis {
+                GroupBasis::OneDecision => AnswerReach::EveryLikeRowInThisSession,
+                GroupBasis::OneMovement => AnswerReach::ThisRow,
+            },
+            question,
+        });
+    }
+    // Largest first, and by the rows themselves where two are equal — the group
+    // worth putting to him first is first, and the order does not move between
+    // two readings of one session. Both this and the offers beside it are
+    // ordered that way, because a caller reads them together.
+    groups.sort_by(|left, right| {
+        right
+            .rows
+            .len()
+            .cmp(&left.rows.len())
+            .then_with(|| left.rows.cmp(&right.rows))
+    });
+    groups
+}
+
+/// What every member of a set states alike.
+///
+/// One fold for both groupings, which is what «one shape» costs and what it buys:
+/// nothing here knows why these rows are together, so a grouping whose members
+/// agree about their account and their party and one whose members agree about
+/// neither are described by the same code.
+fn shared_row(members: &[ObservedRow], directory: &AccountDirectory) -> SharedRow {
+    let Some(first) = members.first() else {
+        return SharedRow {
+            account: None,
+            currency: None,
+            movement: None,
+            counterparty: None,
+            source_category: None,
+            description: None,
+        };
+    };
+    let account = members
+        .iter()
+        .all(|row| row.account == first.account)
+        .then(|| group_account(directory, first.account))
+        .flatten();
+    let currency = members
+        .iter()
+        .all(|row| row.currency == first.currency)
+        .then_some(first.currency);
+    let movement = members
+        .iter()
+        .all(|row| row.movement() == first.movement())
+        .then(|| {
+            first
+                .movement()
+                .map_or(SharedMovement::NoneStated, SharedMovement::Stated)
+        });
+    let counterparty = first.counterparty_name().and_then(|named| {
+        members
+            .iter()
+            .all(|row| row.counterparty_name() == Some(named))
+            .then(|| named.to_owned())
+    });
+    let source_category = first.source_category.as_deref().and_then(|category| {
+        members
+            .iter()
+            .all(|row| row.source_category.as_deref() == Some(category))
+            .then(|| category.to_owned())
+    });
+    let description = first.description.as_deref().and_then(|described| {
+        members
+            .iter()
+            .all(|row| row.description.as_deref() == Some(described))
+            .then(|| described.to_owned())
+    });
+    SharedRow {
+        account,
+        currency,
+        movement,
+        counterparty,
+        source_category,
+        description,
+    }
+}
+
+/// One of the owner's accounts in the shape a person reads it by.
+///
+/// `None` for an account this instance's directory does not hold, and the group
+/// then names none: a title cannot be invented for it, and an identifier alone is
+/// not something anybody can be asked about. The row is still in the group and
+/// still publishes its own account.
+fn group_account(directory: &AccountDirectory, account: AccountId) -> Option<AccountCandidate> {
+    directory
+        .accounts
+        .iter()
+        .find(|held| held.id == account)
+        .map(|held| AccountCandidate {
+            id: held.id,
+            title: held.title.clone(),
+            institution: held.institution.clone(),
+        })
+}
+
+/// The days the members that state one run between.
+fn day_span(members: &[ObservedRow]) -> Option<DaySpan> {
+    let mut stated = members.iter().filter_map(|row| row.dates.effective_date());
+    let first = stated.next()?;
+    let (earliest, latest) = stated.fold((first, first), |(earliest, latest), day| {
+        (earliest.min(day), latest.max(day))
+    });
+    Some(DaySpan { earliest, latest })
+}
+
+/// The amounts the members run between, signed as the source printed them.
+fn amount_span(members: &[ObservedRow]) -> Option<AmountSpan> {
+    let first = members.first()?.amount_minor;
+    let (smallest_minor, largest_minor) =
+        members
+            .iter()
+            .fold((first, first), |(smallest, largest), row| {
+                (
+                    smallest.min(row.amount_minor),
+                    largest.max(row.amount_minor),
+                )
+            });
+    Some(AmountSpan {
+        smallest_minor,
+        largest_minor,
+    })
+}
+
+/// What the source says about the whole group, as a person finds it on the
+/// statement in front of him.
+///
+/// **[`row_mark`] one level up, and it keeps that function's rule.** A day and an
+/// amount identify a line well enough to point at; a span of days and a span of
+/// amounts identify a set of them, and the description stays out of the sentence
+/// for the reason it stays out of `row_mark`'s — it is the source's whole text,
+/// of unbounded length, and a sentence carrying it is how a statement's words end
+/// up in a queue item, a log line and an agent transcript. Where the group shares
+/// one, [`SharedRow::description`] publishes it beside this.
+///
+/// Only what the members agree on is said. A clause for a field they disagree
+/// about would be a claim about the group that is false of some of it, which is
+/// the whole failure this shape exists to prevent.
+fn group_mark(
+    count: usize,
+    common: &SharedRow,
+    days: Option<&DaySpan>,
+    amounts: Option<&AmountSpan>,
+) -> String {
+    let mut clauses = vec![common.account.as_ref().map_or_else(
+        || format!("{count} lines of this import"),
+        |account| format!("{count} lines of this import on «{}»", account.title),
+    )];
+    match common.movement {
+        Some(SharedMovement::Stated(Movement::Out)) => {
+            clauses.push("all money that left".to_owned());
+        }
+        Some(SharedMovement::Stated(Movement::In)) => {
+            clauses.push("all money that arrived".to_owned());
+        }
+        Some(SharedMovement::NoneStated) => {
+            clauses.push("none of them saying which way the money went".to_owned());
+        }
+        None => {}
+    }
+    if let Some(counterparty) = &common.counterparty {
+        clauses.push(format!("all naming «{counterparty}» on the other side"));
+    }
+    if let Some(category) = &common.source_category {
+        clauses.push(format!("all filed under «{category}»"));
+    }
+    if let Some(days) = days {
+        clauses.push(if days.earliest == days.latest {
+            format!("all dated {}", days.earliest)
+        } else {
+            format!("dated between {} and {}", days.earliest, days.latest)
+        });
+    }
+    if let (Some(amounts), Some(currency)) = (amounts, common.currency) {
+        let code = currency.code();
+        let smallest = decimal(PostedMinor::new(amounts.smallest_minor), currency);
+        if amounts.smallest_minor == amounts.largest_minor {
+            clauses.push(format!("each for {smallest} {code}"));
+        } else {
+            let largest = decimal(PostedMinor::new(amounts.largest_minor), currency);
+            clauses.push(format!("for amounts from {smallest} to {largest} {code}"));
+        }
+    }
+    clauses.join(", ")
+}
+
+/// The one sentence to put to a person about a set of rows raising one decision.
+///
+/// **The discriminating clause is read off what the members share, and that is
+/// decision 0032's own rule rather than a shortcut.** The question a row raises is
+/// determined by exactly two facts the source stated — which way the money went
+/// and whether a party was named — so a third field naming the question would be
+/// one fact written twice in a place where the two spellings could drift. The
+/// four branches here are `question_for`'s four, reached from the same pair.
+///
+/// **The words that answer it are not repeated here.** They are on every member,
+/// read from what was stored when the question was asked, and `iaam-ulib` is the
+/// bead about a question published without them; a group that carried its own
+/// copy would be a fifth publisher of one stored list, which is the thing that
+/// bead's one reader exists to prevent.
+fn decision_group_question(
+    count: usize,
+    common: &SharedRow,
+    days: Option<&DaySpan>,
+    amounts: Option<&AmountSpan>,
+) -> OwnerQuestion {
+    let mark = group_mark(count, common, days, amounts);
+    let ask = match (common.movement, common.counterparty.as_deref()) {
+        (Some(SharedMovement::Stated(_)), Some(named)) => format!(
+            "{mark}. Is «{named}» one of your own accounts — and if so which one — or was this \
+             money moving between you and somebody who is not you?"
+        ),
+        (Some(SharedMovement::Stated(Movement::Out)), None) => format!(
+            "{mark}. Your statement named nobody on the other side of any of them. Were these \
+             charges the institution made, or money you paid to somebody?"
+        ),
+        (Some(SharedMovement::Stated(Movement::In)), None) => format!(
+            "{mark}. Your statement named nobody on the other side of any of them. Was this \
+             money your capital earned, money somebody returned on something you had paid for, \
+             or money arriving from outside?"
+        ),
+        (Some(SharedMovement::NoneStated), _) => format!(
+            "{mark}. Your statement did not say which way any of them ran. Which way did this \
+             money go, and what was it?"
+        ),
+        // Unreachable for a group these rows raise one decision about, and
+        // written rather than asserted: a sentence is what this function owes its
+        // reader, and a panic here would take the whole assessment down over a
+        // clause.
+        (None, _) => format!("{mark}. What were they?"),
+    };
+    OwnerQuestion {
+        ask,
+        consequence: format!(
+            "One answer here decides all {count} of these lines together instead of one at a \
+             time, and decides nothing outside them: no line of a later statement is settled by \
+             it and no standing decision is kept. Your statement says the same thing about every \
+             one of them, but only you know whether they were the same thing — answered as a \
+             group, a line that was something else is decided wrongly along with the rest, and \
+             the way to keep it out is to answer that one on its own first. Which figure of your \
+             money-flow report each line moves depends on the word you choose, and every one of \
+             these lines is published with the words that answer it and what each of them \
+             decides. Nothing is written until you commit this import."
+        ),
+    }
+}
+
+/// The one sentence to put to a person about two rows that look like one
+/// movement.
+///
+/// **A group whose members agree about almost nothing, and that is what makes it
+/// one.** A pair is a departure on one account and the arrival on the other, so
+/// the account and the direction — the two things a decision group agrees on —
+/// are exactly what these two differ in, and the sentence is therefore built from
+/// the members rather than from what they share. It is the same shape carrying
+/// the opposite content, which is the argument for there being one shape.
+///
+/// **It asks and it does not conclude** (decision 0031). Two unrelated payments of
+/// one sum on one day have this shape, and the answer that says so is any answer
+/// that does not name the other row's account.
+fn movement_group_question(members: &[ObservedRow], directory: &AccountDirectory) -> OwnerQuestion {
+    let legs: Vec<String> = members
+        .iter()
+        .map(|row| {
+            let amount = decimal(PostedMinor::new(row.amount_minor), row.currency);
+            let code = row.currency.code();
+            let title = directory.title(row.account);
+            let side = match row.movement() {
+                Some(Movement::Out) => format!("{amount} {code} left «{title}»"),
+                Some(Movement::In) => format!("{amount} {code} arrived on «{title}»"),
+                None => format!("{amount} {code} on «{title}»"),
+            };
+            row.dates.effective_date().map_or_else(
+                || format!("{side}, which the source left undated"),
+                |date| format!("{side} on {date}"),
+            )
+        })
+        .collect();
+    let printed = legs.join(", and ");
+    OwnerQuestion {
+        ask: format!(
+            "Two lines of this import look like one movement your statement printed twice: \
+             {printed}. Was this your own money moving between two accounts of yours?"
+        ),
+        consequence: "If it was, answering either of the two as a movement to or from the other \
+                      account records one movement and settles both, and the second line is left \
+                      with nothing of its own to record — so the same money is not counted twice \
+                      in your money-flow report. If it was not, two unrelated lines of one sum on \
+                      one day look exactly like this: any other answer leaves them as two lines \
+                      with two questions, and nothing about this pairing is kept. Nothing is \
+                      written until you commit this import."
+            .to_owned(),
+    }
 }
 
 /// The standing decisions this session's unanswered rows offer, one per word the
@@ -8617,6 +9349,444 @@ mod tests {
         let contents = session_with(row(account(1), "Savings", None), Some(Answer::Paid), None);
         let described = generalisation_of(&contents.observations, &contents.questions[0]);
         assert_eq!(described.code(), "available");
+    }
+
+    // -----------------------------------------------------------------------
+    // A group publishes what its members have in common (iaam-cixz, 0034)
+    //
+    // Every account, title, party, word, sum and day below is invented
+    // (CLAUDE.md).
+    // -----------------------------------------------------------------------
+
+    /// The owner's directory, in the one shape the plan resolves rows against.
+    fn held(accounts: Vec<AccountDetailView>) -> AccountDirectory {
+        AccountDirectory::from_accounts(accounts)
+    }
+
+    /// One open question whose decision the named rows also raise.
+    fn open_alike(row: u32, alike: Vec<u32>) -> OpenQuestion {
+        OpenQuestion {
+            alike,
+            ..open_about(row)
+        }
+    }
+
+    /// One open question that is a leg of the movement `pair` names.
+    fn open_paired(row: u32, pair: Uuid) -> OpenQuestion {
+        OpenQuestion {
+            pair: Some(pair),
+            ..open_about(row)
+        }
+    }
+
+    /// The same row at another day and another sum — which is what the owner
+    /// said the members of a group differ in and nothing else.
+    fn on_day(observed: ObservedRow, amount_minor: i64, day: time::Date) -> ObservedRow {
+        ObservedRow {
+            amount_minor,
+            dates: OperationDates {
+                cash_posted: Some(day),
+                ..OperationDates::default()
+            },
+            ..observed
+        }
+    }
+
+    /// Three lines one party was paid over one month, as one group.
+    fn one_party_three_times(main: AccountId) -> Vec<ImportObservationView> {
+        let shop = filed_under(
+            row(main, "Shop One", Some(date!(2025 - 01 - 03))),
+            "Groceries",
+        );
+        vec![
+            stored_row(1, &shop),
+            stored_row(2, &on_day(shop.clone(), -4_500, date!(2025 - 01 - 19))),
+            stored_row(3, &on_day(shop, -250, date!(2025 - 01 - 28))),
+        ]
+    }
+
+    fn three_alike() -> Vec<OpenQuestion> {
+        vec![
+            open_alike(1, vec![2, 3]),
+            open_alike(2, vec![1, 3]),
+            open_alike(3, vec![1, 2]),
+        ]
+    }
+
+    /// A group says what its members agree on and how far the rest of them run.
+    ///
+    /// The complaint, in the owner's own words: he does not need every record —
+    /// show one of the group and ask what it was, because most of them share
+    /// every attribute except the day, the time and the amount. Wave Y published
+    /// the relation from each row to the others and never the set, so a caller
+    /// asked what a set of rows was either read every member out or invented a
+    /// summary of them. The one that happened was neither: it read his raw
+    /// statement file.
+    #[test]
+    fn a_group_publishes_what_its_members_agree_on_and_the_spread_of_what_they_do_not() {
+        let main = account(1);
+        let groups = row_groups(
+            &one_party_three_times(main),
+            &three_alike(),
+            &held(vec![detail(main, "Main")]),
+        );
+        assert_eq!(groups.len(), 1, "one decision is one group: {groups:?}");
+        let group = &groups[0];
+        assert_eq!(group.basis, GroupBasis::OneDecision);
+        assert_eq!(
+            group.rows,
+            vec![1, 2, 3],
+            "the members are the list, and the count is its length"
+        );
+        assert_eq!(
+            group
+                .common
+                .account
+                .as_ref()
+                .map(|held| held.title.as_str()),
+            Some("Main")
+        );
+        assert_eq!(group.common.counterparty.as_deref(), Some("Shop One"));
+        assert_eq!(group.common.source_category.as_deref(), Some("Groceries"));
+        assert_eq!(
+            group.common.movement,
+            Some(SharedMovement::Stated(Movement::Out))
+        );
+        assert_eq!(group.common.currency, Some(CurrencyCode::Rub));
+        assert_eq!(
+            group.days,
+            Some(DaySpan {
+                earliest: date!(2025 - 01 - 03),
+                latest: date!(2025 - 01 - 28)
+            }),
+            "the day is one of the two things they differ in, and a span says \
+             more than either endpoint"
+        );
+        assert_eq!(
+            group.amounts,
+            Some(AmountSpan {
+                smallest_minor: -4_500,
+                largest_minor: -250
+            }),
+            "and the amount is the other, signed as the source printed it"
+        );
+    }
+
+    /// The description belongs to the group where every member carries it.
+    ///
+    /// Decision 0032 kept it off the row and this does not put it back: it is
+    /// published for a set, only where the source said the same thing about
+    /// every member of that set, and never inside the sentence — `row_mark`'s
+    /// rule about what a person is read is untouched.
+    #[test]
+    fn a_description_every_member_carries_is_the_groups_and_one_that_differs_is_nobodys() {
+        let main = account(1);
+        let printed = "What the statement printed on this line";
+        let mut one = row(main, "Shop One", Some(date!(2025 - 01 - 03)));
+        one.description = Some(printed.to_owned());
+        let mut two = row(main, "Shop One", Some(date!(2025 - 01 - 09)));
+        two.description = Some(printed.to_owned());
+        let open = vec![open_alike(1, vec![2]), open_alike(2, vec![1])];
+        let directory = held(vec![detail(main, "Main")]);
+
+        let agreeing = vec![stored_row(1, &one), stored_row(2, &two)];
+        let groups = row_groups(&agreeing, &open, &directory);
+        assert_eq!(
+            groups[0].common.description.as_deref(),
+            Some(printed),
+            "one string for the set is the field that answers what these were"
+        );
+        assert!(
+            !groups[0].question.ask.contains(printed),
+            "and it is not read into the sentence: {}",
+            groups[0].question.ask
+        );
+
+        two.description = Some("Something else the statement printed".to_owned());
+        let differing = vec![stored_row(1, &one), stored_row(2, &two)];
+        let groups = row_groups(&differing, &open, &directory);
+        assert_eq!(
+            groups[0].common.description, None,
+            "a text one member does not carry is that member's and not the group's"
+        );
+    }
+
+    /// A set of one is not a group.
+    ///
+    /// Decision 0033 §2 one surface down: a question already stands alone, and
+    /// «here is a group of one» would make a caller take a group apart to find
+    /// that out — and would put a sentence about several lines to him about one.
+    #[test]
+    fn a_set_of_one_is_no_group_because_one_row_is_one_question_already() {
+        let main = account(1);
+        let observations = vec![stored_row(1, &row(main, "Shop One", None))];
+        let directory = held(vec![detail(main, "Main")]);
+        assert!(
+            row_groups(&observations, &[open_about(1)], &directory).is_empty(),
+            "a question nothing else is alike to is published as itself"
+        );
+        assert!(
+            row_groups(
+                &observations,
+                &[open_paired(1, Uuid::from_bytes([7; 16]))],
+                &directory
+            )
+            .is_empty(),
+            "and a movement whose other leg an answer already settled is one \
+             question again, not a group of one"
+        );
+    }
+
+    /// A group says which single call settles it, and the two do not settle
+    /// alike.
+    ///
+    /// `iaam-q5og` gave the answering call a stated reach; nothing said which
+    /// reach settles which set, so a group published as a set was still a set a
+    /// caller had to work out how to answer. A group with no answer is the wall
+    /// in better clothes.
+    #[test]
+    fn a_group_publishes_the_reach_that_settles_it_and_a_pair_settles_from_either_side() {
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let shop = row(main, "Shop One", Some(date!(2025 - 01 - 03)));
+        let observations = vec![
+            stored_row(1, &shop),
+            stored_row(2, &on_day(shop, -250, date!(2025 - 01 - 04))),
+            stored_row(3, &departure),
+            stored_row(4, &arrival),
+        ];
+        let pair = Uuid::from_bytes([9; 16]);
+        let open = vec![
+            open_alike(1, vec![2]),
+            open_alike(2, vec![1]),
+            open_paired(3, pair),
+            open_paired(4, pair),
+        ];
+        let groups = row_groups(
+            &observations,
+            &open,
+            &held(vec![detail(main, "Main"), detail(savings, "Savings")]),
+        );
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        let decision = groups
+            .iter()
+            .find(|group| group.basis == GroupBasis::OneDecision)
+            .expect("the two alike rows are a decision");
+        assert_eq!(decision.settles, AnswerReach::EveryLikeRowInThisSession);
+        let movement = groups
+            .iter()
+            .find(|group| group.basis == GroupBasis::OneMovement)
+            .expect("the two legs are a movement");
+        assert_eq!(
+            movement.settles,
+            AnswerReach::ThisRow,
+            "the legs are one movement, so either of them settles it and a \
+             wider reach would claim rows that are not this movement"
+        );
+        assert_eq!(movement.rows, vec![3, 4]);
+        assert_eq!(
+            movement.common.account, None,
+            "the account is what the two legs differ in"
+        );
+        assert_eq!(movement.common.movement, None, "and so is the direction");
+        assert_eq!(
+            movement.common.currency,
+            Some(CurrencyCode::Rub),
+            "what they do share is what makes the two sums comparable at all"
+        );
+        assert_eq!(
+            movement.amounts,
+            Some(AmountSpan {
+                smallest_minor: -1_000,
+                largest_minor: 1_000
+            }),
+            "and the span is the two signs the source printed, not one sum twice"
+        );
+    }
+
+    /// The group is put to him in his words and says what one answer decides.
+    ///
+    /// Decision 0027's register, checked the mechanical way the offer beside it
+    /// is checked: no field name, no word that exists only because of how this
+    /// is built, and a consequence that says what one answer costs when it is
+    /// wrong rather than that the decision is his.
+    #[test]
+    fn a_group_is_asked_in_his_words_and_says_what_answering_it_once_decides() {
+        let main = account(1);
+        let groups = row_groups(
+            &one_party_three_times(main),
+            &three_alike(),
+            &held(vec![detail(main, "Main")]),
+        );
+        let question = &groups[0].question;
+        for internal in [
+            "source_category",
+            "matcher",
+            "classification",
+            "session",
+            "row",
+            "rule",
+            "alike",
+            "subject",
+            "reach",
+        ] {
+            assert!(
+                !question.ask.to_lowercase().contains(internal),
+                "«{internal}» is our word, not his: {}",
+                question.ask
+            );
+            assert!(
+                !question.consequence.to_lowercase().contains(internal),
+                "«{internal}» is our word, not his: {}",
+                question.consequence
+            );
+        }
+        assert!(
+            question.ask.contains("Shop One") && question.ask.contains("Main"),
+            "he is shown what his statement says about all of them: {}",
+            question.ask
+        );
+        assert!(
+            question.consequence.contains('3'),
+            "what turns on the answer is how many lines it decides at once: {}",
+            question.consequence
+        );
+        assert!(
+            question.consequence.contains("wrongly"),
+            "and what it costs to be wrong, which is the half that gets dropped: {}",
+            question.consequence
+        );
+    }
+
+    /// A range taken over two currencies is a pair of numbers with no unit.
+    #[test]
+    fn a_group_whose_members_are_in_two_currencies_publishes_no_amount_range() {
+        let main = account(1);
+        let one = row(main, "Shop One", Some(date!(2025 - 01 - 03)));
+        let mut two = row(main, "Shop One", Some(date!(2025 - 01 - 09)));
+        two.currency = CurrencyCode::Usd;
+        let observations = vec![stored_row(1, &one), stored_row(2, &two)];
+        let open = vec![open_alike(1, vec![2]), open_alike(2, vec![1])];
+        let groups = row_groups(&observations, &open, &held(vec![detail(main, "Main")]));
+        assert_eq!(groups[0].common.currency, None);
+        assert_eq!(
+            groups[0].amounts, None,
+            "«from twelve to four hundred» across two currencies tells him \
+             something false"
+        );
+        assert!(
+            groups[0].days.is_some(),
+            "the days are still days, and only the amounts lose their unit"
+        );
+    }
+
+    /// An account a group names carries the title he reads beside the
+    /// identifier a call takes.
+    ///
+    /// One shape for an account published for a person, and not a second one
+    /// invented here.
+    #[test]
+    fn a_group_names_its_account_the_way_the_owner_reads_it() {
+        let main = account(1);
+        let mut known = detail(main, "Main");
+        known.institution = Some("Institution One".to_owned());
+        let observations = one_party_three_times(main);
+        let open = three_alike();
+        let groups = row_groups(&observations, &open, &held(vec![known]));
+        let named = groups[0]
+            .common
+            .account
+            .as_ref()
+            .expect("the members are all on one account");
+        assert_eq!(named.id, main);
+        assert_eq!(named.title, "Main");
+        assert_eq!(named.institution.as_deref(), Some("Institution One"));
+
+        let stranger = row_groups(&observations, &open, &held(Vec::new()));
+        assert_eq!(
+            stranger[0].common.account, None,
+            "an identifier this instance cannot put a title on is not something \
+             he can be asked about"
+        );
+        assert!(
+            !stranger[0].question.ask.contains("«»"),
+            "and the sentence drops the clause rather than quoting an empty \
+             name: {}",
+            stranger[0].question.ask
+        );
+    }
+
+    /// The word the source files by is offered as a condition and is no group.
+    ///
+    /// The stated reason the third grouping does not take this shape. One word
+    /// covering one row shape still covers as many decisions as it covers
+    /// parties, so there is no one answer to put to him about it, and the only
+    /// call that acts on the word whole decides rows nobody has looked at.
+    #[test]
+    fn a_word_the_source_filed_rows_under_is_offered_as_a_condition_and_is_no_group() {
+        let main = account(1);
+        let observations = vec![
+            stored_row(
+                1,
+                &filed_under(
+                    row(main, "Shop One", Some(date!(2025 - 01 - 03))),
+                    "Groceries",
+                ),
+            ),
+            stored_row(
+                2,
+                &filed_under(
+                    row(main, "Shop Two", Some(date!(2025 - 01 - 09))),
+                    "Groceries",
+                ),
+            ),
+        ];
+        // Two parties, so two decisions and nothing alike between them.
+        let open = vec![open_about(1), open_about(2)];
+        assert_eq!(
+            offers(&observations, &open).offered.len(),
+            1,
+            "the word is still worth one condition"
+        );
+        assert!(
+            row_groups(&observations, &open, &held(vec![detail(main, "Main")])).is_empty(),
+            "and it is not a group: no one answer settles two parties"
+        );
+    }
+
+    /// The group worth putting to him first is first.
+    #[test]
+    fn groups_are_published_largest_first_so_the_one_that_settles_most_is_read_first() {
+        let main = account(1);
+        let two_more = row(main, "Shop Two", Some(date!(2025 - 02 - 02)));
+        let mut observations = one_party_three_times(main);
+        observations.push(stored_row(4, &two_more));
+        observations.push(stored_row(
+            5,
+            &on_day(two_more, -700, date!(2025 - 02 - 06)),
+        ));
+        let mut open = three_alike();
+        open.push(open_alike(4, vec![5]));
+        open.push(open_alike(5, vec![4]));
+        let groups = row_groups(&observations, &open, &held(vec![detail(main, "Main")]));
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(groups[0].rows, vec![1, 2, 3]);
+        assert_eq!(groups[1].rows, vec![4, 5]);
+    }
+
+    /// A group nothing can be said about is not published as one.
+    ///
+    /// A group is a claim about what its members have in common, and a member
+    /// this build cannot read leaves nothing to make the claim out of. It is not
+    /// published as a group with the claim silently taken over the rest, which
+    /// would be a set that says it is complete and is not.
+    #[test]
+    fn a_group_whose_rows_this_build_cannot_read_is_not_published_at_all() {
+        let main = account(1);
+        let observations = vec![stored_row(1, &row(main, "Shop One", None))];
+        let open = vec![open_alike(1, vec![2]), open_alike(2, vec![1])];
+        assert!(row_groups(&observations, &open, &held(vec![detail(main, "Main")])).is_empty());
     }
 }
 

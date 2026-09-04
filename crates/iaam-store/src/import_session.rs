@@ -340,6 +340,15 @@ impl SqliteStore {
     /// A session that is no longer open refuses: an observation added after
     /// commit would sit in a session whose facts are already written and would
     /// never be written itself.
+    ///
+    /// **What the number counts, said here because this is where it is
+    /// decided** (`iaam-f6y4`). `MAX(row) + 1` over this session makes it the
+    /// row's position among what the session **took**, in submission order; the
+    /// idempotent return above makes it stable across a re-reading of the same
+    /// document. It is not a line of any file, and a record the reader refused
+    /// never reaches this function — so the document's line and this number
+    /// diverge by the refusals between them. The line is the `locator` the
+    /// reading publishes; decision 0035 §4 is the whole of it.
     pub fn add_import_observation(
         &mut self,
         owner: OwnerId,

@@ -332,6 +332,7 @@ Every published type that prints an identifier of a thing the owner named.
 | `AccountRetirementDto` | `account` | `title`, `institution` |
 | `PopulationAccountDto` | `account` | `title` |
 | `ImportQuestionDto` | in `prompt`, and `accounts[].id` | the titles, in the sentence; `title` and `institution` on each candidate |
+| `PrintedRowDto` | `account` | `title`, `institution`, both optional — see below |
 | `ContourDto` | `contour` | `title` |
 | `CategoryDto`, `CategoryGroupDto` | `id` | `title` |
 | `InstrumentDto` | `id` | `symbol`, `title` |
@@ -350,10 +351,28 @@ And the types that print a bare identifier on purpose.
 | `BatchTotalDto`, `ControlComparisonDto`, `PlannedOriginDto` | `account` | the import assessment they sit in carries `account_resolution`, whose `resolved` and `missing` name every account the rows are on and say which of them the owner's directory holds. The join table is in the same response, computed by the same fold. It is also why a name cannot simply be printed: a total over rows on an account the directory has never heard of is precisely what these sections must be able to publish |
 | every request body | — | §3.2 |
 
+**A name that is sometimes absent is still the name.** `PrintedRowDto` is the
+first entry above whose `title` is optional, and the option is not a weakening of
+the rule. A row of an import session may name an account by identifier that the
+owner's directory has never held — `account_resolution.missing` is exactly that
+list — and a question about such a row is still a question he has to answer. That
+case is the reason the second table gives for `BatchTotalDto`'s bare identifier,
+and on inspection it justifies only not making the name **required**: an optional
+title publishes the name where there is one and the absence where there is none,
+which is strictly more than an identifier alone and true in both cases. What it
+is never is the identifier printed where a name belongs. Decision 0035.
+
 Two things follow for a client. Where a response carries a `population` block, it
 is the name table for every account named anywhere in that response — look the
 account up there rather than calling `GET /v1/accounts`. Where a response carries
 neither the name nor a population, the account is the one the request named.
+
+A caller of the import session assessment should read one more warning here.
+`interpretation.answer_accounts` looks like a name table for that response and is
+not one: it is published only where some open question admits an answer that
+names one of his accounts, and it is his whole directory rather than the accounts
+this session's rows are on. The question carries its own account's name for that
+reason.
 
 ### 3.6 Where the rule is not yet kept
 
@@ -385,6 +404,40 @@ prints only its identifier, with no name table beside it in the same response:
 Each of these is a shape change to a published type, so each is its own decision
 about breaking a client, and none of them is a reason to publish a new type that
 prints an identifier alone. A type added after this section carries the name.
+
+### 3.7 The rule §3 is one instance of
+
+§3 is about a name. The rule it is an instance of is about every value published
+to be read out, and it was stated once the API had gone on to publish closed
+vocabularies and counters that no name rule covers (decision 0035):
+
+> **Nothing this API publishes in order to be read out to the owner is stated
+> only in this system's own vocabulary.**
+
+§3.3's asymmetry is this rule's two faces and not two rules. What he must
+**supply** carries the question to put to him, because a JSON pointer is mute —
+that is decision 0027, and it is satisfied by writing a sentence. What is
+**published** carries the words he reads, because an identifier is opaque and a
+code word is ours — that is this section, and it is almost always satisfied by
+publishing beside it a value the system already holds.
+
+Three obligations follow for anything new, and the first is §3:
+
+- An identifier of a thing the owner named carries his name for it (§3.5).
+- A word out of a closed vocabulary that a client may show him carries one static
+  sentence saying what it means for him, published from one function so that two
+  publishers of one word cannot disagree — `AnswerShape::consequence` is the
+  shape.
+- A decision number and a bead identifier are this project's own bookkeeping,
+  and **a doc comment on a published type is not a private place to put one**:
+  it is rendered into the contract as the field's description, where a client
+  reads it and repeats it. So a published description says what a caller must
+  know; why we decided it stays in the decision record, which the contract does
+  not cite. Everywhere else in the source, cite freely.
+
+A count carries what it counts, which is the same rule about a number rather than
+a word: `SourceDocumentRowDto.row` and `locator` are two counters over one
+document, and the wording on each says which.
 
 ---
 

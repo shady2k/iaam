@@ -20,6 +20,7 @@ use iaam_core::rules::LotRuleVersion;
 use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
 use iaam_ingest::dedup::IdentityScope;
+use iaam_ingest::profile::UnresolvedAccountName;
 use iaam_store::documents::BrokerCode;
 // The grouping label deliberately does not live in `iaam-core`: the core is
 // where rules live, and nothing may branch on it.
@@ -628,6 +629,32 @@ pub struct DocumentToKeep {
     pub body: Vec<u8>,
 }
 
+/// One account name a kept document printed, as this instance recorded it.
+///
+/// Three facts and no verdict. The document printed `printed` in the column its
+/// profile names as the account; `records` of that document's records printed
+/// it; and the reading that found this was into `session`, of the document
+/// named by `document_hash`.
+///
+/// **It does not say the account is missing.** It said so once, at the moment of
+/// the reading, and that is why the row exists — but the owner's directory moves
+/// and this row does not, so the question is asked again wherever the row is
+/// read, against the directory as it then stands. A row that carried the verdict
+/// would go stale in exactly the direction that hurts: publishing work the owner
+/// has already done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAccountView {
+    pub session: ImportSessionId,
+    /// SHA-256 of the document, in hexadecimal — the name a re-reading is
+    /// addressed by.
+    pub document_hash: String,
+    /// The cell as the document printed it.
+    pub printed: String,
+    /// Records of that document that printed it. Arithmetic over one reading:
+    /// not a count of movements, since every one of those records was refused.
+    pub records: u32,
+}
+
 /// Store for facts and reference data.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -862,6 +889,43 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         document_hash: RawHash,
     ) -> Result<Option<Vec<u8>>, AppError>;
+
+    /// Record the account names one reading of one document could not place.
+    ///
+    /// **An instance fact, written where the reading happens and nowhere else.**
+    /// Nothing was appended to the journal when these names were read — every
+    /// record that printed one was refused — so there is no provenance to carry
+    /// them and no event to hang them on. They survive here or they survive in
+    /// the document's bytes, and recovering them from the bytes means reading
+    /// every kept document again, which is a fold this system will not put on
+    /// the queue's path.
+    ///
+    /// The document's whole set is replaced. A later reading of the same
+    /// document answers the same question against a directory that has moved,
+    /// and two answers side by side with nothing saying which is current is the
+    /// staleness this record exists to avoid. An empty list is that statement
+    /// too: this reading placed every account the document named.
+    async fn record_unresolved_accounts(
+        &self,
+        owner: OwnerId,
+        document_hash: RawHash,
+        session: ImportSessionId,
+        names: Vec<UnresolvedAccountName>,
+    ) -> Result<(), AppError>;
+
+    /// Every account name this instance holds for the owner, in the order each
+    /// document first printed it.
+    ///
+    /// **Whether a name is still unresolved is not stored and is not asked
+    /// here.** What comes back is what the documents printed; the caller decides
+    /// what is still outstanding by resolving each against the owner's directory
+    /// as it now stands, through the one implementation of that tiering. A
+    /// stored verdict would say «missing» about an account created an hour
+    /// later, and a queue built on it would publish work already done.
+    async fn list_unresolved_accounts(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<UnresolvedAccountView>, AppError>;
 
     async fn find_principal(&self, token_hash: String) -> Result<Option<Principal>, AppError>;
     async fn record_token_use(

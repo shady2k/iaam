@@ -53,6 +53,39 @@ pub struct DocumentReading {
     /// One outcome per record below the header row, in the order the document
     /// printed them.
     pub rows: Vec<ReadOutcome>,
+    /// The account names the document printed that the owner's directory
+    /// resolved to no single account, once each, in the order the document
+    /// first printed them.
+    ///
+    /// **A summary of the reading and not a conclusion about it.** Each entry
+    /// is a string the document printed and a count of the records that printed
+    /// it; nothing here says what the account is, whether it should exist, or
+    /// what the owner ought to call it. Every one of these records is refused
+    /// individually and by name in [`Self::rows`] — this says the same thing
+    /// once per name instead of once per record, which is the difference
+    /// between a reader learning that seven accounts are wanted and a reader
+    /// mining two hundred and twenty identical refusals for them.
+    ///
+    /// Empty for a profile whose document does not print its account: a
+    /// declaration is resolved before the first record is read, and a caller
+    /// that declared nothing is refused the whole document rather than every
+    /// row of it.
+    pub unresolved_accounts: Vec<UnresolvedAccountName>,
+}
+
+/// One account name a document printed and this reading could not place.
+///
+/// The count is arithmetic over the reading and nothing else: how many records
+/// of this document printed this string in the column the profile names as the
+/// account. It is not a claim that the account has that many movements — the
+/// records were refused, so nothing was read out of them — and it is not a
+/// proposal that an account be created under this name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAccountName {
+    /// The cell as the document printed it, transcribed verbatim.
+    pub printed: String,
+    /// Records of this document that printed it.
+    pub records: usize,
 }
 
 impl DocumentReading {
@@ -189,6 +222,11 @@ pub fn read(
 
     let digest = hex_digest(bytes);
     let mut rows = Vec::new();
+    // First-seen order, and a `Vec` rather than a map for that reason: the
+    // order a reader compares against his own file is the order the document
+    // printed, and a map would publish the names in whatever order its keys
+    // happen to sort in.
+    let mut unresolved_accounts: Vec<UnresolvedAccountName> = Vec::new();
     for record in records.iter().filter(|record| record.locator > header_line) {
         let locator = record.locator;
         rows.push(
@@ -197,11 +235,62 @@ pub fn read(
                     locator,
                     row: Box::new(row),
                 },
-                Err(rejection) => ReadOutcome::Rejected { locator, rejection },
+                Err(refusal) => {
+                    if let Some(printed) = refusal.unresolved_account {
+                        // By position rather than by a mutable find, so the
+                        // lookup's borrow ends before the push.
+                        let seen = unresolved_accounts
+                            .iter()
+                            .position(|seen| seen.printed == printed);
+                        match seen {
+                            Some(index) => unresolved_accounts[index].records += 1,
+                            None => unresolved_accounts.push(UnresolvedAccountName {
+                                printed,
+                                records: 1,
+                            }),
+                        }
+                    }
+                    ReadOutcome::Rejected {
+                        locator,
+                        rejection: refusal.rejection,
+                    }
+                }
             },
         );
     }
-    Ok(DocumentReading { digest, rows })
+    Ok(DocumentReading {
+        digest,
+        rows,
+        unresolved_accounts,
+    })
+}
+
+/// Why one record did not become an observation.
+///
+/// Internal to the engine, and it exists for one reason: the refusal a caller
+/// reads is a [`Rejection`], and the *summary* the reading publishes needs to
+/// know which refusals were about an account name and what that name was.
+/// Recovering that by reading the refusal's own sentence back would make the
+/// wording load-bearing, and the wording belongs to
+/// [`crate::csv_source::AccountNames::resolve`], which is entitled to change it.
+///
+/// Every other refusal converts into this through [`From`], carrying no name:
+/// a date that will not parse and an amount with too much precision are not
+/// statements about an account.
+struct RowRefusal {
+    rejection: Rejection,
+    /// The account name the document printed, where this record was refused
+    /// because that name resolved to no single account of the owner's.
+    unresolved_account: Option<String>,
+}
+
+impl From<Rejection> for RowRefusal {
+    fn from(rejection: Rejection) -> Self {
+        Self {
+            rejection,
+            unresolved_account: None,
+        }
+    }
 }
 
 /// The key under which one row of one document is the same submission twice.
@@ -448,7 +537,7 @@ fn row(
     context: &ReadContext<'_>,
     digest: &str,
     locator: u64,
-) -> Result<ObservedRow, Rejection> {
+) -> Result<ObservedRow, RowRefusal> {
     let shape = profile.row();
     let account = match &shape.account {
         AccountSource::Declaration => context.declared.ok_or_else(|| Rejection {
@@ -461,10 +550,17 @@ fn row(
             context
                 .accounts
                 .resolve(printed)
-                .map_err(|unresolved| Rejection {
-                    field: "account".to_owned(),
-                    expected: unresolved.expected,
-                    actual: format!("«{column}»: {}", unresolved.actual),
+                .map_err(|unresolved| RowRefusal {
+                    rejection: Rejection {
+                        field: "account".to_owned(),
+                        expected: unresolved.expected,
+                        actual: format!("«{column}»: {}", unresolved.actual),
+                    },
+                    // The cell as printed, not the sentence built from it: the
+                    // summary this feeds names accounts, and a name recovered by
+                    // parsing a refusal back out would break the first time the
+                    // refusal is reworded.
+                    unresolved_account: Some(printed.trim().to_owned()),
                 })?
         }
     };
@@ -1241,6 +1337,122 @@ mod tests {
         let refusal = rejection(&reading.rows[1]);
         assert_eq!(refusal.field, "account");
         assert!(refusal.actual.contains("Elsewhere"), "{refusal:?}");
+    }
+
+    /// The reading says which accounts the document asked for, once each.
+    ///
+    /// The defect this covers is not a wrong answer; it is an unreadable one. A
+    /// statement whose records are on accounts this instance does not hold
+    /// refuses every one of them, correctly and by name, and a caller wanting
+    /// the set of accounts to create has to walk the whole list and deduplicate
+    /// a string out of a sentence. Two hundred and twenty refusals for seven
+    /// names is what that costs in practice.
+    ///
+    /// First-seen order, and the count is over records: `Elsewhere` is printed
+    /// first and twice, `Somewhere` second and once.
+    #[test]
+    fn the_reading_names_the_accounts_the_document_asked_for() {
+        let profile = profile(serde_json::json!({
+            "row": { "account": { "from": "column", "column": "Account" } }
+        }));
+        let (declared, names) = account();
+        let reading = read(
+            "Posted;Sum;Account\n\
+             2026-08-05;-1.00;Elsewhere\n\
+             2026-08-06;-2.00;Everyday\n\
+             2026-08-07;-3.00;Somewhere\n\
+             2026-08-08;-4.00;Elsewhere\n"
+                .as_bytes(),
+            &profile,
+            &ReadContext {
+                accounts: &names,
+                declared: Some(declared),
+            },
+        )
+        .expect("the document is readable");
+
+        assert_eq!(
+            reading.unresolved_accounts,
+            vec![
+                UnresolvedAccountName {
+                    printed: "Elsewhere".to_owned(),
+                    records: 2,
+                },
+                UnresolvedAccountName {
+                    printed: "Somewhere".to_owned(),
+                    records: 1,
+                },
+            ],
+            "the summary must name each account once, in the order the document printed it"
+        );
+        // And it adds nothing to the refusals: every one of those records is
+        // still refused individually, by field and by locator.
+        assert_eq!(rejection(&reading.rows[0]).field, "account");
+        assert_eq!(observed(&reading.rows[1]).account, declared);
+        assert_eq!(rejection(&reading.rows[2]).field, "account");
+        assert_eq!(rejection(&reading.rows[3]).field, "account");
+    }
+
+    /// A document every account of which is placed asks for nothing.
+    ///
+    /// The empty list is a statement, not an absence: it is what tells a caller
+    /// that no account has to be created before this document imports.
+    #[test]
+    fn a_document_whose_accounts_are_all_held_names_none() {
+        let profile = profile(serde_json::json!({
+            "row": { "account": { "from": "column", "column": "Account" } }
+        }));
+        let (declared, names) = account();
+        let reading = read(
+            "Posted;Sum;Account\n2026-08-05;-1.00;Everyday\n".as_bytes(),
+            &profile,
+            &ReadContext {
+                accounts: &names,
+                declared: Some(declared),
+            },
+        )
+        .expect("the document is readable");
+        assert!(reading.unresolved_accounts.is_empty());
+    }
+
+    /// A refusal that is not about an account contributes no name.
+    ///
+    /// The summary is fed structurally — the engine keeps the printed cell where
+    /// the account column was what failed — and not by reading the refusal's own
+    /// sentence back. A date that will not parse is not a statement about an
+    /// account, and a summary that inferred one from the wording would say it
+    /// was.
+    #[test]
+    fn a_refusal_about_another_field_names_no_account() {
+        let profile = profile(serde_json::json!({
+            "row": { "account": { "from": "column", "column": "Account" } }
+        }));
+        let (declared, names) = account();
+        let reading = read(
+            "Posted;Sum;Account\n2026-13-45;-1.00;Everyday\n".as_bytes(),
+            &profile,
+            &ReadContext {
+                accounts: &names,
+                declared: Some(declared),
+            },
+        )
+        .expect("the document is readable");
+        assert_eq!(rejection(&reading.rows[0]).field, "date");
+        assert!(reading.unresolved_accounts.is_empty());
+    }
+
+    /// A profile that takes the caller's declaration asks for no account.
+    ///
+    /// The declaration is resolved once for the whole document, before the first
+    /// record is read, so a caller that declared nothing is refused the document
+    /// rather than every row of it — and there is no printed string to name.
+    #[test]
+    fn a_declared_document_names_no_account() {
+        let reading = read_with(
+            "Posted;Sum\n2026-08-05;-1.00\n",
+            &profile(serde_json::json!({})),
+        );
+        assert!(reading.unresolved_accounts.is_empty());
     }
 
     /// A date and a time in one cell, and the time is recorded as printed.

@@ -29,6 +29,21 @@ use time::Date;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ActionKind {
     CreateFirstAccount,
+    /// A document this instance kept printed an account name, and the owner's
+    /// directory resolves it to no single account of his.
+    ///
+    /// Declared straight after [`Self::CreateFirstAccount`], and emitted there,
+    /// because it is the same act said precisely: «create an account» and
+    /// «create the account this statement calls this». An empty instance raises
+    /// the first and can raise no second — nothing has been read yet — and the
+    /// moment a document has been handed over, this one names what to create
+    /// instead of leaving the caller to provoke a refusal for it.
+    ///
+    /// It outlives the item above it, which is why it is a kind of its own
+    /// rather than a widening: `CreateFirstAccount` is existential and stops
+    /// being raised after the first account exists, while a statement naming
+    /// seven accounts still wants six more.
+    CreateAccountNamedByDocument,
     CreateFirstContour,
     AccountScopeUndecided,
     /// The owner has not said which of his accounts money moves between this
@@ -96,6 +111,7 @@ impl ActionKind {
     pub const fn id(self) -> &'static str {
         match self {
             Self::CreateFirstAccount => "create_first_account",
+            Self::CreateAccountNamedByDocument => "create_account_named_by_document",
             Self::CreateFirstContour => "create_first_contour",
             Self::AccountScopeUndecided => "account_scope_undecided",
             Self::ResolveTransferRelationships => "resolve_transfer_relationships",
@@ -122,8 +138,9 @@ impl ActionKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::CreateFirstAccount,
+        Self::CreateAccountNamedByDocument,
         Self::CreateFirstContour,
         Self::AccountScopeUndecided,
         Self::ResolveTransferRelationships,
@@ -156,7 +173,7 @@ impl ActionKind {
     /// what it blocks fails at construction rather than publishing a required
     /// item that names nothing.
     ///
-    /// Exhaustive on purpose. A nineteenth kind cannot compile until someone
+    /// Exhaustive on purpose. A twentieth kind cannot compile until someone
     /// has answered, for that kind, the question this whole type exists to
     /// answer.
     ///
@@ -223,6 +240,13 @@ impl ActionKind {
         match self {
             // Blocking, not required work: no goal.
             Self::CreateFirstAccount => ReportGoals::NONE,
+            // Every report, and for `StartAccountImport`'s reason exactly: the
+            // records that named this account were refused, so they are in no
+            // journal, so they are in no report — and nothing anywhere says a
+            // month of one account is missing. Not blocking, though: the system
+            // accepts every other act while this stands, which is the difference
+            // from the item above.
+            Self::CreateAccountNamedByDocument => ReportGoals::ALL,
             Self::CreateFirstContour | Self::AccountScopeUndecided => {
                 ReportGoals::of(&[AssetSnapshot, MoneyFlow, Returns])
             }
@@ -1135,6 +1159,7 @@ pub async fn frontier(
     }
     let rules = standing_rules(owner, rules).await?;
     let retirements = retired_products(owner, store).await?;
+    let wanted_accounts = accounts_named_by_documents(owner, store).await?;
     let mut assertions = Vec::new();
     for account in activity
         .iter()
@@ -1157,7 +1182,83 @@ pub async fn frontier(
         sessions: &sessions,
         questions: &questions,
         rules: &rules,
+        wanted_accounts: &wanted_accounts,
     })
+}
+
+/// The accounts the owner's kept documents asked for and his directory does not
+/// hold.
+///
+/// **Two cheap reads, and no document is opened.** The names were recorded when
+/// each document was read, as an instance fact beside the bytes: nothing was
+/// appended to the journal then and nothing could have been, because every
+/// record that printed one of these names was refused. So the queue reads what
+/// the reading wrote.
+///
+/// The rejected alternatives are worth naming, because the obvious one is the
+/// expensive one:
+///
+/// - **Reading every kept document again here.** That is a parse of every
+///   statement the owner ever uploaded, on every reading of the queue, to answer
+///   a question that was already answered when each was read. `iaam-4jso` was
+///   filed for widening this function exactly like that; a fold that fails takes
+///   the whole queue with it, and this one would fail on any document a later
+///   profile release stopped recognising.
+/// - **Reading the refused records out of the session.** There are none. A
+///   record the reader could not read never reached the session, which is
+///   correct — a session holds rows, and that was not one.
+/// - **Recording the names in the journal.** Nothing happened that a journal
+///   records. The journal holds facts about the owner's money, and «a document
+///   printed a string I could not place» is a fact about a reading.
+///
+/// **The gap is decided here and not stored.** The record says a document
+/// printed a string; whether the directory places it is asked now, against the
+/// accounts as they now stand, through
+/// [`iaam_ingest::csv_source::AccountNames::resolve`] — the one implementation
+/// of decision 0004's tiering, reached through the same translation the reader
+/// uses, so the queue and the reader cannot disagree about the same string. A
+/// stored verdict would publish an account created an hour ago.
+///
+/// Folded per name and not per document: two statements of one bank naming the
+/// same unknown account are one account to create, and an item per document
+/// would ask for it twice.
+async fn accounts_named_by_documents(
+    owner: OwnerId,
+    store: &dyn Store,
+) -> Result<Vec<AccountNamedByDocument>, AppError> {
+    let recorded = store.list_unresolved_accounts(owner).await?;
+    if recorded.is_empty() {
+        // The ordinary case, and it is worth the branch: an owner whose
+        // documents all placed their accounts pays nothing for this item, in the
+        // same bargain `retired_products` strikes one function down.
+        return Ok(Vec::new());
+    }
+    let directory =
+        import_session::AccountDirectory::from_accounts(store.list_account_details(owner).await?);
+    let names = directory.names();
+    let mut wanted: Vec<AccountNamedByDocument> = Vec::new();
+    for record in recorded {
+        if !account_named_by_document_gap(&names, &record.printed) {
+            continue;
+        }
+        // By position rather than by a mutable find, so the lookup's borrow ends
+        // before the push.
+        let seen = wanted
+            .iter()
+            .position(|seen| seen.printed == record.printed);
+        match seen {
+            Some(index) => {
+                wanted[index].records = wanted[index].records.saturating_add(record.records);
+                wanted[index].documents = wanted[index].documents.saturating_add(1);
+            }
+            None => wanted.push(AccountNamedByDocument {
+                printed: record.printed,
+                records: record.records,
+                documents: 1,
+            }),
+        }
+    }
+    Ok(wanted)
 }
 
 /// The owner's ceased products, each with the journal's verdict on it.
@@ -2034,6 +2135,18 @@ struct OwnerState<'a> {
     /// offer has already been adopted. Nothing else here consults them, and an
     /// empty slice is «he has written none», never «they were not fetched».
     rules: &'a [ClassificationRule],
+    /// The accounts a kept document asked for that the owner's directory still
+    /// does not place.
+    ///
+    /// **Already filtered**, which is the one field here that arrives with its
+    /// gap decided. The eligibility — a document printed this string — is what
+    /// the instance recorded when it read the document; the gap — and no account
+    /// of his answers to it — is a question about the directory, and it is
+    /// answered in [`frontier`] through the one implementation of decision
+    /// 0004's tiering rather than through a second copy of it here. An empty
+    /// slice is «every account his documents named is in his directory», never
+    /// «nothing was read».
+    wanted_accounts: &'a [AccountNamedByDocument],
 }
 
 /// Fallible for one reason: every item about an account publishes what the
@@ -2052,9 +2165,11 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
         sessions,
         questions,
         rules,
+        wanted_accounts,
     } = *state;
     let names = AccountNames::new(accounts);
-    let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
+    let mut actions =
+        actions_from_views(accounts, contours, exclusions, transfers, wanted_accounts);
     actions.reserve(
         activity.len()
             + assertions.len()
@@ -2762,15 +2877,31 @@ fn actions_from_views(
     contours: &[ContourView],
     exclusions: &[AccountScopeExclusionView],
     transfers: &[AccountTransferStatementView],
+    wanted: &[AccountNamedByDocument],
 ) -> Vec<Action> {
     let account_completion = account_completion(accounts);
     let contour_eligibility = !accounts.is_empty();
     let contour_completion = contour_completion(contours);
     let contour_gap = !contour_completion;
-    let mut actions = Vec::with_capacity(2);
+    let mut actions = Vec::with_capacity(2 + wanted.len());
 
     if !account_completion {
         actions.push(first_account_action());
+    }
+    // Straight after it, because the kind is declared straight after it and the
+    // frontier's kinds must stay non-decreasing in that order. The two belong
+    // together for a better reason than the ordering: they are the same act, and
+    // the second one says which. An empty instance raises the first alone —
+    // nothing has been read, so no name exists — and it stays raised beside
+    // these until an account exists.
+    //
+    // The gap is decided before this function is reached, in `frontier`, where
+    // the owner's directory is loaded: the eligibility of one of these is «a
+    // document printed this string», which is what the slice holds, and the gap
+    // is «and the directory still does not place it», which needs the tiering
+    // and therefore the accounts in the shape the tiering searches.
+    for name in wanted {
+        actions.push(account_named_by_document_action(name));
     }
     if contour_eligibility && contour_gap {
         actions.push(first_contour_action(accounts));
@@ -3535,6 +3666,28 @@ fn retirement_not_assessed_action(refusal: &str) -> Action {
     .expect("the unassessed-retirement item names the correction route")
 }
 
+/// The item for an empty directory, and the one sentence it has to add.
+///
+/// **It cannot say which account to create, and that is a property of the state
+/// rather than a defect of the item.** Nothing has been read; there is no
+/// document, no statement and no name, so an item naming one would be inventing
+/// it. What the item can do — and did not, which is what sent a live agent round
+/// a loop — is say that the question has an answer and name the call that gives
+/// it: a statement names its accounts in its own words, and reading one into a
+/// session publishes those words back, once each, with the number of records
+/// each accounts for.
+///
+/// That escape works today and always did. Its cost was that it had to be found:
+/// the only way to learn the names was to provoke a refusal per record and mine
+/// the response for them, and the response repeats one sentence per record.
+/// Saying it here costs a paragraph; the alternative cost a reader ninety
+/// kilobytes for seven names.
+///
+/// The target is unchanged and stays one operation. The document channel is not
+/// an [`OperationKey`] (`iaam-1tij`), so it cannot be published as a resolution
+/// beside this one; naming it in the reason is what this item can honestly do
+/// until that bead lands, and it is deliberately not spelled as a route — the
+/// queue names calls, and a path typed into prose is a second route table.
 fn first_account_action() -> Action {
     Action::new(
         ActionFacts {
@@ -3545,7 +3698,17 @@ fn first_account_action() -> Action {
             // Existential: no account exists, so the item names none.
             subject: None,
         },
-        "No account exists; create one before portfolio actions can be offered.",
+        "No account exists; create one before portfolio actions can be offered. Which accounts to \
+         create is a question this instance answers rather than guesses at, and it does not have to \
+         be guessed at here: a statement names its accounts in its own words, so open an import \
+         session — no account has to be declared for one — and hand it the document. Every record \
+         naming an account this directory does not hold is refused, and the response summarises those \
+         refusals as the distinct account names the document asked for, in the order it printed them, \
+         with the number of records each accounts for. Create an account for each, giving it the \
+         printed string as the identifier its source prints for it, and read the same document again: \
+         the row keys are over the document and the line, so nothing is imported twice. Once a \
+         document has been read, the accounts it asked for are published in this queue by name and \
+         this item does not have to be read for them.",
         ActionTarget::Operation {
             operation: OperationKey::CreateAccount,
             request: RequestPlan {
@@ -3555,6 +3718,139 @@ fn first_account_action() -> Action {
         },
     )
     .expect("first account action has an operation target")
+}
+
+/// One account a kept document asked for, folded over every reading the instance
+/// holds.
+///
+/// The printed string is the whole subject. There is no [`AccountId`] here and
+/// there cannot be: the account does not exist, which is the item's whole point,
+/// and minting an identifier for it would be this queue creating the thing it is
+/// asking the owner to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountNamedByDocument {
+    /// The cell as a document printed it.
+    pub printed: String,
+    /// Records that printed it, summed over the kept documents that did.
+    ///
+    /// Arithmetic over readings and nothing more. Not movements: every one of
+    /// those records was refused, so nothing was read out of any of them.
+    pub records: u32,
+    /// How many kept documents printed it.
+    pub documents: u32,
+}
+
+/// The account a document named that this instance cannot place.
+///
+/// **The one item in this queue whose subject is a string.** Every other item
+/// about an account names it by identifier and prints the owner's own title
+/// beside it; this one has neither, because the account does not exist. What it
+/// has is what the document printed, and that is exactly what the owner needs in
+/// order to recognise which of his accounts is meant.
+///
+/// [`ActionSubject`] is therefore `None`. The vocabulary's account subject
+/// carries an identifier and a title, and filling either with a printed string
+/// would publish, as one of the owner's accounts, something that is not one —
+/// which is a worse answer than the absence, and the absence already reads as
+/// «this is not about an account you hold».
+///
+/// **`provider_account_id` is preset and `title` is not**, and the asymmetry is
+/// decision 0004's. The printed string is what the source repeats; the title is
+/// what the owner reads and may rename tomorrow. Presetting it as the title
+/// would resolve the rows — the third tier matches a title — and would do it
+/// through the vocabulary the resolver deliberately does not offer in its own
+/// refusals, so the first rename would silently stop a statement importing. As
+/// the identifier the source prints, it is the second tier, it beats a title,
+/// and it survives being renamed.
+///
+/// `provider` is missing rather than preset, and it is the owner's: it is his
+/// label for the source, it scopes the identifier so two sources printing short
+/// sequential numbers cannot collide, and nothing in a document says what he
+/// calls the institution.
+///
+/// **`NeedsOwnerInput`, with every field the queue can supply supplied.** Whether
+/// an account of his is meant by this string — and whether it is one account or
+/// two — is his judgement, exactly as the reporting perimeter is. A complete
+/// request does not change who may send it.
+fn account_named_by_document_action(wanted: &AccountNamedByDocument) -> Action {
+    let mut preset = BTreeMap::new();
+    preset.insert(
+        "provider_account_id".to_owned(),
+        wanted.printed.clone().into(),
+    );
+
+    Action::new(
+        ActionFacts {
+            // Scoped to the name: several may stand at once, and an unscoped id
+            // would give every one of them the identity an agent deduplicates
+            // by — which would publish one item for seven accounts.
+            id: format!(
+                "{}:{}",
+                ActionKind::CreateAccountNamedByDocument.id(),
+                wanted.printed
+            ),
+            kind: ActionKind::CreateAccountNamedByDocument,
+            category: ActionCategory::required_for(ActionKind::CreateAccountNamedByDocument),
+            state: ActionState::NeedsOwnerInput,
+            subject: None,
+        },
+        format!(
+            "A document this instance kept prints «{printed}» where it names the account a record is on, \
+             and no single account of yours answers to it — by its iaam identifier, by an identifier a \
+             source prints for it, or by its title. Either none does, or more than one does and the \
+             reading refused rather than choosing. {records} record{record_plural} in {documents} \
+             kept document{document_plural} named it, and every one of them was refused when the document \
+             was read: they are in no journal, so they are in no report, and nothing else says so. \
+             Nothing here decides what the account is. It may be one you hold under another name, in \
+             which case give that account this identifier rather than creating a second; it may be one \
+             you have not described yet, in which case create it. Either way the remedy ends the same: \
+             read the document again, and the records that named it are read this time. The row keys are \
+             over the document and the line, so the records that already imported do not import twice.",
+            printed = wanted.printed,
+            records = wanted.records,
+            record_plural = if wanted.records == 1 { "" } else { "s" },
+            documents = wanted.documents,
+            document_plural = if wanted.documents == 1 { "" } else { "s" },
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::CreateAccount,
+            request: RequestPlan {
+                preset,
+                missing: vec![
+                    MissingInput::plain("/title", ProvidedBy::Owner),
+                    MissingInput::plain("/provider", ProvidedBy::Owner),
+                ],
+            },
+        },
+    )
+    .expect("the named-account item names the account route")
+}
+
+/// Whether a name a document printed still names no single account of his.
+///
+/// **Asked here and never stored.** The record says a document printed a string;
+/// whether the directory places it is a question about the directory, and the
+/// directory moves. A stored verdict would keep publishing an account the owner
+/// created an hour ago, and a queue that publishes work already done is a queue
+/// he learns to ignore.
+///
+/// Asked through [`iaam_ingest::csv_source::AccountNames::resolve`] and nowhere
+/// else, because that is the one implementation of decision 0004's tiering. A
+/// second copy here — «is there an account with this title» — would let the
+/// queue and the reader disagree about the same string, and the disagreement
+/// would look like a queue item that never closes.
+fn account_named_by_document_completion(
+    directory: &iaam_ingest::csv_source::AccountNames,
+    printed: &str,
+) -> bool {
+    directory.resolve(printed).is_ok()
+}
+
+fn account_named_by_document_gap(
+    directory: &iaam_ingest::csv_source::AccountNames,
+    printed: &str,
+) -> bool {
+    !account_named_by_document_completion(directory, printed)
 }
 
 /// The account no contour names and the owner has not ruled out.
@@ -3774,6 +4070,7 @@ mod tests {
     use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
     use iaam_core::report::confidence::CaveatKind;
     use iaam_ingest::classification::{Answer, Counterparty, FarSide};
+    use iaam_ingest::profile::UnresolvedAccountName;
     use iaam_store::SqliteStore;
     use std::collections::BTreeSet;
     use time::macros::date;
@@ -3798,7 +4095,7 @@ mod tests {
             "two kinds share an identity, or one is listed twice: {:?}",
             ActionKind::ALL.map(ActionKind::id)
         );
-        assert_eq!(ActionKind::ALL.len(), 18, "a kind was added without a goal");
+        assert_eq!(ActionKind::ALL.len(), 19, "a kind was added without a goal");
     }
 
     /// Every kind graded `RequiredForGoal` names at least one goal, and every
@@ -3810,7 +4107,7 @@ mod tests {
     /// the mapping, written a second time, from what the reports actually read.
     ///
     /// The `match` is exhaustive on purpose, and that is what keeps this from
-    /// going stale. A nineteenth kind does not slip through — it stops the test
+    /// going stale. A twentieth kind does not slip through — it stops the test
     /// from compiling, so whoever adds it answers, here, which reports their new
     /// item stands in the way of, before the queue can publish an item that
     /// names none.
@@ -3827,6 +4124,14 @@ mod tests {
             let expected: &[ReportGoal] = match kind {
                 // Blocking: it stops the next call, not a report.
                 ActionKind::CreateFirstAccount => &[],
+                // The records that named this account were refused when the
+                // document was read, so they are in no journal and therefore in
+                // no report. The same grading `StartAccountImport` gets, for the
+                // same reason, and it is the whole of the item's case for being
+                // required rather than recommended.
+                ActionKind::CreateAccountNamedByDocument => {
+                    &[AssetSnapshot, MoneyFlow, Returns, Reconciliation]
+                }
                 // An account in no contour is outside `report_population`'s
                 // covered set. Not reconciliation: `reconciliation::report`
                 // takes an account and resolves no contour.
@@ -4083,6 +4388,248 @@ mod tests {
         assert_eq!(request.missing[0].pointer, "/title");
         assert_eq!(request.missing[0].provided_by, ProvidedBy::Owner);
         assert!(request.missing[0].candidates.is_none());
+    }
+
+    // --- The accounts a document asked for (iaam-x9ls) ----------------------
+    //
+    // The defect these cover, in one sentence: `create_first_account` says
+    // «create an account» and cannot say which, so an agent following the queue
+    // literally invents a title, the import refuses every row against it, and
+    // the only way to learn the real names is to provoke two hundred refusals
+    // and mine them.
+
+    fn wanted(printed: &str, records: u32, documents: u32) -> AccountNamedByDocument {
+        AccountNamedByDocument {
+            printed: printed.to_owned(),
+            records,
+            documents,
+        }
+    }
+
+    fn queue_wanting(accounts: &[AccountView], wanted: &[AccountNamedByDocument]) -> Vec<Action> {
+        actions_from_state(&OwnerState {
+            accounts,
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            retired: RetirementAssessment::Assessed(&[]),
+            sessions: &[],
+            questions: &[],
+            rules: &[],
+            wanted_accounts: wanted,
+        })
+        .expect("actions from state")
+    }
+
+    /// The queue names the account, and hands back a request that resolves it.
+    ///
+    /// Two assertions and the second is the one that matters. The name is in the
+    /// item, so a reader learns it without provoking anything; and the request
+    /// presets `provider_account_id` rather than `title`, so the account created
+    /// from this item is recognised at decision 0004's *identity* tier — which a
+    /// rename does not move — instead of the title tier, which it does.
+    #[test]
+    fn the_queue_names_the_account_a_document_asked_for() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 220, 1)]);
+
+        let action = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .expect("the account a document named is in the queue");
+        assert!(
+            action.reason().contains("Shop One"),
+            "the item must name the account: {}",
+            action.reason()
+        );
+        assert!(
+            action.reason().contains("220"),
+            "the item must say how many records named it: {}",
+            action.reason()
+        );
+        assert_eq!(action.state(), ActionState::NeedsOwnerInput);
+
+        let ActionTarget::Operation { operation, request } = action.target() else {
+            panic!("the named-account item needs an operation target");
+        };
+        assert_eq!(*operation, OperationKey::CreateAccount);
+        assert_eq!(
+            request.preset.get("provider_account_id"),
+            Some(&serde_json::Value::String("Shop One".to_owned())),
+            "the printed string is the identifier the source prints, not a title"
+        );
+        assert!(
+            !request.preset.contains_key("title"),
+            "what the owner calls the account is his, and a rename must not stop the import"
+        );
+        let missing: Vec<&str> = request
+            .missing
+            .iter()
+            .map(|input| input.pointer.as_str())
+            .collect();
+        assert_eq!(missing, vec!["/title", "/provider"]);
+    }
+
+    /// One item per account, not one per document.
+    ///
+    /// Two statements of one bank naming the same unknown account are one
+    /// account to create. The counts are summed over the readings, because that
+    /// is what «how much of my history is unread because of this» asks.
+    #[test]
+    fn two_documents_naming_one_account_raise_one_item() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 12, 2)]);
+        let named: Vec<&Action> = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .collect();
+        assert_eq!(named.len(), 1);
+        assert!(
+            named[0].reason().contains("2 kept documents"),
+            "{}",
+            named[0].reason()
+        );
+    }
+
+    /// Each name is its own item, with its own identity.
+    ///
+    /// An unscoped identity would give seven accounts one item, and an agent
+    /// deduplicating by `id` — which is what `id` is for — would act on one of
+    /// them and believe it was done.
+    #[test]
+    fn each_named_account_is_its_own_item() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 3, 1), wanted("Shop Two", 4, 1)]);
+        let ids: BTreeSet<&str> = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .map(Action::id)
+            .collect();
+        assert_eq!(ids.len(), 2, "two accounts, two items: {ids:?}");
+    }
+
+    /// The blocking item stands beside them and says how the names were learned.
+    ///
+    /// It cannot name an account itself — in an empty instance nothing has been
+    /// read, so there is no name to publish — but it must not be the dead end it
+    /// was: the sentence has to say that the question has an answer and that
+    /// handing a document over is what gives it.
+    #[test]
+    fn the_first_account_item_says_how_to_find_out_which() {
+        let actions = queue_wanting(&[], &[]);
+        let action = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::CreateFirstAccount)
+            .expect("an empty directory raises the blocking item");
+        let reason = action.reason();
+        assert!(
+            reason.contains("import session") && reason.contains("document"),
+            "the item must name the act that publishes the account names: {reason}"
+        );
+    }
+
+    /// A name the directory now places raises nothing.
+    ///
+    /// This is the whole reason the stored fact is a transcription and the
+    /// verdict is recomputed: an account created after the reading closes the
+    /// item without the document being read again, and a queue that kept
+    /// publishing it would be one the owner learns to ignore.
+    #[tokio::test]
+    async fn an_account_that_answers_to_the_name_closes_the_item() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let session = store
+            .open_import_session(owner, None, None, None)
+            .await
+            .expect("session");
+        let document = RawHash::parse(&"d".repeat(64)).expect("raw hash");
+        store
+            .record_unresolved_accounts(
+                owner,
+                document,
+                session.id,
+                vec![
+                    UnresolvedAccountName {
+                        printed: "Shop One".to_owned(),
+                        records: 3,
+                    },
+                    UnresolvedAccountName {
+                        printed: "Shop Two".to_owned(),
+                        records: 1,
+                    },
+                ],
+            )
+            .await
+            .expect("record");
+
+        let before: Vec<String> = frontier(owner, &store, &store)
+            .await
+            .expect("frontier")
+            .iter()
+            .filter(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .map(|action| action.id().to_owned())
+            .collect();
+        assert_eq!(before.len(), 2, "{before:?}");
+
+        store
+            .upsert_account(owner, named("Shop One"))
+            .await
+            .expect("account");
+
+        let after: Vec<String> = frontier(owner, &store, &store)
+            .await
+            .expect("frontier")
+            .iter()
+            .filter(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .map(|action| action.id().to_owned())
+            .collect();
+        assert_eq!(
+            after.len(),
+            1,
+            "the account the owner created must close its own item: {after:?}"
+        );
+        assert!(after[0].contains("Shop Two"), "{after:?}");
+    }
+
+    /// A second reading of one document replaces what the first recorded.
+    ///
+    /// Two readings are two answers to the same question against a directory
+    /// that moved, and the later one is the current one. Adding to the set
+    /// instead would count one document's records twice and leave a name nobody
+    /// can close.
+    #[tokio::test]
+    async fn a_second_reading_replaces_what_the_first_recorded() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let session = store
+            .open_import_session(owner, None, None, None)
+            .await
+            .expect("session");
+        let document = RawHash::parse(&"e".repeat(64)).expect("raw hash");
+        store
+            .record_unresolved_accounts(
+                owner,
+                document.clone(),
+                session.id,
+                vec![UnresolvedAccountName {
+                    printed: "Shop One".to_owned(),
+                    records: 3,
+                }],
+            )
+            .await
+            .expect("first reading");
+        store
+            .record_unresolved_accounts(owner, document, session.id, Vec::new())
+            .await
+            .expect("second reading");
+
+        assert!(
+            frontier(owner, &store, &store)
+                .await
+                .expect("frontier")
+                .iter()
+                .all(|action| action.kind() != ActionKind::CreateAccountNamedByDocument),
+            "an empty reading is the statement that every account was placed"
+        );
     }
 
     #[tokio::test]
@@ -4647,6 +5194,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -4718,6 +5266,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -4983,6 +5532,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
         let mut sorted = actions;
@@ -5054,6 +5604,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
         let import = actions
@@ -5161,6 +5712,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
         // What this test is about is the gap and its closing. The target is
@@ -5192,6 +5744,7 @@ mod tests {
                 sessions: &[],
                 questions: &[],
                 rules: &[],
+                wanted_accounts: &[],
             })
             .expect("actions from state")
             .iter()
@@ -5222,6 +5775,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state")
     }
@@ -5393,6 +5947,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
         let ids: Vec<_> = actions
@@ -5424,6 +5979,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
         assert!(
@@ -5443,6 +5999,7 @@ mod tests {
                 sessions: &[],
                 questions: &[],
                 rules: &[],
+                wanted_accounts: &[],
             })
             .expect("actions from state")
             .iter()
@@ -6560,6 +7117,7 @@ mod tests {
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -6601,6 +7159,7 @@ mod tests {
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -6636,6 +7195,7 @@ mod tests {
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -6679,6 +7239,7 @@ mod tests {
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -6708,6 +7269,7 @@ mod tests {
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -6760,6 +7322,7 @@ mod tests {
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -6791,6 +7354,7 @@ mod tests {
                 sessions: &[],
                 questions: std::slice::from_ref(&question),
                 rules: &[],
+                wanted_accounts: &[],
             })
             .expect("actions from state");
             assert!(
@@ -6824,6 +7388,7 @@ mod tests {
             sessions: &[],
             questions: &[first.clone(), second.clone()],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 
@@ -6981,6 +7546,7 @@ mod tests {
             sessions: &[],
             questions: std::slice::from_ref(question),
             rules,
+            wanted_accounts: &[],
         })
         .expect("actions from state")
     }
@@ -7204,6 +7770,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state")
     }
@@ -7265,6 +7832,7 @@ mod tests {
             sessions,
             questions,
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state")
     }
@@ -7363,6 +7931,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("a fold that refused must not take the queue with it");
 
@@ -7533,6 +8102,7 @@ mod tests {
             sessions: &[],
             questions: &[],
             rules: &[],
+            wanted_accounts: &[],
         })
         .expect("actions from state");
 

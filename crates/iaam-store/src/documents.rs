@@ -411,3 +411,113 @@ fn parse_uuid(value: &str, what: &'static str) -> Result<uuid::Uuid, StoreError>
         id: value.to_owned(),
     })
 }
+
+/// One account name a reading of a document could not place, as it is stored.
+///
+/// A transcription and a count, and nothing else. Whether the owner's directory
+/// still fails to resolve `printed` is decided by whoever reads this back,
+/// against the directory as it then stands — see the migration for why a stored
+/// verdict would go quietly stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAccountRecord {
+    pub document_hash: RawHash,
+    pub import_session: uuid::Uuid,
+    /// The cell as the document printed it.
+    pub printed: String,
+    /// Records of that document that printed it.
+    pub records: u32,
+}
+
+impl SqliteStore {
+    /// Record what one reading of one document could not place.
+    ///
+    /// **The document's whole set is replaced, in one transaction.** A reading
+    /// is an answer to «what does this document ask for, against the directory
+    /// as it now stands», and a second reading — after the owner created two of
+    /// the accounts, say — answers it again and answers it better. Adding to the
+    /// set rather than replacing it would leave the two answers side by side
+    /// with nothing saying which is current, and would count one document's
+    /// records twice.
+    ///
+    /// An empty `names` is therefore a statement and not a no-op: it says this
+    /// reading placed every account the document named, and it is what clears
+    /// the rows an earlier reading left.
+    pub fn record_unresolved_accounts(
+        &mut self,
+        owner: OwnerId,
+        document_hash: &RawHash,
+        import_session: uuid::Uuid,
+        names: &[(String, u32)],
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM document_unresolved_accounts
+             WHERE owner = ?1 AND document_hash = ?2",
+            params![owner.inner().to_string(), document_hash.as_str()],
+        )?;
+        let recorded_at = now();
+        for (ordinal, (printed, records)) in names.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO document_unresolved_accounts (
+                     owner, document_hash, printed, ordinal, records,
+                     import_session, recorded_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    owner.inner().to_string(),
+                    document_hash.as_str(),
+                    printed.as_str(),
+                    i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    i64::from(*records),
+                    import_session.to_string(),
+                    recorded_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every such name this instance holds for the owner.
+    ///
+    /// Ordered by document and then by the position the document first printed
+    /// the name at, so a caller sees each document's names in the order its own
+    /// file prints them. The owner is in the query rather than checked after
+    /// reading, for the reason every read here gives.
+    pub fn list_unresolved_accounts(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<UnresolvedAccountRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT document_hash, import_session, printed, records
+             FROM document_unresolved_accounts
+             WHERE owner = ?1
+             ORDER BY document_hash, ordinal",
+        )?;
+        let rows = statement.query_map(params![owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for entry in rows {
+            let (document_hash, session, printed, count) = entry?;
+            records.push(UnresolvedAccountRecord {
+                document_hash: RawHash::parse(&document_hash).ok_or_else(|| {
+                    StoreError::DocumentDecode {
+                        id: document_hash.clone(),
+                        detail: "document hash is not SHA-256".to_owned(),
+                    }
+                })?,
+                import_session: parse_uuid(&session, "import session")?,
+                printed,
+                records: u32::try_from(count).unwrap_or(u32::MAX),
+            });
+        }
+        Ok(records)
+    }
+}

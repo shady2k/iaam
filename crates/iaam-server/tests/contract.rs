@@ -23424,6 +23424,21 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
         );
     }
 
+    // And the same two refusals, said once per account instead of once per
+    // record (iaam-x9ls). This is what makes the answer usable at scale: an
+    // export whose records are on accounts this instance does not hold refuses
+    // every one of them, correctly, and a caller that had to deduplicate the
+    // names out of those sentences has to walk the whole list first.
+    //
+    // Nothing here is a conclusion. The name is the cell as the export printed
+    // it, and the count is how many of its records printed it.
+    let wanted = read["unresolved_accounts"]
+        .as_array()
+        .expect("the accounts the document asked for");
+    assert_eq!(wanted.len(), 1, "{read}");
+    assert_eq!(wanted[0]["printed"], "Outside");
+    assert_eq!(wanted[0]["records"], 2);
+
     let held: Vec<&Value> = rows
         .iter()
         .filter(|row| row["state"] != "unreadable")
@@ -23459,6 +23474,62 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
             "{row}"
         );
     }
+
+    // The assessment says the same thing, and it is the one place `missing`
+    // structurally could not (iaam-x9ls). `missing` is a list of identifiers,
+    // and a printed name that matched no account has none — so the section whose
+    // whole purpose is «which accounts did these rows name» was silent about the
+    // only accounts the owner has to act on.
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(
+        plan["account_resolution"]["unrecognised"],
+        json!(["Outside"]),
+        "{plan}"
+    );
+    assert_eq!(
+        plan["account_resolution"]["missing"],
+        json!([]),
+        "no row of this session named an account by an identifier the owner does not \
+         hold — the records that named one were refused: {plan}"
+    );
+
+    // And the queue names it, so the owner learns which account to create
+    // without provoking the refusals again. The request it publishes carries the
+    // printed string as the identifier the source prints, not as a title: a
+    // title is his and he may change it, and the identity tier beats it.
+    let (status, queue) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{queue}");
+    let wanted: Vec<&Value> = queue
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "create_account_named_by_document")
+        .collect();
+    assert_eq!(wanted.len(), 1, "{queue}");
+    assert_eq!(wanted[0]["id"], "create_account_named_by_document:Outside");
+    assert_eq!(wanted[0]["target"]["operationId"], "create_account");
+    assert_eq!(
+        wanted[0]["target"]["request"]["preset"]["provider_account_id"], "Outside",
+        "{queue}"
+    );
+    assert!(
+        wanted[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Outside")),
+        "{queue}"
+    );
 
     // The document was kept under the profile that read it, so the remedy for a
     // corrected profile is to read the stored document again rather than to

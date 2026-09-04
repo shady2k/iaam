@@ -188,7 +188,7 @@ things. Read it as the lookup table for §1.
 | `POST /v1/reconciliation/balance` | `OwnerBalanceOutcomeDto` | object, `statuses` | `control_assertions` — whether each claim reached the journal or was already held there, which no status row can say |
 | `POST /v1/import-sessions/{session}/rows` | `[ImportRowDto]` | bare array | one outcome per fed row; nothing was recorded |
 | `POST /v1/documents` | `DocumentDto` | object, `rows` | the document hash, source, parser version and period |
-| `POST /v1/import-sessions/{session}/document` | `SourceDocumentDto` | object, `rows` | the document hash, the source it is kept under, and which source profile read it — none of which a row can carry |
+| `POST /v1/import-sessions/{session}/document` | `SourceDocumentDto` | object, `rows` | the document hash, the source it is kept under, which source profile read it, and `unresolved_accounts` — the distinct account names the document asked for and this instance does not hold, each with the number of records it accounts for. None of the first three is a property of a row; the fourth is a fold over every row, and a caller that had to compute it would have to walk the whole list to find out that two hundred refusals are seven accounts |
 | `GET /v1/source-profiles` | `SourceProfileCatalogueDto` | object, `profiles` | `refused` — the files this instance would not read and why, which no installed profile can say; a profile that merely failed to load is otherwise indistinguishable from one nobody wrote |
 | `POST /v1/brokers/{broker}/sync` | `SyncOutcomeDto` | object, `recorded` | the duplicate and assertion counts for the run, and `actions` |
 | `POST /v1/import-sessions/{session}/commit` | `ImportCommitDto` | object, `rows` | the session and the revision the commit was planned from |
@@ -368,6 +368,10 @@ prints only its identifier, with no name table beside it in the same response:
   `AccountResolutionDto.resolved` and `.missing`, `ScopeAssessmentDto`'s three
   lists, `PlannedFactDto.account`, `TransferLegDto.account`. The session's
   questions do keep the rule; the assessment printed beside them does not.
+  `AccountResolutionDto.unrecognised` is **not** one of these and is not an
+  exception to the rule: it carries no identifier, because the accounts it names
+  do not exist. It is the string a document printed, which is the whole of what
+  is known about them.
 - Contour references: `AccountScopeDto.contours`, `ContourDto.accounts`,
   `ContourVersionDto.accounts`, `PopulationDto.contour`,
   `MoneyFlowReportDto.contour`, `AppliedRulesDto.contour`.

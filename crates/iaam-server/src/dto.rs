@@ -9368,10 +9368,34 @@ pub struct SourceInventoryDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AccountResolutionDto {
     pub resolved: Vec<Uuid>,
-    /// Named by a row and absent from the owner's directory.
+    /// Named by a row **by identifier** and absent from the owner's directory.
+    ///
+    /// Identifiers, and only identifiers. A printed name that matched no
+    /// account has none, so it is not here and cannot be: see `unrecognised`.
     pub missing: Vec<Uuid>,
     /// Counterparty strings naming more than one of the owner's accounts.
     pub conflicting: Vec<String>,
+    /// Account names a document of this session printed that name no single
+    /// account of the owner's.
+    ///
+    /// A fourth field rather than a widening of `missing` (decision 0024).
+    /// `missing` is a list of identifiers because a row that named an account
+    /// carried one; a string a document printed and the directory did not
+    /// recognise has no identifier at all. Widening `missing` to hold both would
+    /// put two kinds of thing in one slot, distinguishable only by which half of
+    /// a union is filled — and a caller that reads `missing` as identifiers
+    /// would either break or silently drop the entries that matter most.
+    ///
+    /// **The records these names came from are not in this session.** They were
+    /// refused when the document was read, so no row here carries them and no
+    /// figure below counts them. Reading this list as pending rows would say the
+    /// commit is about to record something it will not.
+    ///
+    /// Empty is «every account the documents named is in the directory», and it
+    /// is recomputed against the directory as it now stands: an account created
+    /// since the reading removes its name from this list without the document
+    /// being read again.
+    pub unrecognised: Vec<String>,
 }
 
 /// Where the rows' accounts stand relative to the reporting perimeter.
@@ -9859,6 +9883,7 @@ impl ImportPlanDto {
                     .map(|id| id.inner())
                     .collect(),
                 conflicting: plan.account_resolution.conflicting.clone(),
+                unrecognised: plan.account_resolution.unrecognised.clone(),
             },
             scope_assessment: ScopeAssessmentDto {
                 in_contour: plan
@@ -10287,6 +10312,44 @@ pub struct SourceDocumentDto {
     pub document_hash: String,
     pub profile: ReadingProfileDto,
     pub rows: Vec<SourceDocumentRowDto>,
+    /// The accounts this document asked for that this instance could not place.
+    ///
+    /// «Could not place» is the exact claim, and it covers two states the row
+    /// refusals tell apart: the string names none of the owner's accounts, which
+    /// is the ordinary one, or it names more than one and the reading refused
+    /// rather than choosing. Neither is a conclusion about what the account is.
+    ///
+    /// One entry per distinct name, in the order the document first printed it,
+    /// with the number of the document's records that printed it. **A summary of
+    /// the refusals below and never an addition to them**: every one of those
+    /// records is refused by name and locator in `rows`, which stays the
+    /// contract; this says the same thing once per account instead of once per
+    /// record, so that a statement whose two hundred rows are on seven unknown
+    /// accounts is answered in seven lines.
+    ///
+    /// Nothing here is a conclusion. The count is arithmetic over this reading —
+    /// how many records printed the string — and not a count of movements, since
+    /// those records were refused and nothing was read out of them. No account
+    /// is proposed, none is created, and the string is not interpreted: it is the
+    /// cell as the document printed it, which is the only thing anybody here
+    /// knows about that account.
+    ///
+    /// Empty for a document that names its account in no column: such a profile
+    /// takes the caller's declaration, which is resolved once for the whole
+    /// document rather than once per record.
+    pub unresolved_accounts: Vec<UnresolvedAccountDto>,
+}
+
+/// One account a document asked for by a name this instance could not place.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UnresolvedAccountDto {
+    /// The cell as the document printed it, trimmed and otherwise verbatim.
+    pub printed: String,
+    /// Records of this document that printed it. Named `records` and not `rows`
+    /// because `rows` beside it is the list of outcomes, and one word for a
+    /// count and a list is how a reader comes to believe the count indexes the
+    /// list (conventions §3.5).
+    pub records: usize,
 }
 
 impl SourceDocumentDto {
@@ -10312,6 +10375,14 @@ impl SourceDocumentDto {
                 .rows
                 .iter()
                 .map(SourceDocumentRowDto::from_domain)
+                .collect(),
+            unresolved_accounts: import
+                .unresolved_accounts
+                .iter()
+                .map(|name| UnresolvedAccountDto {
+                    printed: name.printed.clone(),
+                    records: name.records,
+                })
                 .collect(),
         }
     }

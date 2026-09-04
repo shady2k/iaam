@@ -26,3 +26,4 @@
 | [0020](0020-a-fact-names-its-reader-and-keeps-the-sources-two-words-apart.md) | A fact names its reader, and the source's two words stay apart | 2026-09-04 | proposed | `iaam-h69n` |
 | [0021](0021-the-authority-a-call-demands-is-a-property-of-the-call.md) | The authority a call demands is a property of the call | 2026-09-04 | proposed | `iaam-woeh` |
 | [0022](0022-an-agent-may-convey-a-document-and-may-not-interpret-one.md) | An agent may convey a document, and may not interpret one | 2026-09-04 | proposed | `iaam-cw3k` |
+| [0024](0024-the-system-says-which-accounts-a-statement-asked-for.md) | The system says which accounts a statement asked for | 2026-09-04 | proposed | `iaam-x9ls` |

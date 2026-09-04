@@ -385,6 +385,21 @@ async fn park(
     question: &Question,
     resolver: &Resolver,
 ) -> Result<AskedQuestion, AppError> {
+    // The observation the question was raised from. The wording needs it: a
+    // question alone does not say which row of a statement it is about, and
+    // four rows of one export produced four identical sentences before it did
+    // (`iaam-3ewp`) — see [`Resolver::render`].
+    //
+    // Matched here rather than taken as a seventh argument, and the arm is
+    // written out rather than assumed. Only an observation can be unsettled — a
+    // conclusion is recorded, not questioned — so this is unreachable, and an
+    // invariant refused in one line is one a later caller cannot break by
+    // handing the wrong half of the pair along.
+    let Intake::Observed { row } = intake else {
+        return Err(AppError::Store(
+            "a concluded row reached the question path".to_owned(),
+        ));
+    };
     let observation = services
         .store
         .add_import_observation(
@@ -397,7 +412,7 @@ async fn park(
             })?,
         )
         .await?;
-    let prompt = resolver.render(question);
+    let prompt = resolver.render(question, row);
     let alternatives = question.alternatives();
     let stored = services
         .store
@@ -824,7 +839,7 @@ pub async fn add_rows(
                 row: observation.row,
             }),
             Assessment::Ambiguous { question } => {
-                let prompt = resolver.render(&question);
+                let prompt = resolver.render(&question, row);
                 let alternatives = question.alternatives();
                 let stored = services
                     .store
@@ -3479,21 +3494,60 @@ impl Resolver {
         }
     }
 
-    /// The question in words, with account titles rather than identifiers.
+    /// The question in words, with account titles rather than identifiers, and
+    /// with the row named the way a person can find it on a statement.
     ///
     /// The rendering is here rather than in `iaam-ingest` because the pure
     /// function has no directory, and a sentence containing a UUID is not a
     /// specific question.
-    fn render(&self, question: &Question) -> String {
+    ///
+    /// **Why the row is handed in as well as the question (`iaam-3ewp`).** A
+    /// [`Question`] carries what the row left open — the account, the word the
+    /// source printed, the party it named — and none of that distinguishes one
+    /// row of a statement from another. One export raised four
+    /// `UnresolvedDirection` questions whose four sentences were identical to
+    /// the character, because all four rows carried the same word and named
+    /// nobody. The owner matched question to row by counting down the list, got
+    /// the offset wrong, and answered for rows he had not read — and a wrong
+    /// answer is *accepted*: it settles the row, may be generalised into a
+    /// standing rule, and nothing ever asks again.
+    ///
+    /// This is **not** the identifier problem earlier waves fixed. The row
+    /// number is a perfectly good identifier, it is published beside the
+    /// question, and it is what the answering call takes. What was missing is
+    /// what a *human* recognises a row by, and on a bank statement that is the
+    /// date and the amount.
+    ///
+    /// **Why they go in the sentence rather than into two new published
+    /// fields.** The prompt is the one carrier both surfaces share: the same
+    /// string is the ingest verdict's `question`, the session's `prompt`, and
+    /// the action queue's `reason` ([`crate::actions`]). Fields on
+    /// `ImportQuestionDto` would leave the queue publishing four items nothing
+    /// tells apart. And a published amount invites a client to compute with it,
+    /// while the figures a session's rows are read by are published by the
+    /// assessment route, computed by planning the commit — a second rendering
+    /// of the same rows built from the stored observation is exactly the pair of
+    /// readings that can disagree which `ImportSessionContentsDto.row_count`
+    /// documents refusing.
+    fn render(&self, question: &Question, row: &ObservedRow) -> String {
         let account = self.title(question.account());
+        let mark = row_mark(row);
+        // One clause, identical on all four, saying that the alternatives carry
+        // their own consequences. The consequences themselves are **not** here:
+        // seven of them in one sentence would be a mapping from a word to its
+        // effect encoded as prose, which `docs/api/conventions.md` §5 refuses,
+        // and they are published attached to the words they belong to — see
+        // [`AnswerShape::consequence`].
+        let stakes = "What you answer decides which figure the row moves in your money-flow \
+                      report; each alternative published with this question says which.";
         match question {
             Question::IsTransferInternal { counterparty, .. } => format!(
-                "On {account}, the source named «{counterparty}» as the other side. \
-                 Is that one of your own accounts, and if so which one?"
+                "On {account}, {mark}: the source named «{counterparty}» as the other side. \
+                 Is that one of your own accounts, and if so which one? {stakes}"
             ),
             Question::IsOutflowAFee { .. } => format!(
-                "Money left {account} and the source named no counterparty. \
-                 Was it a fee, or a payment out?"
+                "On {account}, {mark}: money left the account and the source named no \
+                 counterparty. Was it a fee, or a payment out? {stakes}"
             ),
             // Three alternatives and therefore three clauses. The middle one is
             // new wording as well as a new answer: the question used to read
@@ -3502,9 +3556,9 @@ impl Resolver {
             // to a human, and to an agent relaying it, as the refund the
             // vocabulary could not express (`iaam-7l7v`).
             Question::IsInflowIncome { .. } => format!(
-                "Money arrived at {account} and the source named no counterparty. \
+                "On {account}, {mark}: money arrived and the source named no counterparty. \
                  Was it income the capital earned, money a counterparty returned \
-                 on something you paid for, or money coming in from outside?"
+                 on something you paid for, or money coming in from outside? {stakes}"
             ),
             Question::UnresolvedDirection {
                 stated,
@@ -3533,10 +3587,47 @@ impl Resolver {
                         )
                     },
                 );
-                format!("On {account}, the source stated {word} and {rest}. Which was it?")
+                format!(
+                    "On {account}, {mark}: the source stated {word} and {rest}. \
+                     Which was it? {stakes}"
+                )
             }
         }
     }
+}
+
+/// The row as a person finds it on the statement in front of him: its date and
+/// the amount with the sign the source printed.
+///
+/// **Two facts and no more.** The description would narrow it further, and it is
+/// deliberately left out: it is the row's whole text, of unbounded length and
+/// written by the source, and pasting it into a sentence the owner reads is how
+/// a statement's own words end up quoted in a queue item, a log line and an
+/// agent transcript. A date and an amount identify a line on a month's statement
+/// well enough to point at, and stop there.
+///
+/// **The sign is kept.** [`ObservedRow::amount_minor`] holds the amount as the
+/// source printed it, and this is a recognition aid: the owner is matching it
+/// against a line he is looking at, not against a normalised figure. For the one
+/// question where the direction is genuinely open the sign is not evidence of
+/// anything — that is why the question exists — and printing it as the source
+/// did says exactly what the source said and no more.
+///
+/// **An undated row says so.** The formatting drops nothing silently: a row with
+/// no date at all is a row the commit will refuse for want of one, and a
+/// sentence that just omitted the date would read as a row dated nowhere in
+/// particular.
+///
+/// [`decimal`] and not arithmetic of its own: the same value in another
+/// representation, which is the one transition §3.4 allows, and the one this
+/// module already prints a control figure with.
+fn row_mark(row: &ObservedRow) -> String {
+    let amount = decimal(PostedMinor::new(row.amount_minor), row.currency);
+    let code = row.currency.code();
+    row.dates.effective_date().map_or_else(
+        || format!("the row for {amount} {code}, which the source left undated"),
+        |date| format!("the row dated {date} for {amount} {code}"),
+    )
 }
 
 /// One account as the tiering reads it.
@@ -3902,6 +3993,20 @@ mod tests {
             direction: ObservedDirection::Inner,
             amount_minor: 1_000,
             source_kind: Some("INNER".to_owned()),
+            ..row
+        }
+    }
+
+    /// The same row with the source naming nobody, at the amount it printed.
+    ///
+    /// The shape `iaam-3ewp` was found in: a word the bank uses for a movement
+    /// internal to itself, an amount, a date, and no counterparty at all. It is
+    /// the absence of the counterparty that makes several such rows of one
+    /// statement read alike, so it is what the fixture has to reproduce.
+    fn anonymous(row: ObservedRow, amount_minor: i64) -> ObservedRow {
+        ObservedRow {
+            counterparty: ObservedCounterparty::Unknown,
+            amount_minor,
             ..row
         }
     }
@@ -4544,6 +4649,141 @@ mod tests {
             Classification::ExternalFlow,
             "the outcome is the classification the answer settled the row as"
         );
+    }
+
+    // --- what a question says about the row (iaam-3ewp, iaam-pzm9) --------
+
+    /// The defect, in the shape it was found in: one statement, several rows
+    /// the source described with the same word and no counterparty, and four
+    /// questions whose sentences were identical to the character.
+    ///
+    /// The owner matched question to row by counting down the list, got the
+    /// offset wrong, and answered for rows he had not read. Nothing catches
+    /// that afterwards: an answer the question admits is accepted, it settles
+    /// the row, it may become a standing rule, and no later call asks again.
+    ///
+    /// Two rows here rather than four, because two is what the assertion needs:
+    /// they agree on the account, the word, the currency and the absence of a
+    /// counterparty, and differ only in the two things a person reads a
+    /// statement by.
+    #[test]
+    fn two_rows_differing_only_in_date_and_amount_get_questions_that_tell_them_apart() {
+        let main = account(1);
+        let resolver = resolver(vec![detail(main, "Main")]);
+        let first = anonymous(
+            directionless(row(main, "", Some(date!(2026 - 03 - 04)))),
+            1_000,
+        );
+        let second = anonymous(
+            directionless(row(main, "", Some(date!(2026 - 03 - 19)))),
+            4_250,
+        );
+
+        let question = Question::UnresolvedDirection {
+            account: main,
+            stated: Some("INNER".to_owned()),
+            counterparty: None,
+        };
+        let one = resolver.render(&question, &first);
+        let other = resolver.render(&question, &second);
+
+        assert_ne!(
+            one, other,
+            "the two rows raised the same question, and the question is all the \
+             owner is shown: if the sentences match he can only count"
+        );
+        assert!(
+            one.contains("2026-03-04") && one.contains("10.00"),
+            "the row is named by what a person finds it on the statement by: {one}"
+        );
+        assert!(
+            other.contains("2026-03-19") && other.contains("42.50"),
+            "and so is the other one: {other}"
+        );
+    }
+
+    /// The amount is printed with the sign the source printed.
+    ///
+    /// Not normalised to a magnitude. This is a recognition aid — the owner is
+    /// matching it against a line he is looking at — and
+    /// [`ObservedRow::amount_minor`] exists precisely to keep what the source
+    /// said. Where the question is about a direction the sign is not evidence
+    /// of one, which is why the question is being asked at all; printing it as
+    /// the source did says what the source said and stops.
+    #[test]
+    fn the_question_prints_the_amount_with_the_sign_the_source_printed() {
+        let main = account(1);
+        let resolver = resolver(vec![detail(main, "Main")]);
+        let outgoing = anonymous(row(main, "", Some(date!(2026 - 03 - 04))), -1_000);
+        let question = Question::IsOutflowAFee { account: main };
+
+        let prompt = resolver.render(&question, &outgoing);
+        assert!(prompt.contains("-10.00"), "{prompt}");
+    }
+
+    /// A row with no date says so instead of quietly losing the clause.
+    ///
+    /// Such a row exists — the commit refuses it for want of a date — and a
+    /// sentence that simply omitted the date would read as a row dated nowhere
+    /// in particular rather than as one the source dated nowhere at all.
+    #[test]
+    fn a_row_the_source_left_undated_says_so_rather_than_dropping_the_clause() {
+        let main = account(1);
+        let resolver = resolver(vec![detail(main, "Main")]);
+        let undated = anonymous(directionless(row(main, "", None)), 1_000);
+        let question = Question::UnresolvedDirection {
+            account: main,
+            stated: Some("INNER".to_owned()),
+            counterparty: None,
+        };
+
+        let prompt = resolver.render(&question, &undated);
+        assert!(
+            prompt.contains("undated") && prompt.contains("10.00"),
+            "the absence is stated and the amount still identifies the row: {prompt}"
+        );
+    }
+
+    /// All four questions say that the answer decides something, not just that
+    /// the row is unclear (iaam-pzm9).
+    ///
+    /// The clause is one sentence and identical on all four, and that is the
+    /// decision: the consequences themselves are seven, one per alternative,
+    /// and they are published attached to the words they belong to rather than
+    /// gathered into the prompt — see [`AnswerShape::consequence`].
+    #[test]
+    fn every_question_says_that_the_answer_decides_a_figure_in_the_report() {
+        let main = account(1);
+        let resolver = resolver(vec![detail(main, "Main")]);
+        let subject = anonymous(
+            directionless(row(main, "", Some(date!(2026 - 03 - 04)))),
+            1_000,
+        );
+
+        for question in [
+            Question::IsTransferInternal {
+                account: main,
+                counterparty: "Shop One".to_owned(),
+            },
+            Question::IsOutflowAFee { account: main },
+            Question::IsInflowIncome { account: main },
+            Question::UnresolvedDirection {
+                account: main,
+                stated: Some("INNER".to_owned()),
+                counterparty: None,
+            },
+        ] {
+            let prompt = resolver.render(&question, &subject);
+            assert!(
+                prompt.contains("money-flow report"),
+                "a question that does not say what turns on the answer asks the \
+                 owner to choose blind: {prompt}"
+            );
+            assert!(
+                prompt.contains("2026-03-04"),
+                "and every one of the four names its row: {prompt}"
+            );
+        }
     }
 
     // --- what a proposed rule asks about (iaam-g7yc) -----------------------

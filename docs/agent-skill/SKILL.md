@@ -139,6 +139,26 @@ money went and whose account was on the other side are facts about the owner's
 affairs; you may show him the question and the alternatives, and relay what he
 says.
 
+**Show him the sentence, not a summary of it.** The wording names the row by the
+day the source dated it and the amount the source printed, with the sign the
+source printed. That is there because it is what a person recognises a line on a
+statement by: several rows of one month can carry the same word, name nobody,
+and be described identically in every other respect, and an owner matching
+questions to rows by counting down a list will eventually be off by one. A wrong
+answer is not caught later — it settles the row, it may become a standing rule,
+and nothing asks again. The row number beside the question is what you send
+back; the day and the sum are what he reads.
+
+**Every alternative says what answering it does to his money-flow report, and
+you relay that too.** Two of these words are one keystroke apart and land in
+different figures of his year: money that came in from outside is not the same
+line as money of his own moving between his own accounts, and a return a
+counterparty made is subtracted from what he spent rather than added to what he
+received. Read him the effect beside the word. Do not compress the seven into
+one sentence of your own, and do not decide that some of them are obvious: the
+whole reason the effect is published per alternative is that the choice between
+two of them is not a wording preference.
+
 Where an answer names one of the owner's own accounts, the question carries the
 accounts it may name, each with his own title for it and the institution holding
 it. Show him those and send back the identifier of the one he picks. You never

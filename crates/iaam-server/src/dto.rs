@@ -1153,6 +1153,26 @@ pub struct AnswerAlternativeDto {
     pub answer: String,
     /// Whether the answer must also name one of the owner's accounts.
     pub needs_account: bool,
+    /// What answering this word does to the owner's money-flow report.
+    ///
+    /// **This is iaam-pzm9.** The prompt says what the row leaves open — that
+    /// no counterparty was named, that no direction can be read — and stopped
+    /// there. It did not say what the answer decides, and the difference
+    /// between two of these words is which figure of a year's money-flow report
+    /// the row lands in: answering `received` where the truth is
+    /// `received_from_own_account` moves the amount out of transfers between
+    /// the owner's own accounts and into what came in from outside.
+    ///
+    /// A sentence per word rather than a longer prompt. Seven consequences in
+    /// one sentence would be a mapping from a word to its effect encoded as
+    /// prose, which §5 refuses for the reason that the client would have to
+    /// take it apart again to show the owner one alternative; here the caller
+    /// that reads the word reads its effect in the same object.
+    ///
+    /// Always present. An alternative whose consequence were sometimes absent
+    /// would read as one that decides nothing, and every one of the seven
+    /// decides something.
+    pub consequence: String,
 }
 
 impl AnswerAlternativeDto {
@@ -1161,6 +1181,7 @@ impl AnswerAlternativeDto {
         Self {
             answer: shape.code().to_owned(),
             needs_account: shape.needs_account(),
+            consequence: shape.consequence().to_owned(),
         }
     }
 }
@@ -4015,6 +4036,16 @@ pub struct InputAlternativeDto {
     /// Fields that become required only if this alternative is chosen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<RequiredInputDto>,
+    /// What choosing this value does, where the word does not say it.
+    ///
+    /// Absent for a vocabulary that explains itself — a channel, a disposition.
+    /// Present on the answers to an import question, where it is the same
+    /// sentence `AnswerAlternativeDto.consequence` carries, from the same
+    /// source: a queue item that offered seven words and no stakes would leave
+    /// an agent reading only the queue to guess what it is asking the owner to
+    /// decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consequence: Option<String>,
 }
 
 /// A field one alternative requires. It carries no alternatives of its own.

@@ -13801,21 +13801,30 @@ async fn another_account(harness: &Harness, title: &str) -> Uuid {
         .expect("account identifier")
 }
 
-/// A row whose direction the source did not give.
+/// A row whose direction the source did not give, on a stated day and for a
+/// stated amount.
 ///
 /// Invented from nothing: `INNER` is the shape of word a bank prints for a
-/// movement it considers internal to itself, and every amount and label here was
-/// made up for this test.
-fn unresolved_row(account: Uuid, key: &str) -> Value {
+/// movement it considers internal to itself, and every amount, date and label
+/// here was made up for this test.
+///
+/// The two figures are parameters because `iaam-3ewp` is about rows that agree
+/// on everything else: a fixture that fixed them could not express the case.
+fn unresolved_row_dated(account: Uuid, key: &str, day: &str, amount: &str) -> Value {
     json!({
         "account": account,
         "type": "unresolved_direction",
-        "amount": "2500.00",
+        "amount": amount,
         "currency": "RUB",
-        "dates": { "cash_posted": "2025-03-18" },
+        "dates": { "cash_posted": day },
         "source_category": "INNER",
         "idempotency_key": key,
     })
+}
+
+/// A row whose direction the source did not give.
+fn unresolved_row(account: Uuid, key: &str) -> Value {
+    unresolved_row_dated(account, key, "2025-03-18", "2500.00")
 }
 
 /// The same row with the source stating which way the money went.
@@ -13932,6 +13941,251 @@ async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_i
         journal_rows(&harness).await,
         before,
         "nothing may be recorded while the question waits"
+    );
+}
+
+/// Two rows of one statement that differ only in date and amount are told apart
+/// by the questions raised about them (iaam-3ewp).
+///
+/// The defect, from a real run: one bank's month, several rows the source
+/// described with the same word and no counterparty. Every question named the
+/// account, the word and the fact that nobody was named — so every sentence was
+/// identical, and the only way to match a question to a row was to count down
+/// the list. The owner counted wrong and answered for rows he had not read, and
+/// a wrong answer is *accepted*: it settles the row, it may become a standing
+/// rule, and nothing asks again.
+///
+/// The row number is not the fix and was never the problem. It identifies the
+/// row for the machine and it is what the answering call takes. What was missing
+/// is what a person recognises a line on a statement by.
+#[tokio::test]
+async fn two_rows_that_differ_only_in_date_and_amount_get_questions_that_name_them() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "paste", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(account, "twin-one", "2025-03-04", "1000.00"),
+                    unresolved_row_dated(account, "twin-two", "2025-03-19", "4250.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "needs_classification", "{rows}");
+    assert_eq!(rows[1]["state"], "needs_classification", "{rows}");
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let questions = contents["questions"].as_array().expect("questions");
+    assert_eq!(questions.len(), 2, "{contents}");
+
+    let prompts: Vec<&str> = questions
+        .iter()
+        .map(|question| question["prompt"].as_str().expect("prompt"))
+        .collect();
+    assert_ne!(
+        prompts[0], prompts[1],
+        "the two sentences are all the owner is shown, and identical ones leave \
+         him counting down the list: {contents}"
+    );
+    // By content and not by position: which question the response lists first
+    // is not what the owner reads it by, and asserting on the order would pass
+    // for a pair he still cannot tell apart.
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains("2025-03-04") && prompt.contains("1000.00")),
+        "a question names its row by the day and the sum the source printed: {contents}"
+    );
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains("2025-03-19") && prompt.contains("4250.00")),
+        "and so does the other: {contents}"
+    );
+}
+
+/// The queue's item for a question is recognisable in the same terms.
+///
+/// The item's `reason` carries the question's prompt, so the row's day and sum
+/// reach the outstanding-work list without a second rendering of them. This is
+/// half of why the recognition went into the sentence rather than into fields
+/// beside it: a field on the session's question would leave the queue publishing
+/// items nothing tells apart.
+#[tokio::test]
+async fn the_outstanding_work_item_names_the_row_the_question_is_about() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [
+                    unresolved_row_dated(account, "queued-one", "2025-03-04", "1000.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let reason = items[0]["reason"].as_str().expect("reason");
+    assert!(
+        reason.contains("2025-03-04") && reason.contains("1000.00"),
+        "the queue is where the owner is told there is work waiting, and it \
+         must say which line: {reason}"
+    );
+}
+
+/// Every alternative says what it does to the money-flow report (iaam-pzm9).
+///
+/// The prompt said what the row left open and stopped there. What the answer
+/// decides was nowhere: `received` and `received_from_own_account` are one word
+/// apart and put the amount in different figures of the year — money that came
+/// in from outside, or a movement between the owner's own accounts. He chose
+/// between them from a sentence that never mentioned the difference.
+///
+/// The consequence rides on the alternative rather than in the prompt, so a
+/// caller that shows the owner one answer shows him its effect with it, and does
+/// not have to split one sentence into seven.
+#[tokio::test]
+async fn every_alternative_a_question_offers_says_what_it_does_to_the_report() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "stakes-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session identifier")
+        .to_owned();
+
+    // The verdict answering the write already carries them: a caller that never
+    // reads the session back is the ordinary case, and it must not be the one
+    // that decides blind.
+    let published = verdicts[0]["alternatives"]
+        .as_array()
+        .expect("the verdict publishes what may be said");
+    assert!(
+        published
+            .iter()
+            .all(|alternative| alternative["consequence"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())),
+        "an alternative that says nothing about itself is the defect: {verdicts}"
+    );
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let question = &contents["questions"].as_array().expect("questions")[0];
+    let alternatives = question["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .clone();
+
+    let consequences: Vec<&str> = alternatives
+        .iter()
+        .map(|alternative| alternative["consequence"].as_str().expect("consequence"))
+        .collect();
+    let distinct: BTreeSet<&&str> = consequences.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        consequences.len(),
+        "two alternatives that read alike are two the owner cannot choose \
+         between: {question}"
+    );
+
+    let says = |answer: &str| -> String {
+        alternatives
+            .iter()
+            .find(|alternative| alternative["answer"] == answer)
+            .and_then(|alternative| alternative["consequence"].as_str())
+            .expect("every alternative carries one")
+            .to_owned()
+    };
+    assert_ne!(
+        says("received"),
+        says("received_from_own_account"),
+        "this is the pair that was answered wrong, and the report treats the \
+         two as opposites: {question}"
+    );
+
+    // And the prompt says that something turns on the answer at all, because it
+    // is the part that reaches a surface carrying no alternatives.
+    assert!(
+        question["prompt"]
+            .as_str()
+            .is_some_and(|text| text.contains("money-flow report")),
+        "{question}"
+    );
+
+    // The queue publishes the same sentences, from the same source: an agent
+    // reading only the outstanding-work list must not be offered seven words
+    // and no stakes.
+    let items = open_question_items(&harness).await;
+    let queued: Vec<&str> = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .and_then(|answer| answer["alternatives"].as_array())
+        .expect("alternatives")
+        .iter()
+        .map(|alternative| alternative["consequence"].as_str().expect("consequence"))
+        .collect();
+    assert_eq!(
+        queued, consequences,
+        "one question, one set of consequences"
     );
 }
 

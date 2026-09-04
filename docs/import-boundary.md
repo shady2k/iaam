@@ -570,3 +570,68 @@ evidence a row carries — the source's word for the operation, its own category
 its description, the counterparty it printed, its claim about the far side — and
 improves nothing about how many questions a row nothing matches will raise. That
 remains decision 0008's ground.
+
+## 10. What a converter may assert, and the one field where it matters
+
+§4 says what an **agent** may do with a document. This section says what a
+**converter** may put in the observation channel — the engine reading a profile,
+the owner's own script, or a tool nobody in this repository has seen. It is a
+narrower question and it has a sharper answer, because a converter's output is
+not prose an owner reads: it is fields the classifier acts on.
+
+The rule is one line. **A converter relays what the source printed, and asserts
+nothing the source did not.** Every field of an observation is a transcription:
+the direction is the source's word or the source's sign, the counterparty is the
+string it printed, `source_kind` and `source_category` are its own two words, and
+the description is its purpose line as it stands. Nothing in the shape is a
+conclusion, and that is deliberate — decision 0019 §1 is the argument, and the
+type is the enforcement: an `ObservedRow` has no operation kind, no
+classification and no category, so there is nothing for a converter to conclude
+into.
+
+The exposure this leaves is the same one direction has, and the mitigation is the
+same: the plan publishes every fact before the commit writes any of them, so a
+converter that transcribed wrongly is caught by a reader comparing the plan with
+the document.
+
+**`far_side` is different, and it is the one field worth naming here.** Setting
+it to `own_account` says the source stated in words that the other side is an
+account of the owner's. It is read by `classify` **before** the question is
+raised, so a row carrying it resolves to an own-account movement and **raises no
+question at all**. Every other field a converter gets wrong produces a refused
+row or a visibly wrong fact; this one produces silence. It is therefore the
+easiest field in the channel to reach for — setting it makes questions go away —
+and the only one whose misuse cannot be found by reading the questions that were
+asked.
+
+So, precisely:
+
+- A converter may set `far_side: own_account` **only** where the source says so
+  in words, on that row, in a cell the converter can quote.
+- It may not set it because the amounts on two rows match, because the
+  counterparty looks like the owner, because the row's category is one the bank
+  files transfers under, or because the owner said the account is his. The first
+  three are inferences and this channel carries none; the last is a
+  classification rule, which is his, editable, and re-runnable over rows already
+  recorded.
+- It may not set it to make an import quieter. That is not a caricature: it is the
+  first thing anybody tries when a two-hundred-row export asks two hundred
+  questions, and it works.
+
+A profile is a converter that cannot break the first rule by accident: the only
+way to write the field is `own_account_words`, quoting the source's own printed
+sentence, or a total map over a column whose vocabulary is closed. Decision 0028
+§1 is the shape and §2 is why the shape has that asymmetry.
+
+**Where the shipped profile's list goes.** `crates/iaam-ingest/profiles/tbank-operations-csv.json`
+carries no `far_side` block, on purpose: the sentence its institution prints is a
+value out of the owner's own document, and a guess that happens to be wrong marks
+a movement as internal forever without saying so. Filling it in is one block —
+
+```json
+"far_side": { "column": "<the description column>", "own_account_words": ["<the sentence, verbatim>"] }
+```
+
+— beside a version bump and a test, by somebody who has read a real export. The
+same holds for `row.status`, whose words that institution prints are equally not
+in this repository. A profile has no comment key, so this paragraph is the marker.

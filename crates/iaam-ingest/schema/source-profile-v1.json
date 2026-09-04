@@ -5,7 +5,7 @@
 
   "description": "A source profile describes one document type printed by one institution: which column carries which cell, and which of that source's own words mean which of iaam's own words. It is data read by the import engine, never code and never an input to a calculation. Decision 0019 is the argument; this file is the vocabulary. What the engine decides, and what therefore has no key here: whether a cell is readable at all, whether a number fits the currency's minor unit, whether a date exists, whether a currency is known, what a row turned out to be, which category it falls in, which account a printed identity is, whether a row duplicates one already recorded, and what happens to a row that cannot be read. None of those is parameterised, so a profile that is valid against this schema cannot widen what the engine accepts; it can only be wrong about where a value sits, and a value read out of the wrong column is a value the engine still validates.",
 
-  "$comment": "Three invariants make the paragraph above checkable rather than promised, and a reviewer should check them before reading anything else. (1) CLOSURE. Every object in this file that describes a profile's own structure sets \"additionalProperties\": false. There is exactly one kind of exception, marked in place: a token map, where \"additionalProperties\" is the schema of the map's VALUES and \"propertyNames\" closes its keys. A widening a profile author wanted would have to be a new key, and there is no key to write. (2) LEAVES. Every leaf in a profile is one of exactly three kinds, each with its own $defs entry and no fourth: a LOCATOR (#/$defs/column, #/$defs/sheet_name, #/$defs/header_row) saying where in the document to look; a TOKEN (#/$defs/direction_token, #/$defs/far_side_token, #/$defs/date_format, #/$defs/time_format, #/$defs/negative_form, #/$defs/group_separator_dot_decimal, #/$defs/group_separator_comma_decimal, #/$defs/currency_code) drawn from a closed vocabulary of iaam's own words; and a LITERAL (#/$defs/source_literal) quoting the source's own printed text, which may appear only as a key of a token map. Nothing in a profile is a number the engine computes with, a regular expression, a format pattern, or a predicate. A leaf cannot denote engine behaviour because none of the three kinds can name any. (3) NO LENIENCY VOCABULARY. This file contains no key whose meaning is 'accept', 'tolerate', 'ignore', 'skip', 'default', 'fallback', 'on error', 'round' or 'coerce'. There is deliberately no way to say what should happen to a cell the engine cannot read, because the engine has one answer and it is not a profile's to change: the row is rejected, naming field, expected and actual, and the other rows of the document are read (specification section 10.1).",
+  "$comment": "Three invariants make the paragraph above checkable rather than promised, and a reviewer should check them before reading anything else. (1) CLOSURE. Every object in this file that describes a profile's own structure sets \"additionalProperties\": false. There is exactly one kind of exception, marked in place: a token map, where \"additionalProperties\" is the schema of the map's VALUES and \"propertyNames\" closes its keys. A widening a profile author wanted would have to be a new key, and there is no key to write. (2) LEAVES. Every leaf in a profile is one of exactly three kinds, each with its own $defs entry and no fourth: a LOCATOR (#/$defs/column, #/$defs/sheet_name, #/$defs/header_row) saying where in the document to look; a TOKEN (#/$defs/direction_token, #/$defs/far_side_token, #/$defs/row_status_token, #/$defs/date_format, #/$defs/time_format, #/$defs/negative_form, #/$defs/group_separator_dot_decimal, #/$defs/group_separator_comma_decimal, #/$defs/currency_code) drawn from a closed vocabulary of iaam's own words; and a LITERAL (#/$defs/source_literal) quoting the source's own printed text, which may appear only as a key of a token map. Nothing in a profile is a number the engine computes with, a regular expression, a format pattern, or a predicate. A leaf cannot denote engine behaviour because none of the three kinds can name any. (3) NO LENIENCY VOCABULARY. This file contains no key whose meaning is 'accept', 'tolerate', 'ignore', 'skip', 'default', 'fallback', 'on error', 'round' or 'coerce'. There is deliberately no way to say what should happen to a cell the engine cannot read, because the engine has one answer and it is not a profile's to change: the row is rejected, naming field, expected and actual, and the other rows of the document are read (specification section 10.1).",
 
   "type": "object",
   "additionalProperties": false,
@@ -261,21 +261,41 @@
         },
 
         "far_side": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["column", "tokens"],
-          "description": "What the source said about whose account is on the far side. Only two values exist and one of them says nothing, so this block exists for exactly one purpose: a source that asserts in words that the other side is an account of the owner's. A profile may set \"own_account\" only from such a word. Absent, every row of the document is \"unstated\", which is what a source that does not make the claim said.",
-          "properties": {
-            "column": { "$ref": "#/$defs/column" },
-            "tokens": {
+          "description": "What the source said about whose account is on the far side. Only two values exist and one of them says nothing, so this block exists for exactly one purpose: a source that asserts in words that the other side is an account of the owner's. A profile may set \"own_account\" only from such a word. Absent, every row of the document is \"unstated\", which is what a source that does not make the claim said.\n\nTwo branches, and which one a profile may write is decided by the column, not by the author's taste. A source that states the far side in a column of its own — an operation-type column, a status column — has a closed vocabulary there, and \"tokens\" maps all of it. A source that states it inside a free-text column — the description or purpose line, where the institution prints one fixed sentence of its own for a movement between the owner's accounts and arbitrary text on every other row — has no closed vocabulary to map, so \"own_account_words\" names the sentences and every other cell is \"unstated\". This is decision 0028; before it the only branch was the total map, and a profile could not read a claim its source made in the one column that carried it.",
+          "oneOf": [
+            {
               "type": "object",
-              "minProperties": 1,
-              "maxProperties": 128,
-              "propertyNames": { "$ref": "#/$defs/source_literal" },
-              "additionalProperties": { "$ref": "#/$defs/far_side_token" },
-              "$comment": "TOKEN MAP: \"additionalProperties\" is the value schema, not a closure. Total, and with no catch-all, for the direction map's reason. Being wrong here is expensive in one direction only: a row wrongly carrying \"own_account\" is recorded as a movement between the owner's own accounts and raises no question, so it is the one mapping that can silence a question that should have been asked."
+              "additionalProperties": false,
+              "required": ["column", "tokens"],
+              "properties": {
+                "column": { "$ref": "#/$defs/column" },
+                "tokens": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "maxProperties": 128,
+                  "propertyNames": { "$ref": "#/$defs/source_literal" },
+                  "additionalProperties": { "$ref": "#/$defs/far_side_token" },
+                  "$comment": "TOKEN MAP: \"additionalProperties\" is the value schema, not a closure. Total, and with no catch-all, for the direction map's reason. Being wrong here is expensive in one direction only: a row wrongly carrying \"own_account\" is recorded as a movement between the owner's own accounts and raises no question, so it is the one mapping that can silence a question that should have been asked."
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["column", "own_account_words"],
+              "properties": {
+                "column": { "$ref": "#/$defs/column" },
+                "own_account_words": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 32,
+                  "uniqueItems": true,
+                  "items": { "$ref": "#/$defs/source_literal" },
+                  "$comment": "The cells with which this source asserts the far side is the owner's, quoted as it prints them. A cell equal to one of them, after trimming, is \"own_account\"; every other cell is \"unstated\". That is not the leniency the third invariant refuses, and the difference is worth being exact about: leniency says what to do with a cell the engine could not read, and there is no such cell here — every cell is read, and a cell that is not one of these words is a cell in which the source made no claim about the far side, which is precisely what \"unstated\" means. The list admits only the asserting words and there is deliberately no way to write a word meaning \"unstated\": nothing here can be absent in a way that conceals anything, because absence is already the weaker value. A word misspelt or gone stale therefore costs a question that gets asked, not one that stops being asked. Matching is equality after trimming and never a substring: a substring test is a predicate, the second invariant admits none, and a counterparty whose printed name happened to contain the sentence would be filed as the owner's own account."
+                }
+              }
             }
-          }
+          ]
         },
 
         "counterparty": {
@@ -292,6 +312,24 @@
           "required": ["column"],
           "description": "What the source printed as the description or payment purpose, transcribed exactly from one column. One column and not several: the joined string is what the owner's description rules match, so a join order would be a silent part of every rule he ever writes.",
           "properties": { "column": { "$ref": "#/$defs/column" } }
+        },
+
+        "status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column", "tokens"],
+          "description": "Whether the source says this row is a movement it has completed. A card export prints a column for it and files an authorisation it is still holding, one it refused, and one that settled under three different words; without this block a profile cannot read the column, so a row the source itself marks as not final is transcribed and committed like any other and the journal records money that did not move. That is decision 0028's first half.\n\nThe profile transcribes and stops, exactly as the direction map does: it says which of the source's words mean which of iaam's three, and it says nothing about what follows. What follows is the engine's and is not parameterised — a row the map calls \"pending\" or \"declined\" is refused by name, with its column and its word, and the other rows of the document are read (section 10.1). There is no key here that turns that off, and none that turns it on for a word the author would rather keep: the whole block is a transcription, and the one decision in it was the source's.",
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "tokens": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 128,
+              "propertyNames": { "$ref": "#/$defs/source_literal" },
+              "additionalProperties": { "$ref": "#/$defs/row_status_token" },
+              "$comment": "TOKEN MAP: \"additionalProperties\" is the value schema, not a closure. Total, and with no catch-all, for the direction map's reason — and the refusal a missing word produces is the same refusal a non-final word produces, so a source that adds a status word costs a rejected row rather than a committed one. A word for a reversal has no token to map to and is meant to have none: a reversal is a second movement the source printed beside the first, not a status on one, and a profile that filed it under \"declined\" would say the money never moved."
+            }
+          }
         },
 
         "source_kind": {
@@ -408,6 +446,11 @@
       "$comment": "TOKEN. iaam's own two words for what a source said about whose account is on the far side. There is no token for 'the far side is this named account of the owner's': recognising a printed name as one of his accounts is a conclusion drawn against his directory, and a profile draws no conclusions."
     },
 
+    "row_status_token": {
+      "enum": ["completed", "pending", "declined"],
+      "$comment": "TOKEN. iaam's own three words for what a source said about whether the movement happened, and the one vocabulary in this file whose values never leave the engine: no field of an observation carries a status and nothing downstream can read one. \"completed\" is the only one an observation is made from. \"pending\" is money the source has not moved yet and expects to — it prints the row again, completed, in a later export, which is why refusing it now is what keeps the journal from holding the movement twice. \"declined\" is money the source states never moved at all. There is no fourth word and in particular none for a reversal, because a reversal is a movement of its own with its own row and its own sign."
+    },
+
     "source_literal": {
       "type": "string",
       "minLength": 1,
@@ -509,6 +552,14 @@
             "Credit": "unstated",
             "Internal transfer": "unstated",
             "Own account transfer": "own_account"
+          }
+        },
+        "status": {
+          "column": "State",
+          "tokens": {
+            "Settled": "completed",
+            "Authorised": "pending",
+            "Refused": "declined"
           }
         },
         "counterparty": { "column": "Payee" },

@@ -14,6 +14,14 @@
 //! therefore has nothing to reach for: there is no field on the output in which
 //! a conclusion could be written.
 //!
+//! **One thing a profile transcribes never reaches that output at all**
+//! (decision 0028): [`RowStatus`], the source's own word for whether it
+//! completed the movement. A profile says which of the source's words mean
+//! which of iaam's three and stops; the engine refuses a row that is not
+//! `completed`, and nothing carries the word any further. That is deliberate —
+//! a status in the journal would be a fact about the source's own workflow
+//! sitting beside facts about the owner's money.
+//!
 //! Three modules, and the split is the decision's own:
 //!
 //! - [`load`] turns bytes into a [`SourceProfile`] or refuses them, and it is
@@ -28,7 +36,7 @@ pub mod catalogue;
 pub mod engine;
 pub mod load;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::event::provenance::ParserVersion;
 
@@ -176,7 +184,10 @@ impl SourceProfile {
             named.push(column);
         }
         if let Some(far_side) = &row.far_side {
-            named.push(&far_side.column);
+            named.push(far_side.column());
+        }
+        if let Some(status) = &row.status {
+            named.push(&status.column);
         }
         for column in [
             row.counterparty.as_deref(),
@@ -264,6 +275,10 @@ pub struct RowShape {
     pub currency: CurrencySource,
     pub direction: DirectionSource,
     pub far_side: Option<FarSideSource>,
+    /// Whether the source says the row is a movement it completed. Absent, the
+    /// engine reads every row as one — which is what a document that prints no
+    /// such column has said.
+    pub status: Option<StatusSource>,
     pub counterparty: Option<String>,
     pub description: Option<String>,
     pub source_kind: Option<String>,
@@ -456,8 +471,119 @@ pub enum DirectionSource {
 ///
 /// Absent from a profile, every row of the document is `unstated`, which is
 /// what a source that does not make the claim said.
+///
+/// **Two variants, and the column decides which one a profile may write**
+/// (`iaam-b0r0`). Which is not a matter of taste: a source that states the far
+/// side in a column of its own prints a closed vocabulary there and
+/// [`Self::Tokens`] maps all of it, while a source that states it inside a
+/// free-text column prints one fixed sentence of its own beside arbitrary text
+/// on every other row, and there is no closed vocabulary to be total over. The
+/// second is the shape the first shipped profile needed and could not have: the
+/// only branch was the total map, so the one column that carried the claim
+/// could not be read, and every movement between the owner's own accounts
+/// became a question the document had already answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FarSideSource {
+pub enum FarSideSource {
+    /// A total map with no catch-all, over a column whose vocabulary is closed.
+    /// A word the map does not carry rejects the row and names the word.
+    Tokens {
+        column: String,
+        tokens: BTreeMap<String, crate::classification::FarSide>,
+    },
+    /// The cells with which this source asserts the far side is the owner's,
+    /// over a column whose vocabulary is not closed. A cell equal to one of
+    /// them, after trimming, is `own_account`; every other cell is `unstated`.
+    ///
+    /// **Not the leniency decision 0019's third invariant refuses**, and the
+    /// difference is exact: leniency says what becomes of a cell the engine
+    /// could not read, and there is no such cell here. Every cell is read, and
+    /// a cell that is not one of these words is a cell in which the source made
+    /// no claim about the far side — which is what `unstated` means. There is
+    /// deliberately no way to write a word meaning `unstated`, so nothing here
+    /// can be absent in a way that conceals anything: a word misspelt or gone
+    /// stale costs a question that gets asked, never one that stops being
+    /// asked.
+    ///
+    /// Matched by equality after trimming and never as a substring. A substring
+    /// test is a predicate, the second invariant admits none, and a
+    /// counterparty whose printed name happened to contain the sentence would
+    /// be filed as an account of the owner's.
+    OwnAccountWords {
+        column: String,
+        words: BTreeSet<String>,
+    },
+}
+
+impl FarSideSource {
+    /// The column this source reads, whichever branch it is.
+    #[must_use]
+    pub fn column(&self) -> &str {
+        match self {
+            Self::Tokens { column, .. } | Self::OwnAccountWords { column, .. } => column,
+        }
+    }
+}
+
+/// Whether the source says the row is a movement it has completed.
+///
+/// A card export prints a column for it and files an authorisation it is still
+/// holding, one it refused, and one that settled under three different words.
+/// Without this block a profile cannot read that column, so a row the source
+/// itself marks as not final is transcribed and committed like any other, and
+/// the journal records money that did not move (`iaam-2hq0`).
+///
+/// The profile transcribes and stops. What follows a non-final word is the
+/// engine's and is not parameterised: the row is refused by name, with its
+/// column and its word, and the other rows of the document are read (§10.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSource {
     pub column: String,
-    pub tokens: BTreeMap<String, crate::classification::FarSide>,
+    pub tokens: BTreeMap<String, RowStatus>,
+}
+
+/// iaam's own three words for what a source said about whether the movement
+/// happened.
+///
+/// **The one profile vocabulary whose values never leave the engine.** No field
+/// of an observation carries a status and nothing downstream can read one; the
+/// three exist to be the vocabulary a refusal is written from. That is
+/// deliberate — a status that survived into the journal would be a fact about
+/// the source's own workflow sitting beside facts about the owner's money.
+///
+/// There is no fourth word, and in particular none for a reversal: a reversal
+/// is a movement of its own with its own row and its own sign, not a status on
+/// another movement, and a profile that filed a source's reversal word under
+/// [`Self::Declined`] would say the money never moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowStatus {
+    /// The source states it moved the money. The only word an observation is
+    /// made from.
+    Completed,
+    /// The source has not moved the money yet and expects to. Refusing it now
+    /// is what keeps the journal from holding one movement twice: the source
+    /// prints the row again, completed, in a later export.
+    Pending,
+    /// The source states the money never moved at all.
+    Declined,
+}
+
+impl RowStatus {
+    /// What a refusal says this word meant, in the owner's own reading rather
+    /// than in this vocabulary's (ADR 0027).
+    #[must_use]
+    pub const fn refusal(self) -> &'static str {
+        match self {
+            // Never reached: the engine returns before it asks. Named all the
+            // same rather than joined to a catch-all, so that a fourth word
+            // added to this vocabulary has to be given a sentence of its own
+            // here instead of inheriting one that is untrue of it.
+            Self::Completed => "a movement the source completed",
+            Self::Pending => {
+                "a payment the source has not taken yet. It prints this row again, \
+                 completed, once it has, and reading it now would record the same \
+                 money twice"
+            }
+            Self::Declined => "a payment the source refused. No money moved",
+        }
+    }
 }

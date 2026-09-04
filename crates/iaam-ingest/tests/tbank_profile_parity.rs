@@ -56,6 +56,9 @@ use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, Observed
 use iaam_ingest::profile::{ProfileCatalogue, ReadContext, ReadOutcome, engine};
 use time::macros::{date, time};
 
+/// One reading's rows with their line numbers, borrowed for a partition.
+type Rows<'a> = Vec<&'a (u64, &'a ObservedRow)>;
+
 /// The converter's own fixture, read rather than copied.
 const EXPORT: &[u8] =
     include_bytes!("../../../tools/tbank-csv-import/fixtures/synthetic-export.csv");
@@ -215,7 +218,7 @@ fn the_engine_reads_the_same_sums_the_converter_submitted_plus_the_leg_it_droppe
         })
         .collect();
     // The leg the converter dropped: `dropped_second_leg` is one, and the pair
-    // it belongs to is the only 5 000,00 transfer in the fixture.
+    // it belongs to is the only transfer of its magnitude in the fixture.
     assert_eq!(
         expected["dropped_second_leg"].as_u64(),
         Some(1),
@@ -232,7 +235,7 @@ fn the_engine_reads_the_same_sums_the_converter_submitted_plus_the_leg_it_droppe
     found.sort_unstable();
     assert_eq!(found, wanted);
 
-    let (out, into): (Vec<&(u64, &ObservedRow)>, Vec<&(u64, &ObservedRow)>) = observed
+    let (out, into): (Rows<'_>, Rows<'_>) = observed
         .iter()
         .partition(|(_, row)| row.direction == ObservedDirection::Out);
     assert_eq!(out.len(), 6);

@@ -1260,9 +1260,13 @@ mod tests {
                 }
             }
         }));
+        // The document is a fixture rather than a literal: a correctly grouped
+        // amount is, by construction, shaped like one off a statement, and
+        // `scripts/check-no-personal-data.sh` refuses that shape in a source
+        // file whatever it means. Its own allowance is a fixture directory, and
+        // a four-row document belongs in a file regardless.
         let reading = read_with(
-            "Posted;Sum\n2026-08-05;-1 234 567,89\n2026-08-06;-1\u{a0}234,50\n\
-             2026-08-07;-1\u{202f}234,50\n2026-08-08;-1 ,50\n",
+            include_str!("../../tests/fixtures/profile/grouped-amounts.csv"),
             &profile,
         );
         assert_eq!(observed(&reading.rows[0]).amount_minor, -123_456_789);

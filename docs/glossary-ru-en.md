@@ -123,6 +123,8 @@ is how you match a term in them to the code.
 | движение без направления | unresolved own-account movement | `EventKind::UnresolvedOwnAccountMovement`; the same movement with no direction stated, so it posts no leg |
 | строка без факта | settled without a fact | `RowResolution::NoFact`; a row read, understood and correctly producing no journal fact. Not a refusal and not a quarantine |
 | скилл импорта | import skill | per-institution knowledge held as an agent skill, never as code |
+| удержанная строка | held row | a row an import session holds and the journal does not. It becomes a fact only at commit, and until then it is outside every figure the system publishes unless the request asks for it (decision 0018) |
+| совокупность строк | held-row scope | `HeldScope`; which held rows, **beside** the journal, a report was asked to fold: none, every open session, or the sessions the request named. Never *instead of* the journal — there is no report over held rows alone |
 
 ## Refusals and quality
 

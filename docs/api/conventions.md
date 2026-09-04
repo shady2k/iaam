@@ -106,6 +106,36 @@ and `POST /v1/import-sessions/{session}/commit` uses it for exactly that. One
 word cannot be both, and the count is the one that gives way — a client that
 indexes into a list it was given is doing the ordinary thing.
 
+### 1.4c Two coverage statements, and why they are two
+
+`population` says **which accounts** a report's figures are about. `held_rows`
+says **which rows**: the journal alone, which is the default, or the journal plus
+the held rows of import sessions the request named. They are two coordinates of
+one answer and neither substitutes for the other — a report can cover every
+account the system knows of and still be folded over rows nobody has confirmed.
+
+`held_rows` is published on all four reports whatever was asked for, and the
+empty block is a statement rather than a placeholder: it says these figures are
+the journal and nothing else. It carries `requested` for the reason
+`MarketPriceSeriesDto` carries `complete_through` — an empty `sessions` list
+under `all` means the owner is holding nothing, and the same empty list under
+`none` means nobody asked, and a reader that could not tell those apart would
+read the first as the second.
+
+It also carries `retained_unrecorded`: how many held rows produced no fact at
+all. That count is what keeps the block honest. A row with an unanswered question
+becomes nothing, so a figure "including held rows" is short exactly where
+attention is owed, and a §1.4-style coverage statement that named only what it
+included would be the confident half of a partial answer. Decision 0018 records
+why it is a field and not a caveat in prose.
+
+`GET /v1/journal/events` takes no such parameter and carries no such block. It
+publishes no figure — it computes no total and derives none — so there is nothing
+on it for a population statement to qualify, and a held row printed among its
+rows would carry an event identifier that names nothing and differs on the next
+read. The rows of a held session are published, per row and with what each would
+become, by that session's own assessment.
+
 ### 1.5 What this means when a new list route is added
 
 Decide the shape when the route is published, because it cannot be changed
@@ -148,9 +178,9 @@ things. Read it as the lookup table for §1.
 | `GET /v1/transfer-pairings` | `CrossSourceMatchingDto` | object, `candidates` | `without_counterpart` — the legs nothing paired with, which no candidate can carry |
 | `GET /v1/accounts/{id}/transfer-partners` | `AccountTransferPartnersDto` | object, `partners` | `stated` — whether the owner has ruled at all, which an empty array cannot say |
 | `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, `row_count`, and how many questions are unanswered |
-| `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population` |
-| `GET /v1/reports/returns` | `ReturnsAnswerDto` | object | not a list at the top level; `population` sits beside the report's own figures |
-| `GET /v1/reports/flow` | `MoneyFlowReportDto` | object, `currencies` | the interval, the scope version, `population`, `actions` |
+| `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population`, `held_rows` |
+| `GET /v1/reports/returns` | `ReturnsAnswerDto` | object | not a list at the top level; `population` and `held_rows` sit beside the report's own figures |
+| `GET /v1/reports/flow` | `MoneyFlowReportDto` | object, `currencies` | the interval, the scope version, `population`, `held_rows`, `actions` |
 | `POST /v1/ingest/operations` | `[VerdictDto]` | bare array | one verdict per submitted row, in the caller's own order |
 | `POST /v1/ingest/journal-events` | `[VerdictDto]` | bare array | one verdict per submitted row |
 | `POST /v1/ingest/csv` | `[VerdictDto]` | bare array | one verdict per parsed row |
@@ -312,6 +342,7 @@ And the types that print a bare identifier on purpose.
 |---|---|---|
 | `ActionSubjectDto::Event` | `id` | nothing the owner said names an event; the identifier is the whole of its identity and the item's `reason` states what it was |
 | `AccountBalanceDto`, `NegativeCashDto`, `AssetAccountDto`, `CashClassTotalDto`, `NotDecomposedAccountDto`, `AccountResidualDto`, `EarningSourceAmountDto`, `CaveatSubjectDto` | `account` | the answer these sit in carries `population`, whose `covered` and `outside` name every account it mentions and every account it left out. The join table is in the same response, computed by the same fold, and one report row cannot disagree with it |
+| `HeldSessionDto` | `session` | nothing the owner said names an import session. He names an *import* by its label, and a session may declare no source at all; the identifier is the whole of the session's identity, and it addresses `GET /v1/import-sessions/{session}` and its assessment, where everything about it is published |
 | `ReconciliationStatusDto`, `TaintDto` | `account` | the caller named the account in the request; the response answers about that one and no other |
 | `JournalEventReadDto`, `JournalLegDto`, `OperationDto`, `VerdictDto` | `account` | a row-level echo of what the caller submitted or asked for |
 | `BatchTotalDto`, `ControlComparisonDto`, `PlannedOriginDto` | `account` | the import assessment they sit in carries `account_resolution`, whose `resolved` and `missing` name every account the rows are on and say which of them the owner's directory holds. The join table is in the same response, computed by the same fold. It is also why a name cannot simply be printed: a total over rows on an account the directory has never heard of is precisely what these sections must be able to publish |

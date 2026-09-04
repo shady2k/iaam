@@ -3,7 +3,7 @@ use std::sync::Arc;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{AccountView, Clock, InstrumentUpsert, Principal, Scope};
-use iaam_app::scenarios::reports::{ReturnsQuery, returns};
+use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -214,6 +214,7 @@ async fn report_values_position_from_market_observation() {
             report_currency: CurrencyCode::Rub,
             fx: FxTable::new(FxSource::OwnerSupplied),
             lot_rule: iaam_core::rules::LotRuleVersion(1),
+            held: HeldScope::None,
         },
     )
     .await
@@ -306,6 +307,7 @@ async fn contradictory_price_leaves_only_its_position_uncovered() {
             report_currency: CurrencyCode::Rub,
             fx: FxTable::new(FxSource::OwnerSupplied),
             lot_rule: iaam_core::rules::LotRuleVersion(1),
+            held: HeldScope::None,
         },
     )
     .await

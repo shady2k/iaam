@@ -21102,3 +21102,534 @@ async fn the_verdict_vocabulary_publishes_the_settled_row_and_says_what_it_means
         "the code names the determination a client will see in `detail`: {meaning}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A figure says which population it was computed from (iaam-5put, decision 0018)
+// ---------------------------------------------------------------------------
+
+/// Open a session on the harness account, feed it `operations`, and hand back
+/// the identifier.
+async fn session_holding(harness: &Harness, label: &str, operations: Value) -> String {
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({
+                "source": {
+                    "account": harness.account.inner(),
+                    "channel": "paste",
+                    "label": label,
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": operations }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    id
+}
+
+/// A contour holding the harness account, for a report to be computed over.
+async fn contour_over_the_account(harness: &Harness, title: &str) -> String {
+    let (status, contour) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": title, "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour}");
+    contour["contour"].as_str().expect("contour").to_owned()
+}
+
+/// One held row that becomes a fact, with no question.
+fn held_deposit(account: Uuid, key: &str, amount: &str) -> Value {
+    json!({
+        "account": account,
+        "type": "deposit",
+        "amount": amount,
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-03-02" },
+        "idempotency_key": key,
+    })
+}
+
+async fn balances_over(harness: &Harness, contour: &str, held: Option<&str>) -> Value {
+    let path = match held {
+        None => format!("/v1/reports/balances?contour={contour}&as_of=2025-03-31"),
+        Some(held) => {
+            format!("/v1/reports/balances?contour={contour}&as_of=2025-03-31&held={held}")
+        }
+    };
+    let (status, body) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// The default is the journal, and the request is what changes it.
+///
+/// The defect this answers is not a wrong number: it is a number whose
+/// provenance cannot be read off the answer that carries it. So both halves are
+/// asserted — that the journal-only answer says so in as many words, and that
+/// the answer over held rows names the session it folded.
+#[tokio::test]
+async fn a_report_reads_the_journal_alone_until_the_request_names_a_session() {
+    let harness = harness();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let session = session_holding(
+        &harness,
+        "march",
+        json!([held_deposit(harness.account.inner(), "held-one", "1000.00")]),
+    )
+    .await;
+
+    let plain = balances_over(&harness, &contour, None).await;
+    assert_eq!(
+        plain["held_rows"]["requested"], "none",
+        "the block is published even when nothing was asked for: an absent one \
+         is indistinguishable from a report that never asked: {plain}"
+    );
+    assert_eq!(plain["held_rows"]["sessions"], json!([]), "{plain}");
+    assert_eq!(plain["held_rows"]["retained_unrecorded"], 0, "{plain}");
+    assert_eq!(
+        plain["accounts"][0]["cash"],
+        json!([]),
+        "a held row is in no figure the system publishes until it is asked for: \
+         {plain}"
+    );
+
+    let widened = balances_over(&harness, &contour, Some(&session)).await;
+    assert_eq!(widened["held_rows"]["requested"], "named", "{widened}");
+    let folded = &widened["held_rows"]["sessions"][0];
+    assert_eq!(folded["session"], session, "{widened}");
+    assert_eq!(folded["state"], "open", "{widened}");
+    assert_eq!(folded["contribution"], "folded", "{widened}");
+    assert_eq!(folded["facts"], 1, "{widened}");
+    assert!(
+        folded["revision"].is_string(),
+        "the answer names not only the session but which reading of it, so the \
+         caller can compare it against the assessment he read: {widened}"
+    );
+    assert_eq!(
+        widened["accounts"][0]["cash"][0]["movement"], "1000.00",
+        "the row the caller asked for is in the figure: {widened}"
+    );
+}
+
+/// The answer counts what it could not include.
+///
+/// A row with an unanswered question becomes no fact at all, so a figure «over
+/// the held rows» is short by exactly those rows — and short precisely where
+/// attention is owed. The count is a field and not a caveat in prose, and the
+/// two kinds of «no fact» are counted apart: nothing is owed for a row that
+/// moves nothing.
+#[tokio::test]
+async fn a_figure_over_held_rows_publishes_the_rows_it_could_not_include() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let session = session_holding(
+        &harness,
+        "march",
+        json!([
+            held_deposit(account, "held-clean", "1000.00"),
+            unresolved_row(account, "held-unanswered"),
+        ]),
+    )
+    .await;
+
+    let body = balances_over(&harness, &contour, Some(&session)).await;
+    let folded = &body["held_rows"]["sessions"][0];
+    assert_eq!(folded["contribution"], "folded", "{body}");
+    assert_eq!(folded["facts"], 1, "{body}");
+    assert_eq!(
+        folded["retained_unrecorded"], 1,
+        "the row nobody has answered yet is in no figure here, and the answer \
+         says so rather than presenting a short total as a whole one: {body}"
+    );
+    assert_eq!(
+        body["held_rows"]["retained_unrecorded"], 1,
+        "the shortfall is a fact about the whole answer, folded once so that a \
+         client which may not do arithmetic does none: {body}"
+    );
+    assert_eq!(
+        body["accounts"][0]["cash"][0]["movement"], "1000.00",
+        "only the row that became a fact is in the figure: {body}"
+    );
+}
+
+/// Naming a session that has already committed does not count its rows twice.
+///
+/// Its rows reached the journal, so the ordinary read already holds them. The
+/// request is not refused: committing between two reads must not turn a request
+/// that worked into one that fails, and the figure is the same either way —
+/// which is the property that makes committing safe to do. What changes is what
+/// the answer says about the session.
+#[tokio::test]
+async fn a_committed_session_is_named_and_folded_once() {
+    let harness = harness();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let session = session_holding(
+        &harness,
+        "march",
+        json!([held_deposit(
+            harness.account.inner(),
+            "held-commit",
+            "1000.00"
+        )]),
+    )
+    .await;
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let plain = balances_over(&harness, &contour, None).await;
+    let named = balances_over(&harness, &contour, Some(&session)).await;
+
+    let entry = &named["held_rows"]["sessions"][0];
+    assert_eq!(entry["state"], "committed", "{named}");
+    assert_eq!(
+        entry["contribution"], "already_in_journal",
+        "the reason nothing was folded is published, because «its rows are \
+         already counted» and «its rows will never be counted» are opposite \
+         facts that an absence spells the same way: {named}"
+    );
+    assert!(
+        entry.get("facts").is_none(),
+        "the counts describe a plan, and no plan was folded: {named}"
+    );
+    assert_eq!(
+        named["accounts"], plain["accounts"],
+        "naming a committed session changes no figure — folding it beside the \
+         journal would count its money twice: {named} vs {plain}"
+    );
+}
+
+/// What a report says over a held session is what it says once the session
+/// commits.
+///
+/// This is the single-planner design read from the reporting side. The events
+/// folded here come from `plan_session`, the same function the commit carries
+/// one step further into the journal, so the two answers cannot drift. A
+/// preview computed by a second pass over the stored observations is exactly
+/// the defect the assessment was built to end — rows arriving with positive
+/// verdicts and absent from the report the owner was shown — and it would be
+/// invisible here: the figures would simply be wrong.
+#[tokio::test]
+async fn the_figure_over_a_held_session_is_the_figure_it_commits_to() {
+    let harness = harness();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let session = session_holding(
+        &harness,
+        "march",
+        json!([
+            held_deposit(harness.account.inner(), "parity-one", "1000.00"),
+            held_deposit(harness.account.inner(), "parity-two", "250.00"),
+        ]),
+    )
+    .await;
+
+    let previewed = balances_over(&harness, &contour, Some(&session)).await;
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let after = balances_over(&harness, &contour, None).await;
+    assert_eq!(
+        previewed["accounts"], after["accounts"],
+        "the answer the owner read before committing is the answer he gets \
+         after: {previewed} vs {after}"
+    );
+    assert_eq!(
+        previewed["negative_cash"], after["negative_cash"],
+        "{previewed} vs {after}"
+    );
+}
+
+/// «Everything held» is a quantifier the request carries, and the answer says
+/// it was one.
+///
+/// An empty `sessions` list under `all` means the owner is holding nothing; the
+/// same empty list under `none` means nobody asked. A reader that could not tell
+/// them apart would read the first as the second and stop looking.
+#[tokio::test]
+async fn everything_held_names_every_open_session_and_echoes_the_quantifier() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let first = session_holding(
+        &harness,
+        "march-one",
+        json!([held_deposit(account, "all-one", "1000.00")]),
+    )
+    .await;
+    let second = session_holding(
+        &harness,
+        "march-two",
+        json!([held_deposit(account, "all-two", "250.00")]),
+    )
+    .await;
+
+    let body = balances_over(&harness, &contour, Some("all")).await;
+    assert_eq!(body["held_rows"]["requested"], "all", "{body}");
+    let named: Vec<&str> = body["held_rows"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|entry| entry["session"].as_str().expect("session identifier"))
+        .collect();
+    assert!(named.contains(&first.as_str()), "{body}");
+    assert!(named.contains(&second.as_str()), "{body}");
+    assert_eq!(
+        body["accounts"][0]["cash"][0]["movement"], "1250.00",
+        "both sessions are in the figure: {body}"
+    );
+}
+
+/// A session named twice is refused rather than folded twice.
+///
+/// Deduplicating it silently would accept a request whose plain reading is
+/// «count this import twice» and answer something else, which is the shape of
+/// defect this parameter exists to remove.
+#[tokio::test]
+async fn a_session_named_twice_is_refused() {
+    let harness = harness();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let session = session_holding(
+        &harness,
+        "march",
+        json!([held_deposit(harness.account.inner(), "twice", "1000.00")]),
+    )
+    .await;
+
+    let (status, error) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/balances?contour={contour}&as_of=2025-03-31&held={session},{session}"
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+    assert_eq!(error["field"], "held", "{error}");
+}
+
+/// A value that is neither the quantifier nor an identifier is refused, and the
+/// refusal publishes the vocabulary.
+#[tokio::test]
+async fn an_unreadable_population_is_refused_with_the_vocabulary() {
+    let harness = harness();
+    let contour = contour_over_the_account(&harness, "March").await;
+
+    for value in ["", "everything", "not-a-uuid"] {
+        let (status, error) = call(
+            &harness.router,
+            get(
+                &format!("/v1/reports/balances?contour={contour}&as_of=2025-03-31&held={value}"),
+                Some(&harness.owner_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["field"], "held", "{error}");
+        assert!(
+            error["expected"]
+                .as_str()
+                .expect("the expected shape")
+                .contains("all"),
+            "the refusal names the quantifier, so a caller reading one is \
+             steered to the vocabulary rather than to guessing: {error}"
+        );
+    }
+}
+
+/// A session identifier the owner does not hold is not found.
+///
+/// An identifier is not an access right, and a report over a session that does
+/// not exist is not an empty answer: it is a request built on something that
+/// was never handed out.
+#[tokio::test]
+async fn a_population_naming_an_unknown_session_is_not_found() {
+    let harness = harness();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let stranger = Uuid::new_v4();
+
+    let (status, error) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour}&as_of=2025-03-31&held={stranger}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+}
+
+/// Every report carries the block, and the journal page does not take the
+/// parameter.
+///
+/// The four reports publish figures, and a figure has to say which population
+/// it was folded from. The journal page publishes no figure — it computes no
+/// total and derives no total, which is the whole of what it is for — so there
+/// is nothing on it for the block to qualify, and a held row printed among its
+/// rows would carry an event identifier that names nothing and differs on the
+/// next read. Decision 0018 §3.
+#[tokio::test]
+async fn every_report_states_its_population_and_the_journal_page_states_none() {
+    let harness = harness();
+    let contour = contour_over_the_account(&harness, "March").await;
+    let session = session_holding(
+        &harness,
+        "march",
+        json!([held_deposit(harness.account.inner(), "surface", "1000.00")]),
+    )
+    .await;
+
+    for path in [
+        format!("/v1/reports/balances?contour={contour}&as_of=2025-03-31&held={session}"),
+        format!("/v1/reports/assets?contour={contour}&as_of=2025-03-31&held={session}"),
+        format!("/v1/reports/flow?contour={contour}&from=2025-03-01&to=2025-03-31&held={session}"),
+        format!(
+            "/v1/reports/returns?contour={contour}&as_of=2025-03-31&currency=RUB&held={session}"
+        ),
+    ] {
+        let (status, body) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert_eq!(
+            body["held_rows"]["sessions"][0]["session"], session,
+            "{path}: {body}"
+        );
+        assert_eq!(
+            body["held_rows"]["sessions"][0]["contribution"], "folded",
+            "{path}: {body}"
+        );
+    }
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?import_session={session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(
+        page.get("held_rows").is_none(),
+        "the journal page publishes no figure, so it makes no statement about \
+         which population one was folded from: {page}"
+    );
+    assert_eq!(
+        page["rows"],
+        json!([]),
+        "the journal holds nothing for a session that has not committed, and \
+         that is the true answer rather than an omission: {page}"
+    );
+}
+
+/// A projection folded over held rows is never persisted.
+///
+/// A snapshot is the journal's state, kept so that the next report advances
+/// from it instead of replaying everything. One folded over rows that are not
+/// in the journal would persist money nobody has committed, and every later
+/// report would advance from it without ever having been asked to.
+///
+/// The check is at the store rather than through a second report, and that is
+/// not laziness: `advance` compares a prefix fingerprint and would recompute
+/// when it did not match, so the defect would be invisible from outside and the
+/// answers would look right until the day the fingerprint happened to agree.
+/// The second half of the test is what keeps the guard honest — the ordinary
+/// read still saves one, so this is about the held rows and not about the date.
+#[tokio::test]
+async fn a_projection_folded_over_held_rows_is_never_saved() {
+    let (harness, path) = harness_on_disk();
+    let contour = contour_over_the_account(&harness, "Held").await;
+    let session = session_holding(
+        &harness,
+        "held",
+        json!([held_deposit(
+            harness.account.inner(),
+            "not-persisted",
+            "1000.00"
+        )]),
+    )
+    .await;
+    // The same probe the snapshot test one screen up uses: a direct count,
+    // because from outside a substituted snapshot looks like an ordinary
+    // response with the wrong figures in it.
+    let snapshots = |path: &std::path::Path| -> u32 {
+        let probe = SqliteStore::open(path).expect("second connection");
+        probe
+            .connection()
+            .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+            .expect("snapshot count")
+    };
+
+    // The clock is fixed at this date, which is the one condition under which a
+    // snapshot may be saved at all.
+    let (status, over_held) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/returns?contour={contour}&as_of=2026-01-01&currency=RUB&held={session}"
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{over_held}");
+    assert_eq!(
+        snapshots(&path),
+        0,
+        "a fold that included rows the journal does not hold left a snapshot \
+         behind, and every later report would advance from it"
+    );
+
+    let (status, plain) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour}&as_of=2026-01-01&currency=RUB"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plain}");
+    assert_eq!(
+        snapshots(&path),
+        1,
+        "the ordinary read still saves one: the guard is the held rows, not \
+         the date"
+    );
+}

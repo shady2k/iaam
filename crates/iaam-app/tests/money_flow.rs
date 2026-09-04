@@ -4,7 +4,7 @@ use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{AccountView, Clock, Principal, Scope};
 use iaam_app::scenarios::reports::{
-    AccountStanding, KnownAccountCoverage, MoneyFlowQuery, account_balances, money_flow,
+    AccountStanding, HeldScope, KnownAccountCoverage, MoneyFlowQuery, account_balances, money_flow,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
@@ -170,6 +170,7 @@ async fn a_month_of_a_card_reports_what_came_in_and_what_went_out() {
             contour_version: None,
             from: date!(2026 - 08 - 01),
             to: date!(2026 - 08 - 31),
+            held: HeldScope::None,
         },
     )
     .await
@@ -221,6 +222,7 @@ async fn a_reversed_interval_is_rejected_by_the_period_field() {
             contour_version: None,
             from: date!(2026 - 08 - 31),
             to: date!(2026 - 08 - 01),
+            held: HeldScope::None,
         },
     )
     .await
@@ -288,9 +290,11 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
         contour,
         None,
         date!(2026 - 08 - 31),
+        &HeldScope::None,
     )
     .await
-    .unwrap_or_else(|error| panic!("balances: {error}"));
+    .unwrap_or_else(|error| panic!("balances: {error}"))
+    .report;
     let rows = &report.accounts;
 
     assert_eq!(rows.len(), 2);
@@ -343,9 +347,11 @@ async fn balances_name_the_account_left_outside_that_nobody_has_ruled_on() {
         contour,
         None,
         date!(2026 - 08 - 31),
+        &HeldScope::None,
     )
     .await
-    .unwrap_or_else(|error| panic!("balances: {error}"));
+    .unwrap_or_else(|error| panic!("balances: {error}"))
+    .report;
 
     let population = &report.population;
     assert_eq!(
@@ -397,9 +403,11 @@ async fn an_account_placed_in_another_contour_is_outside_on_a_decision() {
         reported,
         None,
         date!(2026 - 08 - 31),
+        &HeldScope::None,
     )
     .await
-    .unwrap_or_else(|error| panic!("balances: {error}"));
+    .unwrap_or_else(|error| panic!("balances: {error}"))
+    .report;
 
     let outside: Vec<_> = report.population.outside().collect();
     assert_eq!(outside.len(), 1);
@@ -428,9 +436,11 @@ async fn changing_the_contour_changes_the_population_the_report_names() {
         whole,
         None,
         date!(2026 - 08 - 31),
+        &HeldScope::None,
     )
     .await
-    .unwrap_or_else(|error| panic!("balances: {error}"));
+    .unwrap_or_else(|error| panic!("balances: {error}"))
+    .report;
 
     let covered: Vec<_> = report
         .population
@@ -468,6 +478,7 @@ async fn the_flow_report_names_the_population_it_covered() {
             contour_version: None,
             from: date!(2026 - 08 - 01),
             to: date!(2026 - 08 - 31),
+            held: HeldScope::None,
         },
     )
     .await

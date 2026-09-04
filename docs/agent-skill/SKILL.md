@@ -281,6 +281,22 @@ A session refuses to commit while any of its questions is unanswered. That
 refusal is the point of it: committing with a question open records exactly the
 guess the question exists to prevent.
 
+A report can still be asked what the answer would look like with a session's
+rows in it, and it will not do so unless asked. Every report takes a `held`
+parameter — absent means the journal alone, `all` means the journal plus every
+open session, and otherwise it is the session identifiers the answer is to
+include. The answer carries `held_rows` back: which sessions it folded, which
+reading of each one it folded, and how many held rows produced no fact at all.
+
+Read that last count before quoting any figure computed this way. A row whose
+question is unanswered becomes nothing, so such a figure is short by exactly the
+rows nobody has ruled on — and those are the ones whose amounts are least
+predictable. Quote it beside the number, never instead of it.
+
+Naming a session that has already committed is allowed and changes nothing: its
+rows are in the journal, so the answer says `already_in_journal` and counts them
+once. Naming one that was abandoned changes nothing either, and says so.
+
 ## What a contour is
 
 A contour is the set of accounts the owner considers "his portfolio". The

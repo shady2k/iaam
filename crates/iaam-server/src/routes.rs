@@ -43,7 +43,7 @@ use iaam_app::scenarios::market_reference::{
 };
 use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, report, statuses};
 use iaam_app::scenarios::reports::{
-    MoneyFlowQuery, ReturnsQuery, account_balances, asset_snapshot, money_flow, returns,
+    HeldScope, MoneyFlowQuery, ReturnsQuery, account_balances, asset_snapshot, money_flow, returns,
 };
 use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
@@ -4096,6 +4096,18 @@ pub struct MoneyFlowParams {
     pub from: String,
     /// Inclusive end, ISO-8601.
     pub to: String,
+    /// Which held rows, beside the journal, these figures are folded over.
+    ///
+    /// Absent — the journal alone, which is the default and stays it. `all` —
+    /// the journal, plus every import session of the owner's that is still
+    /// open. Otherwise a comma-separated list of import session identifiers,
+    /// each taken from a response that handed it out.
+    ///
+    /// The answer echoes what it folded in `held_rows`, session by session,
+    /// with the count of rows that produced no fact and are therefore missing
+    /// from every figure here.
+    #[serde(default)]
+    pub held: Option<String>,
 }
 
 /// The flow of money over an interval.
@@ -4105,8 +4117,8 @@ pub struct MoneyFlowParams {
     params(MoneyFlowParams),
     responses(
         (status = 200, description = "Flow of money over the interval", body = MoneyFlowReportDto),
-        (status = 404, description = "Scope not found", body = ApiError),
-        (status = 422, description = "Invalid interval", body = ApiError),
+        (status = 404, description = "Scope or import session not found", body = ApiError),
+        (status = 422, description = "Invalid interval, or an unreadable held-row scope", body = ApiError),
         (status = 500, description = "Money flow could not be built", body = ApiError)
     ),
     security(("bearer" = []))
@@ -4122,6 +4134,7 @@ pub async fn flow_report(
         contour_version: params.contour_version.map(ContourVersion),
         from: parse_query_date("from", &params.from)?,
         to: parse_query_date("to", &params.to)?,
+        held: parse_held_scope(params.held.as_deref())?,
     };
     let outcome = money_flow(&state.services, &principal, &query).await?;
     // No scoping: the projection admits no leg from outside the contour, so the
@@ -4148,6 +4161,18 @@ pub struct BalancesParams {
     pub contour_version: Option<u32>,
     /// Report date in YYYY-MM-DD format.
     pub as_of: String,
+    /// Which held rows, beside the journal, these figures are folded over.
+    ///
+    /// Absent — the journal alone, which is the default and stays it. `all` —
+    /// the journal, plus every import session of the owner's that is still
+    /// open. Otherwise a comma-separated list of import session identifiers,
+    /// each taken from a response that handed it out.
+    ///
+    /// The answer echoes what it folded in `held_rows`, session by session,
+    /// with the count of rows that produced no fact and are therefore missing
+    /// from every figure here.
+    #[serde(default)]
+    pub held: Option<String>,
 }
 
 /// Cash and positions by contour account.
@@ -4157,8 +4182,8 @@ pub struct BalancesParams {
     params(BalancesParams),
     responses(
         (status = 200, description = "Cash and positions by account, and the scope's negative cash", body = BalancesReportDto),
-        (status = 404, description = "Scope not found", body = ApiError),
-        (status = 422, description = "Invalid report date", body = ApiError),
+        (status = 404, description = "Scope or import session not found", body = ApiError),
+        (status = 422, description = "Invalid report date, or an unreadable held-row scope", body = ApiError),
         (status = 500, description = "Balances could not be built", body = ApiError)
     ),
     security(("bearer" = []))
@@ -4170,15 +4195,20 @@ pub async fn balances_report(
     ApiQuery(params): ApiQuery<BalancesParams>,
 ) -> Result<Json<BalancesReportDto>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
-    let report = account_balances(
+    let outcome = account_balances(
         &state.services,
         &principal,
         ContourId(params.contour),
         params.contour_version.map(ContourVersion),
         as_of,
+        &parse_held_scope(params.held.as_deref())?,
     )
     .await?;
-    Ok(Json(BalancesReportDto::from_domain(&report, &catalog)))
+    Ok(Json(BalancesReportDto::from_domain(
+        &outcome.report,
+        &outcome.held_rows,
+        &catalog,
+    )))
 }
 
 /// What the owner holds at a date.
@@ -4192,6 +4222,18 @@ pub struct AssetSnapshotParams {
     pub contour_version: Option<u32>,
     /// Report date in YYYY-MM-DD format.
     pub as_of: String,
+    /// Which held rows, beside the journal, these figures are folded over.
+    ///
+    /// Absent — the journal alone, which is the default and stays it. `all` —
+    /// the journal, plus every import session of the owner's that is still
+    /// open. Otherwise a comma-separated list of import session identifiers,
+    /// each taken from a response that handed it out.
+    ///
+    /// The answer echoes what it folded in `held_rows`, session by session,
+    /// with the count of rows that produced no fact and are therefore missing
+    /// from every figure here.
+    #[serde(default)]
+    pub held: Option<String>,
 }
 
 /// What the owner holds at a date, grouped by the class of cash he declared.
@@ -4206,8 +4248,8 @@ pub struct AssetSnapshotParams {
     responses(
         (status = 200, description = "Cash by class, positions at the prices the journal holds, \
                                       and the whole", body = AssetSnapshotDto),
-        (status = 404, description = "Scope not found", body = ApiError),
-        (status = 422, description = "Invalid report date", body = ApiError),
+        (status = 404, description = "Scope or import session not found", body = ApiError),
+        (status = 422, description = "Invalid report date, or an unreadable held-row scope", body = ApiError),
         (status = 500, description = "Snapshot could not be built", body = ApiError)
     ),
     security(("bearer" = []))
@@ -4219,15 +4261,20 @@ pub async fn asset_snapshot_report(
     ApiQuery(params): ApiQuery<AssetSnapshotParams>,
 ) -> Result<Json<AssetSnapshotDto>, ApiFailure> {
     let as_of = parse_query_date("as_of", &params.as_of)?;
-    let snapshot = asset_snapshot(
+    let outcome = asset_snapshot(
         &state.services,
         &principal,
         ContourId(params.contour),
         params.contour_version.map(ContourVersion),
         as_of,
+        &parse_held_scope(params.held.as_deref())?,
     )
     .await?;
-    Ok(Json(AssetSnapshotDto::from_domain(&snapshot, &catalog)))
+    Ok(Json(AssetSnapshotDto::from_domain(
+        &outcome.snapshot,
+        &outcome.held_rows,
+        &catalog,
+    )))
 }
 
 /// Returns report parameters.
@@ -4245,6 +4292,18 @@ pub struct ReturnsParams {
     pub as_of: Option<String>,
     /// Report currency.
     pub currency: CurrencyDto,
+    /// Which held rows, beside the journal, these figures are folded over.
+    ///
+    /// Absent — the journal alone, which is the default and stays it. `all` —
+    /// the journal, plus every import session of the owner's that is still
+    /// open. Otherwise a comma-separated list of import session identifiers,
+    /// each taken from a response that handed it out.
+    ///
+    /// The answer echoes what it folded in `held_rows`, session by session,
+    /// with the count of rows that produced no fact and are therefore missing
+    /// from every figure here.
+    #[serde(default)]
+    pub held: Option<String>,
 }
 
 /// Returns report **before tax**.
@@ -4254,7 +4313,7 @@ pub struct ReturnsParams {
     params(ReturnsParams),
     responses(
         (status = 200, description = "Report", body = ReturnsAnswerDto),
-        (status = 404, description = "Scope not found", body = ApiError),
+        (status = 404, description = "Scope or import session not found", body = ApiError),
         (status = 500, description = "Invariant violated", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
     ),
@@ -4275,6 +4334,7 @@ pub async fn returns_report(
         // knows neither the adapter nor the source format.
         fx: FxTable::new(FxSource::CbrOfficial),
         lot_rule: LotRuleVersion(1),
+        held: parse_held_scope(params.held.as_deref())?,
     };
     let outcome = returns(&state.services, &principal, &query).await?;
     Ok(Json(ReturnsAnswerDto::from_domain(&outcome, &catalog)))
@@ -4291,6 +4351,7 @@ pub async fn returns_report(
     request_body = Vec<FxRateDto>,
     responses(
         (status = 200, description = "Report using the specified exchange rates", body = ReturnsAnswerDto),
+        (status = 404, description = "Scope or import session not found", body = ApiError),
         (status = 422, description = "Invalid exchange rate", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -4331,6 +4392,7 @@ pub async fn returns_report_with_rates(
         report_currency: params.currency.to_domain(),
         fx,
         lot_rule: LotRuleVersion(1),
+        held: parse_held_scope(params.held.as_deref())?,
     };
     let outcome = returns(&state.services, &principal, &query).await?;
     Ok(Json(ReturnsAnswerDto::from_domain(&outcome, &catalog)))
@@ -4671,6 +4733,45 @@ fn missing_companion(field: &'static str, expected: &'static str) -> ApiFailure 
         .about(field)
         .expecting(expected),
     )
+}
+
+/// Read the population a report is asked to answer over.
+///
+/// **One parameter, and no combination that has to be refused.** The rejected
+/// shape was a pair — a word naming the population beside a list of sessions —
+/// and it has a state a caller composes by accident: the list filled in and the
+/// word left at its default, which reads as «include these» and answers over
+/// the journal alone. A request whose plain reading differs from what it does
+/// is the defect this whole feature exists to remove, so the shape that cannot
+/// express it wins.
+///
+/// `all` is a quantifier over a set, not a name of a thing the owner named, so
+/// §3.2 is untouched: no title is resolved here, and every identifier a caller
+/// sends was copied out of an earlier response. It cannot collide with an
+/// identifier either — a session is a UUID, and `all` is not one.
+///
+/// An empty value is refused rather than read as the default. A caller that
+/// wrote the parameter meant something by it, and «you asked for nothing» is
+/// not a reading of `held=`.
+fn parse_held_scope(value: Option<&str>) -> Result<HeldScope, ApiFailure> {
+    let Some(raw) = value else {
+        return Ok(HeldScope::None);
+    };
+    if raw == "all" {
+        return Ok(HeldScope::All);
+    }
+    let expected = "\"all\", or a comma-separated list of import session identifiers";
+    if raw.is_empty() {
+        return Err(invalid_field("held", expected, raw.to_owned()));
+    }
+    let mut sessions = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        let parsed =
+            Uuid::parse_str(part).map_err(|_| invalid_field("held", expected, part.to_owned()))?;
+        sessions.push(ImportSessionId(parsed));
+    }
+    Ok(HeldScope::Named(sessions))
 }
 
 fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure> {

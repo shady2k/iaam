@@ -2547,11 +2547,7 @@ pub async fn plan_session(
         .await?
         .into_iter()
         .filter(|name| {
-            name.session == session
-                || source_inventory
-                    .documents
-                    .iter()
-                    .any(|document| *document == name.document_hash)
+            name.session == session || source_inventory.documents.contains(&name.document_hash)
         })
         .collect();
     let account_resolution = account_resolution(&resolver, &read_rows, &recorded_names);

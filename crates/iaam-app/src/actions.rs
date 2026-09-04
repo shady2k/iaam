@@ -5233,8 +5233,8 @@ mod tests {
     #[test]
     fn losing_contour_eligibility_is_not_contour_completion() {
         let account = account();
-        let eligible = actions_from_views(&[account], &[], &[], &[]);
-        let ineligible = actions_from_views(&[], &[], &[], &[]);
+        let eligible = actions_from_views(&[account], &[], &[], &[], &[]);
+        let ineligible = actions_from_views(&[], &[], &[], &[], &[]);
 
         assert!(
             eligible
@@ -5296,7 +5296,7 @@ mod tests {
         let savings = named("Savings");
         let accounts = [main.clone(), savings.clone()];
 
-        let actions = actions_from_views(&accounts, &[], &[], &[]);
+        let actions = actions_from_views(&accounts, &[], &[], &[], &[]);
         let asked: Vec<_> = actions
             .iter()
             .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
@@ -5347,7 +5347,7 @@ mod tests {
             &[]
         ));
         assert!(
-            actions_from_views(std::slice::from_ref(&only), &[], &[], &[])
+            actions_from_views(std::slice::from_ref(&only), &[], &[], &[], &[])
                 .iter()
                 .all(|action| action.kind() != ActionKind::ResolveTransferRelationships)
         );
@@ -5364,7 +5364,7 @@ mod tests {
         assert!(transfer_relationships_completion(main.id, &statements));
         assert!(transfer_relationships_completion(savings.id, &statements));
         assert!(
-            actions_from_views(&accounts, &[], &[], &statements)
+            actions_from_views(&accounts, &[], &[], &statements, &[])
                 .iter()
                 .all(|action| action.kind() != ActionKind::ResolveTransferRelationships)
         );
@@ -5382,10 +5382,11 @@ mod tests {
         let statements = [stated(main.id, &[savings.id])];
 
         assert!(!transfer_relationships_completion(savings.id, &statements));
-        let asked: Vec<_> = actions_from_views(&[main, savings.clone()], &[], &[], &statements)
-            .into_iter()
-            .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
-            .collect();
+        let asked: Vec<_> =
+            actions_from_views(&[main, savings.clone()], &[], &[], &statements, &[])
+                .into_iter()
+                .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+                .collect();
         assert_eq!(asked.len(), 1);
         assert_eq!(
             asked[0].subject().and_then(ActionSubject::account),
@@ -5405,17 +5406,22 @@ mod tests {
         let savings = named("Savings");
         let statements = [stated(main.id, &[savings.id]), stated(savings.id, &[])];
         assert!(
-            actions_from_views(&[main.clone(), savings.clone()], &[], &[], &statements)
+            actions_from_views(&[main.clone(), savings.clone()], &[], &[], &statements, &[])
                 .iter()
                 .all(|action| action.kind() != ActionKind::ResolveTransferRelationships)
         );
 
         let everyday = named("Everyday");
-        let asked: Vec<_> =
-            actions_from_views(&[main, savings, everyday.clone()], &[], &[], &statements)
-                .into_iter()
-                .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
-                .collect();
+        let asked: Vec<_> = actions_from_views(
+            &[main, savings, everyday.clone()],
+            &[],
+            &[],
+            &statements,
+            &[],
+        )
+        .into_iter()
+        .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
+        .collect();
         assert_eq!(asked.len(), 1, "only the new account is asked again");
         assert_eq!(
             asked[0].subject().and_then(ActionSubject::account),
@@ -5449,7 +5455,7 @@ mod tests {
             reason: "A counterparty's account, not the owner's money.".into(),
         }];
 
-        let asked: Vec<_> = actions_from_views(&accounts, &contours, &exclusions, &[])
+        let asked: Vec<_> = actions_from_views(&accounts, &contours, &exclusions, &[], &[])
             .into_iter()
             .filter(|action| action.kind() == ActionKind::ResolveTransferRelationships)
             .map(|action| action.subject().and_then(ActionSubject::account))
@@ -5495,7 +5501,7 @@ mod tests {
             reason: "Closed years ago.".into(),
         }];
 
-        let asked = actions_from_views(&accounts, &contours, &exclusions, &[])
+        let asked = actions_from_views(&accounts, &contours, &exclusions, &[], &[])
             .into_iter()
             .find(|action| action.kind() == ActionKind::ResolveTransferRelationships)
             .expect("the inside account is asked");

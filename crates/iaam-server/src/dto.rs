@@ -47,6 +47,10 @@ use iaam_app::scenarios::import_session::PlannedOrigin;
 // to a wrapped list reflows every line of it.
 use iaam_app::actions::OwnerQuestion;
 use iaam_app::scenarios::import_session::{AnswerReach, AnsweredQuestions, stored_alternatives};
+// Wave Y's own names, in a block of their own for the reason the blocks above
+// give: this file is edited by several changes at once, and a name added to a
+// wrapped list reflows every line of it.
+use iaam_app::scenarios::import_session::{PrintedRow, RowShape};
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     HeldContribution, HeldRows, HeldSession, MoneyFlowOutcome, PopulationAccount, ReportConfidence,
@@ -9835,8 +9839,67 @@ pub struct InterpretationDto {
     /// Empty where the document printed no category of its own, which is the
     /// truthful answer and not a failure: decision 0019 §6 has a profile name
     /// that column and stop, so a source without one leaves nothing to offer.
+    ///
+    /// **Every entry here is safe to put to the owner** (decision 0032). A word
+    /// whose rows are not one thing is in `withheld_offers` instead and never
+    /// here, so a client that walks this list and relays what it finds cannot
+    /// relay an offer that would file most of what it matches wrongly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offered_rules: Vec<OfferedRuleDto>,
+    /// Words the source filed rows under that no rule is offered on, and what
+    /// each of them turned out to hold. Most-covering first.
+    ///
+    /// **This is `iaam-xchm`, and it is a second list rather than a flag on the
+    /// first.** One word of a real export covered a large share of the document
+    /// and held movements between the owner's own accounts, payments to a
+    /// person, payments to a company and others at once. A rule on that word
+    /// would have been wrong for most of what it matched, and the offer said
+    /// nothing about it. A `mixed` flag would have been a field a client can
+    /// ignore guarding the entries that must not be relayed; two lists make the
+    /// safe reading the default one.
+    ///
+    /// **Nothing is hidden by the split.** Every row named here is in
+    /// `open_questions` as well, so a client that ignores this field loses a
+    /// shortcut and never a row. What it buys is the answer to «why is there no
+    /// offer on the word that covers half my statement», which silence answers
+    /// wrongly.
+    ///
+    /// The group is **not** narrowed to the direction instead, and decision 0032
+    /// argues it: a classification rule carries no direction on purpose, so a
+    /// group narrowed to one would publish a `covers` list its own `matcher`
+    /// does not agree with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld_offers: Vec<WithheldOfferDto>,
+    /// The owner's accounts an answer that names one may name, once for the
+    /// whole assessment.
+    ///
+    /// **This is `iaam-7iyg`.** Two of the four questions are answered by naming
+    /// one of his accounts, `alternatives[].needs_account` says which words those
+    /// are, and this section said an account was required without ever saying
+    /// which accounts exist — so a client working a first import of a few hundred
+    /// rows made one extra call per question to learn a list identical every
+    /// time.
+    ///
+    /// **Once here and not once per question**, which `MissingInputDto.candidates`
+    /// does and this deliberately does not: a queue item is read alone and has no
+    /// second item to share a list with, while this response holds every open
+    /// question of the session at once. Repeating the directory under each of
+    /// them would publish the owner's whole account list hundreds of times to say
+    /// the same thing.
+    ///
+    /// **One account of this list is wrong for any given question**: the one the
+    /// row is already on, because an account is not the other side of itself.
+    /// `open_questions[].printed.account` says which, so the exclusion is one
+    /// comparison against a value published beside the question rather than a
+    /// call somewhere else. `ImportQuestionDto.accounts` still does the exclusion
+    /// itself, because that response is about one row.
+    ///
+    /// `id` is what `POST …/answer` takes; `title` and `institution` are what the
+    /// owner reads (conventions §3.3). Absent when no open question offers an
+    /// answer that names an account, and when the owner holds no accounts —
+    /// both statements about his directory rather than a lookup nobody made.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answer_accounts: Vec<AccountCandidateDto>,
 }
 
 /// One question the session is waiting on.
@@ -9845,6 +9908,34 @@ pub struct OpenQuestionDto {
     pub row: u32,
     pub question: Uuid,
     pub prompt: String,
+    /// The row the question is about, as the source printed it.
+    ///
+    /// **This is `iaam-pm4w`.** An agent that had to show the owner what a group
+    /// of questions contained — dates, amounts, directions, accounts,
+    /// counterparties — recovered them from `prompt` with regular expressions,
+    /// because that string was the only place they were published. Every one of
+    /// them was a typed value while the question was being built.
+    ///
+    /// That is the act `docs/import-boundary.md` refuses one level down: a client
+    /// may not interpret a document's rows, and a client re-deriving structure
+    /// from prose this engine wrote is the same act with the same failure — an
+    /// expression that is right today and silently wrong when the wording
+    /// changes. The sentence stays, because it is what a person reads; these are
+    /// what a client groups, sorts and totals by.
+    ///
+    /// **Not a second reading of the row.** What each row will move in the
+    /// journal is published by `commit_delta` and `resolved`, computed by
+    /// planning the commit — and a row with an open question is in neither, so
+    /// the two never describe one row. What is here is what the **source**
+    /// printed, signed as it printed it.
+    ///
+    /// Absent for a question whose stored row this build cannot read. One absence
+    /// and not six: the values are one row, they fail together, and six optional
+    /// fields would suggest a row could state its amount and not its account.
+    /// Such a question keeps its `prompt` and its `alternatives` and is answered
+    /// exactly as any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printed: Option<PrintedRowDto>,
     /// What may be said in answer, each word carrying what it decides.
     ///
     /// **This is `iaam-ulib`.** A question was published in four places and this
@@ -9936,7 +10027,143 @@ pub struct OfferedRuleDto {
     pub question: OwnerQuestionDto,
     /// The rows of this session, in order, whose open question this condition
     /// would settle. Never empty: an offer covering nothing is not published.
+    ///
+    /// **Exactly the open rows `matcher` matches**, and it stays that way: a
+    /// group narrowed past what the condition can express would claim rows the
+    /// rule does not settle, and `POST /v1/category-rules/preview`'s answer to
+    /// «what would this match» would contradict the offer beside it.
     pub covers: Vec<u32>,
+    /// What those rows are, as far as the source said — one shape, always.
+    ///
+    /// **An offer is only made where the group is one thing** (`iaam-xchm`,
+    /// decision 0032), and this is the claim being made rather than a decoration:
+    /// a client can show the owner what he is deciding about without expanding
+    /// the group itself, and can check the claim instead of taking it. A word
+    /// whose rows disagree is in `withheld_offers`, where this field is a list.
+    pub contains: RowShapeDto,
+}
+
+/// A word the source filed rows under whose rows are not one thing, and the rule
+/// that is therefore not offered on it.
+///
+/// **This is `iaam-xchm`.** An institution files by its own purposes, and a
+/// transfer word covers every transfer — inward and outward, to the owner's own
+/// accounts and to other people's. The word is not the defect; what was missing
+/// is that the offer said nothing about whether the group was one thing, so a
+/// client could only find out by expanding the group by hand.
+///
+/// **An offer withheld with a reason is a fact.** An offer made on a group that
+/// is not one thing is a confident recommendation to make one wrong standing
+/// decision instead of many right ones, and the owner adopting it is the failure
+/// the offer exists to prevent.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WithheldOfferDto {
+    /// The word the source filed these rows under, verbatim.
+    pub source_category: String,
+    /// The rows of this session, in order, that no offer covers because of it.
+    /// The union of `contains[].rows`.
+    pub covers: Vec<u32>,
+    /// What the word turned out to hold, largest share first. Two entries at
+    /// least — one would have been an offer.
+    ///
+    /// This is the part a client shows. Working the group by shape is what is
+    /// left when no standing decision can be offered on it, and it is not
+    /// nothing: `open_questions[].alike` and the answering call's `settles`
+    /// already settle many rows from one answer with no rule written at all.
+    pub contains: Vec<RowShapeDto>,
+    /// Why no rule is offered, in one sentence a person can read.
+    ///
+    /// **A statement and not a question**, so it has one part where
+    /// `OwnerQuestionDto` has two: nothing is being asked and no answer of his
+    /// changes anything, so a `consequence` would have to be invented — and an
+    /// invented one is exactly the sentence that reads as finished which
+    /// decision 0027 exists to prevent.
+    pub reason: String,
+}
+
+/// What a group of rows is, as far as the source said.
+///
+/// **Two facts, and they are the two that decide which question a row raises.**
+/// A named party with a stated direction is asked whether the far side is one of
+/// the owner's accounts; an unnamed outflow is asked whether it was a fee; an
+/// unnamed inflow is asked what arrived; a row with no direction is asked which
+/// way it ran. So two rows of one shape raised the same question and two of
+/// different shapes did not, and a third field naming the question would be the
+/// same fact written twice.
+///
+/// **What this cannot see.** It is made of what the source stated, which is all
+/// this side has. It separates rows that ran opposite ways and rows that named
+/// nobody; it cannot separate a payment to a person from a payment to a company,
+/// because no field of the row says which. One shape is therefore a statement
+/// that the document contradicts itself nowhere, not a guarantee that the owner
+/// would answer alike — the offer's own wording is his protection for the rest.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RowShapeDto {
+    /// `in` or `out`, as the source stated it. Absent where it stated nothing,
+    /// which is what these rows have in common and never a wildcard: the sign on
+    /// the amount is not read as a direction anywhere on this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Whether the source named a party at all. Not the party's name: two shops
+    /// are one shape, and grouping by the name would be one group per shop,
+    /// which is the count the offer exists to reduce.
+    pub counterparty_named: bool,
+    /// The rows of this shape, in order.
+    pub rows: Vec<u32>,
+}
+
+/// The row one open question is about, as the source printed it.
+///
+/// Every value here was a typed value while the question was being built and was
+/// published only joined into the sentence beside it (`iaam-pm4w`). Nothing is
+/// normalised: `amount` carries the sign the source printed, `direction` is the
+/// source's own word and never the sign, and an absence means the source said
+/// nothing rather than that this system could not decide.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrintedRowDto {
+    /// The account whose statement the row is on — not the far side, which is
+    /// what is being asked about. It is also the one entry of
+    /// `interpretation.answer_accounts` that is wrong for this question.
+    pub account: Uuid,
+    /// The amount as a decimal string, **with the sign the source printed**.
+    ///
+    /// Not made positive and not normalised into what the journal would post:
+    /// the sign is the source's own statement about direction and the thing the
+    /// owner matches against the line in front of him. For the one question
+    /// whose direction is genuinely open it is evidence of nothing, which is why
+    /// that question exists.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    /// The day the row states. Absent for a row that states none — which the
+    /// commit will refuse for want of one, and which is published as an absence
+    /// rather than filled in.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub date: Option<Date>,
+    /// `in` or `out`, from the source's own direction word. Absent where the
+    /// source stated none, which is the condition the "which way did it go"
+    /// question is asked under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// The party the source named, exactly as it printed it. Absent for the two
+    /// questions asked precisely because no party was named.
+    ///
+    /// The string a rule would match on, so a client that groups by it groups by
+    /// what a standing decision would later fire on. The row's description is
+    /// deliberately not published beside it: it is the row's whole text, of
+    /// unbounded length, and it belongs in no sentence read to the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterparty: Option<String>,
+    /// The word the source filed the row under, when it printed one — the field
+    /// `offered_rules` and `withheld_offers` group by, published here so that a
+    /// client can see which word an open row belongs to without joining two
+    /// lists by row number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_category: Option<String>,
 }
 
 /// The identity one account's planned facts will carry into the journal.
@@ -10474,6 +10701,7 @@ impl ImportPlanDto {
                         row: open.row,
                         question: open.question.inner(),
                         prompt: open.prompt.clone(),
+                        printed: open.printed.as_ref().map(PrintedRowDto::from_domain),
                         alternatives: open
                             .alternatives
                             .iter()
@@ -10492,6 +10720,32 @@ impl ImportPlanDto {
                         matcher: RuleMatcherDto::from_domain(&offered.matcher),
                         question: OwnerQuestionDto::from_domain(&offered.question),
                         covers: offered.covers.clone(),
+                        contains: RowShapeDto::from_domain(&offered.contains),
+                    })
+                    .collect(),
+                withheld_offers: plan
+                    .interpretation
+                    .withheld_offers
+                    .iter()
+                    .map(|withheld| WithheldOfferDto {
+                        source_category: withheld.source_category.clone(),
+                        covers: withheld.covers.clone(),
+                        contains: withheld
+                            .contains
+                            .iter()
+                            .map(RowShapeDto::from_domain)
+                            .collect(),
+                        reason: withheld.reason.clone(),
+                    })
+                    .collect(),
+                answer_accounts: plan
+                    .interpretation
+                    .answer_accounts
+                    .iter()
+                    .map(|candidate| AccountCandidateDto {
+                        id: candidate.id.inner(),
+                        title: candidate.title.clone(),
+                        institution: candidate.institution.clone(),
                     })
                     .collect(),
             },
@@ -10590,6 +10844,48 @@ impl PlannedFactDto {
     }
 }
 
+impl PrintedRowDto {
+    #[must_use]
+    pub fn from_domain(printed: &PrintedRow) -> Self {
+        Self {
+            account: printed.account.inner(),
+            // `minor_amount`, as every other amount this API publishes: a JSON
+            // number would stop being the fact it states. The sign it carries is
+            // the source's, unaltered.
+            amount: minor_amount(printed.amount_minor, printed.currency),
+            currency: CurrencyDto::from_domain(printed.currency),
+            date: printed.date,
+            direction: printed.movement.map(movement_code),
+            counterparty: printed.counterparty.clone(),
+            source_category: printed.source_category.clone(),
+        }
+    }
+}
+
+impl RowShapeDto {
+    #[must_use]
+    pub fn from_domain(shape: &RowShape) -> Self {
+        Self {
+            direction: shape.movement.map(movement_code),
+            counterparty_named: shape.counterparty_named,
+            rows: shape.rows.clone(),
+        }
+    }
+}
+
+/// The wire word for a direction the source stated.
+///
+/// One function, so the two sections that publish a direction out of an open
+/// question — the row it is about and the shape its group has — cannot come to
+/// spell it differently from each other or from `TransferLegDto.direction`.
+fn movement_code(movement: Movement) -> String {
+    match movement {
+        Movement::In => "in",
+        Movement::Out => "out",
+    }
+    .to_owned()
+}
+
 impl SettledRowDto {
     #[must_use]
     pub fn from_domain(settled: &SettledRow) -> Self {
@@ -10681,10 +10977,7 @@ impl TransferLegDto {
             session,
             row,
             account: leg.account.inner(),
-            direction: match leg.direction {
-                Movement::In => "in".to_owned(),
-                Movement::Out => "out".to_owned(),
-            },
+            direction: movement_code(leg.direction),
             amount: minor_amount(leg.amount_minor, leg.currency),
             currency: CurrencyDto::from_domain(leg.currency),
             date: leg.date,

@@ -20178,6 +20178,59 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
     // One question, so nothing is a repeat of it, and the field says so by
     // being absent rather than by naming this row as its own repeat.
     assert!(open[0]["alike"].is_null(), "{plan}");
+
+    // And the row it is about travels beside the sentence, typed (iaam-pm4w,
+    // decision 0032). An agent that had to show the owner what a group of
+    // questions contained pulled these back out of `prompt` with regular
+    // expressions, which is `docs/import-boundary.md`'s refusal turned on this
+    // engine's own prose.
+    let printed = &open[0]["printed"];
+    assert_eq!(printed["account"], json!(account.to_string()), "{plan}");
+    assert_eq!(printed["amount"], "2500.00", "{plan}");
+    assert_eq!(printed["currency"], "RUB", "{plan}");
+    assert_eq!(printed["date"], "2025-03-18", "{plan}");
+    assert!(
+        printed["direction"].is_null(),
+        "the source stated none, and a positive amount is not one: {plan}"
+    );
+    assert!(
+        printed["counterparty"].is_null(),
+        "the source named nobody: {plan}"
+    );
+    assert!(
+        open[0]["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("2500.00")),
+        "and the sentence still names the row, because it is what a person \
+         reads: {plan}"
+    );
+
+    // The accounts an answer may name are published once for the assessment
+    // (iaam-7iyg, decision 0032). Two of the words above name one of the
+    // owner's accounts, and this section used to say that and never which
+    // accounts exist — so a caller made one extra call per question to learn a
+    // list identical every time.
+    assert!(
+        alternatives
+            .iter()
+            .any(|alternative| alternative["needs_account"] == json!(true)),
+        "the premise: an answer to this question names an account: {plan}"
+    );
+    let answer_accounts = plan["interpretation"]["answer_accounts"]
+        .as_array()
+        .expect("the accounts an answer may name");
+    assert!(
+        answer_accounts
+            .iter()
+            .any(|candidate| candidate["id"] == json!(savings.to_string())),
+        "including the one the answer below names: {plan}"
+    );
+    for candidate in answer_accounts {
+        assert!(
+            candidate["title"].as_str().is_some_and(|t| !t.is_empty()),
+            "each is published with what the owner reads it by: {plan}"
+        );
+    }
     assert_eq!(plan["readiness"], "requires_owner_decision", "{plan}");
 
     // Reading the assessment wrote nothing, which is the other half of the
@@ -20248,6 +20301,153 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
         before + 2,
         "the commit wrote exactly what the assessment said it would"
     );
+}
+
+/// A word whose rows are one thing is offered; a word that holds two is not.
+///
+/// The defect (`iaam-xchm`): the assessment grouped unanswered rows by the word
+/// the source filed them under and offered a standing rule on it, saying nothing
+/// about whether the group was one thing. On a real export one such word covered
+/// a large share of the document and held movements between the owner's own
+/// accounts, payments to a person and payments to a company at once — so the one
+/// rule offered would have been wrong for most of what it matched, and the owner
+/// adopting it is the failure the offer exists to prevent.
+///
+/// Everything here is invented: `Shop One` and the rest are nobody, the words
+/// are made up, and the amounts were chosen for this test.
+#[tokio::test]
+async fn a_word_that_holds_two_things_is_published_with_its_contents_and_no_rule() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "mixed" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let filed = |key: &str, category: &str, direction: &str, counterparty: &str| {
+        json!({
+            "account": account,
+            "type": "unresolved_direction",
+            "amount": "100.00",
+            "currency": "RUB",
+            "direction": direction,
+            "counterparty": counterparty,
+            "dates": { "cash_posted": "2025-03-18" },
+            "source_kind": "TRANSFER",
+            "source_category": category,
+            "idempotency_key": key,
+        })
+    };
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    filed("mixed-one", "Transfer", "out", "Shop One"),
+                    filed("mixed-two", "Transfer", "out", "Shop Two"),
+                    filed("mixed-three", "Transfer", "in", "Shop Three"),
+                    filed("plain-one", "Groceries", "out", "Shop Four"),
+                    filed("plain-two", "Groceries", "out", "Shop Five"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+
+    let offered = plan["interpretation"]["offered_rules"]
+        .as_array()
+        .expect("offered rules");
+    assert_eq!(
+        offered.len(),
+        1,
+        "only the word whose rows agree is offered: {plan}"
+    );
+    assert_eq!(
+        offered[0]["matcher"]["source_category"], "Groceries",
+        "{plan}"
+    );
+    assert_eq!(offered[0]["covers"], json!([4, 5]), "{plan}");
+    assert_eq!(
+        offered[0]["contains"]["direction"], "out",
+        "the offer publishes the shape it is claiming, so its reader can check \
+         the claim instead of taking it: {plan}"
+    );
+    assert_eq!(offered[0]["contains"]["counterparty_named"], true, "{plan}");
+    assert_eq!(offered[0]["contains"]["rows"], json!([4, 5]), "{plan}");
+
+    let withheld = plan["interpretation"]["withheld_offers"]
+        .as_array()
+        .expect("withheld offers");
+    assert_eq!(withheld.len(), 1, "{plan}");
+    assert_eq!(withheld[0]["source_category"], "Transfer", "{plan}");
+    assert_eq!(withheld[0]["covers"], json!([1, 2, 3]), "{plan}");
+    let contains = withheld[0]["contains"].as_array().expect("what it holds");
+    assert_eq!(
+        contains.len(),
+        2,
+        "money that left and money that arrived under one word: {plan}"
+    );
+    assert_eq!(
+        contains[0]["rows"],
+        json!([1, 2]),
+        "largest share first: {plan}"
+    );
+    assert_eq!(contains[1]["rows"], json!([3]), "{plan}");
+    assert!(
+        withheld[0]["reason"].as_str().is_some_and(
+            |reason| reason.contains("Transfer") && reason.contains("not all the same thing")
+        ),
+        "an offer withheld with a reason is a fact; silence is not: {plan}"
+    );
+
+    // The word is nowhere among the offers, so a client that walks that list and
+    // relays what it finds cannot relay this one. That is why it is a second
+    // list and not a flag: a flag is a field a client can ignore, guarding the
+    // entries that must not be relayed.
+    assert!(
+        offered
+            .iter()
+            .all(|entry| entry["matcher"]["source_category"] != json!("Transfer")),
+        "{plan}"
+    );
+
+    // And nothing is hidden by the split: every row it names is still a question
+    // the owner is being asked, so what such a client loses is a shortcut and
+    // never a row.
+    let open: Vec<u64> = plan["interpretation"]["open_questions"]
+        .as_array()
+        .expect("open questions")
+        .iter()
+        .filter_map(|question| question["row"].as_u64())
+        .collect();
+    for row in [1, 2, 3] {
+        assert!(
+            open.contains(&row),
+            "row {row} is still asked about: {plan}"
+        );
+    }
 }
 
 /// A commit against a reading the session no longer answers to is refused.

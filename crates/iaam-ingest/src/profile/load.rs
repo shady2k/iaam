@@ -1228,7 +1228,11 @@ mod tests {
         let mut profile = complete();
         profile["row"]["far_side"] = serde_json::json!({
             "column": "Purpose",
-            "own_account_words": ["Between your accounts", "  Between your accounts at us  "]
+            // The same sentence twice, once with the padding a hand-written
+            // profile picks up. Two *different* sentences are an ordinary list
+            // — an institution prints more than one — so the duplicate has to
+            // be a duplicate to test what it claims to.
+            "own_account_words": ["Between your accounts", "  Between your accounts  "]
         });
         let error = load(&profile).expect_err("one sentence written twice does not load");
         assert!(
@@ -1237,7 +1241,7 @@ mod tests {
         );
 
         profile["row"]["far_side"]["own_account_words"] =
-            serde_json::json!(["Between your accounts"]);
+            serde_json::json!(["Between your accounts", "Between your accounts at us"]);
         let loaded = load(&profile).expect("a list of sentences is a far-side block");
         let super::FarSideSource::OwnAccountWords { column, words } =
             loaded.row().far_side.as_ref().expect("a far-side block")
@@ -1246,6 +1250,10 @@ mod tests {
         };
         assert_eq!(column, "Purpose");
         assert!(words.contains("Between your accounts"));
+        assert!(
+            words.contains("Between your accounts at us"),
+            "an institution prints more than one such sentence"
+        );
         assert!(loaded.columns().contains(&"Purpose"));
     }
 

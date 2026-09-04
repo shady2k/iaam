@@ -6378,6 +6378,9 @@ mod tests {
             account: None,
             origin: None,
             income_kind: None,
+            // Absent, which is `this_row`: these tests are about what one
+            // answer says, not about how far it reaches.
+            settles: None,
         }
     }
 

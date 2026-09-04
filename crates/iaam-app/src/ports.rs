@@ -2058,7 +2058,7 @@ mod tests {
             .iter()
             .filter(|operation| required_scope(**operation) == Scope::Agent)
             .count();
-        assert_eq!(owner, 10, "the owner-only half of §4.3");
+        assert_eq!(owner, 11, "the owner-only half of §4.3");
         assert_eq!(agent, 8, "the half an agent reaches, §4.3");
         assert_eq!(owner + agent, OperationKey::ALL.len());
     }

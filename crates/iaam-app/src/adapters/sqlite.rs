@@ -15,10 +15,11 @@ use crate::ports::{
     BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
     CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
     ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
-    CustodyView, Declared, DocumentToKeep, ImportObservationView, ImportQuestionView,
-    ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
-    InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, NewImportQuestion, Principal,
-    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView, UnresolvedAccountView,
+    CustodyView, Declared, DeclinedAccountNameView, DocumentToKeep, ImportObservationView,
+    ImportQuestionView, ImportSessionState, ImportSessionSummaryView, ImportSessionView,
+    InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery,
+    NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -941,6 +942,70 @@ impl Store for SqliteAdapter {
                     records: record.records,
                 })
                 .collect())
+        })
+        .await
+    }
+
+    async fn list_unresolved_account_sources(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<UnresolvedAccountSourceView>, AppError> {
+        self.blocking(move |store| {
+            let sources = store
+                .list_unresolved_account_sources(owner)
+                .map_err(store_error)?;
+            Ok(sources
+                .into_iter()
+                .map(|source| UnresolvedAccountSourceView {
+                    document_hash: source.document_hash.as_str().to_owned(),
+                    issuer: source.issuer,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn list_declined_account_names(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<DeclinedAccountNameView>, AppError> {
+        self.blocking(move |store| {
+            let declined = store
+                .list_declined_account_names(owner)
+                .map_err(store_error)?;
+            Ok(declined
+                .into_iter()
+                .map(|record| DeclinedAccountNameView {
+                    printed: record.printed,
+                    reason: record.reason,
+                })
+                .collect())
+        })
+        .await
+    }
+
+    async fn decline_account_name(
+        &self,
+        owner: OwnerId,
+        declined: DeclinedAccountNameView,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .decline_account_name(owner, &declined.printed, &declined.reason)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn withdraw_declined_account_name(
+        &self,
+        owner: OwnerId,
+        printed: String,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .withdraw_declined_account_name(owner, &printed)
+                .map_err(store_error)
         })
         .await
     }

@@ -464,6 +464,7 @@ Read-only is the absence of all four.
 | Record a control balance | yes | no | no |
 | Write classification, category and account rules | yes | no | no |
 | Record or withdraw a product's retirement | yes | **no** | no |
+| Record or withdraw that a printed account name is not the owner's | yes | **no** | no |
 | Create accounts, contours, categories, instruments | yes | no | no |
 | Issue and revoke tokens and broker access | yes | no | no |
 

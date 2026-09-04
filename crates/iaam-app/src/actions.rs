@@ -766,6 +766,32 @@ pub enum OwnerPrompt {
     ImportAnswer,
     /// Which of his accounts is the far side of a movement.
     TransferFarSide,
+    /// The bank, broker or organisation an account is held at.
+    ///
+    /// **The question that replaced one nobody could answer** (`iaam-9i83`).
+    /// `create_account` carries `provider` beside this, and `provider`'s only
+    /// property is that it differs between sources: a person cannot get such a
+    /// value right in an interesting way, gains nothing by choosing it, and must
+    /// then remember it forever. Told as much, the owner said what should have
+    /// been asked instead — «then it should have asked me what the bank is
+    /// called» — and then narrowed it himself, because a broker is not a bank
+    /// and an account may sit at neither.
+    ///
+    /// It carries no datum, and the contrast with [`Self::AccountTitle`] is the
+    /// reason: that one carries the printed string because what a rename
+    /// **costs** differs between the two states it can be asked in. What an
+    /// institution is for does not differ, and neither does what turns on it, so
+    /// there is nothing for a datum to vary.
+    AccountInstitution,
+    /// What a name a document printed is, where it is not an account of his.
+    ///
+    /// The second way out of the item this vocabulary's neighbour raises
+    /// (`iaam-mk1n`), and the reason it needs a question of its own is that it
+    /// is not the same act as ruling an account outside the perimeter — there is
+    /// no account. `/reason` is the pointer both share, which is exactly why a
+    /// question is keyed on the pair: the two sentences are about different
+    /// things and would otherwise be one entry.
+    DeclinedNameReason,
 }
 
 impl OwnerPrompt {
@@ -796,6 +822,10 @@ impl OwnerPrompt {
             Self::RuleCategory => "/category",
             Self::ImportAnswer => "/answer",
             Self::TransferFarSide => "/account",
+            Self::AccountInstitution => "/institution",
+            // The same pointer as `ExclusionReason` and a different question,
+            // which is what `asked_by` below is for.
+            Self::DeclinedNameReason => "/reason",
         }
     }
 
@@ -821,6 +851,8 @@ impl OwnerPrompt {
             }
             Self::RuleMatcher | Self::RuleCategory => OperationKey::CreateCategoryRule,
             Self::ImportAnswer | Self::TransferFarSide => OperationKey::AnswerImportQuestion,
+            Self::AccountInstitution => OperationKey::CreateAccount,
+            Self::DeclinedNameReason => OperationKey::RecordAccountNameDisposition,
         }
     }
 
@@ -1038,6 +1070,31 @@ impl OwnerPrompt {
                  spending as an internal move."
                     .to_owned(),
             ),
+            Self::AccountInstitution => (
+                "Which bank, broker or other organisation is this account held at? Write it \
+                 the way you would say it out loud."
+                    .to_owned(),
+                "No figure moves whichever way you answer, and nothing is worked out from it: \
+                 this system does not read it, and no statement is matched against it. It is \
+                 read by you. It is what tells two accounts apart in a list when they are \
+                 called something similar, and what says, a year from now, where the account a \
+                 report is about is actually kept."
+                    .to_owned(),
+            ),
+            Self::DeclinedNameReason => (
+                "Why is this name not one of your accounts? A few words are enough — what it \
+                 actually is."
+                    .to_owned(),
+                "The records printed under this name stay out of everything, exactly as they \
+                 are now: they are already refused, and saying this does not recover them. \
+                 What changes is that they are refused because you decided so rather than \
+                 because nobody has got round to them, and this system stops asking you to \
+                 create the account. Your sentence is the only thing that will \
+                 tell, a year from now, a name you ruled out from one nobody ever looked at. \
+                 If one of your accounts turns out to answer to the name after all, saying so \
+                 wins: this is not consulted once the name is recognised."
+                    .to_owned(),
+            ),
         };
         OwnerQuestion { ask, consequence }
     }
@@ -1069,20 +1126,25 @@ pub struct OwnerQuestion {
 /// Fields the owner is asked for that carry no question, and the bead deciding
 /// whether they should be asked at all.
 ///
-/// **The second way the guard below is satisfied, and it is not a phrasing
-/// debt.** `create_account`'s `provider` is the owner's label for a source, and
-/// its only property is that it differs between sources. A value whose whole
-/// purpose is uniqueness is one this instance should mint rather than one a
-/// person invents and then has to remember forever, and the question a person
-/// can actually answer — what the institution is called — is a different field
-/// of the same request. `iaam-9i83` owns both halves of that.
+/// **Empty, and it was not emptied by writing the missing sentence.** The one
+/// entry this register ever held was `create_account`'s `provider`, and
+/// `iaam-9i83` answered it the other way: the field stopped being the owner's.
+/// Its only property is that it differs between sources, a person cannot get
+/// such a value right in an interesting way, gains nothing by choosing it, and
+/// `CreateAccountRequest::provider_account_id`'s own doc obliges whoever supplies
+/// it to change it whenever the derivation changes — a rule no person can keep.
+/// So the queue mints it from the institution the profile that read the document
+/// declares, and asks him instead for [`OwnerPrompt::AccountInstitution`], which
+/// is a question he can answer without being taught anything first.
 ///
-/// The entry exists because a guard that can only be satisfied by writing prose
-/// would have bought a fluent question for a question that should not be asked.
-/// Registering it says the field is unanswered on purpose and names who is
-/// deciding; leaving it silent is the only thing refused.
-pub const QUESTIONS_UNDER_REVIEW: &[(OperationKey, &str)] =
-    &[(OperationKey::CreateAccount, "/provider")];
+/// **It stays, empty, on purpose.** The register is the third way
+/// `every_field_the_owner_fills_in_carries_the_question_to_put_to_him` is
+/// satisfied, and its worth is that the next author facing the same shape has
+/// somewhere to put «this should not be asked at all» other than into a fluent
+/// sentence that settles the question by making it painless to leave. Deleting
+/// the register would leave writing prose as the only way past the guard, which
+/// is exactly the pressure decision 0027 §5 refused.
+pub const QUESTIONS_UNDER_REVIEW: &[(OperationKey, &str)] = &[];
 
 /// One required request field not supplied by the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1745,9 +1807,23 @@ pub async fn frontier(
 /// uses, so the queue and the reader cannot disagree about the same string. A
 /// stored verdict would publish an account created an hour ago.
 ///
-/// Folded per name and not per document: two statements of one bank naming the
-/// same unknown account are one account to create, and an item per document
-/// would ask for it twice.
+/// **Folded per name and per institution, and not per document.** Two statements
+/// of one bank naming the same unknown account are one account to create, and an
+/// item per document would ask for it twice. Two *institutions* printing one
+/// string are not one account, and that is why the institution is in the key:
+/// the item mints the label that scopes a printed identifier, and folding two
+/// sources into one item would mint one label for both — which is the collision
+/// `provider` exists to prevent, arrived at from the other direction
+/// (`iaam-9i83`). In every instance anybody has run this makes no difference,
+/// because one string is printed by one institution; where it does, the honest
+/// answer is two items.
+///
+/// **The declination is read here and decides nothing about the fold**
+/// (`iaam-mk1n`). A name the owner has said is no account of his is still a name
+/// his documents printed and his directory does not place, so it still folds and
+/// still produces an item. What it produces is a statement of fact rather than
+/// required work, which is [`account_named_by_document_action`]'s business and
+/// not this function's.
 async fn accounts_named_by_documents(
     owner: OwnerId,
     store: &dyn Store,
@@ -1756,9 +1832,18 @@ async fn accounts_named_by_documents(
     if recorded.is_empty() {
         // The ordinary case, and it is worth the branch: an owner whose
         // documents all placed their accounts pays nothing for this item, in the
-        // same bargain `retired_products` strikes one function down.
+        // same bargain `retired_products` strikes one function down. The two
+        // reads below are inside it for the same reason.
         return Ok(Vec::new());
     }
+    let sources = store.list_unresolved_account_sources(owner).await?;
+    let issuer_of = |document_hash: &str| -> Option<String> {
+        sources
+            .iter()
+            .find(|source| source.document_hash == document_hash)
+            .map(|source| source.issuer.clone())
+    };
+    let declined = store.list_declined_account_names(owner).await?;
     let directory =
         import_session::AccountDirectory::from_accounts(store.list_account_details(owner).await?);
     let names = directory.names();
@@ -1767,20 +1852,33 @@ async fn accounts_named_by_documents(
         if !account_named_by_document_gap(&names, &record.printed) {
             continue;
         }
+        let issuer = issuer_of(&record.document_hash);
         // By position rather than by a mutable find, so the lookup's borrow ends
         // before the push.
         let seen = wanted
             .iter()
-            .position(|seen| seen.printed == record.printed);
+            .position(|seen| seen.printed == record.printed && seen.issuer == issuer);
         match seen {
             Some(index) => {
                 wanted[index].records = wanted[index].records.saturating_add(record.records);
                 wanted[index].documents = wanted[index].documents.saturating_add(1);
             }
             None => wanted.push(AccountNamedByDocument {
+                // Per string and not per institution, which is the one place
+                // these two keys deliberately differ. What he declared is that
+                // no account of **his** answers to the name, and his directory
+                // does not hold a different answer for one source than for
+                // another; the institution is in the fold key above because a
+                // printed *identifier* is scoped to its source, and that is a
+                // statement about identity rather than about his accounts.
+                declined: declined
+                    .iter()
+                    .find(|statement| statement.printed == record.printed)
+                    .map(|statement| statement.reason.clone()),
                 printed: record.printed,
                 records: record.records,
                 documents: 1,
+                issuer,
             }),
         }
     }
@@ -4337,6 +4435,29 @@ pub struct AccountNamedByDocument {
     pub records: u32,
     /// How many kept documents printed it.
     pub documents: u32,
+    /// The institution whose documents printed it, as their profile declares it.
+    ///
+    /// **Not a guess and not a proposal**: it is what the profile that read the
+    /// document says it read, recorded beside the bytes when the document was
+    /// kept and joined back here (`iaam-9i83`). It is what the item mints
+    /// `provider` from, which is the only reason it is carried.
+    ///
+    /// `None` where this instance no longer keeps the document the reading was
+    /// of. It is not reachable through any route — a kept document is immutable
+    /// and is written before the names are — and it is still a state rather than
+    /// an impossibility, because the item that would be built from it can say
+    /// nothing about which source prints the string and must therefore not
+    /// preset an identity scoped to one.
+    pub issuer: Option<String>,
+    /// The owner's own sentence, where he has said this is no account of his.
+    ///
+    /// **It does not decide whether the item is raised** (`iaam-mk1n`). That is
+    /// asked of the directory, here as before, so an account answering to the
+    /// string removes the item whether or not a statement stands. What this
+    /// changes is what the item *says* and what it offers: work the owner has
+    /// not done becomes a fact he settled, and the way out becomes the
+    /// withdrawal instead of the account.
+    pub declined: Option<String>,
 }
 
 /// The account a document named that this instance cannot place.
@@ -4362,49 +4483,228 @@ pub struct AccountNamedByDocument {
 /// the identifier the source prints, it is the second tier, it beats a title,
 /// and it survives being renamed.
 ///
-/// `provider` is missing rather than preset, and it is the owner's: it is his
-/// label for the source, it scopes the identifier so two sources printing short
-/// sequential numbers cannot collide, and nothing in a document says what he
-/// calls the institution.
+/// **`provider` is preset too, and is no longer his** (`iaam-9i83`). It used to
+/// be published as a field the owner fills in, with no question beside it,
+/// because there is no question a person can be asked about it: its only
+/// property is that it differs between sources. A value whose whole purpose is
+/// that it must differ is one this instance should mint — he cannot get it wrong
+/// in an interesting way, gains nothing by choosing it, and must then remember
+/// it forever, which is exactly what `provider_account_id`'s own doc obliges
+/// whoever supplies it to do. And the scope was already known: the name was
+/// refused while a document was being read, and the profile that read it
+/// declares the institution the document is from.
+///
+/// **The institution and not the profile.** A profile's `id` is the identity
+/// half of its `ParserVersion` and would survive the profile being corrected,
+/// which is the argument for it; against it is that one institution ships two
+/// documents — a card statement and a deposit statement are two profiles with
+/// two ids — and an identifier scoped by the profile would say that one bank's
+/// short sequential numbers are two vocabularies. They are one, and the thing
+/// `provider` is for is keeping *different* sources' identifiers apart.
+///
+/// **What it asks him instead is where the account is held.** That is the
+/// owner's own correction, and he narrowed it himself: not «what bank», because
+/// a broker is not a bank and an account may sit at neither, but the bank,
+/// broker or organisation the account is held at. `CreateAccountRequest` already
+/// carried `institution` beside `provider`, so the item was publishing the
+/// derived field and leaving the answerable one unasked — which is decision
+/// 0027 §5's general form, stated on the field that produced it.
+///
+/// **Two ways out, because there are two** (`iaam-mk1n`). A statement names
+/// accounts that are not the owner's at all, and from his side those records are
+/// an expense already visible from the account whose statement they are on. The
+/// item published `create_account` and nothing else, so «this name is not an
+/// account of mine» was unrepresentable and the one act that closed the item was
+/// one he had decided against — while the item stood as required work against
+/// every report goal, permanently. That is `account_scope_action`'s finding one
+/// noun over, and it was found the same way: an agent working a real import
+/// reasoned its way to the hole, went looking for a route no item mentioned,
+/// found none, and left the items behind without saying so.
+///
+/// The two are ordered and not ranked, and the account comes first: a name a
+/// document printed on the owner's own statement is usually one of his.
 ///
 /// **`NeedsOwnerInput`, with every field the queue can supply supplied.** Whether
 /// an account of his is meant by this string — and whether it is one account or
 /// two — is his judgement, exactly as the reporting perimeter is. A complete
 /// request does not change who may send it.
 fn account_named_by_document_action(wanted: &AccountNamedByDocument) -> Action {
-    let mut preset = BTreeMap::new();
-    preset.insert(
-        "provider_account_id".to_owned(),
-        wanted.printed.clone().into(),
+    // Scoped to the name **and** to the institution that printed it: several may
+    // stand at once, and an unscoped id would give every one of them the
+    // identity an agent deduplicates by, which would publish one item for seven
+    // accounts. The institution is in it because it is in the fold key, and two
+    // items sharing an id would be worse than the two items being separate.
+    let id = format!(
+        "{}:{}:{}",
+        ActionKind::CreateAccountNamedByDocument.id(),
+        wanted.issuer.as_deref().unwrap_or_default(),
+        wanted.printed
     );
+    // Named in the sentence where it is known, because it is the fact that turns
+    // «a document prints this» into «your bank prints this», and that is what
+    // the owner recognises the account by.
+    let read_as = wanted
+        .issuer
+        .as_deref()
+        .map_or_else(String::new, |issuer| format!(", read as {issuer}'s,"));
+
+    if let Some(reason) = &wanted.declined {
+        return declined_account_name_action(wanted, id, &read_as, reason);
+    }
+
+    // **The identity travels whole or not at all.** `create_account` refuses
+    // half of it, so where this instance cannot say which source printed the
+    // string it presets neither half rather than one — an item presetting an
+    // identifier with no scope would publish a request the route rejects on
+    // arrival. That is unreachable through any route this API publishes, because
+    // a kept document is immutable and is written before the names it could not
+    // place are; it is written out because a `None` that cannot be reached is
+    // still a `None` that has to mean something.
+    let mut preset = BTreeMap::new();
+    if let Some(issuer) = &wanted.issuer {
+        preset.insert("provider".to_owned(), issuer.clone().into());
+        preset.insert(
+            "provider_account_id".to_owned(),
+            wanted.printed.clone().into(),
+        );
+    }
 
     Action::new(
         ActionFacts {
-            // Scoped to the name: several may stand at once, and an unscoped id
-            // would give every one of them the identity an agent deduplicates
-            // by — which would publish one item for seven accounts.
-            id: format!(
-                "{}:{}",
-                ActionKind::CreateAccountNamedByDocument.id(),
-                wanted.printed
-            ),
+            id,
             kind: ActionKind::CreateAccountNamedByDocument,
             category: ActionCategory::required_for(ActionKind::CreateAccountNamedByDocument),
             state: ActionState::NeedsOwnerInput,
             subject: None,
         },
         format!(
-            "A document this instance kept prints «{printed}» where it names the account a record is on, \
-             and no single account of yours answers to it — by its iaam identifier, by an identifier a \
-             source prints for it, or by its title. Either none does, or more than one does and the \
-             reading refused rather than choosing. {records} record{record_plural} in {documents} \
-             kept document{document_plural} named it, and every one of them was refused when the document \
-             was read: they are in no journal, so they are in no report, and nothing else says so. \
-             Nothing here decides what the account is. It may be one you hold under another name, in \
-             which case give that account this identifier rather than creating a second; it may be one \
-             you have not described yet, in which case create it. Either way the remedy ends the same: \
-             read the document again, and the records that named it are read this time. The row keys are \
-             over the document and the line, so the records that already imported do not import twice.",
+            "A document this instance kept{read_as} prints «{printed}» where it names the account a \
+             record is on, and no single account of yours answers to it — by its iaam identifier, by \
+             an identifier a source prints for it, or by its title. Either none does, or more than \
+             one does and the reading refused rather than choosing. {records} record{record_plural} \
+             in {documents} kept document{document_plural} named it, and every one of them was \
+             refused when the document was read: they are in no journal, so they are in no report, \
+             and nothing else says so. Nothing here decides what the account is. It may be one you \
+             hold under another name, in which case give that account this identifier rather than \
+             creating a second; it may be one you have not described yet, in which case create it; \
+             and it may be no account of yours at all — a party you paid, an account belonging to \
+             somebody else — in which case say so, and those records stay refused because you \
+             decided it rather than because nobody has got round to them. If it is yours, the \
+             remedy ends the same either way: read the document again, and the records that named \
+             it are read this time. The row keys are over the document and the line, so the records \
+             that already imported do not import twice.",
+            printed = wanted.printed,
+            records = wanted.records,
+            record_plural = if wanted.records == 1 { "" } else { "s" },
+            documents = wanted.documents,
+            document_plural = if wanted.documents == 1 { "" } else { "s" },
+        ),
+        ActionTarget::from_options(vec![
+            ResolutionOption {
+                operation: OperationKey::CreateAccount,
+                request: RequestPlan {
+                    preset,
+                    missing: vec![
+                        // The printed string travels *in the question*, not as a
+                        // second preset: what is preset is the identifier, and
+                        // saying so to the owner is what stops a caller showing
+                        // him the preset instead (`iaam-ytvf`).
+                        MissingInput::asked(OwnerPrompt::AccountTitle {
+                            printed: Some(wanted.printed.clone()),
+                        }),
+                        // The question that replaced `/provider`. What the label
+                        // scoping the printed identifier should be is worked out
+                        // above; where the account is held is asked here, and it
+                        // is the half a person can answer.
+                        MissingInput::asked(OwnerPrompt::AccountInstitution),
+                    ],
+                },
+            },
+            declining_option(&wanted.printed),
+        ]),
+    )
+    .expect("the named-account item publishes both of its resolutions")
+}
+
+/// Saying that a printed name is nobody's account of his, as a resolution.
+///
+/// Everything is known except the judgement and the sentence. The name is the
+/// whole subject of the call and is preset; the disposition is what this option
+/// **is**, so it is preset too — an option that left the caller to guess
+/// `not_mine` would publish a route and not a resolution. The reason is the
+/// owner's and is the only field asked for, for the reason `ExclusionReason` is
+/// asked for one item over: a name ruled out without one is indistinguishable, a
+/// year later, from one nobody ever got round to, and here it is stronger still,
+/// because the records printed under the name stay refused on the strength of it.
+fn declining_option(printed: &str) -> ResolutionOption {
+    let mut preset = BTreeMap::new();
+    preset.insert("printed".to_owned(), printed.to_owned().into());
+    preset.insert("disposition".to_owned(), "not_mine".into());
+    ResolutionOption {
+        operation: OperationKey::RecordAccountNameDisposition,
+        request: RequestPlan {
+            preset,
+            missing: vec![MissingInput::asked(OwnerPrompt::DeclinedNameReason)],
+        },
+    }
+}
+
+/// The same name, after the owner has said it is no account of his.
+///
+/// **`Informational`, and the demotion is the whole of `iaam-mk1n`'s remedy.**
+/// The item is the same item, with the same identity, about the same string: the
+/// records it counts are still refused and still in no report. What has changed
+/// is that they are refused deliberately, and required work is what an owner has
+/// not done rather than what he has decided. Left graded required, every report
+/// he asked for would go on being flagged short on account of a decision he had
+/// already made.
+///
+/// **The item does not disappear**, and that is deliberate rather than a
+/// convenience. Two hundred records of his documents are in no journal because
+/// of this statement; a queue that said nothing about them would be hiding the
+/// consequence of his own decision from him, which is the silent drop this
+/// module refuses everywhere else. So the queue keeps saying how many, and says
+/// why.
+///
+/// **`NeedsOwnerInput` and not `Ready`.** Nothing is asked of him — that is what
+/// `Informational` says — but the one act this item still offers is the
+/// withdrawal of his own statement, and an agent may not withdraw a judgement it
+/// could not have made.
+///
+/// **The way back is the withdrawal and not `create_account`.** Offering both
+/// would publish, on an item that says the matter is settled, the very act he
+/// declined; withdrawing puts the name back to being asked about, and the
+/// required item that returns offers the account as it always did. And the
+/// directory beats both: if an account of his comes to answer to the string, the
+/// name is not folded at all and no item is raised, whether or not this
+/// statement still stands.
+fn declined_account_name_action(
+    wanted: &AccountNamedByDocument,
+    id: String,
+    read_as: &str,
+    reason: &str,
+) -> Action {
+    let mut preset = BTreeMap::new();
+    preset.insert("printed".to_owned(), wanted.printed.clone().into());
+    preset.insert("disposition".to_owned(), "undecided".into());
+
+    Action::new(
+        ActionFacts {
+            id,
+            kind: ActionKind::CreateAccountNamedByDocument,
+            category: ActionCategory::Informational,
+            state: ActionState::NeedsOwnerInput,
+            subject: None,
+        },
+        format!(
+            "A document this instance kept{read_as} prints «{printed}» where it names the account a \
+             record is on, and you have said it is not an account of yours: «{reason}». \
+             {records} record{record_plural} in {documents} kept document{document_plural} named \
+             it, and every one of them is refused, so they are in no journal and in no report — \
+             deliberately, and this line is the only thing that says so. Nothing is asked of you. \
+             If one of your accounts does answer to the name after all, withdraw this and the \
+             question is put again; and if you give an account that identifier, the name stops \
+             being raised whether this stands or not.",
             printed = wanted.printed,
             records = wanted.records,
             record_plural = if wanted.records == 1 { "" } else { "s" },
@@ -4412,29 +4712,16 @@ fn account_named_by_document_action(wanted: &AccountNamedByDocument) -> Action {
             document_plural = if wanted.documents == 1 { "" } else { "s" },
         ),
         ActionTarget::Operation {
-            operation: OperationKey::CreateAccount,
+            operation: OperationKey::RecordAccountNameDisposition,
             request: RequestPlan {
                 preset,
-                missing: vec![
-                    // The printed string travels *in the question*, not as a
-                    // second preset: what is preset is the identifier, and
-                    // saying so to the owner is what stops a caller showing him
-                    // the preset instead (`iaam-ytvf`).
-                    MissingInput::asked(OwnerPrompt::AccountTitle {
-                        printed: Some(wanted.printed.clone()),
-                    }),
-                    // No question, on purpose. `provider` is a label whose only
-                    // property is that it differs between sources, and whether
-                    // a person should be asked to invent one at all is
-                    // `iaam-9i83`'s — see `QUESTIONS_UNDER_REVIEW`. A fluent
-                    // sentence written here would have settled that question by
-                    // making it comfortable.
-                    MissingInput::asked_without_a_question("/provider"),
-                ],
+                // Nothing. Withdrawing leaves no statement for a reason to
+                // explain, which is what the route says when one is sent.
+                missing: Vec::new(),
             },
         },
     )
-    .expect("the named-account item names the account route")
+    .expect("the declined-name item offers the withdrawal of the statement")
 }
 
 /// Whether a name a document printed still names no single account of his.
@@ -4647,6 +4934,7 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
 mod tests {
     use super::*;
     use crate::adapters::sqlite::SqliteAdapter;
+    use crate::ports::DeclinedAccountNameView;
     use crate::ports::ImportSessionView;
     use crate::ports::NewImportQuestion;
     use crate::ports::Store;
@@ -5093,6 +5381,8 @@ mod tests {
             OwnerPrompt::RuleCategory,
             OwnerPrompt::ImportAnswer,
             OwnerPrompt::TransferFarSide,
+            OwnerPrompt::AccountInstitution,
+            OwnerPrompt::DeclinedNameReason,
         ]
     }
 
@@ -5124,6 +5414,8 @@ mod tests {
             OwnerPrompt::RuleCategory => "RuleCategory",
             OwnerPrompt::ImportAnswer => "ImportAnswer",
             OwnerPrompt::TransferFarSide => "TransferFarSide",
+            OwnerPrompt::AccountInstitution => "AccountInstitution",
+            OwnerPrompt::DeclinedNameReason => "DeclinedNameReason",
         }
     }
 
@@ -5133,12 +5425,12 @@ mod tests {
         let names: BTreeSet<&str> = specimens().iter().map(question_name).collect();
         assert_eq!(
             names.len(),
-            20,
+            22,
             "a question was added to the vocabulary and not to the list the guards run over"
         );
         assert_eq!(
             specimens().len(),
-            21,
+            23,
             "the account title is asked in two shapes and both are swept"
         );
     }
@@ -5736,11 +6028,19 @@ mod tests {
     // the only way to learn the real names is to provoke two hundred refusals
     // and mine them.
 
+    /// A name one institution's documents printed, and nothing said about it.
+    ///
+    /// The issuer is filled in because that is the ordinary case: a name is
+    /// recorded by a reading, a reading is of a kept document, and a kept
+    /// document says which profile read it. The absent one is written out at
+    /// `a_name_whose_document_is_gone_presets_no_half_of_an_identity`.
     fn wanted(printed: &str, records: u32, documents: u32) -> AccountNamedByDocument {
         AccountNamedByDocument {
             printed: printed.to_owned(),
             records,
             documents,
+            issuer: Some("Example Bank".to_owned()),
+            declined: None,
         }
     }
 
@@ -5761,6 +6061,25 @@ mod tests {
         .expect("actions from state")
     }
 
+    /// The one resolution of the item, by the operation it names.
+    fn resolution(action: &Action, operation: OperationKey) -> &RequestPlan {
+        action
+            .target()
+            .resolutions()
+            .into_iter()
+            .find(|(named, _)| *named == operation)
+            .unwrap_or_else(|| panic!("the item offers no {operation:?}"))
+            .1
+    }
+
+    /// The item for one printed name, whatever it is graded.
+    fn named_by_document(actions: &[Action]) -> &Action {
+        actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .expect("the account a document named is in the queue")
+    }
+
     /// The queue names the account, and hands back a request that resolves it.
     ///
     /// Two assertions and the second is the one that matters. The name is in the
@@ -5772,10 +6091,7 @@ mod tests {
     fn the_queue_names_the_account_a_document_asked_for() {
         let actions = queue_wanting(&[], &[wanted("Shop One", 220, 1)]);
 
-        let action = actions
-            .iter()
-            .find(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
-            .expect("the account a document named is in the queue");
+        let action = named_by_document(&actions);
         assert!(
             action.reason().contains("Shop One"),
             "the item must name the account: {}",
@@ -5788,10 +6104,7 @@ mod tests {
         );
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
 
-        let ActionTarget::Operation { operation, request } = action.target() else {
-            panic!("the named-account item needs an operation target");
-        };
-        assert_eq!(*operation, OperationKey::CreateAccount);
+        let request = resolution(action, OperationKey::CreateAccount);
         assert_eq!(
             request.preset.get("provider_account_id"),
             Some(&serde_json::Value::String("Shop One".to_owned())),
@@ -5806,7 +6119,256 @@ mod tests {
             .iter()
             .map(|input| input.pointer.as_str())
             .collect();
-        assert_eq!(missing, vec!["/title", "/provider"]);
+        assert_eq!(missing, vec!["/title", "/institution"]);
+    }
+
+    // --- The label is minted and the question is one he can answer (iaam-9i83)
+
+    /// `provider` is worked out, and what he is asked is where the account is.
+    ///
+    /// **The whole of `iaam-9i83` in one item.** The label used to be published
+    /// as a field he fills in with no question beside it, because there is no
+    /// question a person can be asked about it: its only property is that it
+    /// differs between sources. So the assertion is made in both directions —
+    /// the derived field is preset and no longer his, and the field he is asked
+    /// for is the one `CreateAccountRequest` was carrying beside it unasked.
+    #[test]
+    fn the_label_that_scopes_the_identifier_is_minted_and_the_institution_is_asked() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 3, 1)]);
+        let request = resolution(named_by_document(&actions), OperationKey::CreateAccount);
+
+        assert_eq!(
+            request.preset.get("provider"),
+            Some(&serde_json::Value::String("Example Bank".to_owned())),
+            "the scope of a printed identifier is known to the reading and is not his to invent"
+        );
+        assert!(
+            !request
+                .missing
+                .iter()
+                .any(|missing| missing.pointer == "/provider"),
+            "a value this instance can work out is worked out, not asked for"
+        );
+
+        let institution = request
+            .missing
+            .iter()
+            .find(|missing| missing.pointer == "/institution")
+            .expect("the question he can answer is published");
+        assert_eq!(institution.provided_by, ProvidedBy::Owner);
+        assert_eq!(
+            institution.prompt.as_ref().map(OwnerPrompt::asked_by),
+            Some(OperationKey::CreateAccount)
+        );
+    }
+
+    /// The register of unasked questions is empty, and stays.
+    ///
+    /// It was emptied by the field ceasing to be his and not by a sentence being
+    /// written for it, which is the outcome decision 0027 §5 held the register
+    /// open for. The assertion is the emptiness; the argument for keeping the
+    /// register is on the constant.
+    #[test]
+    fn no_field_the_owner_fills_in_is_still_waiting_on_a_decision() {
+        assert!(
+            QUESTIONS_UNDER_REVIEW.is_empty(),
+            "a field is registered as unanswered: {QUESTIONS_UNDER_REVIEW:?}"
+        );
+    }
+
+    /// Two institutions printing one string are two accounts, not one.
+    ///
+    /// The fold is per name **and** per institution, and this is why: the item
+    /// mints the label that keeps two sources' identifiers apart, so folding two
+    /// sources into one item would mint one label for both — which is the
+    /// collision `provider` exists to prevent, reached from the other side.
+    #[test]
+    fn one_string_printed_by_two_institutions_is_two_items() {
+        let actions = queue_wanting(
+            &[],
+            &[
+                AccountNamedByDocument {
+                    issuer: Some("Example Bank".to_owned()),
+                    ..wanted("0001", 3, 1)
+                },
+                AccountNamedByDocument {
+                    issuer: Some("Example Broker".to_owned()),
+                    ..wanted("0001", 4, 1)
+                },
+            ],
+        );
+        let named: Vec<&Action> = actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::CreateAccountNamedByDocument)
+            .collect();
+        assert_eq!(named.len(), 2);
+        let ids: BTreeSet<&str> = named.iter().map(|action| action.id()).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "two items must not share an identity: {ids:?}"
+        );
+        let scopes: Vec<Option<&serde_json::Value>> = named
+            .iter()
+            .copied()
+            .map(|action| {
+                resolution(action, OperationKey::CreateAccount)
+                    .preset
+                    .get("provider")
+            })
+            .collect();
+        assert_ne!(
+            scopes[0], scopes[1],
+            "one label for two sources is the collision the label exists to prevent"
+        );
+    }
+
+    /// A name whose document is gone presets no half of an identity.
+    ///
+    /// `create_account` refuses half an identity, so an item that presets the
+    /// printed string with no scope publishes a request the route rejects on
+    /// arrival. The state is not reachable through any route — a kept document
+    /// is immutable and is written before the names it could not place are — and
+    /// it is written out because a `None` that cannot be reached still has to
+    /// mean something.
+    #[test]
+    fn a_name_whose_document_is_gone_presets_no_half_of_an_identity() {
+        let actions = queue_wanting(
+            &[],
+            &[AccountNamedByDocument {
+                issuer: None,
+                ..wanted("Shop One", 3, 1)
+            }],
+        );
+        let request = resolution(named_by_document(&actions), OperationKey::CreateAccount);
+        assert!(
+            !request.preset.contains_key("provider")
+                && !request.preset.contains_key("provider_account_id"),
+            "half an identity is refused by the route it is addressed to: {:?}",
+            request.preset
+        );
+    }
+
+    // --- A printed name he can say is not his (iaam-mk1n) -------------------
+
+    /// The item publishes the answer he actually has.
+    ///
+    /// The defect: the item published `create_account` and nothing else, so «this
+    /// name is not an account of mine» was unrepresentable and the one act that
+    /// closed it was the one he had decided against. An agent working a real
+    /// import reasoned its way to the hole, went looking for a route no item
+    /// mentioned, and left the items behind without saying so.
+    #[test]
+    fn a_name_a_document_printed_can_be_said_not_to_be_his() {
+        let actions = queue_wanting(&[], &[wanted("Shop One", 220, 1)]);
+        let action = named_by_document(&actions);
+
+        let offered: Vec<OperationKey> = action
+            .target()
+            .resolutions()
+            .into_iter()
+            .map(|(operation, _)| operation)
+            .collect();
+        assert_eq!(
+            offered,
+            vec![
+                OperationKey::CreateAccount,
+                OperationKey::RecordAccountNameDisposition
+            ],
+            "ordered and not ranked: a name his own statement printed is usually his"
+        );
+
+        let request = resolution(action, OperationKey::RecordAccountNameDisposition);
+        assert_eq!(
+            request.preset.get("printed"),
+            Some(&serde_json::Value::String("Shop One".to_owned())),
+            "the name is the whole subject of the call and there is no account to identify it by"
+        );
+        assert_eq!(
+            request.preset.get("disposition"),
+            Some(&serde_json::Value::String("not_mine".to_owned())),
+            "an option that left the caller to guess the word publishes a route, not a resolution"
+        );
+        let missing: Vec<&str> = request
+            .missing
+            .iter()
+            .map(|input| input.pointer.as_str())
+            .collect();
+        assert_eq!(
+            missing,
+            vec!["/reason"],
+            "a name ruled out without a reason is indistinguishable from one nobody looked at"
+        );
+    }
+
+    /// Once he has said so, the name stops being work and stays a fact.
+    ///
+    /// Both halves matter. It stops being `RequiredForGoal`, because required
+    /// work is what an owner has not done and this is what he decided — left as
+    /// it was, every report he asked for would go on being flagged short on
+    /// account of a decision already made. And it does not disappear, because
+    /// the records are still refused and still in no report, and a queue that
+    /// said nothing about them would hide the consequence of his own decision.
+    #[test]
+    fn a_declared_name_becomes_a_statement_of_fact_and_not_work() {
+        let actions = queue_wanting(
+            &[],
+            &[AccountNamedByDocument {
+                declined: Some("a shop I pay".to_owned()),
+                ..wanted("Shop One", 220, 1)
+            }],
+        );
+        let action = named_by_document(&actions);
+
+        assert_eq!(action.category(), ActionCategory::Informational);
+        assert!(
+            action.category().goals().is_empty(),
+            "a decision he made is not work standing between him and a report"
+        );
+        assert!(
+            action.reason().contains("220") && action.reason().contains("a shop I pay"),
+            "the queue still says how many records are refused, and why: {}",
+            action.reason()
+        );
+
+        let request = resolution(action, OperationKey::RecordAccountNameDisposition);
+        assert_eq!(
+            request.preset.get("disposition"),
+            Some(&serde_json::Value::String("undecided".to_owned())),
+            "the way out of a settled item is the withdrawal of the statement"
+        );
+        assert!(
+            request.missing.is_empty(),
+            "withdrawing leaves nothing for a reason to explain"
+        );
+        assert_eq!(
+            action.state(),
+            ActionState::NeedsOwnerInput,
+            "an agent may not withdraw a judgement it could not have made"
+        );
+    }
+
+    /// The declaration is beaten by the directory, and is never asked instead.
+    ///
+    /// The completion is `directory.resolve` and nothing else, exactly as it was:
+    /// a stored verdict would say «missing» about an account created an hour
+    /// later, and the same argument applies to a statement, which says what he
+    /// decided and never what is true of his accounts now. So a name an account
+    /// answers to raises nothing whether or not a statement stands against it.
+    #[test]
+    fn an_account_that_answers_to_a_declared_name_beats_the_declaration() {
+        let directory: iaam_ingest::csv_source::AccountNames =
+            [iaam_ingest::csv_source::AccountEntry::titled(
+                "Shop One",
+                AccountId::new_random(),
+            )]
+            .into_iter()
+            .collect();
+        assert!(
+            account_named_by_document_completion(&directory, "Shop One"),
+            "completion is asked of the directory and of nothing else"
+        );
+        assert!(!account_named_by_document_gap(&directory, "Shop One"));
     }
 
     /// One item per account, not one per document.
@@ -5926,6 +6488,80 @@ mod tests {
             "the account the owner created must close its own item: {after:?}"
         );
         assert!(after[0].contains("Shop Two"), "{after:?}");
+    }
+
+    /// A statement he makes settles the item, and withdrawing it brings it back.
+    ///
+    /// Through the store and the frontier rather than through the builder, so
+    /// what is asserted is the round trip: the queue reads his statement where it
+    /// reads the names, and it is the same item — same identity, same string,
+    /// same counts — graded differently. The withdrawal is asserted too, because
+    /// a statement he cannot take back is not a statement, it is a deletion.
+    #[tokio::test]
+    async fn saying_a_name_is_not_his_settles_the_item_and_withdrawing_it_returns() {
+        let owner = OwnerId::new_random();
+        let store = store();
+        let session = store
+            .open_import_session(owner, None, None, None)
+            .await
+            .expect("session");
+        let document = RawHash::parse(&"f".repeat(64)).expect("raw hash");
+        store
+            .record_unresolved_accounts(
+                owner,
+                document,
+                session.id,
+                vec![UnresolvedAccountName {
+                    printed: "Shop One".to_owned(),
+                    records: 3,
+                }],
+            )
+            .await
+            .expect("record");
+
+        let required = frontier(owner, &store, &store).await.expect("frontier");
+        let before = named_by_document(&required);
+        assert!(matches!(
+            before.category(),
+            ActionCategory::RequiredForGoal(_)
+        ));
+        let identity = before.id().to_owned();
+
+        store
+            .decline_account_name(
+                owner,
+                DeclinedAccountNameView {
+                    printed: "Shop One".to_owned(),
+                    reason: "a shop I pay".to_owned(),
+                },
+            )
+            .await
+            .expect("declined");
+
+        let settled = frontier(owner, &store, &store).await.expect("frontier");
+        let after = named_by_document(&settled);
+        assert_eq!(
+            after.id(),
+            identity,
+            "it is the same name and the same item, and only its grading moved"
+        );
+        assert_eq!(after.category(), ActionCategory::Informational);
+        assert!(
+            after.reason().contains("a shop I pay"),
+            "the queue says why those records are refused: {}",
+            after.reason()
+        );
+
+        store
+            .withdraw_declined_account_name(owner, "Shop One".to_owned())
+            .await
+            .expect("withdrawn");
+
+        let asked_again = frontier(owner, &store, &store).await.expect("frontier");
+        assert!(matches!(
+            named_by_document(&asked_again).category(),
+            ActionCategory::RequiredForGoal(_)
+        ));
     }
 
     /// A second reading of one document replaces what the first recorded.

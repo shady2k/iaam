@@ -521,3 +521,140 @@ impl SqliteStore {
         Ok(records)
     }
 }
+
+/// The institution whose document printed a name this instance could not place.
+///
+/// One row per kept document that still has such a name recorded against it.
+/// `issuer` comes from `source_documents.broker`, which is the name the reader
+/// is registered under: for a document read through a source profile it is the
+/// profile's own `issuer`, written there by the scenario that keeps the bytes.
+/// It is a **join and not a new fact** — the reading already recorded which
+/// document it was, and the document already recorded who printed it (`iaam-9i83`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAccountSource {
+    pub document_hash: RawHash,
+    pub issuer: String,
+}
+
+/// One name the owner has said is no account of his, as it is stored.
+///
+/// A decision and not a verdict about his directory. Whether the string still
+/// names no account of his is asked wherever this is read, against the accounts
+/// as they then stand; this says only that he was asked and answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclinedAccountName {
+    /// The cell as a document printed it.
+    pub printed: String,
+    /// His own sentence saying what the name is, where it is not an account.
+    pub reason: String,
+}
+
+impl SqliteStore {
+    /// Who printed each name this instance could not place, by document.
+    ///
+    /// **Bounded by the names and not by the documents.** The join runs from
+    /// `document_unresolved_accounts` inwards, so an owner with a hundred kept
+    /// statements and no unplaced name is not read at all, and one with a single
+    /// such name reads one row. That is the same bargain the listing above
+    /// strikes and the reason the queue can afford to ask.
+    ///
+    /// A document that was read and is no longer kept simply does not appear.
+    /// The caller therefore learns «no source is recorded for this name» as an
+    /// absence rather than as a guess, which is what lets the queue publish an
+    /// item that presets no identity instead of one that presets a wrong one.
+    pub fn list_unresolved_account_sources(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<UnresolvedAccountSource>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT d.document_hash, d.broker
+             FROM document_unresolved_accounts u
+             JOIN source_documents d
+               ON d.owner = u.owner AND d.document_hash = u.document_hash
+             WHERE u.owner = ?1
+             ORDER BY d.document_hash",
+        )?;
+        let rows = statement.query_map(params![owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut sources = Vec::new();
+        for entry in rows {
+            let (document_hash, issuer) = entry?;
+            sources.push(UnresolvedAccountSource {
+                document_hash: RawHash::parse(&document_hash).ok_or_else(|| {
+                    StoreError::DocumentDecode {
+                        id: document_hash.clone(),
+                        detail: "document hash is not SHA-256".to_owned(),
+                    }
+                })?,
+                issuer,
+            });
+        }
+        Ok(sources)
+    }
+
+    /// Record that a printed name is not an account of the owner's.
+    ///
+    /// **Replaces rather than accumulates.** Declaring a second time is the
+    /// owner restating what the name is, and two sentences side by side with
+    /// nothing saying which is current is the shape the reading's own record
+    /// refuses one function up.
+    pub fn decline_account_name(
+        &self,
+        owner: OwnerId,
+        printed: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO declined_account_names (owner, printed, reason, recorded_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (owner, printed) DO UPDATE SET
+                 reason = excluded.reason,
+                 recorded_at = excluded.recorded_at
+             WHERE declined_account_names.owner = excluded.owner",
+            params![owner.inner().to_string(), printed, reason, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Withdraw that statement, leaving the name undecided again.
+    ///
+    /// Deleted rather than marked withdrawn, as a scope exclusion is: what is
+    /// being withdrawn is a decision about what to ask him, not a fact about his
+    /// money, and the journal is where facts are never removed.
+    pub fn withdraw_declined_account_name(
+        &self,
+        owner: OwnerId,
+        printed: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM declined_account_names WHERE owner = ?1 AND printed = ?2",
+            params![owner.inner().to_string(), printed],
+        )?;
+        Ok(())
+    }
+
+    /// Every such statement the owner has made, in the order he made them.
+    pub fn list_declined_account_names(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<DeclinedAccountName>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT printed, reason
+             FROM declined_account_names
+             WHERE owner = ?1
+             ORDER BY recorded_at, printed",
+        )?;
+        let rows = statement.query_map(params![owner.inner().to_string()], |row| {
+            Ok(DeclinedAccountName {
+                printed: row.get(0)?,
+                reason: row.get(1)?,
+            })
+        })?;
+        let mut declined = Vec::new();
+        for entry in rows {
+            declined.push(entry?);
+        }
+        Ok(declined)
+    }
+}

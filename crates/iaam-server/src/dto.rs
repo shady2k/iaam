@@ -4574,6 +4574,74 @@ pub struct RecordAccountScopeRequest {
     pub reason: Option<String>,
 }
 
+/// What a name a document printed turned out to be.
+///
+/// **Three values, and the first is refused by the route** — the same shape
+/// [`AccountScopeDispositionDto`] has, for the same reason. A name that *is* one
+/// of the owner's accounts is said by giving an account that identifier, which
+/// is what makes the statement line resolve; recording it here as a flag would
+/// be a second answer to «which account is this», and the one that changes
+/// nothing. So the value exists, and the route says why it will not take it,
+/// rather than accepting a word it cannot honour.
+///
+/// `undecided` is where every printed name starts and is how a statement is
+/// withdrawn. It is not «this might be his»: it is «he has not said», which is
+/// the state the queue asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountNameDispositionDto {
+    /// One of the owner's accounts answers to this name. Refused here: say it by
+    /// giving that account the identifier its source prints.
+    Mine,
+    /// It is nobody's account of his — a party he paid, somebody else's account
+    /// — and the records printed under it stay refused deliberately.
+    NotMine,
+    /// He has not said. Every name starts here, and this is the withdrawal.
+    Undecided,
+}
+
+/// Recording what the owner says a printed account name is (`iaam-mk1n`).
+///
+/// The state this closes is one the queue could not represent: a document names
+/// accounts that are not his at all, the item raised for each published only
+/// `create_account`, and so the only act that closed it was one he had decided
+/// against. Each such name therefore stood as required work against every report
+/// he asked for.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RecordAccountNameDispositionRequest {
+    /// The name as the document printed it, matched verbatim.
+    ///
+    /// Not an account identifier, because there is no account: this is the one
+    /// string anybody here knows about the thing the document named. It is the
+    /// string the queue publishes in the item and presets in this request.
+    pub printed: String,
+    pub disposition: AccountNameDispositionDto,
+    /// Required for `not_mine` and refused for `undecided`.
+    ///
+    /// A name ruled out without one is indistinguishable, a year later, from a
+    /// name nobody ever got round to — and the records printed under this one
+    /// stay refused on the strength of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One name a document printed, and what the owner has said it is.
+///
+/// **It does not say whether the name resolves.** That is a question about his
+/// directory, asked wherever the name is read and against the accounts as they
+/// then stand — so an account created afterwards that answers to the string
+/// beats this outright and nothing here is consulted while it does. What this
+/// carries is what he decided.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PrintedAccountNameDto {
+    /// The name as the document printed it.
+    pub printed: String,
+    pub disposition: AccountNameDispositionDto,
+    /// His reason, present only for `not_mine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Whether one of the owner's products still exists.
 ///
 /// **A second axis beside [`AccountScopeDispositionDto`], and not a fourth

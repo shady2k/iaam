@@ -11,8 +11,9 @@ use crate::perimeter::NegativeCashSpan;
 use crate::projection::balances::PositionKey;
 use crate::reconciliation::ReconciliationStatus;
 
-use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence, ReportGoal};
+use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence};
 use super::population::ReportPopulation;
+use crate::goal::ReportGoal;
 
 /// Whether anything asserts the state a cash figure was accumulated from.
 ///

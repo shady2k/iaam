@@ -5,14 +5,17 @@
 //! the scenario — the owner telling the system what a statement says — is lost
 //! if two different statements are folded into one.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{Clock, Principal, Recorded, Scope};
-use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance};
+use iaam_app::scenarios::reconciliation::{
+    OWNER_STATED_CHANNEL, OwnerBalance, record_owner_balance,
+};
 use iaam_core::event::provenance::RawHash;
-use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId};
+use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
@@ -288,4 +291,123 @@ async fn one_period_does_not_answer_for_another() {
 
     assert_eq!(inserted(&march_claim).len(), 1);
     assert_eq!(inserted(&april_claim).len(), 1);
+}
+
+#[tokio::test]
+async fn every_claim_about_one_account_arrives_under_one_source() {
+    // The defect (iaam-eq2i): each call minted `SourceId::new_random()`, so the
+    // opening and the closing statement about one interval — two calls since the
+    // key gained the balance point — carried two source identities. The core
+    // groups control assertions by (account, period, channel), and the channel
+    // holds the source, so one statement about one month became two
+    // `StatementGroup`s.
+    let ctx = harness();
+    let account = AccountId::new_random();
+
+    for at in [BalancePoint::Opening, BalancePoint::Closing] {
+        record_owner_balance(
+            &ctx.services,
+            &ctx.principal,
+            cash_balance(account, at, 100_000),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{at:?} claim: {error:?}"));
+    }
+
+    let sources: BTreeSet<SourceId> = ctx
+        .services
+        .store
+        .load_events_through(ctx.principal.owner, Date::MAX)
+        .await
+        .unwrap_or_else(|error| panic!("journal: {error:?}"))
+        .iter()
+        .map(|event| event.provenance.source())
+        .collect();
+    assert_eq!(
+        sources,
+        BTreeSet::from([SourceId::declared(
+            ctx.principal.owner,
+            account,
+            OWNER_STATED_CHANNEL
+        )]),
+        "the owner's word about one account is one source, derived from it"
+    );
+}
+
+#[tokio::test]
+async fn two_accounts_are_two_sources() {
+    // The other half of the key. A single derived identity for every
+    // owner-stated fact would put two accounts' statements in one source, and
+    // deduplication is scoped by the source.
+    let ctx = harness();
+    let main = AccountId::new_random();
+    let savings = AccountId::new_random();
+
+    assert_ne!(
+        SourceId::declared(ctx.principal.owner, main, OWNER_STATED_CHANNEL),
+        SourceId::declared(ctx.principal.owner, savings, OWNER_STATED_CHANNEL),
+    );
+
+    for account in [main, savings] {
+        record_owner_balance(
+            &ctx.services,
+            &ctx.principal,
+            cash_balance(account, BalancePoint::Closing, 100_000),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("claim: {error:?}"));
+    }
+
+    let sources: BTreeSet<SourceId> = ctx
+        .services
+        .store
+        .load_events_through(ctx.principal.owner, Date::MAX)
+        .await
+        .unwrap_or_else(|error| panic!("journal: {error:?}"))
+        .iter()
+        .map(|event| event.provenance.source())
+        .collect();
+    assert_eq!(sources.len(), 2, "one source per account, and no more");
+}
+
+#[tokio::test]
+async fn a_restated_month_does_not_become_a_second_statement() {
+    // What the derivation is worth: two months of one account are two periods
+    // and one source, so the second month cannot look like an independent
+    // channel confirming the first. The period is deliberately not in the source
+    // key — it is carried by the assertion, and grouping separates by it.
+    let ctx = harness();
+    let account = AccountId::new_random();
+
+    record_owner_balance(
+        &ctx.services,
+        &ctx.principal,
+        cash_balance(account, BalancePoint::Closing, 125_000),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("March: {error:?}"));
+    record_owner_balance(
+        &ctx.services,
+        &ctx.principal,
+        OwnerBalance {
+            period: AssertionPeriod::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30))
+                .unwrap_or_else(|| unreachable!("April is not an inverted interval")),
+            ..cash_balance(account, BalancePoint::Closing, 130_000)
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("April: {error:?}"));
+
+    let events = ctx
+        .services
+        .store
+        .load_events_through(ctx.principal.owner, Date::MAX)
+        .await
+        .unwrap_or_else(|error| panic!("journal: {error:?}"));
+    assert_eq!(events.len(), 2, "two months, two facts");
+    let sources: BTreeSet<SourceId> = events
+        .iter()
+        .map(|event| event.provenance.source())
+        .collect();
+    assert_eq!(sources.len(), 1, "two months, one source");
 }

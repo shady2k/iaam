@@ -25,9 +25,41 @@
 
 use std::collections::BTreeMap;
 
+use time::Date;
+
 use crate::ids::AccountId;
 use crate::money::{CurrencyCode, Money, MoneyError, PostedMinor};
 use crate::reconciliation::claim::AssertionPeriod;
+
+/// One cash movement a batch holds, as the batch places it.
+///
+/// `BatchMovement` and not `Movement`, which is taken: `iaam_ingest`'s
+/// `Movement` is a **direction**, in or out, and the two meet in the import
+/// scenario that uses both. Not linked, because the core depends on no
+/// workspace crate (§3.2) and a link the other way would be the dependency this
+/// crate refuses. A type whose name has to be aliased at every import is one
+/// that will eventually be aliased differently in two files.
+///
+/// A triple rather than the `(account, amount)` pair it used to be, and the
+/// date is the whole of iaam-mnv0. [`compare`] puts the source's stated figures
+/// beside the rows' own totals; with no date on the row it could not also ask
+/// whether the rows it folded are the rows those figures are about, so a
+/// statement whose rows spill past its own period compared cleanly — the
+/// turnover matched because the same rows were folded on both sides of nothing.
+///
+/// `date` is optional because a row is dated by whatever its source dated it
+/// by: a cash movement carrying only a trade date has no posting day to be
+/// placed by. `None` means «this batch cannot say», never «today» and never
+/// «inside» — the same line §4.9 draws between an absence and a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchMovement {
+    pub account: AccountId,
+    /// Signed the way the journal will record it: positive arrived, negative
+    /// left.
+    pub amount: Money,
+    /// The day the batch places this movement on, where it places it on one.
+    pub date: Option<Date>,
+}
 
 /// One account and currency's share of a batch.
 ///
@@ -64,6 +96,13 @@ pub struct BatchTotal {
 /// one its caller asked, and the caller is the only one who knows whether a row
 /// that moved no cash on the account is an omission or a security trade.
 ///
+/// [`BatchMovement::date`] is deliberately not read. A total is a sum and takes
+/// every entry it is given; whether those entries belong to the interval
+/// somebody stated is a different question, asked by [`compare`] against the
+/// section that states one. Filtering by date here would silently answer it,
+/// and answer it by making the arithmetic agree — the total would omit exactly
+/// the rows that disagree with the figure it is compared to.
+///
 /// The order is by account and then currency, which is `BTreeMap`'s and not an
 /// accident: two calls over the same batch must produce the same list, because
 /// the assessment this feeds is fingerprinted and a reordering would refuse a
@@ -72,23 +111,24 @@ pub struct BatchTotal {
 /// Overflow is an error rather than a wrap. A batch whose sum does not fit is a
 /// batch nobody can check, and reporting a wrapped total would be reporting a
 /// figure that agrees with nothing.
-pub fn total(movements: &[(AccountId, Money)]) -> Result<Vec<BatchTotal>, MoneyError> {
+pub fn total(movements: &[BatchMovement]) -> Result<Vec<BatchTotal>, MoneyError> {
     let mut folded: BTreeMap<(AccountId, CurrencyCode), (usize, Money, Money)> = BTreeMap::new();
-    for (account, movement) in movements {
-        let currency = movement.currency();
-        let bucket = folded.entry((*account, currency)).or_insert((
+    for movement in movements {
+        let amount = movement.amount;
+        let currency = amount.currency();
+        let bucket = folded.entry((movement.account, currency)).or_insert((
             0,
             Money::zero(currency),
             Money::zero(currency),
         ));
         bucket.0 += 1;
-        if movement.amount().raw() >= 0 {
-            bucket.1 = bucket.1.try_add(*movement)?;
+        if amount.amount().raw() >= 0 {
+            bucket.1 = bucket.1.try_add(amount)?;
         } else {
             // Subtracted from zero rather than negated: `-i64::MIN` is
             // unrepresentable, and `Money::try_sub` says so instead of
             // panicking (see its own note).
-            bucket.2 = bucket.2.try_sub(*movement)?;
+            bucket.2 = bucket.2.try_sub(amount)?;
         }
     }
     folded
@@ -198,6 +238,12 @@ impl ControlFigure {
 /// journal contains. Sharing a vocabulary between them would let a client read
 /// «no journal coverage» off an import that has not touched the journal.
 ///
+/// The two were put side by side again in `iaam-tx3c` and kept apart, on the
+/// test of which side of the comparison is missing: every `NotComparable` reason
+/// is a fact about the observed side, and this one is a fact about the claimed
+/// side — the document did not print the term. [`NotComparable`] carries the
+/// same argument from its end.
+///
 /// [`NotComparable`]: crate::reconciliation::check::NotComparable
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoCounterpart {
@@ -278,6 +324,70 @@ impl ControlCheck {
     }
 }
 
+/// How the movements folded into one comparison sit in the interval its source
+/// stated (iaam-mnv0).
+///
+/// The question [`compare`] could not ask. Its two sides are a figure **about a
+/// period** and a total **over some rows**, and nothing checked that the rows
+/// were the period's — so a statement whose rows spill past its own period
+/// agreed with itself, the same rows folded on both sides of nothing. That
+/// agreement is worse than a disagreement: a mismatch tells the reader
+/// something is wrong, while this told him everything was right and was
+/// computed over the wrong set.
+///
+/// Deliberately **not** a [`ControlCheck`]. A check is about one figure the
+/// source printed; this is about the set of rows every figure of the section
+/// was checked against, and expressed as a fourth [`ControlFigure`] it would be
+/// a figure no source ever prints.
+///
+/// Nothing here refuses anything, for the same reason the checks beside it do
+/// not: a document can print a period its own rows spill out of — a card
+/// statement listing a movement posted the next morning is the ordinary case —
+/// and a system that could not record what happened because a bank's period
+/// line is off is a system that cannot record what happened. What this does is
+/// stop such a batch from reading as checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntervalFit {
+    /// Movements dated outside the stated interval, and folded into the total
+    /// regardless.
+    ///
+    /// Folded rather than dropped, deliberately. What the batch will write is
+    /// what the batch will write, and quietly leaving a row out of the total
+    /// would make the arithmetic agree by removing the row that disagrees with
+    /// it. The comparison is published as it stands, and this number says what
+    /// it is worth.
+    pub outside: usize,
+    /// Movements the batch cannot date, which no interval places either way.
+    ///
+    /// Counted apart from `outside` because it is a different answer: one is
+    /// «this row is not in your period», the other is «I cannot tell». Both are
+    /// [`Self::misplaced`], because neither was shown to be inside the interval
+    /// the figures speak about, and a total is only worth what its least
+    /// placeable row is.
+    pub undated: usize,
+    /// The earliest and latest day among the movements dated outside.
+    ///
+    /// A reader deciding whether to record the batch anyway needs to know
+    /// **where** they went — a day either side of a month boundary is a
+    /// posting-date convention, and three months out is a converter reading the
+    /// wrong file. A count alone cannot tell him which he has.
+    pub span: Option<(Date, Date)>,
+}
+
+impl IntervalFit {
+    /// Movements the stated interval does not place inside itself.
+    #[must_use]
+    pub const fn misplaced(&self) -> usize {
+        self.outside + self.undated
+    }
+
+    /// Whether every movement folded here is one the stated interval covers.
+    #[must_use]
+    pub const fn fits(&self) -> bool {
+        self.misplaced() == 0
+    }
+}
+
 /// One account and currency: what the source said, what the batch says, and
 /// where the two are put beside each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,12 +408,27 @@ pub struct ControlComparison {
     pub observed: BatchTotal,
     /// One entry per figure the source stated. Empty where it stated none.
     pub checks: Vec<ControlCheck>,
+    /// Whether the movements folded into `observed` fall inside the interval
+    /// `stated` declares.
+    ///
+    /// `None` exactly where `stated` is `None`: with no section there is no
+    /// interval to fit into, and a fit reported against an interval nobody
+    /// printed would be the batch checked against itself. An all-zero
+    /// [`IntervalFit`] would say «checked, and every row is in the period»,
+    /// which is a claim, so the absence is carried as an absence.
+    pub fit: Option<IntervalFit>,
 }
 
 /// Check every stated control section against the batch's totals.
 ///
 /// One comparison per account and currency named by either side, in the order
 /// [`total`] produces, so that the same session read twice compares the same.
+///
+/// The movements are taken rather than their totals, and [`total`] is called
+/// here. Two reasons, and the second is iaam-mnv0's: a caller handing in a
+/// total it folded itself could hand in one folded from other rows, and a total
+/// cannot say which rows made it — so the interval fit, which is a statement
+/// about those rows, could not be computed at all.
 ///
 /// **The journal is not consulted, and that is the design rather than a
 /// simplification.** What this answers is «did the rows get read correctly»,
@@ -316,10 +441,11 @@ pub struct ControlComparison {
 /// most worth checking.
 pub fn compare(
     sections: &[ControlSection],
-    totals: &[BatchTotal],
+    movements: &[BatchMovement],
 ) -> Result<Vec<ControlComparison>, MoneyError> {
+    let totals = total(movements)?;
     let mut keys: BTreeMap<(AccountId, CurrencyCode), ()> = BTreeMap::new();
-    for total in totals {
+    for total in &totals {
         keys.insert((total.account, total.currency), ());
     }
     for section in sections {
@@ -353,9 +479,41 @@ pub fn compare(
                 stated,
                 observed,
                 checks,
+                fit: stated.map(|section| fit_of(&section, movements)),
             })
         })
         .collect()
+}
+
+/// How one section's interval places the movements folded into its total.
+///
+/// The movements are selected again here rather than carried alongside the
+/// total, because a total is a sum and cannot say which rows made it. The
+/// selection is by the same account and currency the total was folded on, which
+/// is what keeps the two about the same rows.
+fn fit_of(section: &ControlSection, movements: &[BatchMovement]) -> IntervalFit {
+    let mut fit = IntervalFit {
+        outside: 0,
+        undated: 0,
+        span: None,
+    };
+    for movement in movements.iter().filter(|movement| {
+        movement.account == section.account && movement.amount.currency() == section.currency
+    }) {
+        let Some(date) = movement.date else {
+            fit.undated += 1;
+            continue;
+        };
+        if section.period.contains(date) {
+            continue;
+        }
+        fit.outside += 1;
+        fit.span = Some(match fit.span {
+            None => (date, date),
+            Some((from, to)) => (from.min(date), to.max(date)),
+        });
+    }
+    fit
 }
 
 /// The checks one stated section buys against one total.
@@ -450,6 +608,38 @@ mod tests {
         Money::new(PostedMinor::new(minor), CurrencyCode::Usd)
     }
 
+    /// A movement dated inside [`march`], the period every section here states.
+    ///
+    /// Dated rather than undated, and that is the point of the helper: an
+    /// undated movement is now a finding of its own, so a test about turnover
+    /// arithmetic that left its rows undated would be testing two things and
+    /// reporting one.
+    fn moved(account: AccountId, amount: Money) -> BatchMovement {
+        BatchMovement {
+            account,
+            amount,
+            date: Some(date!(2026 - 03 - 15)),
+        }
+    }
+
+    /// The same movement on a day the section's period does not cover.
+    fn moved_on(account: AccountId, amount: Money, day: time::Date) -> BatchMovement {
+        BatchMovement {
+            account,
+            amount,
+            date: Some(day),
+        }
+    }
+
+    /// A movement the batch cannot date at all.
+    fn undated(account: AccountId, amount: Money) -> BatchMovement {
+        BatchMovement {
+            account,
+            amount,
+            date: None,
+        }
+    }
+
     #[test]
     fn an_empty_batch_totals_nothing() {
         // Not «zero on every account»: a batch that moved nothing on an account
@@ -461,7 +651,7 @@ mod tests {
     #[test]
     fn the_two_sides_are_kept_apart_and_both_are_positive() {
         let main = account(1);
-        let totals = total(&[(main, rub(3_000)), (main, rub(-1_200))]).unwrap();
+        let totals = total(&[moved(main, rub(3_000)), moved(main, rub(-1_200))]).unwrap();
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].debit, PostedMinor::new(3_000));
         assert_eq!(
@@ -479,7 +669,7 @@ mod tests {
         // more than it received over the period has a negative net, and a
         // closing balance below its opening one is the ordinary case.
         let main = account(1);
-        let totals = total(&[(main, rub(100)), (main, rub(-900))]).unwrap();
+        let totals = total(&[moved(main, rub(100)), moved(main, rub(-900))]).unwrap();
         assert_eq!(totals[0].net, PostedMinor::new(-800));
     }
 
@@ -488,7 +678,7 @@ mod tests {
         // Not a `CurrencyMismatch`: the pair is the key precisely so that a
         // multi-currency account totals rather than refuses.
         let main = account(1);
-        let totals = total(&[(main, rub(500)), (main, usd(700))]).unwrap();
+        let totals = total(&[moved(main, rub(500)), moved(main, usd(700))]).unwrap();
         assert_eq!(totals.len(), 2);
         assert_eq!(totals[0].account, main);
         assert_eq!(totals[1].account, main);
@@ -499,7 +689,7 @@ mod tests {
     fn two_accounts_are_two_totals() {
         let main = account(1);
         let savings = account(2);
-        let totals = total(&[(main, rub(500)), (savings, rub(500))]).unwrap();
+        let totals = total(&[moved(main, rub(500)), moved(savings, rub(500))]).unwrap();
         assert_eq!(totals.len(), 2);
         assert_eq!(totals[0].account, main);
         assert_eq!(totals[1].account, savings);
@@ -512,8 +702,18 @@ mod tests {
         // depended on input order would refuse commits that changed nothing.
         let main = account(1);
         let savings = account(2);
-        let forwards = total(&[(main, rub(1)), (savings, usd(2)), (savings, rub(3))]).unwrap();
-        let backwards = total(&[(savings, rub(3)), (savings, usd(2)), (main, rub(1))]).unwrap();
+        let forwards = total(&[
+            moved(main, rub(1)),
+            moved(savings, usd(2)),
+            moved(savings, rub(3)),
+        ])
+        .unwrap();
+        let backwards = total(&[
+            moved(savings, rub(3)),
+            moved(savings, usd(2)),
+            moved(main, rub(1)),
+        ])
+        .unwrap();
         assert_eq!(forwards, backwards);
     }
 
@@ -524,7 +724,7 @@ mod tests {
         // «this row moved no cash» drop it deliberately rather than discover it
         // was dropped for it.
         let main = account(1);
-        let totals = total(&[(main, rub(0))]).unwrap();
+        let totals = total(&[moved(main, rub(0))]).unwrap();
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].rows, 1);
         assert_eq!(totals[0].debit, PostedMinor::new(0));
@@ -534,7 +734,7 @@ mod tests {
     #[test]
     fn a_sum_that_does_not_fit_is_refused_rather_than_wrapped() {
         let main = account(1);
-        let overflow = total(&[(main, rub(i64::MAX)), (main, rub(1))]);
+        let overflow = total(&[moved(main, rub(i64::MAX)), moved(main, rub(1))]);
         assert_eq!(overflow, Err(MoneyError::Overflow));
     }
 
@@ -585,8 +785,15 @@ mod tests {
             credit_turnover: Some(minor(500)),
             ..section(main)
         };
-        let totals = total(&[(main, rub(1_000)), (main, rub(300)), (main, rub(-500))]).unwrap();
-        let compared = compare(&[stated], &totals).unwrap();
+        let compared = compare(
+            &[stated],
+            &[
+                moved(main, rub(1_000)),
+                moved(main, rub(300)),
+                moved(main, rub(-500)),
+            ],
+        )
+        .unwrap();
         assert_eq!(compared.len(), 1);
         assert_eq!(
             compared[0].checks[0],
@@ -619,8 +826,7 @@ mod tests {
             closing: Some(minor(150_000)),
             ..section(main)
         };
-        let totals = total(&[(main, rub(15_000_000))]).unwrap();
-        let compared = compare(&[stated], &totals).unwrap();
+        let compared = compare(&[stated], &[moved(main, rub(15_000_000))]).unwrap();
         assert_eq!(
             compared[0].checks[0],
             ControlCheck::Mismatched {
@@ -642,7 +848,7 @@ mod tests {
             closing: Some(minor(500)),
             ..section(main)
         };
-        let compared = compare(&[stated], &total(&[(main, rub(100))]).unwrap()).unwrap();
+        let compared = compare(&[stated], &[moved(main, rub(100))]).unwrap();
         assert_eq!(
             compared[0].checks[0],
             ControlCheck::NotChecked {
@@ -682,7 +888,7 @@ mod tests {
         // «It agreed» and «it was never checked» are different answers, and an
         // import that could not be checked must not read like one that passed.
         let main = account(1);
-        let compared = compare(&[], &total(&[(main, rub(100))]).unwrap()).unwrap();
+        let compared = compare(&[], &[moved(main, rub(100))]).unwrap();
         assert_eq!(compared.len(), 1);
         assert!(compared[0].stated.is_none());
         assert!(compared[0].checks.is_empty());
@@ -701,8 +907,11 @@ mod tests {
             debit_turnover: Some(minor(100)),
             ..section(main)
         };
-        let totals = total(&[(main, rub(100)), (main, usd(200))]).unwrap();
-        let compared = compare(&[roubles, dollars], &totals).unwrap();
+        let compared = compare(
+            &[roubles, dollars],
+            &[moved(main, rub(100)), moved(main, usd(200))],
+        )
+        .unwrap();
         assert_eq!(compared.len(), 2);
         assert!(
             compared[0].checks[0]
@@ -718,6 +927,166 @@ mod tests {
         );
     }
 
+    /// The failure iaam-mnv0 names, in miniature.
+    ///
+    /// Every figure agrees, and the agreement is worth nothing: the turnover
+    /// matched because the same rows were folded on both sides of nothing, and
+    /// two of them are not in the period the section is about. Before the fit,
+    /// this batch read exactly like one that had been checked.
+    #[test]
+    fn rows_that_spill_past_the_stated_period_agree_and_say_they_do_not_fit() {
+        let main = account(1);
+        let stated = ControlSection {
+            debit_turnover: Some(minor(3_000)),
+            ..section(main)
+        };
+        let compared = compare(
+            &[stated],
+            &[
+                moved(main, rub(1_000)),
+                moved_on(main, rub(1_000), date!(2026 - 02 - 20)),
+                moved_on(main, rub(1_000), date!(2026 - 04 - 02)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            compared[0].checks[0],
+            ControlCheck::Matched {
+                figure: ControlFigure::DebitTurnover,
+                claimed: minor(3_000),
+                observed: minor(3_000),
+            },
+            "the arithmetic comes out, which is the whole trouble"
+        );
+
+        let fit = compared[0].fit.expect("a stated section is fitted");
+        assert!(!fit.fits());
+        assert_eq!(fit.outside, 2);
+        assert_eq!(fit.undated, 0);
+        assert_eq!(
+            fit.span,
+            Some((date!(2026 - 02 - 20), date!(2026 - 04 - 02))),
+            "a reader deciding whether to record it anyway needs to know where \
+             they went, not only how many there were"
+        );
+    }
+
+    #[test]
+    fn a_batch_whose_rows_are_all_inside_the_stated_period_fits() {
+        let main = account(1);
+        let stated = ControlSection {
+            debit_turnover: Some(minor(1_000)),
+            ..section(main)
+        };
+        let compared = compare(
+            &[stated],
+            &[
+                moved_on(main, rub(400), date!(2026 - 03 - 01)),
+                moved_on(main, rub(600), date!(2026 - 03 - 31)),
+            ],
+        )
+        .unwrap();
+        let fit = compared[0].fit.expect("a stated section is fitted");
+        assert!(
+            fit.fits(),
+            "the interval is inclusive at both ends: {fit:?}"
+        );
+        assert_eq!(fit.misplaced(), 0);
+    }
+
+    /// A row the batch cannot date is not a row the interval placed.
+    ///
+    /// Counted apart from `outside` because it is a different answer — «I
+    /// cannot tell» is not «this is not in your period» — and counted as
+    /// misplaced all the same, because neither was shown to be inside the
+    /// interval the figures speak about.
+    #[test]
+    fn a_row_with_no_date_is_neither_inside_nor_outside_and_is_still_misplaced() {
+        let main = account(1);
+        let stated = ControlSection {
+            debit_turnover: Some(minor(500)),
+            ..section(main)
+        };
+        let compared = compare(&[stated], &[undated(main, rub(500))]).unwrap();
+        let fit = compared[0].fit.expect("a stated section is fitted");
+        assert_eq!(fit.undated, 1);
+        assert_eq!(fit.outside, 0);
+        assert_eq!(fit.span, None, "an undated row went nowhere in particular");
+        assert!(!fit.fits());
+    }
+
+    /// A section that was never printed is not a section that fitted.
+    ///
+    /// The same distinction the checks keep: «it agreed» and «it was never
+    /// checked» are different answers, and an all-zero fit would be the first
+    /// where the truth is the second.
+    #[test]
+    fn a_comparison_with_no_stated_section_reports_no_fit() {
+        let main = account(1);
+        let compared = compare(&[], &[undated(main, rub(100))]).unwrap();
+        assert!(compared[0].stated.is_none());
+        assert!(compared[0].fit.is_none());
+    }
+
+    /// The fit is per account and currency, like everything else here.
+    ///
+    /// A row on another account, or in another currency, cannot misplace this
+    /// section: it was never folded into the total this section was compared
+    /// with.
+    #[test]
+    fn a_row_on_another_account_or_currency_does_not_misplace_this_section() {
+        let main = account(1);
+        let savings = account(2);
+        let stated = ControlSection {
+            debit_turnover: Some(minor(100)),
+            ..section(main)
+        };
+        let compared = compare(
+            &[stated],
+            &[
+                moved(main, rub(100)),
+                moved_on(savings, rub(900), date!(2026 - 04 - 02)),
+                moved_on(main, usd(900), date!(2026 - 04 - 02)),
+            ],
+        )
+        .unwrap();
+        let roubles = compared
+            .iter()
+            .find(|comparison| comparison.stated.is_some())
+            .expect("the stated section");
+        assert!(
+            roubles.fit.expect("a stated section is fitted").fits(),
+            "{compared:?}"
+        );
+    }
+
+    /// A row outside the period is folded into the total anyway, and that is
+    /// deliberate: dropping it would make the arithmetic agree by removing the
+    /// row that disagrees with it.
+    #[test]
+    fn a_row_outside_the_period_is_still_folded_into_the_total() {
+        let main = account(1);
+        let stated = ControlSection {
+            debit_turnover: Some(minor(100)),
+            ..section(main)
+        };
+        let compared = compare(
+            &[stated],
+            &[
+                moved(main, rub(100)),
+                moved_on(main, rub(700), date!(2026 - 04 - 02)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(compared[0].observed.debit, minor(800));
+        assert_eq!(compared[0].observed.rows, 2);
+        assert!(
+            compared[0].checks[0].is_mismatch(),
+            "the row outside is in the total, so the figure disagrees: {compared:?}"
+        );
+    }
+
     #[test]
     fn a_single_kopeck_is_a_difference() {
         // No tolerance, for `check_claim`'s reason: both sides are posted
@@ -727,7 +1096,7 @@ mod tests {
             debit_turnover: Some(minor(1_001)),
             ..section(main)
         };
-        let compared = compare(&[stated], &total(&[(main, rub(1_000))]).unwrap()).unwrap();
+        let compared = compare(&[stated], &[moved(main, rub(1_000))]).unwrap();
         assert!(compared[0].checks[0].is_mismatch());
     }
 }

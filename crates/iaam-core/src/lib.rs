@@ -10,6 +10,7 @@ pub mod category;
 pub mod contour;
 pub mod dates;
 pub mod event;
+pub mod goal;
 pub mod ids;
 pub mod instrument;
 pub mod money;

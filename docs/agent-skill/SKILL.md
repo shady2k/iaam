@@ -139,6 +139,12 @@ money went and whose account was on the other side are facts about the owner's
 affairs; you may show him the question and the alternatives, and relay what he
 says.
 
+Where an answer names one of the owner's own accounts, the question carries the
+accounts it may name, each with his own title for it and the institution holding
+it. Show him those and send back the identifier of the one he picks. You never
+look an account up to answer a question, and you never compose an identifier: the
+one you send was in the question you are answering.
+
 **An answer you relay settles the row and nothing beyond it.** Answering has two
 halves. Disposing of the line in front of you is import mechanics, and it is
 yours to do. Turning that disposal into a standing classification rule decides
@@ -146,14 +152,23 @@ rows nobody has looked at yet — including months not yet imported, and includi
 rows that will never be shown to anyone, because a row a rule matches is never
 asked about. That second half is the owner's, it is the same act as writing a
 rule directly, and under your credential the system now does only the first.
-Nothing is refused and nothing goes wrong: the answer simply comes back with no
-rule on it, the row is settled, and the import goes on.
+Nothing is refused and nothing goes wrong: the answer comes back saying in a
+word that no rule stands, and carrying the rule it would have made, the row is
+settled, and the import goes on.
 
-The consequence is worth telling the owner rather than hiding. The same
-counterparty will be asked about again next month, once per import, until he
-records the decision as a rule with his own credential. When you notice a
-question you have relayed before, that is the thing to say — not a second guess
-at the answer.
+That word is worth reading, because it distinguishes two things an absent rule
+used to hide. A rule may have been impossible — the row named no counterparty,
+carried no description and printed no word of its own, and a condition that asks
+nothing matches nothing, so there is no rule for anyone to write. Or a rule was
+perfectly possible and simply is not yours to write. Only the second is worth
+telling the owner about, and only the second comes with the rule attached.
+
+Say it, and hand him the remedy with it. The same counterparty will be asked
+about again next month, once per import, until he records the decision with his
+own credential — and the answer you relayed already holds exactly what he would
+record, so he can adopt it as it stands instead of reconstructing it from the
+row. When you notice a question you have relayed before, that is the thing to
+say: which rule is waiting to be adopted, not a second guess at the answer.
 
 A rule the owner does write is kept in his own vocabulary, and he can see it,
 change it, and retire it afterwards like any other.

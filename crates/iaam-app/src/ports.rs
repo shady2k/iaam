@@ -459,6 +459,11 @@ pub struct JournalQuery {
     pub idempotency_key: Option<String>,
     pub account: Option<AccountId>,
     pub source: Option<iaam_core::ids::SourceId>,
+    /// Only facts committed out of this import session. The session is stamped
+    /// on the event's provenance at commit, so this narrows to what one act of
+    /// importing put in — which the declared source cannot, since a source
+    /// covers every import that ever came through the same channel.
+    pub import_session: Option<iaam_core::ids::ImportSessionId>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -711,9 +716,17 @@ pub trait Store: Send + Sync {
     // design.
 
     /// Open a session, or return the open one this import already has.
+    ///
+    /// `account` is what the declaration resolved to, and it is passed and
+    /// stored rather than recovered later: `source` and `import` are one-way
+    /// derivations of it, so a session that kept only those could not say
+    /// afterwards which account it was declared for. `None` is a session opened
+    /// without a declaration, which legitimately holds rows for several
+    /// accounts.
     async fn open_import_session(
         &self,
         owner: OwnerId,
+        account: Option<AccountId>,
         source: Option<SourceId>,
         import: Option<ImportId>,
     ) -> Result<ImportSessionView, AppError>;
@@ -843,6 +856,15 @@ impl ImportSessionState {
 pub struct ImportSessionView {
     pub id: ImportSessionId,
     pub state: ImportSessionState,
+    /// The account the declaration named, when it named one.
+    ///
+    /// `None` on two kinds of session, and the two are not distinguished here
+    /// because nothing may treat them differently: a session opened without a
+    /// declaration, which holds rows for as many accounts as its export covers,
+    /// and one opened before the account was recorded at all. Neither has an
+    /// account to check a row against, and neither may be given one after the
+    /// fact.
+    pub account: Option<AccountId>,
     pub source: Option<SourceId>,
     pub import: Option<ImportId>,
     pub opened_at: String,

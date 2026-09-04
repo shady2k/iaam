@@ -35,6 +35,7 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::{DateCertainty, EventKind};
 use iaam_core::event::provenance::ParserVersion;
+use iaam_core::goal::ReportGoal;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
@@ -42,7 +43,7 @@ use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::reconciliation::{Dimension, ReconciliationLedger};
-use iaam_core::report::confidence::{CaveatKind, ReportGoal};
+use iaam_core::report::confidence::CaveatKind;
 use iaam_core::returns::{
     KnowledgeCoordinate, MaterialIssue, ReturnsRequest, UnverifiableReason, returns_report,
 };
@@ -2487,6 +2488,223 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
     assert_eq!(verdicts[2]["verdict"], "provisional");
 }
 
+/// The header of iaam's own row format, without the optional
+/// `idempotency_key` column.
+///
+/// Omitted rather than left blank on purpose: these tests are about the key the
+/// parser *derives* when the row names none, and a blank column would leave it
+/// to the CSV reader whether that is `None` or an empty string.
+const CSV_HEADER: &str = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,\
+     accrued_interest,currency";
+
+/// Submit a CSV document under the owner's token, with the given query string.
+async fn post_csv(harness: &Harness, query: &str, document: &str) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .uri(format!("/v1/ingest/csv{query}"))
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from(document.to_owned()))
+        .expect("request");
+    call(&harness.router, request).await
+}
+
+/// Retract what one CSV label brought in, or the unlabelled rows when none is
+/// given.
+///
+/// The declaration is built here exactly as a caller would build it, out of
+/// nothing but what it already knew: the account its rows named, the channel
+/// this route fixes, and the label it submitted under. That is the whole claim
+/// the fix makes — the identity is re-derivable — so the test states it by
+/// re-deriving it rather than by reading anything back.
+async fn retract_csv_import(harness: &Harness, label: Option<&str>) -> (StatusCode, Value) {
+    let mut source = json!({ "account": harness.account.inner(), "channel": "csv" });
+    if let Some(label) = label {
+        source["label"] = json!(label);
+    }
+    call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({ "acknowledge_retraction": true, "source": source }),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn rows_submitted_as_csv_are_retractable_as_an_import() {
+    // iaam-0f8f / iaam-ewcl. The route minted `SourceId::new_random()` per
+    // request, so `POST /v1/corrections/imports` — which is keyed on a
+    // declaration the caller can re-derive — could never reach these rows.
+    // Every other channel's rows were retractable as a group; this one's were
+    // not, and the caller was left reversing them one event at a time.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-01-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
+         2025-01-02,withdrawal,Brokerage,,,,,50.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "?label=january", &document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let verdicts = body.as_array().expect("verdicts");
+    assert_eq!(verdicts.len(), 2, "{body}");
+    for verdict in verdicts {
+        assert_eq!(verdict["verdict"], "provisional", "{body}");
+    }
+
+    let (status, retracted) = retract_csv_import(&harness, Some("january")).await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["affected"], 2, "{retracted}");
+    assert_eq!(retracted["written"], 2, "{retracted}");
+}
+
+#[tokio::test]
+async fn re_sending_one_csv_document_writes_nothing_the_second_time() {
+    // The other half of the same defect. A row of this format carries no source
+    // operation identifier, so a row that named no key of its own was identified
+    // by nothing at all and a re-import wrote every one of them a second time.
+    // The digest of the document plus the row's own line number is what §10.6
+    // calls a level-4 identity, and the broker-report path already states it the
+    // same way.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-02-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
+         2025-02-02,deposit,Brokerage,,,,,110.00,,,RUB\n"
+    );
+
+    let (status, first) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first = first.as_array().expect("verdicts").clone();
+    assert_eq!(first.len(), 2, "{first:?}");
+    for verdict in &first {
+        assert_eq!(verdict["verdict"], "provisional", "{verdict}");
+    }
+
+    let (status, second) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let second = second.as_array().expect("verdicts");
+    assert_eq!(second.len(), 2, "{second:?}");
+    for (repeat, original) in second.iter().zip(first.iter()) {
+        assert_eq!(repeat["verdict"], "duplicate", "{repeat}");
+        assert_eq!(
+            repeat["event_id"], original["event_id"],
+            "a repeat must be answered with the event it repeats"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_identical_csv_rows_stay_two_operations() {
+    // The bound on the derived key, and §10.6 states it outright: two
+    // legitimate identical purchases on the same day must not be folded into
+    // one. The document is the evidence that there were two, because the parser
+    // saw two rows — which is why the key is the document plus the locator and
+    // never the row's contents.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-03-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
+         2025-03-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let verdicts = body.as_array().expect("verdicts");
+    assert_eq!(verdicts.len(), 2, "{body}");
+    for verdict in verdicts {
+        assert_eq!(verdict["verdict"], "provisional", "{body}");
+    }
+    assert_ne!(
+        verdicts[0]["event_id"], verdicts[1]["event_id"],
+        "two rows at two locators are two facts"
+    );
+}
+
+#[tokio::test]
+async fn one_csv_label_is_retracted_without_touching_another() {
+    // What the label is worth here, and it is what it is worth on the
+    // conclusive route: two months of one account through one channel are one
+    // source and two imports, and retracting one must leave the other counting.
+    let harness = harness();
+    let january = format!(
+        "{CSV_HEADER}\n\
+         2025-01-05,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+    let february = format!(
+        "{CSV_HEADER}\n\
+         2025-02-05,deposit,Brokerage,,,,,200.00,,,RUB\n"
+    );
+
+    for (label, document) in [("january", &january), ("february", &february)] {
+        let (status, body) = post_csv(&harness, &format!("?label={label}"), document).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[0]["verdict"], "provisional", "{body}");
+    }
+
+    let (status, first) = retract_csv_import(&harness, Some("january")).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["affected"], 1, "{first}");
+    assert_eq!(first["written"], 1, "{first}");
+
+    let (status, second) = retract_csv_import(&harness, Some("february")).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["source"], first["source"],
+        "one account and one channel are one source, whatever the label"
+    );
+    assert_eq!(
+        second["affected"], 1,
+        "retracting January must not have swept February"
+    );
+    assert_eq!(second["written"], 1, "{second}");
+}
+
+#[tokio::test]
+async fn unlabelled_csv_rows_are_retracted_as_the_unnamed_group() {
+    // Omitting the label has a meaning rather than being a default: the rows
+    // belong to no named import and are retracted together with every other
+    // unlabelled row of the same account and channel. Before the fix they
+    // belonged to a source nobody could name, which is not the same thing.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-04-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "", &document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let (status, retracted) = retract_csv_import(&harness, None).await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["affected"], 1, "{retracted}");
+    assert_eq!(retracted["written"], 1, "{retracted}");
+    assert!(
+        retracted["import"].is_null(),
+        "an unnamed group names no import: {retracted}"
+    );
+}
+
+#[tokio::test]
+async fn a_csv_label_the_derivation_cannot_mean_is_refused() {
+    // The same bound the conclusive route puts on `source.label`, reported
+    // against the field the caller actually wrote — `label`, because a request
+    // with no `source` object has nothing called `source.label` in it.
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-05-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
+    );
+
+    let (status, body) = post_csv(&harness, "?label=%20", &document).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "label", "{body}");
+}
+
 #[tokio::test]
 async fn ambiguous_account_name_is_rejected_when_resolving_row() {
     let (harness, path) = harness_on_disk();
@@ -3268,7 +3486,9 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    let statuses = response.as_array().expect("reconciliation statuses");
+    let statuses = response["statuses"]
+        .as_array()
+        .expect("reconciliation statuses");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0]["account"], json!(harness.account.inner()));
     assert_eq!(statuses[0]["dimensions"][0]["dimension"], "cash");
@@ -3280,6 +3500,97 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
     );
     drop(harness);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The verdict is the half of the answer the statuses cannot give.
+///
+/// A status is about a dimension over a period. It reads identically whether
+/// this call wrote the claim, found it already written, or — as in iaam-ihyi —
+/// deduplicated it against a different claim entirely. The route used to answer
+/// with the statuses alone, so a claim that never reached the journal was
+/// reported exactly as one that did.
+#[tokio::test]
+async fn a_recorded_balance_says_whether_the_claim_reached_the_journal() {
+    let harness = harness();
+    let claim = json!({
+        "account": harness.account.inner(),
+        "from": "2026-08-01",
+        "to": "2026-08-31",
+        "at": "closing",
+        "cash": { "currency": "RUB", "amount": "100.00" },
+    });
+
+    let (status, first) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &claim),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let written = first["control_assertions"]
+        .as_array()
+        .expect("one entry per claim the request stated");
+    assert_eq!(written.len(), 1, "{first}");
+    assert_eq!(written[0]["outcome"], "inserted", "{first}");
+    let event = written[0]["event"].as_str().expect("the event written");
+    assert!(first["statuses"].is_array(), "{first}");
+
+    // Restating the same claim is one fact, not two, and the honest answer is
+    // that it was already held — not an error, and not silence.
+    let (status, again) = call(
+        &harness.router,
+        post("/v1/reconciliation/balance", &harness.owner_token, &claim),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let repeated = again["control_assertions"]
+        .as_array()
+        .expect("one entry per claim the request stated");
+    assert_eq!(repeated.len(), 1, "{again}");
+    assert_eq!(repeated[0]["outcome"], "duplicate", "{again}");
+    assert_eq!(
+        repeated[0]["event"], event,
+        "a duplicate names the event it repeats: {again}"
+    );
+}
+
+/// One entry per claim, in the order the request stated them.
+///
+/// The opening and closing claims of one account and period are two facts, and
+/// iaam-ihyi is the wave in which they were one. The verdicts are what a client
+/// can read that against: two `inserted` entries naming two different events.
+#[tokio::test]
+async fn an_opening_and_a_closing_claim_are_two_written_facts() {
+    let harness = harness();
+    let mut written = Vec::new();
+    for at in ["opening", "closing"] {
+        let (status, response) = call(
+            &harness.router,
+            post(
+                "/v1/reconciliation/balance",
+                &harness.owner_token,
+                &json!({
+                    "account": harness.account.inner(),
+                    "from": "2026-08-01",
+                    "to": "2026-08-31",
+                    "at": at,
+                    "cash": { "currency": "RUB", "amount": "100.00" },
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{at}: {response}");
+        let entries = response["control_assertions"]
+            .as_array()
+            .expect("one entry per claim")
+            .clone();
+        assert_eq!(entries.len(), 1, "{at}: {response}");
+        assert_eq!(entries[0]["outcome"], "inserted", "{at}: {response}");
+        written.push(entries[0]["event"].as_str().expect("event id").to_owned());
+    }
+    assert_ne!(
+        written[0], written[1],
+        "the opening and the closing claim are two events"
+    );
 }
 
 /// A coverage gap is written by the broker sync path before any assertion is
@@ -9212,6 +9523,115 @@ async fn the_journal_narrows_by_the_source_the_caller_declared() {
     assert_eq!(body["code"], "invalid_request");
     assert_eq!(body["field"], "source_channel");
 }
+/// A figure leads back to the act that produced it, not merely to its source.
+///
+/// The declared source answers «which channel of which account», and covers
+/// every import that ever arrived that way. This is the question the owner
+/// actually asks when a figure surprises him — *which import put this here* —
+/// and until the session was stamped on the fact nothing in the journal could
+/// answer it: the import label is derived from the declaration, one label opens
+/// a new session every time it is committed and declared again, and a row
+/// carrying a label need never have passed through a session at all.
+#[tokio::test]
+async fn a_journal_row_names_the_import_session_that_committed_it() {
+    let harness = harness();
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "1000.00",
+        "2026-03-01",
+        "straight-to-the-journal",
+        Some("file"),
+    )
+    .await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({
+                "source": {
+                    "account": harness.account.inner(),
+                    "channel": "file",
+                    "label": "march",
+                },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "2000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-03-02" },
+                    "idempotency_key": "committed-by-a-session",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    // Both rows arrived through one declared source, so the source cannot tell
+    // them apart. The session can.
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    let by_key = |key: &str| {
+        rows.iter()
+            .find(|row| row["idempotency_key"] == key)
+            .unwrap_or_else(|| panic!("{key} is in the journal: {page}"))
+            .clone()
+    };
+    assert_eq!(
+        by_key("committed-by-a-session")["import_session"],
+        id,
+        "the fact names the act that admitted it: {page}"
+    );
+    assert!(
+        by_key("straight-to-the-journal")
+            .get("import_session")
+            .is_none(),
+        "a row that passed through no session invents none: {page}"
+    );
+
+    let narrowed = format!("/v1/journal/events?import_session={id}");
+    let (status, page) = call(&harness.router, get(&narrowed, Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["idempotency_key"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("committed-by-a-session")],
+        "the filter answers what that one import put in: {page}"
+    );
+}
 #[tokio::test]
 async fn the_journal_lists_without_any_narrowing() {
     // Reading the list is not a privilege beyond reading the aggregates: every
@@ -9859,7 +10279,11 @@ async fn a_classification_rule_round_trips_through_the_shape_it_is_read_in() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answered}");
-    let learned = answered["rule"]
+    assert_eq!(
+        answered["generalisation"]["state"], "recorded",
+        "{answered}"
+    );
+    let learned = answered["generalisation"]["rule"]
         .as_str()
         .expect("the rule the answer wrote");
 
@@ -12805,6 +13229,177 @@ async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_i
     );
 }
 
+/// The question carries the accounts an answer to it may name (iaam-boj4).
+///
+/// Two of the six answers name one of the owner's own accounts, and the question
+/// used to publish only `needs_account: true`. A client answering one had to
+/// call `GET /v1/accounts` and join — the last identifier on the import path it
+/// had to fetch rather than copy out of the response it was answering.
+///
+/// The whole test is written the way such a client would now work: the account
+/// directory is never read, and the identifier the answer sends is taken from
+/// the question itself.
+#[tokio::test]
+async fn a_question_that_needs_an_account_offers_the_accounts_it_may_name() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "candidates-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "needs_classification", "{verdicts}");
+
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    let session = sessions.as_array().expect("sessions")[0]["session"]
+        .as_str()
+        .expect("session identifier")
+        .to_owned();
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let question = contents["questions"].as_array().expect("questions")[0].clone();
+
+    // The alternatives still say which answers need one; the candidates say
+    // which accounts those are. The first without the second is the defect.
+    assert!(
+        question["alternatives"]
+            .as_array()
+            .expect("alternatives")
+            .iter()
+            .any(|alternative| alternative["needs_account"] == json!(true)),
+        "{question}"
+    );
+    let candidates = question["accounts"]
+        .as_array()
+        .expect("the accounts an answer may name");
+    assert_eq!(candidates.len(), 1, "{question}");
+
+    // The name travels with the identifier, and the institution with it: two
+    // accounts the owner calls `Savings` at two banks are not one question
+    // (conventions §3.1).
+    assert_eq!(candidates[0]["id"], json!(savings), "{question}");
+    assert_eq!(candidates[0]["title"], "Savings", "{question}");
+    assert_eq!(candidates[0]["institution"], "Northline", "{question}");
+
+    // An account is not the other side of itself.
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate["id"] != json!(account)),
+        "the row is already on that account: {question}"
+    );
+
+    // The answer is a copy of what the question published, not a lookup: this is
+    // the only place the identifier comes from.
+    let chosen = candidates[0]["id"].clone();
+    let question_id = question["question"].as_str().expect("question identifier");
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question_id}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": chosen }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert!(answered["answered_at"].is_string(), "{answered}");
+
+    // Nothing is offered on a question that can no longer be answered, and the
+    // client tells that case from the others by `answered_at`.
+    assert!(
+        answered
+            .get("accounts")
+            .is_none_or(|accounts| accounts.as_array().is_some_and(Vec::is_empty)),
+        "an answered question offers no candidates: {answered}"
+    );
+}
+
+/// The question and the queue offer one list, because one function builds it.
+///
+/// The queue's item for the same question publishes the candidates under
+/// `/account`, and the question publishes them itself. Two constructions of
+/// "which accounts may this answer name" would eventually differ, and a client
+/// copying an id out of either could not tell which was right.
+#[tokio::test]
+async fn the_question_and_the_action_queue_offer_the_same_accounts() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let _savings = another_account(&harness, "Savings").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "same-list-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let from_queue = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .and_then(|answer| answer["alternatives"].as_array())
+        .expect("alternatives")
+        .iter()
+        .find(|alternative| alternative["value"] == "sent_to_own_account")
+        .and_then(|alternative| alternative["requires"].as_array())
+        .and_then(|requires| requires.first())
+        .map(|required| required["candidates"].clone())
+        .expect("the queue offers the accounts under /account");
+
+    let session = items[0]["target"]["request"]["preset"]["session"]
+        .as_str()
+        .expect("the session is preset");
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let from_question = contents["questions"].as_array().expect("questions")[0]["accounts"].clone();
+
+    assert_eq!(
+        from_question, from_queue,
+        "one question, one list of accounts it may name"
+    );
+}
+
 /// A count is named as a count, so no client reads it as the list beside it.
 ///
 /// `rows` sat next to `questions`, which is a list of the same per-row shape,
@@ -12921,10 +13516,11 @@ async fn answering_the_question_writes_a_rule_that_settles_what_the_next_row_is(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answered}");
-    assert!(
-        answered["rule"].is_string(),
+    assert_eq!(
+        answered["generalisation"]["state"], "recorded",
         "the answer must be recorded as a rule: {answered}"
     );
+    assert!(answered["generalisation"]["rule"].is_string(), "{answered}");
 
     let (status, rules) = call(
         &harness.router,
@@ -13025,6 +13621,220 @@ async fn answering_the_question_writes_a_rule_that_settles_what_the_next_row_is(
         status,
         StatusCode::NOT_FOUND,
         "nothing may be recorded while the question waits: {page}"
+    );
+}
+
+/// A row the source printed with a merchant's name beside a positive amount.
+///
+/// Invented end to end: `Shop One` is nobody, and the amount and labels were made
+/// up for this test. The direction is stated because a bank prints one for a
+/// card return; what it does not print, and cannot, is that the money is coming
+/// back rather than arriving.
+fn merchant_inflow_row(account: Uuid, key: &str) -> Value {
+    json!({
+        "account": account,
+        "type": "unresolved_direction",
+        "amount": "1250.00",
+        "currency": "RUB",
+        "direction": "in",
+        "counterparty": "Shop One",
+        "dates": { "cash_posted": "2025-03-20" },
+        "source_category": "RETURN",
+        "idempotency_key": key,
+    })
+}
+
+/// A refund submitted as an observation reaches the journal as a refund
+/// (`iaam-7l7v`).
+///
+/// The whole path, because the defect was that the path did not exist. The
+/// caller states what the source printed and concludes nothing; the question
+/// offers `refund` among its alternatives; the owner says so; the committed fact
+/// is `refund` and not `cash_in`.
+///
+/// Before this, the conclusive channel had `refund` and the observation channel
+/// had four outcomes without it, so the same row submitted honestly could only
+/// come out as a deposit — and no question could repair it afterwards, because
+/// none was ever asked about a return. The money-flow projection subtracts a
+/// refund from what went out in the category it was spent in, so the deposit was
+/// not a wording difference: it overstated what arrived and what was spent, by
+/// the same sum, in the same month.
+#[tokio::test]
+async fn an_observed_refund_reaches_the_journal_as_a_refund() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "paste", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [merchant_inflow_row(account, "refund-one")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["state"], "needs_classification", "{rows}");
+    let question = rows[0]["question_id"]
+        .as_str()
+        .expect("question identifier")
+        .to_owned();
+
+    let alternatives: Vec<&str> = rows[0]["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|entry| entry["answer"].as_str().expect("answer code"))
+        .collect();
+    assert!(
+        alternatives.contains(&"refund"),
+        "a named counterparty and money arriving is exactly the shape of a \
+         return, so the question must admit one: {rows}"
+    );
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "refund" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    // The decision survives as a rule the owner can read back, in the same
+    // vocabulary he may write one in. A word the listing cannot print is a
+    // decision he can never send again.
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert_eq!(rules[0]["outcome"]["kind"], "refund", "{rules}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=refund-one",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page["rows"][0]["kind"], "refund",
+        "the owner said the money came back, so the fact is a refund and not \
+         money arriving: {page}"
+    );
+}
+
+/// An answer that names an earning names which earning (`iaam-7l7v`, second
+/// half).
+///
+/// The kind is refused on every answer but `income`, and carried into the rule
+/// by the one that takes it — so the next statement's interest is settled with
+/// the word the owner chose rather than asked about again, and never reaches the
+/// journal as an earning of no stated kind while a converter reading the same
+/// row supplies one.
+#[tokio::test]
+async fn an_answer_that_names_income_may_name_which_earning_it_was() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "paste", "label": "march" },
+                "operations": [{
+                    "account": account,
+                    "type": "unresolved_direction",
+                    "amount": "42.15",
+                    "currency": "RUB",
+                    "direction": "in",
+                    "dates": { "cash_posted": "2025-03-31" },
+                    "source_category": "BALANCE INTEREST",
+                    "idempotency_key": "interest-one",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "needs_classification", "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    // A kind on an answer that names no earning is refused rather than dropped:
+    // a caller sending one beside `refund` has confused a return with an
+    // earning, and the reports keep the two in opposite columns.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "refund", "income_kind": "deposit_interest" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "income_kind", "{refused}");
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "income", "income_kind": "deposit_interest" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert_eq!(rules[0]["outcome"]["kind"], "income", "{rules}");
+    assert_eq!(
+        rules[0]["outcome"]["income_kind"], "deposit_interest",
+        "the word the owner chose must survive into the rule, or every later \
+         row matching it is income of no stated kind again: {rules}"
     );
 }
 
@@ -13181,6 +13991,148 @@ async fn a_session_is_declared_by_the_identifier_the_source_prints() {
     assert!(
         journal_rows(&harness).await > before,
         "the whole path was walked without a directory read: {committed}"
+    );
+}
+
+/// A row names its account the way its statement prints it (`iaam-varx`).
+///
+/// The declaration has taken the source's identifier since it was widened, and
+/// the row did not: `account` was a `Uuid`, so one flow answered «which account
+/// is this» in two vocabularies and the caller had to copy an identifier out of
+/// one response to say the same thing again on every row. Both ends now go
+/// through the one directory, and a converter that never read `/v1/accounts` can
+/// submit a batch.
+#[tokio::test]
+async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+    let before = journal_rows(&harness).await;
+    let directory_size = {
+        let (status, accounts) = call(
+            &harness.router,
+            get("/v1/accounts", Some(&harness.owner_token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accounts}");
+        accounts.as_array().expect("accounts").len()
+    };
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": "acct-1", "channel": "file", "label": "march" },
+                "operations": [{
+                    "account": "acct-1",
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "row-named-by-identifier",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    // "provisional", not "accepted": a row with no independent confirmation to
+    // reconcile against is recorded provisionally, and that is the system
+    // working as designed. What this test pins is which account it reached.
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    assert!(
+        journal_rows(&harness).await > before,
+        "the row was recorded without the caller ever naming a uuid: {verdicts}"
+    );
+
+    // And the account it landed on is the one the identifier names, not a
+    // second account minted from the string. Counted rather than listed: the
+    // harness seeds an account of its own, so what says nothing was minted is
+    // that the directory is the size it was, with the named account still in it.
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    let accounts = accounts.as_array().expect("accounts");
+    assert_eq!(accounts.len(), directory_size, "{accounts:?}");
+    assert!(
+        accounts.iter().any(|account| account["id"] == created),
+        "the identifier reached the account it names: {accounts:?}"
+    );
+}
+
+/// A row naming no account of the owner's is one rejected row, not a rejected
+/// request.
+///
+/// The field used to be a `Uuid`, so a value that named nothing failed the whole
+/// body at deserialisation and the readable rows beside it were never judged.
+/// §10.1 says an unreadable operation is one row's problem, and this is now one:
+/// the rejection carries `account`, and the row beside it is recorded.
+#[tokio::test]
+async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
+    let harness = harness();
+    account_with(
+        &harness,
+        &json!({
+            "title": "Main",
+            "provider": "bank-one",
+            "provider_account_id": "acct-1",
+        }),
+    )
+    .await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    {
+                        "account": "acct-1",
+                        "type": "deposit",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-02" },
+                        "idempotency_key": "readable-row",
+                    },
+                    {
+                        "account": "an-account-he-never-declared",
+                        "type": "deposit",
+                        "amount": "2000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-03" },
+                        "idempotency_key": "row-naming-nothing",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    // "provisional", not "accepted": nothing independent has confirmed the
+    // account yet, so a freshly recorded row is provisional. The point here is
+    // that the readable row was judged at all, beside the one that was not.
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+    assert_eq!(verdicts[1]["verdict"], "rejected", "{verdicts}");
+    assert_eq!(verdicts[1]["field"], "account", "{verdicts}");
+    assert!(
+        verdicts[1]["actual"]
+            .as_str()
+            .is_some_and(|actual| actual.contains("an-account-he-never-declared")),
+        "the refusal quotes what arrived, so the owner can see which string \
+         reached nothing: {verdicts}"
     );
 }
 
@@ -13353,6 +14305,123 @@ async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_na
         fresh["session"], opened["session"],
         "the abandoned session is not reopened: {fresh}"
     );
+}
+
+/// A declared session takes rows for the account it declared and no other
+/// (iaam-tmvz).
+///
+/// The batch route has always refused this, because its declaration and its
+/// rows arrive in one request. A session could not: it stored `source` and
+/// `import`, both one-way hashes of the account, so by the time rows arrived
+/// the account was gone — and a row for another account was held and then
+/// committed under **this** import's identity, recorded against one account
+/// while carrying the import identity of another. Retracting either import
+/// then takes the wrong rows.
+///
+/// Three properties, and the third is what keeps the fix from being a
+/// regression: the wrong account is refused, the right one is taken, and a free
+/// session — one opened with no declaration — still holds rows for several
+/// accounts, which is the whole reason for opening one.
+///
+/// Every account, label and amount below is invented for this test (CLAUDE.md).
+#[tokio::test]
+async fn a_declared_session_refuses_a_row_for_an_account_it_did_not_declare() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, opened) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": main, "channel": "file", "label": "march" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    // One row for the declared account and one for another. The whole call is
+    // refused rather than the row: a row for another account contradicts the
+    // declaration the session was opened under, and holding the agreeing half
+    // would leave a half-import staged under an identity naming the wrong
+    // account.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [
+                unresolved_row(main, "march-1"),
+                unresolved_row(savings, "march-2"),
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let detail = refused.to_string();
+    assert!(
+        detail.contains(&main.to_string()) && detail.contains(&savings.to_string()),
+        "the refusal must name the account declared and the one the row named: {refused}"
+    );
+
+    // And nothing was held: the check runs before the first observation is
+    // written, so a refused call leaves the session as it found it.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["row_count"], 0,
+        "a refused call must hold none of its rows: {contents}"
+    );
+
+    // The declared account is taken exactly as before.
+    let (status, held) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [unresolved_row(main, "march-1")] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+
+    // A free session declares no account, so there is nothing for its rows to
+    // disagree with. This is the shape for an export covering a whole
+    // institution: one session, questions answered once, one commit.
+    let (status, free) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{free}");
+    let free = free["session"].as_str().expect("session").to_owned();
+    let (status, both) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{free}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [
+                unresolved_row(main, "free-1"),
+                unresolved_row(savings, "free-2"),
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a session with no declaration holds rows for several accounts: {both}"
+    );
+    assert_eq!(both.as_array().expect("held rows").len(), 2, "{both}");
 }
 
 /// With every question answered, committing is what the refusal leads with.
@@ -13712,6 +14781,245 @@ async fn a_concluded_row_is_recorded_exactly_as_it_was_before_sessions_existed()
     );
 }
 
+/// A free session's rows are retractable as the import that session is.
+///
+/// iaam-zv54. `plan_session` stamped `SourceId::new_random()` on the rows of a
+/// session that declared no source, and the session's own `source` stayed
+/// absent, so nothing the caller held could name those rows again:
+/// `POST /v1/corrections/imports` is keyed on a declaration, and there was none
+/// to make. A free session's rows could be corrected only one event at a time,
+/// after finding them in the journal.
+///
+/// The identity is now derived from what the caller already holds — the account
+/// each row names, the channel `session`, and the session's own identifier as
+/// the label — so the retraction below is written the way a caller would write
+/// it, out of nothing but the account and the session identifier it was handed
+/// when it opened.
+#[tokio::test]
+async fn a_free_sessions_rows_are_retractable_as_the_import_the_session_is() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-02" },
+                    "idempotency_key": "free-session-1",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    // Read twice before committing. Committing plans the session again, so a
+    // provenance that depended on anything but the session and the row would
+    // differ between what the owner read and what was written — the defect that
+    // is invisible on the wire, because the assessment publishes no source.
+    let first = assessment_of(&harness, &session).await;
+    let second = assessment_of(&harness, &session).await;
+    assert_eq!(
+        first["facts"], second["facts"],
+        "two readings of one session must plan one import: {first}"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "source": {
+                    "account": account,
+                    "channel": "session",
+                    "label": session
+                }
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(
+        retracted["affected"], 1,
+        "the commit wrote the identity the caller can re-derive: {retracted}"
+    );
+    assert_eq!(retracted["written"], 1, "{retracted}");
+}
+
+/// Two free sessions are two imports, and one is retracted without the other.
+///
+/// The session identifier is the label because a session commits once, so one
+/// session is one import. Keying the whole thing on the account and channel
+/// alone would have made every free session of an account one undifferentiated
+/// group.
+#[tokio::test]
+async fn two_free_sessions_are_two_imports() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let mut sessions = Vec::new();
+    for (index, key) in ["free-a", "free-b"].into_iter().enumerate() {
+        let (status, opened) = call(
+            &harness.router,
+            post("/v1/import-sessions", &harness.owner_token, &json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{opened}");
+        let session = opened["session"].as_str().expect("session").to_owned();
+
+        let (status, rows) = call(
+            &harness.router,
+            post(
+                &format!("/v1/import-sessions/{session}/rows"),
+                &harness.owner_token,
+                &json!({
+                    "operations": [{
+                        "account": account,
+                        "type": "deposit",
+                        "amount": "1000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": format!("2025-0{}-02", index + 4) },
+                        "idempotency_key": key,
+                    }],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rows}");
+
+        let (status, committed) = call(
+            &harness.router,
+            post(
+                &format!("/v1/import-sessions/{session}/commit"),
+                &harness.owner_token,
+                &json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{committed}");
+        sessions.push(session);
+    }
+
+    let retract = |session: String| {
+        json!({
+            "acknowledge_retraction": true,
+            "source": { "account": account, "channel": "session", "label": session }
+        })
+    };
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &retract(sessions[0].clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["affected"], 1, "{first}");
+
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &retract(sessions[1].clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["source"], first["source"],
+        "one account and one channel are one source, whatever the session"
+    );
+    assert_eq!(
+        second["affected"], 1,
+        "retracting one free session must not have swept the other: {second}"
+    );
+}
+
+/// A declaration without a label reaches the session it already opened.
+///
+/// iaam-zv54, the second fact. Recognition was keyed on the import, which a
+/// declaration without a label does not name, so every call opened a fresh
+/// session — splitting one declaration's questions across as many sessions as
+/// the caller made calls, which is the exact failure the reuse exists to
+/// prevent.
+#[tokio::test]
+async fn a_declaration_without_a_label_reaches_the_session_it_already_opened() {
+    let harness = harness();
+    let declaration = json!({
+        "source": { "account": harness.account.inner(), "channel": "file" }
+    });
+
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+
+    let (status, again) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{again}");
+    assert_eq!(
+        again["session"], opened["session"],
+        "one declaration has one open session, label or no label: {again}"
+    );
+
+    // Declaring nothing at all is still a session of its own every time: there
+    // is nothing to recognise a free session by, and pretending otherwise would
+    // join two unrelated exports.
+    let (status, free) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{free}");
+    let (status, free_again) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{free_again}");
+    assert_ne!(
+        free["session"], free_again["session"],
+        "a free session is recognised by nothing: {free_again}"
+    );
+}
+
 /// Every schema the contract points at is a schema the contract defines.
 ///
 /// A `$ref` to a component that does not exist is a document a generator cannot
@@ -13857,6 +15165,7 @@ async fn an_open_classification_question_is_an_item_in_the_action_queue() {
             "received",
             "fee",
             "income",
+            "refund",
         ],
         "{item}"
     );
@@ -14521,6 +15830,16 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
             .all(|assertion| assertion["outcome"] == json!("inserted")),
         "{committed}"
     );
+    // Nothing was declined, so nothing is recorded as declined: a gap is a
+    // statement about rows an attempt did not take, and this one took them all
+    // (iaam-bufs).
+    assert!(
+        committed["coverage_gaps"]
+            .as_array()
+            .expect("coverage gaps")
+            .is_empty(),
+        "{committed}"
+    );
 
     let (status, reconciliation) = call(
         &harness.router,
@@ -14547,6 +15866,408 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
     );
 }
 
+/// A commit that declines a row records what it declined (iaam-bufs).
+///
+/// The assessment has always computed, from facts the system derived itself,
+/// what an import was offered and did not take. `commit_session` then threw the
+/// plan away: the rows the caller had sent and the server had refused left no
+/// trace in the journal at all, so reconciliation could afterwards **confirm**
+/// the very dimensions those rows would have moved.
+///
+/// The line this holds, and it is the point of the bead: the gap is not a
+/// statement about the document. This server never sees the document — it
+/// receives the rows a client chose to send — so a field saying what the
+/// statement contained would republish the client's word as the server's
+/// knowledge. What the gap records is what the server **was handed and
+/// declined**, which is a fact it owns entirely.
+///
+/// Note what the flag does and does not do: `accept_control_mismatch` lets the
+/// batch be committed, and the gap is what keeps that permission from becoming
+/// a confirmation later.
+///
+/// Every account, amount and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_commit_that_declines_a_row_writes_the_coverage_gap_that_says_so() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "declining",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-06-10" },
+                "idempotency_key": "declining-good",
+            },
+            // A row the server cannot read into a fact: it states no date at
+            // all, so nothing places it in a period. It is held by the session
+            // and declined by the commit.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "200.00",
+                "currency": "RUB",
+                "idempotency_key": "declining-dateless",
+            },
+        ]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "300.00",
+                "debit_turnover": "300.00",
+            }],
+        }),
+    )
+    .await;
+
+    // The plan already says the row will not be recorded. What was missing is
+    // that the journal never learned it.
+    let plan = assessment_of(&harness, &session).await;
+    let retained = plan["commit_delta"]["retained_unrecorded"]
+        .as_array()
+        .expect("retained rows");
+    assert_eq!(retained.len(), 1, "{plan}");
+    assert_eq!(plan["readiness"], "does_not_reconcile", "{plan}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({ "accept_control_mismatch": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let gaps = committed["coverage_gaps"]
+        .as_array()
+        .expect("coverage gaps");
+    assert_eq!(
+        gaps.len(),
+        1,
+        "one account, one stated interval: {committed}"
+    );
+    assert_eq!(gaps[0]["outcome"], "inserted", "{committed}");
+
+    // And it is readable where it matters: beside the statuses the assertions
+    // this same commit wrote would otherwise confirm.
+    let (status, reconciliation) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reconciliation?account={account}&from=2025-06-01&to=2025-06-30"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reconciliation}");
+    let reported = reconciliation["gaps"].as_array().expect("gaps");
+    assert_eq!(reported.len(), 1, "{reconciliation}");
+    assert_eq!(reported[0]["refused"], 1, "{reconciliation}");
+    assert_eq!(
+        reported[0]["dimensions"],
+        json!(["cash"]),
+        "a deposit the server could not read is a cash line, and nothing more \
+         is claimed about it: {reconciliation}"
+    );
+    assert_eq!(
+        reported[0]["rows"][0]["row"],
+        json!({ "given": "idempotency/declining-dateless" }),
+        "the gap names the row it refused, not merely how many: {reconciliation}"
+    );
+
+    // Committing the same session again is refused — it is closed — so the key
+    // is exercised where it can be: the gap names its rows, so two different
+    // refusals cannot collide on one identity the way iaam-lg4q describes.
+    assert_eq!(
+        reported[0]["parser_version"], "import-control/1",
+        "the gap stands under the parser version its assertions do, or it \
+         taints nothing it is about: {reconciliation}"
+    );
+}
+
+/// A source that printed no control section leaves no gap, deliberately
+/// (iaam-bufs).
+///
+/// A gap is dated and scoped by an interval, and the only interval this server
+/// has been told about is the one the source printed beside the rows. Deriving
+/// one from the rows it managed to read would place a claim on an interval
+/// nobody asserted, computed from the rows that are not the problem.
+///
+/// This is a real limitation and it is iaam-hj1o's to close; it is asserted
+/// here so that closing it is a deliberate act rather than an accident.
+///
+/// Every account, amount and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_commit_with_no_stated_control_section_writes_no_coverage_gap() {
+    let harness = harness();
+    let account = another_account(&harness, "Savings").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "silent",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            "amount": "200.00",
+            "currency": "RUB",
+            "idempotency_key": "silent-dateless",
+        }]),
+    )
+    .await;
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert!(
+        committed["coverage_gaps"]
+            .as_array()
+            .expect("coverage gaps")
+            .is_empty(),
+        "{committed}"
+    );
+}
+
+/// A statement whose rows spill past its own period no longer compares cleanly
+/// (iaam-mnv0).
+///
+/// The defect: `compare` put the source's stated figures beside the rows' own
+/// totals and never asked whether those rows were dated inside the interval the
+/// section declares. So a batch whose rows fall in three different months
+/// matched its own turnover — the same rows were folded on both sides of
+/// nothing — and every figure came out `matched` with `readiness: ready`.
+///
+/// That is worse than a mismatch, and the assertion below says why: the two
+/// turnover figures still agree, and `readiness` is nevertheless
+/// `does_not_reconcile`. A mismatch announces itself; a comparison folded over
+/// the wrong set of rows does not.
+///
+/// It refuses through the flag rather than outright, for the same reason a
+/// mismatched figure does: a document can print a period its own rows spill out
+/// of, and a system that cannot record what happened because a bank's period
+/// line is off is a system that cannot record what happened.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn rows_dated_outside_the_stated_interval_refuse_a_commit_that_otherwise_adds_up() {
+    let harness = harness();
+    let account = another_account(&harness, "Main").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "spilling",
+        json!([
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-06-10" },
+                "idempotency_key": "spilling-inside",
+            },
+            // The converter read the neighbouring months into the same file.
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-05-20" },
+                "idempotency_key": "spilling-before",
+            },
+            {
+                "account": account,
+                "type": "deposit",
+                "amount": "100.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2025-07-02" },
+                "idempotency_key": "spilling-after",
+            },
+        ]),
+    )
+    .await;
+
+    // The figures are the ones the rows come to, which is the whole trouble:
+    // every check below matches.
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "300.00",
+                "debit_turnover": "300.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(
+        plan["control_reconciliation"]["mismatched_figures"], 0,
+        "the arithmetic comes out: {plan}"
+    );
+    assert_eq!(
+        check_of(&plan, "debit_turnover")["outcome"],
+        "matched",
+        "{plan}"
+    );
+    assert_eq!(
+        check_of(&plan, "closing_balance")["outcome"],
+        "matched",
+        "{plan}"
+    );
+
+    // And it is still not a batch that was checked.
+    assert_eq!(
+        plan["control_reconciliation"]["rows_outside_interval"], 2,
+        "{plan}"
+    );
+    assert_eq!(
+        plan["readiness"], "does_not_reconcile",
+        "every figure agrees and the rows are not the period's: {plan}"
+    );
+
+    let fit = &plan["control_reconciliation"]["comparisons"][0]["fit"];
+    assert_eq!(fit["outside"], 2, "{plan}");
+    assert_eq!(fit["undated"], 0, "{plan}");
+    assert_eq!(
+        fit["outside_from"], "2025-05-20",
+        "where they went, not only how many: {plan}"
+    );
+    assert_eq!(fit["outside_to"], "2025-07-02", "{plan}");
+
+    // The commit is refused, and the refusal names the interval and the rows
+    // rather than saying something is wrong somewhere.
+    let before = journal_rows(&harness).await;
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refusal}");
+    let detail = refusal.to_string();
+    assert!(detail.contains("2025-06-01"), "{refusal}");
+    assert!(detail.contains("2025-05-20"), "{refusal}");
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "a refused commit writes nothing: {refusal}"
+    );
+
+    // And it stays possible as a stated act, because the document itself can be
+    // the thing that is wrong.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({ "accept_control_mismatch": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+}
+
+/// A batch whose rows all fall inside the stated interval says so, and commits
+/// without the flag (iaam-mnv0).
+///
+/// The other half of the property above: the fit is published whether or not it
+/// found anything, because «every row is in the period» and «nobody looked» are
+/// different answers, and the check must not make an ordinary import harder to
+/// commit than it was.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_batch_inside_its_stated_interval_reports_a_fit_and_needs_no_flag() {
+    let harness = harness();
+    let account = another_account(&harness, "Savings").await;
+    let session = session_holding(
+        &harness,
+        account,
+        "fitting",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            "amount": "100.00",
+            "currency": "RUB",
+            // The last day of the interval: it is inclusive at both ends.
+            "dates": { "cash_posted": "2025-06-30" },
+            "idempotency_key": "fitting-in",
+        }]),
+    )
+    .await;
+
+    state_control_figures(
+        &harness,
+        &session,
+        &json!({
+            "from": "2025-06-01",
+            "to": "2025-06-30",
+            "figures": [{
+                "account": account,
+                "currency": "RUB",
+                "opening": "0.00",
+                "closing": "100.00",
+                "debit_turnover": "100.00",
+            }],
+        }),
+    )
+    .await;
+
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(plan["readiness"], "ready", "{plan}");
+    assert_eq!(
+        plan["control_reconciliation"]["rows_outside_interval"], 0,
+        "{plan}"
+    );
+    let fit = &plan["control_reconciliation"]["comparisons"][0]["fit"];
+    assert_eq!(fit["outside"], 0, "{plan}");
+    assert_eq!(fit["undated"], 0, "{plan}");
+    assert!(
+        fit.get("outside_from").is_none(),
+        "no row went outside, so there is no span to report: {plan}"
+    );
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+}
+
 /// The commit delta totals its rows, per account and currency (iaam-o1ni).
 ///
 /// The defect: `commit_delta` published three lists, each row carrying a signed
@@ -14555,6 +16276,13 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
 /// add two hundred decimal strings on the client — and the client of this API is
 /// a language model, in a system that deliberately keeps money arithmetic inside
 /// the core.
+///
+/// The session is opened with **no declaration**, and that is as much the point
+/// as the arithmetic is. A total per account is only a total per account when
+/// the batch spans more than one, and a declared session takes rows for the
+/// account it declared and no other (iaam-tmvz) — so the batch below can only
+/// be held by a free session, which is exactly what a free session is for: an
+/// export covering a whole institution is one session, not one per account.
 ///
 /// Every amount and account here is invented (CLAUDE.md).
 #[tokio::test]
@@ -14588,11 +16316,7 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
 
     let (status, session) = call(
         &harness.router,
-        post(
-            "/v1/import-sessions",
-            &harness.owner_token,
-            &json!({ "source": { "account": main, "channel": "file", "label": "totalled" } }),
-        ),
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{session}");
@@ -14665,7 +16389,7 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
     let on_main = totals
         .iter()
         .find(|total| total["account"] == json!(main.to_string()))
-        .expect("a total for the declared account");
+        .expect("a total for the first account");
     assert_eq!(on_main["rows"], 2, "{plan}");
     assert_eq!(on_main["debit"], "1000.00", "{plan}");
     assert_eq!(on_main["credit"], "250.00", "both sides positive: {plan}");
@@ -16740,12 +18464,12 @@ async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
 
 /// The classification outcome vocabulary travels as values, not as a sentence.
 ///
-/// `outcome.kind` is one of four words and the schema does not say which, so the
-/// refusal carries them. The check runs at the door — before the rule is stored
-/// — because a rule the classifier cannot read is a decision written and lost in
-/// the same call.
+/// `outcome.kind` is one of a closed set of words and the schema does not say
+/// which, so the refusal carries them. The check runs at the door — before the
+/// rule is stored — because a rule the classifier cannot read is a decision
+/// written and lost in the same call.
 #[tokio::test]
-async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
+async fn a_rejected_classification_outcome_publishes_the_words_it_admits() {
     let harness = harness();
     let (status, body) = call(
         &harness.router,
@@ -16770,7 +18494,13 @@ async fn a_rejected_classification_outcome_publishes_the_four_it_admits() {
         .collect();
     assert_eq!(
         admitted,
-        ["internal_transfer", "external_flow", "income", "fee"],
+        [
+            "internal_transfer",
+            "external_flow",
+            "refund",
+            "income",
+            "fee"
+        ],
         "{body}"
     );
 }
@@ -16995,9 +18725,15 @@ async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
         StatusCode::OK,
         "the row still settles under an agent token: {answered}"
     );
+    assert_eq!(
+        answered["generalisation"]["state"], "available",
+        "an agent's answer must not become a standing rule, and must say why \
+         no rule stands rather than leaving an absent field to be guessed at: \
+         {answered}"
+    );
     assert!(
-        answered["rule"].is_null(),
-        "an agent's answer must not become a standing rule: {answered}"
+        answered["generalisation"]["rule"].is_null(),
+        "no rule was written: {answered}"
     );
     assert!(
         answered["answered_at"].is_string(),
@@ -17035,11 +18771,112 @@ async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answered}");
-    assert!(
-        answered["rule"].is_string(),
+    assert_eq!(
+        answered["generalisation"]["state"], "recorded",
         "the owner's answer is still recorded as a rule: {answered}"
     );
+    assert!(answered["generalisation"]["rule"].is_string(), "{answered}");
     assert_eq!(classification_rule_count(&harness).await, 1);
+}
+
+/// The rule an agent's answer could not write comes back with the answer
+/// (iaam-ngwn).
+///
+/// The scope split above is right and it left the owner a bill: he reads a
+/// session back, sees a question answered and no rule, and nothing tells him
+/// whether a rule was impossible or merely not the answerer's to make. Both look
+/// like an absent field, and only one of them is worth acting on.
+///
+/// So the question carries what it *would* have generalised into, in the exact
+/// body `POST /v1/classification-rules` takes. This test posts it back
+/// unedited: if the published proposal were a look-alike rather than the request
+/// type itself, this is the call that would fail.
+#[tokio::test]
+async fn an_answer_that_could_not_generalise_publishes_the_rule_it_would_have_made() {
+    let harness = harness();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (session, question) = ask_one_question(&harness, &harness.agent_token, "agent-inner").await;
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(
+        answered["generalisation"]["state"], "available",
+        "a rule was possible here and was not written: {answered}"
+    );
+    let proposal = answered["generalisation"]["proposal"].clone();
+    assert_eq!(
+        proposal["outcome"]["kind"], "internal_transfer",
+        "the proposal states the classification the answer settled the row as: {answered}"
+    );
+    assert_eq!(proposal["outcome"]["to"], json!(savings), "{answered}");
+    assert_eq!(
+        proposal["matcher"]["kind"], "INNER",
+        "the matcher asks what the source printed on the row: {answered}"
+    );
+    assert_eq!(classification_rule_count(&harness).await, 0);
+
+    // Read back off the session, the owner sees the same thing the answerer was
+    // told — which is the half he could not see before.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["questions"][0]["generalisation"], answered["generalisation"],
+        "the session says what the answer said: {contents}"
+    );
+
+    // One call, with the object exactly as it was published.
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/classification-rules", &harness.owner_token, &proposal),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "the proposal is the request body, not a description of one: {created}"
+    );
+    assert_eq!(classification_rule_count(&harness).await, 1);
+}
+
+/// A question waiting on an answer says so, rather than looking like an answer
+/// that generalised nothing.
+#[tokio::test]
+async fn an_unanswered_question_names_its_own_state() {
+    let harness = harness();
+    let (session, _) = ask_one_question(&harness, &harness.agent_token, "still-open").await;
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["questions"][0]["generalisation"]["state"], "unanswered",
+        "{contents}"
+    );
+    assert!(
+        contents["questions"][0]["generalisation"]["proposal"].is_null(),
+        "there is no answer yet to generalise: {contents}"
+    );
 }
 
 /// Ingest one deposit under a declared import and report what the journal holds.

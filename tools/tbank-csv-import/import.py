@@ -106,7 +106,14 @@ def post(base_url, path, token, payload):
 
 
 def resolve_accounts(base_url, token, account_map):
-    """Resolve export names against the live account directory."""
+    """Resolve export names against the live account directory, by title.
+
+    The pre-0004 path, kept for an offline preview and for an operator who has
+    not yet declared his accounts' identities. It resolves by TITLE, so it
+    breaks on a rename at either end -- which is the defect decision 0004 was
+    written about and decision 0005 retires. Prefer running without
+    --account-map.
+    """
     by_title = {account["title"]: account["id"] for account in get(base_url, "/v1/accounts", token)}
     missing = [title for title in account_map.values() if title not in by_title]
     if missing:
@@ -117,6 +124,47 @@ def resolve_accounts(base_url, token, account_map):
         export_name: by_title[title]
         for export_name, title in account_map.items()
     }
+
+
+def identify_accounts(base_url, token, export_names):
+    """Resolve the export's own account names against the identity iaam holds.
+
+    Decision 0004 gave an account the identity its source prints: an opaque
+    ``provider_account_id``, plus aliases for the cards over it. So the name
+    this export prints in its account column is a value the operator declares
+    ONCE, on the account, and this tool reads it back instead of taking a file
+    that maps the same name to a title.
+
+    Exact equality on the declared identity and its aliases, and nothing else.
+    The server's own resolution has three tiers and falls back to the title;
+    this deliberately does not, because a title match here would silently
+    restore the behaviour the map is being retired for. An export name the
+    directory does not identify is simply outside the contour -- reported to
+    the caller, never guessed at.
+
+    A value two accounts answer to identifies neither, exactly as the server
+    refuses an ambiguity rather than picking between candidates.
+    """
+    accounts = get(base_url, "/v1/accounts", token)
+    reached = defaultdict(set)
+    for account in accounts:
+        printed = account.get("provider_account_id")
+        if printed:
+            reached[printed].add(account["id"])
+        for alias in account.get("aliases", []):
+            reached[alias["value"]].add(account["id"])
+    resolved = {}
+    for name in export_names:
+        candidates = reached.get(name, set())
+        if len(candidates) == 1:
+            resolved[name] = next(iter(candidates))
+        elif len(candidates) > 1:
+            raise SystemExit(
+                f"«{name}» is declared on {len(candidates)} accounts: give exactly "
+                "one of them that identifier, or name the account by its iaam "
+                "identifier"
+            )
+    return resolved
 
 
 # What the bank calls a row when the money was earned by the balance itself
@@ -333,8 +381,12 @@ def main():
     parser.add_argument("--export", required=True)
     parser.add_argument(
         "--account-map",
-        required=True,
-        help='JSON: {"<name in the export>": "<account title in iaam>"}',
+        help='JSON: {"<name in the export>": "<account title in iaam>"}. The '
+        "pre-0004 fallback, resolved by TITLE and therefore broken by a rename "
+        "at either end. Omit it: the export's account names are then resolved "
+        "against the identity iaam holds for each account "
+        "(provider_account_id and its aliases), which the operator declares "
+        "once instead of passing a file on every run.",
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--token-env", default="IAAM_TOKEN")
@@ -365,16 +417,34 @@ def main():
     lines = text.splitlines()
     rows = list(csv.DictReader(lines, delimiter=";"))
     raw_lines = {id(row): line for row, line in zip(rows, lines[1:])}
-    with open(args.account_map, encoding="utf-8") as handle:
-        account_map = json.load(handle)
 
     token = os.environ.get(args.token_env, "")
-    if args.dry_run:
-        accounts = {
-            export_name: export_name for export_name in account_map
-        }
+    if args.account_map:
+        with open(args.account_map, encoding="utf-8") as handle:
+            account_map = json.load(handle)
+        # The map is its own contour, so the preview needs no directory: a name
+        # the file does not list is outside, whatever the server holds.
+        if args.dry_run:
+            accounts = {export_name: export_name for export_name in account_map}
+        else:
+            accounts = resolve_accounts(args.base_url, token, account_map)
     else:
-        accounts = resolve_accounts(args.base_url, token, account_map)
+        # No file: the contour is what iaam identifies. That is a directory
+        # read, and a dry run performs it -- a dry run writes nothing, which is
+        # not the same promise as touching nothing.
+        printed_names = sorted({row["Имя счёта"] for row in rows})
+        accounts = identify_accounts(args.base_url, token, printed_names)
+        # An unrecognised name is a whole account's month dropped in silence,
+        # where a missing line in the map used to be a refusal. It is reported
+        # before anything is submitted, because the fix is to declare that
+        # identifier on the account and run again.
+        for name in printed_names:
+            if name not in accounts:
+                print(
+                    f"outside the contour: no account of yours is identified by "
+                    f"«{name}»",
+                    file=sys.stderr,
+                )
 
     counterparty_map = (
         json.load(open(args.counterparty_map, encoding="utf-8"))

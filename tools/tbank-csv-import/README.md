@@ -25,21 +25,37 @@ All other export columns are retained only as part of the raw row text used for
 idempotency. The importer does not translate or normalise source category or
 description values.
 
+## Which account a printed name is
+
+**Declare it once, on the account, and pass no file.** The export prints a name
+in its account column. Give that exact string to the matching iaam account as
+its `provider_account_id`, or as an alias if the account already has an
+identity — an alias carries a validity interval, which is how a card that was
+replaced is recorded. From then on this tool recognises the export's accounts by
+asking `GET /v1/accounts`, and the accounts it does not recognise are outside
+the contour.
+
+An export account name that identifies none of your accounts is reported on
+stderr before anything is submitted, and its rows are counted as
+`skipped_outside_contour`. **Read that list.** A statement's whole month is
+dropped in silence otherwise, and the fix — declaring the identifier on the
+account — takes one call.
+
+`--account-map` still works and is the fallback: it maps export names to iaam
+**titles** and resolves by title, so it breaks on a rename at either end. That
+is the defect decision 0004 was written about and decision 0005 retires. It is
+kept for an offline preview, which has no directory to read, and for an operator
+who has not finished declaring identities.
+
 ## Run
 
-Create an account map outside this repository. Its keys are names from the export and
-its values are account titles in the live iaam account directory:
-
-```json
-{"<export account name>": "<iaam account title>"}
-```
-
-Preview without contacting the server:
+Preview. Nothing is written; the directory is read to work out the contour:
 
 ```bash
-python3 tools/tbank-csv-import/import.py \
+IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
   --export /path/to/export.csv \
-  --account-map /path/to/account-map.json \
+  --base-url http://127.0.0.1:8080 \
+  --token-env IAAM_TOKEN \
   --channel file \
   --dry-run
 ```
@@ -49,14 +65,23 @@ Submit after reviewing the dry-run summary:
 ```bash
 IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
   --export /path/to/export.csv \
-  --account-map /path/to/account-map.json \
   --base-url http://127.0.0.1:8080 \
   --token-env IAAM_TOKEN \
   --channel file \
   --submit
 ```
 
-On submission, account titles are resolved at runtime with `GET /v1/accounts`.
+With `--account-map` instead, the preview contacts nothing at all, because the
+file is its own contour:
+
+```bash
+python3 tools/tbank-csv-import/import.py \
+  --export /path/to/export.csv \
+  --account-map /path/to/account-map.json \
+  --channel file \
+  --dry-run
+```
+
 Operations are sent to `POST /v1/ingest/operations`, batched by resolved
 account, with the declared source `{account, channel, label}`. The label is
 `tbank-export <file name>`: it names this import within the account and
@@ -128,9 +153,9 @@ unrelated row.
 ## What this tool must never contain
 
 No account name, account identifier, balance, counterparty or row of anybody's
-export. All of those are run-time inputs: the account map supplies the
-export-name to account-title mapping, and `GET /v1/accounts` supplies the
-identifiers.
+export. All of those are run-time inputs: `GET /v1/accounts` supplies the
+identity each account was declared under, and `--counterparty-map` supplies the
+one judgement an export cannot.
 
 The reason is not tidiness. This file is checked in and the repository is
 public, so a value written here is published, and a value published in a commit

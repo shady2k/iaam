@@ -5,7 +5,7 @@ use iaam_core::event::kind::{
     CASH_TRANSFER_KIND, CONTROL_ASSERTION_KIND, EventKind, FlowEndpoints, IMPORT_COVERAGE_GAP_KIND,
 };
 use iaam_core::event::{Event, Relation};
-use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, EventId, ImportSessionId, OwnerId, SourceId};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::IdentityScope;
@@ -377,8 +377,8 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
         "INSERT INTO events (
              id, schema_version, owner, account, kind, effective_date, sequence, source_time,
              relation_kind, relation_target, source, source_operation_id,
-             idempotency_key, raw_hash, payload, recorded_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             idempotency_key, raw_hash, payload, recorded_at, import_session
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             event.id.inner().to_string(),
             event.schema_version,
@@ -396,6 +396,15 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
             event.provenance.raw_hash().as_str(),
             payload,
             recorded_at,
+            // Lifted out of the payload it is already in, so the journal can be
+            // narrowed by it. Written from the event rather than from an
+            // argument: a caller that could pass a different session than the
+            // one the fact carries is a caller that can make the column
+            // disagree with the provenance.
+            event
+                .provenance
+                .import_session()
+                .map(|session| session.inner().to_string()),
         ],
     )?;
     Ok(())
@@ -496,6 +505,8 @@ pub struct JournalQuery {
     pub idempotency_key: Option<String>,
     pub account: Option<AccountId>,
     pub source: Option<SourceId>,
+    /// Only facts committed out of this import session.
+    pub import_session: Option<ImportSessionId>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -567,6 +578,13 @@ fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rus
             &mut sql,
             " AND source = ?",
             Box::new(source.inner().to_string()),
+        );
+    }
+    if let Some(session) = query.import_session {
+        bind(
+            &mut sql,
+            " AND import_session = ?",
+            Box::new(session.inner().to_string()),
         );
     }
     if let Some(from) = query.from {

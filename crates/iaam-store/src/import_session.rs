@@ -9,7 +9,7 @@
 //! and the application reads them. It validates that they parse, because a
 //! payload the application cannot read must not be written silently.
 
-use iaam_core::ids::{ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{SqliteStore, StoreError, now};
@@ -60,6 +60,13 @@ pub struct StoredSession {
     pub id: ImportSessionId,
     pub owner: OwnerId,
     pub state: SessionState,
+    /// The account the declaration named, when it named one.
+    ///
+    /// Stored beside `source` and `import` rather than derived from them: both
+    /// of those are one-way hashes of the account, so a session that kept only
+    /// them could not say afterwards which account it was declared for — and
+    /// therefore could not refuse a row for a different one.
+    pub account: Option<AccountId>,
     pub source: Option<SourceId>,
     pub import: Option<ImportId>,
     pub opened_at: String,
@@ -141,24 +148,48 @@ pub struct StoredControlFigures {
 }
 
 impl SqliteStore {
-    /// Open a session, or return the open one this import already has.
+    /// Open a session, or return the open one this declaration already has.
     ///
     /// Reuse rather than a second session, because two sessions over one
     /// declared import would split that statement's questions across two places
-    /// and the owner would answer one of them. A batch that declared no import
-    /// gets a session of its own every time: there is nothing to recognise it by.
+    /// and the owner would answer one of them.
+    ///
+    /// Recognition is keyed on the **whole** declaration and not on the import
+    /// alone (iaam-zv54). A batch that declared a source and no label names no
+    /// import, so keying on the import recognised nothing and opened a fresh
+    /// session on every call — splitting one declaration's questions across as
+    /// many sessions as the caller made calls, which is the very failure the
+    /// reuse exists to prevent. A batch that declared nothing at all still gets
+    /// a session of its own every time, and must: there is nothing to recognise
+    /// it by.
+    ///
+    /// **No unique index guards the source-only case**, unlike
+    /// `import_sessions_by_import`. It cannot be added: this behaviour has
+    /// already produced databases holding several open sessions for one source,
+    /// and a migration creating the index over them would refuse to apply and
+    /// leave the store unopenable. The race it would close is closed anyway —
+    /// the lookup and the insert share one `Immediate` transaction, so two
+    /// concurrent opens serialise — and across processes the worst outcome is
+    /// the state every such database is already in.
+    ///
+    /// `account` is stored and nothing here derives from it, and it is stored
+    /// **as well as** `source` and `import` rather than instead of them: those
+    /// two are what the journal is stamped with, and both are one-way hashes of
+    /// this account together with the channel and the label. A reused session
+    /// keeps the account it was opened with, which cannot disagree with the one
+    /// passed here: an import identity is derived from an account, so two calls
+    /// naming one import name one account.
     pub fn open_import_session(
         &mut self,
         owner: OwnerId,
+        account: Option<AccountId>,
         source: Option<SourceId>,
         import: Option<ImportId>,
     ) -> Result<StoredSession, StoreError> {
         let transaction = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(import) = import
-            && let Some(existing) = open_session_for_import(&transaction, owner, import)?
-        {
+        if let Some(existing) = standing_session(&transaction, owner, source, import)? {
             transaction.commit()?;
             return Ok(existing);
         }
@@ -166,18 +197,21 @@ impl SqliteStore {
             id: ImportSessionId::new_random(),
             owner,
             state: SessionState::Open,
+            account,
             source,
             import,
             opened_at: now(),
             closed_at: None,
         };
         transaction.execute(
-            "INSERT INTO import_sessions (id, owner, state, source, import, opened_at, closed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            "INSERT INTO import_sessions
+                 (id, owner, state, account, source, import, opened_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
             params![
                 session.id.inner().to_string(),
                 owner.inner().to_string(),
                 session.state.code(),
+                account.map(|id| id.inner().to_string()),
                 source.map(|id| id.inner().to_string()),
                 import.map(|id| id.inner().to_string()),
                 session.opened_at,
@@ -199,7 +233,7 @@ impl SqliteStore {
     ) -> Result<Option<StoredSession>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, state, source, import, opened_at, closed_at
+                "SELECT id, state, account, source, import, opened_at, closed_at
                  FROM import_sessions WHERE owner = ?1 AND id = ?2",
                 params![owner.inner().to_string(), id.inner().to_string()],
                 |row| {
@@ -208,8 +242,9 @@ impl SqliteStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -225,7 +260,7 @@ impl SqliteStore {
     /// it.
     pub fn list_import_sessions(&self, owner: OwnerId) -> Result<Vec<StoredSession>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, state, source, import, opened_at, closed_at
+            "SELECT id, state, account, source, import, opened_at, closed_at
              FROM import_sessions WHERE owner = ?1
              ORDER BY opened_at DESC, id",
         )?;
@@ -235,8 +270,9 @@ impl SqliteStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut sessions = Vec::new();
@@ -630,7 +666,7 @@ fn open_session_for_import(
     import: ImportId,
 ) -> Result<Option<StoredSession>, StoreError> {
     conn.query_row(
-        "SELECT id, state, source, import, opened_at, closed_at
+        "SELECT id, state, account, source, import, opened_at, closed_at
          FROM import_sessions
          WHERE owner = ?1 AND import = ?2 AND state = 'open'",
         params![owner.inner().to_string(), import.inner().to_string()],
@@ -640,14 +676,71 @@ fn open_session_for_import(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         },
     )
     .optional()?
     .map(|row| session_from(owner, row))
     .transpose()
+}
+
+/// The open session one declared source has while naming no import.
+///
+/// Ordered oldest first and taken one at a time, unlike the lookup above: the
+/// import case is unique by index, while this one is not and this behaviour has
+/// left databases holding several. The oldest is the one that has been open
+/// longest and therefore the one holding whatever has already been answered, so
+/// picking it is what the refusal above it means to describe.
+fn open_session_for_source(
+    conn: &Connection,
+    owner: OwnerId,
+    source: SourceId,
+) -> Result<Option<StoredSession>, StoreError> {
+    conn.query_row(
+        "SELECT id, state, account, source, import, opened_at, closed_at
+         FROM import_sessions
+         WHERE owner = ?1 AND source = ?2 AND import IS NULL AND state = 'open'
+         ORDER BY opened_at, id
+         LIMIT 1",
+        params![owner.inner().to_string(), source.inner().to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(|row| session_from(owner, row))
+    .transpose()
+}
+
+/// The open session a declaration already has, whatever it declared.
+///
+/// One place, so the store and the scenario that refuses a half-imported
+/// session cannot disagree about which session a declaration reaches. A
+/// declaration naming an import is recognised by it; one naming only a source
+/// is recognised by that; one naming neither is recognised by nothing, which is
+/// the honest answer and not an oversight.
+pub(crate) fn standing_session(
+    conn: &Connection,
+    owner: OwnerId,
+    source: Option<SourceId>,
+    import: Option<ImportId>,
+) -> Result<Option<StoredSession>, StoreError> {
+    match (source, import) {
+        (_, Some(import)) => open_session_for_import(conn, owner, import),
+        (Some(source), None) => open_session_for_source(conn, owner, source),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Refuse to touch a session that is no longer open.
@@ -769,16 +862,22 @@ type SessionColumns = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
     String,
     Option<String>,
 );
 
 fn session_from(owner: OwnerId, row: SessionColumns) -> Result<StoredSession, StoreError> {
-    let (id, state, source, import, opened_at, closed_at) = row;
+    let (id, state, account, source, import, opened_at, closed_at) = row;
     Ok(StoredSession {
         id: ImportSessionId(parse_uuid(&id, "import session")?),
         owner,
         state: SessionState::parse(&state)?,
+        account: account
+            .as_deref()
+            .map(|value| parse_uuid(value, "account"))
+            .transpose()?
+            .map(AccountId),
         source: source
             .as_deref()
             .map(|value| parse_uuid(value, "source"))

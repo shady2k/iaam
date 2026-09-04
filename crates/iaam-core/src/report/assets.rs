@@ -40,6 +40,7 @@ use thiserror::Error;
 use time::Date;
 
 use crate::bond::{BondSchedule, remaining_principal};
+use crate::goal::ReportGoal;
 use crate::ids::{AccountId, InstrumentId};
 use crate::money::{CalcMoney, CurrencyCode, Money, MoneyError, PerUnitAmount, Quantity};
 use crate::numeric::NumericError;
@@ -54,7 +55,7 @@ use crate::valuation::{
 };
 
 use super::balances::{AccountCash, BalancesReport, CashFigure, CashOpening};
-use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence, ReportGoal};
+use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence};
 use super::population::ReportPopulation;
 
 /// What went wrong while folding a snapshot.

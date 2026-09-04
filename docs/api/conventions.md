@@ -155,7 +155,7 @@ things. Read it as the lookup table for §1.
 | `POST /v1/ingest/journal-events` | `[VerdictDto]` | bare array | one verdict per submitted row |
 | `POST /v1/ingest/csv` | `[VerdictDto]` | bare array | one verdict per parsed row |
 | `POST /v1/corrections` | `[VerdictDto]` | bare array | one verdict per submitted correction |
-| `POST /v1/reconciliation/balance` | `[ReconciliationStatusDto]` | bare array | the statuses the balance changed |
+| `POST /v1/reconciliation/balance` | `OwnerBalanceOutcomeDto` | object, `statuses` | `control_assertions` — whether each claim reached the journal or was already held there, which no status row can say |
 | `POST /v1/import-sessions/{session}/rows` | `[ImportRowDto]` | bare array | one outcome per fed row; nothing was recorded |
 | `POST /v1/documents` | `DocumentDto` | object, `rows` | the document hash, source, parser version and period |
 | `POST /v1/brokers/{broker}/sync` | `SyncOutcomeDto` | object, `recorded` | the duplicate and assertion counts for the run, and `actions` |
@@ -199,6 +199,16 @@ manifest exists to be read: an owner asked to rule on an account cannot act on a
 bare UUID, and a caller that had to fetch the names separately would be free to
 render the manifest without them." An action item is that sentence with the same
 reader.
+
+`ImportQuestionDto.accounts` is the same reasoning reaching the last place on
+the import path that had not had it. Two of the six answers to a classification
+question name one of the owner's own accounts, and the question published only
+`needs_account: true` — so a client answering one called `GET /v1/accounts` and
+joined, which is the join §3.1 exists to remove. The candidates are the
+question's own: the account the row is already on is not among them, because an
+account is not the other side of itself, and they are built by the function that
+builds the action queue's `/account` field so that the two cannot offer
+different lists for one question.
 
 `institution` travels with `title` for the case a title alone cannot settle. Two
 accounts the owner calls `Savings`, at two banks, are one word apart in a list
@@ -275,7 +285,7 @@ Every published type that prints an identifier of a thing the owner named.
 | `ActionSubjectDto::Account` | `id` | `title`, `institution` |
 | `AccountScopeDto` | `account` | `title`, `institution` |
 | `PopulationAccountDto` | `account` | `title` |
-| `ImportQuestionDto` | in `prompt` | the titles, in the sentence |
+| `ImportQuestionDto` | in `prompt`, and `accounts[].id` | the titles, in the sentence; `title` and `institution` on each candidate |
 | `ContourDto` | `contour` | `title` |
 | `CategoryDto`, `CategoryGroupDto` | `id` | `title` |
 | `InstrumentDto` | `id` | `symbol`, `title` |
@@ -422,15 +432,29 @@ That is the same act `POST /v1/classification-rules` performs, so it is gated th
 same way, and the agent's answer now settles the row and writes no rule.
 
 The route was not closed to the agent, because the agent's half of it is
-legitimate and closing it would stop the import. `rule` simply comes back absent.
-A client cannot tell that absence from the other one — a row that offered nothing
-a matcher could match on — and does not need to: it knows which token it holds.
+legitimate and closing it would stop the import. What comes back instead of a
+bare `rule` identifier is `generalisation`, which names its own state:
+`recorded` when the answer created a rule, `available` when one was possible and
+the answerer may not write it, `impossible` when the row offers nothing a matcher
+could match on, and `unanswered` while the question is open.
 
-The cost is real and is the point. An agent relaying the owner's answers is asked
-about the same counterparty again next month, because nobody recorded that the
-answer generalises. Recording it is one call the owner makes with his own token,
-and what he gets is a decision in his own vocabulary that he can read back, edit
-and retire.
+The identifier alone could not separate the middle two. Both were an absent
+field, and only a client could tell which applied, because only a client knows
+which token it holds. The owner reading a session back could not — he saw a
+question answered and no rule — and he is the one for whom the difference is
+actionable.
+
+`available` therefore carries the rule itself, in the exact body
+`POST /v1/classification-rules` takes, so adopting the agent's settlement is one
+call with an object copied unedited. The cost of the split is still real — the
+same counterparty is asked about again next month until the owner adopts it — but
+it is a call rather than a reconstruction, and what he gets is a decision in his
+own vocabulary that he can read back, edit and retire.
+
+Nothing links the adopted rule back to the question. `generalisation` says what
+*this answer* wrote, so it goes on saying `available` after the owner posts the
+proposal: the rule he created is his own act, and it is read back from
+`GET /v1/classification-rules` like any other.
 
 ### 4.5 Retracting an import, and retracting anything else
 

@@ -3,7 +3,7 @@
 //! The row this file is written around is invented: an amount, a word meaning
 //! "internal to this institution", and nothing else.
 
-use iaam_core::event::kind::FeeOrigin;
+use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::ids::{AccountId, ClassificationRuleId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::classification::{
@@ -162,8 +162,9 @@ fn an_internal_transfer_states_no_direction_of_its_own() {
     // `Answer::ReceivedFromOwnAccount { from }` records the far side in that
     // same field for money that arrived.
     //
-    // Two of the four outcomes do state a direction, and they state it because
-    // the classification *is* the direction: a fee leaves and income arrives.
+    // Three of the five outcomes do state a direction, and they state it
+    // because the classification *is* the direction: a fee leaves, income
+    // arrives, and a refund is money coming back.
     let savings = AccountId::new_random();
     assert_eq!(
         Classification::InternalTransfer { to: savings }.implied_movement(),
@@ -183,8 +184,21 @@ fn an_internal_transfer_states_no_direction_of_its_own() {
         Some(Movement::Out)
     );
     assert_eq!(
-        Classification::Income.implied_movement(),
+        Classification::Income { kind: None }.implied_movement(),
         Some(Movement::In)
+    );
+    assert_eq!(
+        Classification::Income {
+            kind: Some(IncomeKind::DepositInterest)
+        }
+        .implied_movement(),
+        Some(Movement::In),
+        "naming the earning does not change which way it came"
+    );
+    assert_eq!(
+        Classification::Refund.implied_movement(),
+        Some(Movement::In),
+        "the journal holds no refund that left the account"
     );
 }
 
@@ -229,7 +243,18 @@ fn an_answer_whose_direction_contradicts_what_it_names_is_refused() {
         )
         .is_err()
     );
-    assert!(row.resolve(Classification::Income, Movement::Out).is_err());
+    assert!(
+        row.resolve(Classification::Income { kind: None }, Movement::Out)
+            .is_err()
+    );
+    // A refund that left is the same contradiction, and unlike the other two it
+    // is reachable — not from an answer, both of which say the money arrived,
+    // but from a rule, which carries no direction and matches a merchant's
+    // purchases as readily as its returns.
+    assert!(
+        row.resolve(Classification::Refund, Movement::Out).is_err(),
+        "a refund is money coming back, so one that left is not a fact"
+    );
 }
 
 #[test]
@@ -304,9 +329,30 @@ fn a_question_admits_only_the_answers_it_published() {
     }));
     assert!(outflow.admits(&Answer::Paid));
     assert!(
-        !outflow.admits(&Answer::Income),
+        !outflow.admits(&Answer::Income { kind: None }),
         "a question about an outflow does not admit income"
     );
+    assert!(
+        !outflow.admits(&Answer::Refund),
+        "a question whose alternatives both leave the account admits no arrival"
+    );
+    for question in [
+        Question::IsInflowIncome { account },
+        Question::IsTransferInternal {
+            account,
+            counterparty: "Shop One".to_owned(),
+        },
+        Question::UnresolvedDirection {
+            account,
+            stated: None,
+            counterparty: None,
+        },
+    ] {
+        assert!(
+            question.admits(&Answer::Refund),
+            "{question:?} leaves an arrival open, so it must offer a refund"
+        );
+    }
     for shape in outflow.alternatives() {
         assert!(
             !shape.needs_account(),
@@ -329,18 +375,197 @@ fn every_answer_names_a_direction_and_a_classification() {
         Answer::Fee {
             origin: FeeOrigin::Brokerage,
         },
-        Answer::Income,
+        Answer::Income { kind: None },
+        Answer::Income {
+            kind: Some(IncomeKind::DepositInterest),
+        },
+        Answer::Refund,
     ] {
         let classification = answer.classification();
         let movement = answer.movement();
         match (classification, movement) {
             (Classification::Fee { .. }, Movement::Out)
-            | (Classification::Income, Movement::In)
+            | (Classification::Income { .. } | Classification::Refund, Movement::In)
             | (Classification::ExternalFlow, _)
             | (Classification::InternalTransfer { .. }, _) => {}
             other => panic!("{answer:?} names a contradiction: {other:?}"),
         }
         assert_eq!(answer.shape().code(), answer.shape().code());
+    }
+}
+
+/// A row a merchant returned money on, as a source prints one.
+///
+/// Invented: `Shop One` is nobody. The source states the direction, because a
+/// bank prints one for a card return; what no source states is that the money is
+/// coming back rather than arriving, which is the thing the owner is asked.
+fn merchant_inflow(account: AccountId) -> ObservedRow {
+    ObservedRow {
+        account,
+        direction: ObservedDirection::In,
+        amount_minor: 125_000,
+        currency: CurrencyCode::Rub,
+        counterparty: ObservedCounterparty::Named("Shop One".to_owned()),
+        source_kind: Some("RETURN".to_owned()),
+        description: None,
+        dates: OperationDates {
+            cash_posted: Some(date!(2025 - 03 - 20)),
+            ..OperationDates::default()
+        },
+        source_time: None,
+        identity: RowIdentity {
+            document: None,
+            row: None,
+            idempotency_key: Some("refund-one".to_owned()),
+        },
+    }
+}
+
+#[test]
+fn an_observed_row_the_owner_calls_a_refund_becomes_one() {
+    // The parity defect of `iaam-7l7v`, at the seam it lived on. A caller that
+    // concluded could send `refund`; a caller that observed could reach four
+    // outcomes, none of them a return, so the same row submitted honestly came
+    // out as a deposit — and the journal keeps the two apart, subtracting a
+    // refund from what went out in the category it was spent in.
+    let account = AccountId::new_random();
+    let row = merchant_inflow(account);
+
+    let question = match classify(&row.subject(None), &[]) {
+        ClassificationResult::Ambiguous { question } => question,
+        other => panic!("a merchant the directory does not know is a question: {other:?}"),
+    };
+    assert!(
+        question.admits(&Answer::Refund),
+        "money arriving from a named counterparty is the shape of a return: {question:?}"
+    );
+
+    let operation = row
+        .resolve_with(Answer::Refund)
+        .expect("a refund the owner named resolves");
+    assert_eq!(operation.account, account);
+    assert!(
+        matches!(
+            operation.kind,
+            OperationKind::Refund {
+                amount_minor: 125_000,
+                ..
+            }
+        ),
+        "{:?}",
+        operation.kind
+    );
+}
+
+#[test]
+fn the_owners_answer_is_the_only_thing_that_can_name_an_earning() {
+    // The second half of `iaam-7l7v`. An observation resolved as income used to
+    // carry no kind at all, on the correct ground that the source named none —
+    // and the ground stays correct: what changed is that the owner can now name
+    // one, and that his naming travels into the rule, because it is a claim
+    // about every row the matcher matches rather than a fact about this row.
+    let account = AccountId::new_random();
+    let row = merchant_inflow(account);
+
+    let unnamed = row
+        .resolve_with(Answer::Income { kind: None })
+        .expect("income the owner named no kind for");
+    assert!(
+        matches!(unnamed.kind, OperationKind::Income { kind: None, .. }),
+        "silence is recorded as silence (§4.9): {:?}",
+        unnamed.kind
+    );
+
+    let named = row
+        .resolve_with(Answer::Income {
+            kind: Some(IncomeKind::DepositInterest),
+        })
+        .expect("income the owner named");
+    assert!(
+        matches!(
+            named.kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::DepositInterest),
+                instrument: None,
+                ..
+            }
+        ),
+        "{:?}",
+        named.kind
+    );
+    assert_eq!(
+        Answer::Income {
+            kind: Some(IncomeKind::DepositInterest)
+        }
+        .classification(),
+        Classification::Income {
+            kind: Some(IncomeKind::DepositInterest)
+        },
+        "the kind must reach the rule vocabulary, or the next statement asks again"
+    );
+}
+
+#[test]
+fn every_conclusion_a_cash_row_can_be_is_reachable_from_an_observation() {
+    // The parity list, asserted rather than described. The left column is what
+    // an `OperationKind` can say about a statement row of cash; the right is
+    // what the observation channel reaches. Buying, selling, an opening balance
+    // or a valuation are absent from both, because an observed row carries no
+    // instrument, quantity or price for them to be built from — that is a
+    // difference in what the shape states, not a channel that concludes less.
+    //
+    // `Tax` is the one genuine survivor, and it is deliberate rather than
+    // forgotten: `classification_of` answers `None` for a recorded tax, so tax
+    // sits outside rule recalculation entirely, and a fifth outcome for it would
+    // overturn that in passing.
+    let account = AccountId::new_random();
+    let far = AccountId::new_random();
+    let row = merchant_inflow(account);
+
+    let cases: [(Classification, Movement, &str); 7] = [
+        (Classification::ExternalFlow, Movement::In, "deposit"),
+        (Classification::ExternalFlow, Movement::Out, "withdrawal"),
+        (
+            Classification::InternalTransfer { to: far },
+            Movement::Out,
+            "transfer",
+        ),
+        (
+            Classification::InternalTransfer { to: far },
+            Movement::In,
+            "transfer",
+        ),
+        (
+            Classification::Fee {
+                origin: FeeOrigin::AccountMaintenance,
+            },
+            Movement::Out,
+            "fee",
+        ),
+        (
+            Classification::Income {
+                kind: Some(IncomeKind::DepositInterest),
+            },
+            Movement::In,
+            "income",
+        ),
+        (Classification::Refund, Movement::In, "refund"),
+    ];
+
+    for (classification, movement, expected) in cases {
+        let operation = row
+            .resolve(classification, movement)
+            .unwrap_or_else(|error| panic!("{classification:?} + {movement:?}: {error:?}"));
+        let actual = match operation.kind {
+            OperationKind::Deposit { .. } => "deposit",
+            OperationKind::Withdrawal { .. } => "withdrawal",
+            OperationKind::Transfer { .. } => "transfer",
+            OperationKind::Fee { .. } => "fee",
+            OperationKind::Income { .. } => "income",
+            OperationKind::Refund { .. } => "refund",
+            other => panic!("an observation must not become {other:?}"),
+        };
+        assert_eq!(actual, expected, "{classification:?} + {movement:?}");
     }
 }
 

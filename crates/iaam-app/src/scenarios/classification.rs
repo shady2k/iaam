@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use iaam_core::event::Event;
-use iaam_core::event::kind::{EventKind, FeeOrigin};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, OwnerId};
 use iaam_ingest::classification::{
     Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, Movement,
@@ -31,8 +31,9 @@ pub async fn list_rules(
 /// A classification named the way the rule that decides it names one.
 ///
 /// The vocabulary is the rule outcome's own — `internal_transfer`,
-/// `external_flow`, `income`, `fee` — so the plan answers in the words the
-/// owner wrote the rule in, rather than in the journal's event discriminants.
+/// `external_flow`, `refund`, `income`, `fee` — so the plan answers in the words
+/// the owner wrote the rule in, rather than in the journal's event
+/// discriminants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifiedAs {
     pub kind: &'static str,
@@ -40,6 +41,14 @@ pub struct ClassifiedAs {
     pub to: Option<AccountId>,
     /// The fee's origin, for `fee` only.
     pub origin: Option<&'static str>,
+    /// The earning the owner named, for `income` only.
+    ///
+    /// Optional twice over, and the two absences are not the same one. The field
+    /// is absent from every outcome but `income`, where it means the outcome
+    /// takes no such word; and it is absent on `income` itself where the owner
+    /// named no kind, which is a decision he made about the rows the rule
+    /// matches (§4.9). Only the second can be sent back.
+    pub income_kind: Option<&'static str>,
 }
 
 /// One event a rule change requires correcting, and what it would become.
@@ -78,17 +87,68 @@ pub async fn create_rule(
     outcome: Classification,
     replaces: Option<Uuid>,
 ) -> Result<RuleChange, AppError> {
+    let matcher = encoded(&matcher_json(matcher), "matcher")?;
+    let outcome = encoded(&outcome_json(outcome), "outcome")?;
+    refuse_unreadable_rules(services, principal.owner, &matcher, &outcome).await?;
     let rule = services
         .rules
-        .create_rule(
-            principal.owner,
-            encoded(&matcher_json(matcher), "matcher")?,
-            encoded(&outcome_json(outcome), "outcome")?,
-            replaces,
-        )
+        .create_rule(principal.owner, matcher, outcome, replaces)
         .await?;
     let plan = recompute_history(services, principal.owner).await?;
     Ok(RuleChange { rule, plan })
+}
+
+/// Read every rule the recomputation will read, before anything is written.
+///
+/// **This is the ordering, and it is the whole of iaam-y6kt.**
+/// [`recompute_history`] parses the owner's entire active rule set with
+/// [`rule_from_view`], and a rule it cannot read is an
+/// [`AppError::Invalid`] — a 422 at the transport. Run after the write, that
+/// refusal reached the caller while the store already held the rule it had just
+/// been told was refused, and the only reasonable response to a refusal —
+/// sending it again — added a second copy of it. Nothing in the response said
+/// so, and `GET /v1/classification-rules` refuses for the same reason, so the
+/// caller could not even look.
+///
+/// Two things this is deliberately not.
+///
+/// It is **not** a check of the proposal alone. The proposal is composed here
+/// out of typed values by [`matcher_json`] and [`outcome_json`], so it
+/// round-trips by construction; what actually fails is one of the rules already
+/// stored. The store keeps every matcher and outcome as opaque text — on
+/// purpose, so that it need not know the classifier's vocabulary — so it can
+/// hold JSON written before this route was typed or by something other than it,
+/// and one such rule made *every* later rule creation refuse. The proposal is
+/// read back all the same, through the same function and not a second parser of
+/// the same text, because "round-trips by construction" is an invariant worth
+/// holding rather than assuming.
+///
+/// It is **not** a recomputation moved before the write. The plan is still
+/// computed afterwards, from the rule set the store actually holds, for the
+/// reason [`recompute_history`] gives in its third point: there is exactly one
+/// write, so nothing can half-happen. Computing the plan first would mean
+/// modelling here what the write will do — which rule the amendment retires,
+/// what version the new one is given, and therefore which rule wins a tie — and
+/// a second model of the store's own behaviour is a model that drifts, silently,
+/// into a plan the owner applies to his journal.
+///
+/// What remains after the write can still fail: `recompute_plan` refuses a
+/// journal it cannot resolve. That is a fact about the journal and not about the
+/// rule, it is reported as a 5xx and not as a refusal, and the rule it leaves
+/// stored is a valid standing decision whose plan any later call recomputes.
+async fn refuse_unreadable_rules(
+    services: &AppServices,
+    owner: OwnerId,
+    matcher: &str,
+    outcome: &str,
+) -> Result<(), AppError> {
+    matcher_and_outcome(matcher, outcome)?;
+    for rule in services.rules.list_rules(owner).await? {
+        if rule.retired_at.is_none() {
+            rule_from_view(rule)?;
+        }
+    }
+    Ok(())
 }
 
 /// The condition, in the form the rule store keeps it in.
@@ -112,13 +172,26 @@ pub fn matcher_json(matcher: &RuleMatcher) -> Value {
 #[must_use]
 pub fn outcome_json(classification: Classification) -> Value {
     let named = classified_as(classification);
-    match named.to {
-        Some(to) => serde_json::json!({ "kind": named.kind, "to": to.inner().to_string() }),
-        None => match named.origin {
-            Some(origin) => serde_json::json!({ "kind": named.kind, "origin": origin }),
-            None => serde_json::json!({ "kind": named.kind }),
-        },
+    // Built by walking the named fields rather than by a ladder over the
+    // outcomes. The ladder had one arm per shape of outcome and needed a new one
+    // for every field an outcome learned to carry, which is how `income` could
+    // gain a kind that this function would have written nowhere — a rule stored
+    // without the word the owner chose, and unreadable as the decision he made.
+    let mut object = serde_json::Map::new();
+    object.insert("kind".to_owned(), Value::String(named.kind.to_owned()));
+    if let Some(to) = named.to {
+        object.insert("to".to_owned(), Value::String(to.inner().to_string()));
     }
+    if let Some(origin) = named.origin {
+        object.insert("origin".to_owned(), Value::String(origin.to_owned()));
+    }
+    if let Some(income_kind) = named.income_kind {
+        object.insert(
+            "income_kind".to_owned(),
+            Value::String(income_kind.to_owned()),
+        );
+    }
+    Value::Object(object)
 }
 
 fn encoded(value: &Value, field: &'static str) -> Result<String, AppError> {
@@ -126,11 +199,29 @@ fn encoded(value: &Value, field: &'static str) -> Result<String, AppError> {
         .map_err(|error| AppError::Store(format!("{field} could not be written: {error}")))
 }
 
+/// Retire a rule and say what the remaining set corrects.
+///
+/// The readability check runs first for the reason
+/// [`refuse_unreadable_rules`] gives, and this route had the same defect:
+/// retiring wrote, and the recomputation that followed could refuse with a 422
+/// naming a different rule entirely — leaving the rule retired, and a second
+/// attempt answered `404`, because a retired rule cannot be retired again. A
+/// caller reading the two responses would conclude it had never retired
+/// anything.
+///
+/// Checking the set *before* the retirement is a superset of what the
+/// recomputation afterwards reads: retiring only removes a rule from it. So the
+/// check cannot pass here and fail there.
 pub async fn retire_rule(
     services: &AppServices,
     principal: &Principal,
     id: Uuid,
 ) -> Result<Vec<PlannedCorrection>, AppError> {
+    for rule in services.rules.list_rules(principal.owner).await? {
+        if rule.retired_at.is_none() {
+            rule_from_view(rule)?;
+        }
+    }
     services.rules.retire_rule(principal.owner, id).await?;
     recompute_history(services, principal.owner).await
 }
@@ -212,16 +303,30 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
             kind: "internal_transfer",
             to: Some(to),
             origin: None,
+            income_kind: None,
         },
         Classification::ExternalFlow => ClassifiedAs {
             kind: "external_flow",
             to: None,
             origin: None,
+            income_kind: None,
         },
-        Classification::Income => ClassifiedAs {
+        Classification::Refund => ClassifiedAs {
+            kind: "refund",
+            to: None,
+            origin: None,
+            income_kind: None,
+        },
+        Classification::Income { kind } => ClassifiedAs {
             kind: "income",
             to: None,
             origin: None,
+            income_kind: match kind {
+                None => None,
+                Some(IncomeKind::Coupon) => Some("coupon"),
+                Some(IncomeKind::Dividend) => Some("dividend"),
+                Some(IncomeKind::DepositInterest) => Some("deposit_interest"),
+            },
         },
         Classification::Fee { origin } => ClassifiedAs {
             kind: "fee",
@@ -233,6 +338,7 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
                 FeeOrigin::MarginInterest => "margin_interest",
                 FeeOrigin::Other => "other",
             }),
+            income_kind: None,
         },
     }
 }
@@ -244,18 +350,37 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
 /// readings of one stored matcher would eventually disagree about what the owner
 /// decided.
 pub fn rule_from_view(rule: ClassificationRuleView) -> Result<ClassificationRule, AppError> {
-    let matcher = json_object(&rule.matcher, "matcher")?;
-    let outcome = json_object(&rule.outcome, "outcome")?;
+    let (matcher, outcome) = matcher_and_outcome(&rule.matcher, &rule.outcome)?;
     Ok(ClassificationRule {
         id: ClassificationRuleId(rule.id),
         version: rule.version,
-        matcher: RuleMatcher {
+        matcher,
+        outcome,
+    })
+}
+
+/// The stored condition and outcome, in the classifier's own vocabulary.
+///
+/// Split out of [`rule_from_view`] so that a rule which is not stored yet can be
+/// read by exactly the code that reads one which is: [`create_rule`] reads its
+/// own proposal back before writing it, and it has no identity or version to
+/// build a view out of. A second parser there would eventually accept text the
+/// classifier refuses, which is the failure the one-reader rule exists to
+/// prevent.
+fn matcher_and_outcome(
+    matcher: &str,
+    outcome: &str,
+) -> Result<(RuleMatcher, Classification), AppError> {
+    let matcher = json_object(matcher, "matcher")?;
+    let outcome = json_object(outcome, "outcome")?;
+    Ok((
+        RuleMatcher {
             counterparty_account: optional_string(&matcher, "counterparty_account", "matcher")?,
             description_contains: optional_string(&matcher, "description_contains", "matcher")?,
             kind: optional_string(&matcher, "kind", "matcher")?,
         },
-        outcome: parse_outcome(outcome)?,
-    })
+        parse_outcome(outcome)?,
+    ))
 }
 
 fn json_object(raw: &str, field: &str) -> Result<Map<String, Value>, AppError> {
@@ -299,6 +424,7 @@ fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError
         kind,
         outcome.get("to").and_then(Value::as_str),
         outcome.get("origin").and_then(Value::as_str),
+        outcome.get("income_kind").and_then(Value::as_str),
     )
 }
 
@@ -314,6 +440,7 @@ pub fn outcome_from(
     kind: &str,
     to: Option<&str>,
     origin: Option<&str>,
+    income_kind: Option<&str>,
 ) -> Result<Classification, AppError> {
     match kind {
         "internal_transfer" => {
@@ -322,7 +449,21 @@ pub fn outcome_from(
             Ok(Classification::InternalTransfer { to: AccountId(to) })
         }
         "external_flow" => Ok(Classification::ExternalFlow),
-        "income" => Ok(Classification::Income),
+        "refund" => Ok(Classification::Refund),
+        // Absent means the owner named no kind, and that is a rule he is
+        // entitled to write: it says the rows this matches are income of a kind
+        // nobody stated. A word this reader does not know is refused rather than
+        // dropped to `None` — dropping it would store a weaker decision than the
+        // one he sent and tell him nothing (§4.9).
+        "income" => Ok(Classification::Income {
+            kind: match income_kind {
+                None => None,
+                Some("coupon") => Some(IncomeKind::Coupon),
+                Some("dividend") => Some(IncomeKind::Dividend),
+                Some("deposit_interest") => Some(IncomeKind::DepositInterest),
+                Some(actual) => Err(invalid_income_kind(actual))?,
+            },
+        }),
         "fee" => Ok(Classification::Fee {
             origin: match origin {
                 Some("brokerage") => FeeOrigin::Brokerage,
@@ -346,10 +487,32 @@ pub fn outcome_from(
 fn invalid_outcome(actual: &str) -> AppError {
     FieldRejection::new(
         "outcome",
-        "internal_transfer, external_flow, income or fee",
+        "internal_transfer, external_flow, refund, income or fee",
         actual,
     )
-    .admitting_codes(&["internal_transfer", "external_flow", "income", "fee"])
+    .admitting_codes(&[
+        "internal_transfer",
+        "external_flow",
+        "refund",
+        "income",
+        "fee",
+    ])
+    .into()
+}
+
+/// The income vocabulary is closed too, and names its own field.
+///
+/// Separate from [`invalid_outcome`] so the refusal points at the word that was
+/// wrong. A caller told that `income` is not one of the outcomes, when `income`
+/// is exactly what it sent and `interest` was the unknown word beside it, is
+/// being sent to fix a field it got right.
+fn invalid_income_kind(actual: &str) -> AppError {
+    FieldRejection::new(
+        "outcome.income_kind",
+        "coupon, dividend or deposit_interest, or nothing where the owner named no kind",
+        actual,
+    )
+    .admitting_codes(&["coupon", "dividend", "deposit_interest"])
     .into()
 }
 

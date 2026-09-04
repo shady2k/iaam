@@ -156,55 +156,45 @@ impl ActionKind {
     }
 }
 
-/// One report the owner is trying to reach.
-///
-/// The four are the whole vocabulary, and they are the four report scenarios
-/// this workspace computes: [`crate::scenarios::reports::account_balances`],
+/// One report the owner is trying to reach: the four scenarios this crate
+/// computes — [`crate::scenarios::reports::account_balances`],
 /// [`crate::scenarios::reports::money_flow`],
 /// [`crate::scenarios::reports::returns`] and
-/// [`crate::scenarios::reconciliation::report`]. A fifth name would be a goal no
-/// code produces, and a queue whose goals do not match the reports is worse than
-/// a queue with no goals at all, because it would be believed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ReportGoal {
-    /// What the owner holds, per account: `reports::account_balances`.
-    AssetSnapshot,
-    /// Where money came from and where it went: `reports::money_flow`.
-    MoneyFlow,
-    /// What the holdings earned: `reports::returns`.
-    Returns,
-    /// Whether the journal agrees with the documents: `reconciliation::report`.
-    Reconciliation,
-}
+/// [`crate::scenarios::reconciliation::report`].
+///
+/// Re-exported rather than declared here, and for the reason
+/// [`OperationKey`] is. Until this wave the queue declared its own enum with the
+/// same four variants and the same four `code()` strings as the one a report's
+/// confidence register carries, and the two were joined only where the strings
+/// met on the wire. A stopgap assertion compared the two arrays of codes, which
+/// is the weakest form the promise can take: it lets both enums exist, and it
+/// reports a divergence only when someone runs the tests. The vocabulary belongs
+/// to neither side, so it lives in [`iaam_core::goal`], which is also where the
+/// argument for that placement is written down. Every path that named
+/// `iaam_app::actions::ReportGoal` still resolves.
+pub use iaam_core::goal::ReportGoal;
 
-impl ReportGoal {
-    /// Every goal, in the order the queue publishes them.
-    pub const ALL: [Self; 4] = [
-        Self::AssetSnapshot,
-        Self::MoneyFlow,
-        Self::Returns,
-        Self::Reconciliation,
-    ];
+/// The queue's goal type **is** the report's, asserted where a comment would
+/// otherwise have to be believed.
+///
+/// A coercion and not a test: it is checked by every build rather than by
+/// `cargo test`, and re-declaring a local `ReportGoal` here — the exact defect
+/// this wave removed — stops the crate from compiling instead of producing two
+/// vocabularies that agree until they do not.
+const _: fn(iaam_core::goal::ReportGoal) -> ReportGoal = std::convert::identity;
 
-    /// The stable wire name of this goal.
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::AssetSnapshot => "asset_snapshot",
-            Self::MoneyFlow => "money_flow",
-            Self::Returns => "returns",
-            Self::Reconciliation => "reconciliation",
-        }
-    }
-
-    /// This goal's place in a set's bit pattern.
-    const fn bit(self) -> u8 {
-        match self {
-            Self::AssetSnapshot => 1,
-            Self::MoneyFlow => 1 << 1,
-            Self::Returns => 1 << 2,
-            Self::Reconciliation => 1 << 3,
-        }
+/// A goal's place in a [`ReportGoals`] bit pattern.
+///
+/// A free function because the goal is a foreign type now, and it stays an
+/// exhaustive `match` for the reason [`ReportGoals`] is four bits wide: a fifth
+/// goal must not acquire a bit by accident, and here it acquires a compile
+/// error instead.
+const fn bit(goal: ReportGoal) -> u8 {
+    match goal {
+        ReportGoal::AssetSnapshot => 1,
+        ReportGoal::MoneyFlow => 1 << 1,
+        ReportGoal::Returns => 1 << 2,
+        ReportGoal::Reconciliation => 1 << 3,
     }
 }
 
@@ -240,7 +230,7 @@ impl ReportGoals {
         let mut bits = 0;
         let mut index = 0;
         while index < goals.len() {
-            bits |= goals[index].bit();
+            bits |= bit(goals[index]);
             index += 1;
         }
         Self(bits)
@@ -248,7 +238,7 @@ impl ReportGoals {
 
     #[must_use]
     pub const fn contains(self, goal: ReportGoal) -> bool {
-        self.0 & goal.bit() != 0
+        self.0 & bit(goal) != 0
     }
 
     #[must_use]
@@ -449,6 +439,31 @@ impl<'a> AccountNames<'a> {
 }
 
 /// A source from which the value of a missing request field must come.
+///
+/// **Three words, and there is deliberately no fourth for a converter**
+/// (`iaam-tt71`). The case for one was real while it stood: the queue's
+/// `start_account_import` item tells a caller to open a session and *feed it the
+/// rows*, and between "the owner obtains the statement" and that clause sat a
+/// conversion the item attributed to nobody. `docs/import-boundary.md` §8
+/// concluded that the item's honest gain was a word for the converter here.
+///
+/// That conclusion was conditional on a defect, and the defect is gone. It held
+/// because the observation channel could not express two of the outcomes the
+/// conclusive one could, so a converter that concluded first was the only thing
+/// that could produce a complete import — `iaam-7l7v` and decision 0006 closed
+/// that. A caller holding rows the owner pasted now transcribes them as
+/// observations and the server reaches the conclusions, so the conversion the
+/// item presupposed is no longer a step anybody has to take.
+///
+/// Writing the word anyway would record a workaround as the design at the moment
+/// it stopped being needed. It would also make this enum answer two questions:
+/// each word here names **who supplies a value**, and a converter is a step
+/// rather than a source. The half that was genuinely unattributed — the rows —
+/// is not a missing field of any request this type describes: it is the body of
+/// `POST /v1/import-sessions/{session}/rows`, a later call, and a pointer into
+/// it could not be satisfied by filling in the request it was published on. What
+/// the item gains instead is a sentence naming the shape a row is submitted in,
+/// which is a fact about this API and therefore something the queue may state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvidedBy {
     Owner,
@@ -1778,14 +1793,7 @@ fn answer_classification_question_action(
 /// route no longer accepts.
 #[must_use]
 pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput {
-    // The far side of an internal transfer is one of the owner's *other*
-    // accounts: the row is already on this one, and an account is not the other
-    // side of itself.
-    let others: Vec<AccountView> = accounts
-        .iter()
-        .filter(|candidate| candidate.id != asked.account())
-        .cloned()
-        .collect();
+    let others = answer_account_candidates(asked, accounts);
 
     MissingInput {
         pointer: "/answer".to_owned(),
@@ -1796,15 +1804,15 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
             .into_iter()
             .map(|shape| InputAlternative {
                 value: shape.code().to_owned(),
-                // Two of the six name an account, and only those two. The
+                // Two of the shapes name an account, and only those two. The
                 // alternative says so itself rather than the field being marked
-                // required for all six, which would refuse `paid` for want of an
-                // account nothing asked it about.
+                // required for all of them, which would refuse `paid` for want
+                // of an account nothing asked it about.
                 requires: if shape.needs_account() {
                     vec![RequiredInput {
                         pointer: "/account".to_owned(),
                         provided_by: ProvidedBy::Owner,
-                        candidates: Some(account_candidates(&others)),
+                        candidates: Some(others.clone()),
                     }]
                 } else {
                     Vec::new()
@@ -1812,6 +1820,31 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
             })
             .collect(),
     }
+}
+
+/// The accounts an answer to this question may name.
+///
+/// The far side of an internal transfer is one of the owner's **other**
+/// accounts: the row is already on this one, and an account is not the other
+/// side of itself.
+///
+/// Split out of [`answer_input`] so that the import question itself can publish
+/// the same list the queue publishes for the same question. Two constructions of
+/// "which accounts may this answer name" would eventually offer a caller an
+/// account the answering route refuses, or withhold one it would have taken —
+/// and the caller cannot check either, because it is being handed the list
+/// precisely so that it need not fetch one.
+#[must_use]
+pub fn answer_account_candidates(
+    asked: &Question,
+    accounts: &[AccountView],
+) -> Vec<AccountCandidate> {
+    let others: Vec<AccountView> = accounts
+        .iter()
+        .filter(|candidate| candidate.id != asked.account())
+        .cloned()
+        .collect();
+    account_candidates(&others)
 }
 
 fn actions_from_views(
@@ -2112,6 +2145,23 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
 /// both routes check `may_submit`, which an agent token satisfies, and an item
 /// marked `owner` would tell an agent it may not send a request the server would
 /// accept.
+///
+/// **The reason names the shape a row is submitted in, and that closes
+/// `iaam-tt71`.** «Feed it the rows» presupposed something that turns a
+/// statement into rows this API accepts, and named nobody: for the owner running
+/// his own converter the presupposition held, and for an agent holding rows he
+/// pasted it held only through the observation shape, which the item never
+/// mentioned. So an agent that read this item and knew only the conclusive kinds
+/// had to conclude — from a document it is not allowed to open — or stop.
+///
+/// The fix is a sentence rather than a fourth `ProvidedBy` word, and the
+/// argument for that is on [`ProvidedBy`] itself: the case for the word rested
+/// on a parity defect that `iaam-7l7v` removed, and the rows are not a field of
+/// this request in the first place. Naming the shape is not naming the tool,
+/// which `docs/import-boundary.md` §8 rejects and still should:
+/// `unresolved_direction` is a value of this API's own contract, published in
+/// the document the same caller is already reading, and the queue is entitled to
+/// say what its own calls accept.
 fn start_account_import_action(account: &AccountView) -> Action {
     // The session's `source` is what names the account these rows belong to, and
     // it is the whole of what the policy knows here: the account is the subject
@@ -2188,10 +2238,15 @@ fn start_account_import_action(account: &AccountView) -> Action {
             "Account {} ({}) has no business facts; import a statement or connect a broker. \
              Fetching the statement out of the bank is a step outside this API — no \
              operation here downloads the document, and the owner obtains it himself. \
-             Recording it is not: open an import session for this account, feed it the \
-             rows, read the assessment the session publishes to see what committing would \
-             record and what it would not, and commit under the revision that assessment \
-             carries; or synchronise a broker channel over an interval. An import already \
+             Recording it is not: open an import session for this account and feed it the \
+             rows the document printed. Deciding what a row was is not a step between \
+             those two — a row whose direction or nature the reader cannot tell is sent \
+             as `unresolved_direction`, carrying the source's own sign, its direction \
+             word and the party it named, and the session settles it against the owner's \
+             accounts and rules or asks him about it. Then read the assessment the \
+             session publishes to see what committing would record and what it would \
+             not, and commit under the revision that assessment carries; or synchronise \
+             a broker channel over an interval. An import already \
              under way for this account is not something this item can see — a session \
              records the source and the import it was opened for, and neither can be read \
              back as an account — so opening one again is what finds it: the call refuses, \
@@ -2684,26 +2739,22 @@ mod tests {
         }
     }
 
-    /// The four names, spelled once, because two spellings is the whole defect.
+    /// The set carries every goal the vocabulary has, and no more.
+    ///
+    /// The four names themselves are asserted where they are declared, in
+    /// `iaam_core::goal`. Restating them here would be a second copy of the
+    /// vocabulary in the crate that has just stopped keeping one — and the
+    /// stopgap that used to stand here, comparing this crate's four codes with
+    /// the core's, is now a comparison of an array with itself.
     #[test]
-    fn the_goal_vocabulary_is_the_four_agreed_names() {
-        assert_eq!(
-            ReportGoal::ALL.map(ReportGoal::code),
-            ["asset_snapshot", "money_flow", "returns", "reconciliation"]
-        );
+    fn the_goal_set_covers_the_whole_vocabulary() {
         assert_eq!(ReportGoals::ALL.iter().count(), ReportGoal::ALL.len());
-        assert!(ReportGoals::NONE.is_empty());
-        // Two enums spell these four names: this one, which grades queue items,
-        // and the one a report's confidence register carries, which the
-        // discovery catalog also publishes. They are joined on the wire — an
-        // item saying `money_flow` and a report saying `money_flow` are meant to
-        // be the same word — and nothing but this assertion joins them in code.
         assert_eq!(
-            ReportGoal::ALL.map(ReportGoal::code),
-            iaam_core::report::confidence::ReportGoal::ALL
-                .map(iaam_core::report::confidence::ReportGoal::code),
-            "the queue and the reports no longer agree on what a goal is called"
+            ReportGoals::ALL.iter().collect::<Vec<_>>(),
+            ReportGoal::ALL.to_vec(),
+            "a goal has no bit in the set, so an item required for it publishes nothing"
         );
+        assert!(ReportGoals::NONE.is_empty());
     }
 
     /// Asking for the snapshot returns a shorter list than asking for the queue.
@@ -3867,6 +3918,16 @@ mod tests {
         assert!(
             import.reason().contains("open an import session"),
             "{}",
+            import.reason()
+        );
+        // And the half that was missing (`iaam-tt71`): «feed it the rows» named
+        // no way of producing them, so an agent that knew only the conclusive
+        // kinds had to conclude — from a document it may not open — or stop. The
+        // item now names the shape that lets it do neither.
+        assert!(
+            import.reason().contains("unresolved_direction"),
+            "the item must name the shape a row nobody has concluded is sent \
+             in, or it presupposes a converter it cannot address: {}",
             import.reason()
         );
     }
@@ -5346,7 +5407,13 @@ mod tests {
         assert_eq!(offered, admitted);
     }
 
-    /// A yes-or-no question offers two shapes, and not the directionless six.
+    /// A question about one direction offers the answers that run that way, and
+    /// not the directionless seven.
+    ///
+    /// Three now rather than two, and `refund` is the third: money arriving that
+    /// nobody sent, money the capital earned and money a counterparty returned
+    /// are three facts the reports keep apart, and until the third had a word
+    /// the queue published a choice that could not express it (`iaam-7l7v`).
     #[test]
     fn a_different_question_publishes_different_shapes() {
         let main = named("Main");
@@ -5371,7 +5438,7 @@ mod tests {
             .iter()
             .map(|alternative| alternative.value.as_str())
             .collect();
-        assert_eq!(offered, vec!["income", "received"]);
+        assert_eq!(offered, vec!["income", "received", "refund"]);
     }
 
     /// Only the two shapes that name an account ask for one, and never this one.
@@ -5527,7 +5594,7 @@ mod tests {
             .await
             .expect("account");
         let session = store
-            .open_import_session(owner, None, None)
+            .open_import_session(owner, None, None, None)
             .await
             .expect("session");
         let question = unresolved(main.id);

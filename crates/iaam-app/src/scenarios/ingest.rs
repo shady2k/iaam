@@ -2,7 +2,7 @@
 
 use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::{Event, SCHEMA_VERSION};
-use iaam_core::ids::{ImportId, PrincipalId, SourceId};
+use iaam_core::ids::{ImportId, ImportSessionId, PrincipalId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{
@@ -17,6 +17,31 @@ use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
 use crate::ports::{Principal, Recorded};
 
+/// Where one row came from and which submission carried it.
+///
+/// The two travel together because they are one answer: the source says «where
+/// do these rows come from» and is what deduplication is scoped by, the import
+/// says «which submission carried this one» and is what a retraction is keyed
+/// on. Both are derived from a declaration — see [`SourceId::declared`] and
+/// [`ImportId::declared`] — and neither is ever minted at random, because a
+/// caller holds no server-assigned handle after a submission and could then
+/// never name its own rows again.
+///
+/// **Carried per row rather than hoisted over the batch.** A source is keyed on
+/// one account, and a channel may name an account per row: the CSV format does,
+/// so one file can carry two of the owner's accounts. Folding them into one
+/// source would let a row of the first deduplicate against a row of the second.
+/// A channel whose declaration names one account for the whole batch builds this
+/// once and repeats it, which costs it nothing.
+///
+/// [`SourceId::declared`]: iaam_core::ids::SourceId::declared
+/// [`ImportId::declared`]: iaam_core::ids::ImportId::declared
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowOrigin {
+    pub source: SourceId,
+    pub import: Option<ImportId>,
+}
+
 /// Submitting a batch of operations.
 ///
 /// A verdict is issued **for each line**: one unrecognised operation
@@ -27,38 +52,38 @@ use crate::ports::{Principal, Recorded};
 /// Parsing lives here, writing is below, in [`submit_candidates`]: the input
 /// for journal facts has its own parser, while the journal and its safeguards are shared.
 ///
-/// `import` names the submission these rows arrived in, when the caller
-/// declared one. It is stamped after normalisation rather than carried in
-/// [`NormalizationContext`], because normalisation decides what a row *is* and
-/// the import decides nothing about that: it is the handle a later retraction
-/// is keyed on, and nothing in the shape of an event depends on it.
+/// Each row arrives with its own [`RowOrigin`]. The import in it is stamped
+/// after normalisation rather than carried in [`NormalizationContext`], because
+/// normalisation decides what a row *is* and the import decides nothing about
+/// that: it is the handle a later retraction is keyed on, and nothing in the
+/// shape of an event depends on it.
 pub async fn submit_operations(
     services: &AppServices,
     principal: &Principal,
-    source: SourceId,
-    import: Option<ImportId>,
-    operations: &[SubmittedOperation],
+    operations: &[(RowOrigin, SubmittedOperation)],
 ) -> Result<Vec<Verdict>, AppError> {
     let candidates = operations
         .iter()
-        .map(|operation| {
+        .map(|(origin, operation)| {
             normalize(
                 operation,
                 NormalizationContext {
                     owner: principal.owner,
-                    source,
+                    source: origin.source,
                 },
             )
             .map(|normalized| {
                 let mut event = normalized.event;
-                if let Some(import) = import {
+                if let Some(import) = origin.import {
                     event.provenance = event.provenance.with_import(import);
                 }
                 event
             })
         })
         .collect();
-    submit_candidates(services, principal, "operation", candidates).await
+    // No session: this route writes straight to the journal, and a session
+    // identifier stamped here would name an act that never happened.
+    submit_candidates(services, principal, "operation", None, candidates).await
 }
 
 /// Ingestion of journal facts with schedule-based depreciation enrichment.
@@ -126,7 +151,7 @@ pub async fn submit_journal_events(
         );
     }
 
-    submit_candidates(services, principal, "fact", candidates).await
+    submit_candidates(services, principal, "fact", None, candidates).await
 }
 
 /// Ingestion of prepared candidates: submission permission, form, writing, verdict.
@@ -157,10 +182,21 @@ pub async fn submit_journal_events(
 /// no less real for a batch that declared no label. Narrowing it to the case
 /// the retraction rule needs would make the journal's answer depend on what one
 /// rule happens to ask.
+///
+/// `session` names the import session this write is the commit of, and is
+/// `None` for every route that writes without one. It is a **parameter** rather
+/// than something each input stamps onto its own candidates, and that is the
+/// difference between a fact somebody remembered to record and one the compiler
+/// asked for: a fifth route added tomorrow cannot reach the journal without
+/// saying which act it is performing. The import beside it is still stamped by
+/// each input, because the import is decided while a row is being read and the
+/// session is decided by the call — see [`crate::scenarios::import_session::commit_session`],
+/// the only caller that passes `Some`.
 pub async fn submit_candidates(
     services: &AppServices,
     principal: &Principal,
     field: &'static str,
+    session: Option<ImportSessionId>,
     candidates: Vec<Result<Event, Rejection>>,
 ) -> Result<Vec<Verdict>, AppError> {
     if !principal.scope.may_submit() {
@@ -185,6 +221,9 @@ pub async fn submit_candidates(
             }
         };
         event.provenance = event.provenance.with_declared_by(declared_by);
+        if let Some(session) = session {
+            event.provenance = event.provenance.with_import_session(session);
+        }
         verdicts.push(record_candidate(services, event, field).await?);
     }
     Ok(verdicts)

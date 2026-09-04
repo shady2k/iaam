@@ -1,0 +1,18 @@
+-- The account a declared import session is for.
+--
+-- A session already stored `source` and `import`, and both are one-way
+-- derivations of the account: `SourceId::declared` and `ImportId::declared`
+-- hash it together with the channel and the label, so nothing read back can
+-- recover which account the caller declared. That is why a declared session
+-- could not check the rows fed to it — by the time the rows arrived, the
+-- account was gone — and a row for another account was held and committed
+-- under this import's identity.
+--
+-- Nullable, and the NULL means what it says: this session declared no account.
+-- Two kinds of session carry one. A free session is opened without a
+-- declaration and legitimately holds rows for several accounts — an
+-- institution-wide export is one session, not four — so it has nothing to
+-- check against. And a session opened before this migration recorded no
+-- account, so it cannot be checked either; it keeps exactly the behaviour it
+-- was opened under rather than acquiring a rule it never agreed to.
+ALTER TABLE import_sessions ADD COLUMN account TEXT;

@@ -16,7 +16,7 @@ use axum::{Extension, Json};
 use iaam_app::AppServices;
 use iaam_app::actions::{
     AccountCandidate, AccountScope, Action, ActionCategory, ActionState, ActionSubject,
-    ActionTarget, InputAlternative, MissingInput, OperationKey, OwnerPrompt, RequestPlan,
+    ActionTarget, InputAlternative, MissingInput, OperationKey, OwnerPrompt, Proposal, RequestPlan,
     account_scope,
 };
 use iaam_app::ingest::csv_source::{Directory, ParsedRow, parse};
@@ -92,14 +92,14 @@ use crate::dto::{
     MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
     MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
     NegativeBalanceExpectationDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
-    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
-    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountNameDispositionRequest,
-    RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
-    RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
-    ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
-    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
-    VerdictDto,
+    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
+    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
+    RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
+    ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest, RequestPlanDto,
+    RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
+    ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -287,6 +287,25 @@ fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
             .iter()
             .map(input_alternative_dto)
             .collect(),
+        // Whether the route takes the request without this field, so a client
+        // can offer him a way past a question no figure depends on instead of
+        // stopping him at it (`iaam-4fsw`).
+        optional: missing.optional,
+        proposal: missing.proposal.as_ref().map(proposed_answer_dto),
+    }
+}
+
+/// One answer the owner may give once for a set of items.
+///
+/// The question is rendered from the same value the set was built with, exactly
+/// as a field's question is rendered from the value its pointer came from: an
+/// item hands over a value and the items it reaches, and the words are the
+/// domain's (`iaam-hdr7`).
+fn proposed_answer_dto(proposal: &Proposal) -> ProposedAnswerDto {
+    ProposedAnswerDto {
+        value: proposal.value().to_owned(),
+        question: OwnerQuestionDto::from_domain(&proposal.question()),
+        covers: proposal.covers.clone(),
     }
 }
 

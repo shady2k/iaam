@@ -24,14 +24,19 @@ pub struct Rejection {
 /// the rejected row could not be parsed (§10.1), and the quarantined row was
 /// parsed but could not be recorded.
 ///
-/// **Whether the fact was recorded matters more than which code it was.**
-/// `Discrepancy` is recorded deliberately: the fact was received, and hiding
-/// it until it is explained would lose data. `NeedsReconciliation` is not
-/// recorded, just as deliberately: there is nothing to record, and the
-/// question has been put to the owner. `is_recorded` below draws that line,
-/// and every code's published meaning states which side of it the code falls
-/// on — but the reason is here, because it belongs to the whole vocabulary
-/// rather than to any one of its ten entries.
+/// **Whether the fact was recorded matters more than which code it was.** A
+/// fact received but not yet explained is recorded anyway, because hiding it
+/// until it is explained would lose data; a code that reports a question with
+/// no fact behind it records nothing, because there is nothing to record.
+/// `is_recorded` below draws that line, and every code's published meaning
+/// states which side of it the code falls on — but the reason is here, because
+/// it belongs to the whole vocabulary rather than to any one of its ten
+/// entries.
+///
+/// The line is drawn over all ten, including the three no path emits. That is
+/// not idle: it is what makes the last paragraph below able to say that
+/// `NeedsReconciliation` is on the side it belongs on and false about every
+/// situation it would describe.
 ///
 /// **A verdict answers a write; confirmation answers a read.** That is why
 /// `Accepted` is in this list and is produced by nothing, and why it is not an
@@ -49,13 +54,37 @@ pub struct Rejection {
 /// itself» actually happens. Decision 0009 is this argument at length,
 /// including why the code is described rather than removed.
 ///
-/// `Discrepancy` and `NeedsReconciliation` are unproduced too, and for a
-/// different reason that this comment must not blur into the one above:
-/// theirs is a gap rather than an impossibility. A commit that overrides a
-/// control mismatch writes rows the source's own figures contradict, and that
-/// is a discrepancy something could report; a missing owner remainder is asked
-/// for by the action queue instead. Both are recorded as open work, not
-/// settled here.
+/// `Discrepancy` and `NeedsReconciliation` are unproduced too, and decision
+/// 0011 reserves them as well — for two reasons this comment keeps apart,
+/// because collapsing them into one loses the sharper of the two.
+///
+/// `Discrepancy` fails for the reason above, and its payload is the proof.
+/// `{ account, dimension }` is the read-time claim itself:
+/// `iaam_core::returns::MaterialIssue::Discrepancy` carries those same two
+/// fields and nothing else, raised where the ledger's fold comes out
+/// `Discrepant`. What the verdict lacks is the interval — without one,
+/// «reconciliation does not match» names no period to not match over. A commit
+/// that overrides a control mismatch does know something real, but not this: it
+/// knows that a batch disagrees with the control section one document printed,
+/// per account, currency and figure. That fact is already carried three times
+/// over — by the import session's assessment, which names every disagreeing
+/// figure with both numbers and the difference; by the control assertions the
+/// commit writes into the journal beside the rows they contradict, which the
+/// ledger folds into `discrepant` for as long as they stand; and by the
+/// `discrepancy_unresolved` queue item, which carries the operations that
+/// settle it. None of the three is a property of one row, and `verdicts` is a
+/// list a caller reads by row position.
+///
+/// `NeedsReconciliation` fails harder: emitting it would be false. Its
+/// published sentence is «nothing was recorded», and no write is ever declined
+/// for want of an owner remainder. The rows are recorded — as `Provisional` —
+/// and the need for a remainder is then derived *from* them, per account and
+/// interval, by the queue's `provide_control_assertion`, which asks the opening
+/// point before the closing one. The need is discovered after the write this
+/// code would have to be the answer to, so there is no moment at which it could
+/// be said truthfully. `is_recorded` puts this code on the «nothing was
+/// recorded» side, and that placement is right about the sentence and wrong
+/// about every situation the sentence would describe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     /// Recorded, and reconciliation matched — which nothing constructs.
@@ -76,14 +105,30 @@ pub enum Verdict {
         of: EventId,
         level: crate::dedup::DedupLevel,
     },
-    /// Recorded, but reconciliation does not match: the owner is investigating.
+    /// Recorded, but reconciliation does not match — which nothing constructs.
+    ///
+    /// **Reserved**, for `Accepted`'s reason. `{ account, dimension }` is the
+    /// read-time claim itself, and `MaterialIssue::Discrepancy` carries exactly
+    /// those two fields out of the fold that can decide them. Kept rather than
+    /// deleted on the same grounds as `Accepted`; the reasoning is on the type
+    /// above, including what a commit that overrides a control mismatch knows
+    /// instead and the three places that already report it.
     Discrepancy {
         event: EventId,
         account: AccountId,
         dimension: Dimension,
         detail: String,
     },
-    /// Nothing to reconcile against: a remainder from the owner is required.
+    /// Nothing to reconcile against — which nothing constructs, and which
+    /// nothing could construct truthfully.
+    ///
+    /// **Reserved**, and for a stronger reason than `Accepted` or
+    /// `Discrepancy`: a missing owner remainder declines no write, so «nothing
+    /// was recorded» is false of every row this code would describe. The
+    /// request for the figure is the action queue's `provide_control_assertion`,
+    /// which is derived from the recorded facts and so cannot precede them. Kept
+    /// rather than deleted on `Accepted`'s grounds; the reasoning is on the type
+    /// above.
     NeedsReconciliation {
         account: AccountId,
         dimension: Dimension,
@@ -130,9 +175,9 @@ macro_rules! verdict_vocabulary {
             PossibleDuplicate => "possible_duplicate":
                 "The fact was recorded and resembles one already in the journal. Neither is deleted and neither is merged: the owner is shown both and decides.",
             Discrepancy => "discrepancy":
-                "The fact was recorded, but reconciliation of the dimension does not match, and the owner is investigating.",
+                "Reserved, and no path emits it. A verdict answers one write, while whether reconciliation of a dimension matches is a property of an account, a dimension and an interval that is folded when a report is read. Do not wait for this code. A batch that disagrees with the control section its own source printed is reported figure by figure, with both numbers and the difference, by the import session's assessment; a disagreement the journal holds is reported by the data quality block as `discrepant` and by the action queue as `discrepancy_unresolved`, which carries the operations that settle it.",
             NeedsReconciliation => "needs_reconciliation":
-                "Nothing was recorded: there is no owner remainder for the dimension to reconcile against.",
+                "Reserved, and no path emits it. Nothing is ever declined for want of an owner remainder: the rows are recorded, and the need for a remainder is derived from them afterwards, per account and interval. Do not wait for this code — the request for the figure is published by the action queue as `provide_control_assertion`, naming the account, the interval and which end of it the balance is wanted at.",
             Duplicate => "duplicate":
                 "Nothing new was recorded: the idempotency key already recorded this fact, and the existing event is returned.",
             NeedsClassification => "needs_classification":

@@ -1236,9 +1236,13 @@ mod tests {
     #[test]
     fn an_empty_journal_is_not_comparable_rather_than_wrong() {
         // The assertion «the account has 100 000» with an empty journal is not
-        // a discrepancy of 100 000: there is nothing to compare against. A discrepancy here
-        // would send the owner looking for an error where none exists,
-        // when what they need is the needs_reconciliation verdict.
+        // a discrepancy of 100 000: there is nothing to compare against. A
+        // discrepancy here would send the owner looking for an error where none
+        // exists. What must be said instead is that it could not be compared —
+        // which is this outcome, and not the `needs_reconciliation` verdict an
+        // earlier version of this comment named: that code is reserved and
+        // emitted by nothing (decision 0011), and what is missing is asked for
+        // by the action queue.
         let account = AccountId::new_random();
         let observed = observe(&[], account, march()).unwrap();
         let claim = ControlClaim::CashBalance {

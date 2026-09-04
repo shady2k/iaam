@@ -138,7 +138,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/tokens` | `[TokenDto]` | bare array | whole list, revoked included |
 | `GET /v1/broker-access` | `[BrokerAccessDto]` | bare array | whole list, revoked included |
 | `GET /v1/contours` | `[ContourDto]` | bare array | whole list; each contour carries its own version |
-| `GET /v1/import-sessions` | `[ImportSessionDto]` | bare array | whole list, newest first |
+| `GET /v1/import-sessions` | `[ImportSessionSummaryDto]` | bare array | whole list, newest first; each entry carries `row_count` and `unanswered` beside the header, so «which import is still waiting on me» is one request rather than one per session |
 | `GET /v1/actions` | `[ActionDto]` | bare array | the whole queue; nothing true of the set that is not true of each item (§1.4a) |
 | `GET /v1/journal/events` | `JournalPageDto` | object, `rows` | `next` — the position to resume the page from |
 | `GET /v1/market/prices` | `MarketPriceSeriesDto` | object, `rows` | `complete_through` — how far the series is known |
@@ -738,3 +738,33 @@ Retiring an account that still holds money is **not** refused. It is his
 statement about his product, and refusing it because a fold disagrees would make
 his word conditional on how much of his history has been imported. §6.4 is what
 makes that safe.
+
+---
+
+## 7. A session that has not ended is an item of its own
+
+A session raises an item per unanswered question, and one more for itself, kind
+`import_session_unfinished` — one per session that holds rows and has not been
+committed or abandoned. The two say different things: «this row is
+unclassified» and «this import has not ended», and a session with an open
+question raises both.
+
+The item exists because the queue used to say the first and not the second. A
+session whose questions were all answered, or that raised none — the ordinary
+outcome of a clean statement — held rows that were in no journal and appeared in
+no item, and a caller reading an empty queue is entitled to conclude the import
+finished. It had not: the next act was to import the same statement again.
+
+The goal is that the session stopped being open, and **both** of the calls that
+end one satisfy it. Its target publishes them in the order the refusal on the
+open route uses: `commit_import_session` first, `abandon_import_session` second.
+Answering a question is not among them, because a resolution is a call that
+closes the item and an answer leaves the session as open as it found it; the
+sentence says how many answers are still outstanding, and the commit is refused
+until they are given. The item is `required_for_goal` over all four reports —
+while it stands, the reports are computed as though those rows did not exist —
+and it names `agent` as the scope, because both routes accept an agent token.
+
+Reading the queue is not the only way to see this. `GET /v1/import-sessions`
+carries `row_count` and `unanswered` on every entry, which is the same question
+answered for every session in one request. Decision 0016 has the argument.

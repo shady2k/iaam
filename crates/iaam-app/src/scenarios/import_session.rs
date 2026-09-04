@@ -48,8 +48,8 @@ use iaam_ingest::dedup::IdentityScope;
 
 use crate::ports::{
     AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, ContourView,
-    ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionView,
-    NewImportQuestion, Principal, Recorded,
+    ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
+    ImportSessionView, NewImportQuestion, Principal, Recorded,
 };
 use crate::scenarios::classification::{matcher_json, outcome_json};
 use crate::scenarios::coverage_gap;
@@ -642,6 +642,10 @@ async fn standing_session(
         .list_import_sessions(principal.owner)
         .await?
         .into_iter()
+        // The counts the listing carries are not read here: this dispatch asks
+        // which session a declaration reaches, and what that session holds is
+        // the refusal's business rather than the recognition's.
+        .map(|summary| summary.session)
         .filter(|session| session.state == ImportSessionState::Open)
         .collect();
     open.sort_by(|left, right| {
@@ -758,11 +762,19 @@ pub async fn read_session(
     })
 }
 
-/// Every session of the owner's, newest first.
+/// Every session of the owner's, newest first, with how much each holds.
+///
+/// The counts travel with the headers, and that is the whole of this
+/// function's shape. A list of headers alone answers «which sessions exist»
+/// and leaves «which of them is waiting on me» to one request per session — a
+/// cost a caller pays by not paying it, concluding from a list it did not walk
+/// that nothing is outstanding. Both numbers are read in the same store
+/// statement as the headers, so the honest answer costs what the incomplete
+/// one did.
 pub async fn list_sessions(
     services: &AppServices,
     principal: &Principal,
-) -> Result<Vec<ImportSessionView>, AppError> {
+) -> Result<Vec<ImportSessionSummaryView>, AppError> {
     services.store.list_import_sessions(principal.owner).await
 }
 

@@ -8375,9 +8375,24 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
                 _ => vec![target],
             };
             for resolution in resolutions {
-                let schema_name = resolution["requestSchema"]
-                    .as_str()
-                    .expect("request schema reference")
+                // A call that takes no request body has no request schema and
+                // therefore requires nothing, so the sweep over it is vacuous
+                // rather than absent — the same reading the shape test above
+                // makes of `requestSchema` being declared and not required.
+                // `abandon_import_session` is that call, and the queue offers
+                // it: `import_session_unfinished` publishes both of the calls
+                // that end a session.
+                let Some(schema_reference) = resolution["requestSchema"].as_str() else {
+                    assert!(
+                        resolution["request"]["missing"]
+                            .as_array()
+                            .expect("missing inputs")
+                            .is_empty(),
+                        "a call with no request body has no field to supply: {resolution}"
+                    );
+                    continue;
+                };
+                let schema_name = schema_reference
                     .strip_prefix("#/components/schemas/")
                     .expect("component schema reference")
                     .to_owned();
@@ -16704,6 +16719,212 @@ async fn open_question_items(harness: &Harness) -> Vec<Value> {
         .filter(|item| item["kind"] == "answer_classification_question")
         .cloned()
         .collect()
+}
+
+/// The queue's items for import sessions that have not ended, and nothing else.
+async fn unfinished_session_items(harness: &Harness) -> Vec<Value> {
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    actions
+        .as_array()
+        .expect("action items")
+        .iter()
+        .filter(|item| item["kind"] == "import_session_unfinished")
+        .cloned()
+        .collect()
+}
+
+/// Open a session for the harness account and feed it one row nothing is asked
+/// about.
+///
+/// A `deposit` is conclusive: the caller has said what the row was, so no
+/// question is raised and the session sits holding a row with nothing
+/// outstanding in it. That is the state this whole pair of tests is about, and
+/// it is the ordinary outcome of a clean statement rather than an exotic one.
+/// Every value here is invented for this file.
+async fn session_holding_one_row(harness: &Harness, label: &str, key: &str) -> String {
+    let account = harness.account.inner();
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": label } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-18" },
+                    "idempotency_key": key,
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_ne!(
+        rows[0]["state"], "needs_classification",
+        "the fixture needs a row nothing is asked about: {rows}"
+    );
+    id
+}
+
+/// A session holding rows is in the queue even when nothing is asked about them
+/// (iaam-8ano).
+///
+/// The defect: an open session raised an item only through an unanswered
+/// question, so a session whose questions were all answered — or that raised
+/// none, which is what a clean statement does — held rows that were in no
+/// journal and appeared in no item. `GET /v1/actions` is this system's
+/// published answer to «what next», and a caller that reads it and finds
+/// nothing outstanding is entitled to conclude the import finished. The next
+/// act is then to import the same statement again.
+#[tokio::test]
+async fn a_session_holding_rows_is_in_the_queue_with_nothing_to_answer() {
+    let harness = harness();
+    let id = session_holding_one_row(&harness, "august", "queued-one").await;
+
+    let items = unfinished_session_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let item = &items[0];
+    assert_eq!(item["id"], format!("import_session_unfinished:{id}"));
+    assert_eq!(item["category"], "required_for_goal", "{item}");
+    assert_eq!(item["state"], "needs_owner_input", "{item}");
+    assert_eq!(item["required_scope"], "agent", "{item}");
+
+    // The two calls that end a session, in the order the refusal on the open
+    // route already puts them: committing is the way on, abandoning the way
+    // out. Answering is neither — it leaves the session as open as it found it
+    // — so it is not offered here.
+    assert_eq!(item["target"]["type"], "options", "{item}");
+    let options = item["target"]["options"].as_array().expect("options");
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option["operationId"].as_str().expect("operation id"))
+            .collect::<Vec<_>>(),
+        vec!["commit_import_session", "abandon_import_session"],
+        "{item}"
+    );
+    for option in options {
+        assert_eq!(
+            option["request"]["preset"]["session"],
+            json!(id),
+            "{option}"
+        );
+    }
+    // Abandoning takes no request body, so it advertises no schema and no
+    // missing field. That is the shape the contract admits rather than a gap.
+    assert!(options[1].get("requestSchema").is_none_or(Value::is_null));
+
+    // Committing ends it, and the item goes with it.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert!(
+        unfinished_session_items(&harness).await.is_empty(),
+        "a committed session is finished"
+    );
+}
+
+/// Abandoning ends the session as finally as committing, so it closes the item.
+///
+/// «The owner committed the rows» and «the owner threw them away» are different
+/// facts, and the question item is right to refuse to read the second as the
+/// first. This item makes no claim about any row: it says the session is open.
+#[tokio::test]
+async fn abandoning_a_session_closes_its_queue_item() {
+    let harness = harness();
+    let id = session_holding_one_row(&harness, "september", "queued-two").await;
+    assert_eq!(unfinished_session_items(&harness).await.len(), 1);
+
+    let (status, abandoned) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/abandon"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{abandoned}");
+    assert!(unfinished_session_items(&harness).await.is_empty());
+}
+
+/// The session list says how much each session holds, without a request per
+/// session (iaam-8ano).
+///
+/// The list used to return headers only — `state`, `source`, `import`,
+/// `opened_at`, `assessment` — so «which of my imports is still waiting on me»
+/// cost one request per session, and a caller had no reason to think it should
+/// make them.
+///
+/// `row_count` and not `rows`: a plural noun beside `questions` reads as the
+/// list of rows, and an external client wrote `len(rows)` against such a name
+/// twice. The rows themselves stay unpublished here — they are published, per
+/// row and with what each would become, by the assessment, which computes them
+/// by planning the commit.
+#[tokio::test]
+async fn the_session_list_says_what_each_session_holds() {
+    let harness = harness();
+    let id = session_holding_one_row(&harness, "october", "listed-one").await;
+
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    let listed = sessions
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|entry| entry["session"] == json!(id))
+        .expect("the session is listed");
+
+    assert_eq!(listed["row_count"], 1, "{listed}");
+    assert_eq!(listed["unanswered"], 0, "{listed}");
+    assert!(listed.get("rows").is_none(), "{listed}");
+    // The header the list always carried is still flattened onto the entry.
+    assert_eq!(listed["state"], "open", "{listed}");
+    assert!(listed["assessment"].is_string(), "{listed}");
+
+    // The same two names, meaning the same two things, on the session itself.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(contents["row_count"], listed["row_count"], "{contents}");
+    assert_eq!(contents["unanswered"], listed["unanswered"], "{contents}");
 }
 
 // ---------------------------------------------------------------------------

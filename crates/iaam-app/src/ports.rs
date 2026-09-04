@@ -815,13 +815,20 @@ pub trait Store: Send + Sync {
         session: ImportSessionId,
     ) -> Result<Option<ImportSessionView>, AppError>;
 
-    /// Every session of the owner's, newest first.
+    /// Every session of the owner's, newest first, with how much each holds.
     ///
     /// This is what makes a question outlive the response that carried it.
+    ///
+    /// The counts come back with the headers rather than through a second call
+    /// per session, and that is the difference between a reader that has them
+    /// and a reader that does not. Both readers exist: the action queue asks
+    /// this to find the imports still under way, and `GET /v1/import-sessions`
+    /// publishes the same two numbers so that a caller need not fetch each
+    /// session to find out which one is waiting on it.
     async fn list_import_sessions(
         &self,
         owner: OwnerId,
-    ) -> Result<Vec<ImportSessionView>, AppError>;
+    ) -> Result<Vec<ImportSessionSummaryView>, AppError>;
 
     /// Add one submitted line, or return the row it already occupies.
     async fn add_import_observation(
@@ -965,6 +972,32 @@ pub struct ImportSessionView {
     pub import: Option<ImportId>,
     pub opened_at: String,
     pub closed_at: Option<String>,
+}
+
+/// A session in a listing, with how much it holds.
+///
+/// The header and two counts, and not the rows. The rows are published per row,
+/// with what each would become, by the assessment route, which computes them by
+/// planning the commit; a second rendering built from the stored observations
+/// would be two readings of one session that can disagree. A count cannot
+/// disagree with a row about what that row would become.
+///
+/// Both counts are read in the same store statement as the headers. That is
+/// what makes them affordable to every reader of the list — the action queue
+/// asks for every session the owner has ever opened — and it is why the queue
+/// can tell «this session holds rows and is still open» without a request per
+/// session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSessionSummaryView {
+    pub session: ImportSessionView,
+    /// How many rows the session holds, conclusive and observed together.
+    ///
+    /// `row_count` and not `rows`, and the suffix carries the same reason it
+    /// carries on the wire: a plural noun reads as the list of rows, and an
+    /// external client wrote `len(rows)` against such a name twice.
+    pub row_count: usize,
+    /// How many of its questions are still waiting on the owner.
+    pub unanswered: usize,
 }
 
 /// One submitted line held in a session.

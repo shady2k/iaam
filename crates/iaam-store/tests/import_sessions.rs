@@ -105,7 +105,7 @@ fn a_declared_session_remembers_the_account_it_was_declared_for() {
 
     let listed = store.list_import_sessions(owner).expect("sessions listed");
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].account, Some(account));
+    assert_eq!(listed[0].session.account, Some(account));
 
     // Reuse returns the session that already exists, and it carries the account
     // it was opened with rather than a fresh reading of anything.
@@ -452,4 +452,66 @@ fn a_session_that_does_not_exist_is_not_found() {
             .expect("query runs")
             .is_none()
     );
+}
+
+/// The listing says how much each session holds without being asked again.
+///
+/// The counts are the whole point of the summary: a reader of the listing that
+/// had to fetch the rows and the questions of every session to find out which
+/// import is still under way is a reader that finds out about none of them.
+///
+/// Counted per session, and the second session is here to prove it: two
+/// sessions in one listing must not both report the totals of the table.
+#[test]
+fn the_listing_counts_the_rows_and_the_open_questions_of_each_session() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+
+    let held = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    for row in 0..3 {
+        store
+            .add_import_observation(owner, held, Some(&format!("row-{row}")), false, "{}")
+            .expect("row held");
+    }
+    let asked = store
+        .record_import_question(owner, held, 1, &asking())
+        .expect("question recorded");
+    store
+        .record_import_question(owner, held, 2, &asking())
+        .expect("question recorded");
+
+    let empty = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+
+    let listed = store.list_import_sessions(owner).expect("sessions listed");
+    let of = |id| {
+        listed
+            .iter()
+            .find(|summary| summary.session.id == id)
+            .expect("the session is listed")
+    };
+    assert_eq!(of(held).row_count, 3);
+    assert_eq!(of(held).unanswered, 2);
+    // A session that holds nothing says so, and that is what tells a caller
+    // retrying an open call from one that left a statement half imported.
+    assert_eq!(of(empty).row_count, 0);
+    assert_eq!(of(empty).unanswered, 0);
+
+    // Answering lowers the unanswered count and leaves the rows where they are:
+    // the two counts answer different questions.
+    store
+        .answer_import_question(owner, held, asked.id, r#"{"answer":"paid"}"#)
+        .expect("question answered");
+    let listed = store.list_import_sessions(owner).expect("sessions listed");
+    let held = listed
+        .iter()
+        .find(|summary| summary.session.id == held)
+        .expect("the session is listed");
+    assert_eq!(held.unanswered, 1);
+    assert_eq!(held.row_count, 3);
 }

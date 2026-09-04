@@ -19,3 +19,4 @@
 | [0012](0012-a-question-names-its-row-and-every-answer-names-its-price.md) | A question names its row, and every answer names its price | 2026-09-04 | proposed | `iaam-3ewp` |
 | [0013](0013-a-movement-whose-far-side-is-the-owners-and-unnamed.md) | A movement whose far side is the owner's and unnamed | 2026-09-04 | proposed | `iaam-fmih` |
 | [0014](0014-a-closed-product-and-a-reporting-perimeter-are-two-axes.md) | A closed product and a reporting perimeter are two axes | 2026-09-04 | proposed | `iaam-gua5` |
+| [0016](0016-an-unfinished-import-is-quantified-over-the-session.md) | An unfinished import is quantified over the session | 2026-09-04 | proposed | `iaam-8ano` |

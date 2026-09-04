@@ -23,7 +23,7 @@ use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
     ClassificationRuleView, IssuedToken, NegativeBalanceExpectation, Scope, TokenView,
 };
-use iaam_app::ports::{ImportSessionView, Recorded};
+use iaam_app::ports::{ImportSessionSummaryView, ImportSessionView, Recorded};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
@@ -8146,6 +8146,57 @@ impl ImportSessionDto {
             closed_at: session.closed_at.clone(),
             assessment: format!("/v1/import-sessions/{}/assessment", session.id.inner()),
             account: None,
+        }
+    }
+}
+
+/// A session in the list, with how much it holds.
+///
+/// **This is the other half of `iaam-8ano`.** The list used to return headers
+/// only — `state`, `source`, `import`, `opened_at`, `assessment` — so finding
+/// out which of the owner's sessions was still waiting on him cost one request
+/// per session, and a caller had no reason to think it should make them. A
+/// caller that reads a list and sees nothing outstanding concludes nothing is,
+/// and for an import that had never been committed that conclusion is a second
+/// import of the same statement.
+///
+/// The two counts are read in the same store statement as the headers, so the
+/// complete answer costs what the incomplete one did.
+///
+/// Flattened onto [`ImportSessionDto`] rather than repeating its fields, and
+/// carrying the same two names [`ImportSessionContentsDto`] carries for the
+/// same two numbers: a caller that walks the list and then opens one session
+/// reads `row_count` and `unanswered` in both places, meaning the same thing.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportSessionSummaryDto {
+    #[serde(flatten)]
+    pub session: ImportSessionDto,
+    /// How many rows are held, conclusive and observed together.
+    ///
+    /// `row_count` and not `rows`, and the suffix is the whole point — the
+    /// reason is written out on [`ImportSessionContentsDto::row_count`]: a
+    /// plural noun reads as the list of rows, and an external client wrote
+    /// `len(rows)` against such a name twice.
+    ///
+    /// The rows themselves are not published here, for the reason they are not
+    /// published there: they are published per row, with what each would become,
+    /// by `GET /v1/import-sessions/{session}/assessment`, which computes them by
+    /// planning the commit. A second rendering built from the stored
+    /// observations alone would be two readings of one session that can
+    /// disagree.
+    pub row_count: usize,
+    /// How many of its questions are still waiting on the owner. Commit refuses
+    /// while this is not zero.
+    pub unanswered: usize,
+}
+
+impl ImportSessionSummaryDto {
+    #[must_use]
+    pub fn from_domain(summary: &ImportSessionSummaryView) -> Self {
+        Self {
+            session: ImportSessionDto::from_domain(&summary.session),
+            row_count: summary.row_count,
+            unanswered: summary.unanswered,
         }
     }
 }

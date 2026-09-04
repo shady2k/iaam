@@ -233,6 +233,19 @@ There is a second cost. If a title were addressable, renaming an account would
 break every stored request that named it, and the owner would be choosing
 between a name that reads well and a name nothing depends on.
 
+**Where a name is still resolved, and why it is not an exception in spirit.**
+Every ingestion channel — a row of a JSON batch, a cell of a document, a batch's
+declaration — reads its account through three vocabularies in order: iaam's own
+identifier, the identifier the account's source prints for it (decision 0004),
+and last the owner's title. The third accepts a name as input. It is kept
+because every account that existed before an account could state an identity has
+nothing else, so dropping the tier would silently stop recognising those
+accounts and would refuse every document written before the change. It is last,
+so an identity beats a title rather than tying with it; a title two accounts
+share is refused rather than guessed at; and **the refusal never offers it**, so
+a client reading one is steered to an identifier and nothing teaches it that a
+name is addressable. Decision 0010 records the trade and what would falsify it.
+
 ### 3.3 Why the asymmetry is the protection
 
 Reading and writing are not the same act, and the rule points the same way in

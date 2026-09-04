@@ -340,11 +340,44 @@ is what is reconciled against, not a second proof: agreement gives
 confirmed. The difference is not cosmetic — the owner usually remembers the
 balance from the same application the statement came from.
 
+## An account is named by an identifier, and every channel reads the same ones
+
+Wherever a row you submit names one of the owner's accounts — the account the
+row is on, the far side of a transfer between two of his own, the account a
+batch is declared for — the string is read the same way, whichever channel
+carried the row and whether it arrived as a document or as a request body.
+Three vocabularies, tried in that order:
+
+1. **iaam's own identifier for the account**, exactly as a response printed it.
+2. **The identifier the account's source prints** for it: what the institution
+   writes on the statement, together with the cards and other identifiers the
+   owner has attached to that same account, each read as of the row's own date.
+3. **The owner's title** for the account.
+
+Send the first where you have it, and the second where the file you are reading
+prints it. Do not send the third. It resolves, and it resolves only so that
+documents written before the other two existed keep parsing — a title is a
+string the owner may change tomorrow, and two of his accounts may carry one
+title, which is refused rather than guessed at. A file that worked last month
+can stop working on a rename; an identifier cannot.
+
+The order is not a preference, it is a rule about ties: the search stops at the
+first vocabulary that recognises anything, so an identifier is never diluted by
+an account whose title happens to agree with it.
+
+A string naming none of his accounts is refused in a sentence that says which
+vocabularies the field would have taken; a string naming two is refused with
+both accounts in it, so he can see the collision he has to clear. That sentence
+is the same across every channel — learn it from one refusal and you have
+learned it for all of them.
+
 ## An instrument's external code resolves as of a date
 
 An instrument is named by an **external code**, not by an identifier. An ISIN,
 a ticker, a MOEX `SECID`, a FIGI and a broker's internal code all serve. The
-place of custody is named by a name from the owner's directory.
+place of custody is named by the owner's own title for it, and nothing else
+names one: no source prints an identity for a depository, so there is no second
+vocabulary there to prefer.
 
 A code resolves **as of the operation's date**, and this is not a formality. An
 ISIN changes through a corporate action: the report for last year arrives with

@@ -14,3 +14,4 @@
 | [0006](0006-the-observation-channel-says-everything-the-conclusive-one-does.md) | The observation channel says everything the conclusive one does | 2026-09-04 | proposed | `iaam-7l7v` |
 | [0008](0008-a-proposed-rule-asks-about-one-field.md) | A rule minted from an answer asks about one field | 2026-09-04 | proposed | `iaam-g7yc` |
 | [0009](0009-a-verdict-answers-a-write-and-confirmation-answers-a-read.md) | A verdict answers a write; confirmation answers a read | 2026-09-04 | proposed | `iaam-eio5` |
+| [0010](0010-a-document-names-an-account-the-way-a-batch-does.md) | A document names an account the way a batch does | 2026-09-04 | proposed | `iaam-w49n` |

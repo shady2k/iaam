@@ -10,7 +10,7 @@ use iaam_core::instrument::AliasInterval;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
-use iaam_ingest::csv_source::{Directory, ParsedRow};
+use iaam_ingest::csv_source::{AccountEntry, Directory, ParsedRow};
 use iaam_ingest::operation::OperationKind;
 use iaam_ingest::report::ReportParser;
 use iaam_ingest::report::sections::ControlSections;
@@ -44,7 +44,7 @@ const EXPECTED_TAX_TOTAL_MINOR: i64 = 7_500;
 
 fn directory(account: AccountId, custody: CustodyId, instrument: InstrumentId) -> Directory {
     Directory {
-        accounts: [("INVEST-001".to_owned(), vec![account])]
+        accounts: [AccountEntry::titled("INVEST-001", account)]
             .into_iter()
             .collect(),
         custodies: [("НРД".to_owned(), vec![custody])].into_iter().collect(),
@@ -107,7 +107,7 @@ fn directory_with_historical_instrument(
     second: InstrumentId,
 ) -> Directory {
     Directory {
-        accounts: [("INVEST-001".to_owned(), vec![account])]
+        accounts: [AccountEntry::titled("INVEST-001", account)]
             .into_iter()
             .collect(),
         custodies: [("НРД".to_owned(), vec![custody])].into_iter().collect(),

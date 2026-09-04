@@ -3845,9 +3845,19 @@ pub struct IngestCsvParams {
 /// **This route does not accept a bank's export**, and the path is the reason
 /// the mistake keeps being made: `csv` is the file extension of every statement
 /// any institution emits, while the columns here are `date`, `type`, `account`,
-/// `currency` and the optional rest, with accounts named by title and resolved
-/// through the owner's directory. A bank export sent here does not half-work; it
-/// rejects every row on the header. Converting an institution's format is the
+/// `currency` and the optional rest. A bank export sent here does not half-work;
+/// it rejects every row on the header.
+///
+/// **An account is named here exactly as it is named on the conclusive route.**
+/// The `account` cell used to be resolved against the owner's title and nothing
+/// else, and was refused with `directory name` — a sentence that names no
+/// vocabulary — while `POST /v1/ingest/operations` read the same string through
+/// the tiering of decision 0004 and refused it in a sentence naming two. One
+/// flow answered one question in two vocabularies, and an agent that had learned
+/// the printed identifier works here read back a refusal that sounds like the
+/// account does not exist. Both now go through one function,
+/// `iaam_ingest::csv_source::AccountNames::resolve` — see decision 0010, and
+/// [`build_directory`] for where its table comes from. Converting an institution's format is the
 /// owner's converter's job and lives outside this repository — see
 /// `docs/import-boundary.md`, which says which channel writes what.
 ///
@@ -3869,8 +3879,13 @@ pub struct IngestCsvParams {
     post,
     path = "/v1/ingest/csv",
     description = "Submit rows in iaam's own CSV format: `date`, `type`, \
-                   `account`, `currency` and the optional rest, with accounts \
-                   named by title and resolved through the owner's directory. \
+                   `account`, `currency` and the optional rest. The `account` \
+                   and `counterparty_account` cells are read the way \
+                   `POST /v1/ingest/operations` reads a row's account: iaam's \
+                   own identifier for the account, then the identifier its \
+                   source prints for it, then the owner's title — which \
+                   resolves for documents written before the other two \
+                   existed, and is refused when two accounts share it. \
                    It is **not** a bank export endpoint — an institution's own \
                    file rejects every row here. Rows arrive under the `csv` \
                    channel of the account each row names, so \
@@ -4724,16 +4739,24 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
     }
 }
 
-/// Name lookup for CSV parsing.
+/// Name lookup for document parsing.
 ///
-/// Accounts and custody locations belonging to the owner are resolved by name.
+/// A place of custody is resolved by the owner's title for it, and nothing else
+/// names one. An **account** is not: its column goes through the same tiering
+/// `POST /v1/ingest/operations` resolves a row's account with — iaam's
+/// identifier, the identifier the source prints, then the title — because the
+/// two routes ask one question and used to answer it in two vocabularies
+/// (iaam-w49n). The table is taken from [`AccountDirectory`] rather than built
+/// here from the account list, so that the translation from a stored account to
+/// a vocabulary exists once.
+///
 /// Instruments are preloaded with all validity intervals for external
 /// codes, so each document row can be resolved as at its own date.
 async fn build_directory(
     services: &Arc<AppServices>,
     principal: &Principal,
 ) -> Result<Directory, ApiFailure> {
-    let accounts = services.store.list_accounts(principal.owner).await?;
+    let accounts = AccountDirectory::load(services, principal.owner).await?;
     let places = iaam_app::ports::InstrumentDirectory::list_custody_places(
         &*services.directory,
         principal.owner,
@@ -4741,14 +4764,10 @@ async fn build_directory(
     .await?;
     let aliases = iaam_app::ports::InstrumentDirectory::list_aliases(&*services.directory).await?;
 
-    let mut directory = Directory::default();
-    for account in accounts {
-        directory
-            .accounts
-            .entry(account.title)
-            .or_default()
-            .push(account.id);
-    }
+    let mut directory = Directory {
+        accounts: accounts.names(),
+        ..Directory::default()
+    };
     for place in places {
         directory
             .custodies

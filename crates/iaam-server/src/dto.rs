@@ -1115,9 +1115,14 @@ pub struct VerdictDto {
     pub detail: Option<String>,
     /// The account concerned. Populated for reconciliation verdicts:
     /// a discrepancy without an account is an instruction to «look somewhere».
+    ///
+    /// Those are the two reserved codes, so in practice this field never
+    /// arrives — see `VerdictCodeDto` for what reports reconciliation instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<Uuid>,
-    /// The dimension for which values do not match or there is nothing to reconcile (§10.3).
+    /// The dimension for which values do not match or there is nothing to
+    /// reconcile (§10.3). Carried by the same two reserved codes as
+    /// `account_id`, and so never sent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimension: Option<String>,
     /// The import session holding the row, for a row that needs an answer.

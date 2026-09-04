@@ -2064,41 +2064,63 @@ async fn the_openapi_document_enumerates_and_explains_every_verdict() {
 }
 
 #[tokio::test]
-async fn the_verdict_vocabulary_admits_that_nothing_emits_accepted() {
-    // `accepted` is published and no path constructs it: a verdict is the
-    // answer to one write, and whether reconciliation matched is a property of
-    // an account, a dimension and an interval that is folded on read and moves
-    // afterwards. A previous reader took the old sentence — "the fact was
-    // recorded and reconciliation matched" — at its word and wrote two tests
-    // waiting for a code that never arrives.
+async fn the_verdict_vocabulary_admits_which_codes_nothing_emits() {
+    // Three of the ten are published and constructed by no path, and all three
+    // are the reconciliation ones. That is not a coincidence: a verdict is the
+    // answer to one write, while reconciliation is a property of an account, a
+    // dimension and an interval, folded on read and moved by evidence that
+    // arrives later. A previous reader took `accepted`'s old sentence — "the
+    // fact was recorded and reconciliation matched" — at its word and wrote two
+    // tests waiting for a code that never arrives.
     //
-    // The code stays listed: removing a value from a published enum breaks a
-    // client for no gain, because the branch was unreachable and no client can
+    // The codes stay listed: removing a value from a published enum breaks a
+    // client for no gain, because each branch was unreachable and no client can
     // ever have taken it. What must not stay is the silence, so the check is on
     // the sentence rather than on the list — and it holds a future
     // implementation to changing the description in the same edit.
+    //
+    // Each sentence must also send the reader somewhere real, because "nothing
+    // emits this" alone converts a false promise into a dead end. Decisions
+    // 0009 and 0011 are the argument; these are the destinations they name.
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let meaning = published_meaning(&spec, "VerdictCodeDto", "accepted");
-    assert!(
-        meaning.contains("no path emits it"),
-        "the meaning of `accepted` must say that nothing produces it: {meaning}"
-    );
-    assert!(
-        meaning.contains("accepted_internal") && meaning.contains("accepted_independent"),
-        "the meaning of `accepted` must send the reader to where confirmation is \
-         actually reported: {meaning}"
-    );
+    let reserved: [(&str, &[&str]); 3] = [
+        // Confirmation is a status on the data quality block, not a verdict.
+        ("accepted", &["accepted_internal", "accepted_independent"]),
+        // A batch against its own source's control section is reported by the
+        // import assessment; a disagreement the journal holds is reported by
+        // the data quality block and by the queue item that settles it.
+        ("discrepancy", &["discrepant", "discrepancy_unresolved"]),
+        // The request for the owner's figure is a queue item, per account and
+        // interval — never a per-row code, because no row is declined for it.
+        ("needs_reconciliation", &["provide_control_assertion"]),
+    ];
+    for (code, destinations) in reserved {
+        let meaning = published_meaning(&spec, "VerdictCodeDto", code);
+        assert!(
+            meaning.contains("no path emits it"),
+            "the meaning of `{code}` must say that nothing produces it: {meaning}"
+        );
+        for destination in destinations {
+            assert!(
+                meaning.contains(destination),
+                "the meaning of `{code}` must send the reader to `{destination}`, where the \
+                 answer is actually reported: {meaning}"
+            );
+        }
+    }
 
     // The codes something does emit say nothing of the kind, so a client cannot
     // read the caveat as decoration on the whole vocabulary.
-    let provisional = published_meaning(&spec, "VerdictCodeDto", "provisional");
-    assert!(
-        !provisional.contains("no path emits it"),
-        "a code production emits must not be described as reserved: {provisional}"
-    );
+    for code in ["provisional", "possible_duplicate", "duplicate"] {
+        let meaning = published_meaning(&spec, "VerdictCodeDto", code);
+        assert!(
+            !meaning.contains("no path emits it"),
+            "a code production emits must not be described as reserved: {meaning}"
+        );
+    }
 }
 
 #[tokio::test]

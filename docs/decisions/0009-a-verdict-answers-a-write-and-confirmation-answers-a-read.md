@@ -108,9 +108,15 @@ change.
   the existing rule not to call `provisional` an error. The two mistakes are the
   same mistake from opposite ends.
 - Two further codes, `discrepancy` and `needs_reconciliation`, are also produced
-  by nothing today. They are **not** covered by this decision, and must not be
-  described as reserved: theirs is a gap rather than an impossibility. A commit
-  that overrides a control mismatch writes rows the source's own figures
-  contradict, which something could report as a discrepancy; a missing owner
-  remainder is asked for by the action queue instead of by a verdict. Both are
-  filed as open work.
+  by nothing today. They were **not** covered by this decision, and this section
+  guessed that theirs was a gap rather than an impossibility: a commit that
+  overrides a control mismatch writes rows the source's own figures contradict,
+  which something could report as a discrepancy, and a missing owner remainder is
+  asked for by the action queue instead of by a verdict.
+
+  **Decision 0011 examined both and found the guess wrong.** What a commit
+  override knows is a fact about a batch and a document rather than about an
+  account's reconciliation, and it is already reported in three places; and
+  `needs_reconciliation` could never be emitted truthfully at all, because no
+  write is declined for want of a remainder. Both are reserved, on the terms this
+  decision sets for `accepted`. Read 0011 for where the three differ.

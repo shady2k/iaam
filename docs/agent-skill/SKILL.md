@@ -661,13 +661,36 @@ and do not report each date to the owner separately.
 **Never call `provisional` an error.** It means no independent confirmation has
 arrived yet, which is an ordinary state of a correct journal.
 
-**And never wait for `accepted`.** The verdict vocabulary publishes the word and
-nothing produces it, which its own published sentence now says. A verdict answers
-one write, while whether reconciliation matched is a property of an account, a
+**And never wait for a reconciliation verdict.** Three of the ten codes —
+`accepted`, `discrepancy` and `needs_reconciliation` — are published and produced
+by nothing, which each one's own published sentence now says. The three are not a
+backlog: they are the reconciliation ones, and the boundary is the point. A
+verdict answers one write, while reconciliation is a property of an account, a
 dimension and an interval, folded when a report is read and moved by evidence
-that arrives later. Confirmation is read from the data quality block, as
-`accepted_internal` or `accepted_independent`; the absence of `accepted` from a
-row's verdict says nothing about it either way.
+that arrives later. The seven codes you will actually see are the ones about a
+row.
+
+Read each of the three where it is answered, and never from a row's verdict:
+
+- **`accepted`** — confirmation is in the data quality block, as
+  `accepted_internal` or `accepted_independent`. The absence of `accepted` from
+  a row's verdict says nothing about it either way.
+- **`discrepancy`** — a batch that disagrees with the control section its own
+  source printed is named figure by figure, with both numbers and the
+  difference, in the assessment an import session publishes; read it before you
+  commit, and read it before you override the disagreement, because overriding
+  is a sentence you are only entitled to write after reading them. A
+  disagreement the journal holds is reported by the data quality block as
+  `discrepant` and by the action queue as `discrepancy_unresolved`, which
+  carries what settles it.
+- **`needs_reconciliation`** — nothing is ever declined because the owner has
+  not named a balance. Rows are recorded, and the need for the figure is derived
+  from them afterwards. Ask for it from the action queue's
+  `provide_control_assertion`, which names the account, the interval and which
+  end of it the balance is wanted at — and answer the opening point before the
+  closing one, because a closing balance compared against a sum accumulated from
+  an unasserted start reports a discrepancy that is only the missing opening
+  balance.
 
 ## A fact can be quoted, a derived value cannot
 

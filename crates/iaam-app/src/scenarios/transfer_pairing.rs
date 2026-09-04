@@ -244,20 +244,61 @@ fn days_apart(left: Date, right: Date) -> i64 {
 
 /// The legs one recorded event offers the matcher, if it offers any.
 ///
-/// Only `CashOut` and `CashIn`, and that is the whole point: a `CashTransfer`
-/// already names both of its accounts, so it is not half of anything. An event
-/// with no cash-posted date is skipped rather than dated from something else —
-/// a proposal resting on a date nobody stated is a proposal resting on nothing.
+/// Three kinds and not every kind: a `CashTransfer` already names both of its
+/// accounts, so it is not half of anything, and neither is a fee, a trade or a
+/// valuation. An event with no cash-posted date is skipped rather than dated
+/// from something else — a proposal resting on a date nobody stated is a
+/// proposal resting on nothing.
 ///
-/// Every other such event qualifies, deliberately and without judgement of what
-/// it looks like. Whether a row is half of a transfer is the question [`propose`]
-/// puts to the owner; withholding rows here on a guess about the description or
-/// the counterparty would answer it earlier, on worse evidence, and invisibly.
+/// Every event of those kinds qualifies, deliberately and without judgement of
+/// what it looks like. Whether a row is half of a transfer is the question
+/// [`propose`] puts to the owner; withholding rows here on a guess about the
+/// description or the counterparty would answer it earlier, on worse evidence,
+/// and invisibly.
+///
+/// # Why an own-account movement is one of the three (`iaam-9ck1`)
+///
+/// `EventKind::OwnAccountMovement` is a movement the source said was between
+/// the owner's own accounts **without saying which two**: one signed leg, no
+/// far side, and `contour::classify` therefore answers `Indeterminate` for it —
+/// rightly, because «an account of the owner's» is not «inside this contour»
+/// and no membership test can make it one. Two such rows, one on each side of
+/// one movement, are the ordinary shape of a bank that files its internal
+/// transfers under a word and names nothing.
+///
+/// While this function offered only `CashOut` and `CashIn`, those two rows
+/// could not be **proposed** as a pair, did not appear in
+/// [`Proposals::unmatched`], and could not be handed to
+/// [`confirm_journal_pairing`]. So every internal transfer a source settled by
+/// asserting a far side became two indeterminate quantities in the money-flow
+/// report, permanently, with no owner-facing route back. The fact was right and
+/// the classification was right; what was missing was the one mechanism that
+/// turns two half-facts into the movement they were.
+///
+/// `EventKind::UnresolvedOwnAccountMovement` is deliberately **not** offered.
+/// It is the same assertion with no direction: it posts no leg at all, and a
+/// leg needs a side. Proposing it would mean choosing a direction for it here,
+/// which is the guess the whole shape exists to refuse; what it needs is the
+/// direction, and that is a question for the owner and not a pairing.
 #[must_use]
 pub fn leg_of_event(event: &Event) -> Option<CashLeg> {
     let (direction, amount) = match &event.kind {
         EventKind::CashOut { amount } => (Movement::Out, *amount),
         EventKind::CashIn { amount } => (Movement::In, *amount),
+        // The direction is read off the sign of the leg the fact posts, which
+        // is the only place it is stated: the kind carries no direction word,
+        // and `normalize` is what put the sign there from the owner's or the
+        // source's own statement of it.
+        EventKind::OwnAccountMovement { amount } => {
+            let raw = amount.amount().raw();
+            if raw > 0 {
+                (Movement::In, *amount)
+            } else if raw < 0 {
+                (Movement::Out, *amount)
+            } else {
+                return None;
+            }
+        }
         _ => return None,
     };
     let magnitude = amount.amount().raw().checked_abs().filter(|it| *it > 0)?;
@@ -404,8 +445,46 @@ fn transfer_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iaam_core::ids::AccountId;
+    use iaam_core::event::provenance::ParserVersion;
+    use iaam_core::ids::{AccountId, OwnerId, SourceId};
+    use iaam_ingest::operation::{NormalizationContext, PARSER_VERSION, normalize};
     use time::macros::date;
+
+    /// A recorded own-account movement, built through `normalize` rather than
+    /// assembled by hand: the direction this function is being tested for is
+    /// put on the leg **there**, and a literal event would be this test
+    /// agreeing with itself about where the sign comes from.
+    fn own_account_movement(account: AccountId, movement: Option<Movement>, day: Date) -> Event {
+        normalize(
+            &SubmittedOperation {
+                account,
+                kind: OperationKind::OwnAccountMovement {
+                    movement,
+                    amount_minor: 1_200_000,
+                    currency: CurrencyCode::Rub,
+                },
+                dates: OperationDates {
+                    trade: None,
+                    settled: None,
+                    cash_posted: Some(day),
+                    paid: None,
+                },
+                source_time: None,
+                idempotency_key: None,
+                source_operation_id: None,
+                source_category: None,
+                source_kind: None,
+                description: None,
+            },
+            &NormalizationContext {
+                owner: OwnerId::new_random(),
+                source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
+            },
+        )
+        .expect("an own-account movement normalises")
+        .event
+    }
 
     fn leg(
         origin: u32,
@@ -495,6 +574,38 @@ mod tests {
             leg(2, everyday, Movement::In, 1_200_000, date!(2025 - 03 - 19)),
         ]);
         assert!(proposals.candidates.is_empty());
+    }
+
+    #[test]
+    fn two_own_account_movements_are_offered_to_the_matcher_as_two_legs() {
+        // `iaam-9ck1`: a source that asserts the far side is the owner's and
+        // names no account settles both rows without a question, and the two
+        // facts were then related by nothing for good. Each posts one signed
+        // leg, and the sign is the direction.
+        let main = AccountId::new_random();
+        let savings = AccountId::new_random();
+        let out = own_account_movement(main, Some(Movement::Out), date!(2025 - 03 - 15));
+        let into = own_account_movement(savings, Some(Movement::In), date!(2025 - 03 - 15));
+        let legs: Vec<CashLeg> = [&out, &into].into_iter().filter_map(leg_of_event).collect();
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].direction, Movement::Out);
+        assert_eq!(legs[1].direction, Movement::In);
+        let proposals = propose(&legs);
+        assert_eq!(proposals.candidates.len(), 1);
+        assert!(proposals.unmatched.is_empty());
+    }
+
+    #[test]
+    fn a_movement_whose_direction_nobody_stated_is_not_offered_as_a_leg() {
+        // It posts no leg, and a leg needs a side. Choosing one here would be
+        // the guess the shape exists to refuse; what it wants is the direction.
+        let main = AccountId::new_random();
+        let event = own_account_movement(main, None, date!(2025 - 03 - 15));
+        assert!(matches!(
+            event.kind,
+            EventKind::UnresolvedOwnAccountMovement { .. }
+        ));
+        assert!(leg_of_event(&event).is_none());
     }
 
     #[test]

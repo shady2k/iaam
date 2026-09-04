@@ -462,10 +462,37 @@ fn describe_outcome(outcome: Classification) -> &'static str {
 }
 
 /// Why the operation was classified this way.
+///
+/// **Three values and not two, and the third is the one a reader has to be able
+/// to see** (`iaam-rdya`). [`Self::Derived`] and [`Self::Asserted`] were one
+/// word while both meant «no rule was needed», and they are not one thing: the
+/// first is a conclusion **this system** reached — the owner's directory
+/// recognised the string the source printed and named one of his accounts — and
+/// the second is a claim **the source** made about its own row, which nothing
+/// here checked and nothing here can check. Asserting a far side is the
+/// cheapest way for a profile to make questions disappear, so a plan that
+/// spelt the two alike gave a reader no way to catch a profile that over-asserts.
+///
+/// There is deliberately no value for «the owner answered». An [`Answer`] is
+/// not a classification result: it does not come out of [`classify`], it
+/// reaches [`crate::observation::ObservedRow::resolve_with`] directly, and a
+/// variant here would be a fourth spelling of a fact this type never sees.
+/// Where a caller publishes how a row was settled it has to say that in its own
+/// vocabulary, over the answer it holds and this basis together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Basis {
-    /// Derived from data: no rule was needed.
+    /// Derived from data: the row said what it was, and no rule was needed.
+    ///
+    /// The one case today is a counterparty the owner's directory recognised as
+    /// one of his own accounts, which names the far side and settles the row.
     Derived,
+    /// The source asserted the far side is one of the owner's accounts.
+    ///
+    /// Weaker than [`Self::Derived`] although it also needs no rule, and told
+    /// apart from it for exactly that reason: no account is named, nothing was
+    /// resolved, and the whole of the evidence is a word the document printed
+    /// about itself. See [`FarSide`].
+    Asserted,
     /// Owner's decision.
     Rule {
         rule: ClassificationRuleId,
@@ -927,7 +954,9 @@ pub fn classify(
     if subject.far_side.is_own_account() {
         return ClassificationResult::Resolved {
             classification: Classification::OwnAccountMovement,
-            basis: Basis::Derived,
+            // Not `Derived`, which is what this arm used to answer: nothing was
+            // derived here, the source said so (`iaam-rdya`). See [`Basis`].
+            basis: Basis::Asserted,
         };
     }
     ClassificationResult::Ambiguous {

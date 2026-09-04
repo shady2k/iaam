@@ -32,7 +32,7 @@ sha2 = "0.11"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 time = { version = "0.3", default-features = false, features = ["std", "macros"] }
 tracing = "0.1"
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 # Брокерский токен живёт открытым ровно до шифрования и зануляется.
 zeroize = { version = "1", features = ["alloc"] }
 thiserror = "2"

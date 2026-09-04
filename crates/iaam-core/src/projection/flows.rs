@@ -117,6 +117,27 @@ impl FlowLog {
     /// It counts **movements**, like its two neighbours, so an unresolved
     /// own-account movement — which posts no leg — is not counted here. The
     /// money-flow report is where that one is named, by magnitude and account.
+    ///
+    /// # Why this is not corrected by counting it as internal (`iaam-9ck1`)
+    ///
+    /// A statement that files its internal transfers under one word and names
+    /// no far side produces **two** such movements per transfer, one on each
+    /// account, and both land here — so a household whose banks do that reads a
+    /// figure here and a zero under internal transfers, for every month, for
+    /// good. That was reported as this function being wrong, and it is not:
+    /// `contour::classify` sets out at length why «an account of the owner's»
+    /// cannot be resolved to «inside this contour» by any membership test, and
+    /// calling these internal would silently change a return on the strength of
+    /// a word a bank printed about itself.
+    ///
+    /// What was actually missing is a way out, and it is not in this projection:
+    /// `transfer_pairing::leg_of_event` now offers an own-account movement to
+    /// the matcher, so the two halves are **proposed** as one movement and the
+    /// owner can confirm them. Confirming replaces the pair with a
+    /// `CashTransfer` naming both accounts, which classifies as [`Self::internal`]
+    /// on the ordinary path with nothing guessed. A non-zero figure here is
+    /// therefore a count of movements nobody has related yet, and not a verdict
+    /// that they never can be.
     #[must_use]
     pub const fn indeterminate(&self) -> u64 {
         self.indeterminate
@@ -355,6 +376,43 @@ mod tests {
         assert!(log.external().is_empty());
         assert_eq!(log.internal(), 0);
         assert_eq!(log.indeterminate(), 0);
+    }
+
+    #[test]
+    fn two_halves_of_one_unnamed_movement_are_two_indeterminates_until_they_are_related() {
+        // `iaam-9ck1`, stated as the arithmetic it is: a source that asserts the
+        // far side and names no account prints one movement as two rows, and
+        // each row records one signed leg. Nothing here relates them, and
+        // nothing here should: what relates them is a pairing the owner
+        // confirms, after which the fact is a transfer and this counts it as
+        // internal.
+        let main = AccountId::new_random();
+        let savings = AccountId::new_random();
+        let both = ContourDefinition::new(
+            crate::contour::ContourId::new_random(),
+            ContourVersion(1),
+            [main, savings],
+        );
+        let mut log = FlowLog::new();
+        for (account, amount) in [(main, rub(-40_000)), (savings, rub(40_000))] {
+            let event = event_with(
+                account,
+                date!(2025 - 06 - 06),
+                1,
+                EventKind::OwnAccountMovement { amount },
+                vec![Leg::cash(account, amount)],
+            );
+            log.apply(&event, &both).unwrap();
+        }
+        assert_eq!(log.indeterminate(), 2);
+        assert_eq!(log.internal(), 0);
+
+        let mut confirmed = FlowLog::new();
+        confirmed
+            .apply(&transfer(main, savings, rub(40_000)), &both)
+            .unwrap();
+        assert_eq!(confirmed.indeterminate(), 0);
+        assert_eq!(confirmed.internal(), 1);
     }
 
     #[test]

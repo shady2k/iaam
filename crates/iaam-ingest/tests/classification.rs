@@ -829,8 +829,32 @@ fn a_source_that_says_the_far_side_is_the_owners_settles_the_row_without_a_quest
         classify(&asserted_own(account), &[]),
         ClassificationResult::Resolved {
             classification: Classification::OwnAccountMovement,
+            basis: Basis::Asserted,
+        }
+    );
+}
+
+#[test]
+fn a_far_side_the_source_asserted_is_not_spelt_like_one_the_directory_resolved() {
+    // `iaam-rdya`: both settle the row without a rule and without a question,
+    // and only one of them is a conclusion this system reached. A plan that
+    // spelt them alike gave a reader nothing to catch an over-asserting profile
+    // with.
+    let account = AccountId::new_random();
+    let far = AccountId::new_random();
+    let mut resolved = asserted_own(account);
+    resolved.far_side = FarSide::Unstated;
+    resolved.counterparty = Counterparty::OwnAccount(far);
+    assert_eq!(
+        classify(&resolved, &[]),
+        ClassificationResult::Resolved {
+            classification: Classification::InternalTransfer { to: far },
             basis: Basis::Derived,
         }
+    );
+    assert_ne!(
+        classify(&asserted_own(account), &[]),
+        classify(&resolved, &[])
     );
 }
 

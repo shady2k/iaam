@@ -8300,6 +8300,7 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
         "method": "POST",
         "path": "/v1/accounts",
         "requestSchema": "#/components/schemas/CreateAccountRequest",
+        "requiredScope": "owner",
         "request": {"missing": [{"pointer": "/title", "provided_by": "owner"}]}
     });
     let parsed: iaam_server::dto::ActionTargetDto =
@@ -8323,7 +8324,10 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
     let required = operation["required"]
         .as_array()
         .expect("operation required");
-    for field in ["operationId", "method", "path", "request"] {
+    // `requiredScope` is required, and that is the half of `iaam-woeh` a
+    // client can rely on: a resolution always says which authority it wants,
+    // so choosing among several never means guessing at one of them.
+    for field in ["operationId", "method", "path", "requiredScope", "request"] {
         assert!(required.iter().any(|value| value == field), "{field}");
     }
     // `requestSchema` is declared and is not required: a call that takes no
@@ -12066,6 +12070,78 @@ async fn no_queue_item_promises_a_call_it_does_not_have() {
     );
 }
 
+/// Every way out of every item names the authority it demands, and the item's
+/// own is the narrowest of them (`iaam-woeh`).
+///
+/// A sweep rather than a case, for the reason the sweep above it is a sweep: the
+/// defect was one item whose resolutions disagreed, and the only guard against
+/// the next one is a check that runs over whatever the queue happens to hold.
+///
+/// The narrowest and not the widest is the load-bearing half. A client filtering
+/// the queue by the token it holds is asking «is there anything here I can act
+/// on», and an item that answered «can I finish this alone» would hide the work
+/// it may in fact begin.
+#[tokio::test]
+async fn every_resolution_publishes_its_own_floor_and_the_item_publishes_the_narrowest() {
+    let harness = harness();
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+
+    let items = actions.as_array().expect("action items");
+    assert!(
+        !items.is_empty(),
+        "the fixture must produce a queue to sweep"
+    );
+    for item in items {
+        let target = &item["target"];
+        let resolutions: Vec<&serde_json::Value> = match target["type"].as_str() {
+            Some("none") => Vec::new(),
+            Some("options") => target["options"]
+                .as_array()
+                .expect("resolution options")
+                .iter()
+                .collect(),
+            _ => vec![target],
+        };
+        if resolutions.is_empty() {
+            assert!(
+                item["required_scope"].is_null(),
+                "an item with no way out states no authority: {item}"
+            );
+            continue;
+        }
+        let floors: Vec<&str> = resolutions
+            .iter()
+            .map(|resolution| {
+                resolution["requiredScope"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a resolution names no floor: {resolution}"))
+            })
+            .collect();
+        assert!(
+            floors
+                .iter()
+                .all(|floor| ["owner", "agent"].contains(floor)),
+            "a resolution names a floor no operation demands: {item}"
+        );
+        // Two values, and an owner reaches everything an agent reaches, so the
+        // narrowest of a set is `agent` exactly when the set holds one.
+        let narrowest = if floors.contains(&"agent") {
+            "agent"
+        } else {
+            "owner"
+        };
+        assert_eq!(
+            item["required_scope"], narrowest,
+            "the item's floor is not the narrowest of its resolutions': {item}"
+        );
+    }
+}
+
 /// Every report states the population it answered about, and says when that
 /// population omits an account nobody has ruled on.
 ///
@@ -12481,6 +12557,7 @@ async fn an_account_the_owner_ruled_outside_stops_being_one_nobody_ruled_on() {
             "method": "POST",
             "path": "/v1/contours/{contour}/versions",
             "requestSchema": "#/components/schemas/AddContourVersionRequest",
+            "requiredScope": "owner",
         }]),
         "{ruled_out}"
     );
@@ -12821,7 +12898,13 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
     // Spelled as an action's target spells it, so one client reader serves
     // both.
     let closing = &spec["components"]["schemas"]["ClosingOperationDto"]["properties"];
-    for field in ["operationId", "method", "path", "requestSchema"] {
+    for field in [
+        "operationId",
+        "method",
+        "path",
+        "requestSchema",
+        "requiredScope",
+    ] {
         assert!(closing[field].is_object(), "{field}: {closing}");
     }
 
@@ -13595,7 +13678,13 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
     assert_eq!(item["category"], "required_for_goal", "{item}");
     assert_eq!(item["goals"], json!(["asset_snapshot"]), "{item}");
     assert_eq!(item["state"], "needs_owner_input", "{item}");
-    assert_eq!(item["required_scope"], "owner", "{item}");
+    // `agent`, and this is `iaam-woeh`. The item's own scope is the narrowest
+    // of the floors its three resolutions keep, and the ordinary remedy — the
+    // reconstructed opening — is a call an agent token may make. It read
+    // `owner` while one field had to speak for three calls, and an agent that
+    // filtered the queue by its own scope dropped the item and never reached
+    // the call it could make.
+    assert_eq!(item["required_scope"], "agent", "{item}");
 
     // Three ways out, addressed, in the register's order. The two lists are one
     // vocabulary, so this compares the queue against the snapshot rather than
@@ -13635,6 +13724,24 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
         ],
         "{item}"
     );
+
+    // Each way out publishes the authority it demands, and the three do not
+    // agree — which is why one field on the item could not say it. The register
+    // spells the same three the same way, because a caveat that named an
+    // owner-only remedy to an agent would have told it to make a call that will
+    // be refused.
+    let floors: Vec<&str> = options
+        .iter()
+        .map(|option| option["requiredScope"].as_str().expect("floor"))
+        .collect();
+    assert_eq!(floors, vec!["agent", "owner", "owner"], "{item}");
+    let named_floors: Vec<&str> = caveat["closed_by"]
+        .as_array()
+        .expect("remedies")
+        .iter()
+        .map(|entry| entry["requiredScope"].as_str().expect("floor"))
+        .collect();
+    assert_eq!(named_floors, floors, "{caveat}");
 
     // What the queue adds over the register is the request each call wants.
     // The reconstructed opening knows the account and the kind of row, and asks
@@ -13868,12 +13975,14 @@ async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does(
                 "method": "POST",
                 "path": "/v1/contours/{contour}/versions",
                 "requestSchema": "#/components/schemas/AddContourVersionRequest",
+                "requiredScope": "owner",
             },
             {
                 "operationId": "record_account_scope",
                 "method": "POST",
                 "path": "/v1/accounts/{id}/scope",
                 "requestSchema": "#/components/schemas/RecordAccountScopeRequest",
+                "requiredScope": "owner",
             },
         ]),
         "{outside}"

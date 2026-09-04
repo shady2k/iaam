@@ -622,6 +622,49 @@ And the rule cuts both ways by design. A new route that turns out to write a
 standing decision as a side effect is gated on that decision, not on its own
 name — which is the whole of §4.1 read forwards instead of backwards.
 
+### 4.9 The floor is stated once, and it is published per call
+
+The scope a call demands is written in exactly one place — a total function from
+the operation to the narrowest scope that reaches it — and the route is gated by
+*asking that function*. The handler does not restate it and the queue does not
+grade it: both read the one statement.
+
+That is not tidiness. It was written twice, and the two disagreed. An
+outstanding-work item carried a single `required_scope` typed in beside it, and
+the item for a retired product the journal disagrees with offers three ways out:
+a reconstructed opening, which the agent may submit, and two rulings only the
+owner may make. One field could not say three things, so it said `owner`, and an
+agent that filtered the queue by the token it holds dropped the item and never
+reached the call it could in fact have made. The queue told a client the server
+would refuse a request the server would have accepted.
+
+So the item's `requiredScope` is now derived and each **resolution** publishes
+one of its own. A caveat's `closed_by` entries carry the same field, for the same
+reason: a register that names an owner-only remedy to an agent has told it to
+make a call that will be refused.
+
+Two things a client should read off that:
+
+- **The item's value is the narrowest of its resolutions' values.** It answers
+  «is there anything here I can act on», which is the question a client filtering
+  a queue in one pass is asking. It does not answer «can I finish this alone» —
+  no single value can, because whether a call succeeds depends on the body, and
+  who holds a value the queue cannot supply is `provided_by` on the missing field
+  (§4.4 makes the same split for one route: who decides an answer and who may
+  transmit it are different questions).
+- **It is a floor, not a promise.** §4.7 says the transport keeps only the scope
+  that cannot be right under any journal. A call the floor admits may still be
+  refused for what the request says or for what the journal holds, and a route
+  may gate a second act inside itself — answering an import question admits an
+  agent and writes no standing rule for one.
+
+The contract itself does not state the floor: every route declares the same
+bearer requirement, and the prose beside a refusal already disagrees with the
+handlers in places. Publishing it there as well would be a second statement with
+nothing reading it back, which is the defect this section exists to remove. It is
+published where a client chooses a call — on the resolution and on the remedy.
+See decision 0021.
+
 ---
 
 ## 5. A structure is never sent as a string

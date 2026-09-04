@@ -34,6 +34,17 @@ Three steps, in order:
    already decided, and the fields still missing together with who must supply
    each. Work that queue; do not reconstruct an order of setup from memory.
 
+   **Read `requiredScope` on the resolution, not only on the item.** An item
+   with several ways out publishes a `requiredScope` for each of them, and they
+   need not agree: an item may offer one call your credential reaches and two it
+   does not. The item's own `requiredScope` is the narrowest of them — it says
+   «there is at least one call here you may make», never «you may make them
+   all». Filter the queue by the item's, then choose among the resolutions by
+   theirs. It is a floor and not a promise: a call you may make can still be
+   refused for what the request says or for what the journal holds, and
+   `providedBy` on a missing field is a separate question — who holds the value,
+   not who may transmit it.
+
 A credential is not obtained through the API. It is issued at the console by
 whoever runs the instance and handed to you; no call produces one. If a call is
 refused for want of one, say so — there is no other route to try.
@@ -397,6 +408,17 @@ same three calls, each with the body it wants, are also an outstanding-work item
 of kind `retired_account_not_empty`, and that item disappears once the account's
 figures are zero — whoever brought them there and however. Nobody has to report
 the work done.
+
+**If instead the queue carries `retirement_not_assessed`, nobody could work out
+whether the retirement took effect.** The item means what it says: his effective
+journal does not fold, so the question «does this product still hold anything»
+has no answer this reading, and the item that would have carried the answer is
+absent because it could not be computed — not because there is nothing
+outstanding. The asset snapshot is folded from the same facts and refuses for
+the same reason. Do not report the retirement as done and do not report it as
+outstanding; report that it could not be checked, quote what the item says
+refused, and put the correction it names to him. He is the only one who can say
+which fact should stop counting.
 
 One thing the structure cannot warn you about: the same account usually carries
 `running_cash_sum` as well, and **its** remedy is not this one's. An owner-balance

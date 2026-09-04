@@ -2474,11 +2474,17 @@ pub struct CaveatDto {
 
 /// One operation a caveat names, addressed against the completed contract.
 ///
-/// `ResolutionOptionDto` without the `request`, and spelled identically in the
-/// three fields they share so that a client reading an action's target reads
-/// this with the same code. The request plan is what the two genuinely differ
-/// on: the queue holds an account and an interval and can preset fields from
-/// them, and a caveat kind holds nothing but its own identity.
+/// `ResolutionOptionDto` without the `request`, and spelled identically in every
+/// field they share so that a client reading an action's target reads this with
+/// the same code. The request plan is what the two genuinely differ on: the
+/// queue holds an account and an interval and can preset fields from them, and
+/// a caveat kind holds nothing but its own identity.
+///
+/// `requiredScope` is shared for the same reason it exists on a resolution: a
+/// register that names an owner-only remedy to an agent has told it to make a
+/// call the server will refuse, and the register offers the same sets of calls
+/// the queue does — `retired_account_not_empty` is one caveat and one item,
+/// naming the same three operations.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClosingOperationDto {
     #[serde(rename = "operationId")]
@@ -2489,6 +2495,10 @@ pub struct ClosingOperationDto {
     /// takes no body — see [`crate::action_catalog::ActionOperation`].
     #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
     pub request_schema: Option<String>,
+    /// The narrowest token scope that reaches this call: `owner` or `agent`.
+    /// A floor, exactly as on a resolution — see [`ResolutionOptionDto`].
+    #[serde(rename = "requiredScope")]
+    pub required_scope: String,
 }
 
 /// The typed subject of a caveat.
@@ -2557,6 +2567,7 @@ impl CaveatDto {
                         method: resolved.method.clone(),
                         path: resolved.path.clone(),
                         request_schema: resolved.request_schema.clone(),
+                        required_scope: resolved.required_scope.code().to_owned(),
                     }
                 })
                 .collect(),
@@ -4231,6 +4242,26 @@ pub enum ActionTargetDto {
         /// that takes no body — see [`crate::action_catalog::ActionOperation`].
         #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
         request_schema: Option<String>,
+        /// The narrowest token scope that reaches this call: `owner` or `agent`.
+        ///
+        /// **Per resolution, because the authority is a property of the call.** An
+        /// item's own `required_scope` is a summary — the narrowest scope reaching
+        /// *any* of its resolutions — and an item offering three ways out can want
+        /// three different authorities. `retired_account_not_empty` is the case
+        /// that made this a field: it offers a reconstructed opening, which an
+        /// agent token may submit, and a correction and a retirement withdrawal,
+        /// which only the owner may. Graded once for the whole item it read
+        /// `owner`, and an agent that filtered on it was told that none of the
+        /// three was available to it while the ordinary remedy was.
+        ///
+        /// **A floor, not a promise the call will succeed.** It is the scope the
+        /// transport checks before it reads anything else; a route may still refuse
+        /// for what the request says or for what the journal holds, and one route
+        /// may gate a second act inside itself — answering an import question
+        /// admits an agent and writes no standing rule for one. See
+        /// `docs/api/conventions.md` §4.
+        #[serde(rename = "requiredScope")]
+        required_scope: String,
         request: RequestPlanDto,
     },
     /// Two or more admissible resolutions, in the order the item offers them.
@@ -4258,6 +4289,26 @@ pub struct ResolutionOptionDto {
     /// takes no body — see [`crate::action_catalog::ActionOperation`].
     #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
     pub request_schema: Option<String>,
+    /// The narrowest token scope that reaches this call: `owner` or `agent`.
+    ///
+    /// **Per resolution, because the authority is a property of the call.** An
+    /// item's own `required_scope` is a summary — the narrowest scope reaching
+    /// *any* of its resolutions — and an item offering three ways out can want
+    /// three different authorities. `retired_account_not_empty` is the case
+    /// that made this a field: it offers a reconstructed opening, which an
+    /// agent token may submit, and a correction and a retirement withdrawal,
+    /// which only the owner may. Graded once for the whole item it read
+    /// `owner`, and an agent that filtered on it was told that none of the
+    /// three was available to it while the ordinary remedy was.
+    ///
+    /// **A floor, not a promise the call will succeed.** It is the scope the
+    /// transport checks before it reads anything else; a route may still refuse
+    /// for what the request says or for what the journal holds, and one route
+    /// may gate a second act inside itself — answering an import question
+    /// admits an agent and writes no standing rule for one. See
+    /// `docs/api/conventions.md` §4.
+    #[serde(rename = "requiredScope")]
+    pub required_scope: String,
     pub request: RequestPlanDto,
 }
 

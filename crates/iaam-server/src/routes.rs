@@ -24,7 +24,7 @@ use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Ver
 use iaam_app::ports::{
     AccountAliasView, AccountCreated, AccountDeclarations, AccountDetailView, AccountIdentityView,
     AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Declared,
-    Principal, Scope,
+    Principal, Scope, required_scope,
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
@@ -176,6 +176,7 @@ fn action_dto(action: &Action, catalog: &ActionCatalog) -> ActionDto {
                 method: resolved.method,
                 path: resolved.path,
                 request_schema: resolved.request_schema,
+                required_scope: resolved.required_scope,
                 request: resolved.request,
             }
         }
@@ -247,6 +248,10 @@ pub(crate) fn resolution_option_dto(
         method: resolved.method.clone(),
         path: resolved.path.clone(),
         request_schema: resolved.request_schema.clone(),
+        // The floor the route keeps, taken from the same statement the route
+        // is gated by. One resolution among several may want a different one
+        // from its neighbours, which is the whole of `iaam-woeh`.
+        required_scope: resolved.required_scope.code().to_owned(),
         request: RequestPlanDto {
             preset: request.preset.clone(),
             missing: request.missing.iter().map(missing_input_dto).collect(),
@@ -574,8 +579,9 @@ pub async fn repair_custody(
 /// ingest handler — operations, CSV, journal facts, broker synchronisation — a
 /// surface on which an agent could retract the owner's history, guarded only by
 /// a per-row check that any one of those inputs could forget to make. Here the
-/// authority is a property of the route and is checked once, exactly as
-/// `require_admin` guards every other owner-only route in this file.
+/// authority is a property of the route and is checked once, against the floor
+/// `iaam_app::ports::required_scope` states for the operation, exactly as every
+/// other route the queue can offer is.
 ///
 /// Permission is checked before the body is parsed: an agent token receives 403
 /// even for a body that is itself invalid (§7, §14).
@@ -598,7 +604,7 @@ pub async fn submit_corrections(
     Extension(principal): Extension<Principal>,
     ApiBytes(body): ApiBytes,
 ) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::SubmitCorrections)?;
     let request: SubmitCorrectionsRequest = serde_json::from_slice(&body)
         .map_err(|error| invalid_field("body", "correction JSON object", error.to_string()))?;
 
@@ -781,7 +787,7 @@ pub async fn reconciliation_balance(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<OwnerBalanceRequest>,
 ) -> Result<Json<OwnerBalanceOutcomeDto>, ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::RecordOwnerBalance)?;
     let period = AssertionPeriod::between(request.from, request.to).ok_or_else(|| {
         invalid_field(
             "period",
@@ -908,7 +914,7 @@ pub async fn create_classification_rule(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<ClassificationRuleRequest>,
 ) -> Result<(StatusCode, Json<ClassificationRuleChangeDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::CreateClassificationRule)?;
     let change = create_rule(
         &state.services,
         &principal,
@@ -1139,7 +1145,7 @@ pub async fn create_category_rule_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<(StatusCode, Json<CategoryRuleDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::CreateCategoryRule)?;
     let matcher = parse_category_matcher(request.matcher)?;
     let rule = create_category_rule(
         &state.services,
@@ -1220,9 +1226,7 @@ pub async fn sync_broker(
     ApiPath(broker): ApiPath<String>,
     ApiJson(request): ApiJson<BrokerSyncRequest>,
 ) -> Result<Json<SyncOutcomeDto>, ApiFailure> {
-    if !principal.scope.may_submit() {
-        return Err(ApiFailure::forbidden(principal.scope.code()));
-    }
+    require(&principal, OperationKey::SyncBroker)?;
     let channel = state
         .services
         .channels
@@ -1575,7 +1579,7 @@ pub async fn create_account(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<AccountDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::CreateAccount)?;
     // The pair is the identity, so half of it is refused rather than silently
     // stored as no identity at all. This is a check on the shape of the pair and
     // never on the value: `provider_account_id` stays opaque, and the refusal
@@ -2057,7 +2061,7 @@ pub async fn record_account_scope(
 ) -> Result<Json<AccountScopeDto>, ApiFailure> {
     // Drawing the perimeter is the owner's judgement, in either direction: the
     // same rule that keeps contour composition out of the agent's hands.
-    require_admin(&principal)?;
+    require(&principal, OperationKey::RecordAccountScope)?;
     let account = AccountId(id);
     let named = owned_account(&state, &principal, account).await?;
 
@@ -2175,7 +2179,7 @@ pub async fn record_account_retirement(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(request): ApiJson<RecordAccountRetirementRequest>,
 ) -> Result<Json<AccountRetirementDto>, ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::RecordAccountRetirement)?;
     let named = owned_account(&state, &principal, AccountId(id)).await?;
 
     let outcome = match request.state {
@@ -2288,7 +2292,7 @@ pub async fn record_account_transfer_partners(
     // Saying which two accounts are the two sides of one movement is the
     // owner's judgement, by the same rule that keeps the contour composition
     // out of the agent's hands.
-    require_admin(&principal)?;
+    require(&principal, OperationKey::RecordAccountTransferPartners)?;
     let account = AccountId(id);
     let statement =
         validated_transfer_statement(&state, &principal, account, request.partners, "partners")
@@ -2791,7 +2795,7 @@ pub async fn create_contour_version(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CreateContourVersionRequest>,
 ) -> Result<(StatusCode, Json<ContourVersionDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::CreateContour)?;
     // Refused rather than ignored. Ignoring it would leave every client still
     // sending the field creating perimeters it did not ask for, and saying
     // nothing — which is the defect, only quieter.
@@ -2876,7 +2880,7 @@ pub async fn add_contour_version(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(request): ApiJson<AddContourVersionRequest>,
 ) -> Result<(StatusCode, Json<ContourVersionDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::AddContourVersion)?;
     let current = owned_contour(&state, &principal, ContourId(id)).await?;
 
     // The precondition, checked before anything is read out of the body: a
@@ -3074,9 +3078,7 @@ pub async fn ingest_operations(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<SubmitOperationsRequest>,
 ) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
-    if !principal.scope.may_submit() {
-        return Err(ApiFailure::forbidden(principal.scope.code()));
-    }
+    require(&principal, OperationKey::SubmitOperations)?;
     // One reading of the owner's accounts for the whole request. The
     // declaration and every row are resolved against it, because they ask the
     // same question and a second reading could answer it differently.
@@ -3226,9 +3228,7 @@ pub async fn open_import_session(
     Extension(catalog): Extension<Arc<ActionCatalog>>,
     ApiJson(request): ApiJson<OpenImportSessionRequest>,
 ) -> Result<(StatusCode, Json<ImportSessionDto>), ApiFailure> {
-    if !principal.scope.may_submit() {
-        return Err(ApiFailure::forbidden(principal.scope.code()));
-    }
+    require(&principal, OperationKey::OpenImportSession)?;
     let (account, source, import) = match &request.source {
         Some(declared) => {
             let account = declared_account(&state, &principal, declared).await?;
@@ -3459,9 +3459,7 @@ pub async fn answer_import_question(
     ApiPath((session, question)): ApiPath<(Uuid, Uuid)>,
     ApiJson(request): ApiJson<AnswerImportQuestionRequest>,
 ) -> Result<Json<ImportQuestionDto>, ApiFailure> {
-    if !principal.scope.may_submit() {
-        return Err(ApiFailure::forbidden(principal.scope.code()));
-    }
+    require(&principal, OperationKey::AnswerImportQuestion)?;
     let answer = request.to_domain().map_err(|rejection| {
         invalid_field(rejection.field, &rejection.expected, rejection.actual)
     })?;
@@ -3539,9 +3537,7 @@ pub async fn commit_import_session(
     ApiPath(id): ApiPath<Uuid>,
     ApiJsonOrDefault(request): ApiJsonOrDefault<CommitImportSessionRequest>,
 ) -> Result<Json<ImportCommitDto>, ApiFailure> {
-    if !principal.scope.may_submit() {
-        return Err(ApiFailure::forbidden(principal.scope.code()));
-    }
+    require(&principal, OperationKey::CommitImportSession)?;
     // The body is optional, and so is the revision inside it: a caller that
     // never read an assessment still commits, and is told in the answer which
     // revision it committed under. Making the body mandatory would break every
@@ -3793,9 +3789,7 @@ pub async fn abandon_import_session(
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ImportSessionDto>, ApiFailure> {
-    if !principal.scope.may_submit() {
-        return Err(ApiFailure::forbidden(principal.scope.code()));
-    }
+    require(&principal, OperationKey::AbandonImportSession)?;
     let session = iaam_app::scenarios::import_session::abandon_session(
         &state.services,
         &principal,
@@ -4969,6 +4963,35 @@ fn declared_label<'a>(field: &str, label: Option<&'a str>) -> Result<Option<&'a 
     Ok(Some(trimmed))
 }
 
+/// Refuse a call the caller's scope does not reach, by the operation's own floor.
+///
+/// **The gate reads the same statement the queue publishes.** Every route named
+/// by an [`OperationKey`] is guarded through here, so the authority a call
+/// demands is written once — in [`required_scope`] — and the handler enforces
+/// *from* that writing rather than restating it. `iaam-woeh` is what the
+/// restatement cost: the queue graded an item owner-only while one of the three
+/// calls it offered admitted an agent, and nothing could notice, because the
+/// two facts were two sentences in two crates.
+///
+/// The refusal is the one [`require_admin`] gives and the one the `may_submit`
+/// tests gave before it: 403 naming the scope the caller holds. Nothing about
+/// what a client sees on a refusal changes.
+fn require(principal: &Principal, operation: OperationKey) -> Result<(), ApiFailure> {
+    if principal.scope.admits(required_scope(operation)) {
+        Ok(())
+    } else {
+        Err(ApiFailure::forbidden(principal.scope.code()))
+    }
+}
+
+/// Refuse a call to an owner-only route that no [`OperationKey`] names.
+///
+/// The routes left here are the ones the queue and the caveat register never
+/// offer — aliases and declarations, categories and groups, instruments,
+/// tokens, broker access — so there is no second reader of their authority and
+/// nothing for a floor to disagree with. A route that becomes an
+/// [`OperationKey`] moves to [`require`] in the same edit, which is what
+/// `every_offered_route_is_gated_by_the_floor_it_publishes` checks.
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
     if principal.scope.may_administer() {
         Ok(())
@@ -5026,4 +5049,216 @@ async fn build_directory(
         ));
     }
     Ok(directory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// This module's own source, read so that a guard can check what the
+    /// handlers do rather than what a comment says they do.
+    ///
+    /// A source scan and not a request sweep, and the reason is the order the
+    /// extractors run in: on most of these routes the body is parsed before the
+    /// handler is entered, so an agent token sent with an empty body is refused
+    /// for the body and not for the scope. A behavioural sweep would therefore
+    /// have to construct a valid request for sixteen routes to observe one bit
+    /// each, and every one of those bodies would be a second fixture to keep
+    /// current. What has to be guarded is narrower than that: that no route the
+    /// queue offers states its own authority instead of reading the one it
+    /// publishes.
+    const SOURCE: &str = include_str!("routes.rs");
+
+    struct Handler<'a> {
+        operation_id: String,
+        name: &'a str,
+        body: Vec<&'a str>,
+    }
+
+    /// The `pub const … : &str = "…";` declarations this file uses for its
+    /// operation identifiers, so that `operation_id = SOME_CONST` resolves.
+    ///
+    /// The value may sit on the next line: one of these names is long enough
+    /// that rustfmt wraps the declaration, and a parser that read only the
+    /// first line would silently fail to resolve exactly the constants most
+    /// likely to be introduced later.
+    fn operation_id_constants() -> BTreeMap<&'static str, &'static str> {
+        let lines: Vec<&str> = SOURCE.lines().collect();
+        let mut constants = BTreeMap::new();
+        for (index, line) in lines.iter().enumerate() {
+            let Some(rest) = line.trim().strip_prefix("pub const ") else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once(": &str =") else {
+                continue;
+            };
+            let tail = tail.trim();
+            let value = if tail.is_empty() {
+                lines[index + 1].trim()
+            } else {
+                tail
+            };
+            constants.insert(name, value.trim_end_matches(';').trim_matches('"'));
+        }
+        constants
+    }
+
+    /// Every documented handler in this file, with the operation id it declares
+    /// and the lines of its body.
+    fn documented_handlers() -> Vec<Handler<'static>> {
+        let constants = operation_id_constants();
+        let lines: Vec<&str> = SOURCE.lines().collect();
+        let mut handlers = Vec::new();
+        let mut index = 0;
+        while index < lines.len() {
+            if lines[index].trim_start() != "#[utoipa::path(" {
+                index += 1;
+                continue;
+            }
+            let mut declared: Option<String> = None;
+            index += 1;
+            while index < lines.len() && lines[index].trim() != ")]" {
+                if let Some(value) = lines[index].trim().strip_prefix("operation_id = ") {
+                    let token = value.trim_end_matches(',');
+                    declared = Some(if token.starts_with('"') {
+                        token.trim_matches('"').to_owned()
+                    } else {
+                        (*constants
+                            .get(token)
+                            .unwrap_or_else(|| panic!("{token} is not a declared constant")))
+                        .to_owned()
+                    });
+                }
+                index += 1;
+            }
+            // Past the closing `)]` to the signature it documents.
+            index += 1;
+            while index < lines.len()
+                && !lines[index].starts_with("pub async fn ")
+                && !lines[index].starts_with("pub fn ")
+            {
+                index += 1;
+            }
+            if index >= lines.len() {
+                break;
+            }
+            let name = lines[index]
+                .trim_start_matches("pub async fn ")
+                .trim_start_matches("pub fn ")
+                .split('(')
+                .next()
+                .expect("a signature names a function");
+            index += 1;
+            let mut body = Vec::new();
+            while index < lines.len() && lines[index] != "}" {
+                body.push(lines[index]);
+                index += 1;
+            }
+            handlers.push(Handler {
+                operation_id: declared.unwrap_or_else(|| name.to_owned()),
+                name,
+                body,
+            });
+        }
+        handlers
+    }
+
+    /// Whitespace removed, so that the guard survives rustfmt wrapping a call.
+    fn squashed(lines: &[&str]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| line.chars())
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    /// Every route the queue and the caveat register can offer is gated by the
+    /// floor it publishes, and by nothing else (`iaam-woeh`).
+    ///
+    /// The defect this refuses is a second statement of one fact. Before the
+    /// floor existed, a handler said `require_admin` and the item that offered
+    /// it said `Scope::Owner`, in another crate, by hand — and
+    /// `retired_account_not_empty` proved the two could disagree without
+    /// anything noticing. A handler that goes back to stating its own authority
+    /// puts the disagreement back, so the guard refuses both halves: the call
+    /// must be there, and the restatements must not.
+    #[test]
+    fn every_offered_route_is_gated_by_the_floor_it_publishes() {
+        let handlers = documented_handlers();
+        for operation in OperationKey::ALL {
+            let handler = handlers
+                .iter()
+                .find(|handler| handler.operation_id == operation.as_str())
+                .unwrap_or_else(|| {
+                    panic!("no handler in this file declares {}", operation.as_str())
+                });
+            let body = squashed(&handler.body);
+            let expected = format!("require(&principal,OperationKey::{operation:?})");
+            assert!(
+                body.contains(&expected),
+                "{} must be gated by {expected}",
+                handler.name
+            );
+            assert!(
+                !body.contains("require_admin"),
+                "{} restates an authority it already publishes",
+                handler.name
+            );
+            assert!(
+                !body.contains("may_submit"),
+                "{} restates an authority it already publishes",
+                handler.name
+            );
+        }
+    }
+
+    /// The guard above can only fail loudly if it finds the handlers at all.
+    ///
+    /// A parse that silently matched nothing would pass the sweep by having
+    /// nothing to sweep, which is the failure mode of every source-reading
+    /// check. This pins the two ways an operation id is declared here — a
+    /// literal, and a constant that has to be resolved — against a handler
+    /// known to use each.
+    #[test]
+    fn the_source_scan_finds_the_handlers_it_claims_to_check() {
+        let handlers = documented_handlers();
+        assert!(
+            handlers.len() > OperationKey::ALL.len(),
+            "this file documents more routes than the queue offers"
+        );
+        // Declared by a constant, and named differently from its handler.
+        let by_constant = handlers
+            .iter()
+            .find(|handler| handler.operation_id == "record_owner_balance")
+            .expect("record_owner_balance was not found by the scan");
+        assert_eq!(by_constant.name, "reconciliation_balance");
+        // Declared by nothing at all: the identifier is the function name.
+        let by_default = handlers
+            .iter()
+            .find(|handler| handler.operation_id == "submit_corrections")
+            .expect("submit_corrections was not found by the scan");
+        assert_eq!(by_default.name, "submit_corrections");
+    }
+
+    /// `require` is the refusal the two removed tests made, and it must make it
+    /// for the same tokens.
+    #[test]
+    fn the_floor_admits_the_scopes_the_removed_checks_admitted() {
+        for operation in OperationKey::ALL {
+            let floor = required_scope(operation);
+            assert!(Scope::Owner.admits(floor), "{}", operation.as_str());
+            assert!(
+                !Scope::ReadOnly.admits(floor),
+                "{} is a write",
+                operation.as_str()
+            );
+            assert_eq!(
+                Scope::Agent.admits(floor),
+                floor == Scope::Agent,
+                "{}",
+                operation.as_str()
+            );
+        }
+    }
 }

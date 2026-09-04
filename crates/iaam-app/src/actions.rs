@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::ports::{
     AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
     ClassificationRuleStore, ContourView, ControlAssertionView, ImportQuestionView,
-    ImportSessionState, ImportSessionSummaryView, Scope, Store,
+    ImportSessionState, ImportSessionSummaryView, Scope, Store, required_scope,
 };
 use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
 use crate::scenarios::import_session::{self, Generalisation};
@@ -45,6 +45,21 @@ pub enum ActionKind {
     /// does not come to zero. The frontier's kinds must stay non-decreasing in
     /// this enum's order.
     RetiredAccountNotEmpty,
+    /// The owner retired something and the queue could not find out whether the
+    /// journal agrees, because the journal would not fold (`iaam-4jso`).
+    ///
+    /// It stands in for [`Self::RetiredAccountNotEmpty`] and is emitted where
+    /// that one would be: same read, same place in the order, and exactly one
+    /// of the two can be raised for a given fold. Declared straight after it
+    /// for that reason — the frontier's kinds must stay non-decreasing in this
+    /// enum's order.
+    ///
+    /// It exists because the alternatives are both dishonest. Failing the
+    /// request takes away the queue, which is the surface the owner recovers
+    /// *from*; guessing the item away publishes «nothing outstanding» about a
+    /// question nobody could answer, which is worse than a loud failure because
+    /// it reads as an answer.
+    RetirementNotAssessed,
     /// A row the source described without a settled direction or counterparty
     /// is held in an import session, and the owner has not said what it was.
     ///
@@ -92,6 +107,7 @@ impl ActionKind {
             // an item of this kind is holding one fact twice, and the two names
             // agreeing is what lets it say so.
             Self::RetiredAccountNotEmpty => "retired_account_not_empty",
+            Self::RetirementNotAssessed => "retirement_not_assessed",
             Self::AnswerClassificationQuestion => "answer_classification_question",
             Self::AdoptClassificationRule => "adopt_classification_rule",
             Self::ImportSessionUnfinished => "import_session_unfinished",
@@ -106,7 +122,7 @@ impl ActionKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::CreateFirstAccount,
         Self::CreateFirstContour,
         Self::AccountScopeUndecided,
@@ -114,6 +130,7 @@ impl ActionKind {
         Self::StartAccountImport,
         Self::ProvideControlAssertion,
         Self::RetiredAccountNotEmpty,
+        Self::RetirementNotAssessed,
         Self::AnswerClassificationQuestion,
         Self::AdoptClassificationRule,
         Self::ImportSessionUnfinished,
@@ -139,7 +156,7 @@ impl ActionKind {
     /// what it blocks fails at construction rather than publishing a required
     /// item that names nothing.
     ///
-    /// Exhaustive on purpose. An eighteenth kind cannot compile until someone
+    /// Exhaustive on purpose. A nineteenth kind cannot compile until someone
     /// has answered, for that kind, the question this whole type exists to
     /// answer.
     ///
@@ -190,6 +207,16 @@ impl ActionKind {
     ///   asks whether the product still exists. The one goal it names is the one
     ///   whose register carries the caveat for the same state, which is what
     ///   makes the two joinable.
+    /// - `RetirementNotAssessed` — **the same one goal, and deliberately not
+    ///   more.** The item stands where `RetiredAccountNotEmpty` would have
+    ///   stood, so it stands between the owner and the same report. A journal
+    ///   that will not fold does of course refuse more than the snapshot; but
+    ///   this item is raised only for an owner who has retired something, so
+    ///   grading it against every report would tell an owner who has retired
+    ///   nothing — and whose journal is just as unfoldable — nothing at all,
+    ///   while telling the one who has that his retirement is what stands
+    ///   between him and his money flow. The goal an item names is the goal it
+    ///   is about.
     #[must_use]
     pub const fn goals(self) -> ReportGoals {
         use ReportGoal::{AssetSnapshot, MoneyFlow, Reconciliation, Returns};
@@ -205,7 +232,9 @@ impl ActionKind {
             | Self::ImportSessionUnfinished
             | Self::PossibleDuplicateUndecided => ReportGoals::ALL,
             Self::ProvideControlAssertion => ReportGoals::of(&[AssetSnapshot, Reconciliation]),
-            Self::RetiredAccountNotEmpty => ReportGoals::of(&[AssetSnapshot]),
+            Self::RetiredAccountNotEmpty | Self::RetirementNotAssessed => {
+                ReportGoals::of(&[AssetSnapshot])
+            }
             Self::CoverageGapUnrepaired
             | Self::IndependentConfirmationMissing
             | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
@@ -787,7 +816,15 @@ impl ActionTarget {
 pub enum ActionInvariantError {
     ReadyWithoutOperation,
     BlockedWithOperation,
-    BlockedWithScope,
+    /// An item that is not blocked and offers no way out.
+    ///
+    /// It used to say something narrower — an item that stated no required
+    /// scope — and the scope is no longer stated: it is read off the
+    /// resolutions, so an item with none has no authority to publish. The
+    /// combination it now refuses is [`ActionState::NeedsOwnerInput`] with
+    /// [`ActionTarget::None`], which was legal and should not have been: an
+    /// item the owner must act on through no call in this API is
+    /// [`ActionState::Blocked`], and that is the word for it.
     NonBlockedWithoutScope,
     /// A set of resolutions holding fewer than two of them.
     ///
@@ -807,6 +844,16 @@ pub enum ActionInvariantError {
     RequiredForNoGoal,
 }
 
+/// The narrower of two floors: the one a token reaching the other also reaches.
+///
+/// Ordering by [`Scope::admits`] rather than by a rank declared here. A rank
+/// would be a second statement of «an owner may do what an agent may», and the
+/// predicate pair on [`Scope`] already says it; a rank that drifted from it
+/// would grade an item by an ordering the transport does not enforce.
+const fn narrower(left: Scope, right: Scope) -> Scope {
+    if right.admits(left) { left } else { right }
+}
+
 /// What an action is, apart from its prose and its target.
 ///
 /// Packaged as a struct rather than five arguments: `id` and `reason` are both
@@ -819,7 +866,6 @@ pub struct ActionFacts {
     pub kind: ActionKind,
     pub category: ActionCategory,
     pub state: ActionState,
-    pub required_scope: Option<Scope>,
     /// The account or event this item is about, when it is about one.
     pub subject: Option<ActionSubject>,
 }
@@ -832,7 +878,6 @@ pub struct Action {
     category: ActionCategory,
     state: ActionState,
     reason: String,
-    required_scope: Option<Scope>,
     subject: Option<ActionSubject>,
     target: ActionTarget,
 }
@@ -862,10 +907,7 @@ impl Action {
         if matches!(&target, ActionTarget::Options(options) if options.len() < 2) {
             return Err(ActionInvariantError::OptionsWithoutChoice);
         }
-        if facts.state == ActionState::Blocked && facts.required_scope.is_some() {
-            return Err(ActionInvariantError::BlockedWithScope);
-        }
-        if facts.state != ActionState::Blocked && facts.required_scope.is_none() {
+        if facts.state != ActionState::Blocked && matches!(&target, ActionTarget::None) {
             return Err(ActionInvariantError::NonBlockedWithoutScope);
         }
         if matches!(facts.category, ActionCategory::RequiredForGoal(goals) if goals.is_empty()) {
@@ -877,7 +919,6 @@ impl Action {
             category: facts.category,
             state: facts.state,
             reason: reason.into(),
-            required_scope: facts.required_scope,
             subject: facts.subject,
             target,
         })
@@ -908,8 +949,46 @@ impl Action {
         &self.reason
     }
 
-    pub const fn required_scope(&self) -> Option<Scope> {
-        self.required_scope
+    /// The narrowest scope that reaches **any** of this item's resolutions.
+    ///
+    /// **Read off the target, never stated beside it.** The authority a call
+    /// demands is a property of the call, so the queue cannot hold an opinion
+    /// about it separate from the calls it publishes:
+    /// [`crate::ports::required_scope`] is the one statement, and
+    /// `iaam_server::routes` gates the route by the same one. Before this it
+    /// was typed in per item, and `retired_account_not_empty` proved what that
+    /// costs — the item was graded owner-only while one of the three calls it
+    /// offered admits an agent token, so an agent filtering on this field was
+    /// told nothing was available to it when the ordinary remedy was
+    /// (`iaam-woeh`).
+    ///
+    /// **The narrowest and not the widest, and the choice is what a client can
+    /// do with the field.** A client filtering the queue by the token it holds
+    /// wants one pass over the items, not a pass over every resolution of every
+    /// item, and the question it is really asking is «is there anything here I
+    /// can act on». The narrowest floor answers exactly that. The widest would
+    /// answer «is there anything here I can finish alone», which is a question
+    /// no single value can answer anyway: whether a call succeeds depends on
+    /// the body, and [`MissingInput::provided_by`] is where the queue says who
+    /// holds a value it cannot supply.
+    ///
+    /// So a client that keeps the items this scope admits sees **every item it
+    /// can make at least one call on**, and does not see items where it can
+    /// make none. What it does not see is *which* of an item's resolutions it
+    /// may call: the item may offer three and admit it to one. That is on the
+    /// resolutions, one floor each, and a client acting rather than filtering
+    /// reads them there.
+    ///
+    /// `None` only where the item publishes no resolution at all, which by the
+    /// invariants above is exactly [`ActionState::Blocked`]: nothing in this
+    /// API closes it, so there is no authority to state.
+    #[must_use]
+    pub fn required_scope(&self) -> Option<Scope> {
+        self.target
+            .resolutions()
+            .into_iter()
+            .map(|(operation, _)| required_scope(operation))
+            .reduce(narrower)
     }
 
     /// The account or event this item is about, when it is about one.
@@ -946,6 +1025,17 @@ fn identity(kind: ActionKind) -> String {
 /// is read rather than carried inwards as an unparsed string. Dropping such a
 /// row instead would put the queue back where this action found it — an
 /// outstanding question nothing mentions.
+///
+/// **It still fails the whole queue, and that is now the odd one out.**
+/// `iaam-4jso` established the third answer for the retirement fold: name the
+/// failure as an item rather than swallow it or propagate it. The same argument
+/// applies here word for word — an unreadable question is a content failure,
+/// dropping it is the silence this type exists to prevent, and «this session
+/// holds a question this build cannot read» is a sentence an item could carry.
+/// It is left alone deliberately: it is a different item to design, with a
+/// different subject and a different remedy, and doing it in the same change as
+/// the fold would have been two designs sharing one argument. Filed, not
+/// fixed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationQuestion {
     /// The stored question, its wording, and its answer if it has one.
@@ -985,6 +1075,14 @@ pub struct ClassificationQuestion {
 /// Since `iaam-xnhu` the same argument buys a **fold of the journal**, and it is
 /// the most expensive thing this function does. See [`retired_products`] for
 /// what it costs, when it is paid, and why nothing cheaper answers the question.
+///
+/// **What fails this function and what does not.** A port that will not answer
+/// fails it: there is no queue to publish, and no item could say anything about
+/// a store that is not there. A fold that refuses does **not** (`iaam-4jso`) —
+/// it becomes an item, because the queue is the surface the owner recovers
+/// from and a request that fails takes the recovery with it. The one content
+/// failure still left propagating is a stored import question this build cannot
+/// parse, and [`ClassificationQuestion`] says why it is where it is.
 pub async fn frontier(
     owner: OwnerId,
     store: &dyn Store,
@@ -1036,7 +1134,7 @@ pub async fn frontier(
         }
     }
     let rules = standing_rules(owner, rules).await?;
-    let retired = retired_products(owner, store).await?;
+    let retirements = retired_products(owner, store).await?;
     let mut assertions = Vec::new();
     for account in activity
         .iter()
@@ -1055,7 +1153,7 @@ pub async fn frontier(
         transfers: &transfers,
         activity: &activity,
         assertions: &assertions,
-        retired: &retired,
+        retired: retirements.as_assessment(),
         sessions: &sessions,
         questions: &questions,
         rules: &rules,
@@ -1083,53 +1181,123 @@ pub async fn frontier(
 /// movement the owner recorded with a later effective date. See
 /// [`retired_account_completion`] for what this asks and what it does not.
 ///
-/// A journal that will not fold **fails the queue**, and that is the opposite of
-/// what [`standing_rules`] does with a rule it cannot read. The difference is
-/// what degrading would have to invent. A skipped rule costs one duplicate
-/// proposal; a guessed `emptied` is either an item the owner does not owe or a
-/// silence about one he does, and there is no third value to publish. The state
-/// it fails in is one where the asset snapshot fails too — the same fold, the
-/// same events — so the queue is not going silent while the reports still work.
-async fn retired_products(
-    owner: OwnerId,
-    store: &dyn Store,
-) -> Result<Vec<RetiredProduct>, AppError> {
+/// **A journal that will not fold no longer fails the queue** (`iaam-4jso`). It
+/// did, and the argument for that was half right: there is no honest third
+/// value for `emptied`, and guessing one is either an item the owner does not
+/// owe or a silence about one he does. What the argument left out is that the
+/// queue is the surface an owner recovers *from* — [`standing_rules`] says so
+/// two functions down, about a rule it cannot read — so an owner whose journal
+/// will not fold had no queue to recover through, and the one act that could
+/// repair the fold was published nowhere he would look for acts.
+///
+/// So the fold's refusal is neither swallowed nor propagated: it is **named**.
+/// The failure is carried out as [`Retirements::NotAssessed`] and becomes an
+/// item of its own — [`ActionKind::RetirementNotAssessed`] — which says that
+/// this question could not be answered and offers the call that answers the
+/// journal's. Nothing is guessed: the item that would have been raised is not
+/// raised, and its absence is stated rather than left to be read as «nothing
+/// outstanding».
+///
+/// **Only the fold degrades.** `list_account_retirements` and
+/// `load_events_through` are the store answering at all, and a store that will
+/// not answer takes every other read here with it; there is no queue to publish
+/// and nothing an item could say about it. What degrades is exactly the two
+/// steps that read the *content* of the events: correction resolution and the
+/// balance projection.
+async fn retired_products(owner: OwnerId, store: &dyn Store) -> Result<Retirements, AppError> {
     let declared = store.list_account_retirements(owner).await?;
     if declared.statements.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Retirements::Assessed(Vec::new()));
     }
     let events = store.load_events_through(owner, Date::MAX).await?;
     // The **effective** set, as every other fold in this workspace reads it: a
     // retracted movement is not on the account any more, and a retirement whose
     // row was emptied by a retraction has to read as emptied here too.
-    let effective = resolve(&events).map_err(AppError::Correction)?;
+    let effective = match resolve(&events) {
+        Ok(effective) => effective,
+        Err(error) => return Ok(Retirements::NotAssessed(error.to_string())),
+    };
     let mut balances = Balances::new();
     for event in &effective {
-        balances
-            .apply(event)
-            .map_err(ProjectionError::from)
-            .map_err(AppError::from_projection)?;
+        if let Err(error) = balances.apply(event).map_err(ProjectionError::from) {
+            return Ok(Retirements::NotAssessed(error.to_string()));
+        }
     }
-    Ok(declared
-        .statements
-        .iter()
-        .map(|statement| RetiredProduct {
-            account: statement.account,
-            effective_on: statement.effective_on,
-            // The same two tests `iaam_core::report::assets::retired_and_empty`
-            // makes, over the same fold: cash in every currency and every
-            // position quantity. Stated as one predicate here because the queue
-            // has no rows to suppress — it has one question per account.
-            emptied: balances
-                .iter_cash()
-                .filter(|(account, _)| *account == statement.account)
-                .all(|(_, money)| money.is_zero())
-                && balances
-                    .iter_positions()
-                    .filter(|(key, _)| key.account == statement.account)
-                    .all(|(_, quantity)| quantity.0.is_zero()),
-        })
-        .collect())
+    Ok(Retirements::Assessed(
+        declared
+            .statements
+            .iter()
+            .map(|statement| RetiredProduct {
+                account: statement.account,
+                effective_on: statement.effective_on,
+                // The same two tests `iaam_core::report::assets::retired_and_empty`
+                // makes, over the same fold: cash in every currency and every
+                // position quantity. Stated as one predicate here because the queue
+                // has no rows to suppress — it has one question per account.
+                emptied: balances
+                    .iter_cash()
+                    .filter(|(account, _)| *account == statement.account)
+                    .all(|(_, money)| money.is_zero())
+                    && balances
+                        .iter_positions()
+                        .filter(|(key, _)| key.account == statement.account)
+                        .all(|(_, quantity)| quantity.0.is_zero()),
+            })
+            .collect(),
+    ))
+}
+
+/// What one reading of the owner's retirements produced: verdicts, or a refusal.
+///
+/// Owned, because the fold it comes from is owned; [`RetirementAssessment`] is
+/// the borrowed view [`OwnerState`] carries. Two types rather than one for the
+/// ordinary reason a `String` and a `&str` are two: the state is computed in an
+/// `async fn` that returns it and read in a synchronous one that borrows it,
+/// and a single owned type in the state struct would make every caller of
+/// [`actions_from_state`] build a `Vec` it does not have.
+enum Retirements {
+    /// The journal folded, and this is its verdict on each declaration. Empty
+    /// is «he has retired nothing», which is also what spares [`frontier`] the
+    /// fold entirely.
+    Assessed(Vec<RetiredProduct>),
+    /// The journal would not fold, and this is what refused.
+    ///
+    /// A rendered message and not the error: the item built from it prints it
+    /// to the owner, and nothing branches on it. A typed error carried this far
+    /// would invite a caller to decide something from it, and there is nothing
+    /// here to decide — every way a fold refuses is repaired by ruling on the
+    /// fact that refused.
+    NotAssessed(String),
+}
+
+impl Retirements {
+    fn as_assessment(&self) -> RetirementAssessment<'_> {
+        match self {
+            Self::Assessed(products) => RetirementAssessment::Assessed(products),
+            Self::NotAssessed(refusal) => RetirementAssessment::NotAssessed(refusal),
+        }
+    }
+}
+
+/// The borrowed form of [`Retirements`], as the frontier's state holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetirementAssessment<'a> {
+    Assessed(&'a [RetiredProduct]),
+    NotAssessed(&'a str),
+}
+
+impl<'a> RetirementAssessment<'a> {
+    /// The verdicts, which is none where there was no fold to take them from.
+    ///
+    /// Not an excuse to treat a refusal as «he has retired nothing»: the caller
+    /// that uses this also matches on the refusal and raises an item for it.
+    /// The accessor exists so that the loop over the products is written once.
+    fn products(self) -> &'a [RetiredProduct] {
+        match self {
+            Self::Assessed(products) => products,
+            Self::NotAssessed(_) => &[],
+        }
+    }
 }
 
 /// The owner's active classification rules, in the classifier's own vocabulary.
@@ -1365,10 +1533,11 @@ fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCateg
 /// owner may have read the same figure in the same report that was parsed — so
 /// it cannot raise a dimension past the level this item reports.
 ///
-/// `Scope::Agent` on the promoted half, for the reason
-/// `start_account_import_action` gives: `sync_broker` checks `may_submit`, which
-/// an agent token satisfies, and marking the item owner-only would tell an agent
-/// it may not send a request the server would accept.
+/// The promoted half reads `agent`, for the reason `start_account_import_action`
+/// gives: the floor `sync_broker` keeps is [`Scope::Agent`], and an item marked
+/// owner-only would tell an agent it may not send a request the server would
+/// accept. The item states no scope of its own — it is read off the route it
+/// names, through [`crate::ports::required_scope`].
 fn independent_confirmation_action(
     account: &AccountView,
     period: AssertionPeriod,
@@ -1416,7 +1585,6 @@ fn independent_confirmation_action(
             kind: ActionKind::IndependentConfirmationMissing,
             category: ActionCategory::required_for(ActionKind::IndependentConfirmationMissing),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Agent),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -1470,8 +1638,9 @@ fn independent_confirmation_action(
 /// the same reason: the diagnostic deliberately does not retain what it would
 /// take to fill the field.
 ///
-/// `Scope::Owner`: `submit_corrections` is behind `require_admin`, and it is
-/// there so that an agent token cannot retract the owner's history.
+/// The item reads `owner`, because that is the floor `submit_corrections` keeps
+/// and it is kept so that an agent token cannot retract the owner's history. The
+/// item does not grade itself: the floor comes from the operation it names.
 fn discrepancy_action(
     account: &AccountView,
     period: AssertionPeriod,
@@ -1492,7 +1661,6 @@ fn discrepancy_action(
             kind: ActionKind::DiscrepancyUnresolved,
             category: ActionCategory::required_for(ActionKind::DiscrepancyUnresolved),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -1613,8 +1781,8 @@ fn unexplained_residual_action(account: &AccountView, amount: Money) -> Action {
 /// in this API is available for this item" and category-rule creation is in this
 /// same API. The earlier wording — no *report* operation can provide a rule — was
 /// true and irrelevant: the action catalogue resolves a target against the whole
-/// completed contract, not a report-local namespace, and owner-only is what
-/// `required_scope` says, not what `Blocked` says. `first_contour_action` is the
+/// completed contract, not a report-local namespace, and owner-only is what the
+/// floor of `create_category_rule` says, not what `Blocked` says. `first_contour_action` is the
 /// precedent: the agent may not draw the boundary, and the action still names the
 /// owner-only operation and the inputs only he can supply.
 ///
@@ -1657,7 +1825,6 @@ fn undecomposed_outflows_action(
             kind: ActionKind::UndecomposedOutflows,
             category: ActionCategory::Recommended,
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -1791,7 +1958,6 @@ fn blocked_action(
             kind,
             category,
             state: ActionState::Blocked,
-            required_scope: None,
             subject,
         },
         reason,
@@ -1842,10 +2008,17 @@ struct OwnerState<'a> {
     activity: &'a [AccountActivityView],
     assertions: &'a [ControlAssertionView],
     /// The owner's products that have ceased, each with the journal's verdict on
-    /// whether anything is still on it. Empty is «he has retired nothing», which
-    /// is where most owners stay, and it is also what spares [`frontier`] the
-    /// journal read this field is folded from.
-    retired: &'a [RetiredProduct],
+    /// whether anything is still on it — or the reason the journal would not
+    /// fold, which is a fact the queue publishes rather than a request it fails
+    /// (`iaam-4jso`).
+    ///
+    /// [`RetirementAssessment::Assessed`] holding nothing is «he has retired
+    /// nothing», which is where most owners stay and is also what spares
+    /// [`frontier`] the journal read this field is folded from. That is not the
+    /// same state as [`RetirementAssessment::NotAssessed`], and the enum is
+    /// here so that the two cannot be spelled alike: an empty slice standing
+    /// for a failed fold is exactly the silence this field exists to break.
+    retired: RetirementAssessment<'a>,
     /// Every import session of the owner's, with how much each holds.
     ///
     /// Every session and not only the open ones, for the reason the questions
@@ -1883,7 +2056,11 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
     let names = AccountNames::new(accounts);
     let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
     actions.reserve(
-        activity.len() + assertions.len() + retired.len() + questions.len() + sessions.len(),
+        activity.len()
+            + assertions.len()
+            + retired.products().len()
+            + questions.len()
+            + sessions.len(),
     );
     for account in activity
         .iter()
@@ -1922,10 +2099,18 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
     // belong together for a better reason than the ordering: both are what an
     // account whose history begins mid-way produces.
     for product in retired
+        .products()
         .iter()
         .filter(|product| retired_account_eligibility(product) && retired_account_gap(product))
     {
         actions.push(retired_account_action(names.get(product.account)?, product));
+    }
+    // Exactly where the loop above would have run, and instead of it: the two
+    // are the same read, and a fold either produced verdicts or produced this.
+    // The kind is declared straight after `RetiredAccountNotEmpty` so that
+    // emitting it here keeps the frontier's order non-decreasing.
+    if let RetirementAssessment::NotAssessed(refusal) = retired {
+        actions.push(retirement_not_assessed_action(refusal));
     }
     // Last, so the frontier's kinds stay non-decreasing in `ActionKind`'s own
     // order: this kind is declared after the control assertion.
@@ -2078,11 +2263,11 @@ fn classification_question_completion(question: &ClassificationQuestion) -> bool
 /// same guess made one layer up, and a fully preset request does not change who
 /// may send it.
 ///
-/// `Scope::Agent`, and this is the first item whose scope is not `Scope::Owner`.
-/// The route that answers checks `may_submit`, which an agent token satisfies,
-/// and the queue's business is to say what may be called: an item marked `owner`
-/// would tell an agent it may not send a request the server would accept. Who
-/// decides the answer and who may transmit it are different questions, and
+/// This is the first item that reads `agent` rather than `owner`, and it reads
+/// it because `answer_import_question` keeps [`Scope::Agent`] as its floor. The
+/// queue's business is to say what may be called: an item marked `owner` would
+/// tell an agent it may not send a request the server would accept. Who decides
+/// the answer and who may transmit it are different questions, and
 /// `NeedsOwnerInput` is where the first one is already answered.
 fn answer_classification_question_action(
     question: &ClassificationQuestion,
@@ -2114,7 +2299,6 @@ fn answer_classification_question_action(
             kind: ActionKind::AnswerClassificationQuestion,
             category: ActionCategory::required_for(ActionKind::AnswerClassificationQuestion),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Agent),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -2248,9 +2432,10 @@ fn adopt_classification_rule_completion(
 /// derived from the row and the answer, and `replaces` is absent because a
 /// proposal supersedes nothing. What is missing is not a value; it is his
 /// decision, and [`ActionState::Ready`] means «may be invoked without asking the
-/// owner», which this must never be. `Scope::Owner`, because generalising is the
-/// administer decision arriving by another door — the same gate
-/// `may_generalise` reads when it declines to write the rule in the first place.
+/// owner», which this must never be. It reads `owner`, because generalising is
+/// the administer decision arriving by another door — the same gate
+/// `may_generalise` reads when it declines to write the rule in the first place,
+/// and the floor `create_classification_rule` keeps for the same reason.
 fn adopt_classification_rule_action(
     question: &ClassificationQuestion,
     account: &AccountView,
@@ -2281,7 +2466,6 @@ fn adopt_classification_rule_action(
             kind: ActionKind::AdoptClassificationRule,
             category: ActionCategory::Recommended,
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -2396,9 +2580,10 @@ fn import_session_completion(summary: &ImportSessionSummaryView) -> bool {
 /// that stops the same statement being imported twice — and a scope of one
 /// piece of work the owner controls is not `Blocking`.
 ///
-/// `NeedsOwnerInput`, not `Ready`. Both calls are ones an agent may transmit,
-/// which is what `Scope::Agent` says; whether these rows become facts or are
-/// thrown away is not a choice anything but the owner may make on his behalf.
+/// `NeedsOwnerInput`, not `Ready`. Both calls are ones an agent may transmit —
+/// both keep [`Scope::Agent`] as their floor, which is what the item reads —
+/// while whether these rows become facts or are thrown away is not a choice
+/// anything but the owner may make on his behalf.
 fn import_session_unfinished_action(
     summary: &ImportSessionSummaryView,
     account: Option<&AccountView>,
@@ -2476,7 +2661,6 @@ fn import_session_unfinished_action(
             kind: ActionKind::ImportSessionUnfinished,
             category: ActionCategory::required_for(ActionKind::ImportSessionUnfinished),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Agent),
             subject: account.map(|account| ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -2788,7 +2972,6 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
             kind: ActionKind::ResolveTransferRelationships,
             category: ActionCategory::required_for(ActionKind::ResolveTransferRelationships),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -2867,10 +3050,11 @@ fn activity_period(activity: &AccountActivityView) -> Option<AssertionPeriod> {
 /// publishing either alone would leave the other reachable only by reading the
 /// specification.
 ///
-/// `Scope::Agent`, for the reason `answer_classification_question_action` gives:
-/// both routes check `may_submit`, which an agent token satisfies, and an item
-/// marked `owner` would tell an agent it may not send a request the server would
-/// accept.
+/// The item reads `agent`, for the reason `answer_classification_question_action`
+/// gives: both routes keep [`Scope::Agent`] as their floor, and an item marked
+/// `owner` would tell an agent it may not send a request the server would
+/// accept. Both options read `agent`, which is why this item hid `iaam-woeh`
+/// rather than exposing it — its two resolutions happen to agree.
 ///
 /// **The reason names the shape a row is submitted in, and that closes
 /// `iaam-tt71`.** «Feed it the rows» presupposed something that turns a
@@ -2957,7 +3141,6 @@ fn start_account_import_action(account: &AccountView) -> Action {
             kind: ActionKind::StartAccountImport,
             category: ActionCategory::required_for(ActionKind::StartAccountImport),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Agent),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -3041,7 +3224,6 @@ fn provide_control_assertion_action(
             // the same thing.
             category: ActionCategory::required_for(ActionKind::ProvideControlAssertion),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         match point {
@@ -3170,12 +3352,17 @@ fn retired_account_completion(retired: &RetiredProduct) -> bool {
 /// `/cash` the same way, and a control assertion's figure is commonly printed on
 /// a document too.
 ///
-/// **`Scope::Owner`, though one of the three ways out admits an agent.** The
-/// ingest route checks `may_submit`, which an agent token satisfies; the
-/// correction route and the retirement route are owner-only. One field cannot
-/// say two things, and the honest single answer is the authority the *item*
-/// needs: an agent cannot close this on its own under any of the three
-/// readings, and it could not supply the figure for the one route it may call.
+/// **Three ways out, and three floors — this is the item `iaam-woeh` was filed
+/// on.** `ingest_operations` keeps [`Scope::Agent`]; `submit_corrections` and
+/// `record_account_retirement` keep [`Scope::Owner`]. Each resolution publishes
+/// its own floor, so a client choosing among the three is told which of them its
+/// token reaches. The item's own `required_scope` is now the narrowest of the
+/// three — `agent` — and that is a change from what it used to say. It used to
+/// say `owner`, on the argument that an agent could not close the item alone;
+/// that argument was about the *figure*, not about the *call*, and the figure is
+/// already published as `/operations/0/amount` marked [`ProvidedBy::Owner`]. An
+/// agent reading the old grading dropped the item entirely and never reached the
+/// route it could in fact call.
 fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Action {
     // The reconstructed opening. Preset is exactly what the policy knows: the
     // account this row is on, and that the row is an opening. The figure, the
@@ -3253,7 +3440,6 @@ fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Ac
             kind: ActionKind::RetiredAccountNotEmpty,
             category: ActionCategory::required_for(ActionKind::RetiredAccountNotEmpty),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -3276,6 +3462,79 @@ fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Ac
     .expect("the retired-account item publishes three resolutions")
 }
 
+/// A retirement the queue could not check, because the journal would not fold
+/// (`iaam-4jso`).
+///
+/// **It exists so that the failure is an item and not a silence.** The fold that
+/// decides whether a retired product still holds a figure is the most expensive
+/// thing [`frontier`] does, and it can refuse: a correction graph that will not
+/// resolve, or an event the balance projection cannot apply. Refusing the whole
+/// queue on that was deliberate and it was wrong in one respect that matters
+/// more than the rest — [`standing_rules`] states, two functions up, that this
+/// is the surface the owner recovers *from*, and an owner with no queue has
+/// nowhere to be told what to do about the journal that took it away.
+///
+/// **And it exists so that the failure is not guessed away.** The alternative to
+/// failing was to drop the retirement item, and that is worse than a loud
+/// refusal: the caller reads «nothing outstanding» about a question nobody
+/// could answer. `iaam-y1dp` records the same fork for the rules port. So the
+/// item says what happened, in as many words, and carries the refusal the fold
+/// gave.
+///
+/// **One item for the owner, not one per retired account.** The fold is over the
+/// whole journal and it either produced verdicts for every declaration or for
+/// none; an item per account would be one fact repeated, and each copy would
+/// name an account that is not what refused. It carries no [`ActionSubject`]
+/// for the same reason: the subject is the journal, and the vocabulary has no
+/// word for that — inventing one for a state this narrow would be a worse trade
+/// than the absence, which already reads as «this is not about one account».
+///
+/// **`submit_corrections`, and it is the honest remedy for both refusals.** A
+/// correction is the only write in this system that changes what an existing
+/// fold sees: retracting an event removes it from the effective set, and
+/// superseding one replaces it. So it repairs a correction graph that will not
+/// resolve — the offending correction is itself retractable — and it repairs an
+/// event the projection cannot apply. Nothing is preset, and that is not an
+/// omission: which fact should stop counting is the judgement this item cannot
+/// make for him, exactly as `retired_account_action` says about the same call.
+///
+/// **`NeedsOwnerInput` and not `Blocked`.** `Blocked` means no operation in this
+/// API is available, and one is. The item's floor is therefore `owner`, read off
+/// the route like every other.
+fn retirement_not_assessed_action(refusal: &str) -> Action {
+    Action::new(
+        ActionFacts {
+            // Existential in the journal: one unfoldable journal, one item.
+            id: identity(ActionKind::RetirementNotAssessed),
+            kind: ActionKind::RetirementNotAssessed,
+            category: ActionCategory::required_for(ActionKind::RetirementNotAssessed),
+            state: ActionState::NeedsOwnerInput,
+            subject: None,
+        },
+        format!(
+            "A retirement stands and the effective journal will not fold, so whether the \
+             account it names still shows a figure could not be worked out. What refused: \
+             {refusal}. The asset snapshot is folded from the same events and refuses for the \
+             same reason, so this queue has not gone quiet while the reports work. Until the \
+             journal folds, nothing here can say whether the retirement took effect, and \
+             nothing here is saying that it did. Rule on the fact that will not fold — retract \
+             it, or supersede it with what should have stood — and the question is asked again \
+             on the next reading."
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::SubmitCorrections,
+            request: RequestPlan {
+                preset: BTreeMap::new(),
+                missing: vec![
+                    MissingInput::plain("/corrections", ProvidedBy::Owner),
+                    MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                ],
+            },
+        },
+    )
+    .expect("the unassessed-retirement item names the correction route")
+}
+
 fn first_account_action() -> Action {
     Action::new(
         ActionFacts {
@@ -3283,7 +3542,6 @@ fn first_account_action() -> Action {
             kind: ActionKind::CreateFirstAccount,
             category: ActionCategory::Blocking,
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             // Existential: no account exists, so the item names none.
             subject: None,
         },
@@ -3420,7 +3678,6 @@ fn account_scope_action(
             kind: ActionKind::AccountScopeUndecided,
             category: ActionCategory::required_for(ActionKind::AccountScopeUndecided),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
@@ -3468,7 +3725,6 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
             kind: ActionKind::CreateFirstContour,
             category: ActionCategory::required_for(ActionKind::CreateFirstContour),
             state: ActionState::NeedsOwnerInput,
-            required_scope: Some(Scope::Owner),
             // Existential: no contour exists, so the item names no one account.
             subject: None,
         },
@@ -3542,7 +3798,7 @@ mod tests {
             "two kinds share an identity, or one is listed twice: {:?}",
             ActionKind::ALL.map(ActionKind::id)
         );
-        assert_eq!(ActionKind::ALL.len(), 17, "a kind was added without a goal");
+        assert_eq!(ActionKind::ALL.len(), 18, "a kind was added without a goal");
     }
 
     /// Every kind graded `RequiredForGoal` names at least one goal, and every
@@ -3554,7 +3810,7 @@ mod tests {
     /// the mapping, written a second time, from what the reports actually read.
     ///
     /// The `match` is exhaustive on purpose, and that is what keeps this from
-    /// going stale. An eighteenth kind does not slip through — it stops the test
+    /// going stale. A nineteenth kind does not slip through — it stops the test
     /// from compiling, so whoever adds it answers, here, which reports their new
     /// item stands in the way of, before the queue can publish an item that
     /// names none.
@@ -3605,6 +3861,11 @@ mod tests {
                 // returns are unchanged by it, and `reconciliation::report`
                 // never asks whether a product still exists.
                 ActionKind::RetiredAccountNotEmpty => &[AssetSnapshot],
+                // The item that stands in for it when the fold refuses stands
+                // between the owner and the same report, and only that one: it
+                // is raised for an owner who has retired something, and the
+                // question it could not answer is the snapshot's.
+                ActionKind::RetirementNotAssessed => &[AssetSnapshot],
                 // All three are about whether a period is confirmed.
                 ActionKind::CoverageGapUnrepaired
                 | ActionKind::IndependentConfirmationMissing
@@ -3638,7 +3899,6 @@ mod tests {
                     kind,
                     category: ActionCategory::required_for(kind),
                     state: ActionState::NeedsOwnerInput,
-                    required_scope: Some(Scope::Owner),
                     subject: None,
                 },
                 "a reason",
@@ -4362,7 +4622,6 @@ mod tests {
                     kind: ActionKind::CreateFirstAccount,
                     category: ActionCategory::Blocking,
                     state: ActionState::NeedsOwnerInput,
-                    required_scope: Some(Scope::Owner),
                     subject: None,
                 },
                 "invented for this test",
@@ -4384,7 +4643,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(account.id)],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -4455,7 +4714,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(first), no_facts(second)],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -4720,7 +4979,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(main.id), no_facts(savings.id)],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -4748,7 +5007,6 @@ mod tests {
                 kind: ActionKind::CreateFirstAccount,
                 category: ActionCategory::Blocking,
                 state: ActionState::Ready,
-                required_scope: Some(Scope::Owner),
                 subject: None,
             },
             "invalid",
@@ -4792,7 +5050,7 @@ mod tests {
             transfers: &[],
             activity: &[no_facts(account.id)],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -4899,7 +5157,7 @@ mod tests {
             transfers: &[],
             activity: std::slice::from_ref(&activity),
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -4930,7 +5188,7 @@ mod tests {
                 transfers: &[],
                 activity: &[completed],
                 assertions: &[],
-                retired: &[],
+                retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
                 rules: &[],
@@ -4960,7 +5218,7 @@ mod tests {
             transfers: &[],
             activity: std::slice::from_ref(&activity),
             assertions: recorded,
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -5131,7 +5389,7 @@ mod tests {
             transfers: &[],
             activity: &activity,
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -5162,7 +5420,7 @@ mod tests {
             transfers: &[],
             activity: &[activity],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -5181,7 +5439,7 @@ mod tests {
                 transfers: &[],
                 activity: &[],
                 assertions: &[],
-                retired: &[],
+                retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
                 rules: &[],
@@ -5608,7 +5866,6 @@ mod tests {
                 kind: ActionKind::CreateFirstAccount,
                 category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
-                required_scope: None,
                 subject: None,
             },
             "nothing can call this",
@@ -5621,14 +5878,13 @@ mod tests {
     }
 
     #[test]
-    fn blocked_action_rejects_an_operation_and_a_scope() {
+    fn blocked_action_rejects_an_operation() {
         let operation = Action::new(
             ActionFacts {
                 id: "blocked-operation".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
                 category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
-                required_scope: None,
                 subject: None,
             },
             "nothing can call this",
@@ -5641,41 +5897,50 @@ mod tests {
             },
         );
         assert_eq!(operation, Err(ActionInvariantError::BlockedWithOperation));
+    }
 
-        let scope = Action::new(
+    /// A blocked item cannot state a scope, because it no longer states one at
+    /// all: the authority is read off the resolutions, and it publishes none.
+    ///
+    /// This is what `BlockedWithScope` used to refuse. The refusal is gone
+    /// because the combination it refused cannot be built any more — which is
+    /// the point of removing the field, and worth a test rather than an
+    /// absence, so that a later change putting the field back has to face it.
+    #[test]
+    fn a_blocked_item_can_no_longer_state_a_scope_at_all() {
+        let blocked = Action::new(
             ActionFacts {
                 id: "blocked-scope".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
                 category: ActionCategory::Blocking,
                 state: ActionState::Blocked,
-                required_scope: Some(Scope::Owner),
                 subject: None,
             },
             "nothing can call this",
             ActionTarget::None,
-        );
-        assert_eq!(scope, Err(ActionInvariantError::BlockedWithScope));
+        )
+        .expect("a blocked item with no target is valid");
+        assert_eq!(blocked.required_scope(), None);
     }
 
+    /// An item that is not blocked and offers no way out is refused.
+    ///
+    /// The combination used to be legal and produced an item that named an
+    /// authority while naming no call to use it on. It is now
+    /// `NeedsOwnerInput` with no target, and the word for that state is
+    /// `Blocked`.
     #[test]
-    fn a_nonblocked_action_requires_a_scope() {
+    fn a_nonblocked_action_requires_a_resolution() {
         let result = Action::new(
             ActionFacts {
                 id: "missing-scope".to_owned(),
                 kind: ActionKind::CreateFirstAccount,
                 category: ActionCategory::Blocking,
                 state: ActionState::NeedsOwnerInput,
-                required_scope: None,
                 subject: None,
             },
             "invalid",
-            ActionTarget::Operation {
-                operation: OperationKey::CreateAccount,
-                request: RequestPlan {
-                    preset: BTreeMap::new(),
-                    missing: Vec::new(),
-                },
-            },
+            ActionTarget::None,
         );
         assert_eq!(result, Err(ActionInvariantError::NonBlockedWithoutScope));
     }
@@ -6291,7 +6556,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
@@ -6332,7 +6597,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
@@ -6367,7 +6632,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
@@ -6410,7 +6675,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
@@ -6439,7 +6704,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
@@ -6491,7 +6756,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
@@ -6522,7 +6787,7 @@ mod tests {
                 transfers: &[],
                 activity: &[],
                 assertions: &[],
-                retired: &[],
+                retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: std::slice::from_ref(&question),
                 rules: &[],
@@ -6555,7 +6820,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[first.clone(), second.clone()],
             rules: &[],
@@ -6712,7 +6977,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(question),
             rules,
@@ -6935,7 +7200,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired,
+            retired: RetirementAssessment::Assessed(retired),
             sessions: &[],
             questions: &[],
             rules: &[],
@@ -6996,7 +7261,7 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[],
+            retired: RetirementAssessment::Assessed(&[]),
             sessions,
             questions,
             rules: &[],
@@ -7042,6 +7307,119 @@ mod tests {
         assert_eq!(
             items[0].kind().id(),
             CaveatKind::RetiredAccountNotEmpty.code()
+        );
+    }
+
+    /// The item publishes the narrowest of its three floors, and each
+    /// resolution publishes its own (`iaam-woeh`).
+    ///
+    /// This is the item the finding was filed on. `ingest_operations` keeps
+    /// [`Scope::Agent`] and the other two keep [`Scope::Owner`], so a single
+    /// grading had to lie in one direction or the other; it said `owner`, and
+    /// an agent filtering the queue by its own scope dropped the item and never
+    /// reached the call it could in fact make.
+    #[test]
+    fn the_retirement_item_admits_an_agent_to_the_one_call_that_admits_one() {
+        let term = named("Term");
+        let actions = queue_for_retirement(&term, &[ceased(term.id, false)]);
+        let items = retired_items(&actions);
+
+        assert_eq!(
+            items[0].required_scope(),
+            Some(Scope::Agent),
+            "the ordinary remedy admits an agent, so the item does"
+        );
+        let floors: Vec<Scope> = items[0]
+            .target()
+            .resolutions()
+            .into_iter()
+            .map(|(operation, _)| required_scope(operation))
+            .collect();
+        assert_eq!(
+            floors,
+            vec![Scope::Agent, Scope::Owner, Scope::Owner],
+            "the three ways out do not want one authority"
+        );
+    }
+
+    /// A journal that will not fold produces an item, not a failed request
+    /// (`iaam-4jso`).
+    ///
+    /// Three things at once, because they are one promise: the request
+    /// succeeds, the retirement item is **not** raised — nothing is guessed —
+    /// and an item stands in its place saying the question could not be
+    /// answered and naming the call that repairs the journal.
+    #[test]
+    fn a_journal_that_will_not_fold_is_an_item_and_not_a_failed_queue() {
+        let term = named("Term");
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&term),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[],
+            assertions: &[],
+            retired: RetirementAssessment::NotAssessed("event A references non-existent B"),
+            sessions: &[],
+            questions: &[],
+            rules: &[],
+        })
+        .expect("a fold that refused must not take the queue with it");
+
+        assert!(
+            retired_items(&actions).is_empty(),
+            "an unanswerable question must not be answered: {actions:?}"
+        );
+        let item = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::RetirementNotAssessed)
+            .expect("the fold's refusal is published as an item");
+        assert_eq!(item.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(
+            item.category(),
+            ActionCategory::required_for(ActionKind::RetirementNotAssessed)
+        );
+        assert_eq!(
+            item.subject(),
+            None,
+            "the subject is the journal, and no account is what refused"
+        );
+        assert_eq!(item.required_scope(), Some(Scope::Owner));
+        assert_eq!(
+            item.target().resolutions(),
+            vec![(
+                OperationKey::SubmitCorrections,
+                &RequestPlan {
+                    preset: BTreeMap::new(),
+                    missing: vec![
+                        MissingInput::plain("/corrections", ProvidedBy::Owner),
+                        MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                    ],
+                },
+            )]
+        );
+        assert!(
+            item.reason().contains("event A references non-existent B"),
+            "the item names what refused: {}",
+            item.reason()
+        );
+    }
+
+    /// A fold that refused and a fold that found nothing are two states, and
+    /// only one of them raises the item.
+    ///
+    /// The encoding is what makes this checkable: an empty slice would have
+    /// spelled both, and «he has retired nothing» would then have been
+    /// indistinguishable from «nobody could tell».
+    #[test]
+    fn an_owner_who_has_retired_nothing_gets_no_unassessed_item() {
+        let term = named("Term");
+        let actions = queue_for_retirement(&term, &[]);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| action.kind() == ActionKind::RetirementNotAssessed),
+            "{actions:?}"
         );
     }
 
@@ -7148,7 +7526,10 @@ mod tests {
             transfers: &[],
             activity: &[],
             assertions: &[],
-            retired: &[ceased(first.id, false), ceased(second.id, false)],
+            retired: RetirementAssessment::Assessed(&[
+                ceased(first.id, false),
+                ceased(second.id, false),
+            ]),
             sessions: &[],
             questions: &[],
             rules: &[],

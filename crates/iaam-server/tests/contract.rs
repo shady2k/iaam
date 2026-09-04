@@ -17277,6 +17277,333 @@ async fn two_free_sessions_are_two_imports() {
     );
 }
 
+/// Open a free session — one that declares nothing — and feed it rows.
+///
+/// The undeclared shape on purpose: `session_origin` derives a free session's
+/// source from the owner, the account and the channel `session`, so two free
+/// sessions holding rows for one account derive one source. That is what makes
+/// the tests below about the journal's memory rather than about a label.
+async fn free_session_holding(harness: &Harness, rows: &Value) -> String {
+    let (status, opened) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    let (status, held) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": rows }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    session
+}
+
+async fn commit_session(harness: &Harness, session: &str) -> Value {
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    committed
+}
+
+fn delta_list<'a>(plan: &'a Value, section: &str) -> &'a Vec<Value> {
+    plan["commit_delta"][section]
+        .as_array()
+        .unwrap_or_else(|| panic!("commit_delta.{section}: {plan}"))
+}
+
+/// A row the source identified is a duplicate in the plan, not only in the commit.
+///
+/// iaam-1k9t. The journal's own duplicate test asks for the source's operation
+/// identifier first, scoped by the source, and for the idempotency key second.
+/// The assessment asked the second alone, so a row carrying a
+/// `source_operation_id` and no key was published as a fact the commit would
+/// append — and then answered `duplicate` by that same commit. Two readings of
+/// one import that disagree is the defect the single-planner design exists to
+/// prevent, and this is it happening inside the planner.
+///
+/// Every account, amount, date and identifier here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_row_identified_by_its_source_is_a_duplicate_before_the_commit_says_so() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let rows = json!([{
+        "account": account,
+        "type": "deposit",
+        "amount": "300.00",
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-07-03" },
+        "source_operation_id": "statement-row-7",
+    }]);
+    let before = journal_rows(&harness).await;
+
+    let first = free_session_holding(&harness, &rows).await;
+    let committed = commit_session(&harness, &first).await;
+    assert_eq!(
+        committed["rows"][0]["verdict"], "provisional",
+        "{committed}"
+    );
+
+    // A second session, undeclared exactly as the first, holding the same row.
+    let second = free_session_holding(&harness, &rows).await;
+    let plan = assessment_of(&harness, &second).await;
+    assert!(
+        delta_list(&plan, "facts").is_empty(),
+        "the journal already holds this row under the identifier its source printed: {plan}"
+    );
+    assert_eq!(
+        delta_list(&plan, "duplicates").len(),
+        1,
+        "and the plan must say so before the commit does: {plan}"
+    );
+    assert!(
+        delta_list(&plan, "resembles_recorded").is_empty(),
+        "a row recognised by a key is never also reported as merely resembling one: {plan}"
+    );
+
+    let committed = commit_session(&harness, &second).await;
+    assert_eq!(
+        committed["rows"][0]["verdict"], "duplicate",
+        "the commit must confirm what the plan said, not contradict it: {committed}"
+    );
+    assert_eq!(
+        journal_rows(&harness).await,
+        before + 1,
+        "one statement fed twice is one movement"
+    );
+}
+
+/// A row that names no identity at all is disclosed, never merged and never
+/// silently repeated.
+///
+/// iaam-1k9t, the residue. Such a row can be recognised by no key, and inventing
+/// one over its contents would merge two genuine payments of one amount on one
+/// day — the case §10.6 forbids merging, and the merge would be invisible. So
+/// the plan states what it saw: level five, `resembles_recorded`, the recorded
+/// event beside it, and a readiness word that says the owner must look. The row
+/// is still appended, because nothing here is evidence.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_row_naming_no_identity_is_disclosed_and_still_written() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let rows = json!([{
+        "account": account,
+        "type": "withdrawal",
+        "amount": "45.00",
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-07-04" },
+    }]);
+    let before = journal_rows(&harness).await;
+
+    let first = free_session_holding(&harness, &rows).await;
+    let committed = commit_session(&harness, &first).await;
+    assert_eq!(
+        committed["rows"][0]["verdict"], "provisional",
+        "{committed}"
+    );
+    let recorded = committed["rows"][0]["event_id"]
+        .as_str()
+        .expect("the event the first commit wrote")
+        .to_owned();
+
+    let second = free_session_holding(&harness, &rows).await;
+    let plan = assessment_of(&harness, &second).await;
+    assert!(
+        delta_list(&plan, "duplicates").is_empty(),
+        "nothing about this row is a key, so nothing about it is a duplicate: {plan}"
+    );
+    assert_eq!(
+        delta_list(&plan, "facts").len(),
+        1,
+        "and it is appended: a resemblance refuses nothing: {plan}"
+    );
+    let resembling = delta_list(&plan, "resembles_recorded");
+    assert_eq!(resembling.len(), 1, "{plan}");
+    assert_eq!(resembling[0]["resembles"], json!(recorded), "{plan}");
+    assert_eq!(
+        resembling[0]["match_level"],
+        json!(5),
+        "the list must publish that it is the probabilistic level: {plan}"
+    );
+    assert_eq!(
+        plan["readiness"], "requires_owner_decision",
+        "a commit that may put one movement in twice is not `ready`: {plan}"
+    );
+
+    let committed = commit_session(&harness, &second).await;
+    assert_eq!(
+        committed["rows"][0]["verdict"], "provisional",
+        "the disclosure decides nothing: {committed}"
+    );
+    assert_eq!(
+        journal_rows(&harness).await,
+        before + 2,
+        "both were written, and the owner was told before either was"
+    );
+}
+
+/// Two rows of one session that look alike are two facts, and neither is a
+/// resemblance.
+///
+/// The false positive this must not have. `resembles_recorded` compares a
+/// candidate against the **journal**, never against its neighbours in the same
+/// import: a document that prints two identical rows is itself the evidence
+/// that two things happened, which is §10.6's reason for preferring the row
+/// locator to the row's contents.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn two_alike_rows_in_one_import_are_two_facts_and_no_resemblance() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let row = json!({
+        "account": account,
+        "type": "withdrawal",
+        "amount": "12.50",
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-07-05" },
+        "source_operation_id": "coffee-1",
+    });
+    let mut second = row.clone();
+    second["source_operation_id"] = json!("coffee-2");
+
+    let session = free_session_holding(&harness, &json!([row, second])).await;
+    let plan = assessment_of(&harness, &session).await;
+    assert_eq!(delta_list(&plan, "facts").len(), 2, "{plan}");
+    assert!(
+        delta_list(&plan, "resembles_recorded").is_empty(),
+        "a repeat inside one import is what the document itself asserts: {plan}"
+    );
+    assert_eq!(plan["readiness"], "ready", "{plan}");
+}
+
+/// An undeclared session does not collide with another, and the second one says
+/// what the open call could not.
+///
+/// iaam-56vq. `open_session` refuses a second open for a declaration whose
+/// session already holds rows. An undeclared open declares nothing, so it
+/// matches nothing and is not refused — and this test pins that as a decision
+/// rather than leaving it as an accident.
+///
+/// It is kept because no honest refusal is available at that moment. The store
+/// opens a fresh session for every undeclared open, so nothing is mixed into a
+/// statement somebody is half-way through answering; and the only refusal that
+/// could be written — «you have another undeclared session open» — names
+/// nothing the two have in common, because an undeclared session has no account
+/// until its rows arrive. It would fire between an export of one institution
+/// and an export of another, which is the documented use of a free session.
+///
+/// What must hold instead is the second half: the moment the first session
+/// commits, the second one's assessment stops calling its rows a clean gain.
+///
+/// Every account, amount and date here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_second_undeclared_session_opens_and_its_assessment_names_the_repeat() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let rows = json!([{
+        "account": account,
+        "type": "deposit",
+        "amount": "700.00",
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-07-06" },
+    }]);
+
+    let first = free_session_holding(&harness, &rows).await;
+    // Opened while the first holds rows, and not refused: there is no
+    // declaration for the refusal to be keyed on.
+    let second = free_session_holding(&harness, &rows).await;
+    assert_ne!(
+        first, second,
+        "an undeclared open must never hand back a session already holding rows"
+    );
+
+    // Before either commits there is nothing true to say: neither session's rows
+    // are in the journal, and two sessions holding one statement is not yet a
+    // defect.
+    let early = assessment_of(&harness, &second).await;
+    assert!(
+        delta_list(&early, "resembles_recorded").is_empty(),
+        "nothing is recorded yet, so nothing resembles anything: {early}"
+    );
+    assert_eq!(early["readiness"], "ready", "{early}");
+
+    commit_session(&harness, &first).await;
+
+    let late = assessment_of(&harness, &second).await;
+    assert_eq!(
+        delta_list(&late, "resembles_recorded").len(),
+        1,
+        "committing the first makes the second's rows a repeat, and it must say so: {late}"
+    );
+    assert_eq!(late["readiness"], "requires_owner_decision", "{late}");
+    assert!(
+        late["readiness_detail"]
+            .as_str()
+            .expect("readiness detail")
+            .contains("resembles_recorded"),
+        "the word must name the section that explains it: {late}"
+    );
+}
+
+/// A declared session still refuses the second open, and the two answers are
+/// consistent.
+///
+/// The other side of the decision above: nothing here weakens the refusal that
+/// exists. A caller that declares gets it; a caller that declares nothing gets a
+/// session and an assessment that will not stay quiet.
+///
+/// Every account, amount, date and label here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_declared_session_holding_rows_still_refuses_the_second_open() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let declaration = json!({
+        "source": { "account": account, "channel": "file", "label": "july" }
+    });
+
+    let session = session_holding(
+        &harness,
+        account,
+        "july",
+        json!([{
+            "account": account,
+            "type": "deposit",
+            "amount": "800.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-07-07" },
+            "idempotency_key": "july-1",
+        }]),
+    )
+    .await;
+
+    let (status, refused) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &declaration),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert!(
+        refused.to_string().contains(&session),
+        "the refusal must name the session already under way: {refused}"
+    );
+}
+
 /// A declaration without a label reaches the session it already opened.
 ///
 /// iaam-zv54, the second fact. Recognition was keyed on the import, which a

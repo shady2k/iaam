@@ -12,7 +12,7 @@
 //! session already holds, and [`abandon_session`] does not read or write the
 //! journal at all.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::batch::{
     self, BatchMovement, BatchTotal, ControlCheck, ControlComparison, ControlSection,
@@ -534,6 +534,11 @@ pub async fn resolve_declared_account(
 /// import, so the worst a race produces is the old answer — a session handed
 /// back that acquired its first row in between.
 ///
+/// **Only a declaration reaches this refusal**, and an undeclared open reaches
+/// nothing: `standing_session` answers `None` for it, so two free sessions
+/// can hold one statement at once. That is deliberate and its reasoning is on
+/// that function, together with where the condition is caught instead.
+///
 /// `account` is what the declaration resolved to, and it is stored on the
 /// session rather than left in this request. `source` and `import` are both
 /// one-way hashes of it, so a session that kept only those could not say
@@ -631,6 +636,45 @@ fn session_origin(owner: OwnerId, session: &ImportSessionView, account: AccountI
 /// Sorted oldest first rather than read in the store's listing order, which is
 /// newest first: a source may have several open sessions, because the defect
 /// this fixes produced them, and the store recognises the oldest.
+///
+/// # A declaration naming neither is found by nothing, and stays that way
+///
+/// `(None, None)` answering `None` means an undeclared open bypasses
+/// [`half_imported_refusal`] entirely: two undeclared sessions can hold one
+/// statement at the same time, and each will commit it (iaam-56vq). Weighed and
+/// kept, and the reasons are worth writing down because the arm looks like an
+/// oversight.
+///
+/// **There is no import for it to be half-way through.** The refusal above is
+/// about one *declared import*: the store hands the same session back for the
+/// same declaration, so a second open would mix a second file's rows into a
+/// statement somebody is part-way through answering questions about. An
+/// undeclared open declares no import and the store opens a fresh session every
+/// time, exactly as it documents — so nothing is mixed, and the harm the
+/// refusal prevents does not arise here. What can go wrong is a different
+/// thing: two sessions, two commits, one statement in the journal twice.
+///
+/// **The refusal could not be written truthfully.** An undeclared session does
+/// have a stable identity — [`session_origin`] derives it — but not at the
+/// moment this runs: the identity is keyed on an account, the rows have not
+/// arrived, and the declaration is what would have named one. So the only
+/// refusal available is «you have another undeclared session open, holding
+/// rows», which names nothing the two have in common. It would fire between an
+/// export of one institution and an export of another, and a free session is
+/// opened without a declaration *precisely* so that an institution-wide export
+/// is one session and not four. A refusal that is wrong every time the owner
+/// does the thing the mechanism exists for is worse than the hole it closes.
+///
+/// **What catches it instead is the assessment, at the moment it becomes
+/// true.** Two open sessions holding one statement is not yet a defect;
+/// committing both is. After the first commit the second session's rows are
+/// measured against a journal that now holds them: recognised by key as
+/// [`CommitDelta::duplicates`] — including across the two sessions, since
+/// [`session_origin`] derives one source per account and the source operation
+/// identifier is scoped by it — and, where the rows carry no key at all, named
+/// in [`CommitDelta::resembles_recorded`] with the readiness word to match.
+/// That is later than a refusal and it is the first point at which anything
+/// true can be said.
 async fn standing_session(
     services: &AppServices,
     principal: &Principal,
@@ -1957,6 +2001,56 @@ pub struct PlannedFact {
     pub idempotency_key: Option<String>,
 }
 
+/// A row the journal can prove nothing about, and which looks like a fact it
+/// already holds.
+///
+/// **Not a duplicate, and never folded into one.** [`CommitDelta::duplicates`]
+/// is the hard finding: the journal holds this row's key, the commit answers
+/// `duplicate`, nothing is appended. This is the soft one — §10.6's level five,
+/// [`DedupLevel::Probabilistic`], «looks like a duplicate, but there is no
+/// evidence» — and the commit **will** append it. The two oblige a reader
+/// differently, so they are two lists.
+///
+/// # Why this and not a key derived for the row
+///
+/// A row fed to a session that names no idempotency key and no source operation
+/// identifier could never be recognised as a duplicate at all (iaam-1k9t), and
+/// three ways of giving it a key were weighed:
+///
+/// - **A key over the row's contents.** Two genuine payments of one amount on
+///   one day to one place are an ordinary thing, and §10.6 forbids merging
+///   them. Such a key would merge them, silently, in the direction that loses a
+///   movement that really happened — a wrong answer nobody can see, which is
+///   worse than the duplicate it prevents.
+/// - **A key over where the row sits in this session.** The session identifier
+///   is different in every session, so two sessions holding one statement would
+///   derive two different keys and the check would answer «fresh» to exactly
+///   the case that motivated it. It protects against re-feeding one session,
+///   which the store's own `row_key` already does, and against nothing else.
+/// - **A key over the document and the locator**, as `csv_source::parse`
+///   stamps. That one is sound and is already had: a row stating a locator
+///   carries it as `source_operation_id`, which is level **one** and is now
+///   compared. What is left over is the row that states no locator either, and
+///   for it the document is not a digest of anything — it is a name the caller
+///   typed, and two months of statements saved under one name would collide at
+///   every row.
+///
+/// What is left is to say what was seen and let the owner decide, which is what
+/// [`DedupDecision::PossibleDuplicate`] has meant since §10.6 was written and
+/// what no caller had ever been shown.
+///
+/// [`DedupLevel::Probabilistic`]: iaam_ingest::dedup::DedupLevel::Probabilistic
+/// [`DedupDecision::PossibleDuplicate`]: iaam_ingest::dedup::DedupDecision::PossibleDuplicate
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResemblingRow {
+    /// The fact this row would append — and does append: nothing here stops it.
+    pub fact: PlannedFact,
+    /// The recorded event it looks like: the earliest, where several share the
+    /// shape, so that the plan does not depend on the journal's insertion
+    /// order.
+    pub resembles: EventId,
+}
+
 /// What the journal gains, and what it does not.
 ///
 /// Every list here is a list of rows, and beside two of them is what those rows
@@ -1974,11 +2068,35 @@ pub struct PlannedFact {
 pub struct CommitDelta {
     /// Facts that would be appended.
     pub facts: Vec<PlannedFact>,
-    /// Rows whose idempotency key the owner's journal already holds. They commit
-    /// to a `duplicate` verdict and add nothing — which is correct, and is also
-    /// exactly what «every verdict was positive and half the rows are not in the
-    /// report» looked like from the outside.
+    /// Rows the owner's journal already holds under a key of theirs. They
+    /// commit to a `duplicate` verdict and add nothing — which is correct, and
+    /// is also exactly what «every verdict was positive and half the rows are
+    /// not in the report» looked like from the outside.
+    ///
+    /// **Both key levels the store consults, in the store's order**
+    /// (iaam-1k9t). `find_duplicate` matches the source's own operation
+    /// identifier first, scoped by the source, and the idempotency key second,
+    /// scoped by the owner. This list was computed from the second alone, so a
+    /// row carrying the source's identifier and no key was published here as a
+    /// **fact** and then answered `duplicate` by the very commit this plan is
+    /// the description of. See `RecordedIdentities`.
     pub duplicates: Vec<PlannedFact>,
+    /// Rows the journal holds no key for, and whose shape it already holds.
+    ///
+    /// The list `duplicates` cannot contain and must never grow to absorb:
+    /// those rows append nothing, and these ones will. They are counted in
+    /// `facts` and in `fact_totals` for that reason — the totals say what the
+    /// journal gains, and it gains these.
+    ///
+    /// Separate for the reason `facts`, `duplicates`, `retained_unrecorded` and
+    /// `settled_without_fact` are separate: a reader acts differently on each.
+    /// Separate above all because folding a guess into a finding makes the
+    /// finding a guess, and `duplicates` is the one list here whose meaning is
+    /// arithmetic the owner need not check.
+    ///
+    /// Empty is the ordinary case, and a non-empty one is not an accusation.
+    /// See [`ResemblingRow`].
+    pub resembles_recorded: Vec<ResemblingRow>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRow>,
     /// Rows the commit read and deliberately recorded nothing for.
@@ -2093,9 +2211,21 @@ pub enum Readiness {
     /// legs separately, which is the state the journal is in today and is not a
     /// fabrication. It is still reported, because committing without looking is
     /// how the two legs came to be unrelated in the first place.
+    ///
+    /// The third counter is the same argument about a heavier consequence. A
+    /// row whose shape the journal already holds under no key of its own
+    /// (`commit_delta.resembles_recorded`) commits by default too, and what it
+    /// writes may be one movement recorded twice. It does not refuse, for the
+    /// reason it is only a count and not a verdict: two genuine payments of one
+    /// amount on one day have this exact shape, and a refusal that fired on
+    /// them would refuse honest imports and teach its reader to wave the flag
+    /// through. What the word does is make «I committed without looking» a
+    /// thing the owner cannot say afterwards.
     RequiresOwnerDecision {
         unanswered_questions: usize,
         transfer_candidates: usize,
+        /// Rows in `commit_delta.resembles_recorded`.
+        rows_resembling_recorded: usize,
     },
     /// Every row is readable and answered, and the batch does not agree with the
     /// control figures its own source printed.
@@ -2199,6 +2329,21 @@ impl Readiness {
 /// is probably not a verdict: every planned fact is already published here with
 /// its amount and its currency, so what such a source lacks is a reader, not a
 /// suspicion computed on its behalf.
+///
+/// # What it does say, and why that is not the same thing
+///
+/// `commit_delta.resembles_recorded` looks like the mark refused above and is
+/// its opposite in the one way that decides it: **it is a comparison.** The
+/// magnitude mark compared a row against a distribution nobody asserted. This
+/// compares a candidate against a fact the journal holds, by the canonical
+/// fingerprint `normalize` already stamps, and states the event it matched. It
+/// says what it compared, it assumes nothing, and the reader can go and look at
+/// both.
+///
+/// It is still a guess about what the owner should do, which is why it lives in
+/// a list of its own and never inside `duplicates`, why it refuses nothing, and
+/// why the level it belongs to — §10.6's fifth, the probabilistic one — is
+/// published beside every row of it.
 pub async fn plan_session(
     services: &AppServices,
     principal: &Principal,
@@ -2211,17 +2356,17 @@ pub async fn plan_session(
         .store
         .list_account_scope_exclusions(principal.owner)
         .await?;
-    // The keys the journal already holds, so the plan can say which rows will
-    // commit to `duplicate` rather than to a fact. Read here rather than at
-    // commit for the reason the whole split exists: what commit will do is what
-    // the owner is entitled to read before it does it.
-    let recorded_keys: BTreeSet<String> = services
-        .store
-        .load_events_through(principal.owner, time::Date::MAX)
-        .await?
-        .into_iter()
-        .filter_map(|event| event.idempotency_key)
-        .collect();
+    // What the journal already holds, in the terms the write path recognises:
+    // so the plan can say which rows will commit to `duplicate` rather than to
+    // a fact, and which carry no identity it can decide on at all. Read here
+    // rather than at commit for the reason the whole split exists: what commit
+    // will do is what the owner is entitled to read before it does it.
+    let recorded = RecordedIdentities::of(
+        &services
+            .store
+            .load_events_through(principal.owner, time::Date::MAX)
+            .await?,
+    );
 
     let mut candidates = Vec::with_capacity(contents.observations.len());
     let mut dispositions = Vec::with_capacity(contents.observations.len());
@@ -2309,6 +2454,11 @@ pub async fn plan_session(
 
     let mut facts = Vec::new();
     let mut duplicates = Vec::new();
+    // Rows the journal holds no key for and whose shape it already holds. They
+    // are in `facts` as well, because the commit appends them; this list is
+    // what the owner reads before deciding whether it should. See
+    // [`ResemblingRow`].
+    let mut resembling: Vec<ResemblingRow> = Vec::new();
     let mut retained = Vec::new();
     // Rows this commit was handed and will not take, in the shape a coverage
     // gap names them (iaam-bufs). Collected in the same pass as everything
@@ -2333,13 +2483,19 @@ pub async fn plan_session(
         match candidate {
             Ok(event) => {
                 let fact = planned_fact(read, event);
-                if fact
-                    .idempotency_key
-                    .as_deref()
-                    .is_some_and(|key| recorded_keys.contains(key))
-                {
+                if recorded.holds(event) {
                     duplicates.push(fact);
                 } else {
+                    // Level five is asked only of a row the two key levels
+                    // above said nothing about — `dedup::assess`'s own order,
+                    // so a row already known to be recorded is never also
+                    // reported as merely resembling one.
+                    if let Some(existing) = recorded.resembling(event) {
+                        resembling.push(ResemblingRow {
+                            fact: fact.clone(),
+                            resembles: existing,
+                        });
+                    }
                     facts.push(fact);
                 }
             }
@@ -2394,6 +2550,7 @@ pub async fn plan_session(
         duplicate_totals: batch_totals(&duplicates)?,
         facts,
         duplicates,
+        resembles_recorded: resembling,
         retained_unrecorded: retained,
         settled_without_fact,
     };
@@ -2430,7 +2587,16 @@ pub async fn plan_session(
     // same finding wearing another shape, that the figures and the rows are not
     // about the same thing, and it reaches the same flag on the same call. Last
     // the unconfirmed transfer candidates, which commit by default and change
-    // what the journal *relates*, not what it holds.
+    // what the journal *relates*, not what it holds — and beside them the rows
+    // whose shape the journal already holds under no key of theirs, which
+    // commit by default too.
+    //
+    // The resemblance is last and not first although it is the one thing here
+    // that can put a movement in the journal twice. It is level five of §10.6:
+    // it proves nothing, it is true of two genuine payments of one amount on
+    // one day, and it is right about neither of them. A word that let a guess
+    // speak over an unanswered question or a figure that disagrees would teach
+    // its reader to skip the word.
     //
     // Nothing is hidden by the ordering: every section is published whatever the
     // readiness says, and `control_reconciliation` states both numbers of every
@@ -2448,16 +2614,20 @@ pub async fn plan_session(
         Readiness::RequiresOwnerDecision {
             unanswered_questions: open_questions.len(),
             transfer_candidates: cross_source_matching.candidates.len(),
+            rows_resembling_recorded: commit_delta.resembles_recorded.len(),
         }
     } else if mismatched_figures > 0 || misplaced_rows > 0 {
         Readiness::DoesNotReconcile {
             mismatched_figures,
             misplaced_rows,
         }
-    } else if !cross_source_matching.candidates.is_empty() {
+    } else if !cross_source_matching.candidates.is_empty()
+        || !commit_delta.resembles_recorded.is_empty()
+    {
         Readiness::RequiresOwnerDecision {
             unanswered_questions: 0,
             transfer_candidates: cross_source_matching.candidates.len(),
+            rows_resembling_recorded: commit_delta.resembles_recorded.len(),
         }
     } else {
         Readiness::Ready
@@ -2495,6 +2665,122 @@ pub async fn plan_session(
         },
         candidates,
     })
+}
+
+/// What the owner's journal already holds, in the terms the plan must answer in.
+///
+/// Built once per plan, out of the journal load the plan already makes, and
+/// asked about every candidate. Three fields, and the line between the first
+/// two and the third is the line between a duplicate and a disclosure.
+///
+/// **`keys` and `operations` are the write path's own test, not a second one.**
+/// The store's `find_duplicate` looks for the source operation identifier
+/// first, scoped by the source, and only then for the idempotency key, scoped
+/// by the owner. This plan asked the second alone (iaam-1k9t), so a row
+/// carrying the source's own identifier and no key was published as a fact and
+/// then answered `duplicate` by the very commit the plan is the description of
+/// — the assessment and the commit disagreeing about the one thing the
+/// assessment exists to settle. Both levels are asked here, in that order and
+/// with that scoping, because two answers to «is this row already recorded» is
+/// how they come to differ.
+///
+/// The scoping is what makes the answer travel between sessions. A source is
+/// [`SourceId::declared`] on the owner, the account and the channel, and
+/// [`session_origin`] derives an undeclared session's from those three and
+/// nothing else — so two sessions holding one statement for one account derive
+/// **one** source, and a row identified by its source's operation identifier is
+/// recognised across both. That is the half of «the same statement must not
+/// enter twice» that a key can carry.
+///
+/// **`fingerprints` is not a key and decides nothing.** It is §10.6's level
+/// five — [`DedupLevel::Probabilistic`], «looks like a duplicate, but there is
+/// no evidence» — and it is the only thing that can be said about a row whose
+/// caller named no identity at all. It is keyed on
+/// [`Provenance::raw_hash`], which is what `normalize` stamps and what
+/// [`iaam_ingest::dedup::fingerprint`] computes: the canonical form of the
+/// account, the kind and the dates, deliberately excluding both submission
+/// identifiers so that one operation sent under two different keys has one
+/// fingerprint. Level five has been specified and implemented since §10.6 was
+/// written and had reached no caller; this is where it reaches one, as a list
+/// the owner reads and never as a decision taken for him.
+///
+/// The earliest event wins where several share a fingerprint. Two genuine
+/// identical purchases on one day have one fingerprint between them — which is
+/// exactly why level five is a hint — and naming the later one would make the
+/// plan depend on the journal's insertion order, so the revision stamp would
+/// move under a session nobody touched.
+///
+/// [`DedupLevel::Probabilistic`]: iaam_ingest::dedup::DedupLevel::Probabilistic
+/// [`Provenance::raw_hash`]: iaam_core::event::provenance::Provenance::raw_hash
+/// [`SourceId::declared`]: iaam_core::ids::SourceId::declared
+struct RecordedIdentities {
+    /// Every idempotency key in the journal. Scoped to the owner, as the
+    /// store's lookup on this column is.
+    keys: BTreeSet<String>,
+    /// Every source operation identifier, beside the source it is unique
+    /// within. The pair and not the identifier, because an identifier is unique
+    /// **within a source**: comparing two across sources suppresses a
+    /// legitimate fact (§10.6).
+    operations: BTreeSet<(SourceId, String)>,
+    /// The earliest event carrying each canonical fingerprint.
+    fingerprints: BTreeMap<String, EventId>,
+}
+
+impl RecordedIdentities {
+    fn of(events: &[iaam_core::event::Event]) -> Self {
+        let mut keys = BTreeSet::new();
+        let mut operations = BTreeSet::new();
+        let mut fingerprints: BTreeMap<String, EventId> = BTreeMap::new();
+        for event in events {
+            if let Some(key) = &event.idempotency_key {
+                keys.insert(key.clone());
+            }
+            if let Some(operation) = event.provenance.source_operation_id() {
+                operations.insert((event.provenance.source(), operation.to_owned()));
+            }
+            // `load_events_through` answers in effective order, so the first
+            // entry for a fingerprint is the earliest event that carries it.
+            fingerprints
+                .entry(event.provenance.raw_hash().as_str().to_owned())
+                .or_insert(event.id);
+        }
+        Self {
+            keys,
+            operations,
+            fingerprints,
+        }
+    }
+
+    /// Whether the journal already holds this candidate under a key of its own.
+    ///
+    /// The store's own two levels, in the store's own order. A third level
+    /// there — the event identifier — is not asked, because the identifier is
+    /// minted for this candidate and can name nothing already written.
+    fn holds(&self, event: &iaam_core::event::Event) -> bool {
+        if let Some(operation) = event.provenance.source_operation_id()
+            && self
+                .operations
+                .contains(&(event.provenance.source(), operation.to_owned()))
+        {
+            return true;
+        }
+        event
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| self.keys.contains(key))
+    }
+
+    /// The recorded event this candidate looks like, on the evidence of nothing
+    /// but its own shape.
+    ///
+    /// Asked only of a candidate [`Self::holds`] answered `false` about, which
+    /// is [`iaam_ingest::dedup::assess`]'s own order: a row already known to be
+    /// recorded is never also reported as merely resembling something.
+    fn resembling(&self, event: &iaam_core::event::Event) -> Option<EventId> {
+        self.fingerprints
+            .get(event.provenance.raw_hash().as_str())
+            .copied()
+    }
 }
 
 /// One row, read once and used by every section.
@@ -2851,6 +3137,9 @@ fn fingerprint(
     }
     for fact in &delta.duplicates {
         let _ = writeln!(rendered, "duplicate {fact:?}");
+    }
+    for resembling in &delta.resembles_recorded {
+        let _ = writeln!(rendered, "resembles {resembling:?}");
     }
     for retained in &delta.retained_unrecorded {
         let _ = writeln!(rendered, "retained {retained:?}");
@@ -5345,5 +5634,151 @@ mod tests {
         let contents = session_with(row(account(1), "Savings", None), Some(Answer::Paid), None);
         let described = generalisation_of(&contents.observations, &contents.questions[0]);
         assert_eq!(described.code(), "available");
+    }
+}
+
+/// The identity index the plan asks about every candidate (iaam-1k9t).
+///
+/// Every account, amount, date and identifier below is invented (CLAUDE.md).
+#[cfg(test)]
+mod recorded_identities {
+    use super::*;
+    use iaam_ingest::operation::{OperationDates, OperationKind};
+    use time::macros::date;
+
+    fn owner() -> OwnerId {
+        OwnerId(uuid::Uuid::from_bytes([1; 16]))
+    }
+
+    fn account() -> AccountId {
+        AccountId(uuid::Uuid::from_bytes([2; 16]))
+    }
+
+    fn source(byte: u8) -> SourceId {
+        SourceId(uuid::Uuid::from_bytes([byte; 16]))
+    }
+
+    /// One recorded movement.
+    fn recorded(
+        source: SourceId,
+        source_operation_id: Option<&str>,
+        idempotency_key: Option<&str>,
+        amount_minor: i64,
+    ) -> iaam_core::event::Event {
+        let operation = SubmittedOperation {
+            account: account(),
+            kind: OperationKind::Deposit {
+                amount_minor,
+                currency: CurrencyCode::Rub,
+            },
+            dates: OperationDates {
+                cash_posted: Some(date!(2025 - 03 - 02)),
+                ..OperationDates::default()
+            },
+            source_time: None,
+            idempotency_key: idempotency_key.map(str::to_owned),
+            source_operation_id: source_operation_id.map(str::to_owned),
+            source_category: None,
+            description: None,
+        };
+        normalize(
+            &operation,
+            NormalizationContext {
+                owner: owner(),
+                source,
+            },
+        )
+        .expect("a movement this test states completely")
+        .event
+    }
+
+    #[test]
+    fn a_row_the_source_identified_is_held_although_it_names_no_key() {
+        let journal = [recorded(source(3), Some("row-7"), None, 100)];
+        let identities = RecordedIdentities::of(&journal);
+        assert!(
+            identities.holds(&recorded(source(3), Some("row-7"), None, 100)),
+            "the store matches this identifier first, and the plan must match it too"
+        );
+    }
+
+    #[test]
+    fn one_operation_identifier_under_two_sources_is_two_facts() {
+        // §10.6: an operation identifier is unique **within** a source, so
+        // comparing two across sources suppresses a legitimate fact. This is
+        // the property that makes the pair the key and not the string.
+        let journal = [recorded(source(3), Some("row-7"), None, 100)];
+        let identities = RecordedIdentities::of(&journal);
+        assert!(!identities.holds(&recorded(source(4), Some("row-7"), None, 100)));
+    }
+
+    #[test]
+    fn a_key_the_journal_holds_is_held_whatever_the_source() {
+        // The other scoping, and it is deliberately different: the idempotency
+        // key is the owner's namespace, not the source's.
+        let journal = [recorded(source(3), None, Some("statement-1"), 100)];
+        let identities = RecordedIdentities::of(&journal);
+        assert!(identities.holds(&recorded(source(4), None, Some("statement-1"), 100)));
+    }
+
+    #[test]
+    fn a_row_naming_neither_is_never_held() {
+        let journal = [recorded(source(3), None, None, 100)];
+        let identities = RecordedIdentities::of(&journal);
+        assert!(
+            !identities.holds(&recorded(source(3), None, None, 100)),
+            "nothing about this row is a key, so nothing about it may be a duplicate"
+        );
+    }
+
+    #[test]
+    fn a_row_naming_neither_still_resembles_what_the_journal_holds() {
+        // The whole of the disclosure: the shape is all there is, and the shape
+        // is enough to tell the owner about and never enough to decide on.
+        let journal = [recorded(source(3), None, None, 100)];
+        let identities = RecordedIdentities::of(&journal);
+        assert_eq!(
+            identities.resembling(&recorded(source(3), None, None, 100)),
+            Some(journal[0].id)
+        );
+    }
+
+    #[test]
+    fn a_row_of_another_amount_resembles_nothing() {
+        let journal = [recorded(source(3), None, None, 100)];
+        let identities = RecordedIdentities::of(&journal);
+        assert_eq!(
+            identities.resembling(&recorded(source(3), None, None, 101)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_key_a_row_carries_does_not_stop_it_resembling_another_fact() {
+        // A file re-imported after one row was corrected carries new derived
+        // keys for every row, so the unchanged ones are fresh by key and are
+        // about to be written twice. The resemblance is the only thing that
+        // says so.
+        let journal = [recorded(source(3), None, Some("first-import-row-1"), 100)];
+        let identities = RecordedIdentities::of(&journal);
+        let again = recorded(source(3), None, Some("second-import-row-1"), 100);
+        assert!(!identities.holds(&again));
+        assert_eq!(identities.resembling(&again), Some(journal[0].id));
+    }
+
+    #[test]
+    fn the_earliest_event_sharing_a_shape_is_the_one_named() {
+        // Two genuine identical payments have one fingerprint between them.
+        // Naming the later one would make the plan — and therefore the revision
+        // stamp — depend on the order the journal happened to be read in.
+        let journal = [
+            recorded(source(3), None, Some("one"), 100),
+            recorded(source(3), None, Some("two"), 100),
+        ];
+        let identities = RecordedIdentities::of(&journal);
+        assert_eq!(
+            identities.resembling(&recorded(source(3), None, Some("three"), 100)),
+            Some(journal[0].id)
+        );
     }
 }

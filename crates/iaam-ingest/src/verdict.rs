@@ -202,7 +202,7 @@ macro_rules! verdict_vocabulary {
             NeedsReconciliation => "needs_reconciliation":
                 "Reserved, and no path emits it. Nothing is ever declined for want of an owner remainder: the rows are recorded, and the need for a remainder is derived from them afterwards, per account and interval. Do not wait for this code — the request for the figure is published by the action queue as `provide_control_assertion`, naming the account, the interval and which end of it the balance is wanted at.",
             Duplicate => "duplicate":
-                "Nothing new was recorded: the idempotency key already recorded this fact, and the existing event is returned.",
+                "Nothing new was recorded: the journal already holds this fact under an identity the row itself carries, and the existing event is returned. Two identities produce it, and they are checked in this order: the source's own operation identifier, which is unique within one source, and then the idempotency key the caller named, which is unique within the owner. A row carrying neither cannot earn this code — two identical payments on one day are an ordinary thing, and nothing may merge them — so an import session's assessment lists such a row separately, as one that resembles a recorded fact, and leaves the decision to the owner.",
             NeedsClassification => "needs_classification":
                 "Nothing was recorded: the classification is ambiguous and an answer from the owner is required.",
             Unsupported => "unsupported":

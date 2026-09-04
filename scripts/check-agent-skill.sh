@@ -10,7 +10,8 @@
 # CANNOT make the claim. A running instance answers what it serves through
 # `/.well-known/api-catalog` and the contract behind it; the document explains
 # meaning. So this guard refuses a versioned route path, an HTTP method spelled
-# as an instruction, and an HTTP status code, anywhere in that file.
+# as an instruction, and an HTTP status code, anywhere in the skill — the entry
+# file and every companion file it names alike.
 #
 # Like the privacy guard, it checks SHAPES. It needs no list of routes, so it
 # cannot itself go stale when the API changes — which is the whole point.
@@ -22,9 +23,21 @@ if ! REPO_ROOT=$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-top
 fi
 cd "$REPO_ROOT"
 
-DOC="docs/agent-skill/SKILL.md"
+DIR="docs/agent-skill"
+DOC="$DIR/SKILL.md"
 if [ ! -f "$DOC" ]; then
   echo "SKILL: $DOC is missing." >&2
+  exit 1
+fi
+
+# `SKILL.md` is loaded whole and names companion files a caller opens when the
+# work reaches them. A guard over the entry file alone would stop covering most
+# of the skill the moment the first of those was written, so every markdown file
+# in the directory is held to the same three refusals.
+DOCS=()
+while IFS= read -r f; do DOCS+=("$f"); done < <(find "$DIR" -type f -name '*.md' | sort)
+if [ "${#DOCS[@]}" -eq 0 ]; then
+  echo "SKILL: no markdown files under $DIR." >&2
   exit 1
 fi
 
@@ -43,13 +56,15 @@ METHOD_SHAPE='\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b'
 STATUS_SHAPE='\b(200|201|202|204|301|302|304|400|401|403|404|405|409|410|415|422|429|500|501|502|503|504)\b'
 
 check() {
-  local shape=$1 what=$2 remedy=$3 hits
-  hits=$(grep -nE "$shape" "$DOC" || true)
-  if [ -n "$hits" ]; then
-    err "$what in $DOC:"
-    printf '%s\n' "$hits" | head -10 >&2
-    echo "        $remedy" >&2
-  fi
+  local shape=$1 what=$2 remedy=$3 doc hits
+  for doc in "${DOCS[@]}"; do
+    hits=$(grep -nE "$shape" "$doc" || true)
+    if [ -n "$hits" ]; then
+      err "$what in $doc:"
+      printf '%s\n' "$hits" | head -10 >&2
+      echo "        $remedy" >&2
+    fi
+  done
 }
 
 check "$ROUTE_SHAPE" "a route path" \
@@ -84,4 +99,4 @@ if [ "$fail" -ne 0 ]; then
   echo "SKILL: refused." >&2
   exit 1
 fi
-echo "Agent document checked."
+echo "Agent documents checked: ${#DOCS[@]}."

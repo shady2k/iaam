@@ -124,6 +124,76 @@ fn a_declared_session_remembers_the_account_it_was_declared_for() {
     assert_eq!(free.account, None);
 }
 
+/// A key names one account, so the account `open_import_session` drops on reuse
+/// cannot be a different one (iaam-tahg).
+///
+/// This is the invariant stated on the reuse dispatch, asserted where the
+/// dispatch consumes it rather than only where the identifier is computed. It
+/// lives in the derivation and not in this table, which is exactly why the store
+/// can drop the argument — and exactly why nothing here would notice if the
+/// derivation stopped carrying the account.
+///
+/// Both keys are exercised, because the reuse dispatch has two arms and they
+/// rely on the property for the same reason: the source-only arm (iaam-zv54) is
+/// the newer one and the doc comment defending the drop was written before it.
+#[test]
+fn one_declared_key_names_one_account() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let main = AccountId::new_random();
+    let savings = AccountId::new_random();
+
+    let on_main = SourceId::declared(owner, main, "file");
+    let on_savings = SourceId::declared(owner, savings, "file");
+    assert_ne!(
+        on_main, on_savings,
+        "one owner and one channel, two accounts: two sources"
+    );
+
+    let first = store
+        .open_import_session(owner, Some(main), Some(on_main), None)
+        .expect("session opens");
+    let second = store
+        .open_import_session(owner, Some(savings), Some(on_savings), None)
+        .expect("session opens");
+    assert_ne!(
+        first.id, second.id,
+        "a session opened for one account is not handed to a declaration for another"
+    );
+    assert_eq!(first.account, Some(main));
+    assert_eq!(second.account, Some(savings));
+
+    // Re-deriving the key from the same account reaches the session that
+    // already exists, and it still carries the account the dropped argument
+    // named.
+    let again = store
+        .open_import_session(
+            owner,
+            Some(main),
+            Some(SourceId::declared(owner, main, "file")),
+            None,
+        )
+        .expect("the same declaration reaches the same session");
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.account, Some(main));
+
+    // The import arm carries the account the same way, under one label.
+    let march_on_main = ImportId::declared(owner, main, "file", "march");
+    assert_ne!(
+        march_on_main,
+        ImportId::declared(owner, savings, "file", "march"),
+        "one channel and one label, two accounts: two imports"
+    );
+    let labelled = store
+        .open_import_session(owner, Some(main), Some(on_main), Some(march_on_main))
+        .expect("session opens");
+    let labelled_again = store
+        .open_import_session(owner, Some(main), Some(on_main), Some(march_on_main))
+        .expect("the same import reaches the same session");
+    assert_eq!(labelled_again.id, labelled.id);
+    assert_eq!(labelled_again.account, Some(main));
+}
+
 #[test]
 fn a_row_resubmitted_under_its_own_key_occupies_the_row_it_already_had() {
     // Without this the same row opens a second question about the same money,

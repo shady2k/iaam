@@ -2461,6 +2461,7 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
     // would reject the entire document on the account field, and «no account was set up»
     // would become indistinguishable from «the lookup failed».
     let harness = harness();
+    let before = journal_rows(&harness).await;
     let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
         2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,csv-1\n\
         2025-01-02,deposit,No such account,,,,,1000.00,,,RUB,csv-2\n\
@@ -2483,9 +2484,47 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
         .collect();
     assert_eq!(rows, vec![1, 2, 3]);
     assert_eq!(verdicts[0]["verdict"], "provisional");
+    assert_eq!(verdicts[2]["verdict"], "provisional");
+
+    // The refusal is pinned in all three of its fields, not just the one that
+    // says which column failed. This route resolves an account by the title the
+    // document prints and nothing else, so `expected` is the whole of what tells
+    // a caller holding a statement that a number will not do here — and it is
+    // deliberately not the wording `POST /v1/ingest/operations` refuses a row
+    // with, which offers the identifier the source prints as well.
     assert_eq!(verdicts[1]["verdict"], "rejected");
     assert_eq!(verdicts[1]["field"], "account");
-    assert_eq!(verdicts[2]["verdict"], "provisional");
+    assert_eq!(verdicts[1]["expected"], "directory name", "{verdicts:?}");
+    assert_eq!(
+        verdicts[1]["actual"], "No such account",
+        "the refusal quotes the name the document printed, so the owner can see \
+         which cell reached nothing: {verdicts:?}"
+    );
+
+    // And what the resolution did is read back out of the journal rather than
+    // taken from the verdict word: the two readable rows landed, on the account
+    // their name resolved to, and the refused one landed nowhere.
+    assert_eq!(
+        journal_rows(&harness).await,
+        before + 2,
+        "the two rows that named an account were recorded, and only those"
+    );
+    let recorded = journal_events(&harness).await;
+    for key in ["csv-1", "csv-3"] {
+        let row = recorded
+            .iter()
+            .find(|row| row["idempotency_key"] == key)
+            .unwrap_or_else(|| panic!("{key} is in the journal: {recorded:?}"));
+        assert_eq!(
+            row["account"],
+            json!(harness.account.inner()),
+            "the printed name reached the account that bears it: {row}"
+        );
+    }
+    assert!(
+        !journal_keys(&harness).await.contains(&"csv-2".to_owned()),
+        "a rejected row records nothing under its key: {recorded:?}"
+    );
 }
 
 /// The header of iaam's own row format, without the optional
@@ -13141,14 +13180,32 @@ fn directed_row(account: Uuid, key: &str, direction: &str) -> Value {
     row
 }
 
-async fn journal_rows(harness: &Harness) -> usize {
+/// The journal as the API serves it, row by row.
+async fn journal_events(harness: &Harness) -> Vec<Value> {
     let (status, page) = call(
         &harness.router,
         get("/v1/journal/events", Some(&harness.owner_token)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{page}");
-    page["rows"].as_array().expect("journal rows").len()
+    page["rows"].as_array().expect("journal rows").clone()
+}
+
+async fn journal_rows(harness: &Harness) -> usize {
+    journal_events(harness).await.len()
+}
+
+/// The client keys the journal holds, for the rows that carry one.
+///
+/// A count answers «how many were recorded»; a test about one row among several
+/// is asking «which», and the key is the only thing in a journal row that the
+/// caller itself wrote and can therefore name a row by.
+async fn journal_keys(harness: &Harness) -> Vec<String> {
+    journal_events(harness)
+        .await
+        .iter()
+        .filter_map(|row| row["idempotency_key"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The question is a stored resource, not a sentence in a response body.
@@ -14079,6 +14136,11 @@ async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
 /// body at deserialisation and the readable rows beside it were never judged.
 /// §10.1 says an unreadable operation is one row's problem, and this is now one:
 /// the rejection carries `account`, and the row beside it is recorded.
+///
+/// Both halves are read out of the system rather than inferred: the rejection is
+/// asserted field, expected and actual, because those three are the whole of what
+/// a client reads a refusal by; and «recorded» is the journal, not the verdict
+/// word, because a verdict is what the route said and the journal is what it did.
 #[tokio::test]
 async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
     let harness = harness();
@@ -14091,6 +14153,7 @@ async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
         }),
     )
     .await;
+    let before = journal_rows(&harness).await;
 
     let (status, verdicts) = call(
         &harness.router,
@@ -14127,12 +14190,39 @@ async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
     assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
     assert_eq!(verdicts[1]["verdict"], "rejected", "{verdicts}");
     assert_eq!(verdicts[1]["field"], "account", "{verdicts}");
+    assert_eq!(
+        verdicts[1]["expected"],
+        "an account of the owner's, named by its iaam identifier or by the \
+         identifier its source prints for it",
+        "the refusal says what would have been readable, and says it in the \
+         vocabulary the row was written in — a caller that only learns which \
+         string failed learns nothing about what to send instead: {verdicts}"
+    );
     assert!(
         verdicts[1]["actual"]
             .as_str()
             .is_some_and(|actual| actual.contains("an-account-he-never-declared")),
         "the refusal quotes what arrived, so the owner can see which string \
          reached nothing: {verdicts}"
+    );
+
+    // And the claim the verdicts make about the journal is read back out of it.
+    // One row was recorded, and it is the readable one: a verdict of
+    // `provisional` beside a verdict of `rejected` would say exactly this much
+    // even if both rows had been dropped.
+    assert_eq!(
+        journal_rows(&harness).await,
+        before + 1,
+        "the readable row was recorded and the rejected one was not: {verdicts}"
+    );
+    let keys = journal_keys(&harness).await;
+    assert!(
+        keys.contains(&"readable-row".to_owned()),
+        "the row beside the rejected one reached the journal: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"row-naming-nothing".to_owned()),
+        "a rejected row records nothing under its key: {keys:?}"
     );
 }
 

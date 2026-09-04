@@ -911,3 +911,124 @@ fn the_two_words_the_far_side_may_carry_survive_the_wire() {
     }
     assert!(FarSide::parse("own").is_err(), "a near miss is refused");
 }
+
+// --- The same decision put twice (iaam-q5og, decision 0029) ----------------
+//
+// A statement names one shop on thirty lines and every one of them is the same
+// question. What makes them the same is not the row and not the question alone;
+// it is the pair `QuestionSubject` holds, and the half that is easy to leave out
+// is the direction the source stated.
+
+/// Two rows naming one counterparty, both leaving the account, are one decision.
+#[test]
+fn one_counterparty_on_two_rows_that_ran_the_same_way_is_one_decision() {
+    let account = AccountId::new_random();
+    let named = |movement| ClassificationSubject {
+        account,
+        counterparty: Counterparty::Named("Shop One".to_owned()),
+        description: None,
+        source_kind: None,
+        source_category: None,
+        movement: Some(movement),
+        far_side: FarSide::Unstated,
+    };
+    let first = named(Movement::Out);
+    let second = named(Movement::Out);
+    let (
+        ClassificationResult::Ambiguous { question: one },
+        ClassificationResult::Ambiguous { question: two },
+    ) = (classify(&first, &[]), classify(&second, &[]))
+    else {
+        panic!("a named counterparty no rule covers is a question");
+    };
+    assert_eq!(one.about(first.movement), two.about(second.movement));
+}
+
+/// One counterparty, two directions: the question is equal and the decision is not.
+///
+/// This is the whole reason the subject is a pair. `question_for` builds
+/// `IsTransferInternal` for a named counterparty in either direction, so the two
+/// questions here **are** equal — and an answer states a direction of its own
+/// that `resolve_with` records, so carrying one answer across both would file
+/// money that arrived as money that left.
+#[test]
+fn one_counterparty_on_two_rows_the_source_ran_opposite_ways_is_two_decisions() {
+    let account = AccountId::new_random();
+    let named = |movement| ClassificationSubject {
+        account,
+        counterparty: Counterparty::Named("Shop One".to_owned()),
+        description: None,
+        source_kind: None,
+        source_category: None,
+        movement: Some(movement),
+        far_side: FarSide::Unstated,
+    };
+    let paid = named(Movement::Out);
+    let arrived = named(Movement::In);
+    let (
+        ClassificationResult::Ambiguous { question: one },
+        ClassificationResult::Ambiguous { question: two },
+    ) = (classify(&paid, &[]), classify(&arrived, &[]))
+    else {
+        panic!("a named counterparty no rule covers is a question");
+    };
+    assert_eq!(one, two, "the question itself does not distinguish them");
+    assert_ne!(
+        one.about(paid.movement),
+        two.about(arrived.movement),
+        "the decision does"
+    );
+}
+
+/// Two counterparties are two decisions however alike the rows are otherwise.
+#[test]
+fn two_counterparties_are_two_decisions() {
+    let account = AccountId::new_random();
+    let named = |name: &str| ClassificationSubject {
+        account,
+        counterparty: Counterparty::Named(name.to_owned()),
+        description: None,
+        source_kind: None,
+        source_category: None,
+        movement: Some(Movement::Out),
+        far_side: FarSide::Unstated,
+    };
+    let one = named("Shop One");
+    let two = named("Shop Two");
+    let (
+        ClassificationResult::Ambiguous { question: first },
+        ClassificationResult::Ambiguous { question: second },
+    ) = (classify(&one, &[]), classify(&two, &[]))
+    else {
+        panic!("a named counterparty no rule covers is a question");
+    };
+    assert_ne!(first.about(one.movement), second.about(two.movement));
+}
+
+/// The same account asked two different questions is two decisions.
+///
+/// The falsification for reading the account alone: both of these are asked of
+/// one account, neither names a counterparty, and they are opposite questions.
+#[test]
+fn one_account_asked_about_an_outflow_and_an_inflow_is_two_decisions() {
+    let account = AccountId::new_random();
+    let anonymous = |movement| ClassificationSubject {
+        account,
+        counterparty: Counterparty::Unknown,
+        description: None,
+        source_kind: None,
+        source_category: None,
+        movement: Some(movement),
+        far_side: FarSide::Unstated,
+    };
+    let out = anonymous(Movement::Out);
+    let into = anonymous(Movement::In);
+    let (
+        ClassificationResult::Ambiguous { question: first },
+        ClassificationResult::Ambiguous { question: second },
+    ) = (classify(&out, &[]), classify(&into, &[]))
+    else {
+        panic!("an unnamed counterparty no rule covers is a question");
+    };
+    assert_ne!(first.about(out.movement), second.about(into.movement));
+}

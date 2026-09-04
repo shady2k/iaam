@@ -288,11 +288,7 @@ fn missing_input_dto(missing: &MissingInput) -> MissingInputDto {
 /// Rendered from the same value the pointer was derived from, so the field and
 /// the question cannot name two different things.
 fn owner_question_dto(prompt: &OwnerPrompt) -> OwnerQuestionDto {
-    let question = prompt.question();
-    OwnerQuestionDto {
-        ask: question.ask,
-        consequence: question.consequence,
-    }
+    OwnerQuestionDto::from_domain(&prompt.question())
 }
 
 /// One admissible value, and the fields choosing it then needs.
@@ -3652,15 +3648,19 @@ pub async fn answer_import_question(
     let answer = request.to_domain().map_err(|rejection| {
         invalid_field(rejection.field, &rejection.expected, rejection.actual)
     })?;
+    let reach = request.to_reach().map_err(|rejection| {
+        invalid_field(rejection.field, &rejection.expected, rejection.actual)
+    })?;
     let answered = iaam_app::scenarios::import_session::answer_question(
         &state.services,
         &principal,
         ImportSessionId(session),
         ImportQuestionId(question),
         answer,
+        reach,
     )
     .await?;
-    Ok(Json(ImportQuestionDto::from_domain(&answered)))
+    Ok(Json(ImportQuestionDto::from_answered(&answered)))
 }
 
 /// What committing this session would do, before it does it (iaam-k1xa).

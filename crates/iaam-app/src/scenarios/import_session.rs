@@ -30,7 +30,7 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule,
-    ClassificationSubject, Movement, Question, RuleMatcher, classify,
+    ClassificationSubject, Movement, Question, QuestionSubject, RuleMatcher, classify,
 };
 use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
 use iaam_ingest::observation::{Intake, ObservedRow};
@@ -40,8 +40,8 @@ use sha2::{Digest, Sha256};
 
 use crate::AppServices;
 use crate::actions::{
-    AccountCandidate, AccountScope, OperationKey, RequestPlan, ResolutionOption, account_scope,
-    answer_account_candidates, answer_input,
+    AccountCandidate, AccountScope, OperationKey, OwnerQuestion, RequestPlan, ResolutionOption,
+    account_scope, answer_account_candidates, answer_input,
 };
 use crate::error::{AppError, FieldRejection};
 use iaam_ingest::dedup::IdentityScope;
@@ -210,7 +210,7 @@ pub async fn answerable_questions(
         .map(|question| {
             question
                 .is_open()
-                .then(|| serde_json::from_str::<Question>(&question.question).ok())
+                .then(|| stored_question(question))
                 .flatten()
                 .filter(|asked| {
                     asked
@@ -1113,6 +1113,60 @@ pub fn subject_of(
         .map(|observed| observed.subject(None))
 }
 
+/// What was published as answerable when this question was asked.
+///
+/// **One reader, because there are four publishers** (`iaam-ulib`). The ingest
+/// verdict, the held row, the question route and — since decision 0029 — the
+/// session's assessment all say what may be said to one question, and four
+/// readings of one stored string is four chances for a surface to offer a word
+/// the stored question does not admit. `answer_question` refuses such a word, so
+/// the drift would show up as a caller being told to send something the server
+/// then rejects.
+///
+/// **Stored and not recomputed.** `Question::alternatives` answers for the
+/// question *this build* would ask; the stored list is what the owner was
+/// offered. They differ exactly when the vocabulary has changed under a session
+/// that was already open, which is the moment publishing the recomputed list
+/// would offer a word the answer path still measures against the stored one.
+///
+/// A stored list this build cannot read yields none, which is what the callers
+/// that read it have always done with it: a question published with an empty
+/// list says «nothing may be said to this», which is visibly wrong and sends the
+/// reader to the question route, where the same absence is visible.
+#[must_use]
+pub fn stored_alternatives(question: &ImportQuestionView) -> Vec<AnswerShape> {
+    serde_json::from_str(&question.alternatives).unwrap_or_default()
+}
+
+/// The question as it was asked, where this build can still read it.
+///
+/// Lenient, and every caller here is a reader rather than a writer: a stored
+/// question this build cannot parse is a question that can be published, shown
+/// and answered by its stored prompt and alternatives, and only the grouping and
+/// the account candidates are lost. `answer_question` reads the same string
+/// strictly, because writing an answer against a question nobody can read is a
+/// different act.
+#[must_use]
+pub fn stored_question(question: &ImportQuestionView) -> Option<Question> {
+    serde_json::from_str(&question.question).ok()
+}
+
+/// The decision one open question puts, where both halves can be read.
+///
+/// `None` for a question this build cannot parse and for one whose row it cannot
+/// read. Such a question is grouped with nothing and is published alone —
+/// which is the honest answer for a question nobody can compare, and never
+/// «this one is unlike every other», which the absence would otherwise be
+/// mistaken for.
+fn subject_asked(
+    observations: &[ImportObservationView],
+    question: &ImportQuestionView,
+) -> Option<QuestionSubject> {
+    let asked = stored_question(question)?;
+    let row = observed_row(observations, question.row).ok()?;
+    Some(asked.about(row.movement()))
+}
+
 /// Record the owner's answer to one question.
 ///
 /// Three things happen, in this order and for these reasons:
@@ -1136,6 +1190,17 @@ pub fn subject_of(
 /// derivation rather than the fact. The reasoning is at the call, together with
 /// what remains possible now that it cannot be made one transaction.
 ///
+/// **`reach` decides how many rows this settles and never whether a rule is
+/// written** (`iaam-q5og`, decision 0029). [`AnswerReach::ThisRow`] is the
+/// default and is what this call has always done.
+/// [`AnswerReach::EveryLikeRowInThisSession`] records the same answer against
+/// every question still open in this session that is the same decision — a
+/// question equal to this one, about a row the source stated the same direction
+/// for. Those rows are checked before anything is written and the call is
+/// refused whole if one of them cannot take the answer; step 3 above is
+/// unchanged by any of it, and at most one rule is ever written, from the row
+/// the caller addressed.
+///
 /// The journal is not touched. The answer settles what the row is; commit is
 /// what records it.
 ///
@@ -1150,7 +1215,8 @@ pub async fn answer_question(
     session: ImportSessionId,
     question: ImportQuestionId,
     answer: Answer,
-) -> Result<AnswerableQuestion, AppError> {
+    reach: AnswerReach,
+) -> Result<AnsweredQuestions, AppError> {
     require_submit(principal)?;
     let contents = read_session(services, principal, session).await?;
     let stored = contents
@@ -1222,6 +1288,57 @@ pub async fn answer_question(
             actual: rejection.actual,
         })?;
 
+    // The other rows this answer reaches, chosen and checked **before** anything
+    // is written.
+    //
+    // Checked, because a caller saying «and every other row like this one» is
+    // making a claim about those rows, and a claim that is false of one of them
+    // is a wrong request rather than a row to skip. Settling the rest and
+    // silently dropping the one is the failure this module refuses everywhere
+    // else: an import that files what it can and says nothing about what it
+    // could not. The one this catches in practice is an answer naming an own
+    // account which some other row is itself on — `resolve` refuses a transfer
+    // to itself, and that row is not the same decision however alike its
+    // question looks.
+    //
+    // The subject is recomputed here rather than read off the assessment: the
+    // assessment is a rendering the caller may be holding from before the last
+    // row was fed, and what this call settles must be decided from the session
+    // as it now stands.
+    let targets: Vec<&ImportQuestionView> = match reach {
+        AnswerReach::ThisRow => Vec::new(),
+        AnswerReach::EveryLikeRowInThisSession => {
+            let Some(subject) = subject_asked(&contents.observations, stored) else {
+                return Err(FieldRejection::new(
+                    "settles",
+                    "a question this build can still read, for an answer that reaches beyond \
+                     its own row",
+                    "a stored question that could not be read",
+                )
+                .into());
+            };
+            contents
+                .questions
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != question
+                        && candidate.is_open()
+                        && subject_asked(&contents.observations, candidate)
+                            .is_some_and(|of_candidate| of_candidate == subject)
+                })
+                .collect()
+        }
+    };
+    for target in &targets {
+        let row = observed_row(&contents.observations, target.row)?;
+        row.resolve_with(answer)
+            .map_err(|rejection| AppError::Invalid {
+                field: format!("settles/{}", target.row),
+                expected: rejection.expected,
+                actual: rejection.actual,
+            })?;
+    }
+
     // **The answer is written before the rule, and this is iaam-77hk.** It used
     // to be the other way round: the rule was created, and its identifier was
     // passed to the write that recorded the answer. A failure of that second
@@ -1244,10 +1361,35 @@ pub async fn answer_question(
     // caller that sees this call fail must therefore re-read the session rather
     // than repeat the call: the answer may already stand, and answering twice is
     // refused.
+    //
+    // The reach makes one addition to that reasoning and no change to it. The
+    // rows this answer also settles are answered **before** the row it was asked
+    // about, and that order is chosen for recovery rather than for precedence:
+    // every one of them is the owner's own fact, so decision 0027's «his fact
+    // before the derived one» is satisfied whichever comes first among them,
+    // while answering a question twice is refused — so a call that failed
+    // half-way must be repeatable, and it is repeatable only if the question the
+    // caller addresses is the last one written. On a repeat the session is read
+    // again, the rows already settled are no longer open, and they are simply
+    // not among the targets.
+    let payload = json(&answer, "answer")?;
+    let mut also_settled = Vec::with_capacity(targets.len());
+    for target in &targets {
+        also_settled.push(
+            services
+                .store
+                .answer_import_question(principal.owner, session, target.id, payload.clone())
+                .await?,
+        );
+    }
     let answered = services
         .store
-        .answer_import_question(principal.owner, session, question, json(&answer, "answer")?)
+        .answer_import_question(principal.owner, session, question, payload)
         .await?;
+    // One rule at most, whatever the reach, and it is minted from the row the
+    // caller addressed. A rule per settled row would be one decision recorded
+    // many times — and `matcher_for` builds them all from the same field of the
+    // same subject, so they would be the same rule written over and over.
     let answered = match matcher_for(&observed).filter(|_| may_generalise(principal)) {
         Some(matcher) => {
             let rule = services
@@ -1280,19 +1422,77 @@ pub async fn answer_question(
     // `contents` was read before the answer was written, and that is harmless:
     // what the generalisation consults it for is the observed row, which an
     // answer does not change.
-    Ok(answerable_questions(
+    let mut paired = answerable_questions(
         services,
         principal,
         &contents,
-        std::slice::from_ref(&answered),
+        &also_settled
+            .iter()
+            .cloned()
+            .chain(std::iter::once(answered.clone()))
+            .collect::<Vec<_>>(),
     )
-    .await?
-    .pop()
-    .unwrap_or(AnswerableQuestion {
+    .await?;
+    let asked = paired.pop().unwrap_or(AnswerableQuestion {
         view: answered,
         accounts: Vec::new(),
         generalisation: Generalisation::Unanswered,
-    }))
+    });
+    Ok(AnsweredQuestions {
+        asked,
+        also_settled: paired,
+    })
+}
+
+/// How far one answer reaches (`iaam-q5og`, decision 0029).
+///
+/// **Both members settle rows and neither writes a rule.** That line is the
+/// whole of this type: `may_generalise` is unchanged, a standing rule is still
+/// the owner's, and the wider reach claims nothing about a statement nobody has
+/// imported yet. What it settles is rows already fed to one session, which the
+/// owner reads in that session's assessment before the commit writes anything
+/// and can abandon whole, leaving the journal exactly as it was.
+///
+/// **Stated by the caller, never assumed.** Making the wider reach automatic was
+/// weighed and refused: it would turn a call that settled one row into a call
+/// that settles fifty without the caller choosing, and «a mistake is made many
+/// times» is the third of the three complaints this bead was filed on. An
+/// explicit reach makes the fan-out a decision, and the assessment publishes
+/// [`OpenQuestion::alike`] so the decision is an informed one rather than a
+/// guess about how many rows are alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AnswerReach {
+    /// Only the row the question names. The behaviour before decision 0029, and
+    /// the default, so a caller that says nothing settles exactly what it
+    /// addressed.
+    #[default]
+    ThisRow,
+    /// Every open question of this session raising the same decision.
+    ///
+    /// «The same decision» is
+    /// [`QuestionSubject`](iaam_ingest::classification::QuestionSubject), which
+    /// is the question paired with the direction the source stated for the row.
+    /// The pairing is what keeps a counterparty named on a row that arrived and
+    /// on a row that left two decisions rather than one.
+    EveryLikeRowInThisSession,
+}
+
+/// What one call to [`answer_question`] settled.
+///
+/// Two lists rather than one, and the split is the caller's own act: `asked` is
+/// the question it addressed, and `also_settled` is what its reach carried the
+/// answer to. Folded into one list they would be indistinguishable, and the
+/// caller could not tell the owner which row he decided and which rows were
+/// decided with it — which is the thing the reach must never hide.
+///
+/// `also_settled` is empty for [`AnswerReach::ThisRow`], and it is empty for the
+/// wider reach when no other open question of the session was the same decision.
+/// Those are the same fact about the session and are not distinguished here: in
+/// both, this answer settled one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnsweredQuestions {
+    pub asked: AnswerableQuestion,
+    pub also_settled: Vec<AnswerableQuestion>,
 }
 
 /// Record what the source printed about itself in its own control section.
@@ -2048,6 +2248,24 @@ pub struct ScopeAssessment {
 pub struct Interpretation {
     pub resolved: Vec<PlannedFact>,
     pub open_questions: Vec<OpenQuestion>,
+    /// Standing decisions this session's own rows offer, before the owner is
+    /// asked about them one at a time.
+    ///
+    /// **This is the first import problem** (`iaam-qn6d`). A first import has no
+    /// rules, so every row carrying a party name becomes a question, and the
+    /// answer is the same for most of them. The one field in the document that
+    /// says what a row was **for** — the category the source filed it under — is
+    /// transcribed by the profile, matchable by a rule since decision 0026, and
+    /// read by nothing on a first import, because a standing rule comes only
+    /// from answering a question and there are hundreds of those.
+    ///
+    /// So the session says what it has: the words its own unanswered rows were
+    /// filed under, how many rows each accounts for, and the condition a rule on
+    /// that word would ask. It offers **conditions and never outcomes** — see
+    /// [`OfferedRule`] — which is decision 0019 §6's line held one level up: the
+    /// source's word is evidence, what the rows *are* is the owner's, and
+    /// nothing here concludes on his behalf.
+    pub offered_rules: Vec<OfferedRule>,
 }
 
 /// One question the session is still waiting on.
@@ -2056,6 +2274,79 @@ pub struct OpenQuestion {
     pub row: u32,
     pub question: ImportQuestionId,
     pub prompt: String,
+    /// What may be said in answer to it, each carrying what it decides.
+    ///
+    /// **This is `iaam-ulib`.** The question was published in four places and
+    /// this one omitted the words that answer it, so an agent reading the
+    /// assessment to work a session went hunting across routes — guessing at one
+    /// that does not exist — for the list every other publisher already carried.
+    /// A question published without its answers is not a question a reader can
+    /// put to anybody.
+    ///
+    /// Read from what was stored when the question was asked, through
+    /// [`stored_alternatives`], which is the one function every publisher reads
+    /// them with. Recomputing them here from the question would publish what
+    /// *this build* would offer for a question asked by an older one, and the
+    /// owner would be shown a word the stored question does not admit.
+    pub alternatives: Vec<AnswerShape>,
+    /// The other open rows of this session raising the same decision, in row
+    /// order and excluding this one.
+    ///
+    /// **This is the half of `iaam-q5og` that is not about answering.** The
+    /// assessment published questions in row order, and grouping them was work
+    /// the caller had to invent — so the owner was read a question he had
+    /// already answered, which is the state decision 0016 and the whole
+    /// visibility line were filed to end. Empty means this row's decision is
+    /// asked once.
+    ///
+    /// «The same decision» is `iaam_ingest::classification::QuestionSubject`
+    /// and not the question alone: a counterparty named on a row that arrived
+    /// and on a row that left raises the *same* question and is two decisions,
+    /// because an answer carries a direction of its own.
+    pub alike: Vec<u32>,
+}
+
+/// One standing decision the session's own rows offer, stated as a condition.
+///
+/// **The condition, and never the outcome.** What the rows have in common is a
+/// fact about the document: this many of them were filed by the source under
+/// this word. What they *are* — a purchase, a fee, money of his coming back — is
+/// the owner's, and a profile mapping a source's category to one of his
+/// classifications is exactly what decision 0019 §6 refuses, on the ground that
+/// a map baked into a profile is frozen into every fact at import while a rule
+/// of his is editable and re-runnable over rows already recorded. An offer that
+/// filled in the outcome would be that map, written at the session instead of in
+/// the profile, and no better for being written later.
+///
+/// **One field per condition, which is decision 0008's number**, and here it is
+/// the category rather than the counterparty [`matcher_for`] would pick. That is
+/// the point of the offer: a counterparty condition is one decision per shop and
+/// there are hundreds of shops, while the categories one statement prints are a
+/// handful and they cover the same rows. The two are not rivals — a counterparty
+/// rule the owner adopts still wins nothing over this one, because
+/// [`classify`](iaam_ingest::classification::classify) takes the highest version
+/// among matching rules and both are his.
+///
+/// **Only rows with an open question are counted.** A row a rule of his already
+/// settles is not evidence that he wants another rule, and counting it would
+/// make an offer grow every month while settling nothing new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedRule {
+    /// The condition, in the shape `POST /v1/classification-rules` takes.
+    pub matcher: RuleMatcher,
+    /// What is asked of the owner, and what his answer changes.
+    ///
+    /// [`OwnerQuestion`] and not a second string of this module's own, because
+    /// decision 0027 settled the shape of a question put to a person: two
+    /// values, so that the half saying what turns on the answer cannot be folded
+    /// away into a sentence that already reads as finished. This is the first
+    /// owner-facing text written since that decision, so it is written in its
+    /// type rather than in the older one-string shape of [`OpenQuestion::prompt`]
+    /// beside it.
+    pub question: OwnerQuestion,
+    /// The rows of this session, in order, whose open question this condition
+    /// would settle.
+    pub covers: Vec<u32>,
 }
 
 /// One fact the commit would write, described without writing it.
@@ -2553,16 +2844,8 @@ pub async fn plan_session(
         .collect();
     let account_resolution = account_resolution(&resolver, &read_rows, &recorded_names);
     let scope_assessment = scope_assessment(&source_inventory.accounts, &contours, &exclusions);
-    let open_questions: Vec<OpenQuestion> = contents
-        .questions
-        .iter()
-        .filter(|question| question.is_open())
-        .map(|question| OpenQuestion {
-            row: question.row,
-            question: question.id,
-            prompt: question.prompt.clone(),
-        })
-        .collect();
+    let open_questions = open_questions(&contents.observations, &contents.questions);
+    let offered_rules = offered_rules(&contents.observations, &open_questions);
 
     let mut facts = Vec::new();
     let mut duplicates = Vec::new();
@@ -2757,6 +3040,7 @@ pub async fn plan_session(
     let interpretation = Interpretation {
         resolved,
         open_questions,
+        offered_rules,
     };
     let revision = fingerprint(
         &contents.session,
@@ -4460,6 +4744,153 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
     }
 }
 
+/// The questions still waiting, each carrying what may be said to it and which
+/// other rows are the same decision.
+///
+/// **One pass over one list**, because «alike» is a relation among these
+/// questions: a second walk that recomputed the subjects would be a second
+/// answer to what makes two of them the same, and the two could disagree while
+/// both looked right (decision 0029).
+///
+/// The relation is symmetric and each question is excluded from its own list, so
+/// a caller reading two of them reads each naming the other. It is deliberately
+/// **not** collapsed into groups here: the assessment's unit is a row, decision
+/// 0012 has a question name its row, and publishing groups instead would take
+/// away the one identifier the answering call takes.
+fn open_questions(
+    observations: &[ImportObservationView],
+    questions: &[ImportQuestionView],
+) -> Vec<OpenQuestion> {
+    let open: Vec<&ImportQuestionView> = questions
+        .iter()
+        .filter(|question| question.is_open())
+        .collect();
+    let subjects: Vec<Option<QuestionSubject>> = open
+        .iter()
+        .map(|question| subject_asked(observations, question))
+        .collect();
+    open.iter()
+        .zip(&subjects)
+        .map(|(question, subject)| OpenQuestion {
+            row: question.row,
+            question: question.id,
+            prompt: question.prompt.clone(),
+            alternatives: stored_alternatives(question),
+            alike: subject.as_ref().map_or_else(Vec::new, |subject| {
+                open.iter()
+                    .zip(&subjects)
+                    .filter(|(other, of_other)| {
+                        other.id != question.id && of_other.as_ref() == Some(subject)
+                    })
+                    .map(|(other, _)| other.row)
+                    .collect()
+            }),
+        })
+        .collect()
+}
+
+/// The standing decisions this session's unanswered rows offer, one per word the
+/// source filed them under.
+///
+/// **Why the source's category and not the counterparty [`matcher_for`] would
+/// pick** (`iaam-qn6d`). Both are conditions the owner could adopt, and they
+/// differ in how many decisions they cost him. A first import of one card
+/// statement raises a question per row, most of them repeats of a handful of
+/// merchants and all of them merchants; one decision per merchant is hundreds of
+/// decisions, and the merchants are the part that changes next month. The words
+/// the institution files its own rows under are a closed list it controls, they
+/// are printed on every row, and there are a dozen of them. `matcher_for` is
+/// right to prefer the counterparty for the rule minted from **one** answer —
+/// that rule is a claim about the party the owner just decided about — and this
+/// is the other question: which single condition would settle the most of what
+/// is still open.
+///
+/// **Only rows with an open question.** A row already settled by a rule of his is
+/// not evidence that he wants another one, and counting it would make an offer
+/// grow every month while settling nothing new. A document whose profile
+/// transcribes no category offers nothing here, and the list is empty — which is
+/// the truthful answer and not a failure: decision 0019 §6 has a profile name the
+/// column and stop, so a source that prints no such column leaves nothing to
+/// offer.
+///
+/// Ordered by how many open rows each would settle, most first, and by the word
+/// itself where two are equal — so the offer worth reading first is first, and
+/// the list does not reorder itself between two readings of one session.
+fn offered_rules(
+    observations: &[ImportObservationView],
+    open: &[OpenQuestion],
+) -> Vec<OfferedRule> {
+    let mut by_category: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    for question in open {
+        let Ok(row) = observed_row(observations, question.row) else {
+            continue;
+        };
+        let Some(category) = row.source_category else {
+            continue;
+        };
+        by_category.entry(category).or_default().push(question.row);
+    }
+    let mut offered: Vec<OfferedRule> = by_category
+        .into_iter()
+        .map(|(category, mut covers)| {
+            covers.sort_unstable();
+            OfferedRule {
+                question: offered_rule_question(&category, covers.len()),
+                matcher: RuleMatcher {
+                    counterparty_account: None,
+                    description_contains: None,
+                    kind: None,
+                    source_category: Some(category),
+                },
+                covers,
+            }
+        })
+        .collect();
+    offered.sort_by(|left, right| {
+        right.covers.len().cmp(&left.covers.len()).then_with(|| {
+            left.matcher
+                .source_category
+                .cmp(&right.matcher.source_category)
+        })
+    });
+    offered
+}
+
+/// The offer put to the owner, in his words.
+///
+/// **Decision 0027's register, and the third obligation is the one this had to
+/// earn.** What is asked is what a line the institution files under one of its
+/// own words *is*; what turns on it is that one answer stands for every such
+/// line, this month's and every later one, which is the whole reason the offer
+/// exists and is also the whole of its risk. Saying only «this saves you
+/// questions» would be the shape of consequence the decision refuses — true of
+/// the offer rather than of his choice between one answer and another.
+///
+/// The word is quoted and nothing else of the row is: it is a value out of a
+/// vocabulary the institution controls, printed identically on every row it
+/// covers, and it is the thing he is being asked about. No counterparty, no
+/// amount and no description reaches this sentence — [`row_mark`] argues that at
+/// length for the per-row prompt, and an offer covering many rows has no single
+/// row to point at anyway.
+fn offered_rule_question(category: &str, covers: usize) -> OwnerQuestion {
+    OwnerQuestion {
+        ask: format!(
+            "Your statement files {covers} of the lines still waiting on you under «{category}». \
+             What is a line filed that way — money you spent, a charge the institution made, \
+             money someone gave back, something your money earned, or money moving between \
+             accounts of your own?"
+        ),
+        consequence: format!(
+            "One answer here settles all {covers} of them at once, and every later line the same \
+             institution files under «{category}» is settled the same way without being put to \
+             you again. That is the risk as well as the saving: a word that also covers lines you \
+             would have decided differently files those wrongly, and you will not be asked about \
+             them. Withdrawing the decision afterwards re-files every line it decided, so being \
+             wrong costs a correction rather than a line nobody ever looks at again."
+        ),
+    }
+}
+
 /// The rule condition a row can be recognised by later, if any.
 ///
 /// `None` where the row offers nothing to match on. A matcher that asks nothing
@@ -5545,6 +5976,327 @@ mod tests {
             resolver.assess(&row(main, "Savings", None)),
             Assessment::Ambiguous { .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // The same decision asked many times (iaam-q5og, decision 0029)
+    // -----------------------------------------------------------------------
+
+    /// One open question about a row, stored as the session stores it.
+    fn stored_question_about(row: u32, asked: &Question) -> ImportQuestionView {
+        ImportQuestionView {
+            id: ImportQuestionId::new_random(),
+            session: ImportSessionId::new_random(),
+            row,
+            question: serde_json::to_string(asked).expect("a question"),
+            alternatives: serde_json::to_string(&asked.alternatives()).expect("alternatives"),
+            prompt: String::new(),
+            asked_at: "2026-03-01T00:00:00Z".to_owned(),
+            answered_at: None,
+            answer: None,
+            rule: None,
+        }
+    }
+
+    fn arriving(mut observed: ObservedRow) -> ObservedRow {
+        observed.direction = ObservedDirection::In;
+        observed.amount_minor = 1_000;
+        observed
+    }
+
+    /// The repeats are published as repeats, from both sides.
+    ///
+    /// The complaint: the assessment listed questions in row order, two thirds
+    /// of them the same decision, and nothing said so — so grouping was work
+    /// every caller had to invent and the owner was read a question he had
+    /// already answered.
+    #[test]
+    fn two_rows_naming_one_counterparty_the_same_way_each_name_the_other() {
+        let main = account(1);
+        let asked = Question::IsTransferInternal {
+            account: main,
+            counterparty: "Shop One".to_owned(),
+        };
+        let observations = vec![
+            stored_row(1, &row(main, "Shop One", None)),
+            stored_row(2, &row(main, "Shop One", None)),
+        ];
+        let questions = vec![
+            stored_question_about(1, &asked),
+            stored_question_about(2, &asked),
+        ];
+        let open = open_questions(&observations, &questions);
+        assert_eq!(open[0].alike, vec![2]);
+        assert_eq!(open[1].alike, vec![1]);
+        assert!(
+            !open[0].alternatives.is_empty(),
+            "and the words that answer it travel with it (iaam-ulib)"
+        );
+    }
+
+    /// One counterparty, two directions, two decisions.
+    ///
+    /// This is the whole reason the subject is a pair. The stored questions here
+    /// are byte-identical — `question_for` builds `IsTransferInternal` for a
+    /// named party whichever way the row ran — and an answer states a direction
+    /// of its own that `resolve_with` records, so carrying one across both would
+    /// file money that arrived as money that left.
+    #[test]
+    fn one_counterparty_the_source_ran_two_ways_is_not_one_decision() {
+        let main = account(1);
+        let asked = Question::IsTransferInternal {
+            account: main,
+            counterparty: "Shop One".to_owned(),
+        };
+        let observations = vec![
+            stored_row(1, &row(main, "Shop One", None)),
+            stored_row(2, &arriving(row(main, "Shop One", None))),
+        ];
+        let questions = vec![
+            stored_question_about(1, &asked),
+            stored_question_about(2, &asked),
+        ];
+        assert_eq!(questions[0].question, questions[1].question);
+        let open = open_questions(&observations, &questions);
+        assert!(open[0].alike.is_empty(), "{open:?}");
+        assert!(open[1].alike.is_empty(), "{open:?}");
+    }
+
+    /// Two counterparties are two decisions.
+    #[test]
+    fn two_counterparties_are_never_alike() {
+        let main = account(1);
+        let observations = vec![
+            stored_row(1, &row(main, "Shop One", None)),
+            stored_row(2, &row(main, "Shop Two", None)),
+        ];
+        let questions = vec![
+            stored_question_about(
+                1,
+                &Question::IsTransferInternal {
+                    account: main,
+                    counterparty: "Shop One".to_owned(),
+                },
+            ),
+            stored_question_about(
+                2,
+                &Question::IsTransferInternal {
+                    account: main,
+                    counterparty: "Shop Two".to_owned(),
+                },
+            ),
+        ];
+        let open = open_questions(&observations, &questions);
+        assert!(open[0].alike.is_empty());
+        assert!(open[1].alike.is_empty());
+    }
+
+    /// An answered question is neither published nor counted as a repeat.
+    #[test]
+    fn a_question_already_answered_is_no_longer_one_of_the_repeats() {
+        let main = account(1);
+        let asked = Question::IsTransferInternal {
+            account: main,
+            counterparty: "Shop One".to_owned(),
+        };
+        let observations = vec![
+            stored_row(1, &row(main, "Shop One", None)),
+            stored_row(2, &row(main, "Shop One", None)),
+        ];
+        let mut questions = vec![
+            stored_question_about(1, &asked),
+            stored_question_about(2, &asked),
+        ];
+        questions[0].answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        questions[0].answer = Some(serde_json::to_string(&Answer::Paid).expect("an answer"));
+        let open = open_questions(&observations, &questions);
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(open[0].alike.is_empty(), "{open:?}");
+    }
+
+    /// A question this build cannot read is published alone, and says nothing.
+    ///
+    /// Grouping needs both halves — the question and the row it was asked about
+    /// — and a stored question that will not parse has neither. Publishing it
+    /// with an empty list is the honest answer; the mistake the absence must not
+    /// be read as is «this one is unlike every other», which is a claim nobody
+    /// made.
+    #[test]
+    fn a_stored_question_this_build_cannot_read_is_alike_to_nothing() {
+        let main = account(1);
+        let asked = Question::IsTransferInternal {
+            account: main,
+            counterparty: "Shop One".to_owned(),
+        };
+        let observations = vec![
+            stored_row(1, &row(main, "Shop One", None)),
+            stored_row(2, &row(main, "Shop One", None)),
+        ];
+        let mut questions = vec![
+            stored_question_about(1, &asked),
+            stored_question_about(2, &asked),
+        ];
+        questions[0].question = "{\"question\":\"a word this build has never had\"}".to_owned();
+        let open = open_questions(&observations, &questions);
+        assert!(open[0].alike.is_empty(), "{open:?}");
+        assert!(
+            open[1].alike.is_empty(),
+            "and the readable one does not claim it as a repeat either: {open:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The standing decisions a first import offers (iaam-qn6d, decision 0029)
+    // -----------------------------------------------------------------------
+
+    /// One row of an import, as the session stored it.
+    fn stored_row(row: u32, observed: &ObservedRow) -> ImportObservationView {
+        ImportObservationView {
+            row,
+            row_key: None,
+            concluded: false,
+            payload: serde_json::to_string(&Intake::Observed {
+                row: Box::new(observed.clone()),
+                reader: None,
+            })
+            .expect("an intake"),
+            answer: None,
+        }
+    }
+
+    /// One open question about that row, in the shape the assessment reads.
+    fn open_about(row: u32) -> OpenQuestion {
+        OpenQuestion {
+            row,
+            question: ImportQuestionId::new_random(),
+            prompt: String::new(),
+            alternatives: Vec::new(),
+            alike: Vec::new(),
+        }
+    }
+
+    fn filed_under(mut observed: ObservedRow, category: &str) -> ObservedRow {
+        observed.source_category = Some(category.to_owned());
+        observed
+    }
+
+    /// A statement's own categories are offered once each, whatever the parties.
+    ///
+    /// The complaint this answers: a first import asks about every row, two
+    /// thirds of them literal repeats, and the field that would settle them is
+    /// transcribed and read by nothing. Three shops filed under one word are one
+    /// decision, and the offer says so before any of the three is asked about.
+    #[test]
+    fn one_word_the_source_filed_rows_under_is_offered_once_however_many_shops_it_covers() {
+        let main = account(1);
+        let observations = vec![
+            stored_row(1, &filed_under(row(main, "Shop One", None), "Groceries")),
+            stored_row(2, &filed_under(row(main, "Shop Two", None), "Groceries")),
+            stored_row(3, &filed_under(row(main, "Shop One", None), "Groceries")),
+            stored_row(4, &filed_under(row(main, "Shop Three", None), "Travel")),
+        ];
+        let open: Vec<OpenQuestion> = (1..=4).map(open_about).collect();
+        let offered = offered_rules(&observations, &open);
+        assert_eq!(offered.len(), 2, "two words, two decisions: {offered:?}");
+        assert_eq!(
+            offered[0].matcher.source_category.as_deref(),
+            Some("Groceries"),
+            "the offer that settles the most open rows is read first"
+        );
+        assert_eq!(offered[0].covers, vec![1, 2, 3]);
+        assert_eq!(offered[1].covers, vec![4]);
+    }
+
+    /// An offer states the condition and never the outcome.
+    ///
+    /// Decision 0019 §6 refuses a map from a source's category to one of the
+    /// owner's classifications, on the ground that such a map is frozen into
+    /// every fact at import. An offer that filled in the outcome would be that
+    /// map written a step later, so the only thing this may publish is what the
+    /// rows have in common — and one field of it, which is decision 0008's
+    /// number.
+    #[test]
+    fn an_offer_says_what_the_rows_have_in_common_and_never_what_they_are() {
+        let main = account(1);
+        let observations = vec![stored_row(
+            1,
+            &filed_under(row(main, "Shop One", None), "Groceries"),
+        )];
+        let offered = offered_rules(&observations, &[open_about(1)]);
+        let matcher = &offered[0].matcher;
+        assert_eq!(matcher.source_category.as_deref(), Some("Groceries"));
+        assert_eq!(matcher.counterparty_account, None);
+        assert_eq!(matcher.kind, None);
+        assert_eq!(matcher.description_contains, None);
+    }
+
+    /// A document that prints no category of its own offers nothing.
+    ///
+    /// The falsification for an offer built out of whatever field is to hand: a
+    /// row here names a counterparty and a source word, and neither is a word
+    /// the institution filed the row under. Offering a condition on one of them
+    /// would be one decision per shop, which is the count this exists to reduce.
+    #[test]
+    fn a_document_that_files_its_rows_under_nothing_offers_nothing() {
+        let main = account(1);
+        let observations = vec![stored_row(1, &row(main, "Shop One", None))];
+        assert!(offered_rules(&observations, &[open_about(1)]).is_empty());
+    }
+
+    /// A row nobody is still being asked about is not evidence of a decision.
+    ///
+    /// Only open questions are counted. Counting settled rows would make an
+    /// offer grow every month while settling nothing new, and would tell the
+    /// owner that a word he has already decided about is still outstanding.
+    #[test]
+    fn a_row_no_question_is_open_about_is_not_counted_towards_an_offer() {
+        let main = account(1);
+        let observations = vec![
+            stored_row(1, &filed_under(row(main, "Shop One", None), "Groceries")),
+            stored_row(2, &filed_under(row(main, "Shop Two", None), "Groceries")),
+        ];
+        let offered = offered_rules(&observations, &[open_about(2)]);
+        assert_eq!(offered[0].covers, vec![2], "{offered:?}");
+    }
+
+    /// The offer is put to the owner in his words, and says what turns on it.
+    ///
+    /// Decision 0027's register, checked the mechanical way it is checked in the
+    /// queue: no field name, no word that exists only because of how this is
+    /// built, and a consequence that says what differs between answering one way
+    /// and another rather than that the decision is his.
+    #[test]
+    fn an_offer_is_worded_for_a_person_and_says_what_his_answer_changes() {
+        let question = offered_rule_question("Groceries", 3);
+        for internal in [
+            "source_category",
+            "matcher",
+            "classification",
+            "session",
+            "row",
+            "rule",
+        ] {
+            assert!(
+                !question.ask.to_lowercase().contains(internal),
+                "«{internal}» is our word, not his: {}",
+                question.ask
+            );
+        }
+        assert!(
+            question.ask.contains("Groceries"),
+            "he is asked about the word he can see on his statement: {}",
+            question.ask
+        );
+        assert!(
+            question.consequence.contains('3'),
+            "what turns on the answer is how many lines it decides: {}",
+            question.consequence
+        );
+        assert!(
+            question.consequence.contains("wrongly"),
+            "and what it costs to be wrong, which is the half that gets dropped: {}",
+            question.consequence
+        );
     }
 
     // -----------------------------------------------------------------------

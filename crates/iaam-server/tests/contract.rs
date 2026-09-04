@@ -11604,7 +11604,7 @@ async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() 
                         "type": "opening_cash",
                         "amount": "1000.00",
                         "currency": "RUB",
-                        "dates": { "cash_posted": "2026-01-05" },
+                        "dates": { "cash_posted": "2025-12-05" },
                         "idempotency_key": "retirement-term-opening"
                     },
                     {
@@ -11613,7 +11613,7 @@ async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() 
                         "to_account": main,
                         "amount": "1000.00",
                         "currency": "RUB",
-                        "dates": { "cash_posted": "2026-01-10" },
+                        "dates": { "cash_posted": "2025-12-10" },
                         "idempotency_key": "retirement-term-closed"
                     }
                 ]
@@ -11638,7 +11638,7 @@ async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() 
             .collect()
     };
 
-    let (status, before) = call(&harness.router, snapshot("2026-01-31")).await;
+    let (status, before) = call(&harness.router, snapshot("2025-12-31")).await;
     assert_eq!(status, StatusCode::OK, "{before}");
     assert!(
         rows(&before).contains(&term),
@@ -11650,13 +11650,13 @@ async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() 
         post(
             &format!("/v1/accounts/{term}/retirement"),
             &harness.owner_token,
-            &json!({ "state": "retired", "effective_on": "2026-01-10" }),
+            &json!({ "state": "retired", "effective_on": "2025-12-10" }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{retired}");
 
-    let (status, after) = call(&harness.router, snapshot("2026-01-31")).await;
+    let (status, after) = call(&harness.router, snapshot("2025-12-31")).await;
     assert_eq!(status, StatusCode::OK, "{after}");
     assert_eq!(
         rows(&after),
@@ -11675,11 +11675,11 @@ async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() 
         .find(|entry| entry["account"] == json!(term))
         .unwrap_or_else(|| panic!("the retired account left the population: {after}"));
     assert_eq!(entry["standing"], "covered", "{after}");
-    assert_eq!(entry["retirement"], "2026-01-10", "{after}");
+    assert_eq!(entry["retirement"], "2025-12-10", "{after}");
     assert_eq!(entry["title"], "Term", "{after}");
 
     // A snapshot from before the date the product ceased is untouched.
-    let (status, earlier) = call(&harness.router, snapshot("2026-01-07")).await;
+    let (status, earlier) = call(&harness.router, snapshot("2025-12-07")).await;
     assert_eq!(status, StatusCode::OK, "{earlier}");
     assert!(
         rows(&earlier).contains(&term),
@@ -11692,7 +11692,7 @@ async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() 
     let (status, balances) = call(
         &harness.router,
         get(
-            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-01-31"),
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2025-12-31"),
             Some(&harness.owner_token),
         ),
     )
@@ -11755,7 +11755,7 @@ async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
                     "type": "opening_cash",
                     "amount": "1000.00",
                     "currency": "RUB",
-                    "dates": { "cash_posted": "2026-01-05" },
+                    "dates": { "cash_posted": "2025-12-05" },
                     "idempotency_key": "retirement-still-holding"
                 }]
             }),
@@ -11769,7 +11769,7 @@ async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
         post(
             &format!("/v1/accounts/{term}/retirement"),
             &harness.owner_token,
-            &json!({ "state": "retired", "effective_on": "2026-01-10" }),
+            &json!({ "state": "retired", "effective_on": "2025-12-10" }),
         ),
     )
     .await;
@@ -11778,7 +11778,7 @@ async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
     let (status, snapshot) = call(
         &harness.router,
         get(
-            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2025-12-31"),
             Some(&harness.owner_token),
         ),
     )
@@ -11799,7 +11799,7 @@ async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
         .iter()
         .find(|caveat| caveat["kind"] == "retired_account_not_empty")
         .unwrap_or_else(|| panic!("the row stands and nothing says why: {snapshot}"));
-    assert_eq!(caveat["subject"]["account"], json!(term), "{snapshot}");
+    assert_eq!(caveat["subject"]["id"], json!(term), "{snapshot}");
     // The two sides of the disagreement, both addressable: withdraw the
     // statement, or rule on the journal.
     let remedies: Vec<&str> = caveat["closed_by"]

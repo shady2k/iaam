@@ -81,7 +81,8 @@ expression: report
       }
     ],
     "known_account_coverage": "whole",
-    "outside": []
+    "outside": [],
+    "retirement_revision": 0
   },
   "report_currency": "RUB",
   "terminal_value": {

@@ -1342,7 +1342,7 @@ async fn a_deposit_retired_before_it_emptied_keeps_its_row_and_earns_a_caveat() 
         .iter()
         .find(|caveat| caveat["kind"] == "retired_account_not_empty")
         .unwrap_or_else(|| panic!("the row stands and nothing says why: {snapshot}"));
-    assert_eq!(caveat["subject"]["account"], json!(term), "{snapshot}");
+    assert_eq!(caveat["subject"]["id"], json!(term), "{snapshot}");
     assert_eq!(caveat["see"], "accounts[]", "{snapshot}");
 
     // A day later the closing row has been folded in, the account holds nothing,

@@ -103,6 +103,34 @@ pub enum FlowClass {
     },
     /// Inside the contour: changes allocation, not return.
     Internal,
+    /// Money moved on an account of this contour, and whether it crossed the
+    /// boundary cannot be decided.
+    ///
+    /// The fifth value, and it is an **answer** rather than a missing one, in
+    /// the sense §4.9 fixes for every other unknown in this system. It is
+    /// reached from `FlowEndpoints::OwnAccountUnnamed`: the source asserted the
+    /// far side is an account of the owner's and did not say which.
+    ///
+    /// **«An account of the owner's» is not «inside this contour», and a
+    /// contour cannot prove otherwise.** A [`ContourDefinition`] is a versioned
+    /// *subset* of the accounts the owner chose to put in it — a narrower
+    /// contour deliberately leaves some of his accounts out, and
+    /// `AccountScope` lets him rule an account outside every contour. Even a
+    /// contour that happened to name every account in his directory would prove
+    /// nothing, because the directory holds the accounts he has told this
+    /// system about, and the far side here is by construction one it was never
+    /// told about. So there is no membership test that could resolve this to
+    /// `Internal`, for any contour, and answering `Internal` on the strength of
+    /// the source's word would be the same mistake as reporting a transfer into
+    /// one's own account as earnings, made in the opposite direction.
+    ///
+    /// It carries the definition for the reason the two external classes do: an
+    /// amount that could not be placed is reported per contour version, and a
+    /// reader has to be able to say which definition failed to place it.
+    Indeterminate {
+        contour: ContourId,
+        version: ContourVersion,
+    },
     /// The event does not concern this contour.
     Irrelevant,
 }
@@ -144,6 +172,16 @@ pub fn classify(def: &ContourDefinition, event: &Event) -> FlowClass {
                 (false, true) => inbound,
                 (true, false) => outbound,
                 (false, false) => FlowClass::Irrelevant,
+            }
+        }
+        FlowEndpoints::OwnAccountUnnamed => {
+            if def.contains(event.account) {
+                FlowClass::Indeterminate {
+                    contour: def.id(),
+                    version: def.version(),
+                }
+            } else {
+                FlowClass::Irrelevant
             }
         }
         FlowEndpoints::WithinAccount => {
@@ -214,6 +252,27 @@ mod tests {
         event
     }
 
+    /// A movement whose far side the source called the owner's and did not name.
+    fn own_account_movement(account: AccountId) -> Event {
+        let amount = rub(-1_000_000);
+        let mut event = sample_event(0);
+        event.account = account;
+        event.kind = EventKind::OwnAccountMovement { amount };
+        event.legs = vec![Leg::cash(account, amount)];
+        event
+    }
+
+    /// The same claim with the direction the source never stated.
+    fn unresolved_own_account_movement(account: AccountId) -> Event {
+        let mut event = sample_event(0);
+        event.account = account;
+        event.kind = EventKind::UnresolvedOwnAccountMovement {
+            amount: rub(1_000_000),
+        };
+        event.legs = Vec::new();
+        event
+    }
+
     /// Security purchase: movement within one account.
     fn purchase(account: AccountId) -> Event {
         let gross = rub(5_000_000);
@@ -258,6 +317,8 @@ mod tests {
             cash_out(broker),
             transfer(deposit, broker),
             purchase(broker),
+            own_account_movement(broker),
+            unresolved_own_account_movement(broker),
         ] {
             let verdict = event.validate_structure();
             assert!(
@@ -360,6 +421,7 @@ mod tests {
         In,
         Out,
         Internal,
+        Indeterminate,
         Irrelevant,
     }
 
@@ -368,6 +430,7 @@ mod tests {
             FlowClass::ExternalIn { .. } => Expected::In,
             FlowClass::ExternalOut { .. } => Expected::Out,
             FlowClass::Internal => Expected::Internal,
+            FlowClass::Indeterminate { .. } => Expected::Indeterminate,
             FlowClass::Irrelevant => Expected::Irrelevant,
         }
     }
@@ -378,7 +441,7 @@ mod tests {
         // the whole pair matters for transfers; for the other forms the second
         // account must have no effect—these are the “second account only” and
         // “both accounts” columns.
-        use Expected::{In, Internal, Irrelevant, Out};
+        use Expected::{In, Indeterminate, Internal, Irrelevant, Out};
 
         let first = AccountId::new_random();
         let second = AccountId::new_random();
@@ -391,7 +454,7 @@ mod tests {
             ("both accounts", contour(vec![first, second])),
         ];
 
-        let rows: [(&str, Event, [Expected; 4]); 4] = [
+        let rows: [(&str, Event, [Expected; 4]); 6] = [
             (
                 "inflow from outside to first account",
                 cash_in(first),
@@ -412,6 +475,20 @@ mod tests {
                 purchase(first),
                 [Irrelevant, Internal, Irrelevant, Internal],
             ),
+            // The two new forms answer the same in the «both accounts» column
+            // as in the «first account only» one, and that is the whole point:
+            // widening the contour cannot place a far side nobody named, so no
+            // membership makes them internal.
+            (
+                "own-account movement on first account",
+                own_account_movement(first),
+                [Irrelevant, Indeterminate, Irrelevant, Indeterminate],
+            ),
+            (
+                "unresolved own-account movement on first account",
+                unresolved_own_account_movement(first),
+                [Irrelevant, Indeterminate, Irrelevant, Indeterminate],
+            ),
         ];
 
         for (movement, event, expectations) in &rows {
@@ -426,6 +503,60 @@ mod tests {
     }
 
     // --- Contour definition ---
+
+    #[test]
+    fn a_movement_to_an_unnamed_own_account_is_never_internal() {
+        // The falsification of the whole design: if some contour could call
+        // this internal, an unnamed far side would be safe to treat as inside,
+        // and the money-flow report could net it out.
+        let first = AccountId::new_random();
+        let second = AccountId::new_random();
+        for event in [
+            own_account_movement(first),
+            unresolved_own_account_movement(first),
+        ] {
+            for def in [
+                contour(vec![first]),
+                contour(vec![first, second]),
+                contour(vec![first, second, AccountId::new_random()]),
+            ] {
+                assert!(
+                    matches!(classify(&def, &event), FlowClass::Indeterminate { .. }),
+                    "{} must not be placed by any contour",
+                    event.kind.discriminant()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_indeterminate_flow_names_the_definition_that_could_not_place_it() {
+        let account = AccountId::new_random();
+        let id = ContourId::new_random();
+        let def = ContourDefinition::new(id, ContourVersion(5), vec![account]);
+        match classify(&def, &own_account_movement(account)) {
+            FlowClass::Indeterminate { contour, version } => {
+                assert_eq!(contour, id);
+                assert_eq!(version, ContourVersion(5));
+            }
+            other => panic!("expected Indeterminate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_own_account_movement_on_an_outside_account_is_irrelevant() {
+        // Indeterminate is «this contour holds the near account and cannot
+        // place the far one». A contour that holds neither has nothing to be
+        // uncertain about, and reporting uncertainty would put every other
+        // owner-account movement in every report.
+        let inside = AccountId::new_random();
+        let outside = AccountId::new_random();
+        let def = contour(vec![inside]);
+        assert_eq!(
+            classify(&def, &own_account_movement(outside)),
+            FlowClass::Irrelevant
+        );
+    }
 
     #[test]
     fn contour_version_is_carried_into_the_classification() {

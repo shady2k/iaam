@@ -55,7 +55,7 @@ pub enum MoneyFlowError {
     AggregateOverflow { quantity: &'static str },
 }
 
-/// Seven quantities and the cash they claim to explain.
+/// The explanatory quantities and the cash they claim to explain.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoneyFlow {
     came_in: Ledger,
@@ -65,6 +65,30 @@ pub struct MoneyFlow {
     fees: Ledger,
     taxes: Ledger,
     internal_transfers: Ledger,
+    /// Cash that moved on a contour account towards or from an account of the
+    /// owner's that the source did not name.
+    ///
+    /// The ninth quantity, and it is inside the identity: the money really did
+    /// move, `cash_delta` has it, and something must explain it or every
+    /// account carrying one of these rows shows a residual with no reason
+    /// beside it. What it does not do is claim a direction across the boundary
+    /// — it is neither `came_in`/`went_out` nor `internal_transfers`, because
+    /// which of those it is depends on where the far side sits and nobody said.
+    ///
+    /// Signed, like `internal_transfers`, so each account's identity closes.
+    indeterminate: Ledger,
+    /// The magnitude of movements the source stated and left without a
+    /// direction.
+    ///
+    /// **Outside the identity, and that is the point.** No cash moved as far as
+    /// this journal is concerned — an unresolved own-account movement posts no
+    /// leg — so folding it into the identity would make the identity fail by
+    /// exactly the amount the journal declined to invent. It is reported beside
+    /// the identity instead: the source says money moved here, the journal
+    /// cannot say which way, and a reader comparing this report with a
+    /// statement is entitled to see the difference named rather than discover
+    /// it as a gap.
+    unstated: Ledger,
     cash_delta: Ledger,
     went_out_by_category: CategoryLedger,
     earned_by_capital_by_source: EarningLedger,
@@ -193,6 +217,21 @@ impl MoneyFlow {
             None
         };
         let mut not_decomposed_keys = BTreeSet::new();
+
+        // Read from the kind and not from the legs, because there are none.
+        // Every other quantity in this projection is accumulated inside the
+        // loop below, and this one cannot be: an event with nothing posted is
+        // invisible to a fold over legs, which is precisely why it needs
+        // saying.
+        if let EventKind::UnresolvedOwnAccountMovement { amount } = &event.kind {
+            add(
+                &mut self.unstated,
+                event.account,
+                *amount,
+                "unstated",
+                event.id,
+            )?;
+        }
 
         for leg in &event.legs {
             if !contour.contains(leg.account) {
@@ -331,6 +370,27 @@ impl MoneyFlow {
                             }
                         }
                     }
+                    // The far side is unnamed, so the report cannot say
+                    // whether this left the contour. It goes to its own
+                    // quantity rather than to `went_out` — which would call it
+                    // spending and put it in a category — or to
+                    // `internal_transfers`, which would call it a reallocation
+                    // that changed nothing.
+                    EventKind::OwnAccountMovement { .. } => {
+                        add(
+                            &mut self.indeterminate,
+                            leg.account,
+                            money,
+                            "indeterminate",
+                            event.id,
+                        )?;
+                    }
+                    EventKind::UnresolvedOwnAccountMovement { .. } => {
+                        // It has no legs, so this arm is unreachable through
+                        // the loop. Named rather than joined to a catch-all so
+                        // that a build which ever gave it one fails here
+                        // instead of silently reporting nothing.
+                    }
                     EventKind::CashTransfer { .. } => match flow_class {
                         FlowClass::Internal => {
                             add(
@@ -361,6 +421,10 @@ impl MoneyFlow {
                                 UndecomposedCause::ExternalTransfer,
                                 event.id,
                             )?;
+                        }
+                        FlowClass::Indeterminate { .. } => {
+                            // A `CashTransfer` names both accounts, so nothing
+                            // classifies one as indeterminate.
                         }
                         FlowClass::Irrelevant => {
                             // Irrelevant transfers are rejected by event_belongs.
@@ -417,6 +481,8 @@ impl MoneyFlow {
                     | EventKind::Refund { .. }
                     | EventKind::CashOut { .. }
                     | EventKind::CashTransfer { .. }
+                    | EventKind::OwnAccountMovement { .. }
+                    | EventKind::UnresolvedOwnAccountMovement { .. }
                     | EventKind::Income { .. }
                     | EventKind::Fee { .. }
                     | EventKind::Tax { .. }
@@ -650,6 +716,22 @@ impl MoneyFlow {
         total_positive(&self.internal_transfers, currency, "internal_transfers")
     }
 
+    /// Cash that moved towards or from an account of the owner's the source did
+    /// not name, signed as the contour accounts saw it.
+    pub fn indeterminate(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.indeterminate, currency, "indeterminate")
+    }
+
+    /// The magnitude the source stated for movements it gave no direction.
+    ///
+    /// Positive, and it explains nothing: it is what the journal was told and
+    /// declined to post. A report showing a non-zero figure here is a report
+    /// whose account of the month is short by at least this much in one
+    /// direction or the other.
+    pub fn unstated(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
+        total(&self.unstated, currency, "unstated")
+    }
+
     pub fn cash_delta(&self, currency: CurrencyCode) -> Result<Money, MoneyFlowError> {
         total(&self.cash_delta, currency, "cash_delta")
     }
@@ -663,7 +745,11 @@ impl MoneyFlow {
         currencies.into_iter()
     }
 
-    /// The cash the seven quantities fail to explain, for one account.
+    /// The cash the explanatory quantities fail to explain, for one account.
+    ///
+    /// `unstated` is deliberately absent from the sum. It is not cash this
+    /// journal holds — the fact it comes from posts nothing — so adding it here
+    /// would open a residual on every account that carries one.
     #[must_use]
     fn residual_of(&self, account: AccountId, currency: CurrencyCode) -> i128 {
         let at = |ledger: &Ledger| {
@@ -675,7 +761,8 @@ impl MoneyFlow {
             - at(&self.moved_into_assets)
             - at(&self.fees)
             - at(&self.taxes)
-            + at(&self.internal_transfers);
+            + at(&self.internal_transfers)
+            + at(&self.indeterminate);
         at(&self.cash_delta) - explained
     }
 
@@ -718,7 +805,7 @@ impl MoneyFlow {
             .collect()
     }
 
-    fn ledgers(&self) -> [&Ledger; 8] {
+    fn ledgers(&self) -> [&Ledger; 10] {
         [
             &self.came_in,
             &self.went_out,
@@ -727,6 +814,8 @@ impl MoneyFlow {
             &self.fees,
             &self.taxes,
             &self.internal_transfers,
+            &self.indeterminate,
+            &self.unstated,
             &self.cash_delta,
         ]
     }
@@ -997,6 +1086,78 @@ mod tests {
                 .amount()
                 .raw()
         );
+    }
+
+    #[test]
+    fn a_movement_to_an_unnamed_own_account_is_neither_spending_nor_a_transfer() {
+        // The defect this whole shape answers: read as `CashOut` the amount is
+        // money spent, and read as an internal transfer it is money that stayed
+        // inside. It is neither, because the far side is unnamed, so it has a
+        // quantity of its own — and the identity still closes, because the cash
+        // really did move.
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            &event(
+                EventKind::OwnAccountMovement {
+                    amount: rub(-480_000),
+                },
+                vec![Leg::cash(card, rub(-480_000))],
+                date!(2025 - 08 - 12),
+            ),
+            &contour,
+            august(),
+            &NoCategories,
+        )
+        .expect("applies");
+
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.internal_transfers(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.indeterminate(CurrencyCode::Rub)), rub(-480_000));
+        // Never categorised: «what did I spend it on» is not a question anyone
+        // can ask of a movement that may not have been spending at all.
+        let (count, amount) = flow.not_decomposed(CurrencyCode::Rub).expect("fits");
+        assert_eq!(count, 0);
+        assert_eq!(amount.amount().raw(), 0);
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
+    }
+
+    #[test]
+    fn a_movement_with_no_direction_is_reported_and_left_out_of_the_identity() {
+        // It posts no leg, so no cash moved as far as this journal is
+        // concerned. Folding its magnitude into the identity would open a
+        // residual of exactly the amount the journal declined to invent; the
+        // reader is told instead, by name.
+        let card = AccountId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![card]);
+        let mut flow = MoneyFlow::new();
+        flow.apply(
+            // Built with `event_with` rather than the `event` helper beside it:
+            // that helper takes the account from the first leg, and this fact
+            // has none — which is the point of it.
+            &event_with(
+                card,
+                date!(2025 - 08 - 12),
+                1,
+                EventKind::UnresolvedOwnAccountMovement {
+                    amount: rub(480_000),
+                },
+                Vec::new(),
+            ),
+            &contour,
+            august(),
+            &NoCategories,
+        )
+        .expect("applies");
+
+        assert_eq!(value(flow.unstated(CurrencyCode::Rub)), rub(480_000));
+        assert_eq!(value(flow.cash_delta(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.went_out(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.came_in(CurrencyCode::Rub)), rub(0));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
     #[test]

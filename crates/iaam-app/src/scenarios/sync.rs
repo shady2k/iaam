@@ -497,7 +497,8 @@ fn event_id_from_verdict(verdict: &Verdict) -> Option<EventId> {
         | Verdict::NeedsClassification { .. }
         | Verdict::Unsupported { .. }
         | Verdict::Rejected { .. }
-        | Verdict::Quarantined { .. } => None,
+        | Verdict::Quarantined { .. }
+        | Verdict::NoFact { .. } => None,
     }
 }
 

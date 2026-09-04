@@ -11,7 +11,7 @@
 use crate::action_catalog::ActionCatalog;
 use iaam_app::error::AppError;
 use iaam_app::ingest::classification::{
-    Answer, AnswerShape, Classification, Movement, RuleMatcher,
+    Answer, AnswerShape, Classification, FarSide, Movement, RuleMatcher,
 };
 use iaam_app::ingest::journal_event::{JournalFact, SubmittedJournalEvent};
 use iaam_app::ingest::observation::{
@@ -31,8 +31,8 @@ use iaam_app::scenarios::classification::{
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::{
-    AnswerableQuestion, ControlReconciliation, HeldRow, ImportPlan, PlannedFact, Readiness,
-    RetainedRow, RetentionReason,
+    AnswerableQuestion, ControlReconciliation, HeldRow, ImportPlan, NoFactReason, PlannedFact,
+    Readiness, RetainedRow, RetentionReason, SettledRow,
 };
 // The question's own generalisation, in a block of its own rather than merged
 // into the list above: this file is edited by several changes at once, and one
@@ -526,6 +526,30 @@ pub enum OperationKindDto {
         /// row with no question asked.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         counterparty: Option<String>,
+        /// What the source said about **whose** account is on the far side:
+        /// `own_account` or `unstated`. Omitting the field means `unstated`.
+        ///
+        /// `own_account` is the source asserting that the other side is one of
+        /// the owner's own accounts, without saying which. It is a stronger
+        /// claim than `direction: "inner"` — which says only that the money did
+        /// not leave the institution, and is equally true of a payment to a
+        /// stranger who banks there — and a weaker one than naming the account,
+        /// which the source did not do.
+        ///
+        /// **Send it only where the export says so in words.** It is a
+        /// transcription, like `direction` and unlike anything a converter
+        /// works out: deciding that a counterparty is one of the owner's own
+        /// accounts is a conclusion, it is reached on this side of the wire
+        /// against his directory, and stating it here would put a guess where a
+        /// quotation belongs.
+        ///
+        /// It carries **no direction**, deliberately: the sources that make
+        /// this claim commonly print no direction beside it, and that pairing
+        /// is exactly the row this field exists for. Such a row is recorded as
+        /// a movement between the owner's own accounts with the far side
+        /// unnamed, and no question is raised about it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        far_side: Option<String>,
         /// The document the row was read out of, as the source names it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_document: Option<String>,
@@ -642,6 +666,7 @@ impl OperationDto {
             currency,
             direction,
             counterparty,
+            far_side,
             source_document,
         } = &self.kind
         else {
@@ -669,6 +694,12 @@ impl OperationDto {
                 counterparty: counterparty
                     .clone()
                     .map_or(ObservedCounterparty::Unknown, ObservedCounterparty::Named),
+                far_side: match far_side.as_deref() {
+                    // Absent means the source said nothing about the far side,
+                    // which is `Unstated` and is not «somebody else's».
+                    None => FarSide::Unstated,
+                    Some(stated) => FarSide::parse(stated)?,
+                },
                 source_kind: self.source_category.clone(),
                 description: self.description.clone(),
                 dates: OperationDates {
@@ -1256,6 +1287,13 @@ impl VerdictDto {
                 ..base
             },
             Verdict::Quarantined { reason } => Self {
+                detail: Some(reason.clone()),
+                ..base
+            },
+            // `detail` carries the determination's **code**, not a sentence:
+            // the sentence for it is in the published schema, and a client
+            // that had to match on prose could not act on this row at all.
+            Verdict::NoFact { reason } => Self {
                 detail: Some(reason.clone()),
                 ..base
             },
@@ -2695,6 +2733,25 @@ pub struct MoneyFlowCurrencyDto {
     pub fees: String,
     pub taxes: String,
     pub internal_transfers: String,
+    /// Cash that moved on an account of this contour towards or from an account
+    /// of the owner's the source did not name.
+    ///
+    /// Signed, and it is **inside** the identity that `residual` checks: the
+    /// money really did move. What it is not is placed — the far side is
+    /// unnamed, and no contour can prove it holds every account the owner has,
+    /// so this is neither `came_in`/`went_out` nor `internal_transfers`. It is
+    /// never given a spending category, because «what did I spend it on» is not
+    /// a question anyone can ask of a movement that may not have been spending.
+    pub indeterminate: String,
+    /// The magnitude of movements the source stated and gave no direction.
+    ///
+    /// Positive, and **outside** the identity: no cash moved as far as this
+    /// journal is concerned, because such a fact posts nothing. It is here so
+    /// that a reader comparing this report with a statement sees the difference
+    /// named rather than discovering it as a gap. A non-zero figure means the
+    /// account of the interval is short by at least this much, in one direction
+    /// or the other.
+    pub unstated: String,
     pub cash_delta: String,
     pub residual: String,
     pub went_out_by_category: Vec<CategoryAmountDto>,
@@ -2833,6 +2890,18 @@ impl MoneyFlowReportDto {
                     internal_transfers: report
                         .flow
                         .internal_transfers(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    indeterminate: report
+                        .flow
+                        .indeterminate(currency)?
+                        .to_calc_dec()
+                        .inner()
+                        .to_string(),
+                    unstated: report
+                        .flow
+                        .unstated(currency)?
                         .to_calc_dec()
                         .inner()
                         .to_string(),
@@ -8386,8 +8455,15 @@ impl RecordedEventDto {
 pub struct ImportRowDto {
     /// The row's position in the session, one-based.
     pub row: u32,
-    /// `held`, `needs_classification` or `rejected`.
+    /// `held`, `needs_classification`, `settled` or `rejected`.
     pub state: String,
+    /// Why the row will produce no fact, for `settled`. A code from a closed
+    /// list, matching the `detail` its commit verdict will carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The same determination in words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
     /// The question this row raised, for `needs_classification`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub question_id: Option<Uuid>,
@@ -8410,6 +8486,8 @@ impl ImportRowDto {
         let base = Self {
             row: held.row(),
             state: String::new(),
+            reason: None,
+            explanation: None,
             question_id: None,
             prompt: None,
             alternatives: None,
@@ -8434,6 +8512,15 @@ impl ImportRowDto {
                         .map(AnswerAlternativeDto::from_domain)
                         .collect(),
                 ),
+                ..base
+            },
+            // A state of its own, and never `held`: `held` promises a fact at
+            // commit, and this row will produce none — correctly, so it is not
+            // `rejected` either.
+            HeldRow::Settled { reason, .. } => Self {
+                state: "settled".to_owned(),
+                reason: Some(reason.code().to_owned()),
+                explanation: Some(reason.describe().to_owned()),
                 ..base
             },
             HeldRow::Rejected { rejection, .. } => Self {
@@ -8933,6 +9020,18 @@ pub struct CommitDeltaDto {
     pub duplicates: Vec<PlannedFactDto>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRowDto>,
+    /// Rows that are settled and correctly become no fact.
+    ///
+    /// A third list, because it is a third outcome and not a softer kind of
+    /// retention. A retained row owes something — a repair, or an answer — and
+    /// these owe nothing: the row was read, understood, and the honest journal
+    /// record for it is nothing at all. Reading them as retained would send a
+    /// client looking for a remedy that does not exist; reading them as facts
+    /// would say the journal gained something it did not.
+    ///
+    /// They are also the published explanation for a total that is short of the
+    /// statement's own turnover with nothing wrong.
+    pub settled_without_fact: Vec<SettledRowDto>,
     /// The provenance `facts` will be written under, per account.
     ///
     /// Without it a plan says what a commit will write and not what it will be
@@ -9008,6 +9107,24 @@ impl BatchTotalDto {
             net: minor_amount(total.net.raw(), total.currency),
         }
     }
+}
+
+/// A row that is settled and correctly becomes no fact.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SettledRowDto {
+    pub row: u32,
+    /// The determination that settled it. Today the only value is
+    /// `one_account_two_instruments`.
+    ///
+    /// A code and not free text: it is the same word the row's commit verdict
+    /// carries in `detail`, so a client can match the two without parsing
+    /// prose, and a closed list is what makes «this row needed no fact» a
+    /// determination somebody can audit rather than an importer's silence.
+    pub reason: String,
+    /// The same determination in words, for a reader.
+    pub explanation: String,
+    /// The account the two payment instruments belong to.
+    pub account: Uuid,
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -9287,6 +9404,12 @@ impl ImportPlanDto {
                     .iter()
                     .map(RetainedRowDto::from_domain)
                     .collect(),
+                settled_without_fact: plan
+                    .commit_delta
+                    .settled_without_fact
+                    .iter()
+                    .map(SettledRowDto::from_domain)
+                    .collect(),
                 fact_origins: plan
                     .commit_delta
                     .fact_origins
@@ -9337,6 +9460,19 @@ impl PlannedFactDto {
             currency: CurrencyDto::from_domain(fact.currency),
             date: fact.date,
             idempotency_key: fact.idempotency_key.clone(),
+        }
+    }
+}
+
+impl SettledRowDto {
+    #[must_use]
+    pub fn from_domain(settled: &SettledRow) -> Self {
+        let NoFactReason::OneAccountTwoInstruments { account } = settled.reason;
+        Self {
+            row: settled.row,
+            reason: settled.reason.code().to_owned(),
+            explanation: settled.reason.describe().to_owned(),
+            account: account.inner(),
         }
     }
 }

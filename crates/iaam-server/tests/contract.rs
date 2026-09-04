@@ -2031,8 +2031,8 @@ fn refers_to(property: &serde_json::Value, schema: &str) -> bool {
 async fn the_openapi_document_enumerates_and_explains_every_verdict() {
     // A verdict code the document does not list is a code the agent has to
     // look up somewhere else, and every hand-written list drifts: the one in
-    // the agent skill listed eight of these ten and omitted `possible_duplicate`
-    // and `quarantined`, both of which production emits.
+    // the agent skill listed eight of the then ten and omitted
+    // `possible_duplicate` and `quarantined`, both of which production emits.
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -2059,13 +2059,14 @@ async fn the_openapi_document_enumerates_and_explains_every_verdict() {
             "unsupported",
             "rejected",
             "quarantined",
+            "no_fact",
         ]
     );
 }
 
 #[tokio::test]
 async fn the_verdict_vocabulary_admits_which_codes_nothing_emits() {
-    // Three of the ten are published and constructed by no path, and all three
+    // Three of the eleven are published and constructed by no path, and all three
     // are the reconciliation ones. That is not a coincidence: a verdict is the
     // answer to one write, while reconciliation is a property of an account, a
     // dimension and an interval, folded on read and moved by evidence that
@@ -2114,7 +2115,7 @@ async fn the_verdict_vocabulary_admits_which_codes_nothing_emits() {
 
     // The codes something does emit say nothing of the kind, so a client cannot
     // read the caveat as decoration on the whole vocabulary.
-    for code in ["provisional", "possible_duplicate", "duplicate"] {
+    for code in ["provisional", "possible_duplicate", "duplicate", "no_fact"] {
         let meaning = published_meaning(&spec, "VerdictCodeDto", code);
         assert!(
             !meaning.contains("no path emits it"),
@@ -6338,6 +6339,11 @@ async fn flow_report_exposes_all_quantities_and_residual() {
         "fees",
         "taxes",
         "internal_transfers",
+        // Both new quantities are published even when they are zero: a reader
+        // comparing this against a statement has to be able to see that
+        // nothing was left unplaced, and an absent field is not that answer.
+        "indeterminate",
+        "unstated",
         "cash_delta",
         "residual",
     ] {
@@ -19628,6 +19634,9 @@ async fn a_rejected_classification_outcome_publishes_the_words_it_admits() {
         admitted,
         [
             "internal_transfer",
+            // Beside it, and not instead of it: the two differ by whether the
+            // far account is named, which is what decides the journal shape.
+            "own_account_movement",
             "external_flow",
             "refund",
             "income",
@@ -20412,4 +20421,210 @@ async fn a_read_only_token_may_not_retract_an_import() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
     assert_eq!(refused["code"], "forbidden", "{refused}");
+}
+
+// ---------------------------------------------------------------------------
+// A movement between the owner's own accounts, with the far side unnamed
+// (iaam-cp94, iaam-fmih, iaam-tb5o)
+// ---------------------------------------------------------------------------
+
+/// A row whose source asserted the far side is the owner's and said no more.
+///
+/// Invented end to end. `INNER` is the *shape* of word a source prints for a
+/// movement it files as internal; the amount, the key and the day were made up
+/// for this test, and no institution's wording is reproduced here.
+fn own_account_row(account: Uuid, key: &str) -> Value {
+    json!({
+        "account": account,
+        "type": "unresolved_direction",
+        "amount": "2500.00",
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-03-18" },
+        "source_category": "INNER",
+        "far_side": "own_account",
+        "idempotency_key": key,
+    })
+}
+
+#[tokio::test]
+async fn a_source_that_names_the_far_side_as_the_owners_records_a_fact_and_asks_nothing() {
+    // The run this wave came from: rows with a date, an amount and a word for
+    // «between your own accounts», each of which raised a question and held the
+    // commit. Now each becomes a fact of its own — one that posts nothing,
+    // because the direction is still unstated, and says so.
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [own_account_row(account, "own-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(
+        verdicts[0]["verdict"], "provisional",
+        "the row is recorded rather than questioned: {verdicts}"
+    );
+
+    let recorded = journal_events(&harness).await;
+    let row = recorded
+        .iter()
+        .find(|row| row["idempotency_key"] == "own-one")
+        .unwrap_or_else(|| panic!("the fact is in the journal: {recorded:?}"));
+    assert_eq!(row["kind"], "unresolved_own_account_movement", "{row}");
+    assert!(
+        row["legs"].as_array().expect("legs").is_empty(),
+        "nothing may be posted on a direction nobody stated: {row}"
+    );
+}
+
+#[tokio::test]
+async fn the_same_row_with_a_direction_posts_one_leg_and_is_not_spending() {
+    // With a direction the account really did move, so the journal posts it —
+    // and still not as `cash_out`, which would count the amount as money spent.
+    let harness = harness();
+    let account = harness.account.inner();
+    let mut row = own_account_row(account, "own-two");
+    row["direction"] = json!("out");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [row],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let recorded = journal_events(&harness).await;
+    let row = recorded
+        .iter()
+        .find(|row| row["idempotency_key"] == "own-two")
+        .unwrap_or_else(|| panic!("the fact is in the journal: {recorded:?}"));
+    assert_eq!(row["kind"], "own_account_movement", "{row}");
+    assert_eq!(row["legs"].as_array().expect("legs").len(), 1, "{row}");
+}
+
+#[tokio::test]
+async fn a_far_side_word_the_contract_does_not_know_is_refused_rather_than_dropped() {
+    // Dropping it would read the row as one whose source said nothing about the
+    // far side, which is a weaker statement than the caller meant to make.
+    let harness = harness();
+    let account = harness.account.inner();
+    let mut row = own_account_row(account, "own-three");
+    row["far_side"] = json!("mine");
+
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [row],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{refusal}");
+    assert_eq!(refusal[0]["verdict"], "rejected", "{refusal}");
+    assert_eq!(refusal[0]["field"], "far_side", "{refusal}");
+}
+
+#[tokio::test]
+async fn a_movement_between_two_instruments_over_one_account_is_settled_without_a_fact() {
+    // Two cards over one underlying account are one account with two aliases
+    // (decision 0004), so the identifier printed for the far side resolves to
+    // the account the row is already on. The honest record is nothing: the
+    // balance does not change and there is no second leg to wait for. Nothing
+    // is asked, and the outcome is a word of its own — not `quarantined`,
+    // which would say a fact could not be written.
+    let harness = harness();
+    let created = account_with(
+        &harness,
+        &json!({
+            "title": "Everyday",
+            "aliases": [{ "value": "card-two", "valid_from": "2024-01-01" }],
+        }),
+    )
+    .await;
+    let before = journal_rows(&harness).await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": created, "channel": "file", "label": "march" },
+                "operations": [{
+                    "account": created,
+                    "type": "unresolved_direction",
+                    "amount": "2500.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-18" },
+                    "source_category": "INNER",
+                    "counterparty": "card-two",
+                    "idempotency_key": "instruments-one",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "no_fact", "{verdicts}");
+    assert_eq!(
+        verdicts[0]["detail"], "one_account_two_instruments",
+        "the determination is a code, not prose: {verdicts}"
+    );
+    assert_eq!(
+        journal_rows(&harness).await,
+        before,
+        "a settled row writes nothing at all"
+    );
+
+    // And no session was opened, because nothing is waiting on the owner.
+    let (status, sessions) = call(
+        &harness.router,
+        get("/v1/import-sessions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    assert!(
+        sessions.as_array().expect("sessions").is_empty(),
+        "there is no question to hold: {sessions}"
+    );
+}
+
+#[tokio::test]
+async fn the_verdict_vocabulary_publishes_the_settled_row_and_says_what_it_means() {
+    // A code with no published meaning is a promise a client waits on for ever.
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK, "{spec}");
+    let verdict = &spec["components"]["schemas"]["VerdictCodeDto"];
+    let entry = verdict["oneOf"]
+        .as_array()
+        .expect("the verdict codes")
+        .iter()
+        .find(|item| item["enum"][0] == "no_fact")
+        .unwrap_or_else(|| panic!("the settled-row code is published: {verdict}"));
+    let meaning = entry["description"].as_str().expect("its meaning");
+    assert!(
+        meaning.contains("one_account_two_instruments"),
+        "the code names the determination a client will see in `detail`: {meaning}"
+    );
 }

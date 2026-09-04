@@ -25,7 +25,7 @@ use iaam_core::money::CurrencyCode;
 use serde::{Deserialize, Serialize};
 
 use crate::classification::{
-    Answer, Classification, ClassificationSubject, Counterparty, Movement,
+    Answer, Classification, ClassificationSubject, Counterparty, FarSide, Movement,
 };
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation};
 use crate::verdict::Rejection;
@@ -106,6 +106,12 @@ impl ObservedDirection {
 /// and this type is what the caller is allowed to state. The resolution happens
 /// on this side of the wire, against the owner's directory, and it is what turns
 /// a question into a derived internal transfer without asking anybody.
+///
+/// The source's own assertion that the far side is the owner's does not live
+/// here either, and for a different reason: it names nobody, so it is not an
+/// answer to «who», and it can be made about a row that also prints a name. It
+/// is [`crate::classification::FarSide`], carried beside this field on
+/// [`ObservedRow`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservedCounterparty {
@@ -168,6 +174,15 @@ pub struct ObservedRow {
     pub amount_minor: i64,
     pub currency: CurrencyCode,
     pub counterparty: ObservedCounterparty,
+    /// What the source said about whose account is on the far side.
+    ///
+    /// A statement the source made, transcribed exactly as `direction` and
+    /// `source_kind` are, and never inferred here: a converter may set it only
+    /// where the export says so in words. `#[serde(default)]` because rows
+    /// stored by an earlier build carry no such field, and what they carry is
+    /// [`FarSide::Unstated`] — which is what they meant.
+    #[serde(default)]
+    pub far_side: FarSide,
     /// What the source called the operation, verbatim.
     pub source_kind: Option<String>,
     /// What the source printed as the description or payment purpose, verbatim.
@@ -198,6 +213,7 @@ impl ObservedRow {
             description: self.description.clone(),
             source_kind: self.source_kind.clone(),
             movement: self.movement(),
+            far_side: self.far_side,
         }
     }
 
@@ -263,14 +279,52 @@ impl ObservedRow {
     /// [`Classification::implied_movement`]. An internal transfer whose far side
     /// is this very account is refused rather than recorded as a transfer to
     /// itself.
+    ///
+    /// **`movement` is optional, and exactly one classification survives its
+    /// absence.** Every other outcome needs a direction — a deposit and a
+    /// withdrawal are the same row with two answers — so `None` beside any of
+    /// them is refused rather than resolved into a guess, which is the whole
+    /// reason `Question::UnresolvedDirection` exists.
+    /// [`Classification::OwnAccountMovement`] is the exception because the
+    /// journal has a shape for it without one: the fact records that a movement
+    /// the source attributed to the owner's own accounts happened, and posts
+    /// nothing. Making the argument non-optional and adding a second entry
+    /// point was considered and refused — the pair of functions would have to
+    /// agree about which classifications each admits, and this match is where
+    /// that agreement is checked once.
     pub fn resolve(
         &self,
         classification: Classification,
-        movement: Movement,
+        movement: Option<Movement>,
     ) -> Result<SubmittedOperation, Rejection> {
         let amount_minor = self.magnitude()?;
         let currency = self.currency;
+        let Some(movement) = movement else {
+            return match classification {
+                Classification::OwnAccountMovement => Ok(SubmittedOperation {
+                    account: self.account,
+                    kind: OperationKind::OwnAccountMovement {
+                        movement: None,
+                        amount_minor,
+                        currency,
+                    },
+                    ..self.envelope(self.account)
+                }),
+                other => Err(Rejection {
+                    field: "answer".to_owned(),
+                    expected: "a direction, which every outcome except a movement between \
+                               own accounts needs before it can be recorded"
+                        .to_owned(),
+                    actual: format!("{}, with no direction", outcome_word(other)),
+                }),
+            };
+        };
         let kind = match (classification, movement) {
+            (Classification::OwnAccountMovement, movement) => OperationKind::OwnAccountMovement {
+                movement: Some(movement),
+                amount_minor,
+                currency,
+            },
             (Classification::InternalTransfer { to }, Movement::Out) => {
                 if to == self.account {
                     return Err(self.self_transfer());
@@ -366,8 +420,15 @@ impl ObservedRow {
     }
 
     /// The row resolved by an answer the owner gave.
+    ///
+    /// An answer always states a direction — every variant of [`Answer`] names
+    /// one — so this is the caller for which the argument above is never
+    /// `None`. That is not an accident of the current vocabulary: an answer
+    /// that stated no direction would have to be admitted by a question, and
+    /// the question that would admit it is the one the owner is being asked
+    /// precisely because nothing has settled the direction.
     pub fn resolve_with(&self, answer: Answer) -> Result<SubmittedOperation, Rejection> {
-        self.resolve(answer.classification(), answer.movement())
+        self.resolve(answer.classification(), Some(answer.movement()))
     }
 
     fn self_transfer(&self) -> Rejection {
@@ -400,6 +461,18 @@ impl ObservedRow {
             source_category: self.source_kind.clone(),
             description: self.description.clone(),
         }
+    }
+}
+
+/// One outcome in a word, for a rejection the caller can act on.
+const fn outcome_word(classification: Classification) -> &'static str {
+    match classification {
+        Classification::InternalTransfer { .. } => "a transfer to a named own account",
+        Classification::ExternalFlow => "movement outside the portfolio",
+        Classification::Fee { .. } => "a fee",
+        Classification::Refund => "a refund",
+        Classification::Income { .. } => "income",
+        Classification::OwnAccountMovement => "a movement between own accounts",
     }
 }
 

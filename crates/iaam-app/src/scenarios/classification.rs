@@ -10,8 +10,8 @@ use iaam_core::event::Event;
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, OwnerId};
 use iaam_ingest::classification::{
-    Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, Movement,
-    RuleMatcher, recompute_plan,
+    Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, FarSide,
+    Movement, RuleMatcher, recompute_plan,
 };
 use serde_json::{Map, Value};
 use time::Date;
@@ -31,7 +31,8 @@ pub async fn list_rules(
 /// A classification named the way the rule that decides it names one.
 ///
 /// The vocabulary is the rule outcome's own — `internal_transfer`,
-/// `external_flow`, `refund`, `income`, `fee` — so the plan answers in the words
+/// `own_account_movement`, `external_flow`, `refund`, `income`, `fee` — so the
+/// plan answers in the words
 /// the owner wrote the rule in, rather than in the journal's event
 /// discriminants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +347,16 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
             origin: None,
             income_kind: None,
         },
+        // No `to`, and that is the outcome rather than a field left out: the
+        // whole difference from `internal_transfer` is that no far account is
+        // named. A reader that filled it in from somewhere would be writing the
+        // one thing the source did not say.
+        Classification::OwnAccountMovement => ClassifiedAs {
+            kind: "own_account_movement",
+            to: None,
+            origin: None,
+            income_kind: None,
+        },
         Classification::Refund => ClassifiedAs {
             kind: "refund",
             to: None,
@@ -484,6 +495,14 @@ pub fn outcome_from(
             Ok(Classification::InternalTransfer { to: AccountId(to) })
         }
         "external_flow" => Ok(Classification::ExternalFlow),
+        // Refused if it names a `to`, unlike `internal_transfer`, which
+        // requires one. The two outcomes differ by exactly that field, so a
+        // caller that sent both words and an account has contradicted itself
+        // and must be told rather than have one half quietly dropped.
+        "own_account_movement" => match to {
+            None => Ok(Classification::OwnAccountMovement),
+            Some(actual) => Err(invalid_outcome(actual)),
+        },
         "refund" => Ok(Classification::Refund),
         // Absent means the owner named no kind, and that is a rule he is
         // entitled to write: it says the rows this matches are income of a kind
@@ -522,11 +541,12 @@ pub fn outcome_from(
 fn invalid_outcome(actual: &str) -> AppError {
     FieldRejection::new(
         "outcome",
-        "internal_transfer, external_flow, refund, income or fee",
+        "internal_transfer, own_account_movement, external_flow, refund, income or fee",
         actual,
     )
     .admitting_codes(&[
         "internal_transfer",
+        "own_account_movement",
         "external_flow",
         "refund",
         "income",
@@ -552,17 +572,49 @@ fn invalid_income_kind(actual: &str) -> AppError {
 }
 
 fn subject(event: &Event) -> Option<ClassificationSubject> {
-    let (counterparty, movement) = match event.kind {
+    let (counterparty, movement, far_side) = match event.kind {
         EventKind::CashIn { .. } | EventKind::Income { .. } | EventKind::Refund { .. } => {
-            (Counterparty::Unknown, Movement::In)
+            (Counterparty::Unknown, Some(Movement::In), FarSide::Unstated)
         }
-        EventKind::CashOut { .. } | EventKind::Fee { .. } => (Counterparty::Unknown, Movement::Out),
+        EventKind::CashOut { .. } | EventKind::Fee { .. } => (
+            Counterparty::Unknown,
+            Some(Movement::Out),
+            FarSide::Unstated,
+        ),
         EventKind::CashTransfer { from, to, .. } => {
             if from == event.account {
-                (Counterparty::Named(to.inner().to_string()), Movement::Out)
+                (
+                    Counterparty::Named(to.inner().to_string()),
+                    Some(Movement::Out),
+                    FarSide::Unstated,
+                )
             } else {
-                (Counterparty::Named(from.inner().to_string()), Movement::In)
+                (
+                    Counterparty::Named(from.inner().to_string()),
+                    Some(Movement::In),
+                    FarSide::Unstated,
+                )
             }
+        }
+        // The assertion is carried back into the subject, because it is what
+        // the source said and recomputation must reconsider the row on the same
+        // evidence it was first read on. Dropping it would make every one of
+        // these events look, to `recompute_plan`, like a row whose source said
+        // nothing — and a rule written for exactly such rows would then be
+        // proposed against them as a correction.
+        EventKind::OwnAccountMovement { amount } => (
+            Counterparty::Unknown,
+            Some(if amount.amount().raw() < 0 {
+                Movement::Out
+            } else {
+                Movement::In
+            }),
+            FarSide::OwnAccount,
+        ),
+        // No direction, for the reason the fact has no leg. `None` here is the
+        // same `None` an observation carries, and it reaches the same place.
+        EventKind::UnresolvedOwnAccountMovement { .. } => {
+            (Counterparty::Unknown, None, FarSide::OwnAccount)
         }
         EventKind::Trade { .. }
         | EventKind::OpeningPosition { .. }
@@ -592,7 +644,8 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         // the rule was written about.
         description: event.provenance.description().map(str::to_owned),
         source_kind: event.provenance.source_category().map(str::to_owned),
-        movement: Some(movement),
+        movement,
+        far_side,
     })
 }
 

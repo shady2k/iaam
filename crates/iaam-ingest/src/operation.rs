@@ -131,6 +131,36 @@ pub enum OperationKind {
         amount_minor: i64,
         currency: CurrencyCode,
     },
+    /// Money moved between this account and another account of the owner's
+    /// that the source asserted and did not name.
+    ///
+    /// The one kind here whose direction is a field rather than the variant,
+    /// and it is a field because it may be **absent**: a source that files a row
+    /// as a movement within the owner's own holdings routinely prints no
+    /// direction beside it, and there is no positive-amount convention that
+    /// could stand in — [`ObservedRow::movement`] refuses to read the sign of a
+    /// row whose source stated no direction, precisely because a bank that
+    /// prints every amount positive would otherwise have every row read as an
+    /// arrival.
+    ///
+    /// `amount_minor` is positive like every other kind here; the direction is
+    /// `movement` and nothing else. `build` produces
+    /// `EventKind::OwnAccountMovement` with a signed leg where the direction is
+    /// stated and `EventKind::UnresolvedOwnAccountMovement` with no leg at all
+    /// where it is not — **two** journal facts from one submission shape,
+    /// because a submission may reasonably carry a maybe and a fact may not.
+    ///
+    /// It is not [`Self::Transfer`]. That kind names the far account and writes
+    /// both legs, and it is refused outright when the two accounts are the
+    /// same; here there is no far account to name. It is not
+    /// [`Self::Deposit`] or [`Self::Withdrawal`] either: those say the money
+    /// crossed into or out of the owner's own accounts, which is the opposite
+    /// of what the source said.
+    OwnAccountMovement {
+        movement: Option<crate::classification::Movement>,
+        amount_minor: i64,
+        currency: CurrencyCode,
+    },
     /// A purchase: cash leaves the account and the security arrives.
     ///
     /// `quantity` and `gross_minor` are both positive, as is the optional
@@ -504,6 +534,38 @@ fn build(
                 },
                 vec![Leg::cash(account, outgoing), Leg::cash(*to, amount)],
             ))
+        }
+        OperationKind::OwnAccountMovement {
+            movement,
+            amount_minor,
+            currency,
+        } => {
+            let magnitude = positive(*amount_minor, "amount", *currency)?;
+            match movement {
+                Some(crate::classification::Movement::Out) => {
+                    let amount = money(-magnitude, *currency);
+                    Ok((
+                        EventKind::OwnAccountMovement { amount },
+                        vec![Leg::cash(account, amount)],
+                    ))
+                }
+                Some(crate::classification::Movement::In) => {
+                    let amount = money(magnitude, *currency);
+                    Ok((
+                        EventKind::OwnAccountMovement { amount },
+                        vec![Leg::cash(account, amount)],
+                    ))
+                }
+                // No leg, and the amount stays a magnitude. A leg here would be
+                // the journal asserting a direction on the strength of nothing,
+                // which is the defect the whole shape answers.
+                None => Ok((
+                    EventKind::UnresolvedOwnAccountMovement {
+                        amount: money(magnitude, *currency),
+                    },
+                    Vec::new(),
+                )),
+            }
         }
         OperationKind::Buy {
             instrument,

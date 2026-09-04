@@ -2949,7 +2949,7 @@ mod tests {
     use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
     use iaam_core::reconciliation::evidence::{Evidence, Ground, SourceChannel};
-    use iaam_ingest::classification::{Answer, Counterparty};
+    use iaam_ingest::classification::{Answer, Counterparty, FarSide};
     use iaam_store::SqliteStore;
     use std::collections::BTreeSet;
     use time::macros::date;
@@ -6042,6 +6042,7 @@ mod tests {
             description: Some("card purchase 0001".to_owned()),
             source_kind: Some("card".to_owned()),
             movement: None,
+            far_side: FarSide::Unstated,
         }
     }
 

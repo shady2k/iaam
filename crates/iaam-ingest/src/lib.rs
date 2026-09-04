@@ -14,6 +14,7 @@ pub mod classification;
 pub mod csv_source;
 pub mod dedup;
 pub mod journal_event;
+pub mod mirror;
 pub mod observation;
 pub mod operation;
 pub mod profile;
@@ -23,6 +24,7 @@ pub mod verdict;
 pub use journal_event::{
     JournalEventEnrichment, JournalFact, SubmittedJournalEvent, normalize_journal_event,
 };
+pub use mirror::{Mirror, MirrorEvidence, MirrorSide, mirrored};
 pub use observation::{ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity};
 pub use operation::{Normalized, OperationDates, OperationKind, SubmittedOperation, normalize};
 pub use profile::{ProfileCatalogue, SourceProfile};

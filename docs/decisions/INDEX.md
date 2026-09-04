@@ -33,4 +33,5 @@
 | [0028](0028-a-profile-transcribes-what-the-source-claims-and-the-engine-decides.md) | A profile transcribes what the source claims about a row, and the engine decides what follows | 2026-09-04 | proposed | `iaam-b0r0`, `iaam-rdya`, `iaam-2hq0` |
 | [0029](0029-one-answer-per-decision-and-a-question-published-with-its-answers.md) | One answer per decision, and a question published with the answers it admits | 2026-09-04 | proposed | `iaam-qn6d` |
 | [0030](0030-an-item-asks-what-he-knows-and-offers-what-he-may-answer.md) | An item asks what the owner knows, and offers what he may answer | 2026-09-04 | proposed | `iaam-9i83`, `iaam-mk1n` |
+| [0031](0031-one-movement-a-document-printed-twice-is-one-fact.md) | One movement a document printed twice is one fact | 2026-09-04 | proposed | `iaam-3qsq`, `iaam-9ck1`, `iaam-rdya` |
 | [0033](0033-one-answer-over-a-set-and-a-question-he-may-decline-to-answer.md) | One answer over a set, the fields of one call together, and a question he may decline to answer | 2026-09-04 | proposed | `iaam-hdr7`, `iaam-zxc6`, `iaam-4fsw` |

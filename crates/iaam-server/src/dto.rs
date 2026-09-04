@@ -31,8 +31,8 @@ use iaam_app::scenarios::classification::{
 use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
 use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::{
-    AnswerableQuestion, ControlReconciliation, HeldRow, ImportPlan, NoFactReason, PlannedFact,
-    Readiness, ResemblingRow, RetainedRow, RetentionReason, SettledRow,
+    AnswerableQuestion, ControlReconciliation, FactBasis, HeldRow, ImportPlan, NoFactReason,
+    PlannedFact, Readiness, ResemblingRow, RetainedRow, RetentionReason, SettledRow,
 };
 // The question's own generalisation, in a block of its own rather than merged
 // into the list above: this file is edited by several changes at once, and one
@@ -9883,6 +9883,28 @@ pub struct OpenQuestionDto {
     /// nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alike: Vec<u32>,
+    /// The identifier this question shares with the other leg of one movement.
+    ///
+    /// **Not `alike`, and the difference decides what an answer does.** Alike
+    /// rows are the same decision about different money — twenty payments to one
+    /// merchant — and answering one settles the others only if the call asks for
+    /// it. A pair is **one movement**: this document printed the departure on one
+    /// account and the arrival on the other, and there is one fact between them.
+    /// Answering either question as a movement to or from the other row's account
+    /// settles both, records one transfer from the sending side, and returns the
+    /// other row under `commit_delta.settled_without_fact` with the reason
+    /// `second_leg_of_one_movement`.
+    ///
+    /// **It is a hypothesis and it is refused by answering.** Two unrelated
+    /// payments of one amount on one day have the same shape, and any answer that
+    /// does not name the other row's account — «this was a payment», «this was a
+    /// fee» — leaves the two rows as two rows with two questions. Nothing is
+    /// suppressed or recorded because this field is present.
+    ///
+    /// Absent where this row's question stands alone, which is the ordinary
+    /// case. The value is stable across readings of an unchanged session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair: Option<Uuid>,
 }
 
 /// A standing decision this session's own rows offer, before the owner is asked
@@ -9961,7 +9983,27 @@ pub struct PlannedFactDto {
     pub row: u32,
     pub account: Uuid,
     /// The event kind, in the journal's own vocabulary.
+    ///
+    /// What the fact is. Why it may be written is `settled_by` beside it, and
+    /// the two were one word until `iaam-rdya`.
     pub records_as: String,
+    /// On whose word this row was settled: `concluded`, `directory`,
+    /// `source_asserted`, `rule` or `answered`.
+    ///
+    /// **`source_asserted` is the value this field was added for.** A source
+    /// that asserts the far side of a row is one of the owner's accounts
+    /// settles it with no question and no rule, and the fact it writes is
+    /// indistinguishable in `records_as` from one his own standing rule
+    /// produced. Asserting is the cheapest way for a profile to make questions
+    /// disappear, and the damage it does is measured by what was **never
+    /// asked** — which appears in no list of open questions. This is what a
+    /// reader can catch it with.
+    pub settled_by: String,
+    /// The same determination in words.
+    pub settled_by_explanation: String,
+    /// The standing rule that settled the row, where one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_by_rule: Option<String>,
     /// Signed cash this row moves on its own account, as a decimal string.
     pub amount: String,
     pub currency: CurrencyDto,
@@ -10102,6 +10144,8 @@ pub struct ResemblingRowDto {
     pub account: Uuid,
     /// The event kind, in the journal's own vocabulary.
     pub records_as: String,
+    /// On whose word this row was settled, in `PlannedFactDto`'s vocabulary.
+    pub settled_by: String,
     /// Signed cash this row moves on its own account, as a decimal string.
     pub amount: String,
     pub currency: CurrencyDto,
@@ -10130,6 +10174,7 @@ impl ResemblingRowDto {
             row: fact.row,
             account: fact.account,
             records_as: fact.records_as,
+            settled_by: fact.settled_by,
             amount: fact.amount,
             currency: fact.currency,
             date: fact.date,
@@ -10144,8 +10189,8 @@ impl ResemblingRowDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SettledRowDto {
     pub row: u32,
-    /// The determination that settled it. Today the only value is
-    /// `one_account_two_instruments`.
+    /// The determination that settled it: `one_account_two_instruments` or
+    /// `second_leg_of_one_movement`.
     ///
     /// A code and not free text: it is the same word the row's commit verdict
     /// carries in `detail`, so a client can match the two without parsing
@@ -10155,7 +10200,20 @@ pub struct SettledRowDto {
     /// The same determination in words, for a reader.
     pub explanation: String,
     /// The account the two payment instruments belong to.
-    pub account: Uuid,
+    ///
+    /// Present only for `one_account_two_instruments`, which is the reason that
+    /// is about an account. It became optional when the second reason arrived:
+    /// a movement recorded by another row is about a **row**, and filling this
+    /// with something plausible would name an account nothing determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    /// The row of this session whose fact carries the movement.
+    ///
+    /// Present only for `second_leg_of_one_movement`, and it is what makes that
+    /// determination auditable: the reader can go and look at the fact that was
+    /// kept, in `commit_delta.facts`, under this row number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub records: Option<u32>,
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -10423,6 +10481,7 @@ impl ImportPlanDto {
                             .map(AnswerAlternativeDto::from_domain)
                             .collect(),
                         alike: open.alike.clone(),
+                        pair: open.pair,
                     })
                     .collect(),
                 offered_rules: plan
@@ -10514,6 +10573,15 @@ impl PlannedFactDto {
             row: fact.row,
             account: fact.account.inner(),
             records_as: fact.records_as.to_owned(),
+            settled_by: fact.settled_by.code().to_owned(),
+            settled_by_explanation: fact.settled_by.describe().to_owned(),
+            settled_by_rule: match &fact.settled_by {
+                FactBasis::Rule { rule, .. } => Some(rule.clone()),
+                FactBasis::Concluded
+                | FactBasis::Directory
+                | FactBasis::SourceAsserted
+                | FactBasis::Answered => None,
+            },
             amount: minor_amount(fact.amount_minor, fact.currency),
             currency: CurrencyDto::from_domain(fact.currency),
             date: fact.date,
@@ -10525,12 +10593,16 @@ impl PlannedFactDto {
 impl SettledRowDto {
     #[must_use]
     pub fn from_domain(settled: &SettledRow) -> Self {
-        let NoFactReason::OneAccountTwoInstruments { account } = settled.reason;
+        let (account, records) = match settled.reason {
+            NoFactReason::OneAccountTwoInstruments { account } => (Some(account.inner()), None),
+            NoFactReason::SecondLegOfOneMovement { records } => (None, Some(records)),
+        };
         Self {
             row: settled.row,
             reason: settled.reason.code().to_owned(),
             explanation: settled.reason.describe().to_owned(),
-            account: account.inner(),
+            account,
+            records,
         }
     }
 }

@@ -116,6 +116,8 @@ is how you match a term in them to the code.
 | маппинг колонок | column mapping | which export column feeds which field |
 | профиль источника | source profile | the JSON file describing one document type of one institution: column mapping plus a translation of that source's own words into iaam's. Data, never code, and it concludes nothing (decision 0019) |
 | движок импорта | import engine | the one in-tree reader that takes a document and a profile and produces observations. There is one of it; a profile does not parse, it describes |
+| передача документа | conveying | an agent moving a document of the owner's to his own instance, **unread**. Permitted, and the ordinary way an import starts (decision 0022). Never «uploading», which says nothing about who read it |
+| истолкование документа | interpreting | producing from a document a claim about what it says: parsing it, summarising its rows, or deciding what a row was. Never an agent's act — the engine reads and the session asks (decision 0022) |
 | каталог профилей | profile catalogue | what an instance publishes about the profiles it holds: id, version, digest, origin, and the reason any was refused |
 | карта слов | token map | a profile's mapping from a literal the source prints to one of iaam's own words. Total over the source's vocabulary, with no catch-all: an unmapped word rejects the row |
 | ключ строки | row key | the stable identity that makes a re-import idempotent |

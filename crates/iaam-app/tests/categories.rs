@@ -8,7 +8,7 @@ use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, preview_category_rule,
     retire_category, retire_category_rule, retire_group,
 };
-use iaam_app::scenarios::reports::{MoneyFlowQuery, money_flow};
+use iaam_app::scenarios::reports::{HeldScope, MoneyFlowQuery, money_flow};
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, CategoryGroupId, CategoryId, CategoryRuleId, OwnerId, SourceId};
@@ -204,6 +204,7 @@ async fn the_flow_report_decomposes_by_the_owners_rules() {
             contour_version: None,
             from: date!(2026 - 08 - 01),
             to: date!(2026 - 08 - 31),
+            held: HeldScope::None,
         },
     )
     .await
@@ -244,6 +245,7 @@ async fn a_rule_outside_the_month_does_not_touch_it() {
             contour_version: None,
             from: date!(2026 - 08 - 01),
             to: date!(2026 - 08 - 31),
+            held: HeldScope::None,
         },
     )
     .await

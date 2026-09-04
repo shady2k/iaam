@@ -41,7 +41,8 @@ use iaam_app::scenarios::import_session::Generalisation;
 use iaam_app::scenarios::import_session::PlannedOrigin;
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
-    MoneyFlowOutcome, PopulationAccount, ReportConfidence, ReportPopulation, ReturnsOutcome,
+    HeldContribution, HeldRows, HeldSession, MoneyFlowOutcome, PopulationAccount, ReportConfidence,
+    ReportPopulation, ReturnsOutcome,
 };
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection, IntervalFit};
@@ -2726,6 +2727,140 @@ impl PopulationAccountDto {
     }
 }
 
+/// What a figure was folded over beyond the journal, and what it could not
+/// include.
+///
+/// Every report carries one, always, exactly as `population` does. `population`
+/// says **which accounts** the figures are about; this says **which rows**. They
+/// are two coordinates of one answer and neither substitutes for the other: a
+/// report can cover every account the system knows of and still be folded over
+/// rows nobody has confirmed.
+///
+/// The default is the journal alone, and it stays the default. A figure that
+/// quietly folded unconfirmed rows would be a figure whose provenance cannot be
+/// read off the answer that carries it, which is worse than no figure.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HeldRowsDto {
+    /// The scope the request named, echoed: `none`, `all` or `named`.
+    ///
+    /// Here because `sessions` alone cannot say it. An empty list under `all`
+    /// means the owner is holding nothing; the same empty list under `none`
+    /// means nobody asked. A reader that could not tell those apart would read
+    /// the first as the second and stop looking — the same reason
+    /// `complete_through` is published on an empty market series.
+    pub requested: String,
+    /// One entry per session the scope resolved to. Empty under `none`.
+    pub sessions: Vec<HeldSessionDto>,
+    /// How many held rows became no fact at all, over every folded session.
+    ///
+    /// **A field, not a caveat.** A row with an unanswered question or a
+    /// reading that failed produces nothing, so figures «including held rows»
+    /// are systematically short exactly where attention is owed. An answer that
+    /// did not publish this count would manufacture confident wrong arithmetic.
+    /// `0` under `none` is not a claim about any session: nothing was asked
+    /// for, so nothing was left out.
+    pub retained_unrecorded: usize,
+}
+
+/// One session a report was asked to fold, and what it contributed.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HeldSessionDto {
+    pub session: Uuid,
+    /// The session's own state — `open`, `committed` or `abandoned` — as
+    /// `GET /v1/import-sessions` prints it.
+    pub state: String,
+    /// What this session put into the figures. Three words, and the reader
+    /// never has to reason about an absence:
+    ///
+    /// - `folded` — the session is open and its planned facts are in the
+    ///   figures. The counts below are present and describe that plan;
+    /// - `already_in_journal` — the session is committed. Its rows reached the
+    ///   journal, so the figures hold them **once**, by the ordinary path;
+    ///   folding the plan beside the journal would count that money twice.
+    ///   Naming a committed session is not refused: committing between two
+    ///   reads must not turn a request that worked into one that fails, and the
+    ///   figure is the same either way;
+    /// - `abandoned` — the session was abandoned and its rows will never become
+    ///   facts. The figures are the journal's alone, which is the answer rather
+    ///   than a defect.
+    pub contribution: String,
+    /// The stamp of the plan these figures were folded from. Present exactly
+    /// when `contribution` is `folded`.
+    ///
+    /// The same stamp the commit call checks, so a reader can fetch the
+    /// session's assessment and see whether the plan behind this figure is the
+    /// plan he read. Opaque: it is a fingerprint of the plan, and a client that
+    /// parsed it would depend on how the plan is rendered rather than on what
+    /// it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// How many planned facts were folded into these figures. Present exactly
+    /// when `contribution` is `folded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<usize>,
+    /// How many planned facts the report's own date left out — a held row dated
+    /// after it, outside the answer exactly as a journal row dated after it is.
+    /// Present exactly when `contribution` is `folded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beyond_the_report_date: Option<usize>,
+    /// How many of the session's rows carry an idempotency key the journal
+    /// already holds. Not folded — the journal holds them, and folding them
+    /// beside it would count them twice. Present exactly when `contribution` is
+    /// `folded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_in_journal: Option<usize>,
+    /// How many rows became no fact at all: an unanswered question, or a row
+    /// the reader could not read. **The figures are short by these.** Present
+    /// exactly when `contribution` is `folded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_unrecorded: Option<usize>,
+    /// How many rows were read, understood, and correctly produce no fact.
+    /// The figures are **not** short by these: nothing is owed for a row that
+    /// moves nothing. Counted apart from `retained_unrecorded` so a reader is
+    /// not sent looking for money that was never there. Present exactly when
+    /// `contribution` is `folded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_without_fact: Option<usize>,
+}
+
+impl HeldRowsDto {
+    /// Copied from the answer that folded them. The transport counts nothing:
+    /// every number here is the planner's own, taken from the plan the events
+    /// came from.
+    #[must_use]
+    pub fn from_domain(held: &HeldRows) -> Self {
+        Self {
+            requested: held.requested.code().to_owned(),
+            sessions: held
+                .sessions
+                .iter()
+                .map(HeldSessionDto::from_domain)
+                .collect(),
+            retained_unrecorded: held.retained_unrecorded,
+        }
+    }
+}
+
+impl HeldSessionDto {
+    fn from_domain(session: &HeldSession) -> Self {
+        let folded = match &session.contribution {
+            HeldContribution::Folded(folded) => Some(folded),
+            HeldContribution::AlreadyInJournal | HeldContribution::Abandoned => None,
+        };
+        Self {
+            session: session.session.inner(),
+            state: session.state.code().to_owned(),
+            contribution: session.contribution.code().to_owned(),
+            revision: folded.map(|folded| folded.revision.0.clone()),
+            facts: folded.map(|folded| folded.facts),
+            beyond_the_report_date: folded.map(|folded| folded.beyond_the_report_date),
+            already_in_journal: folded.map(|folded| folded.already_in_journal),
+            retained_unrecorded: folded.map(|folded| folded.retained_unrecorded),
+            settled_without_fact: folded.map(|folded| folded.settled_without_fact),
+        }
+    }
+}
+
 /// Cash movement report over an inclusive interval.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MoneyFlowReportDto {
@@ -2751,6 +2886,10 @@ pub struct MoneyFlowReportDto {
     pub actions: Vec<ActionDto>,
     /// The accounts this report covered, and the known accounts it did not.
     pub population: PopulationDto,
+    /// The held rows these figures were folded over, and what they could not
+    /// include. Always present: the empty block says the figures are the
+    /// journal and nothing else.
+    pub held_rows: HeldRowsDto,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2985,6 +3124,7 @@ impl MoneyFlowReportDto {
             unexplained,
             actions,
             population: PopulationDto::from_domain(population),
+            held_rows: HeldRowsDto::from_domain(&outcome.held_rows),
         })
     }
 }
@@ -3027,6 +3167,10 @@ pub struct BalancesReportDto {
     /// about the set. No row can carry it — there is no row for an account the
     /// report left out, and that silence is what this block breaks.
     pub population: PopulationDto,
+    /// The held rows these figures were folded over, and what they could not
+    /// include. Always present: the empty block says the figures are the
+    /// journal and nothing else.
+    pub held_rows: HeldRowsDto,
 }
 
 /// One account-and-currency carrying a negative cash balance at the report
@@ -3226,7 +3370,15 @@ pub struct PositionQuantityDto {
 }
 
 impl BalancesReportDto {
-    pub fn from_domain(report: &BalancesReport, catalog: &ActionCatalog) -> Self {
+    /// The held-rows statement is a parameter rather than a field on
+    /// `BalancesReport`: that type is the core's, and the core knows nothing
+    /// about import sessions. Taking it here means the answer cannot be built
+    /// without saying which rows it was folded over.
+    pub fn from_domain(
+        report: &BalancesReport,
+        held_rows: &HeldRows,
+        catalog: &ActionCatalog,
+    ) -> Self {
         Self {
             // Asked of the report itself. The transport neither folds the rows
             // nor decides what a caveat is: a register assembled here could
@@ -3258,6 +3410,7 @@ impl BalancesReportDto {
                 })
                 .collect(),
             population: PopulationDto::from_domain(&report.population),
+            held_rows: HeldRowsDto::from_domain(held_rows),
         }
     }
 }
@@ -3354,6 +3507,10 @@ pub struct AssetSnapshotDto {
     /// The accounts this answer covered, and the known accounts it did not. A
     /// total that silently omits an account is worse than no total.
     pub population: PopulationDto,
+    /// The held rows these figures were folded over, and what they could not
+    /// include. Always present: the empty block says the figures are the
+    /// journal and nothing else.
+    pub held_rows: HeldRowsDto,
 }
 
 /// Cash, as the journal recorded it, grouped by the class the owner declared.
@@ -3526,7 +3683,13 @@ pub struct AssetAccountDto {
 }
 
 impl AssetSnapshotDto {
-    pub fn from_domain(snapshot: &AssetSnapshot, catalog: &ActionCatalog) -> Self {
+    /// The held-rows statement is a parameter for [`BalancesReportDto`]'s
+    /// reason: `AssetSnapshot` is a core type.
+    pub fn from_domain(
+        snapshot: &AssetSnapshot,
+        held_rows: &HeldRows,
+        catalog: &ActionCatalog,
+    ) -> Self {
         Self {
             // Asked of the snapshot itself. The transport neither folds the
             // rows nor decides what a caveat is: a register assembled here
@@ -3609,6 +3772,7 @@ impl AssetSnapshotDto {
                 })
                 .collect(),
             population: PopulationDto::from_domain(&snapshot.population),
+            held_rows: HeldRowsDto::from_domain(held_rows),
         }
     }
 }
@@ -3691,6 +3855,10 @@ pub struct ReturnsAnswerDto {
     pub report: ReturnsReportDto,
     /// The accounts this report covered, and the known accounts it did not.
     pub population: PopulationDto,
+    /// The held rows these figures were folded over, and what they could not
+    /// include. Always present: the empty block says the figures are the
+    /// journal and nothing else.
+    pub held_rows: HeldRowsDto,
 }
 
 impl ReturnsAnswerDto {
@@ -3700,6 +3868,7 @@ impl ReturnsAnswerDto {
             confidence: ConfidenceDto::from_domain(&outcome.confidence(), catalog),
             report: ReturnsReportDto::from_domain(&outcome.report),
             population: PopulationDto::from_domain(&outcome.population),
+            held_rows: HeldRowsDto::from_domain(&outcome.held_rows),
         }
     }
 }

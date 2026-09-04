@@ -7,7 +7,7 @@ use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
 use iaam_app::ports::{AccountView, Clock, OutboundHttp, OutboundResponse, Principal, Scope};
-use iaam_app::scenarios::reports::{ReturnsQuery, returns};
+use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_app::scenarios::schedule::{SOURCE_ID, ScheduleSyncRequest, sync_schedule};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
@@ -339,6 +339,7 @@ async fn resyncing_changes_no_bond_attribute_at_a_fixed_coordinate() {
         report_currency: CurrencyCode::Rub,
         fx: iaam_core::valuation::FxTable::new(FxSource::OwnerSupplied),
         lot_rule: iaam_core::rules::LotRuleVersion(1),
+        held: HeldScope::None,
     };
     let before = returns(&services, &principal(owner), &query)
         .await

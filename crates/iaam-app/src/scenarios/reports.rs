@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::bond::BondSchedule;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::Event;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
-use iaam_core::ids::{AccountId, InstrumentId};
+use iaam_core::ids::{AccountId, ImportSessionId, InstrumentId};
 use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::approx::SolverPolicy;
@@ -37,10 +38,13 @@ use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 use super::categories::load_index;
+use super::import_session::{SessionRevision, plan_session};
 use crate::AppServices;
 use crate::error::AppError;
 use crate::market_candidate::MOEX_ISS_SOURCE_ID;
-use crate::ports::{AccountRetirementsView, AccountView, NegativeBalanceExpectation, Principal};
+use crate::ports::{
+    AccountRetirementsView, AccountView, ImportSessionState, NegativeBalanceExpectation, Principal,
+};
 
 pub use iaam_core::goal::ReportGoal;
 /// The report vocabulary, in the core.
@@ -65,6 +69,359 @@ pub use iaam_core::report::population::{
     AccountStanding, KnownAccountCoverage, PopulationAccount, ReportPopulation,
 };
 
+// ---------------------------------------------------------------------------
+// Held rows (iaam-5put, decision 0018)
+// ---------------------------------------------------------------------------
+
+/// Which held rows, beside the journal, a report was asked to fold.
+///
+/// Every report reads the journal. This says what else it reads, and nothing
+/// else: there is no value that answers over held rows *instead of* the
+/// journal. A balance folded from one import alone is not a balance — it has no
+/// opening and no history — and what that import adds is already published, per
+/// account and currency, by the session's own assessment
+/// (`commit_delta.fact_totals`), computed by the same planner. Decision 0018 §2
+/// records the refusal.
+///
+/// [`Self::None`] is the default and stays the default: a figure that quietly
+/// folded unconfirmed rows would be a figure whose provenance cannot be read off
+/// the answer carrying it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HeldScope {
+    /// The journal alone.
+    #[default]
+    None,
+    /// The journal, plus every session of the owner's that is still open.
+    ///
+    /// A quantifier over the set, resolved when the report runs. A caller that
+    /// spells out the identifiers instead gets the set as it stood when it read
+    /// them, which is the difference between «everything I am still holding»
+    /// and «these».
+    All,
+    /// The journal, plus exactly these sessions.
+    Named(Vec<ImportSessionId>),
+}
+
+impl HeldScope {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::All => "all",
+            Self::Named(_) => "named",
+        }
+    }
+
+    /// Whether anything beyond the journal was asked for.
+    ///
+    /// `Named(vec![])` is not reachable: the transport refuses an empty list,
+    /// because a caller that wrote the parameter meant something by it.
+    #[must_use]
+    pub const fn is_journal_only(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// What a figure was folded over beyond the journal, and what it could not
+/// include.
+///
+/// Carried by every report answer, always, exactly as `population` is — and for
+/// `population`'s reason. An absent block is indistinguishable from a report
+/// that never asked, and the empty block is a statement in its own right: it
+/// says these figures are the journal and nothing else.
+///
+/// `requested` is here because the sessions alone cannot say it. An empty
+/// `sessions` list under `all` means the owner is holding nothing; the same
+/// empty list under `none` means nobody asked. A reader that could not tell
+/// those apart would read the first as the second and stop looking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldRows {
+    /// The scope the caller named, echoed.
+    pub requested: HeldScope,
+    /// One entry per session the scope resolved to, in the order it resolved
+    /// them. Empty under [`HeldScope::None`].
+    pub sessions: Vec<HeldSession>,
+    /// How many held rows yielded no fact at all, over every folded session.
+    ///
+    /// **Not a caveat and not optional.** A row with an unanswered question or
+    /// a reading that failed becomes nothing, so a figure «including held rows»
+    /// is systematically short exactly where attention is owed — and an answer
+    /// that did not publish this count would manufacture confident wrong
+    /// arithmetic. It is the sum of the folded sessions' own
+    /// `retained_unrecorded`, folded here so that a reader comparing one number
+    /// against one number does no arithmetic of his own (§13).
+    pub retained_unrecorded: usize,
+}
+
+impl HeldRows {
+    /// The statement a report over the journal alone makes.
+    #[must_use]
+    pub const fn journal_only() -> Self {
+        Self {
+            requested: HeldScope::None,
+            sessions: Vec::new(),
+            retained_unrecorded: 0,
+        }
+    }
+}
+
+/// One session the scope named, and what it contributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSession {
+    pub session: ImportSessionId,
+    /// The session's own state, read from the session and not inferred from
+    /// what it contributed.
+    pub state: ImportSessionState,
+    pub contribution: HeldContribution,
+}
+
+/// What one named session put into the figures.
+///
+/// A word that names its own state, in `Generalisation`'s shape and for its
+/// reason: two of the three contribute nothing, and they contribute nothing for
+/// opposite reasons. A reader shown an absence could not tell «its rows are
+/// already counted» from «its rows will never be counted», and the second means
+/// a figure short by that session while the first means a figure that is right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldContribution {
+    /// The session is open and its planned facts are in the figures.
+    Folded(FoldedRows),
+    /// The session is committed. Its rows are in the journal already, so the
+    /// figures hold them **once**, by the ordinary path; folding the plan
+    /// beside the journal would count that money twice.
+    ///
+    /// Not a refusal, deliberately. Committing a session between reading a
+    /// report and reading it again must not turn a request that worked into a
+    /// request that fails, and the figure is the same either way — which is the
+    /// property that makes committing safe to do. Decision 0018 §4.
+    AlreadyInJournal,
+    /// The session was abandoned. Its rows will never become facts, and the
+    /// figures are the journal's alone — which is the answer, not a defect,
+    /// and is published rather than left as an absence.
+    Abandoned,
+}
+
+impl HeldContribution {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Folded(_) => "folded",
+            Self::AlreadyInJournal => "already_in_journal",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// What one folded session put in, and what it could not.
+///
+/// Every count comes from the plan the events came from — [`plan_session`]'s
+/// `commit_delta` — so nothing here is a second reading of the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedRows {
+    /// The stamp of the plan these figures were folded from.
+    ///
+    /// The same stamp `POST /v1/import-sessions/{session}/commit` checks, so a
+    /// reader can fetch the session's assessment and see whether the plan
+    /// behind this figure is the plan he read. Without it the report would name
+    /// a session and not which reading of it.
+    pub revision: SessionRevision,
+    /// How many planned facts were folded.
+    pub facts: usize,
+    /// How many planned facts the report's own date bound left out.
+    ///
+    /// A held row dated after the report date is outside the answer exactly as
+    /// a journal row dated after it is, and for the same reason. It is counted
+    /// because the caller asked for this session and this is the part of it he
+    /// did not get — an omission the date explains, and one nothing else in the
+    /// answer would show him.
+    pub beyond_the_report_date: usize,
+    /// How many rows carry an idempotency key the journal already holds.
+    ///
+    /// Not folded: the journal holds them, and folding them beside it would
+    /// count them twice. Published because a caller comparing the figure
+    /// against the statement the rows came from needs to know that this much of
+    /// it was already counted.
+    pub already_in_journal: usize,
+    /// How many rows became no fact at all — an unanswered question, or a row
+    /// this build could not read. The figures are short by these.
+    pub retained_unrecorded: usize,
+    /// How many rows were read, understood, and correctly produce no fact.
+    ///
+    /// Counted apart from `retained_unrecorded` because the figures are **not**
+    /// short by these: nothing is owed for a row that moves nothing. Folded
+    /// into one number the pair would send a reader looking for money that was
+    /// never there.
+    pub settled_without_fact: usize,
+}
+
+/// The held facts a report folds, and the statement it publishes about them.
+///
+/// The events are unfiltered by date; every fold site takes the slice its own
+/// journal read would have taken, through [`Self::through`]. One resolution per
+/// report — the returns path folds two slices of one journal and must not plan
+/// the same session twice, or a report could hold two readings of one session.
+struct HeldFacts {
+    events: Vec<Event>,
+    statement: HeldRows,
+}
+
+impl HeldFacts {
+    /// The held events a journal slice loaded through this date would hold.
+    ///
+    /// The predicate is `load_events_through`'s: the ordering date, inclusive.
+    /// A second rule here would put a held row in a report the same row would
+    /// have missed once committed.
+    fn through(&self, through: Date) -> impl Iterator<Item = Event> + '_ {
+        self.events
+            .iter()
+            .filter(move |event| event.order.date() <= through)
+            .cloned()
+    }
+
+    /// Whether anything at all was folded.
+    ///
+    /// Read where a projection may be persisted: a snapshot folded over held
+    /// rows must never be saved. See [`returns`].
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+/// Resolve the scope into the facts to fold and the statement to publish.
+///
+/// **The facts come from the planner that commits.** [`plan_session`] is asked
+/// what each session would append, and its answer is folded unchanged; nothing
+/// here reads the stored observations. Two readings of one session that can
+/// disagree is the defect the single-planner design exists to prevent, and a
+/// report is exactly the surface on which such a disagreement would be
+/// invisible — the figures would simply be wrong, with every verdict positive.
+///
+/// `through` is the report's own date bound, used only to count what it left
+/// out; the events come back whole.
+async fn held_facts(
+    services: &AppServices,
+    principal: &Principal,
+    scope: &HeldScope,
+    through: Date,
+) -> Result<HeldFacts, AppError> {
+    let named: Vec<ImportSessionId> = match scope {
+        HeldScope::None => {
+            return Ok(HeldFacts {
+                events: Vec::new(),
+                statement: HeldRows::journal_only(),
+            });
+        }
+        HeldScope::All => services
+            .store
+            .list_import_sessions(principal.owner)
+            .await?
+            .into_iter()
+            .filter(|view| view.state == ImportSessionState::Open)
+            .map(|view| view.id)
+            .collect(),
+        HeldScope::Named(named) => {
+            // A session named twice would be planned twice and folded twice,
+            // and the second fold is money that never existed. Refused rather
+            // than deduplicated: silently accepting a request whose plain
+            // reading is «count this import twice» teaches a caller that the
+            // spelling does not matter.
+            let mut seen = BTreeSet::new();
+            for session in named {
+                if !seen.insert(*session) {
+                    return Err(AppError::Invalid {
+                        field: "held".into(),
+                        expected: "each session named at most once".into(),
+                        actual: session.inner().to_string(),
+                    });
+                }
+            }
+            named.clone()
+        }
+    };
+
+    let mut events = Vec::new();
+    let mut sessions = Vec::with_capacity(named.len());
+    let mut retained_unrecorded = 0usize;
+    for session in named {
+        let (folded, entry) = held_session_facts(services, principal, session, through).await?;
+        if let HeldContribution::Folded(counts) = &entry.contribution {
+            retained_unrecorded += counts.retained_unrecorded;
+        }
+        events.extend(folded);
+        sessions.push(entry);
+    }
+
+    Ok(HeldFacts {
+        events,
+        statement: HeldRows {
+            requested: scope.clone(),
+            sessions,
+            retained_unrecorded,
+        },
+    })
+}
+
+/// Plan one named session, and say what it contributed.
+///
+/// The state is read before the session is planned, so that a committed or
+/// abandoned session costs a lookup rather than a plan — and so that a session
+/// the owner does not hold is **not found** here, where the answer is about his
+/// money. An identifier is not an access right.
+///
+/// A session that is not open contributes nothing, by rule and not by
+/// arithmetic. Leaving it to the planner's duplicate detection would be nearly
+/// right and wrong where it matters: that check is by idempotency key, so a
+/// committed row that carried none would be folded a second time.
+async fn held_session_facts(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+    through: Date,
+) -> Result<(Vec<Event>, HeldSession), AppError> {
+    let view = services
+        .store
+        .load_import_session(principal.owner, session)
+        .await?
+        .ok_or(AppError::NotFound {
+            what: "an import session",
+            id: session.inner().to_string(),
+        })?;
+    let entry = |contribution| HeldSession {
+        session,
+        state: view.state,
+        contribution,
+    };
+    match view.state {
+        ImportSessionState::Committed => {
+            Ok((Vec::new(), entry(HeldContribution::AlreadyInJournal)))
+        }
+        ImportSessionState::Abandoned => Ok((Vec::new(), entry(HeldContribution::Abandoned))),
+        ImportSessionState::Open => {
+            let planned = plan_session(services, principal, session).await?;
+            let delta = &planned.plan.commit_delta;
+            let beyond_the_report_date = planned
+                .would_append()
+                .iter()
+                .filter(|event| event.order.date() > through)
+                .count();
+            let folded = FoldedRows {
+                revision: planned.plan.revision.clone(),
+                facts: planned.would_append().len() - beyond_the_report_date,
+                beyond_the_report_date,
+                already_in_journal: delta.duplicates.len(),
+                retained_unrecorded: delta.retained_unrecorded.len(),
+                settled_without_fact: delta.settled_without_fact.len(),
+            };
+            Ok((
+                planned.would_append().to_vec(),
+                entry(HeldContribution::Folded(folded)),
+            ))
+        }
+    }
+}
+
 /// Yield report request.
 #[derive(Debug, Clone)]
 pub struct ReturnsQuery {
@@ -74,6 +431,8 @@ pub struct ReturnsQuery {
     pub report_currency: CurrencyCode,
     pub fx: FxTable,
     pub lot_rule: LotRuleVersion,
+    /// Which held rows, beside the journal, these figures are folded over.
+    pub held: HeldScope,
 }
 
 /// The returns answer: the report, and the population it answered about.
@@ -89,6 +448,9 @@ pub struct ReturnsOutcome {
     pub report: ReturnsReport,
     /// The accounts the report covered, and the known accounts it did not.
     pub population: ReportPopulation,
+    /// The held rows these figures were folded over, and what they could not
+    /// include. Travels with the report for `population`'s reason.
+    pub held_rows: HeldRows,
 }
 
 impl ReturnsOutcome {
@@ -104,12 +466,17 @@ impl ReturnsOutcome {
 }
 
 /// Money flow report request.
-#[derive(Debug, Clone, Copy)]
+///
+/// No longer `Copy`: the held scope may name a list of sessions, and a request
+/// that says which population it is about carries that list.
+#[derive(Debug, Clone)]
 pub struct MoneyFlowQuery {
     pub contour: ContourId,
     pub contour_version: Option<ContourVersion>,
     pub from: Date,
     pub to: Date,
+    /// Which held rows, beside the journal, these figures are folded over.
+    pub held: HeldScope,
 }
 
 /// Report of cash movement over an interval.
@@ -135,6 +502,9 @@ pub struct MoneyFlowOutcome {
     pub report: MoneyFlowReport,
     /// The accounts this answer covered, and the known accounts it did not.
     pub population: ReportPopulation,
+    /// The held rows these figures were folded over, and what they could not
+    /// include.
+    pub held_rows: HeldRows,
 }
 
 impl MoneyFlowOutcome {
@@ -358,10 +728,17 @@ pub async fn money_flow(
     let population = report_population(services, principal, &definition).await?;
     let categories = load_index(services, principal).await?;
     let category_rule_versions = categories.versions().to_vec();
-    let events = services
+    let held = held_facts(services, principal, &query.held, query.to).await?;
+    let mut events = services
         .store
         .load_events_through(principal.owner, query.to)
         .await?;
+    // Appended to the same slice the journal read produced, before `resolve`,
+    // so that everything downstream reads one set of facts. `resolve` sorts for
+    // replay itself, so the order this extension leaves the vector in is not
+    // the order anything folds; and a held row dated after `to` is left out by
+    // `through`, exactly as the journal read left one out.
+    events.extend(held.through(query.to));
     let window = DateWindow {
         from: query.from,
         to: query.to,
@@ -386,7 +763,30 @@ pub async fn money_flow(
             flow,
         },
         population,
+        held_rows: held.statement,
     })
+}
+
+/// The balances answer, and the held rows it was folded over.
+///
+/// A wrapper for `MoneyFlowOutcome`'s reason, and one more: `BalancesReport`
+/// lives in the core, which knows nothing about import sessions and must not
+/// learn. So the second statement is made here, and it travels with the report
+/// rather than beside it, because a caller free to drop it would eventually
+/// publish figures that fold unconfirmed rows and say nothing about it.
+#[derive(Debug, Clone)]
+pub struct BalancesOutcome {
+    pub report: BalancesReport,
+    pub held_rows: HeldRows,
+}
+
+/// The asset snapshot, and the held rows it was folded over.
+///
+/// A wrapper for [`BalancesOutcome`]'s reason: `AssetSnapshot` is a core type.
+#[derive(Debug, Clone)]
+pub struct AssetSnapshotOutcome {
+    pub snapshot: AssetSnapshot,
+    pub held_rows: HeldRows,
 }
 
 /// Cash balances, reconciliation statuses, and positions by contour account.
@@ -396,10 +796,11 @@ pub async fn account_balances(
     contour: ContourId,
     contour_version: Option<ContourVersion>,
     as_of: Date,
-) -> Result<BalancesReport, AppError> {
-    let (report, _prices) =
-        balances_with_prices(services, principal, contour, contour_version, as_of).await?;
-    Ok(report)
+    held: &HeldScope,
+) -> Result<BalancesOutcome, AppError> {
+    let (report, _prices, held_rows) =
+        balances_with_prices(services, principal, contour, contour_version, as_of, held).await?;
+    Ok(BalancesOutcome { report, held_rows })
 }
 
 /// What the owner holds at a date, grouped by the class of cash he declared.
@@ -424,9 +825,10 @@ pub async fn asset_snapshot(
     contour: ContourId,
     contour_version: Option<ContourVersion>,
     as_of: Date,
-) -> Result<AssetSnapshot, AppError> {
-    let (report, prices) =
-        balances_with_prices(services, principal, contour, contour_version, as_of).await?;
+    held: &HeldScope,
+) -> Result<AssetSnapshotOutcome, AppError> {
+    let (report, prices, held_rows) =
+        balances_with_prices(services, principal, contour, contour_version, as_of, held).await?;
     // Only the accounts the owner declared a class for appear here. An account
     // missing from the map has said nothing, which is a value the fold groups
     // on its own and never fills in.
@@ -451,7 +853,7 @@ pub async fn asset_snapshot(
         .collect();
     let market_inputs =
         market_price_candidates(services, instruments, as_of, knowledge_as_of).await?;
-    assets::asset_snapshot(
+    let snapshot = assets::asset_snapshot(
         as_of,
         &report,
         &classes,
@@ -469,7 +871,11 @@ pub async fn asset_snapshot(
             },
         },
     )
-    .map_err(AppError::AssetSnapshot)
+    .map_err(AppError::AssetSnapshot)?;
+    Ok(AssetSnapshotOutcome {
+        snapshot,
+        held_rows,
+    })
 }
 
 /// The balances answer and the journal's price board, from one read of the
@@ -485,13 +891,21 @@ async fn balances_with_prices(
     contour: ContourId,
     contour_version: Option<ContourVersion>,
     as_of: Date,
-) -> Result<(BalancesReport, PriceBoard), AppError> {
+    held: &HeldScope,
+) -> Result<(BalancesReport, PriceBoard, HeldRows), AppError> {
     let (_version, definition) =
         resolve_contour(services, principal, contour, contour_version).await?;
-    let events = services
+    let held = held_facts(services, principal, held, as_of).await?;
+    let mut events = services
         .store
         .load_events_through(principal.owner, as_of)
         .await?;
+    // One slice, extended before anything resolves it, so that the balances,
+    // the price board, the perimeter assessment and the reconciliation ledger
+    // below all read the same set of facts. Four folds over three different
+    // populations is precisely the state this feature exists to make
+    // impossible.
+    events.extend(held.through(as_of));
     // Balances and the reconciliation ledger must read the same journal. The
     // ledger resolves internally; folding the raw slice into `Balances` beside
     // it would give one function two answers to what is currently effective,
@@ -617,6 +1031,7 @@ async fn balances_with_prices(
             population,
         },
         prices,
+        held.statement,
     ))
 }
 
@@ -709,10 +1124,15 @@ pub async fn returns(
         }
         FxSource::OwnerSupplied => query.fx.clone(),
     };
-    let projection_events = services
+    // Resolved once, and both slices below are taken from it. Planning a
+    // session twice in one report would give one answer two readings of it,
+    // which is the whole of what the single-planner design refuses.
+    let held = held_facts(services, principal, &query.held, as_of).await?;
+    let mut projection_events = services
         .store
         .load_events_through(principal.owner, as_of)
         .await?;
+    projection_events.extend(held.through(as_of));
 
     let rules = RuleRegistry::with_defaults();
     let context = ProjectionContext {
@@ -724,10 +1144,9 @@ pub async fn returns(
     let projection = build_projection(
         services,
         principal.owner,
-        query,
-        &definition,
         &projection_events,
         &context,
+        held.is_empty(),
     )
     .await?;
     let instruments: BTreeSet<InstrumentId> = projection
@@ -740,7 +1159,14 @@ pub async fn returns(
     let market_inputs =
         market_price_candidates(services, instruments, as_of, knowledge_as_of).await?;
 
-    if snapshot_may_be_saved(as_of, today) {
+    // **Never over held rows.** A snapshot is the journal's state, kept so the
+    // next report can advance from it instead of replaying everything; one
+    // folded over rows that are not in the journal would persist money nobody
+    // has committed, and every later report would advance from it without ever
+    // being asked to. The held rows also carry freshly minted identifiers that
+    // differ on the next call, so such a snapshot could not even be recognised
+    // again. Decision 0018 §5.
+    if held.is_empty() && snapshot_may_be_saved(as_of, today) {
         services
             .store
             .save_snapshot(principal.owner, projection.snapshot().clone())
@@ -749,10 +1175,14 @@ pub async fn returns(
 
     // Projection is a historical snapshot; reconciliation may use facts
     // received later because they can confirm an earlier period.
-    let reconciliation_events = services
+    let mut reconciliation_events = services
         .store
         .load_events_through(principal.owner, Date::MAX)
         .await?;
+    // Every held fact, including one dated after the report: the slice above is
+    // deliberately unbounded, and a held row confirms an earlier period exactly
+    // as a journal row received later does.
+    reconciliation_events.extend(held.through(Date::MAX));
 
     let report = report_from_projection(
         &projection,
@@ -768,7 +1198,11 @@ pub async fn returns(
         as_of,
         &reconciliation_events,
     )?;
-    Ok(ReturnsOutcome { report, population })
+    Ok(ReturnsOutcome {
+        report,
+        population,
+        held_rows: held.statement,
+    })
 }
 
 struct ReportMarketInputs {
@@ -1143,15 +1577,36 @@ fn recompute_is_worth_it(error: &ProjectionError) -> bool {
 async fn build_projection(
     services: &AppServices,
     owner: iaam_core::ids::OwnerId,
-    query: &ReturnsQuery,
-    definition: &ContourDefinition,
     events: &[iaam_core::event::Event],
     context: &ProjectionContext<'_>,
+    journal_only: bool,
 ) -> Result<Projection, AppError> {
-    let snapshot = services
-        .store
-        .load_snapshot(owner, definition.id(), definition.version(), query.lot_rule)
-        .await?;
+    // The contour and the lot rule are read off the context the fold is given,
+    // rather than passed again beside it. They were, and a snapshot keyed on
+    // one pair while the fold ran under another is a class of bug the
+    // duplication made possible for no benefit.
+    let definition = context.contour;
+    // A stored snapshot is a fold over the journal, and `advance` trusts its
+    // prefix. Held rows are interleaved into that prefix by date — an import of
+    // last month's statement lands *before* the boundary, not after it — so
+    // advancing from a snapshot would silently drop every held row the boundary
+    // covers, exactly the defect `advance`'s own doc names. The prefix
+    // fingerprint would in fact catch it and recompute; this does not rely on
+    // that, because a report that is correct only because a check happened to
+    // fire is a report waiting to be wrong.
+    let snapshot = if journal_only {
+        services
+            .store
+            .load_snapshot(
+                owner,
+                definition.id(),
+                definition.version(),
+                context.lot_rule,
+            )
+            .await?
+    } else {
+        None
+    };
 
     if let Some(snapshot) = snapshot {
         match advance(&snapshot, events, context) {

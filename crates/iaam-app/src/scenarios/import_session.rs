@@ -1894,6 +1894,39 @@ pub struct PlannedSession {
     /// verdict is positive and the rows they describe are not the rows the
     /// caller sent.
     dispositions: Vec<Disposition>,
+    /// The events the commit would **append**, in row order: exactly the
+    /// candidates that became `commit_delta.facts`.
+    ///
+    /// Collected in the loop that makes that very split, so this list and the
+    /// published `facts` cannot come to describe different rows. The duplicates
+    /// are deliberately absent: their idempotency key is already in the
+    /// journal, so appending them adds nothing, and folding one into a
+    /// projection beside the journal would count that money twice.
+    ///
+    /// Read through [`PlannedSession::would_append`], which says what these may
+    /// and may not be used for.
+    appended: Vec<iaam_core::event::Event>,
+}
+
+impl PlannedSession {
+    /// The events this commit would append, for a reader that folds them.
+    ///
+    /// Handed out so that a report asked to answer over the journal **plus**
+    /// this session's held rows folds the same facts the commit would write,
+    /// planned once by [`plan_session`] and never by a second pass over the
+    /// stored observations. That is iaam-k1xa read from the reporting side: a
+    /// preview written beside the import describes a different import from the
+    /// one that runs.
+    ///
+    /// **What these are not.** They carry freshly minted identifiers that name
+    /// nothing in the journal and differ on the next call, so nothing may
+    /// publish one, address one, or persist a projection folded over one — see
+    /// decision 0018 §5 for the snapshot that must not be saved. They are
+    /// values to fold and then discard.
+    #[must_use]
+    pub fn would_append(&self) -> &[iaam_core::event::Event] {
+        &self.appended
+    }
 }
 
 /// Where one held row's verdict comes from.
@@ -2472,6 +2505,10 @@ pub async fn plan_session(
     // [`ResemblingRow`].
     let mut resembling: Vec<ResemblingRow> = Vec::new();
     let mut retained = Vec::new();
+    // The events behind `facts`, kept so a reader that folds this session
+    // beside the journal folds what the commit would write. See
+    // [`PlannedSession::would_append`].
+    let mut appended: Vec<iaam_core::event::Event> = Vec::new();
     // Rows this commit was handed and will not take, in the shape a coverage
     // gap names them (iaam-bufs). Collected in the same pass as everything
     // else, for the reason the whole planner is one function: a second walk
@@ -2509,6 +2546,12 @@ pub async fn plan_session(
                         });
                     }
                     facts.push(fact);
+                    // The same event, taken here rather than recovered later by
+                    // matching row numbers against `candidates`: the split into
+                    // facts and duplicates happens on this line and nowhere
+                    // else, so the list of events to append is made where the
+                    // decision is made.
+                    appended.push(event.clone());
                 }
             }
             Err(rejection) => {
@@ -2663,6 +2706,7 @@ pub async fn plan_session(
     Ok(PlannedSession {
         declined,
         dispositions,
+        appended,
         plan: ImportPlan {
             session: contents.session,
             revision,

@@ -1,6 +1,7 @@
 //! Operation ingestion.
 
 use iaam_core::event::corporate_action::CorporateAction;
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::event::{Event, SCHEMA_VERSION};
 use iaam_core::ids::{ImportId, ImportSessionId, PrincipalId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
@@ -57,9 +58,17 @@ pub struct RowOrigin {
 /// normalisation decides what a row *is* and the import decides nothing about
 /// that: it is the handle a later retraction is keyed on, and nothing in the
 /// shape of an event depends on it.
+///
+/// The parser version is the caller's to state and is **one per batch**, unlike
+/// the origin: a route knows what read its rows, and the two routes that reach
+/// this function do not agree — one takes rows a caller typed as JSON, the
+/// other takes a CSV document this crate parsed. While the version was stamped
+/// inside `normalize` both wrote `ingest/manual/1`, so a parsed row and a typed
+/// one were indistinguishable in provenance (`iaam-h69n`).
 pub async fn submit_operations(
     services: &AppServices,
     principal: &Principal,
+    parser_version: &ParserVersion,
     operations: &[(RowOrigin, SubmittedOperation)],
 ) -> Result<Vec<Verdict>, AppError> {
     let candidates = operations
@@ -67,9 +76,10 @@ pub async fn submit_operations(
         .map(|(origin, operation)| {
             normalize(
                 operation,
-                NormalizationContext {
+                &NormalizationContext {
                     owner: principal.owner,
                     source: origin.source,
+                    parser_version: parser_version.clone(),
                 },
             )
             .map(|normalized| {
@@ -111,9 +121,12 @@ pub async fn submit_journal_events(
     let knowledge_as_of_wire = knowledge_as_of
         .format(&Rfc3339)
         .map_err(|error| AppError::Store(error.to_string()))?;
+    // One reader for the whole batch, and it is this crate: a journal fact
+    // arrives as JSON and nothing outside parsed it.
     let context = NormalizationContext {
         owner: principal.owner,
         source,
+        parser_version: ParserVersion(iaam_ingest::journal_event::PARSER_VERSION.to_owned()),
     };
     let mut candidates = Vec::with_capacity(events.len());
 
@@ -156,7 +169,7 @@ pub async fn submit_journal_events(
         };
 
         candidates.push(
-            normalize_journal_event(submitted, &enrichment, context).map(|normalized| {
+            normalize_journal_event(submitted, &enrichment, &context).map(|normalized| {
                 let mut event = normalized.event;
                 if let Some(import) = import {
                     event.provenance = event.provenance.with_import(import);

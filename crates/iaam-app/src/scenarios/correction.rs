@@ -641,9 +641,16 @@ fn candidate_for(
             let source = SourceId::declared(principal.owner, operation.account, CORRECTION_CHANNEL);
             let normalized = normalize(
                 operation,
-                NormalizationContext {
+                &NormalizationContext {
                     owner: principal.owner,
                     source,
+                    // A replacement is written by this code, exactly as the
+                    // reversal beside it is, and [`CORRECTION_PARSER_VERSION`]
+                    // already says it is stamped on *every* correction fact.
+                    // It was not: `normalize` stamped `ingest/manual/1`, so the
+                    // two halves of one channel named two different writers
+                    // (`iaam-h69n`).
+                    parser_version: ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
                 },
             )
             .map_err(|rejection| AppError::Invalid {
@@ -728,6 +735,8 @@ mod tests {
     use iaam_core::ids::{AccountId, OwnerId};
     use iaam_core::money::{CurrencyCode, Money, PostedMinor};
     use time::macros::date;
+
+    use crate::ports::Scope;
 
     fn owner() -> OwnerId {
         OwnerId(uuid::Uuid::from_u128(1))
@@ -814,6 +823,61 @@ mod tests {
         assert!(
             reversal.validate_structure().is_ok(),
             "a reversal must be writable into an append-only journal"
+        );
+    }
+
+    #[test]
+    fn a_replacement_names_the_correction_that_wrote_it_and_not_the_import() {
+        // Both halves of one channel must name the same writer.
+        // [`CORRECTION_PARSER_VERSION`] says it is stamped on *every*
+        // correction fact, and it was not: the replacement went through
+        // `normalize`, which stamped `ingest/manual/1` from a constant of its
+        // own, so a reversal and the replacement beside it disagreed about what
+        // had written them (`iaam-h69n`).
+        let original = deposit(1, SourceId::new_random());
+        let principal = Principal {
+            token_id: uuid::Uuid::from_u128(4),
+            owner: owner(),
+            scope: Scope::Owner,
+        };
+        let by_id = BTreeMap::from([(original.id, &original)]);
+        let replacement = CorrectionRequest::Replacement {
+            target: original.id,
+            operation: Box::new(SubmittedOperation {
+                account: account(),
+                kind: iaam_ingest::operation::OperationKind::Deposit {
+                    amount_minor: 2_000,
+                    currency: CurrencyCode::Rub,
+                },
+                dates: iaam_ingest::operation::OperationDates {
+                    cash_posted: Some(date!(2026 - 03 - 01)),
+                    ..iaam_ingest::operation::OperationDates::default()
+                },
+                source_time: None,
+                idempotency_key: None,
+                source_operation_id: None,
+                source_category: None,
+                source_kind: None,
+                description: None,
+            }),
+        };
+
+        let event =
+            candidate_for(&principal, &by_id, 0, &replacement).expect("a valid replacement");
+
+        assert_eq!(
+            event.provenance.parser_version(),
+            &ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
+            "a replacement is written by this code, exactly as the reversal beside it is"
+        );
+        assert_eq!(
+            event.provenance.parser_version(),
+            reversal_for(&original).provenance.parser_version(),
+            "one channel, one writer: the two halves must not disagree"
+        );
+        assert_eq!(
+            event.provenance.source(),
+            SourceId::declared(owner(), account(), CORRECTION_CHANNEL)
         );
     }
 

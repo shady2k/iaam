@@ -5,6 +5,7 @@ use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{AccountView, Clock, InstrumentUpsert, Principal, Scope};
 use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
@@ -12,7 +13,7 @@ use iaam_core::numeric::decimal::Dec;
 use iaam_core::returns::{NotComputable, UncoveredReason};
 use iaam_core::valuation::{FxSource, FxTable};
 use iaam_ingest::dedup::IdentityScope;
-use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
@@ -77,13 +78,15 @@ async fn seed_position(
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        source_kind: None,
         description: None,
     };
     let event = normalize(
         &operation,
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("normalize position: {error:?}"))

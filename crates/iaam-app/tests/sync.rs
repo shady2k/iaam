@@ -23,7 +23,7 @@ use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlCla
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_ingest::dedup::DedupLevel;
 use iaam_ingest::dedup::IdentityScope;
-use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, Verdict};
 use iaam_store::SqliteStore;
 use time::Date;
@@ -120,6 +120,7 @@ fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> Su
         idempotency_key: None,
         source_operation_id: Some("TRADE-MARCH-1".to_owned()),
         source_category: None,
+        source_kind: None,
         description: None,
     }
 }
@@ -131,9 +132,10 @@ fn report_trade_event(
 ) -> Event {
     let normalized = iaam_ingest::normalize(
         operation,
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: report_source,
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("report trade: {error:?}"));
@@ -343,9 +345,10 @@ fn seeded_trade(
     operation.dates.cash_posted = Some(day);
     iaam_ingest::normalize(
         &operation,
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("seed trade: {error:?}"))
@@ -1281,9 +1284,10 @@ async fn an_event_claiming_an_older_schema_version_is_refused_on_write() {
     let custody = CustodyId::new_random();
     let mut event = iaam_ingest::normalize(
         &trade(account, instrument, custody),
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("valid fixture normalisation: {error:?}"))
@@ -1299,7 +1303,7 @@ async fn an_event_claiming_an_older_schema_version_is_refused_on_write() {
             field,
             expected,
             actual,
-        } if field == "event[0].schema_version" && expected == "13" && actual == "7"
+        } if field == "event[0].schema_version" && expected == "14" && actual == "7"
     ));
     assert!(load_all(&services, owner).await.is_empty());
 }
@@ -1318,18 +1322,20 @@ async fn append_checked_rejects_a_batch_before_any_event_is_written() {
     *quantity = Dec::zero();
     let invalid = iaam_ingest::normalize(
         &invalid_operation,
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("invalid fixture normalisation: {error:?}"))
     .event;
     let valid = iaam_ingest::normalize(
         &trade(account, instrument, custody),
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("valid fixture normalisation: {error:?}"))

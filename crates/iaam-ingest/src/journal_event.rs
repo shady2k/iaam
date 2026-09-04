@@ -23,7 +23,7 @@ use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::offer::OfferExerciseAction;
-use iaam_core::event::provenance::{ParserVersion, Provenance};
+use iaam_core::event::provenance::Provenance;
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 
 use iaam_core::ids::{AccountId, EventId};
@@ -92,7 +92,7 @@ pub struct JournalEventEnrichment {
 pub fn normalize_journal_event(
     submitted: &SubmittedJournalEvent,
     enrichment: &JournalEventEnrichment,
-    context: NormalizationContext,
+    context: &NormalizationContext,
 ) -> Result<Normalized, Rejection> {
     let (dates, day) = dates_of(&submitted.fact);
     let (kind, legs) = build(submitted.account, &submitted.fact, enrichment)?;
@@ -112,11 +112,11 @@ pub fn normalize_journal_event(
             order: EffectiveOrder::new(day, 1),
             legs,
             provenance: {
-                let base = Provenance::new(
-                    context.source,
-                    raw_hash,
-                    ParserVersion(PARSER_VERSION.to_owned()),
-                );
+                // From the context, as on the operation path: what read a
+                // fact is the caller's to state, and a constant here would be
+                // a second place saying it.
+                let base =
+                    Provenance::new(context.source, raw_hash, context.parser_version.clone());
                 match submitted.source_operation_id.as_deref() {
                     Some(id) => base.with_source_operation_id(id),
                     None => base,
@@ -331,6 +331,7 @@ mod tests {
     };
     use iaam_core::event::kind::EventKind;
     use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
+    use iaam_core::event::provenance::ParserVersion;
     use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
     use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
     use iaam_core::numeric::decimal::Dec;
@@ -353,6 +354,7 @@ mod tests {
         NormalizationContext {
             owner: OwnerId::new_random(),
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         }
     }
 
@@ -386,7 +388,7 @@ mod tests {
         let event = normalize_journal_event(
             &submitted(fact),
             &JournalEventEnrichment::default(),
-            context(),
+            &context(),
         )
         .expect("normalization must succeed")
         .event;
@@ -613,7 +615,7 @@ mod tests {
                 },
             )),
             &JournalEventEnrichment::default(),
-            context(),
+            &context(),
         )
         .expect("form normalization is not checked")
         .event;
@@ -641,7 +643,7 @@ mod tests {
                 day: date!(2026 - 04 - 20),
             }),
             &JournalEventEnrichment::default(),
-            context(),
+            &context(),
         )
         .expect_err("a redemption with a fee in a different currency must be rejected");
         assert_eq!(rejection.field, "fee");
@@ -663,7 +665,7 @@ mod tests {
                 day: date!(2026 - 04 - 20),
             }),
             &JournalEventEnrichment::default(),
-            context(),
+            &context(),
         )
         .expect_err("an accrued coupon in a different currency must be rejected");
         assert_eq!(rejection.field, "accrued_interest");
@@ -681,7 +683,7 @@ mod tests {
                 source_operation_id: Some("амортизация-7".into()),
             },
             &JournalEventEnrichment::default(),
-            context(),
+            &context(),
         )
         .expect("normalization must succeed")
         .event;
@@ -699,7 +701,7 @@ mod tests {
             &JournalEventEnrichment {
                 basis_allocation: expected.clone(),
             },
-            context(),
+            &context(),
         )
         .expect("normalization must succeed")
         .event;

@@ -466,6 +466,7 @@ fn operation_to_submitted(
         idempotency_key: Some(operation.deduplication_key),
         source_operation_id: Some(operation.operation_id),
         source_category: None,
+        source_kind: None,
         description: None,
     })
 }
@@ -707,6 +708,7 @@ fn trade_operations(
                     escape_component(&trade.num)
                 )),
                 source_category: None,
+                source_kind: None,
                 description: None,
             })
         })
@@ -891,7 +893,7 @@ mod tests {
     ) -> Result<Vec<iaam_broker::tinkoff::ChannelOperation>, ParseError> {
         parse_operations_page(body).map(|page| page.operations)
     }
-    use iaam_ingest::operation::{NormalizationContext, OperationKind, normalize};
+    use iaam_ingest::operation::{NormalizationContext, OperationKind, PARSER_VERSION, normalize};
     use uuid::Uuid;
 
     use super::{
@@ -1769,13 +1771,14 @@ mod tests {
             let context = NormalizationContext {
                 owner: OwnerId::new_random(),
                 source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
             };
             let events = buy
                 .iter()
                 .chain(sale.iter())
                 .enumerate()
                 .map(|(index, operation)| {
-                    let mut event = normalize(operation, context).expect("normalization").event;
+                    let mut event = normalize(operation, &context).expect("normalization").event;
                     event.id = EventId(Uuid::from_u128((index + 1) as u128));
                     event
                 })
@@ -2055,9 +2058,10 @@ mod tests {
         .expect("August period");
         let event = normalize(
             &operation,
-            NormalizationContext {
+            &NormalizationContext {
                 owner: OwnerId::new_random(),
                 source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
             },
         )
         .expect("trade normalization")
@@ -2088,9 +2092,10 @@ mod tests {
         }
         let old_event = normalize(
             &old_operation,
-            NormalizationContext {
+            &NormalizationContext {
                 owner: OwnerId::new_random(),
                 source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
             },
         )
         .expect("old trade normalization")
@@ -2246,9 +2251,10 @@ mod tests {
         for operation in &first {
             let event = normalize(
                 operation,
-                NormalizationContext {
+                &NormalizationContext {
                     owner: OwnerId::new_random(),
                     source: SourceId::new_random(),
+                    parser_version: ParserVersion(PARSER_VERSION.to_owned()),
                 },
             )
             .expect("commission allocation normalizes");
@@ -2341,9 +2347,10 @@ mod tests {
         assert!(quarantined.is_empty());
         let normalized = normalize(
             &accepted[0],
-            NormalizationContext {
+            &NormalizationContext {
                 owner: OwnerId::new_random(),
                 source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
             },
         )
         .expect("known zero is valid");

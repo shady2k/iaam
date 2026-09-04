@@ -393,6 +393,7 @@ fn transfer_for(
         idempotency_key: Some(format!("pairing/{}/{}", outgoing.inner(), incoming.inner())),
         source_operation_id: None,
         source_category: None,
+        source_kind: None,
         // The two banks described this movement in two vocabularies; neither is
         // the transfer's own description, and picking one would state that the
         // sending bank's words describe both sides.

@@ -17,7 +17,7 @@ use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlCla
 use iaam_core::reconciliation::observed::observe;
 use iaam_core::reconciliation::{Dimension, DimensionStatus, ReconciliationLedger};
 use iaam_ingest::dedup::IdentityScope;
-use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use time::Date;
@@ -124,13 +124,15 @@ fn affected_trade(owner: OwnerId, account: AccountId, instrument: InstrumentId) 
         idempotency_key: None,
         source_operation_id: Some(format!("old-{instrument:?}")),
         source_category: None,
+        source_kind: None,
         description: None,
     };
     normalize(
         &operation,
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("normalize affected trade: {error:?}"))

@@ -66,6 +66,28 @@ pub struct Provenance {
     /// already recorded do not carry this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_category: Option<String>,
+    /// The source's own word for **what the operation was**.
+    ///
+    /// A different fact from [`Self::source_category`] beside it, and the two
+    /// are never written through one slot. This one is the word a bank prints
+    /// in its operation-type column — "transfer", "card payment" — and it says
+    /// what happened; the category says what the money was *for*. A rule the
+    /// owner writes on one must not fire on the other, which is exactly what
+    /// happened while the observation path carried this word in the category's
+    /// field (`iaam-p683`).
+    ///
+    /// Evidence, like every field around it, and never rewritten: it is what
+    /// the direction the row was read with was read *from*, so a wrong reading
+    /// stays visible against the word it was made from.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field. `None` therefore means "not
+    /// recorded", which covers both a source that printed no such word and
+    /// every fact written before schema version 14 — including the observed
+    /// rows whose operation word went into `source_category`. Nothing rewrites
+    /// those; what they carry is what the observation path meant at the time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_kind: Option<String>,
     /// The description or counterparty the source printed on the row.
     ///
     /// Evidence about what the source said, exactly like `source_category`
@@ -160,6 +182,7 @@ impl Provenance {
             parser_version,
             source_operation_id: None,
             source_category: None,
+            source_kind: None,
             description: None,
             import: None,
             declared_by: None,
@@ -177,6 +200,28 @@ impl Provenance {
     #[must_use]
     pub fn with_source_category(mut self, category: impl Into<String>) -> Self {
         self.source_category = Some(category.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_kind(mut self, kind: impl Into<String>) -> Self {
+        self.source_kind = Some(kind.into());
+        self
+    }
+
+    /// Replace the raw hash with the digest of the document the row came off.
+    ///
+    /// The one legitimate caller is the document channel. `normalize` has no
+    /// document, so it fingerprints the row's own canonical form; a report row
+    /// is identified by the document and its locator instead (§10.6, level 4),
+    /// and that digest is only known to the caller that opened the file.
+    ///
+    /// It replaces the hash and nothing else, which is the whole reason it
+    /// exists: rebuilding the provenance to change one field silently drops
+    /// every other field the normaliser had already filled.
+    #[must_use]
+    pub fn with_raw_hash(mut self, raw_hash: RawHash) -> Self {
+        self.raw_hash = raw_hash;
         self
     }
 
@@ -276,6 +321,15 @@ impl Provenance {
     #[must_use]
     pub fn source_category(&self) -> Option<&str> {
         self.source_category.as_deref()
+    }
+
+    /// The source's own word for what the operation was, when it printed one.
+    ///
+    /// Read by classification, never by the category rules: those read
+    /// [`Self::source_category`], and the two answer different questions.
+    #[must_use]
+    pub fn source_kind(&self) -> Option<&str> {
+        self.source_kind.as_deref()
     }
 
     #[must_use]

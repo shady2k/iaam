@@ -7,11 +7,12 @@ use iaam_app::scenarios::reports::{
     AccountStanding, HeldScope, KnownAccountCoverage, MoneyFlowQuery, account_balances, money_flow,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
 use iaam_ingest::dedup::IdentityScope;
-use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use time::Date;
@@ -83,9 +84,10 @@ async fn contour(services: &AppServices, owner: OwnerId, accounts: &[AccountId])
 async fn append_operation(services: &AppServices, owner: OwnerId, operation: SubmittedOperation) {
     let event = normalize(
         &operation,
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .unwrap_or_else(|error| panic!("normalize operation: {error:?}"))
@@ -111,6 +113,7 @@ fn cash_operation(account: AccountId, kind: OperationKind, on: Date) -> Submitte
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        source_kind: None,
         description: None,
     }
 }
@@ -279,6 +282,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
             idempotency_key: None,
             source_operation_id: None,
             source_category: None,
+            source_kind: None,
             description: None,
         },
     )

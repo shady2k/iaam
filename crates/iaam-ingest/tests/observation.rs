@@ -4,6 +4,7 @@
 //! "internal to this institution", and nothing else.
 
 use iaam_core::event::kind::{FeeOrigin, FlowEndpoints, IncomeKind};
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, ClassificationRuleId, OwnerId, SourceId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::classification::{
@@ -12,7 +13,7 @@ use iaam_ingest::classification::{
 };
 use iaam_ingest::normalize;
 use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity};
-use iaam_ingest::operation::{NormalizationContext, OperationDates, OperationKind};
+use iaam_ingest::operation::{NormalizationContext, OperationDates, OperationKind, PARSER_VERSION};
 use time::macros::date;
 
 fn inner_row(account: AccountId) -> ObservedRow {
@@ -24,6 +25,7 @@ fn inner_row(account: AccountId) -> ObservedRow {
         counterparty: ObservedCounterparty::Unknown,
         far_side: FarSide::Unstated,
         source_kind: Some("INNER".to_owned()),
+        source_category: None,
         description: None,
         dates: OperationDates {
             cash_posted: Some(date!(2025 - 03 - 18)),
@@ -411,6 +413,7 @@ fn merchant_inflow(account: AccountId) -> ObservedRow {
         counterparty: ObservedCounterparty::Named("Shop One".to_owned()),
         far_side: FarSide::Unstated,
         source_kind: Some("RETURN".to_owned()),
+        source_category: None,
         description: None,
         dates: OperationDates {
             cash_posted: Some(date!(2025 - 03 - 20)),
@@ -625,6 +628,119 @@ fn a_named_counterparty_the_directory_does_not_know_narrows_the_question() {
 }
 
 // ---------------------------------------------------------------------------
+// The source's two words, kept apart (iaam-p683)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_operation_word_and_the_source_category_survive_resolution_in_their_own_fields() {
+    // The defect: `envelope` filled the operation's `source_category` from the
+    // row's `source_kind`, so an observed row could not carry a source's
+    // category at all, and the owner's category rules — which match
+    // `source_category` — matched an operation word instead.
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::Out,
+        source_kind: Some("card payment".to_owned()),
+        source_category: Some("Groceries".to_owned()),
+        ..inner_row(account)
+    };
+
+    let operation = row
+        .resolve(Classification::ExternalFlow, Some(Movement::Out))
+        .expect("a stated outflow resolves");
+
+    assert_eq!(
+        operation.source_kind.as_deref(),
+        Some("card payment"),
+        "the word the source used for what the operation was"
+    );
+    assert_eq!(
+        operation.source_category.as_deref(),
+        Some("Groceries"),
+        "the word the source used for what it was for"
+    );
+}
+
+#[test]
+fn a_row_whose_source_printed_no_category_carries_none_rather_than_its_operation_word() {
+    // `None` here is «the source printed no category». Filling it from
+    // `source_kind` is the transcription this pair was written to stop: it
+    // states, as the source's category, a word the source used for something
+    // else.
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::Out,
+        ..inner_row(account)
+    };
+    assert_eq!(row.source_kind.as_deref(), Some("INNER"));
+
+    let operation = row
+        .resolve(Classification::ExternalFlow, Some(Movement::Out))
+        .expect("a stated outflow resolves");
+
+    assert_eq!(operation.source_category, None);
+    assert_eq!(operation.source_kind.as_deref(), Some("INNER"));
+}
+
+#[test]
+fn both_words_survive_a_transfer_submitted_from_the_far_side() {
+    // The one arm of `resolve` that rebuilds the envelope against another
+    // account. It is where a field added to the envelope is most easily
+    // dropped, and the evidence belongs to the row either way.
+    let account = AccountId::new_random();
+    let far = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::In,
+        source_kind: Some("transfer".to_owned()),
+        source_category: Some("Between own accounts".to_owned()),
+        ..inner_row(account)
+    };
+
+    let operation = row
+        .resolve(
+            Classification::InternalTransfer { to: far },
+            Some(Movement::In),
+        )
+        .expect("an incoming internal transfer resolves");
+
+    assert_eq!(
+        operation.account, far,
+        "an arriving transfer is filed from the sending side"
+    );
+    assert_eq!(operation.source_kind.as_deref(), Some("transfer"));
+    assert_eq!(
+        operation.source_category.as_deref(),
+        Some("Between own accounts")
+    );
+}
+
+#[test]
+fn a_stored_row_written_before_the_category_existed_reads_back_without_one() {
+    // An import session parks its rows as JSON, and a session opened by an
+    // earlier build holds rows with no `source_category` key at all. Such a row
+    // must still read back — the session outlives the request that opened it —
+    // and it must read back as «the source said nothing», not borrow the
+    // operation word beside it.
+    //
+    // The stored shape is produced by serialising and then dropping the key,
+    // rather than typed out here: a literal would fix this crate's date
+    // encoding into a test that is not about dates.
+    let account = AccountId::new_random();
+    let mut stored = serde_json::to_value(inner_row(account)).expect("a row serialises");
+    let object = stored.as_object_mut().expect("a row is an object");
+    assert!(
+        object.remove("source_category").is_some(),
+        "the field this test is about must be in the written shape"
+    );
+
+    let row: ObservedRow =
+        serde_json::from_value(stored).expect("a row stored by an earlier build still reads");
+
+    assert_eq!(row.source_category, None);
+    assert_eq!(row.source_kind.as_deref(), Some("INNER"));
+}
+
+// ---------------------------------------------------------------------------
 // What each alternative does to the money (iaam-pzm9)
 // ---------------------------------------------------------------------------
 
@@ -640,9 +756,10 @@ fn recorded_as(answer: Answer, account: AccountId) -> (String, FlowEndpoints) {
         .expect("the answer names a direction its classification admits");
     let event = normalize(
         &operation,
-        NormalizationContext {
+        &NormalizationContext {
             owner: OwnerId::new_random(),
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .expect("a dated cash row normalises")

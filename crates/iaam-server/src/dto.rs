@@ -621,8 +621,29 @@ pub struct OperationDto {
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_operation_id: Option<String>,
+    /// The source's own word for what the row was **for**, verbatim.
+    ///
+    /// Evidence, never a verdict: the owner's category rules may match it, and
+    /// nothing here turns it into one of his categories. Send the source's
+    /// category column and nothing else — an operation-type word belongs in
+    /// `source_kind` beside it, and putting it here makes every category rule
+    /// written on a real category miss this row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// The source's own word for what the row **was**, verbatim.
+    ///
+    /// The operation-type cell — "transfer", "card payment" — and a different
+    /// fact from `source_category` beside it. On an observation it is the word
+    /// `direction` was read out of, and it is kept beside that reading rather
+    /// than instead of it, so a wrong reading is visible against the word it
+    /// was made from.
+    ///
+    /// This field used to be absent, and an observation's `source_category`
+    /// was read as if it were this one. A caller that has been sending its
+    /// operation word in `source_category` should move it here: facts already
+    /// recorded keep what they were stamped with, and nothing rewrites them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -701,7 +722,12 @@ impl OperationDto {
                     None => FarSide::Unstated,
                     Some(stated) => FarSide::parse(stated)?,
                 },
-                source_kind: self.source_category.clone(),
+                // Each word from its own field. This read `source_category`,
+                // so a source's category could not be transcribed at all and
+                // the operation word landed in the category's slot
+                // (`iaam-p683`).
+                source_kind: self.source_kind.clone(),
+                source_category: self.source_category.clone(),
                 description: self.description.clone(),
                 dates: OperationDates {
                     trade: self.dates.trade,
@@ -739,6 +765,7 @@ impl OperationDto {
             idempotency_key: self.idempotency_key.clone(),
             source_operation_id: self.source_operation_id.clone(),
             source_category: self.source_category.clone(),
+            source_kind: self.source_kind.clone(),
             description: self.description.clone(),
         })
     }
@@ -5462,6 +5489,7 @@ mod tests {
             idempotency_key: None,
             source_operation_id: None,
             source_category: None,
+            source_kind: None,
             description: None,
         }
     }
@@ -7930,10 +7958,22 @@ pub struct JournalEventReadDto {
     pub import: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_operation_id: Option<String>,
-    /// The category the source itself put on the row. Evidence about what the
-    /// source said, never the owner's own decision.
+    /// The category the source itself put on the row: what the money was
+    /// **for**, in the source's own word. Evidence about what the source said,
+    /// never the owner's own decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// The source's own word for what the operation **was** — its
+    /// operation-type cell. Evidence, exactly as the category beside it is, and
+    /// a different fact: a classification rule matches this one and a category
+    /// rule matches that one.
+    ///
+    /// Absent for every fact recorded before schema version 14, including the
+    /// rows submitted as observations whose operation word went into
+    /// `source_category`. Nothing rewrites those — the journal is append-only,
+    /// and what they carry is what the observation path meant at the time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
     /// The description or counterparty the source printed on the row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -8143,6 +8183,7 @@ impl JournalEventReadDto {
             import: view.import.map(|import| import.inner()),
             source_operation_id: view.source_operation_id.clone(),
             source_category: view.source_category.clone(),
+            source_kind: view.source_kind.clone(),
             description: view.description.clone(),
             import_session: view.import_session.map(|session| session.inner()),
         }

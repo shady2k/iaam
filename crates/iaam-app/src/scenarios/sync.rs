@@ -147,9 +147,15 @@ pub async fn sync_broker(
         let key = dedup::choose_key(&operation, &context);
         let normalized = match normalize(
             &operation,
-            NormalizationContext {
+            &NormalizationContext {
                 owner: principal.owner,
                 source: channel.source,
+                // What read the broker's response, as the channel records it.
+                // Stated here rather than stamped over the event afterwards:
+                // the rebuild that used to do it also silently discarded every
+                // other provenance field the normaliser had filled
+                // (`iaam-h69n`).
+                parser_version: channel.parser_version.clone(),
             },
         ) {
             Ok(normalized) => normalized,
@@ -159,7 +165,7 @@ pub async fn sync_broker(
                 continue;
             }
         };
-        let event = with_channel_provenance(normalized.event, &channel);
+        let event = normalized.event;
         if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
         {
             refusals.push(refused_row(&operation, channel.source));
@@ -321,19 +327,6 @@ pub async fn sync_broker(
 
 fn broker_error(error: crate::ports::BrokerError) -> AppError {
     AppError::Store(format!("broker synchronisation: {error}"))
-}
-
-fn with_channel_provenance(mut event: Event, channel: &SourceChannel) -> Event {
-    let mut provenance = Provenance::new(
-        channel.source,
-        event.provenance.raw_hash().clone(),
-        channel.parser_version.clone(),
-    );
-    if let Some(source_operation_id) = event.provenance.source_operation_id() {
-        provenance = provenance.with_source_operation_id(source_operation_id);
-    }
-    event.provenance = provenance;
-    event
 }
 
 /// Fingerprint of a raw source row, for a row the source did not identify.

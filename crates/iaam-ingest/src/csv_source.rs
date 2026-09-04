@@ -32,6 +32,21 @@ use time::macros::format_description;
 use crate::operation::{OperationDates, OperationKind, SubmittedOperation, to_minor_units};
 use crate::verdict::Rejection;
 
+/// The version of this reader, written to the provenance of every row it
+/// produces.
+///
+/// Its own value rather than [`crate::operation::PARSER_VERSION`], because
+/// these rows were read by software with a version and not stated by hand: a
+/// column this parser reads wrongly is a defect this string names, and a fix to
+/// it is a version to bump. While both said `ingest/manual/1` a row this parser
+/// produced and a row a caller typed were indistinguishable in provenance, so
+/// the rows a broken release of this parser wrote were not a set anybody could
+/// find (`iaam-h69n`).
+///
+/// It reads iaam's own CSV format and no institution's — see
+/// `docs/import-boundary.md` — so the version names one format and one reader.
+pub const PARSER_VERSION: &str = "ingest/csv/1";
+
 /// Name directory. Populated by a wrapper from account and instrument tables.
 ///
 /// Three tables, and only one of them is tiered: see [`AccountNames`] for why
@@ -603,6 +618,7 @@ fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperati
         source_operation_id: None,
         // The category column arrives with the mapping importer.
         source_category: None,
+        source_kind: None,
         description: None,
     })
 }

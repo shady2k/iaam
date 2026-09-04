@@ -643,7 +643,18 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         // `income` — is the answer a rule is meant to revise, not the question
         // the rule was written about.
         description: event.provenance.description().map(str::to_owned),
-        source_kind: event.provenance.source_category().map(str::to_owned),
+        // The source's operation word, from the field that holds it. This read
+        // `source_category`, and the observation path wrote the operation word
+        // there, so the pair round-tripped and nothing failed — while the
+        // owner's category rules, which really do match `source_category`,
+        // matched an operation word instead of a category (`iaam-p683`).
+        //
+        // `None` for a fact recorded before schema version 14, including one
+        // whose operation word is sitting in `source_category`. Nothing
+        // rewrites those: recomputation reconsiders such a row on the evidence
+        // the journal holds, which for that row is a description and a
+        // counterparty and no operation word.
+        source_kind: event.provenance.source_kind().map(str::to_owned),
         movement,
         far_side,
     })
@@ -750,7 +761,7 @@ mod tests {
         // with the event's own discriminant asks the recomputation to reconsider
         // a classification using the previous classification as its input.
         let account = AccountId::new_random();
-        let event = cash_out_of(account, provenance_of().with_source_category("Transfers"));
+        let event = cash_out_of(account, provenance_of().with_source_kind("Transfers"));
 
         let subject = subject(&event).expect("a cash outflow is a classification subject");
 
@@ -784,6 +795,34 @@ mod tests {
 
         assert_eq!(subject.description, None);
         assert_eq!(subject.source_kind, None);
+    }
+
+    #[test]
+    fn the_source_category_is_not_read_back_as_the_operation_word() {
+        // The defect this pair was written through (`iaam-p683`): the two are
+        // different facts, and a subject that took the category as the
+        // operation word made every classification rule on a source's word fire
+        // on rows the owner had described by category instead.
+        let account = AccountId::new_random();
+        let event = cash_out_of(
+            account,
+            provenance_of()
+                .with_source_category("Groceries")
+                .with_source_kind("card payment"),
+        );
+
+        let subject = subject(&event).expect("a cash outflow is a classification subject");
+
+        assert_eq!(
+            subject.source_kind.as_deref(),
+            Some("card payment"),
+            "the operation word, from the field that holds it"
+        );
+        assert_ne!(
+            subject.source_kind.as_deref(),
+            Some("Groceries"),
+            "the category is what the money was for, and answers a different question"
+        );
     }
 
     #[test]

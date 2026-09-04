@@ -184,7 +184,31 @@ pub struct ObservedRow {
     #[serde(default)]
     pub far_side: FarSide,
     /// What the source called the operation, verbatim.
+    ///
+    /// The source's word for what the movement **was** — the cell a bank fills
+    /// with "transfer" or "card payment". It is what the direction was read
+    /// from, and it is kept beside that reading rather than instead of it, so a
+    /// wrong reading stays visible against the word it was made from.
     pub source_kind: Option<String>,
+    /// What the source called the operation's purpose, verbatim.
+    ///
+    /// The source's word for what the movement was **for**, and a different
+    /// fact from [`Self::source_kind`] above it. Both are transcribed and
+    /// neither is mapped: the owner's own category rules match this one, and
+    /// they are his, editable, and re-runnable over rows already recorded.
+    ///
+    /// This field did not exist while the observation path carried
+    /// `source_kind` in the operation's `source_category` slot, so a category
+    /// rule written on a source's category never matched an observed row and
+    /// one written on an operation word matched rows the owner was not
+    /// describing (`iaam-p683`).
+    ///
+    /// `#[serde(default)]` because a row stored by an earlier build carries no
+    /// such field, exactly as [`Self::far_side`] does — and what such a row
+    /// carries is `None`, which is what it meant: there was no way to state a
+    /// source category at all.
+    #[serde(default)]
+    pub source_category: Option<String>,
     /// What the source printed as the description or payment purpose, verbatim.
     pub description: Option<String>,
     pub dates: OperationDates,
@@ -217,14 +241,16 @@ impl ObservedRow {
         }
     }
 
-    /// Which way the money went, when anything says so.
+    /// Which way the money went, when the source said so.
     ///
-    /// The source's own direction word first; failing that, the sign it printed
-    /// on the amount — but **only** when it also stated a direction, so that the
-    /// sign is read as the convention it accompanies rather than as one invented
-    /// here. A row with no direction word has no direction, whatever its sign
-    /// happens to be: a bank that prints every amount positive would otherwise
-    /// have every row read as an inflow.
+    /// The source's own direction word and nothing else. The sign printed on
+    /// the amount is **not** consulted, here or anywhere: a row with no
+    /// direction word has no direction, whatever its sign happens to be,
+    /// because a bank that prints every amount positive would otherwise have
+    /// every row read as an inflow. The sign is still kept on
+    /// [`Self::amount_minor`] as the evidence it is — read by whoever weighs
+    /// evidence, never by this function, which answers only what the source
+    /// stated.
     #[must_use]
     pub const fn movement(&self) -> Option<Movement> {
         self.direction.movement()
@@ -458,7 +484,13 @@ impl ObservedRow {
             source_time: self.source_time,
             idempotency_key: self.identity.idempotency_key.clone(),
             source_operation_id: self.identity.row.clone(),
-            source_category: self.source_kind.clone(),
+            // Each word to its own field. This used to carry `source_kind`,
+            // and the pair round-tripped — `scenarios/classification.rs` read
+            // it back out as `source_kind` again — so nothing failed and the
+            // owner's category rules matched the wrong rows in silence
+            // (`iaam-p683`).
+            source_category: self.source_category.clone(),
+            source_kind: self.source_kind.clone(),
             description: self.description.clone(),
         }
     }

@@ -10,6 +10,7 @@ use iaam_app::ports::{AccountView, Clock, OutboundHttp, OutboundResponse, Princi
 use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_app::scenarios::schedule::{SOURCE_ID, ScheduleSyncRequest, sync_schedule};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
@@ -17,7 +18,7 @@ use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::FxSource;
 use iaam_http::HttpRequest;
 use iaam_ingest::dedup::IdentityScope;
-use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
@@ -177,13 +178,15 @@ async fn seed_report_position(
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        source_kind: None,
         description: None,
     };
     let event = normalize(
         &operation,
-        iaam_ingest::operation::NormalizationContext {
+        &iaam_ingest::operation::NormalizationContext {
             owner,
             source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
         },
     )
     .expect("normalisation")

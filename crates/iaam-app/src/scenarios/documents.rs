@@ -250,9 +250,15 @@ async fn submit_rows(
         };
         let mut normalized = match normalize(
             operation,
-            NormalizationContext {
+            &NormalizationContext {
                 owner: principal.owner,
                 source,
+                // The report parser that recognised this workbook, and the one
+                // place this channel says so. It used to be stamped here a
+                // second time, over an `ingest/manual/1` `normalize` had
+                // already written, which is how every other channel came to
+                // record a version nothing had read it with (`iaam-h69n`).
+                parser_version: parser_version.clone(),
             },
         ) {
             Ok(normalized) => normalized,
@@ -264,11 +270,12 @@ async fn submit_rows(
                 continue;
             }
         };
-        let mut provenance = Provenance::new(source, raw_hash.clone(), parser_version.clone());
-        if let Some(operation_id) = operation.source_operation_id.as_deref() {
-            provenance = provenance.with_source_operation_id(operation_id);
-        }
-        normalized.event.provenance = provenance;
+        // The hash, and nothing else. A report row is identified by the
+        // document it came off and its locator (§10.6, level 4), while
+        // `normalize` has no document and fingerprints the row's own contents.
+        // Rebuilding the whole provenance to change this one field is what used
+        // to drop every other field the normaliser had filled.
+        normalized.event.provenance = normalized.event.provenance.with_raw_hash(raw_hash.clone());
         normalized.event.idempotency_key = Some(format!(
             "report:{document_hash}:row:{}",
             located.locator.row

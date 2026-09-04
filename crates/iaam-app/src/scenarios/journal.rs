@@ -129,6 +129,16 @@ pub struct JournalEventView {
     pub source_operation_id: Option<String>,
     /// The category the source itself put on the row. Evidence, never a verdict.
     pub source_category: Option<String>,
+    /// The source's own word for what the operation was. Evidence, never a
+    /// verdict, and a different fact from the category beside it: this says
+    /// what happened, that says what the money was for.
+    ///
+    /// Published because it is what a classification rule matches, and a field
+    /// a rule fires on that no response ever shows is a rule the owner cannot
+    /// check. `None` for a fact recorded before schema version 14 — including
+    /// one written through the observation path, whose operation word is in
+    /// `source_category`. Nothing rewrites those.
+    pub source_kind: Option<String>,
     /// The description or counterparty the source printed on the row.
     pub description: Option<String>,
     /// The import session this fact was committed out of, when one is recorded.
@@ -227,6 +237,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         import: event.provenance.import(),
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),
         source_category: event.provenance.source_category().map(str::to_owned),
+        source_kind: event.provenance.source_kind().map(str::to_owned),
         description: event.provenance.description().map(str::to_owned),
         import_session: event.provenance.import_session(),
     }

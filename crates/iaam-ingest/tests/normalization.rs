@@ -3,13 +3,14 @@
 //! ingestion builds the legs, and the core defines their shape.
 
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TaxOrigin, TradeSide};
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::EventId;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::valuation::PriceQuality;
 use iaam_ingest::classification::Movement;
-use iaam_ingest::operation::NormalizationContext;
+use iaam_ingest::operation::{NormalizationContext, PARSER_VERSION};
 use iaam_ingest::{
     OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict, normalize,
 };
@@ -20,6 +21,7 @@ fn context() -> NormalizationContext {
     NormalizationContext {
         owner: OwnerId::new_random(),
         source: SourceId::new_random(),
+        parser_version: ParserVersion(PARSER_VERSION.to_owned()),
     }
 }
 
@@ -36,6 +38,7 @@ fn submit(kind: OperationKind) -> SubmittedOperation {
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        source_kind: None,
         description: None,
     }
 }
@@ -137,7 +140,7 @@ fn all_kinds() -> Vec<OperationKind> {
 fn every_operation_kind_produces_a_structurally_valid_event() {
     for kind in all_kinds() {
         let operation = submit(kind.clone());
-        let normalized = normalize(&operation, context())
+        let normalized = normalize(&operation, &context())
             .unwrap_or_else(|rejection| panic!("{kind:?} rejected: {rejection:?}"));
         normalized
             .event
@@ -153,7 +156,7 @@ fn a_submitted_tax_becomes_one_negative_tax_leg() {
         currency: CurrencyCode::Rub,
         origin: TaxOrigin::SelfPaid,
     });
-    let event = normalize(&operation, context())
+    let event = normalize(&operation, &context())
         .expect("tax normalizes")
         .event;
     event.validate_structure().expect("valid shape");
@@ -181,7 +184,7 @@ fn a_non_positive_tax_is_rejected() {
             currency: CurrencyCode::Rub,
             origin: TaxOrigin::SelfPaid,
         });
-        let rejection = normalize(&operation, context()).expect_err("rejected");
+        let rejection = normalize(&operation, &context()).expect_err("rejected");
         assert_eq!(rejection.field, "amount");
     }
 }
@@ -199,7 +202,7 @@ fn a_purchase_settles_for_body_plus_accrued_plus_fee() {
         basis_fee: None,
         currency: CurrencyCode::Rub,
     });
-    let event = normalize(&operation, context()).unwrap().event;
+    let event = normalize(&operation, &context()).unwrap().event;
     let cash = event
         .cash_effect(CurrencyCode::Rub)
         .expect("monetary effect");
@@ -219,7 +222,7 @@ fn a_sale_settles_for_body_plus_accrued_minus_fee() {
         currency: CurrencyCode::Rub,
         basis_fee: None,
     });
-    let event = normalize(&operation, context()).unwrap().event;
+    let event = normalize(&operation, &context()).unwrap().event;
     let cash = event
         .cash_effect(CurrencyCode::Rub)
         .expect("monetary effect");
@@ -251,7 +254,7 @@ fn a_basis_fee_is_rounded_and_retained_without_changing_cash_settlement() {
         currency: CurrencyCode::Rub,
     });
 
-    let event = normalize(&operation, context()).unwrap().event;
+    let event = normalize(&operation, &context()).unwrap().event;
     event
         .validate_structure()
         .expect("negative source commission becomes a valid positive basis fee");
@@ -283,7 +286,7 @@ fn a_negative_amount_is_rejected_with_field_expected_actual() {
         amount_minor: -1,
         currency: CurrencyCode::Rub,
     });
-    let rejection = normalize(&operation, context()).unwrap_err();
+    let rejection = normalize(&operation, &context()).unwrap_err();
     // The field and amount are named exactly as the client sent them: one
     // kopeck is “-0.01”, not “-1”. A rejection stated in
     // internal units sends us to fix something other than what was sent.
@@ -299,7 +302,7 @@ fn an_operation_without_any_date_is_rejected() {
         currency: CurrencyCode::Rub,
     });
     operation.dates = OperationDates::default();
-    let rejection = normalize(&operation, context()).unwrap_err();
+    let rejection = normalize(&operation, &context()).unwrap_err();
     assert_eq!(rejection.field, "dates");
 }
 
@@ -312,7 +315,7 @@ fn a_transfer_to_the_same_account_is_rejected_before_the_legs_are_built() {
         currency: CurrencyCode::Rub,
     });
     operation.account = account;
-    let rejection = normalize(&operation, context()).unwrap_err();
+    let rejection = normalize(&operation, &context()).unwrap_err();
     assert_eq!(rejection.field, "to");
 }
 
@@ -341,7 +344,7 @@ fn a_transfer_is_submitted_once_and_moves_both_accounts_by_itself() {
     });
     operation.account = main;
 
-    let event = normalize(&operation, context())
+    let event = normalize(&operation, &context())
         .expect("a transfer between two accounts")
         .event;
     match event.kind {
@@ -375,7 +378,7 @@ fn mirroring_a_transfer_from_the_other_statement_counts_it_twice() {
             currency: CurrencyCode::Rub,
         });
         operation.account = from;
-        normalize(&operation, context())
+        normalize(&operation, &context())
             .expect("a transfer between two accounts")
             .event
     };
@@ -400,7 +403,7 @@ fn a_negative_transfer_amount_is_refused_rather_than_read_as_the_outgoing_leg() 
         currency: CurrencyCode::Rub,
     });
     operation.account = AccountId::new_random();
-    let rejection = normalize(&operation, context()).unwrap_err();
+    let rejection = normalize(&operation, &context()).unwrap_err();
     assert_eq!(rejection.field, "amount");
     assert_eq!(rejection.expected, "positive value");
     assert_eq!(rejection.actual, "-500.00");
@@ -467,7 +470,7 @@ fn a_zero_amount_is_rejected_just_like_a_negative_one() {
         amount_minor: 0,
         currency: CurrencyCode::Rub,
     });
-    let rejection = normalize(&zero, context()).expect_err("zero must be rejected");
+    let rejection = normalize(&zero, &context()).expect_err("zero must be rejected");
     assert_eq!(rejection.field, "amount");
     assert_eq!(
         rejection.actual, "0.00",
@@ -485,7 +488,7 @@ fn the_sources_own_category_survives_normalisation_verbatim() {
     // it to the owner's category by exact value; normalising it here would
     // silently stop that rule matching.
     operation.source_category = Some("Супермаркеты".to_owned());
-    let event = normalize(&operation, context()).expect("normalises").event;
+    let event = normalize(&operation, &context()).expect("normalises").event;
     assert_eq!(event.provenance.source_category(), Some("Супермаркеты"));
 }
 
@@ -495,8 +498,77 @@ fn an_operation_without_a_source_category_carries_none() {
         amount_minor: 120_000,
         currency: CurrencyCode::Rub,
     });
-    let event = normalize(&operation, context()).expect("normalises").event;
+    let event = normalize(&operation, &context()).expect("normalises").event;
     assert_eq!(event.provenance.source_category(), None);
+}
+
+// --- what read the row, and what the source called it (iaam-h69n, iaam-p683)
+
+#[test]
+fn the_fact_records_the_reader_the_caller_named() {
+    // The defect this exists against: the version used to be a constant inside
+    // this function, so every row said `ingest/manual/1` whatever had produced
+    // it, and «the facts a buggy reader wrote» was not a set anybody could ask
+    // for. `profile/` is the prefix decision 0019 reserves for a source
+    // profile; nothing in the tree uses it yet, which is exactly why it proves
+    // the value travels rather than being defaulted.
+    let operation = submit(OperationKind::Withdrawal {
+        amount_minor: 120_000,
+        currency: CurrencyCode::Rub,
+    });
+    let read_by_a_profile = NormalizationContext {
+        owner: OwnerId::new_random(),
+        source: SourceId::new_random(),
+        parser_version: ParserVersion("profile/invented-bank-csv/1".to_owned()),
+    };
+
+    let event = normalize(&operation, &read_by_a_profile)
+        .expect("normalises")
+        .event;
+
+    assert_eq!(
+        event.provenance.parser_version(),
+        &ParserVersion("profile/invented-bank-csv/1".to_owned()),
+        "the row records what read it, not what this module was compiled with"
+    );
+    assert_ne!(
+        event.provenance.parser_version(),
+        &ParserVersion(PARSER_VERSION.to_owned()),
+        "a caller that named a reader must not have it overwritten by the default that used to be here"
+    );
+}
+
+#[test]
+fn the_operation_word_and_the_category_reach_different_provenance_fields() {
+    // They used to share one slot, so a category rule written on a source's
+    // category matched an operation word instead (iaam-p683). The two answer
+    // different questions and neither is derivable from the other.
+    let mut operation = submit(OperationKind::Withdrawal {
+        amount_minor: 120_000,
+        currency: CurrencyCode::Rub,
+    });
+    operation.source_category = Some("Groceries".to_owned());
+    operation.source_kind = Some("card payment".to_owned());
+
+    let event = normalize(&operation, &context()).expect("normalises").event;
+
+    assert_eq!(event.provenance.source_category(), Some("Groceries"));
+    assert_eq!(event.provenance.source_kind(), Some("card payment"));
+}
+
+#[test]
+fn an_operation_that_named_no_source_word_carries_none() {
+    // `None` is «the source said nothing», and it must not be filled from the
+    // category beside it: that would state a word the source never printed.
+    let mut operation = submit(OperationKind::Withdrawal {
+        amount_minor: 120_000,
+        currency: CurrencyCode::Rub,
+    });
+    operation.source_category = Some("Groceries".to_owned());
+
+    let event = normalize(&operation, &context()).expect("normalises").event;
+
+    assert_eq!(event.provenance.source_kind(), None);
 }
 
 // --- an own-account movement with an unnamed far side (iaam-fmih) -----------
@@ -508,7 +580,7 @@ fn a_stated_direction_posts_one_signed_leg_on_the_rows_own_account() {
         amount_minor: 480_000,
         currency: CurrencyCode::Rub,
     });
-    let event = normalize(&operation, context()).expect("normalises").event;
+    let event = normalize(&operation, &context()).expect("normalises").event;
     event.validate_structure().expect("valid shape");
     assert!(matches!(
         event.kind,
@@ -528,7 +600,7 @@ fn an_unstated_direction_posts_nothing_at_all() {
         amount_minor: 480_000,
         currency: CurrencyCode::Rub,
     });
-    let event = normalize(&operation, context()).expect("normalises").event;
+    let event = normalize(&operation, &context()).expect("normalises").event;
     event.validate_structure().expect("valid shape");
     assert!(matches!(
         event.kind,
@@ -548,7 +620,7 @@ fn an_own_account_movement_is_submitted_with_a_positive_amount() {
         currency: CurrencyCode::Rub,
     });
     assert!(matches!(
-        normalize(&operation, context()),
+        normalize(&operation, &context()),
         Err(Rejection { ref field, .. }) if field == "amount"
     ));
 }

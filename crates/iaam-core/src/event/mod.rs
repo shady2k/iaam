@@ -201,7 +201,17 @@ pub struct Event {
 /// source asserted to be the owner's and did not name is neither an external
 /// flow nor a complete transfer, and until now it could be recorded only as one
 /// of those two lies.
-pub const SCHEMA_VERSION: u32 = 13;
+/// Version 14 adds the optional source operation word inside [`Provenance`],
+/// beside the source category it used to be written through. The two are
+/// different facts — what the operation *was* against what it was *for* — and
+/// one slot could hold only one of them, so a category rule written on a
+/// source's category never matched a row that came in as an observation. It
+/// defaults to absent, so facts already in the journal stay readable, and
+/// nothing rewrites them: a fact below this version whose `source_category`
+/// holds an operation word keeps it, because provenance records what a path
+/// meant at the time and a repair would be this software guessing what a
+/// source said.
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.

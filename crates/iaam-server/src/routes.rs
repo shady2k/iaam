@@ -51,6 +51,7 @@ use iaam_app::sync::{
 };
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
     AccountId, CategoryId, CategoryRuleId, CustodyId, EventId, ImportId, ImportQuestionId,
     ImportSessionId, InstrumentId, SourceId,
@@ -4084,7 +4085,16 @@ pub async fn ingest_csv(
         .iter()
         .map(|(_, origin, operation)| (*origin, operation.clone()))
         .collect();
-    let outcomes = submit_operations(&state.services, &principal, &domain).await?;
+    // What read these rows: `iaam_ingest::csv_source::parse`, named by its own
+    // version. Not `ingest/manual/1` — a row this parser produced and a row a
+    // caller typed used to be indistinguishable in provenance (`iaam-h69n`).
+    let outcomes = submit_operations(
+        &state.services,
+        &principal,
+        &ParserVersion(iaam_app::ingest::csv_source::PARSER_VERSION.to_owned()),
+        &domain,
+    )
+    .await?;
     for ((row, _, _), verdict) in accepted.iter().zip(outcomes.iter()) {
         verdicts.push(VerdictDto::from_domain(*row, verdict));
     }

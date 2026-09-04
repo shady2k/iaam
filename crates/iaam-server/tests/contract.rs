@@ -143,6 +143,7 @@ impl BrokerChannel for PopulatedChannel {
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
                 source_category: None,
+                source_kind: None,
                 description: None,
             }],
             quarantined: Vec::new(),
@@ -850,8 +851,11 @@ async fn health_is_public_and_reports_versions() {
     // response, so it is fixed here rather than derived from the code — a
     // silent bump would tell that agent nothing had changed, and a silent
     // omission would tell it nothing had changed when a new event kind
-    // appeared.
-    assert_eq!(body["schema_version"], 13);
+    // appeared. Version 14 gave the source's own operation word a field of its
+    // own inside Provenance: it used to be written through the source
+    // category's slot, so a category rule could never match a row submitted as
+    // an observation.
+    assert_eq!(body["schema_version"], 14);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version
@@ -2581,6 +2585,86 @@ async fn each_verdict_names_the_row_it_belongs_to() {
 /// and read back a refusal that sounds like the account does not exist
 /// (iaam-w49n). Both flows now resolve through one tiering and refuse in one
 /// sentence.
+/// A parsed row says a parser read it, and a typed row says nobody did.
+///
+/// Invented end to end: the account title is the harness's own and the amounts,
+/// dates and keys were made up here.
+///
+/// The version used to be a constant inside `normalize`, so every row of every
+/// channel that did not overwrite it afterwards recorded `ingest/manual/1` —
+/// a document this parser read and a row an agent typed were the same fact as
+/// far as provenance was concerned, and «the rows a broken release of the CSV
+/// parser wrote» was not a set anybody could ask the journal for (`iaam-h69n`).
+#[tokio::test]
+async fn a_csv_row_records_the_parser_that_read_it_and_not_a_hand_entry() {
+    let (harness, path) = harness_on_disk();
+    let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
+        2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,parser-version-csv\n";
+    let request = Request::builder()
+        .uri("/v1/ingest/csv")
+        .method("POST")
+        .header("Authorization", format!("Bearer {}", harness.owner_token))
+        .header("Content-Type", "text/csv")
+        .body(Body::from(document))
+        .expect("request");
+    let (status, body) = call(&harness.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events.into_iter().next().expect("the recorded row");
+    assert_eq!(
+        event.provenance.parser_version().0,
+        "ingest/csv/1",
+        "the row records the reader that produced it"
+    );
+    assert_ne!(
+        event.provenance.parser_version().0,
+        "ingest/manual/1",
+        "a parsed row must not claim it was stated by hand"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_row_an_agent_typed_records_that_nothing_here_read_it() {
+    // The other half of the pair: `ingest/manual/1` still means what it says,
+    // and it must stay the value for a row a caller stated itself.
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "deposit",
+            "amount": "1000.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2025-01-01" },
+            "idempotency_key": "parser-version-typed",
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events.into_iter().next().expect("the recorded row");
+    assert_eq!(event.provenance.parser_version().0, "ingest/manual/1");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
     // The directory is built from the owner's accounts. An empty one
@@ -6229,6 +6313,73 @@ async fn source_category_survives_api_and_store_round_trip() {
     let _ = std::fs::remove_file(path);
 }
 
+/// The source's two words reach two fields, and the wire carries both.
+///
+/// Invented end to end: `Groceries` and `card payment` are the *shapes* of word
+/// a statement prints, and no institution's wording, account or amount is
+/// reproduced here.
+///
+/// Until `iaam-p683` there was one wire field and one stored field for the two,
+/// so a caller holding a statement that printed both could send only one — and
+/// whichever it sent was matched by both the classification rules, which want
+/// the operation word, and the category rules, which want the category.
+#[tokio::test]
+async fn the_source_word_and_the_source_category_are_stored_in_their_own_fields() {
+    let (harness, path) = harness_on_disk();
+    let body = json!({
+        "source_label": "paste",
+        "source": { "account": harness.account.inner(), "channel": "paste" },
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "1200.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "source_category": "Groceries",
+            "source_kind": "card payment",
+            "idempotency_key": "two-words-one-row",
+        }]
+    });
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events.into_iter().next().expect("stored event");
+    assert_eq!(
+        event.provenance.source_category(),
+        Some("Groceries"),
+        "what the money was for, in the source's word"
+    );
+    assert_eq!(
+        event.provenance.source_kind(),
+        Some("card payment"),
+        "what the operation was, in the source's word"
+    );
+
+    // And the row publishes both, or a rule fires on a field no answer shows.
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let row = &page["rows"][0];
+    assert_eq!(row["source_category"], "Groceries", "{page}");
+    assert_eq!(row["source_kind"], "card payment", "{page}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn an_empty_channel_is_rejected() {
     let harness = harness();
@@ -9014,6 +9165,7 @@ impl BrokerChannel for TwinRowsChannel {
             idempotency_key: None,
             source_operation_id: Some(operation_id.to_owned()),
             source_category: None,
+            source_kind: None,
             description: None,
         };
         Ok(ParsedOperations {
@@ -10804,7 +10956,10 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
             "amount": "1200.00",
             "currency": "RUB",
             "dates": { "cash_posted": "2026-08-12" },
-            "source_category": "Card operation",
+            // The source's own word for what the row was, in the field that
+            // holds it. It is not the row's category — that says what the money
+            // was for, and a classification rule does not read it.
+            "source_kind": "Card operation",
             "description": "Shop One",
             "idempotency_key": "reclass-withdrawal"
         }]
@@ -15149,7 +15304,7 @@ fn unresolved_row_dated(account: Uuid, key: &str, day: &str, amount: &str) -> Va
         "amount": amount,
         "currency": "RUB",
         "dates": { "cash_posted": day },
-        "source_category": "INNER",
+        "source_kind": "INNER",
         "idempotency_key": key,
     })
 }
@@ -15931,7 +16086,7 @@ fn merchant_inflow_row(account: Uuid, key: &str) -> Value {
         "direction": "in",
         "counterparty": "Shop One",
         "dates": { "cash_posted": "2025-03-20" },
-        "source_category": "RETURN",
+        "source_kind": "RETURN",
         "idempotency_key": key,
     })
 }
@@ -16072,7 +16227,7 @@ async fn an_answer_that_names_income_may_name_which_earning_it_was() {
                     "currency": "RUB",
                     "direction": "in",
                     "dates": { "cash_posted": "2025-03-31" },
-                    "source_category": "BALANCE INTEREST",
+                    "source_kind": "BALANCE INTEREST",
                     "idempotency_key": "interest-one",
                 }],
             }),
@@ -22299,7 +22454,7 @@ fn own_account_row(account: Uuid, key: &str) -> Value {
         "amount": "2500.00",
         "currency": "RUB",
         "dates": { "cash_posted": "2025-03-18" },
-        "source_category": "INNER",
+        "source_kind": "INNER",
         "far_side": "own_account",
         "idempotency_key": key,
     })
@@ -22435,7 +22590,7 @@ async fn a_movement_between_two_instruments_over_one_account_is_settled_without_
                     "amount": "2500.00",
                     "currency": "RUB",
                     "dates": { "cash_posted": "2025-03-18" },
-                    "source_category": "INNER",
+                    "source_kind": "INNER",
                     "counterparty": "card-two",
                     "idempotency_key": "instruments-one",
                 }],

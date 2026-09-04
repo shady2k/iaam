@@ -11,10 +11,11 @@ use iaam_app::scenarios::categories::{
 use iaam_app::scenarios::reports::{HeldScope, MoneyFlowQuery, money_flow};
 use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CategoryGroupId, CategoryId, CategoryRuleId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_ingest::dedup::IdentityScope;
-use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use time::Date;
@@ -115,13 +116,15 @@ impl Ctx {
             idempotency_key: None,
             source_operation_id: None,
             source_category: source_category.map(str::to_owned),
+            source_kind: None,
             description: None,
         };
         let event = normalize(
             &operation,
-            iaam_ingest::operation::NormalizationContext {
+            &iaam_ingest::operation::NormalizationContext {
                 owner: self.principal.owner,
                 source: SourceId::new_random(),
+                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
             },
         )
         .unwrap_or_else(|error| panic!("normalize operation: {error:?}"))

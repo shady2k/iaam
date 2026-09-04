@@ -393,7 +393,7 @@ fn ambiguous_row(accounts: Accounts) -> Value {
             "amount": AMBIGUOUS_AMOUNT,
             "currency": "RUB",
             "dates": { "cash_posted": "2025-03-18" },
-            "source_category": "INNER",
+            "source_kind": "INNER",
             "idempotency_key": "everyday-inner",
         })],
     )

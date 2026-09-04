@@ -334,9 +334,16 @@ pub async fn submit_intake(
             operation.clone().and_then(|operation| {
                 normalize(
                     &operation,
-                    NormalizationContext {
+                    &NormalizationContext {
                         owner: principal.owner,
                         source,
+                        // The caller stated these rows itself: nothing in this
+                        // product read a document to produce them, whether the
+                        // caller concluded what they were or left that to the
+                        // resolver. A reader that does read one supplies its
+                        // own version here, and the field has no default so it
+                        // cannot be forgotten (`iaam-h69n`).
+                        parser_version: ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
                     },
                 )
                 .map(|normalized| {
@@ -2448,9 +2455,12 @@ pub async fn plan_session(
             let origin = session_origin(principal.owner, &contents.session, operation.account);
             normalize(
                 &operation,
-                NormalizationContext {
+                &NormalizationContext {
                     owner: principal.owner,
                     source: origin.source,
+                    // As on the intake path above: the rows a session holds
+                    // are the rows a caller submitted to it.
+                    parser_version: ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
                 },
             )
             .map(|normalized| {
@@ -3260,6 +3270,20 @@ fn fingerprint(
 /// [`Ground::OwnerStatedBalance`]: iaam_core::reconciliation::evidence::Ground::OwnerStatedBalance
 /// [`SourceChannel::is_independent_of`]: iaam_core::reconciliation::evidence::SourceChannel::is_independent_of
 const CONTROL_PARSER_VERSION: &str = "import-control/1";
+
+/// What read the rows a session holds: the caller that submitted them.
+///
+/// An alias for [`iaam_ingest::operation::PARSER_VERSION`] rather than a value
+/// of its own, and deliberately so — a session's rows arrive as JSON, and
+/// whether the caller concluded what a row was or left that to the resolver
+/// says nothing about what *read* the document. Naming it here is what makes
+/// the choice visible at the two commit sites instead of inherited from a
+/// default: every row committed out of a session used to record
+/// `ingest/manual/1` because `normalize` stamped it, whatever had produced the
+/// rows (`iaam-h69n`). When a reader in this product produces a session's rows,
+/// it supplies its own version there and this constant stays what it says: the
+/// version for a row nothing here read.
+const SUBMITTED_PARSER_VERSION: &str = iaam_ingest::operation::PARSER_VERSION;
 
 /// Version of the key one transcribed control assertion is written under.
 ///
@@ -4624,6 +4648,7 @@ mod tests {
             counterparty: ObservedCounterparty::Named(counterparty.to_owned()),
             far_side: FarSide::Unstated,
             source_kind: Some("transfer".to_owned()),
+            source_category: None,
             description: None,
             dates: OperationDates {
                 cash_posted: posted,
@@ -5735,13 +5760,15 @@ mod recorded_identities {
             idempotency_key: idempotency_key.map(str::to_owned),
             source_operation_id: source_operation_id.map(str::to_owned),
             source_category: None,
+            source_kind: None,
             description: None,
         };
         normalize(
             &operation,
-            NormalizationContext {
+            &NormalizationContext {
                 owner: owner(),
                 source,
+                parser_version: ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
             },
         )
         .expect("a movement this test states completely")

@@ -17,8 +17,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::verdict::Rejection;
 
-/// Parsing version. Written to provenance: without it, an error in the source cannot be distinguished
-/// from a parsing error corrected later (§4.1).
+/// The version of the reader for a row a caller stated itself.
+///
+/// Written to provenance: without it, an error in the source cannot be
+/// distinguished from a parsing error corrected later (§4.1).
+///
+/// **It is not a default.** [`NormalizationContext`] has no default parser
+/// version, and this constant is what a caller supplies when the reader really
+/// was the caller — an operation posted as JSON, a row typed into an import
+/// session. A caller that read a document supplies the version of whatever read
+/// it, and a caller that forgets does not compile. This was once stamped by
+/// `normalize` itself, so every row committed out of an import session claimed
+/// to have been typed by hand whatever had actually read it (`iaam-h69n`).
 pub const PARSER_VERSION: &str = "ingest/manual/1";
 
 /// Operation dates. All are optional except the one that makes the operation dated: an event without a single date does not belong to any period.
@@ -314,9 +324,22 @@ pub struct SubmittedOperation {
     pub idempotency_key: Option<String>,
     /// Operation identifier in the source, if present.
     pub source_operation_id: Option<String>,
-    /// Category assigned by the source, retained verbatim for later rule matching.
+    /// The source's own word for what the operation was **for**, verbatim.
+    ///
+    /// Retained for later rule matching, and never the same field as
+    /// [`Self::source_kind`] beside it: a category rule matches this one, and
+    /// filling it with an operation word makes that rule fire on rows the owner
+    /// was not describing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// The source's own word for what the operation **was**, verbatim.
+    ///
+    /// `#[serde(default)]` because a row stored by an earlier build carries no
+    /// such field: import sessions hold submitted operations as JSON, and one
+    /// written before this field existed said nothing about the source's
+    /// operation word — which is what `None` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
     /// Description or counterparty printed by the source, retained verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -328,15 +351,33 @@ pub struct Normalized {
     pub event: Event,
 }
 
-/// Normalization context: who owns it and which source it came from.
+/// Normalization context: who owns it, which source it came from, and what
+/// read it.
 ///
 /// There is intentionally no sequence number here: storage assigns it
 /// in the same transaction as the insert. Ingestion uses number `1`
 /// as deliberately temporary—storage will overwrite it (§4.8).
-#[derive(Debug, Clone, Copy)]
+///
+/// **There is intentionally no default parser version either, and no
+/// `Default`.** The field is a plain struct member of a type every caller
+/// builds by literal, so a caller that does not say what read its rows fails to
+/// compile. That is the whole point: a default is how every row committed out of
+/// an import session came to claim it had been typed by hand (`iaam-h69n`), and
+/// the recovery story for a buggy reader — the facts it wrote are a set you can
+/// find and retract — is not true while the facts name the wrong reader.
+///
+/// The version belongs to the **batch** and not to the session or the import: a
+/// session is opened per declaration, and a declaration names an account and a
+/// label, never a reader.
+#[derive(Debug, Clone)]
 pub struct NormalizationContext {
     pub owner: OwnerId,
     pub source: SourceId,
+    /// What read the rows this context normalises.
+    ///
+    /// [`PARSER_VERSION`] where the caller stated the row itself; the document
+    /// reader's own version where a reader produced it.
+    pub parser_version: ParserVersion,
 }
 
 /// Converting an operation into a journal event.
@@ -346,7 +387,7 @@ pub struct NormalizationContext {
 /// (§10.1).
 pub fn normalize(
     operation: &SubmittedOperation,
-    context: NormalizationContext,
+    context: &NormalizationContext,
 ) -> Result<Normalized, Rejection> {
     let dates = operation.dates.to_event_dates();
     let day = dates.effective_date().ok_or_else(|| Rejection {
@@ -376,17 +417,24 @@ pub fn normalize(
             ),
             legs,
             provenance: {
-                let base = Provenance::new(
-                    context.source,
-                    raw_hash,
-                    ParserVersion(PARSER_VERSION.to_owned()),
-                );
+                // The version comes from the context and from nowhere else.
+                // It used to be this constant, and a second place then
+                // overwrote it for one channel out of five (`iaam-h69n`).
+                let base =
+                    Provenance::new(context.source, raw_hash, context.parser_version.clone());
                 let base = match operation.source_operation_id.as_deref() {
                     Some(id) => base.with_source_operation_id(id),
                     None => base,
                 };
                 let base = match operation.source_category.as_deref() {
                     Some(category) => base.with_source_category(category),
+                    None => base,
+                };
+                // Beside the category and never through it: the two are
+                // different facts, and one slot could carry only one of them
+                // (`iaam-p683`).
+                let base = match operation.source_kind.as_deref() {
+                    Some(kind) => base.with_source_kind(kind),
                     None => base,
                 };
                 match operation.description.as_deref() {

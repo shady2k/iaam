@@ -175,10 +175,14 @@ impl SqliteStore {
     /// `account` is stored and nothing here derives from it, and it is stored
     /// **as well as** `source` and `import` rather than instead of them: those
     /// two are what the journal is stamped with, and both are one-way hashes of
-    /// this account together with the channel and the label. A reused session
-    /// keeps the account it was opened with, which cannot disagree with the one
-    /// passed here: an import identity is derived from an account, so two calls
-    /// naming one import name one account.
+    /// this account together with the channel and the label.
+    ///
+    /// A reused session keeps the account it was opened with and **this
+    /// argument is dropped**. What makes that sound is not a property of the
+    /// import path or of the source path but of what it takes to be a key at
+    /// all, so it is stated once on `standing_session`, the dispatch that
+    /// chooses between them — including the single case where it is a tolerance
+    /// rather than an equality.
     pub fn open_import_session(
         &mut self,
         owner: OwnerId,
@@ -464,13 +468,20 @@ impl SqliteStore {
     /// The owner changing their mind is a different act — the rule the first
     /// answer created is what carries it, and amending that rule replans the
     /// history it already classified.
+    ///
+    /// **The rule is not written here, and that is `iaam-77hk`.** It used to be:
+    /// the caller created the standing rule first and passed its identifier in,
+    /// so a failure of this call left the owner holding a rule for an answer no
+    /// session shows — a rule whose origin he never sees, and which he cannot
+    /// reach from the question that made it. The answer is the fact he gave and
+    /// it is written first; what it generalised into is named afterwards by
+    /// [`Self::attach_import_question_rule`].
     pub fn answer_import_question(
         &mut self,
         owner: OwnerId,
         session: ImportSessionId,
         question: ImportQuestionId,
         answer: &str,
-        rule: Option<&str>,
     ) -> Result<StoredQuestion, StoreError> {
         check_json(answer, "answer")?;
         let transaction = self
@@ -479,14 +490,13 @@ impl SqliteStore {
         require_open(&transaction, owner, session)?;
         let answered_at = now();
         let updated = transaction.execute(
-            "UPDATE import_questions SET answered_at = ?3, answer = ?4, rule = ?5
+            "UPDATE import_questions SET answered_at = ?3, answer = ?4
              WHERE session = ?1 AND id = ?2 AND answered_at IS NULL",
             params![
                 session.inner().to_string(),
                 question.inner().to_string(),
                 answered_at,
                 answer,
-                rule,
             ],
         )?;
         if updated == 0 {
@@ -505,6 +515,64 @@ impl SqliteStore {
                 answer,
             ],
         )?;
+        let stored =
+            question_by_id(&transaction, session, question)?.ok_or(StoreError::NotFound {
+                what: "an import question",
+                id: question.inner().to_string(),
+            })?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    /// Name the standing rule an answer was generalised into.
+    ///
+    /// A second write rather than a column of [`Self::answer_import_question`],
+    /// because the two facts are written by two different ports and only one of
+    /// them is this store's. The rule lives behind
+    /// `ClassificationRuleStore`; no transaction spans both, and there is no
+    /// handle either signature could pass to make one. So the order carries what
+    /// a transaction cannot: the answer is durable before the rule exists, and
+    /// the rule is created before anything claims the question made it.
+    ///
+    /// What remains possible after that ordering is one thing, and it is stated
+    /// rather than hidden: the rule is created and this call fails, leaving a
+    /// standing rule the question does not name. The question then reports
+    /// `available` — a rule was possible and none is recorded — which is a state
+    /// the action queue offers the owner an act for, and adopting it a second
+    /// time writes a rule that classifies identically. The failure the old order
+    /// had was not recoverable at all: the answer itself was lost.
+    ///
+    /// `answered_at IS NOT NULL AND rule IS NULL` is the condition, so this
+    /// cannot invent a rule for an open question and cannot overwrite one
+    /// already named. A question that no longer meets it is a `NotFound` for the
+    /// same reason the answer's own update is: the row this call was told about
+    /// is not the row it found.
+    pub fn attach_import_question_rule(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+        rule: &str,
+    ) -> Result<StoredQuestion, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_open(&transaction, owner, session)?;
+        let updated = transaction.execute(
+            "UPDATE import_questions SET rule = ?3
+             WHERE session = ?1 AND id = ?2 AND answered_at IS NOT NULL AND rule IS NULL",
+            params![
+                session.inner().to_string(),
+                question.inner().to_string(),
+                rule,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound {
+                what: "an answered import question without a rule",
+                id: question.inner().to_string(),
+            });
+        }
         let stored =
             question_by_id(&transaction, session, question)?.ok_or(StoreError::NotFound {
                 what: "an import question",
@@ -730,6 +798,36 @@ fn open_session_for_source(
 /// declaration naming an import is recognised by it; one naming only a source
 /// is recognised by that; one naming neither is recognised by nothing, which is
 /// the honest answer and not an oversight.
+///
+/// **What every arm here relies on: a key names an account.**
+/// [`SqliteStore::open_import_session`] hands back the session this function
+/// finds and drops the account it was given, which is only safe while two calls
+/// producing one key cannot have named two accounts. Both keys carry that:
+/// `SourceId::declared` hashes owner, account and channel, and
+/// `ImportId::declared` hashes owner, account, channel and label, so one key is
+/// one account. The same rule seen from the other side: a key derived from no
+/// account — `SourceId::new_random()`, which the undeclared ingest path mints
+/// per request — is a fresh value on every call, matches no stored session, and
+/// therefore reuses nothing.
+///
+/// Stated on the dispatch and not once per arm on purpose. The import arm and
+/// the source arm satisfy this for two different reasons that read like two
+/// local arguments, and a third arm added below would have neither of them to
+/// copy; what it has to satisfy is this one sentence, and reuse keyed on
+/// anything that is not derived from an account would hand a caller a session
+/// opened for a different one.
+///
+/// **One exception, and it is deliberate.** A session opened before
+/// `0024_import_session_account.sql` stored no account, so this function can
+/// hand a NULL-account session to a caller that did declare one — a caller that
+/// followed the new rule reaching a session which structurally cannot check its
+/// rows against an account, because the check is against what the session
+/// recorded and it recorded nothing. That is the tolerance the migration chose:
+/// such a session «keeps exactly the behaviour it was opened under rather than
+/// acquiring a rule it never agreed to». It is bounded — the set of such
+/// sessions is fixed and drains as they commit or are abandoned — and the
+/// alternative is refusing an import over when the session it names happened to
+/// be opened.
 pub(crate) fn standing_session(
     conn: &Connection,
     owner: OwnerId,

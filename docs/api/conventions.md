@@ -300,7 +300,7 @@ And the types that print a bare identifier on purpose.
 | `AccountBalanceDto`, `NegativeCashDto`, `AssetAccountDto`, `CashClassTotalDto`, `NotDecomposedAccountDto`, `AccountResidualDto`, `EarningSourceAmountDto`, `CaveatSubjectDto` | `account` | the answer these sit in carries `population`, whose `covered` and `outside` name every account it mentions and every account it left out. The join table is in the same response, computed by the same fold, and one report row cannot disagree with it |
 | `ReconciliationStatusDto`, `TaintDto` | `account` | the caller named the account in the request; the response answers about that one and no other |
 | `JournalEventReadDto`, `JournalLegDto`, `OperationDto`, `VerdictDto` | `account` | a row-level echo of what the caller submitted or asked for |
-| `BatchTotalDto`, `ControlComparisonDto` | `account` | the import assessment they sit in carries `account_resolution`, whose `resolved` and `missing` name every account the rows are on and say which of them the owner's directory holds. The join table is in the same response, computed by the same fold. It is also why a name cannot simply be printed: a total over rows on an account the directory has never heard of is precisely what these sections must be able to publish |
+| `BatchTotalDto`, `ControlComparisonDto`, `PlannedOriginDto` | `account` | the import assessment they sit in carries `account_resolution`, whose `resolved` and `missing` name every account the rows are on and say which of them the owner's directory holds. The join table is in the same response, computed by the same fold. It is also why a name cannot simply be printed: a total over rows on an account the directory has never heard of is precisely what these sections must be able to publish |
 | every request body | — | §3.2 |
 
 Two things follow for a client. Where a response carries a `population` block, it
@@ -455,6 +455,30 @@ Nothing links the adopted rule back to the question. `generalisation` says what
 *this answer* wrote, so it goes on saying `available` after the owner posts the
 proposal: the rule he created is his own act, and it is read back from
 `GET /v1/classification-rules` like any other.
+
+The proposal is also an item in the action queue, kind
+`adopt_classification_rule`, one per answered question that has one. A state the
+system reports truthfully with no act that resolves it is a dead end dressed as
+information, and `available` was one: the owner is the only principal who may
+generalise, the queue is where he is told what only he can do, and nothing in it
+mentioned the rule waiting for him. The item is `recommended` — the row it came
+from is settled and no report is short of anything — it names `owner` as the
+required scope, and its target is `POST /v1/classification-rules` with the
+proposal preset as the body and no missing field. What is missing is his
+decision, which is why the item's state is `needs_owner_input` rather than
+`ready`.
+
+Because the question goes on saying `available`, the item's completion is read
+from his rules instead: it disappears once a standing rule of his classifies a
+row like that one the way he answered — whether he sent the proposal as it stood,
+narrowed it first, or had written something covering it last month. An item whose
+completion could not be observed would never leave the queue, which is how a
+queue is learned to be ignored.
+
+The condition a proposal asks about is one field, not every field the row
+printed — see decision 0008. A client showing the proposal to the owner should
+show him that condition, because it is the part he may want to change before he
+sends it.
 
 ### 4.5 Retracting an import, and retracting anything else
 

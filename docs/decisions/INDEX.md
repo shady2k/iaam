@@ -12,3 +12,5 @@
 | [0004](0004-an-account-carries-the-identity-its-source-prints.md) | An account carries the identity its source prints | 2026-09-03 | proposed | `iaam-34f3` |
 | [0005](0005-two-maps-two-reasons-and-only-one-is-0004s.md) | Two maps, two reasons, and only one of them is 0004's | 2026-09-04 | proposed | `iaam-5wh2` |
 | [0006](0006-the-observation-channel-says-everything-the-conclusive-one-does.md) | The observation channel says everything the conclusive one does | 2026-09-04 | proposed | `iaam-7l7v` |
+| [0008](0008-a-proposed-rule-asks-about-one-field.md) | A rule minted from an answer asks about one field | 2026-09-04 | proposed | `iaam-g7yc` |
+| [0009](0009-a-verdict-answers-a-write-and-confirmation-answers-a-read.md) | A verdict answers a write; confirmation answers a read | 2026-09-04 | proposed | `iaam-eio5` |

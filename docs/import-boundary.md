@@ -48,6 +48,16 @@ so the retraction is the ordinary one — that account, channel `csv`, and the
 no `idempotency_key` is identified by the document's digest and its own line
 number, so re-sending one document writes nothing the second time.
 
+**Corporate actions and offers are declared the same way.** The journal-fact
+channel had no declaration at all: it minted a source per request, so what it
+recorded was reachable one event at a time and never as the batch it arrived in,
+and a resubmission of the same facts was a second source rather than the same
+rows. It now takes the declaration the conclusive route takes — account, channel,
+label — and refuses a batch whose facts do not all name the declared account, so
+a batch spanning two accounts is two calls. Omitting the declaration still
+records the facts under a source minted for the request; that is what every
+caller written before had, and it is not a default worth choosing.
+
 **A session is not a second vocabulary.** `AddImportRowsRequest` carries the
 same `OperationDto` the conclusive route takes. The difference between the two
 channels is *when* the fact is written, not *what* a row may say. So anything
@@ -158,6 +168,18 @@ Naming the shape is not naming the tool, which §8 rejects and still should.
 `unresolved_direction` is a value of this API's own contract, published in the
 document the same caller is already reading.
 
+**The three words are now published with their meanings** (`iaam-k6l7`). They
+were not: `provided_by` reached the wire as a bare string, with the codes written
+out in the transport and the contract saying neither what the list was nor what
+any entry meant. That is why the fourth word kept being rediscovered — a reader
+with three unexplained codes cannot tell that the axis is *who holds the value*
+rather than *what it took to read it*, and a value the owner exported, converted
+and restated looks like a case with no word for it. It has one, and
+`external_document`'s published sentence now says so: fetching, converting and
+restating are steps on the way to a value, not sources of it. The vocabulary is
+expanded from `iaam_app::provided_by_vocabulary!`, so the code, the meaning and
+the transport's conversion come from one list and cannot drift apart.
+
 ## 6. Where the line should be, and the one thing that must move first
 
 **A converter translates a format. The API reaches conclusions.** That is the
@@ -244,10 +266,14 @@ second half is decision 0005, and it is done.
   settled `refund` and the income kind and deliberately left this one standing:
   `classification_of` answers `None` for a recorded tax, so admitting `Tax` here
   would overturn that in passing rather than by decision.
-- What a rule minted from an answer should generalise on. `matcher_for` fills
-  the counterparty, the whole description and the source's word at once, and
-  choosing which of the three a rule ought to ask about is the owner's decision,
-  not one this document can take.
+- ~~What a rule minted from an answer should generalise on~~ — taken by
+  decision 0008, and the answer is one field: the counterparty where the row
+  named one, failing that the word the source used, failing both the whole
+  description. Filling all three joined them with «and», so the rule recognised
+  the row it was learned from and practically nothing else. The decision is
+  proposed rather than accepted, because which of the three carries the
+  classification is still the owner's call and 0008 only writes down what the
+  code now does and why.
 - ~~Whether `--account-map` and `--counterparty-map` are retired against the
   identity decision 0004 gave an account~~ — settled by decision 0005, and the
   answer is that the two files are two different things. `--account-map` is

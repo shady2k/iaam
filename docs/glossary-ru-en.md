@@ -125,7 +125,7 @@ is how you match a term in them to the code.
 | разрыв | gap | `BasisGap`, `AllocationGap` |
 | разрыв покрытия | coverage gap | `ImportCoverageGap`; refused rows leave named dimensions unconfirmed |
 | сверка | reconciliation | |
-| измерение (сверки) | dimension | `dimension`; what a verdict reconciled, e.g. cash or quantity |
+| измерение (сверки) | dimension | `dimension`; the axis a reconciliation covers — cash, positions, income, tax basis. A verdict names one; it does not reconcile it |
 | основание котировки | quotation basis | `QuotationBasis`; effective, recorded and proof status are three different things |
 | граница полноты | completeness boundary | `complete_through` |
 | выведенная (граница) | inferred | `Boundary::InferredAcrossNonTradingDays`; not “derived” for this |

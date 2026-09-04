@@ -91,10 +91,20 @@ pub async fn submit_operations(
 /// The application reads the schedule and the knowledge coordinate. The normaliser receives
 /// only a prepared [`JournalEventEnrichment`], so it remains a pure
 /// function and does not depend on reference data or storage.
+///
+/// The origin arrives as a source and an import rather than as a [`RowOrigin`]
+/// per fact, and that is the one place this differs from
+/// [`submit_operations`]: a declaration on this input names one account for the
+/// whole batch and the route refuses a fact that names another, so a per-fact
+/// origin here would be the same pair repeated with room to differ. The import
+/// is still stamped after normalisation, for that function's reason:
+/// normalisation decides what a fact *is*, and the handle a retraction is keyed
+/// on decides nothing about that.
 pub async fn submit_journal_events(
     services: &AppServices,
     principal: &Principal,
     source: SourceId,
+    import: Option<ImportId>,
     events: &[SubmittedJournalEvent],
 ) -> Result<Vec<Verdict>, AppError> {
     let knowledge_as_of = OffsetDateTime::now_utc();
@@ -146,8 +156,13 @@ pub async fn submit_journal_events(
         };
 
         candidates.push(
-            normalize_journal_event(submitted, &enrichment, context)
-                .map(|normalized| normalized.event),
+            normalize_journal_event(submitted, &enrichment, context).map(|normalized| {
+                let mut event = normalized.event;
+                if let Some(import) = import {
+                    event.provenance = event.provenance.with_import(import);
+                }
+                event
+            }),
         );
     }
 

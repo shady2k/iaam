@@ -170,6 +170,24 @@ record, so he can adopt it as it stands instead of reconstructing it from the
 row. When you notice a question you have relayed before, that is the thing to
 say: which rule is waiting to be adopted, not a second guess at the answer.
 
+You do not have to remember which ones are waiting. **Every rule an answer could
+not write is an item in the outstanding-work queue**, one per question, kind
+`adopt_classification_rule`, carrying the rule already filled in as the body of
+the call that writes it. It is a recommendation rather than required work — the
+row it came from is settled and no report is short of anything — and it names the
+owner as the one who may send it, which you cannot. Read that item to him. The
+item disappears once a standing rule of his settles a row like that one, whether
+he sent the proposal as it stood or narrowed it first, so the queue is a list of
+decisions still open rather than a list you have to keep yourself.
+
+The condition a proposal asks about is **one thing**: the counterparty the row
+named, or failing that the word the source used for the operation, or failing
+both the description. Not all three at once — a condition joining every field the
+row printed recognises that row and almost nothing else, which is a standing
+decision that decides nothing. Tell him what the condition asks, because it is
+the part he may want to change: a wider one settles more rows next month and can
+settle one wrongly, and only he can weigh that.
+
 A rule the owner does write is kept in his own vocabulary, and he can see it,
 change it, and retire it afterwards like any other.
 
@@ -276,6 +294,17 @@ attempt it. The system refuses an agent's credential for it, and that refusal is
 a limit of rights, not an absence of the capability. What the agent may properly
 do is find what went wrong, tell the owner exactly which facts are affected, and
 prepare the request for him to send.
+
+**Declare a source on everything you submit, corporate actions and offers
+included.** A submission that declares nothing is recorded under an identity
+nobody was ever told the name of, and nothing can name it again: the facts land,
+and the only handle left on them is one event at a time. A declaration is the
+account, the way the rows arrived, and a label naming this batch — a statement
+period, an export file name, a run identifier. Two submissions under one label
+are one import; two labels are two imports. It costs one object in the request,
+and it is the whole difference between an import you can take back and one you
+cannot. Corporate actions and offers had no way to declare it at all until
+recently; they do now.
 
 **Undoing your own import is yours.** An import you declared and committed —
 your account, your channel, your label — you may retract, and you should, the
@@ -631,6 +660,14 @@ and do not report each date to the owner separately.
 
 **Never call `provisional` an error.** It means no independent confirmation has
 arrived yet, which is an ordinary state of a correct journal.
+
+**And never wait for `accepted`.** The verdict vocabulary publishes the word and
+nothing produces it, which its own published sentence now says. A verdict answers
+one write, while whether reconciliation matched is a property of an account, a
+dimension and an interval, folded when a report is read and moved by evidence
+that arrives later. Confirmation is read from the data quality block, as
+`accepted_internal` or `accepted_independent`; the absence of `accepted` from a
+row's verdict says nothing about it either way.
 
 ## A fact can be quoted, a derived value cannot
 

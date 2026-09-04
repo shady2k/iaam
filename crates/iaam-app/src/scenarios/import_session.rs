@@ -29,8 +29,8 @@ use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
-    Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Movement,
-    Question, RuleMatcher, classify,
+    Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule,
+    ClassificationSubject, Movement, Question, RuleMatcher, classify,
 };
 use iaam_ingest::observation::{Intake, ObservedRow};
 use iaam_ingest::operation::NormalizationContext;
@@ -225,7 +225,7 @@ pub async fn answerable_questions(
             accounts: asked.map_or_else(Vec::new, |asked| {
                 answer_account_candidates(&asked, &accounts)
             }),
-            generalisation: generalisation_of(contents, question),
+            generalisation: generalisation_of(&contents.observations, question),
         })
         .collect())
 }
@@ -938,14 +938,24 @@ impl Generalisation {
 /// beside a row that asks nothing — which is not a fudge: «no rule can be built
 /// from this» is true of both, and the assessment is where an unreadable row is
 /// reported as unreadable.
-fn generalisation_of(contents: &SessionContents, question: &ImportQuestionView) -> Generalisation {
+///
+/// Public, and taking the session's observations rather than the whole
+/// [`SessionContents`], because the action queue derives the same state from the
+/// same three facts. It reads the session's questions and observations out of
+/// the store directly — it never loads a session — and a second derivation there
+/// would be a second answer to «what did this answer generalise into», which is
+/// the one thing this type exists to have only one of.
+pub fn generalisation_of(
+    observations: &[ImportObservationView],
+    question: &ImportQuestionView,
+) -> Generalisation {
     if let Some(rule) = question.rule.clone() {
         return Generalisation::Recorded { rule };
     }
     if question.is_open() {
         return Generalisation::Unanswered;
     }
-    observed_row(contents, question.row)
+    observed_row(observations, question.row)
         .ok()
         .and_then(|observed| {
             let matcher = matcher_for(&observed)?;
@@ -961,6 +971,32 @@ fn generalisation_of(contents: &SessionContents, question: &ImportQuestionView) 
         .unwrap_or(Generalisation::Impossible)
 }
 
+/// The row one question is about, as the classifier asks about it.
+///
+/// `None` where this build cannot read the row, which is the same absence
+/// [`generalisation_of`] turns into [`Generalisation::Impossible`]: a row nothing
+/// can read is a row no rule can be tested against.
+///
+/// **Nothing is resolved into it.** [`ObservedRow::subject`] takes the account
+/// the owner's directory made of the printed counterparty, and this passes
+/// `None` — so the counterparty stays the name the source printed. That is not a
+/// shortcut around a directory read: it is the only reading under which a
+/// standing rule can be tested at all, because [`RuleMatcher::matches`] compares
+/// `counterparty_account` against a printed name and never against one of the
+/// owner's accounts, and [`matcher_for`] proposes the printed name for the same
+/// reason. A subject built with the resolution would be tested against rules
+/// written without it, and would answer «no rule matches» for every rule that
+/// does.
+#[must_use]
+pub fn subject_of(
+    observations: &[ImportObservationView],
+    question: &ImportQuestionView,
+) -> Option<ClassificationSubject> {
+    observed_row(observations, question.row)
+        .ok()
+        .map(|observed| observed.subject(None))
+}
+
 /// Record the owner's answer to one question.
 ///
 /// Three things happen, in this order and for these reasons:
@@ -968,15 +1004,21 @@ fn generalisation_of(contents: &SessionContents, question: &ImportQuestionView) 
 /// 1. The answer is checked against what the question actually offered. An
 ///    answer the question does not admit is a different mistake from a wrong
 ///    answer, and only the first can be refused.
-/// 2. If the answerer may generalise, the decision is also written as a durable
-///    [`ClassificationRule`], so the next import of a matching row resolves
-///    without asking. See [`may_generalise`]: settling this row is import
-///    mechanics, and standing rules are the owner's judgement. A row that offers
-///    nothing to match on — no counterparty, no description, no word from the
-///    source — gets **no** rule either way, because a matcher that asks nothing
-///    matches nothing and an "everything" rule would silently reclassify the
-///    portfolio.
-/// 3. The answer is recorded on the question and on the row.
+/// 2. The answer is recorded on the question and on the row.
+/// 3. If the answerer may generalise, the decision is **then** written as a
+///    durable [`ClassificationRule`] and named on the question, so the next
+///    import of a matching row resolves without asking. See [`may_generalise`]:
+///    settling this row is import mechanics, and standing rules are the owner's
+///    judgement. A row that offers nothing to match on — no counterparty, no
+///    description, no word from the source — gets **no** rule either way,
+///    because a matcher that asks nothing matches nothing and an "everything"
+///    rule would silently reclassify the portfolio.
+///
+/// Steps 2 and 3 were the other way round until `iaam-77hk`, and the swap is the
+/// whole of that bead: the answer is the owner's fact and the rule is derived
+/// from it, so the derived one is written second and a failure costs the
+/// derivation rather than the fact. The reasoning is at the call, together with
+/// what remains possible now that it cannot be made one transaction.
 ///
 /// The journal is not touched. The answer settles what the row is; commit is
 /// what records it.
@@ -1048,7 +1090,7 @@ pub async fn answer_question(
         }
     }
 
-    let observed = observed_row(&contents, stored.row)?;
+    let observed = observed_row(&contents.observations, stored.row)?;
     // Refused before the rule is written rather than at commit: a rule created
     // for an answer the row cannot express would outlive the mistake and
     // reclassify later imports by it.
@@ -1060,9 +1102,35 @@ pub async fn answer_question(
             actual: rejection.actual,
         })?;
 
-    let rule = match matcher_for(&observed).filter(|_| may_generalise(principal)) {
-        Some(matcher) => Some(
-            services
+    // **The answer is written before the rule, and this is iaam-77hk.** It used
+    // to be the other way round: the rule was created, and its identifier was
+    // passed to the write that recorded the answer. A failure of that second
+    // write left the owner holding a standing rule for an answer no session
+    // shows — a rule whose origin he never sees, whose question still reads as
+    // open, and which he cannot reach from the row that made it.
+    //
+    // The two writes cannot be one. `services.store` and `services.rules` are
+    // separate ports; neither signature carries a transaction handle and the
+    // rule store need not even be the same database, so a promise of atomicity
+    // here would be a promise nothing keeps. What is left is the order, and the
+    // order is decided by which fact is the owner's: the answer is what he said
+    // about the row, and the rule is derived from it. The derived one goes
+    // second.
+    //
+    // What remains possible is stated rather than hidden. A failure after this
+    // point leaves the row settled and no rule recorded — which is exactly
+    // `Generalisation::Available`, a state the action queue offers an act for,
+    // so the owner is one call from the rule rather than back at the row. A
+    // caller that sees this call fail must therefore re-read the session rather
+    // than repeat the call: the answer may already stand, and answering twice is
+    // refused.
+    let answered = services
+        .store
+        .answer_import_question(principal.owner, session, question, json(&answer, "answer")?)
+        .await?;
+    let answered = match matcher_for(&observed).filter(|_| may_generalise(principal)) {
+        Some(matcher) => {
+            let rule = services
                 .rules
                 .create_rule(
                     principal.owner,
@@ -1070,23 +1138,19 @@ pub async fn answer_question(
                     json(&outcome_json(answer.classification()), "outcome")?,
                     None,
                 )
+                .await?;
+            services
+                .store
+                .attach_import_question_rule(
+                    principal.owner,
+                    session,
+                    question,
+                    rule.id.to_string(),
+                )
                 .await?
-                .id
-                .to_string(),
-        ),
-        None => None,
+        }
+        None => answered,
     };
-
-    let answered = services
-        .store
-        .answer_import_question(
-            principal.owner,
-            session,
-            question,
-            json(&answer, "answer")?,
-            rule,
-        )
-        .await?;
     // Through the same pairing every other reading of a question goes through,
     // rather than an empty list and a generalisation written out here. The
     // answered question offers no candidates *because it is answered*, and what
@@ -1822,6 +1886,31 @@ pub struct CommitDelta {
     pub duplicates: Vec<PlannedFact>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRow>,
+    /// The provenance each account's `facts` will be written under.
+    ///
+    /// **Per account, because that is where the answer is true.** The origin is
+    /// `session_origin`'s, derived from the owner, the session and the account
+    /// a row names, and a session that declared nothing may hold rows for
+    /// several accounts — which is what a free session is for, since an export
+    /// covering a whole institution is one session and not one per account. A
+    /// single source at the top of the plan would therefore be a lie for
+    /// exactly the sessions that need it most. The grouping is the one
+    /// [`CommitDelta::fact_totals`] already uses, minus the currency, which
+    /// nothing about a source depends on.
+    ///
+    /// **Facts only, not duplicates.** A duplicate appends nothing, so there is
+    /// no provenance it will be written under; the row it collides with was
+    /// written by some earlier submission, quite possibly under another import
+    /// entirely, and publishing this session's identity for it would name a
+    /// group a retraction here would not take.
+    ///
+    /// It is published because a plan that says what will be written and not
+    /// what it will be written under cannot be checked against the one question
+    /// a pre-commit review exists to settle: if this turns out to be wrong,
+    /// what does taking it back have to name. The information was there all
+    /// along — the commit derives it from the very same call — and only the
+    /// publishing was missing.
+    pub fact_origins: Vec<PlannedOrigin>,
     /// What `facts` come to, per account and currency.
     pub fact_totals: Vec<BatchTotal>,
     /// What `duplicates` come to, per account and currency.
@@ -1832,6 +1921,29 @@ pub struct CommitDelta {
     /// is the figure that explains a statement whose turnover exceeds what the
     /// import adds. Summed together they would be neither.
     pub duplicate_totals: Vec<BatchTotal>,
+}
+
+/// The identity one account's planned facts will carry into the journal.
+///
+/// Both halves travel together for [`RowOrigin`]'s reason, and they answer two
+/// different questions: the source says which channel of which account these
+/// rows come from and is what deduplication is scoped by, and the import says
+/// which submission carried them and is what a retraction is keyed on. A plan
+/// that published only the first would let a reader work out the channel and
+/// still not know whether taking this import back would take one statement or
+/// every statement that account ever arrived by.
+///
+/// `import` is `None` where the session declared a source without a label:
+/// those rows are retracted together with every other unlabelled row of the
+/// same account and channel, and that is what naming no label means, not an
+/// identity still to be assigned. A session that declared nothing at all always
+/// has one, because `session_origin` derives it from the session identifier —
+/// which the caller has held since it opened the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedOrigin {
+    pub account: AccountId,
+    pub source: SourceId,
+    pub import: Option<ImportId>,
 }
 
 /// A row that stays in the session and becomes no fact.
@@ -2119,6 +2231,7 @@ pub async fn plan_session(
     let cross_source_matching = transfer_pairing::propose(&legs);
 
     let commit_delta = CommitDelta {
+        fact_origins: fact_origins(principal.owner, &contents.session, &facts),
         fact_totals: batch_totals(&facts)?,
         duplicate_totals: batch_totals(&duplicates)?,
         facts,
@@ -2369,6 +2482,41 @@ fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact 
     }
 }
 
+/// The provenance each account's planned facts will be written under.
+///
+/// Derived here from [`session_origin`] rather than carried out of the
+/// normalisation above, and that is deliberate: the same function decides what
+/// the commit stamps, so the plan cannot describe an origin the commit does not
+/// use — which is the whole reason a session's origin is derived and not stored
+/// (iaam-zv54). Reading it back off the built candidates would be a second
+/// answer to a question that already has one owner.
+///
+/// Keyed on [`PlannedFact::account`] — the account the published fact names —
+/// so that a reader can join the two by the value in front of him rather than
+/// by one this function chose and did not print.
+///
+/// Sorted and deduplicated by account, so that two plans of an unchanged session
+/// are the same plan: the row order the facts arrive in is the session's, and a
+/// list that inherited it would make the revision stamp depend on it.
+fn fact_origins(
+    owner: OwnerId,
+    session: &ImportSessionView,
+    facts: &[PlannedFact],
+) -> Vec<PlannedOrigin> {
+    let accounts: BTreeSet<AccountId> = facts.iter().map(|fact| fact.account).collect();
+    accounts
+        .into_iter()
+        .map(|account| {
+            let origin = session_origin(owner, session, account);
+            PlannedOrigin {
+                account,
+                source: origin.source,
+                import: origin.import,
+            }
+        })
+        .collect()
+}
+
 /// What a list of planned facts comes to, per account and currency.
 ///
 /// The fold itself is [`iaam_core::batch::total`]: summing money is arithmetic,
@@ -2526,6 +2674,9 @@ fn fingerprint(
     // that it covers everything the plan says, and a section left out because it
     // «cannot disagree» is the section that will, the day someone changes how it
     // is folded.
+    for origin in &delta.fact_origins {
+        let _ = writeln!(rendered, "fact origin {origin:?}");
+    }
     for total in &delta.fact_totals {
         let _ = writeln!(rendered, "fact total {total:?}");
     }
@@ -3509,19 +3660,82 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
 /// `None` where the row offers nothing to match on. A matcher that asks nothing
 /// matches nothing by construction, and writing one would record a decision that
 /// never applies while looking like one that does.
+///
+/// **One field, not every field the row offers (`iaam-g7yc`).** This used to
+/// fill all three at once, and [`RuleMatcher::matches`] joins present fields
+/// with «and»: the rule then demanded the counterparty exactly *and* the
+/// source's word exactly *and* the description as a substring — and the
+/// description it was given is the row's **whole** description, so as a
+/// substring test it recognises essentially that row and nothing else. The rule
+/// was correct and empty: a standing decision that settles one line the owner
+/// had already settled by hand. `docs/import-boundary.md` §7 recorded the choice
+/// as open; decision 0008 takes it, and this is what it decided.
+///
+/// **Why one field is the right number, and where that is read from.** Every
+/// classification rule written by hand anywhere in this workspace asks about
+/// exactly one thing — a counterparty, a source word, or a fragment of a
+/// description — and never two. Those are the rules people wrote when they meant
+/// something, and a proposal the owner is asked to adopt should have the shape
+/// of a rule somebody would write.
+///
+/// **Which one, and why in this order.**
+///
+/// 1. The **counterparty** where the row names one. The classification is a
+///    claim about who the money moved with — «anything with this counterparty is
+///    a fee», «this name is my own account at another bank» — and the printed
+///    name is the field that identifies him. It is matched exactly, so it is
+///    also the narrowest of the three that still generalises.
+/// 2. Otherwise the **source's own word** for the operation. It is matched
+///    exactly against a vocabulary one source controls, and it is what a row
+///    with no counterparty has instead of one: the bank's word for a movement
+///    internal to itself is the whole evidence such a row carries.
+/// 3. Otherwise the **description**, which is last because it is the only one
+///    matched as a substring and the only one taken whole. A whole description
+///    is close to unique to its row, so this is barely a generalisation — but it
+///    is the difference between a rule and none, and the row would otherwise
+///    read as [`Generalisation::Impossible`], which claims that no rule can be
+///    built from it under any token. That would be false.
+///
+/// **The trade-off is real and is not resolved in this direction by accident.**
+/// A matcher on one field settles more rows than a matcher on three, and one of
+/// them can be settled wrongly: a source word like the one a bank prints on
+/// every transfer would carry a classification onto rows that do not deserve it.
+/// Two things bound that. The proposal is only ever *offered* — it is published
+/// as the body of `POST /v1/classification-rules` for the owner to read, narrow
+/// and send, and a rule he adopts is one he can retire, which replans the
+/// history it classified. And the rows this is computed for are rows the
+/// classifier could **not** settle, so the field it proposes is one that had no
+/// standing rule on it.
 fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
-    let matcher = RuleMatcher {
-        counterparty_account: row.counterparty_name().map(str::to_owned),
-        description_contains: row.description.clone(),
-        kind: row.source_kind.clone(),
+    let matcher = if let Some(counterparty) = row.counterparty_name() {
+        RuleMatcher {
+            counterparty_account: Some(counterparty.to_owned()),
+            description_contains: None,
+            kind: None,
+        }
+    } else if let Some(kind) = row.source_kind.clone() {
+        RuleMatcher {
+            counterparty_account: None,
+            description_contains: None,
+            kind: Some(kind),
+        }
+    } else {
+        RuleMatcher {
+            counterparty_account: None,
+            description_contains: row.description.clone(),
+            kind: None,
+        }
     };
+    // Still the last word, and deliberately not replaced by a fourth branch
+    // returning `None`: «a matcher that asks nothing is no matcher» is one rule,
+    // and it is stated once whatever the field policy above becomes. It is what
+    // answers for the row that prints none of the three.
     (!matcher.asks_nothing()).then_some(matcher)
 }
 
 /// The observed row one question is about.
-fn observed_row(contents: &SessionContents, row: u32) -> Result<ObservedRow, AppError> {
-    let observation = contents
-        .observations
+fn observed_row(observations: &[ImportObservationView], row: u32) -> Result<ObservedRow, AppError> {
+    let observation = observations
         .iter()
         .find(|candidate| candidate.row == row)
         .ok_or(AppError::NotFound {
@@ -4348,7 +4562,7 @@ mod tests {
     fn an_open_question_has_generalised_nothing_yet() {
         let contents = session_with(row(account(1), "Savings", None), None, None);
         assert_eq!(
-            generalisation_of(&contents, &contents.questions[0]),
+            generalisation_of(&contents.observations, &contents.questions[0]),
             Generalisation::Unanswered
         );
     }
@@ -4361,7 +4575,7 @@ mod tests {
             Some("11111111-1111-4111-8111-111111111111"),
         );
         assert_eq!(
-            generalisation_of(&contents, &contents.questions[0]),
+            generalisation_of(&contents.observations, &contents.questions[0]),
             Generalisation::Recorded {
                 rule: "11111111-1111-4111-8111-111111111111".to_owned()
             }
@@ -4378,7 +4592,7 @@ mod tests {
     fn an_answer_the_answerer_could_not_generalise_carries_the_rule_it_would_have_made() {
         let contents = session_with(row(account(1), "Savings", None), Some(Answer::Paid), None);
         let Generalisation::Available { matcher, outcome } =
-            generalisation_of(&contents, &contents.questions[0])
+            generalisation_of(&contents.observations, &contents.questions[0])
         else {
             panic!("a row naming a counterparty generalises");
         };
@@ -4387,12 +4601,96 @@ mod tests {
             Some("Savings"),
             "the matcher asks what the row printed"
         );
-        assert_eq!(matcher.kind.as_deref(), Some("transfer"));
         assert_eq!(
             outcome,
             Classification::ExternalFlow,
             "the outcome is the classification the answer settled the row as"
         );
+    }
+
+    // --- what a proposed rule asks about (iaam-g7yc) -----------------------
+
+    /// The defect: the proposal used to ask about every field the row offered,
+    /// joined with «and», so the rule the owner adopted recognised the row he
+    /// had just settled and practically nothing else.
+    ///
+    /// The row here prints a counterparty **and** a source word; the proposal
+    /// takes the counterparty and leaves the word alone.
+    #[test]
+    fn a_proposed_rule_asks_about_the_counterparty_and_nothing_else() {
+        let proposed = matcher_for(&row(account(1), "Shop One", None)).expect("a matcher");
+        assert_eq!(proposed.counterparty_account.as_deref(), Some("Shop One"));
+        assert_eq!(
+            proposed.kind, None,
+            "the source's word for the operation is not part of who the money \
+             moved with"
+        );
+        assert_eq!(proposed.description_contains, None);
+    }
+
+    /// The point of the change, stated as behaviour rather than as fields: a
+    /// second row from the same counterparty, which the source described
+    /// differently, is recognised.
+    ///
+    /// Under the old matcher it was not — the description alone would have
+    /// failed — and the rule the owner adopted was therefore a standing decision
+    /// that settled one row he had already settled by hand.
+    #[test]
+    fn a_proposed_rule_recognises_the_next_row_from_the_same_counterparty() {
+        let main = account(1);
+        let mut settled = row(main, "Shop One", None);
+        settled.description = Some("card purchase 0001".to_owned());
+        let proposed = matcher_for(&settled).expect("a matcher");
+
+        let mut later = row(main, "Shop One", None);
+        later.description = Some("card purchase 0002".to_owned());
+        later.source_kind = Some("card".to_owned());
+        assert!(
+            proposed.matches(&later.subject(None)),
+            "same counterparty, different words: the rule is about who, not \
+             about how the source spelled it"
+        );
+    }
+
+    /// A row with no counterparty falls to the source's own word, which is the
+    /// whole of what such a row carries.
+    #[test]
+    fn a_row_naming_nobody_generalises_on_the_word_the_source_used() {
+        let mut anonymous = row(account(1), "Savings", None);
+        anonymous.counterparty = ObservedCounterparty::Unknown;
+        anonymous.description = Some("internal movement".to_owned());
+        let proposed = matcher_for(&anonymous).expect("a matcher");
+        assert_eq!(proposed.kind.as_deref(), Some("transfer"));
+        assert_eq!(proposed.counterparty_account, None);
+        assert_eq!(
+            proposed.description_contains, None,
+            "the description is the last resort, not an addition to the word"
+        );
+    }
+
+    /// The last resort. It barely generalises — a whole description is close to
+    /// unique to its row — and it is still a rule, where the alternative would
+    /// be to tell the owner that no rule can be built from the row at all.
+    #[test]
+    fn a_row_carrying_only_a_description_generalises_on_it() {
+        let mut described = row(account(1), "Savings", None);
+        described.counterparty = ObservedCounterparty::Unknown;
+        described.source_kind = None;
+        described.description = Some("standing order".to_owned());
+        let proposed = matcher_for(&described).expect("a matcher");
+        assert_eq!(
+            proposed.description_contains.as_deref(),
+            Some("standing order")
+        );
+        assert_eq!(proposed.counterparty_account, None);
+        assert_eq!(proposed.kind, None);
+    }
+
+    /// The one row that still generalises into nothing, unchanged by the field
+    /// policy above: a matcher that asks nothing matches nothing.
+    #[test]
+    fn a_row_printing_none_of_the_three_proposes_no_matcher() {
+        assert_eq!(matcher_for(&unmatchable(account(1))), None);
     }
 
     #[test]
@@ -4402,7 +4700,7 @@ mod tests {
         // rule to offer him.
         let contents = session_with(unmatchable(account(1)), Some(Answer::Paid), None);
         assert_eq!(
-            generalisation_of(&contents, &contents.questions[0]),
+            generalisation_of(&contents.observations, &contents.questions[0]),
             Generalisation::Impossible
         );
     }
@@ -4436,7 +4734,7 @@ mod tests {
     #[test]
     fn describing_a_session_answers_for_every_question_it_holds() {
         let contents = session_with(row(account(1), "Savings", None), Some(Answer::Paid), None);
-        let described = generalisation_of(&contents, &contents.questions[0]);
+        let described = generalisation_of(&contents.observations, &contents.questions[0]);
         assert_eq!(described.code(), "available");
     }
 }

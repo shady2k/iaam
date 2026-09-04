@@ -1166,17 +1166,26 @@ fn subject_asked(
     question: &ImportQuestionView,
 ) -> Option<QuestionSubject> {
     let row = observed_row(observations, question.row).ok()?;
-    subject_of(question, &row)
+    decision_of_read_row(question, &row)
 }
 
 /// The same decision, for a caller that has already read the row.
+///
+/// Named for what it reads rather than for what it returns, because
+/// `subject_of` was already taken by the *classification* subject a rule is
+/// tested against — a different thing under a name that would have fitted both
+/// (`iaam-93lz`'s reader against this one). Two functions sharing a name is the
+/// drift this module argues against everywhere else.
 ///
 /// Split out of [`subject_asked`] rather than copied into the one caller that
 /// reads the rows itself: what makes two questions one decision is a rule, and a
 /// second spelling of it beside the first is two rules that both look right —
 /// which is the argument `QuestionSubject` is written with and the reason
 /// [`stored_alternatives`] is one function.
-fn subject_of(question: &ImportQuestionView, row: &ObservedRow) -> Option<QuestionSubject> {
+fn decision_of_read_row(
+    question: &ImportQuestionView,
+    row: &ObservedRow,
+) -> Option<QuestionSubject> {
     Some(stored_question(question)?.about(row.movement()))
 }
 
@@ -5547,7 +5556,7 @@ fn open_questions(
     let subjects: Vec<Option<QuestionSubject>> = open
         .iter()
         .zip(&rows)
-        .map(|(question, row)| subject_of(question, row.as_ref()?))
+        .map(|(question, row)| decision_of_read_row(question, row.as_ref()?))
         .collect();
     open.iter()
         .zip(&subjects)
@@ -7739,7 +7748,7 @@ mod tests {
             &filed_under(row(main, "Shop One", Some(day)), "Transfer"),
         )];
         let questions = vec![stored_question_about(1, &asked)];
-        let open = open_questions(&observations, &questions);
+        let open = open_questions(&observations, &questions, &MirroredRows::default());
         let printed = open[0].printed.as_ref().expect("the row it is about");
         assert_eq!(printed.account, main);
         assert_eq!(printed.date, Some(day));
@@ -7772,6 +7781,7 @@ mod tests {
         let open = open_questions(
             &[stored_row(1, &observed)],
             &[stored_question_about(1, &asked)],
+            &MirroredRows::default(),
         );
         let printed = open[0].printed.as_ref().expect("the row it is about");
         assert_eq!(printed.movement, None);
@@ -7794,7 +7804,11 @@ mod tests {
         let asked = Question::IsOutflowAFee { account: main };
         let mut stored = stored_row(1, &row(main, "Shop One", None));
         stored.payload = "{\"not\":\"an intake\"}".to_owned();
-        let open = open_questions(&[stored], &[stored_question_about(1, &asked)]);
+        let open = open_questions(
+            &[stored],
+            &[stored_question_about(1, &asked)],
+            &MirroredRows::default(),
+        );
         assert_eq!(open[0].printed, None);
         assert!(
             !open[0].alternatives.is_empty(),
@@ -7830,7 +7844,7 @@ mod tests {
             stored_question_about(1, &asked),
             stored_question_about(2, &asked),
         ];
-        let open = open_questions(&observations, &questions);
+        let open = open_questions(&observations, &questions, &MirroredRows::default());
         let accounts = answer_accounts(&directory, &open);
         assert_eq!(accounts.len(), 2, "{accounts:?}");
         assert!(
@@ -7864,6 +7878,7 @@ mod tests {
                 &anonymous(row(main, "Shop One", None), -1_000),
             )],
             &[stored_question_about(1, &asked)],
+            &MirroredRows::default(),
         );
         assert!(
             open[0]

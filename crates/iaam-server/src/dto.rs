@@ -32,7 +32,7 @@ use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome
 use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::{
     AnswerableQuestion, ControlReconciliation, HeldRow, ImportPlan, NoFactReason, PlannedFact,
-    Readiness, RetainedRow, RetentionReason, SettledRow,
+    Readiness, ResemblingRow, RetainedRow, RetentionReason, SettledRow,
 };
 // The question's own generalisation, in a block of its own rather than merged
 // into the list above: this file is edited by several changes at once, and one
@@ -9132,9 +9132,34 @@ pub struct PlannedFactDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitDeltaDto {
     pub facts: Vec<PlannedFactDto>,
-    /// Rows whose key the journal already holds. They commit to `duplicate` and
-    /// add nothing.
+    /// Rows the journal already holds under a key of theirs. They commit to
+    /// `duplicate` and add nothing.
+    ///
+    /// Both key levels the journal itself recognises: the source's own
+    /// operation identifier, scoped by the source, and the idempotency key,
+    /// scoped by the owner. This list was computed from the second alone, so a
+    /// row carrying a `source_operation_id` and no `idempotency_key` appeared
+    /// in `facts` here and committed to `duplicate` anyway.
     pub duplicates: Vec<PlannedFactDto>,
+    /// Rows the journal holds no key for, and whose shape it already holds.
+    ///
+    /// Never merged into `duplicates`, and the difference is what to do about
+    /// them. A duplicate adds nothing and needs no reader. One of these **is**
+    /// appended — it is in `facts` and in `fact_totals` as well, because that
+    /// is what the commit will do — and whether it should be is a question only
+    /// the owner can answer: two genuine payments of one amount on one day to
+    /// one place have this exact shape, and so does the same statement imported
+    /// twice by a client that sends no keys.
+    ///
+    /// This is §10.6's level five, which deletes nothing and proves nothing.
+    /// Empty is the ordinary case. When it is not, `readiness` is
+    /// `requires_owner_decision` and the commit is still allowed: a refusal
+    /// here would refuse honest imports of ordinary repeated payments.
+    ///
+    /// **The remedy is not to resend.** A row that turns out to be a repeat is
+    /// undone through `POST /v1/corrections` after the fact, or kept out of the
+    /// commit by abandoning the session and feeding the rows the owner meant.
+    pub resembles_recorded: Vec<ResemblingRowDto>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRowDto>,
     /// Rows that are settled and correctly become no fact.
@@ -9222,6 +9247,51 @@ impl BatchTotalDto {
             debit: minor_amount(total.debit.raw(), total.currency),
             credit: minor_amount(total.credit.raw(), total.currency),
             net: minor_amount(total.net.raw(), total.currency),
+        }
+    }
+}
+
+/// A row the journal can prove nothing about, which looks like a fact it holds.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResemblingRowDto {
+    pub row: u32,
+    pub account: Uuid,
+    /// The event kind, in the journal's own vocabulary.
+    pub records_as: String,
+    /// Signed cash this row moves on its own account, as a decimal string.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date::option", skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub date: Option<Date>,
+    /// The key this row carries, when it carries one. Present here means the
+    /// journal does **not** hold this key — otherwise the row would be in
+    /// `duplicates` — so it is a repeat under a second key, if it is a repeat
+    /// at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// The recorded event it resembles: the earliest, where several share the
+    /// shape. Read it with `GET /v1/journal` and decide.
+    pub resembles: Uuid,
+    /// The §10.6 hierarchy level of the match. Always `5`, the probabilistic
+    /// one, and named so that a client cannot read this list as evidence.
+    pub match_level: u8,
+}
+
+impl ResemblingRowDto {
+    #[must_use]
+    pub fn from_domain(row: &ResemblingRow) -> Self {
+        let fact = PlannedFactDto::from_domain(&row.fact);
+        Self {
+            row: fact.row,
+            account: fact.account,
+            records_as: fact.records_as,
+            amount: fact.amount,
+            currency: fact.currency,
+            date: fact.date,
+            idempotency_key: fact.idempotency_key,
+            resembles: row.resembles.inner(),
+            match_level: 5,
         }
     }
 }
@@ -9412,10 +9482,13 @@ impl ImportPlanDto {
             Readiness::RequiresOwnerDecision {
                 unanswered_questions,
                 transfer_candidates,
+                rows_resembling_recorded,
             } => (
                 Some(format!(
                     "{unanswered_questions} question(s) unanswered, \
-                     {transfer_candidates} transfer candidate(s) unconfirmed"
+                     {transfer_candidates} transfer candidate(s) unconfirmed, \
+                     {rows_resembling_recorded} row(s) resembling facts the journal \
+                     already holds; see commit_delta.resembles_recorded"
                 )),
                 plan.readiness.code(),
             ),
@@ -9514,6 +9587,12 @@ impl ImportPlanDto {
                     .duplicates
                     .iter()
                     .map(PlannedFactDto::from_domain)
+                    .collect(),
+                resembles_recorded: plan
+                    .commit_delta
+                    .resembles_recorded
+                    .iter()
+                    .map(ResemblingRowDto::from_domain)
                     .collect(),
                 retained_unrecorded: plan
                     .commit_delta

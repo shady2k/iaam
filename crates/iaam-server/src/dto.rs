@@ -51,6 +51,10 @@ use iaam_app::scenarios::import_session::{AnswerReach, AnsweredQuestions, stored
 // give: this file is edited by several changes at once, and a name added to a
 // wrapped list reflows every line of it.
 use iaam_app::scenarios::import_session::{PrintedRow, RowShape};
+// Wave Z's own names, in a block of their own for the reason every block above
+// gives: this file is edited by several changes at once, and a name added to a
+// wrapped list reflows every line of it.
+use iaam_app::scenarios::import_session::{RowGroup, SharedMovement, SharedRow};
 use iaam_app::scenarios::reports::{
     AccountBalanceRow, AssetSnapshot, BalancesReport, CashFigure, Caveat, CaveatSubject,
     HeldContribution, HeldRows, HeldSession, MoneyFlowOutcome, PopulationAccount, ReportConfidence,
@@ -6604,6 +6608,31 @@ mod tests {
             Answer::Refund
         );
     }
+
+    /// Every reach a group can publish is a word the answering call takes.
+    ///
+    /// A group says which single call settles the whole of it, and it says so in
+    /// `settles`. A word this response published that the answer route did not
+    /// parse would be the assessment telling a client to send something the
+    /// server then refuses — which is the drift `iaam-ulib` catalogued one field
+    /// over, where four publishers of one stored list could offer a word the
+    /// answer path measures against another.
+    #[test]
+    fn every_reach_a_group_can_publish_is_a_word_the_answering_call_takes() {
+        for reach in [AnswerReach::ThisRow, AnswerReach::EveryLikeRowInThisSession] {
+            let asked = AnswerImportQuestionRequest {
+                settles: Some(reach.code().to_owned()),
+                ..answer("paid")
+            };
+            assert_eq!(
+                asked
+                    .to_reach()
+                    .expect("a word a group published as its own reach"),
+                reach,
+                "a group offers a reach the answering call does not take"
+            );
+        }
+    }
 }
 /// Report upload parameters. The route body is the workbook's binary bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -9900,6 +9929,38 @@ pub struct InterpretationDto {
     /// both statements about his directory rather than a lookup nobody made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answer_accounts: Vec<AccountCandidateDto>,
+    /// The sets these open rows form, each with what its members have in common
+    /// and the one answer that settles the whole of it. Largest first.
+    ///
+    /// **This is `iaam-cixz`.** `open_questions[].alike` and
+    /// `open_questions[].pair` publish the relation from each row to the others;
+    /// nothing published the set. So a client asked what a set of rows actually
+    /// **was** could list every member — the wall those fields were added to end
+    /// — or invent a summary of them, which is interpreting a document with this
+    /// engine's own output as the document. The one that happened was neither:
+    /// it read the owner's raw statement file.
+    ///
+    /// Each entry says what its members agree on, how far the ones that differ
+    /// run, the sentence to put to a person about the whole of it, and the word
+    /// `POST …/answer` takes in `settles` to settle it in one call. A group with
+    /// no answer would be the same wall in better clothes.
+    ///
+    /// **Once here and not once per question**, on `answer_accounts`' grounds: a
+    /// group of twenty rows hung on each of its members would be published
+    /// twenty times, and the field relating a question to its group is already on
+    /// the question. Going the other way costs one comparison of the row against
+    /// `groups[].rows`.
+    ///
+    /// **The word the source filed rows under is not one of these**, and that is
+    /// a decision rather than an omission: it is a grouping for a *condition*,
+    /// its rows raise as many decisions as they name parties, and the only call
+    /// that acts on it whole is the rule route. It is published as
+    /// `offered_rules` and `withheld_offers`, and a group whose members agree on
+    /// the word publishes it as `common.source_category`.
+    ///
+    /// Absent where every open question of this session stands alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<RowGroupDto>,
 }
 
 /// One question the session is waiting on.
@@ -10164,6 +10225,170 @@ pub struct PrintedRowDto {
     /// lists by row number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+}
+
+/// A set of this session's open rows put to a person as one thing.
+///
+/// **This is `iaam-cixz`, and the measure it is written against is the owner's
+/// own.** He does not need every record: show one of the group and ask what it
+/// was, because most of them share every attribute except the day, the time and
+/// the amount. So a group publishes what its members agree on, how many there
+/// are, how far the ones that differ run, and the one sentence to put to him.
+///
+/// **There is no representative row, and it was the obvious carrier.** A real
+/// member is recognisable, but it is also a particular — its day and its amount
+/// are true of it and of nothing else in the group — so a client that showed it
+/// *as* the group would show him one line and take an answer about twenty. Every
+/// member is published in full under `open_questions`, keyed by row, so a client
+/// that wants a line takes one out of `rows`; and `question` is written by the
+/// engine out of the shared values, so the sentence describes the group instead
+/// of standing in for it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RowGroupDto {
+    /// What makes these rows one group: `one_decision`, where every member
+    /// raises the same question about a row the source stated the same direction
+    /// for, or `one_movement`, where the two members are the two legs of one
+    /// movement the document printed twice.
+    pub basis: String,
+    /// The members, in row order. Never fewer than two — one row is one question
+    /// already, and a group of one would be a set a client has to take apart to
+    /// find that out.
+    ///
+    /// The count is this list's length. A `count` beside the list of the things
+    /// counted would be one fact in two places.
+    pub rows: Vec<u32>,
+    /// What every member states alike.
+    pub common: SharedRowDto,
+    /// The days the members run between, over the members that state one.
+    ///
+    /// Absent where none of them states a day. A member that states none is
+    /// still in `rows` and outside this span; its own `printed.date` says so,
+    /// and a date invented for it would be the first invented value in a section
+    /// whose whole point is that nothing in it is invented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<DaySpanDto>,
+    /// The smallest and largest amount among the members, with the signs the
+    /// source printed. Absent unless `common.currency` is present, because a
+    /// range taken over two currencies is a pair of numbers with no unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amounts: Option<AmountSpanDto>,
+    /// The word `POST …/answer` takes in `settles` to settle the whole group in
+    /// one call.
+    ///
+    /// `every_like_row_in_this_session` for `one_decision`, whose members are
+    /// exactly the rows that reach names. `this_row` for `one_movement`, and it
+    /// is not the weaker answer: the two legs are one movement, so an answer
+    /// naming the other row's account settles both from either side, and a wider
+    /// reach would claim rows that are not this movement.
+    pub settles: String,
+    /// The sentence to put to a person about the whole group, and what answering
+    /// it once decides.
+    ///
+    /// Written by the engine and not composed by the client, which is decision
+    /// 0027's finding: a surface that publishes typed values and leaves the
+    /// sentence to whoever relays them gets a sentence made of field names. The
+    /// members' own sentences are on the members and none of them is about the
+    /// group.
+    ///
+    /// It never quotes `common.description`, even where that is present: a
+    /// source's whole text has no place in a sentence a person is read.
+    pub question: OwnerQuestionDto,
+}
+
+/// What every member of a group states alike.
+///
+/// Read off the members and never derived from what made them a group, so one
+/// shape carries a set whose members agree about nearly everything and a set
+/// whose members agree about nearly nothing. An absence is «they do not all
+/// state the same thing» and never «this system could not tell»: every value
+/// here is one the source printed, and each member publishes its own under
+/// `open_questions[].printed`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SharedRowDto {
+    /// The account every member's row is on, with the title the owner reads
+    /// beside the identifier a call takes — the shape every account published
+    /// for a person to read takes in this API (conventions §3.3).
+    ///
+    /// Absent where the members are on different accounts, which is what a
+    /// `one_movement` group is, and where this instance's directory no longer
+    /// holds the account they share: a group named by an identifier nobody can
+    /// read is not a group anybody can be asked about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountCandidateDto>,
+    /// The currency every member is in. Absent where they are not all in one,
+    /// which is also what makes `amounts` unpublishable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<CurrencyDto>,
+    /// What every member says about which way the money went: `in`, `out`, or
+    /// `unstated` where every one of them states no direction — which is a real
+    /// thing to have in common and the condition the "which way did it run"
+    /// question is asked under. Absent where they do not agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// The party every member named, exactly as the source printed it.
+    ///
+    /// Absent where they did not all name one — **including** where none of them
+    /// named anybody. That is not spelt as a third value here the way `direction`
+    /// spells its own: a direction is a closed vocabulary of two words and can
+    /// afford a third, while this field is a name and any sentinel in it would be
+    /// a name somebody could have. What the absence of a party means for the
+    /// group is in `question`, and `open_questions[].printed.counterparty` says
+    /// it row by row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterparty: Option<String>,
+    /// The word the source filed every member under, verbatim — the join to
+    /// `offered_rules` and `withheld_offers`, which group by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_category: Option<String>,
+    /// The description every member carries, verbatim, where the source printed
+    /// one and printed the same one on all of them.
+    ///
+    /// **The one field here that is not on `open_questions[].printed`, and the
+    /// exclusion is revisited rather than reversed** (decision 0032). A
+    /// description beside every one of hundreds of questions is the row's whole
+    /// text, of unbounded length, published once per row; a description shared by
+    /// every member of a group is one string for a set, published only where the
+    /// source itself said the same thing about all of them, and a group is never
+    /// a set of one.
+    ///
+    /// It is here because withholding it cost more than publishing it does:
+    /// asked what a set of rows actually was, a client with no field that says
+    /// could not answer out of this API and read the owner's raw statement
+    /// instead. This is the field that answers «what were these».
+    ///
+    /// Absent where the source printed none and where the members' descriptions
+    /// differ in any character. It never appears inside `question`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The days a group's members run between.
+///
+/// Two endpoints and not a list of days, and not the earliest alone: the owner
+/// is placing a group on a statement he is looking at, and «between these two»
+/// tells him which page. Equal endpoints are a group that happened on one day.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DaySpanDto {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub earliest: Date,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub latest: Date,
+}
+
+/// The amounts a group's members run between, as decimal strings with the signs
+/// the source printed.
+///
+/// Not made positive and not totalled. For a group of rows that left an account
+/// `smallest` is the **largest** sum that left, because the source printed those
+/// negative — which is what publishing the source's own signs costs, and the
+/// alternative costs more: a span of absolute values would agree with no line on
+/// his statement.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AmountSpanDto {
+    pub smallest: String,
+    pub largest: String,
 }
 
 /// The identity one account's planned facts will carry into the journal.
@@ -10748,6 +10973,12 @@ impl ImportPlanDto {
                         institution: candidate.institution.clone(),
                     })
                     .collect(),
+                groups: plan
+                    .interpretation
+                    .groups
+                    .iter()
+                    .map(RowGroupDto::from_domain)
+                    .collect(),
             },
             cross_source_matching: CrossSourceMatchingDto::from_domain(&plan.cross_source_matching),
             commit_delta: CommitDeltaDto {
@@ -10875,15 +11106,76 @@ impl RowShapeDto {
 
 /// The wire word for a direction the source stated.
 ///
-/// One function, so the two sections that publish a direction out of an open
-/// question — the row it is about and the shape its group has — cannot come to
-/// spell it differently from each other or from `TransferLegDto.direction`.
+/// One function, so the sections that publish a direction out of an open
+/// question — the row it is about, the shape its group has, and what the members
+/// of a group agree on — cannot come to spell it differently from each other or
+/// from `TransferLegDto.direction`. A group's third word, `unstated`, is written
+/// where that group is built and not here: «they all stated none» is a fact about
+/// a set of rows and not a direction, and putting it in this function would give
+/// a `Movement` three values.
 fn movement_code(movement: Movement) -> String {
     match movement {
         Movement::In => "in",
         Movement::Out => "out",
     }
     .to_owned()
+}
+
+impl RowGroupDto {
+    /// One set of open rows as a person is put the question about it.
+    #[must_use]
+    pub fn from_domain(group: &RowGroup) -> Self {
+        Self {
+            basis: group.basis.code().to_owned(),
+            rows: group.rows.clone(),
+            common: SharedRowDto::from_domain(&group.common),
+            days: group.days.map(|days| DaySpanDto {
+                earliest: days.earliest,
+                latest: days.latest,
+            }),
+            // The invariant `AmountSpanDto` states, enforced by the shape of the
+            // conversion rather than by a check beside it: no currency, no span.
+            // The engine publishes neither without the other, and a `zip` that
+            // dropped one silently is the whole reason it is written this way.
+            amounts: group
+                .amounts
+                .zip(group.common.currency)
+                .map(|(amounts, currency)| AmountSpanDto {
+                    smallest: minor_amount(amounts.smallest_minor, currency),
+                    largest: minor_amount(amounts.largest_minor, currency),
+                }),
+            settles: group.settles.code().to_owned(),
+            question: OwnerQuestionDto::from_domain(&group.question),
+        }
+    }
+}
+
+impl SharedRowDto {
+    /// What the members of one group state alike.
+    ///
+    /// The direction goes through `movement_code` like every other direction
+    /// this response publishes, and the third word is written here rather than
+    /// in the engine: «they all stated none» is a fact about a group and not a
+    /// direction, so putting it inside that function would give a `Movement`
+    /// three values.
+    #[must_use]
+    pub fn from_domain(common: &SharedRow) -> Self {
+        Self {
+            account: common.account.as_ref().map(|held| AccountCandidateDto {
+                id: held.id.inner(),
+                title: held.title.clone(),
+                institution: held.institution.clone(),
+            }),
+            currency: common.currency.map(CurrencyDto::from_domain),
+            direction: common.movement.map(|movement| match movement {
+                SharedMovement::Stated(stated) => movement_code(stated),
+                SharedMovement::NoneStated => "unstated".to_owned(),
+            }),
+            counterparty: common.counterparty.clone(),
+            source_category: common.source_category.clone(),
+            description: common.description.clone(),
+        }
+    }
 }
 
 impl SettledRowDto {

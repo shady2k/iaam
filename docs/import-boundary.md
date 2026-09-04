@@ -2,9 +2,10 @@
 
 This document joins three others that each describe one piece of an import and
 none of which describes the join: `tools/tbank-csv-import/README.md`, which
-converts one bank's export; `docs/agent-skill/SKILL.md`, which tells an agent to
-open a session and feed it rows; and the contract behind `/v1/openapi.json`,
-which publishes both channels and says nothing about which is which.
+converts one bank's export; `docs/agent-skill/SKILL.md`, which tells an agent
+what an import means and sends it to the queue and the contract for the rest;
+and the contract behind `/v1/openapi.json`, which publishes the channels and
+says nothing about which is which.
 
 It was written because the map had to be assembled by hand every time somebody
 walked the path. An external agent doing so ended up importing `build()` out of
@@ -24,16 +25,24 @@ source's format sits for each.
 | Channel | Run by | Handed | Format knowledge lives |
 |---|---|---|---|
 | `POST /v1/brokers/{broker}/sync` | agent or owner | nothing; the server fetches | `iaam-broker`, in tree |
-| `POST /v1/documents` | owner | a broker's XLSX report | `crates/iaam-ingest/src/report/`, in tree |
+| `POST /v1/documents` | agent or owner | a broker's XLSX report | `crates/iaam-ingest/src/report/`, in tree |
 | `POST /v1/ingest/csv` | either | **iaam's own** CSV columns | `crates/iaam-ingest/src/csv_source.rs`, in tree |
-| `POST /v1/ingest/operations` | owner's converter | already-converted rows | outside the repository |
+| `POST /v1/ingest/operations` | either | already-converted rows | outside the repository |
 | `POST /v1/import-sessions` … `/commit` | either | already-converted rows | outside the repository |
 | `POST /v1/ingest/journal-events` | owner | corporate actions and offers | — |
-| a document read by a **source profile** — decided, not yet built | owner | an institution's own export | `crates/iaam-ingest/schema/source-profile-v1.json` and one profile per document type, in tree or beside the deployment |
+| a document read by a **source profile** | agent or owner | an institution's own export | `crates/iaam-ingest/schema/source-profile-v1.json` and one profile per document type, in tree or beside the deployment |
 
-The last row is the only one that is not a route today. Decision 0019 settles
-what a source profile is and what it may say; the channel that carries such a
-document is a separate bead, and §9 below is what the row means until it exists.
+The last row is the one this document used to say was not a route. Decision
+0019 settles what a source profile is and what it may say, decision 0022 settles
+who may hand such a document over, and the channel that carries it lands beside
+this change; §9 below is what the row means.
+
+It is also the only **document** row an agent can run while holding no value of
+the owner's at all — the broker channel is the other such row, and it exists only
+for the accounts that have one. It hands over bytes it has not read, and
+everything the document turns out to say is reached afterwards: by the engine, by
+the owner's directory, by his rules and by his answers. §4 is why that is allowed
+and what it forbids in exchange.
 
 Two of those rows are read wrongly often enough to be worth naming.
 
@@ -79,8 +88,11 @@ knowledge is therefore not the thing kept outside: a parser is written from a
 format specification and a fixture invented end to end, and `CLAUDE.md` has
 never objected to either.
 
-What keeps a bank export outside is that converting one needs a second kind of
-knowledge, and until recently the server had no home for it.
+What kept a bank export outside is that converting one needs a second kind of
+knowledge, and until recently the server had no home for it. It has one now, and
+that second kind is §3's third heading rather than the format: it is settled
+after the document has been read, not before, by the owner's directory, his
+rules and his answers.
 
 The reason a *third* parser was not simply written is §8's second ground: every
 institution is another format, and every format would be another release. §9 is
@@ -91,8 +103,10 @@ how decision 0019 answers that without moving the format back outside.
 **Format.** Which column holds the posted amount, that a negative sign means
 money left, that the timestamp is `DD.MM.YYYY HH:MM:SS`, that the two legs of an
 internal transfer are posted seconds apart rather than at one instant. All of it
-is recoverable from the export alone by anybody who has one. It lives in the
-owner's tool today; it could live anywhere.
+is recoverable from the export alone by anybody who has one. It lived in the
+owner's tool, and since decision 0019 it lives in a source profile the engine
+reads (§9) — which is the heading's point: it could live anywhere, because the
+export is enough to write it.
 
 **Which account a printed name is.** This used to be pure owner knowledge and is
 not any more. Decision 0004 gave an account the identity its source prints —
@@ -121,24 +135,101 @@ counterparty for every later import; his transfer statement withdraws a
 resolution he says does not happen; `GET /v1/transfer-pairings` proposes the two
 legs. Every one of those is bypassed by a converter that concluded first.
 
-## 4. What an agent is handed, and what it is never handed
+## 4. An agent may convey a document, and may not interpret one
 
-`CLAUDE.md` decides this and decision 0003 draws the credential half of the same
-line. Stated for an import, so it need not be re-derived:
+Decision 0022 settles this; decision 0003 draws the credential half of the same
+line. Stated for an import, so it need not be re-derived.
 
-- **Never a statement.** Not the file, not a path to it, not his database, not
-  the account map, not the counterparty map. The agent does not open the
-  owner's export, and "just read the CSV so you can check the tool works" is the
-  request this rule exists to refuse.
+The rule used to read *never a statement — not the file, not a path to it*, and
+it was written for a world in which the only reader of an export was a script on
+the owner's laptop. That world is gone. The shipped artefact is a Docker image,
+`tools/` is not in it, and an owner running the image on a cluster has no host
+directory to drop a file into and no terminal to run a converter from. An agent
+that read the old rule correctly concluded it could do nothing at all — which is
+worse than the improvisation the rule was written to refuse, and the
+improvisation happened anyway.
+
+The rule now separates two acts the old one did not distinguish, because in that
+world they always happened together.
+
+- **Conveying is permitted.** An agent may hand the owner's own service a
+  document of his — by whatever shape §1's last row takes, in any deployment
+  topology. It carries the bytes; it does not read them. This is the **primary**
+  way an import starts, because it is the only one that needs no user interface,
+  no mounted directory and no terminal, and the only one that is agent-first
+  rather than a substitute for an agent nobody has.
+- **Interpreting is refused.** The agent does not parse a statement, does not
+  summarise its rows, does not tabulate it, and does not decide what a row was:
+  not its direction, not its kind, not whose account the far side is, not which
+  category it belongs to. The engine reads the document through a source profile
+  (decision 0019) and produces observations; the session settles what the
+  owner's directory and his standing rules settle, and asks him about the rest.
+- **Still no store access, and no file of his judgements.** The agent is an
+  external client: it knows what the journal holds because a route answered, and
+  never because it opened his database. And handing it a file of the owner's
+  conclusions — the counterparty map's kind of file — is not a way around the
+  paragraph above; applying his answers to rows is interpreting with the answers
+  written out in advance. Those belong on the server instead, as classification
+  rules he can see, change, and re-run over rows already recorded.
 - **Never a credential but its own.** No broker token, no encryption key.
-- **What it does get** is what the owner chooses to paste into the conversation
-  and everything the API answers. Those are enough to open a session, feed it,
-  read its assessment, relay its questions and commit it.
+  Decision 0003 §2 is untouched by any of this, and it is what refuses the one
+  remaining shortcut: an agent that fetched the statement out of the bank itself
+  would need exactly the credential that decision denies it.
+- **What it does get** is everything the API answers, and whatever the owner puts
+  in front of it. Those are enough to convey the document, open the session, read
+  the assessment, relay the questions and commit.
 
-So an agent asked to import a month does one of two things: it works from rows
-the owner put in front of it, or it hands him the run command for his own tool
-and works from the summary he pastes back. It never becomes the converter by
-opening the file itself.
+**The line between the two verbs is a reading, not a possession.** Holding the
+bytes is not interpreting them; producing from those bytes a claim about what
+they say is. Restating a value the owner has already read out for himself is not
+interpreting either — that is the observation shape, and §5 and §6 are about it.
+Where he pastes the export's own text rather than values he read off it, that
+text is the export, and reading it is the engine's work.
+
+**Nothing was ever protected by the agent's not touching the bytes.** The old
+rule's stated ground was disclosure and it did not hold: the same section granted
+the agent everything the API answers, and an assessment carries the amounts, the
+dates and the counterparties — a question quotes the day the source dated the row
+and the sum it printed, because decision 0012 found that a person cannot
+recognise his own line on a statement without them. The figures reach the agent
+either way. What withholding the bytes did protect, it protected by accident: it
+kept the agent from becoming a second reader of the format.
+
+**So the ground is correctness.** An agent that parses the export is a second
+implementation of that format's rules, and this repository has paid for that
+shape more than once. `iaam-ss2r` found one deduplication rule with three
+implementations. Decision 0017 records that a row converted outside the server
+arrives with no document digest and no locator, so the identity that makes a
+re-import idempotent is destroyed on the way and cannot be restored afterwards.
+Decision 0019's own context counts the same defect one level up: shipping no
+reader guarantees one reader per owner rather than one reader. A second
+implementation does not fail loudly — it files the wrong operations into
+somebody's journal, and nothing says so.
+
+**It is enforced by attribution, not by prohibition.** Since decision 0020 a fact
+records what read it: a row an agent converted itself carries
+`ingest/manual/1`, a row the engine read carries `profile/<id>/<version>`, and
+that pair is bound to a content at load time. A violation of this section is
+therefore not a matter of trust but a query, and the rows it produced are a
+findable set — which is a retractable one, through the account, channel and label
+their declaration named. That is what makes relaxing the blunt rule safe: it used
+to be the only control there was, and it is not any more.
+
+**The rule is stated in capability, not in deployment.** An agent that cannot
+reach the bytes at all — it does not run on the machine the owner's file is on,
+and he has no way to put it there — cannot convey, and there is no reading of
+this section that lets it interpret instead. What it does then is say so, and
+fall back: either the owner puts values in front of it, which it restates as
+observations and never concludes, or, where his deployment gives him a way, he
+puts the document into the instance himself.
+
+That fallback is poor and this document will not pretend otherwise. It is one
+reading of the format that nobody reviewed, made once per import, recorded as
+`ingest/manual/1` so that at least it says so; and it pays §6's questionnaire in
+full. The two arrangements that would remove the edge are a mounted directory,
+which only a Docker deployment has and which still needs a terminal to fill, and
+a surface of the owner's own, which does not exist. **Neither is being built.**
+Saying so is the point: an agent that cannot convey should not wait for one.
 
 ## 5. What the queue's `start_account_import` presupposes and does not name
 
@@ -192,6 +283,25 @@ and restated looks like a case with no word for it. It has one, and
 restating are steps on the way to a value, not sources of it. The vocabulary is
 expanded from `iaam_app::provided_by_vocabulary!`, so the code, the meaning and
 the transport's conversion come from one list and cannot drift apart.
+
+**Does the item change now that a document has a channel? The vocabulary does
+not; the item's list of options does.** Those are two questions, and §4 settles
+the first harder than it was settled before. The case for a fourth word rested on
+a conversion the item attributed to nobody — and where the engine reads the
+document there is no conversion step to attribute at all. The two fields the
+item publishes are unchanged — the channel is the caller's, and the label is read
+off the document the owner holds — and a fourth word would now name a participant
+the design has just removed.
+
+What is no longer true is the item's own list of resolutions. It offers two —
+open a session and feed it rows, or synchronise a broker channel — and for a cash
+account after 0019 and 0022 the ordinary answer is neither: it is to hand the
+document over and let the engine read it. An item publishing only the fallback
+points every agent at the fallback, which is the failure this wave began from.
+The item gains a **third option**, not a fourth word; that is a change to
+`start_account_import_action` and to nothing in `MissingInput`. It is outstanding
+work rather than something this document can do: the option's address comes from
+the channel's own entry in the contract.
 
 ## 6. Where the line should be, and the one thing that must move first
 
@@ -280,14 +390,15 @@ altogether, so an observed tax payment still resolves as a withdrawal. A
 converter that says `tax` is still saying something the observation channel
 cannot.
 
-Until the questionnaire is settled, the honest arrangement is the current one
-stated out loud rather than implied: **the owner's converter concludes about
-what a row was, because it is the only place that can do so cheaply.** Not
-because it is the only place that *could* — for the cash outcomes, since
-decision 0006, it is not. What must not continue is documentation that reads as
-though an agent with a CSV could do the same work at the scale a statement has,
-and a tool that keeps its own copy of a directory the server now holds. That
-second half is decision 0005, and it is done.
+This section used to end with an arrangement: until the questionnaire is
+settled, the owner's converter concludes about what a row was, because it is the
+only place that can do so cheaply. **Decisions 0019 and 0022 retire the
+arrangement without settling the cost.** The document is read by the engine, the
+rows arrive as observations, and nothing concludes for him any more — so the
+questionnaire is paid in full, by him, on every row no rule of his already
+covers. That is the largest remaining cost of an import. It is decision 0008's
+ground, §9 says why a profile does not touch it, and what must not continue is
+documentation reading as though the price were already paid.
 
 ## 7. What this does not settle
 
@@ -320,6 +431,16 @@ second half is decision 0005, and it is done.
   all; it holds the owner's judgement about what a row was, and it is retired
   only once answering a question is cheap enough to be the way that judgement is
   recorded.
+- Whether an agent that cannot reach the bytes ever gets a way to import at
+  all. §4 names the two arrangements that would give it one — a mounted
+  directory, which only a Docker deployment has, and a surface of the owner's
+  own, which does not exist — and neither is being built. Such an owner has the
+  fallback, and the fallback costs him §6 in full.
+- What authority conveying a document demands. Decision 0021 makes the authority
+  a property of the call rather than of the item that offers it, and the document
+  route above already admits an agent token; whether handing over a statement is
+  the same call in that respect is the channel's to state, in the contract, where
+  the queue can resolve it rather than restate it.
 - Whether the tool should feed a session rather than the conclusive route. It
   concludes every row, so no question would be raised and the session would buy
   it only the assessment before commit — which is not nothing, and is the whole
@@ -349,8 +470,17 @@ copy of an importer's rules, because two copies drift and the drift is silent
 until an import files the wrong operations. A copy in the document an agent
 reads is the worst place for the second one.
 
-**Letting the agent open the export "just to check".** Rejected by `CLAUDE.md`,
-and the check it would buy is already bought by fixtures invented end to end.
+That document was carrying a smaller version of the same copy — what the owner's
+converter knows, what an export never states, and how to work from the summary it
+prints — and it no longer does. It names the two acts of §4, says which channel
+each belongs to, and leaves the addresses to the contract.
+
+**Letting the agent open the export "just to check".** Still rejected, and the
+ground moved with §4: not because the bytes are secret — decision 0022 lets it
+carry them — but because reading them makes it the format's second reader for
+exactly as long as it takes to be wrong once. The check it would buy is already
+bought twice over, by fixtures invented end to end and by an engine whose
+rejections name the cell.
 
 **Making the queue item name the tool.** Rejected: the queue is computed from
 the instance's own state and resolves its addresses from its own contract. An
@@ -390,12 +520,16 @@ to reach for. So the *format* becomes data and only the *engine* is released.
 
 Three consequences belong in this document rather than in the decision.
 
-**§4 stops being a handicap.** The agent is still handed no statement, no path
-to one, and no map. What changes is that the document now travels from the owner
-to his own server rather than to a converter on his laptop, so an agent holding
-nothing can open the session, read the assessment, relay the questions and
-commit. Until now that arrangement bought a poorer import than the one where he
-pasted rows; after 0019 it buys a better one.
+**§4 stops being a handicap, and then stops being the rule it was.** This
+paragraph used to say that the agent is still handed no statement, no path to one
+and no map, and that all 0019 changes is that the document travels to the owner's
+own server rather than to a converter on his laptop. That was written while the
+agent was still assumed to be standing beside somebody who could put the file
+there. Decision 0022 finishes the move: the agent may carry the document itself,
+because what the old rule protected was never disclosure but the format's single
+reader — and the engine is that reader. §4 above is the rule that results, and it
+is one verb permitted and one refused rather than a list of things not handed
+over.
 
 **The row keeps the identity it used to lose.** `csv_source::parse` derives a key
 for an unidentified row from the document digest and the row's own locator, and

@@ -25,3 +25,4 @@
 | [0019](0019-a-profile-describes-a-document-and-decides-nothing.md) | A profile describes a document, and decides nothing | 2026-09-04 | proposed | `iaam-ewty` |
 | [0020](0020-a-fact-names-its-reader-and-keeps-the-sources-two-words-apart.md) | A fact names its reader, and the source's two words stay apart | 2026-09-04 | proposed | `iaam-h69n` |
 | [0021](0021-the-authority-a-call-demands-is-a-property-of-the-call.md) | The authority a call demands is a property of the call | 2026-09-04 | proposed | `iaam-woeh` |
+| [0022](0022-an-agent-may-convey-a-document-and-may-not-interpret-one.md) | An agent may convey a document, and may not interpret one | 2026-09-04 | proposed | `iaam-cw3k` |

@@ -73,9 +73,10 @@ retracting a fact the owner holds is his act, and his credential is what the
 system will accept for it. The one exception proves the rule rather than
 softening it: an agent may take back an import it declared itself, while nothing
 has been built on it, because that is not a ruling on the owner's history but a
-return to the state before the agent acted. And it does not hold the owner's
-statements — the owner loads them himself, and the agent sees exactly what the
-owner has shown it.
+return to the state before the agent acted. And it does not **read** the owner's
+statements. It may carry one to his instance, which is the ordinary way an import
+starts; what reads it is the instance, and what the agent knows about the
+contents is what the API answered.
 
 From this follows the thing that is easiest to violate out of the best
 intentions: a missing value is asked of the owner, not filled in. A guess that
@@ -83,28 +84,45 @@ has reached the journal is indistinguishable from a fact — every report will
 read it as one, and only the owner, who knows what actually happened, can
 retract it.
 
-## Where an import begins, and what you are not holding
+## Where an import begins: carry the document, do not read it
 
-An import has a step before its first call: somebody turns a bank's export into
-rows this system can read. That step is not in this API, it is not yours, and it
-is the step the outstanding-work queue asks for without naming.
+An import begins with a document the owner has — a statement, an export, a file
+his institution gave him. There are two acts you can perform on it, and the
+difference between them is the whole rule.
 
-The owner runs a converter of his own against his own file. It knows the
-export's columns, and it knows the two things an export never states: which
-printed name is an account of his at another institution, and which positive row
-is a merchant giving money back rather than money arriving. You are handed
-neither the file nor those answers, so you cannot reproduce that step and must
-not try to — reading his export to work them out is the thing the design forbids
-outright, not a shortcut with a cost.
+**You may convey it.** Handing that document to his own instance is an ordinary
+act and is the way an import normally starts. The contract names the operation
+and says what it takes. The instance reads the document itself, through a profile
+written for that institution and that document type, and what you get back is a
+session holding rows.
 
-What you are handed is what he pastes and what the API answers. On rows he
-pastes, submit what the source stated rather than a conclusion you reached for
-it — the shape for that is the next section. Where he has a converter, give him
-the command and work from the summary he brings back.
+**You may not interpret it.** Do not parse it, do not summarise its rows, do not
+tabulate it, and do not decide what a row was — not its direction, not its kind,
+not whose account is on the other side, not its category. This is not a rule
+about secrecy: the amounts, the dates and the counterparties reach you anyway,
+through the assessment and through every question the session raises. It is a
+rule about a format having one reader. A reading of your own is a second
+implementation of that institution's rules, it does not fail loudly, and what it
+produces is an import that files the wrong operations with nothing saying so.
+
+Which reader read a row is recorded on the fact, so rows you converted yourself
+are marked as such for as long as they exist. That is not a trap. It is what
+makes the permission above safe to give.
+
+**If you cannot reach the document, say so.** An agent that does not run on the
+machine holding the file cannot convey it, and there is no reading of this that
+lets you interpret it instead. What is left is poorer, and you should name it as
+poorer to him: ask him for the values, submit them as what the source stated —
+the shape is the next section — and conclude nothing on his behalf. Every row
+that no rule of his already matches becomes a question he has to answer.
+
+**Never a credential but your own**, whatever the document is. No broker token,
+no encryption key. An import that would need you to fetch the statement out of
+the institution yourself is not one you can do.
 
 `docs/import-boundary.md` is the map: which channel writes what, who runs each,
-what his converter is responsible for knowing, and where that line is drawn
-wrongly today. Read it before extending an import, not before running one.
+what an agent may do with a document, and why the line is drawn where it is. Read
+it before extending an import, not before running one.
 
 ## A row you cannot classify is submitted as such
 
@@ -854,14 +872,15 @@ denominator is the accounts this instance has been told about — `covered` and
 the owner's that was never created here is in neither list, and it is not
 reported as missing: it is invisible to the fold, not omitted by it.
 
-This is not a defect that a field could fix. The system never sees a source
-document. An import sends it the rows a client chose to send, so a statement of
-what the document held would be that client's word republished as the system's
-knowledge — and a client that silently dropped three accounts is the same client
-that would supply the total. The one place the system does compare both sides is
-a channel it fetched itself, and there it records the shortfall as a fact of its
-own: a coverage gap, naming the refused rows and the dimensions they would have
-moved.
+This is not a defect that a field could fix. Where an import sends the rows a
+client chose to send, the system never sees the document behind them, so a
+statement of what that document held would be the client's word republished as
+the system's knowledge — and a client that silently dropped three accounts is the
+same client that would supply the total. A document the system reads itself is
+better evidence about its own rows and still says nothing about an account it
+never mentions. The one place the system does compare both sides is a channel it
+fetched itself, and there it records the shortfall as a fact of its own: a
+coverage gap, naming the refused rows and the dimensions they would have moved.
 
 So the check belongs to whoever holds the source, and it is a comparison, not a
 lookup:

@@ -276,6 +276,7 @@ pub(crate) fn input_alternative_dto(alternative: &InputAlternative) -> InputAlte
                 candidates: required.candidates.as_deref().map(account_candidate_dtos),
             })
             .collect(),
+        consequence: alternative.consequence.clone(),
     }
 }
 
@@ -2549,10 +2550,12 @@ pub async fn create_token(
                     InputAlternativeDto {
                         value: "agent".to_owned(),
                         requires: Vec::new(),
+                        consequence: None,
                     },
                     InputAlternativeDto {
                         value: "read_only".to_owned(),
                         requires: Vec::new(),
+                        consequence: None,
                     },
                 ]),
             ));
@@ -4573,6 +4576,7 @@ fn parse_currency(field: &'static str, value: &str) -> Result<CurrencyCode, ApiF
                         .map(|currency| InputAlternativeDto {
                             value: currency.code().to_owned(),
                             requires: Vec::new(),
+                            consequence: None,
                         })
                         .collect(),
                 ),

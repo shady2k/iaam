@@ -450,6 +450,82 @@ impl AnswerShape {
     pub const fn needs_account(self) -> bool {
         matches!(self, Self::SentToOwnAccount | Self::ReceivedFromOwnAccount)
     }
+
+    /// What choosing this alternative does to the owner's money-flow report.
+    ///
+    /// **Why this is a sentence per alternative and not a longer question.**
+    /// The prompt asks what the row was; this says what each answer to it
+    /// decides. Put in the prompt, the seven consequences would be one string
+    /// holding a mapping from a word to its effect — a structure sent as prose,
+    /// which `docs/api/conventions.md` §5 refuses for the reason that a client
+    /// composing an answer has to parse it back out. Put here, the consequence
+    /// travels **attached to the word it belongs to**, in the same list the
+    /// caller already reads to find out what may be said, and a caller that
+    /// shows the owner one alternative shows him its effect with it.
+    ///
+    /// **Why static text and not a computed projection.** Every sentence below
+    /// is a claim about `MoneyFlow::absorb` in `iaam-core`, reached through
+    /// [`Self`] → [`Answer::classification`] → `ObservedRow::resolve` →
+    /// `normalize` → `EventKind`. The projection cannot be run here — there is
+    /// no journal, no contour and no category index at the moment a question is
+    /// asked — so the link is pinned by test instead: `tests/observation.rs`
+    /// walks that chain for the pair the owner is most likely to confuse and
+    /// asserts the two land in different quantities.
+    ///
+    /// **Why the money-flow report and not the returns path.** They disagree
+    /// about one member, and the disagreement is recorded on
+    /// `EventKind::flow_endpoints`: a refund is `InboundFromOutside` for the
+    /// contour classifier, because a returns calculation must see the cash
+    /// cross the boundary, while the household report subtracts it from
+    /// spending. Naming both in one sentence would make every alternative read
+    /// as a caveat; the household report is the one the owner reads a month of
+    /// statements against, so it is the one named, and the sentence for
+    /// `Refund` says which report it is talking about.
+    #[must_use]
+    pub const fn consequence(self) -> &'static str {
+        match self {
+            Self::SentToOwnAccount => {
+                "The money left this account for the account you name, and both accounts get \
+                 a leg. The money-flow report counts it under transfers between your own \
+                 accounts and as neither money that came in nor money that went out — unless \
+                 the account you name is outside the contour, where it counts as money that \
+                 went out that no category explains."
+            }
+            Self::ReceivedFromOwnAccount => {
+                "The money arrived at this account from the account you name, and both \
+                 accounts get a leg; the operation is recorded from the sending side. The \
+                 money-flow report counts it under transfers between your own accounts and as \
+                 neither money that came in nor money that went out — unless the account you \
+                 name is outside the contour, where the money did cross the boundary and \
+                 counts as money that came in."
+            }
+            Self::Paid => {
+                "The money left the perimeter. The money-flow report counts it as money that \
+                 went out, under the category your rules give the row, or as an outflow \
+                 nothing explains where no rule matches it."
+            }
+            Self::Received => {
+                "The money came into the perimeter from outside. The money-flow report counts \
+                 it as money that came in — the same line as new money you added — and not as \
+                 anything the capital earned and not as money of your own coming back."
+            }
+            Self::Fee => {
+                "The money left as a cost charged against the account, on a fee leg of its \
+                 own. The money-flow report counts it under fees and not under what went out \
+                 on purchases, so no spending category is asked for."
+            }
+            Self::Income => {
+                "The money is what the capital earned. The money-flow report counts it under \
+                 earnings, attributed to this account — a cash statement row names no \
+                 security, so none is recorded — and not as money that came in from outside."
+            }
+            Self::Refund => {
+                "A counterparty gave back an earlier outflow. The money-flow report subtracts \
+                 it from what went out, in the category the money was spent in, \
+                 rather than adding it to what came in or to what the capital earned."
+            }
+        }
+    }
 }
 
 /// The owner's answer to one question.

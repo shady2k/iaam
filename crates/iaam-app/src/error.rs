@@ -202,6 +202,7 @@ impl FieldRejection {
                 .map(|code| InputAlternative {
                     value: (*code).to_owned(),
                     requires: Vec::new(),
+                    consequence: None,
                 })
                 .collect(),
         )

@@ -3,15 +3,16 @@
 //! The row this file is written around is invented: an amount, a word meaning
 //! "internal to this institution", and nothing else.
 
-use iaam_core::event::kind::{FeeOrigin, IncomeKind};
-use iaam_core::ids::{AccountId, ClassificationRuleId};
+use iaam_core::event::kind::{FeeOrigin, FlowEndpoints, IncomeKind};
+use iaam_core::ids::{AccountId, ClassificationRuleId, OwnerId, SourceId};
 use iaam_core::money::CurrencyCode;
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule, Counterparty,
     Movement, Question, RuleMatcher, classify,
 };
+use iaam_ingest::normalize;
 use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity};
-use iaam_ingest::operation::{OperationDates, OperationKind};
+use iaam_ingest::operation::{NormalizationContext, OperationDates, OperationKind};
 use time::macros::date;
 
 fn inner_row(account: AccountId) -> ObservedRow {
@@ -612,4 +613,160 @@ fn a_named_counterparty_the_directory_does_not_know_narrows_the_question() {
             counterparty: Some("Shop One".to_owned()),
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// What each alternative does to the money (iaam-pzm9)
+// ---------------------------------------------------------------------------
+
+/// The journal fact one answer produces, as the money-flow projection sees it.
+///
+/// The whole chain in one call, because the chain is the claim:
+/// [`Answer::classification`] and [`Answer::movement`] together decide the
+/// operation, `normalize` decides the event, and `MoneyFlow::absorb` matches on
+/// the event's kind to choose which of its seven quantities the amount lands in.
+fn recorded_as(answer: Answer, account: AccountId) -> (String, FlowEndpoints) {
+    let operation = inner_row(account)
+        .resolve_with(answer)
+        .expect("the answer names a direction its classification admits");
+    let event = normalize(
+        &operation,
+        NormalizationContext {
+            owner: OwnerId::new_random(),
+            source: SourceId::new_random(),
+        },
+    )
+    .expect("a dated cash row normalises")
+    .event;
+    (
+        event.kind.discriminant().to_owned(),
+        event.kind.flow_endpoints(),
+    )
+}
+
+/// `AnswerShape::consequence` claims what each answer does to the report. This
+/// pins the claim to the code that decides it.
+///
+/// The sentence cannot run the projection — a question is asked before there is
+/// a journal, a contour or a category index — so what it says is checked here
+/// instead: the event kind is what `MoneyFlow::absorb` matches on, and
+/// `flow_endpoints` is what decides whether the cash crossed the boundary.
+#[test]
+fn each_answer_produces_the_journal_fact_its_consequence_claims() {
+    let account = AccountId::new_random();
+    let far = AccountId::new_random();
+
+    assert_eq!(
+        recorded_as(Answer::SentToOwnAccount { to: far }, account),
+        (
+            "cash_transfer".to_owned(),
+            FlowEndpoints::BetweenAccounts {
+                from: account,
+                to: far,
+            }
+        ),
+        "«between your own accounts» is a transfer with a leg on each"
+    );
+    assert_eq!(
+        recorded_as(Answer::ReceivedFromOwnAccount { from: far }, account),
+        (
+            "cash_transfer".to_owned(),
+            FlowEndpoints::BetweenAccounts {
+                from: far,
+                to: account,
+            }
+        ),
+        "the same fact from the sending side, which is where a transfer is \
+         recorded from"
+    );
+    assert_eq!(
+        recorded_as(Answer::Paid, account).0,
+        "cash_out",
+        "«money that went out» is the outflow the category rules decompose"
+    );
+    assert_eq!(
+        recorded_as(Answer::Received, account),
+        ("cash_in".to_owned(), FlowEndpoints::InboundFromOutside),
+        "«money that came in» is money crossing the boundary inward"
+    );
+    assert_eq!(
+        recorded_as(
+            Answer::Fee {
+                origin: FeeOrigin::AccountMaintenance
+            },
+            account
+        )
+        .0,
+        "fee",
+        "a fee is its own kind, so it lands under fees and not under spending"
+    );
+    assert_eq!(
+        recorded_as(Answer::Income { kind: None }, account).0,
+        "income",
+        "an earning is its own kind, so it lands under what the capital earned"
+    );
+    assert_eq!(
+        recorded_as(Answer::Refund, account).0,
+        "refund",
+        "a return is its own kind, which is what lets the report subtract it \
+         from what went out instead of adding it to what came in"
+    );
+}
+
+/// The pair the owner actually got wrong, and the reason the sentence had to be
+/// published (iaam-pzm9).
+///
+/// «Money came in from outside» and «my own money came back» are one word apart
+/// in the answer vocabulary and are not neighbouring shades of one fact: one
+/// crosses the boundary inward and one does not move across it at all. Chosen
+/// from a question that never mentioned the difference, the wrong one turns a
+/// movement between the owner's own accounts into an inflow for the year.
+#[test]
+fn arriving_from_outside_and_arriving_from_your_own_account_are_different_facts() {
+    let account = AccountId::new_random();
+    let far = AccountId::new_random();
+
+    let outside = recorded_as(Answer::Received, account);
+    let own = recorded_as(Answer::ReceivedFromOwnAccount { from: far }, account);
+
+    assert_ne!(
+        outside, own,
+        "if these two produced the same fact the question would not need asking"
+    );
+    assert_eq!(outside.1, FlowEndpoints::InboundFromOutside);
+    assert!(
+        matches!(own.1, FlowEndpoints::BetweenAccounts { .. }),
+        "{own:?}"
+    );
+    assert_ne!(
+        AnswerShape::Received.consequence(),
+        AnswerShape::ReceivedFromOwnAccount.consequence(),
+        "and the words the owner reads must not be the same either"
+    );
+}
+
+/// No two alternatives of one question read alike.
+///
+/// A consequence that repeated across two answers would be worse than none: it
+/// would state, in the place the owner looks to tell them apart, that there is
+/// nothing to tell apart.
+#[test]
+fn no_two_alternatives_of_a_question_say_the_same_thing() {
+    let question = Question::UnresolvedDirection {
+        account: AccountId::new_random(),
+        stated: Some("INNER".to_owned()),
+        counterparty: None,
+    };
+    let said: Vec<&str> = question
+        .alternatives()
+        .into_iter()
+        .map(AnswerShape::consequence)
+        .collect();
+
+    assert!(
+        said.iter().all(|text| !text.is_empty()),
+        "every alternative decides something: {said:?}"
+    );
+    let distinct: std::collections::BTreeSet<&&str> = said.iter().collect();
+    assert_eq!(distinct.len(), said.len(), "{said:?}");
 }

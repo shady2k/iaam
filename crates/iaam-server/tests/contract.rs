@@ -17216,7 +17216,11 @@ async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_na
         "the refusal must name the session standing in the way: {refused}"
     );
     assert!(
-        actual.contains("1 rows") && actual.contains("1 unanswered"),
+        // «Still waiting on you» and not «unanswered», which is `iaam-m2oi`:
+        // the figure counts the questions this session's own reading cannot
+        // settle, and a question a standing rule of his has already settled is
+        // not one of them however empty its `answered_at` stays.
+        actual.contains("1 rows") && actual.contains("1 question still waiting on you"),
         "and say what it holds: {refused}"
     );
 
@@ -20315,6 +20319,199 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
         before + 2,
         "the commit wrote exactly what the assessment said it would"
     );
+}
+
+/// Adopting the offered rule empties the wall of questions it covers.
+///
+/// **The bead (`iaam-m2oi`).** The offer's own sentence says «one answer here
+/// settles all N of them at once», and it did not. Questions are recorded at
+/// intake; `POST /v1/classification-rules` writes the rule and recomputes the
+/// journal and has never heard of an import question. So after he adopted the
+/// offer the rows were re-read as facts, their stored questions kept their empty
+/// `answered_at`, the assessment named the same rows as resolved and as still
+/// open at once, and the commit went on refusing over questions nothing needed
+/// answered — the one act meant to replace hundreds of answers leaving him
+/// exactly as blocked as before, on the strength of a sentence that was false.
+///
+/// Everything here is invented: `Shop One` and the rest are nobody, `Groceries`
+/// is a made-up word, and the amounts were chosen for this test.
+#[tokio::test]
+async fn adopting_the_offered_rule_settles_the_rows_it_covers_and_the_session_commits() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let before = journal_rows(&harness).await;
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "offered" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let filed = |key: &str, counterparty: &str| {
+        json!({
+            "account": account,
+            "type": "unresolved_direction",
+            "amount": "100.00",
+            "currency": "RUB",
+            "direction": "out",
+            "counterparty": counterparty,
+            "dates": { "cash_posted": "2025-03-18" },
+            "source_kind": "PAYMENT",
+            "source_category": "Groceries",
+            "idempotency_key": key,
+        })
+    };
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    filed("offered-one", "Shop One"),
+                    filed("offered-two", "Shop Two"),
+                    filed("offered-three", "Shop Three"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let offered = plan["interpretation"]["offered_rules"]
+        .as_array()
+        .expect("offered rules");
+    assert_eq!(offered.len(), 1, "{plan}");
+    assert_eq!(offered[0]["covers"], json!([1, 2, 3]), "{plan}");
+    assert_eq!(
+        plan["interpretation"]["open_questions"]
+            .as_array()
+            .expect("open questions")
+            .len(),
+        3,
+        "three lines, three questions, and one word covers them all: {plan}"
+    );
+
+    // The sentence he is read before he decides. It promises that one answer
+    // settles all three, and that the decision is not held to the source that
+    // sent them — decision 0026 §4 refuses to scope a category condition, so a
+    // sentence saying «the same institution» would describe a narrower decision
+    // than the one he is making.
+    let consequence = offered[0]["question"]["consequence"]
+        .as_str()
+        .expect("what turns on it");
+    assert!(consequence.contains('3'), "{consequence}");
+    assert!(
+        !consequence.contains("the same institution"),
+        "{consequence}"
+    );
+
+    // The condition is the offer's; the outcome is his, and only he can send it.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": { "source_category": "Groceries" },
+                "outcome": { "kind": "external_flow" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, replanned) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replanned}");
+    assert!(
+        replanned["interpretation"]["open_questions"]
+            .as_array()
+            .expect("open questions")
+            .is_empty(),
+        "his standing decision answered all three: {replanned}"
+    );
+    let resolved = replanned["interpretation"]["resolved"]
+        .as_array()
+        .expect("resolved");
+    assert_eq!(resolved.len(), 3, "{replanned}");
+    for fact in resolved {
+        assert_eq!(
+            fact["settled_by"], "rule",
+            "and each says what settled it: {replanned}"
+        );
+    }
+    assert_eq!(
+        replanned["readiness"], "ready",
+        "so nothing is waiting on him and the session can be committed: {replanned}"
+    );
+
+    // The same determination, read back off the session's own questions. He
+    // never answered any of them and never will, so `answered_at` says nothing;
+    // what a caller must not do is read that absence as work outstanding.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{id}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert_eq!(
+        contents["unanswered"], 0,
+        "the figure counts what is waiting on him, not what he never answered: {contents}"
+    );
+    for question in contents["questions"].as_array().expect("questions") {
+        assert!(question["answered_at"].is_null(), "{contents}");
+        assert_eq!(
+            question["settled_without_answer"]["code"], "rule",
+            "settled is not answered, and the difference is what he is shown: {contents}"
+        );
+        assert!(
+            question["settled_without_answer"]["explanation"]
+                .as_str()
+                .is_some_and(|it| !it.is_empty()),
+            "with what he can read beside the code: {contents}"
+        );
+    }
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/commit"),
+            &harness.owner_token,
+            &json!({ "revision": replanned["revision"] }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the commit no longer refuses over questions nothing needs answered: {committed}"
+    );
+    assert_eq!(journal_rows(&harness).await, before + 3);
 }
 
 /// A word whose rows are one thing is offered; a word that holds two is not.

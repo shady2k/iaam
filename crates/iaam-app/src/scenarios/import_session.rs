@@ -127,13 +127,17 @@ pub struct SessionContents {
     pub control_figures: Vec<ControlSection>,
 }
 
-impl SessionContents {
-    /// Whether anything is still waiting on the owner.
-    #[must_use]
-    pub fn has_open_questions(&self) -> bool {
-        self.questions.iter().any(ImportQuestionView::is_open)
-    }
-}
+// `SessionContents::has_open_questions` was here, and it is gone (`iaam-m2oi`).
+// It answered from `ImportQuestionView::is_open` alone, which is «the owner has
+// not answered it» and not «it is still waiting on him»: a standing rule he
+// wrote after the question was recorded settles the row without touching the
+// question, and the stored question then says the session is blocked by a
+// decision nothing needs. Nothing that holds only `SessionContents` can answer
+// the real question, because the answer is a property of the session's
+// **reading** and not of its rows — see [`QuestionSettlements`], which is where
+// every reader of a question's openness now goes. A method that can only give
+// the wrong answer is worse than no method: it is the wrong answer with the
+// right name on it.
 
 /// A question, and the accounts an answer to it may name.
 ///
@@ -177,6 +181,37 @@ pub struct AnswerableQuestion {
     /// object, and two objects assembled by two functions are two readings of
     /// one answer that can come to disagree.
     pub generalisation: Generalisation,
+    /// What settled the row without the owner ever answering this question.
+    ///
+    /// **`None` is the ordinary state and means two different things on
+    /// purpose** (`iaam-m2oi`): the question is still waiting on him, or he
+    /// answered it. The second is stated by the question itself —
+    /// `answered_at` — and this field says nothing about it, because «he
+    /// answered» and «something else settled it» are the two ways a question
+    /// stops waiting and only the second needs explaining.
+    ///
+    /// **Published on the question rather than left to be inferred.** A caller
+    /// holding a question whose `answered_at` is null used to have exactly one
+    /// reading of it — the owner must answer this — and after a standing rule
+    /// of his settles the row that reading is wrong in the direction that costs
+    /// him an evening: it puts a decision to him that his own earlier decision
+    /// already made. The word is [`QuestionSettlement`]'s and is the same word
+    /// the assessment puts on the row, so a caller that reads both reads one
+    /// determination twice rather than two that can differ.
+    pub settled_without_answer: Option<QuestionSettlement>,
+}
+
+impl AnswerableQuestion {
+    /// Whether this question is still the owner's to answer.
+    ///
+    /// The one predicate a caller should branch on, and the reason the
+    /// settlement is published beside the question rather than computed by
+    /// each caller out of `answered_at` — which answers a different question
+    /// and answered it wrongly for every row a rule settled.
+    #[must_use]
+    pub const fn awaits_answer(&self) -> bool {
+        self.view.is_open() && self.settled_without_answer.is_none()
+    }
 }
 
 /// Pair each question with the accounts an answer to it may name.
@@ -200,13 +235,32 @@ pub struct AnswerableQuestion {
 /// A free function over what [`read_session`] already returned rather than a
 /// field on [`SessionContents`], because it decides nothing the session holds:
 /// it is a second view of the same rows, and the callers that need only the
-/// questions — the refusals, the commit planner — must not pay for it.
+/// questions must not pay for it.
+///
+/// **It reads the session, and that is new** (`iaam-m2oi`). Whether a question
+/// is still waiting on the owner is not written in the questions table — a
+/// standing rule of his settles the row and touches no question — so a view of
+/// a question that did not read the session could only publish `answered_at`
+/// and let its caller draw the wrong conclusion. What that costs is his
+/// directory, his transfer statements and his rules, once for the whole list;
+/// what it buys is that a caller relaying these questions to him relays the ones
+/// that are genuinely his to answer. The commit planner reads the same session
+/// the same way and reaches the same set, because both go through
+/// [`QuestionSettlements`].
 pub async fn answerable_questions(
     services: &AppServices,
     principal: &Principal,
     contents: &SessionContents,
     questions: &[ImportQuestionView],
 ) -> Result<Vec<AnswerableQuestion>, AppError> {
+    // One reading of the session, so that what a published question says about
+    // itself and what the assessment says about the same row are one
+    // determination (`iaam-m2oi`). It costs the owner's accounts, his transfer
+    // statements and his rules — not his journal, which is what
+    // [`SessionReading`] deliberately stops short of.
+    let settlements = SessionReading::of(services, principal, contents)
+        .await?
+        .settlements();
     let asked: Vec<Option<Question>> = questions
         .iter()
         .map(|question| {
@@ -232,10 +286,18 @@ pub async fn answerable_questions(
         .zip(asked)
         .map(|(question, asked)| AnswerableQuestion {
             view: question.clone(),
+            // Still offered for a question a rule settled, and that is the
+            // decision rather than an oversight. His standing rule classifies
+            // the row; his word about *this* row overrules it, because
+            // `resolution_of` reads the stored answer before it consults the
+            // rules at all. So the call stays open to him and the answer keeps
+            // meaning what it meant — what he is no longer told is that he must
+            // make it.
             accounts: asked.map_or_else(Vec::new, |asked| {
                 answer_account_candidates(&asked, &accounts)
             }),
             generalisation: generalisation_of(&contents.observations, question),
+            settled_without_answer: settlements.settlement_of(question).cloned(),
         })
         .collect())
 }
@@ -744,16 +806,35 @@ async fn half_imported_refusal(
     contents: &SessionContents,
 ) -> AppError {
     let session = contents.session.id;
-    let unanswered = contents
-        .questions
-        .iter()
-        .filter(|question| question.is_open())
-        .count();
+    // What the session is **waiting on**, and not what its questions table says
+    // was never answered (`iaam-m2oi`). A refusal that offered a question a
+    // standing rule of his had already settled sent the owner to answer work
+    // that was done, and its count named a wall that was not there.
+    //
+    // A reading that fails leaves the refusal counting stored questions, which
+    // is what it counted before and can only over-state. This is the tolerance
+    // the neighbouring refusal already applies to the accounts it names: what
+    // was wrong with the request does not change because the extra detail could
+    // not be computed.
+    let settlements = SessionReading::of(services, principal, contents)
+        .await
+        .map(|reading| reading.settlements())
+        .unwrap_or_default();
+    let unanswered = settlements.awaiting(&contents.questions);
+    // Singular where there is one. The field is read out to whoever is being
+    // told why the import will not start, and «1 questions» is a sentence
+    // nobody wrote on purpose.
+    let waiting = if unanswered == 1 {
+        "1 question still waiting on you".to_owned()
+    } else {
+        format!("{unanswered} questions still waiting on you")
+    };
     let rejection = FieldRejection::new(
         "source.label",
         "a label naming an import with no session open, or one of the calls that          ends the session this label already has",
         format!(
-            "session {session} has been open since {opened}, holding {rows} rows and              {unanswered} unanswered questions",
+            "session {session} has been open since {opened}, holding {rows} rows and \
+             {waiting}",
             session = session.inner(),
             opened = contents.session.opened_at,
             rows = contents.observations.len(),
@@ -773,7 +854,7 @@ async fn half_imported_refusal(
     let first = match contents
         .questions
         .iter()
-        .filter(|question| question.is_open())
+        .filter(|question| settlements.awaits_answer(question))
         .min_by_key(|question| (question.row, question.id.inner()))
     {
         Some(open) => answer_resolution(services, principal, session, open.id).await,
@@ -1052,11 +1133,19 @@ impl Generalisation {
 ///
 /// The order of the three tests is the decision. A written rule settles it
 /// whatever the row says, because that rule exists and the row is no longer the
-/// evidence. Then an open question, which has no answer to generalise. Only then
-/// is the row consulted, and a row this build cannot read falls to `Impossible`
-/// beside a row that asks nothing — which is not a fudge: «no rule can be built
-/// from this» is true of both, and the assessment is where an unreadable row is
-/// reported as unreadable.
+/// evidence. Then a question he has not answered, which has no answer to
+/// generalise. Only then is the row consulted, and a row this build cannot read
+/// falls to `Impossible` beside a row that asks nothing — which is not a fudge:
+/// «no rule can be built from this» is true of both, and the assessment is where
+/// an unreadable row is reported as unreadable.
+///
+/// **`is_open` is the right test here and is not the one `iaam-m2oi` replaced.**
+/// This asks what the owner's *answer* generalised into, and a question he never
+/// answered has no answer to generalise however his standing rules have since
+/// settled the row. What that bead replaced is «is anything still waiting on
+/// him», which is a different question with a different answer — and a row a
+/// rule settled reports `unanswered` here truthfully, because there is nothing
+/// of his to turn into a rule and a rule already covers the row.
 ///
 /// Public, and taking the session's observations rather than the whole
 /// [`SessionContents`], because the action queue derives the same state from the
@@ -1339,12 +1428,26 @@ pub async fn answer_question(
                 )
                 .into());
             };
+            // Over the questions this session is **waiting on**, which is the
+            // set the assessment published to the caller as
+            // [`OpenQuestion::alike`] (`iaam-m2oi`). Read off `is_open` alone
+            // the reach was wider than the list he was shown: it wrote his
+            // answer onto rows a standing rule of his had already settled and
+            // that no response had named to him as open, so «and every other
+            // row like this one» settled rows he had never seen. The reading is
+            // taken here rather than passed in, because what this call settles
+            // must be decided from the session as it now stands — the same
+            // reason the subject is recomputed rather than read off the
+            // assessment.
+            let settlements = SessionReading::of(services, principal, &contents)
+                .await?
+                .settlements();
             contents
                 .questions
                 .iter()
                 .filter(|candidate| {
                     candidate.id != question
-                        && candidate.is_open()
+                        && settlements.awaits_answer(candidate)
                         && subject_asked(&contents.observations, candidate)
                             .is_some_and(|of_candidate| of_candidate == subject)
                 })
@@ -1459,6 +1562,8 @@ pub async fn answer_question(
         view: answered,
         accounts: Vec::new(),
         generalisation: Generalisation::Unanswered,
+        // The question this call just answered, so nothing else settled it.
+        settled_without_answer: None,
     });
     Ok(AnsweredQuestions {
         asked,
@@ -1489,7 +1594,13 @@ pub enum AnswerReach {
     /// addressed.
     #[default]
     ThisRow,
-    /// Every open question of this session raising the same decision.
+    /// Every question this session is still waiting on that raises the same
+    /// decision.
+    ///
+    /// «Still waiting on» and not «unanswered» (`iaam-m2oi`): a question a
+    /// standing rule of his has already settled is not reached, because it is
+    /// not in the [`OpenQuestion::alike`] list the assessment showed him and a
+    /// reach wider than the list he read is a reach he did not choose.
     ///
     /// «The same decision» is
     /// [`QuestionSubject`](iaam_ingest::classification::QuestionSubject), which
@@ -2408,11 +2519,23 @@ pub struct Interpretation {
 /// read *by* — what each will move in the journal — are [`PlannedFact`]s,
 /// computed by planning the commit, and `Resolver::render` refused published
 /// fields partly on the ground that a second rendering of one row is a pair of
-/// readings that can disagree. There is no such pair here: a row with an open
-/// question produces no planned fact at all, so the two lists are disjoint by
+/// readings that can disagree. There is no such pair here: a row published here
+/// produces no planned fact at all, so the two lists are disjoint by
 /// construction. What is published here is what the **source** printed, signed
 /// as it printed it, and never what the commit would record — see
 /// [`PrintedRow::amount_minor`].
+///
+/// **The disjointness is a property of the reading and not of the questions
+/// table** (`iaam-m2oi`, decision 0038). It used to be written as «a row with an
+/// open question produces no planned fact», which was read off
+/// `ImportQuestionView::is_open` and was false: a row whose stored question the
+/// owner never answered still produces a fact once a standing rule of his
+/// classifies it, and the assessment then named that row in
+/// [`Interpretation::resolved`] and here at once — which is exactly what
+/// decision 0032 §1 says cannot happen. What is published here is now decided by
+/// [`QuestionSettlements`], which is the one fold over what the reading made of
+/// each row, so the two lists are disjoint because they are two halves of one
+/// determination rather than two tests that agree by habit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenQuestion {
     /// The row's position **in this session**, which is what the answering call
@@ -3364,6 +3487,139 @@ impl Readiness {
     }
 }
 
+/// One reading of a whole session: the directory and the standing rules it was
+/// read against, what each of its rows became, and which of its rows are two
+/// sights of one movement.
+///
+/// **Extracted from [`plan_session`] because it is what «is this question still
+/// open» is decided from** (`iaam-m2oi`). The refusals, the answering call and
+/// the published question all have to give the same answer as the assessment,
+/// and the only way for one answer to serve them is for there to be one
+/// function that reads the session. A second, cheaper reading written for the
+/// refusal path would be a second answer to what a row settles as, and the two
+/// would differ exactly where it matters — over a rule the owner wrote between
+/// the two readings.
+///
+/// It stops short of the journal on purpose. Deduplication, the control
+/// figures, the transfer candidates and the coverage gaps all need
+/// `load_events_through`, which is the expensive read on this path; what a row
+/// settles as needs none of it. So a caller that only wants to know what is
+/// still waiting on the owner pays for his accounts, his statements and his
+/// rules, and not for his whole journal.
+struct SessionReading {
+    resolver: Resolver,
+    rows: Vec<ReadRow>,
+    mirrors: MirroredRows,
+}
+
+impl SessionReading {
+    /// Read every row of the session once, against the owner's directory and
+    /// rules as they stand now.
+    async fn of(
+        services: &AppServices,
+        principal: &Principal,
+        contents: &SessionContents,
+    ) -> Result<Self, AppError> {
+        let resolver = Resolver::load(services, principal.owner).await?;
+        let mut read_rows = Vec::with_capacity(contents.observations.len());
+        for observation in &contents.observations {
+            let intake = parse_intake(&observation.payload).ok();
+            let resolution = resolution_of(observation, &resolver);
+            // A settled row that produces nothing leaves the fact pipeline here and
+            // is carried by `settled` instead. It is not folded into `operation`
+            // with a rejection, because it is not one: everything downstream of a
+            // rejection — the coverage gap, the retention reason, the refusal to
+            // commit — is about a row something is owed for.
+            let settled = match &resolution {
+                Ok(RowResolution::NoFact(reason)) => Some(*reason),
+                Ok(RowResolution::Fact { .. }) | Err(_) => None,
+            };
+            let basis = match &resolution {
+                Ok(RowResolution::Fact { basis, .. }) => Some(basis.clone()),
+                Ok(RowResolution::NoFact(_)) | Err(_) => None,
+            };
+            let operation = match resolution {
+                Ok(RowResolution::Fact { operation, .. }) => Ok(*operation),
+                Ok(RowResolution::NoFact(_)) => Err(Rejection {
+                    field: "row".to_owned(),
+                    expected: "a row that becomes a fact".to_owned(),
+                    actual: "a row settled without one".to_owned(),
+                }),
+                Err(rejection) => Err(rejection),
+            };
+            // The origin is derived from the session and the account this row names,
+            // so that this function called twice — which is exactly what committing
+            // does — plans the same provenance both times. See [`session_origin`].
+            // The operation itself is kept beside the candidate because a row this
+            // commit declines is named in the coverage gap by what it would have
+            // moved (iaam-bufs), and a candidate that failed to normalise no longer
+            // says.
+            // What read this row, as its provenance will record it. Read off the
+            // intake rather than assumed, exactly as on the intake path above: a
+            // row the source-profile engine produced records
+            // `profile/<id>/<version>`, so the rows one profile version wrote are a
+            // query rather than an archaeology (decision 0019 §5). A row whose
+            // payload this build cannot parse at all has no reader to name and
+            // falls to the submitted version, which is what it would have carried.
+            let reader = intake.as_ref().map_or_else(
+                || ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
+                reader_of,
+            );
+            let candidate = operation.clone().and_then(|operation| {
+                let origin = session_origin(principal.owner, &contents.session, operation.account);
+                normalize(
+                    &operation,
+                    &NormalizationContext {
+                        owner: principal.owner,
+                        source: origin.source,
+                        parser_version: reader.clone(),
+                    },
+                )
+                .map(|normalized| {
+                    let mut event = normalized.event;
+                    if let Some(import) = origin.import {
+                        event.provenance = event.provenance.with_import(import);
+                    }
+                    event
+                })
+            });
+            read_rows.push(ReadRow {
+                row: observation.row,
+                intake,
+                operation: operation.ok(),
+                row_key: observation.row_key.clone(),
+                payload: observation.payload.clone(),
+                candidate: if settled.is_some() {
+                    None
+                } else {
+                    Some(candidate)
+                },
+                settled,
+                basis,
+            });
+        }
+
+        // One movement this document printed on both of its accounts is one fact
+        // (decision 0031). Run **here**, over the whole session and after every row
+        // has been read: the pair is invisible to a reading of either row on its
+        // own, which is why the two legs used to reach the journal as two complete
+        // transfers, each carrying a leg on each account.
+        let mirrors = mirrored_rows(contents.session.id, &read_rows, &contents.questions);
+        settle_mirrored(&mut read_rows, &mirrors);
+        Ok(Self {
+            resolver,
+            rows: read_rows,
+            mirrors,
+        })
+    }
+
+    /// What this reading settled, in the shape every reader of a question's
+    /// openness asks.
+    fn settlements(&self) -> QuestionSettlements {
+        QuestionSettlements::of(&self.rows, &self.mirrors)
+    }
+}
+
 /// Read the session and say what committing it would do.
 ///
 /// Everything [`commit_session`] needs is decided here, and nothing is written.
@@ -3438,7 +3694,6 @@ pub async fn plan_session(
     session: ImportSessionId,
 ) -> Result<PlannedSession, AppError> {
     let contents = read_session(services, principal, session).await?;
-    let resolver = Resolver::load(services, principal.owner).await?;
     let contours = services.store.list_contours(principal.owner).await?;
     let exclusions = services
         .store
@@ -3456,101 +3711,16 @@ pub async fn plan_session(
             .await?,
     );
 
-    let mut read_rows = Vec::with_capacity(contents.observations.len());
-    for observation in &contents.observations {
-        let intake = parse_intake(&observation.payload).ok();
-        let resolution = resolution_of(observation, &resolver);
-        // A settled row that produces nothing leaves the fact pipeline here and
-        // is carried by `settled` instead. It is not folded into `operation`
-        // with a rejection, because it is not one: everything downstream of a
-        // rejection — the coverage gap, the retention reason, the refusal to
-        // commit — is about a row something is owed for.
-        let settled = match &resolution {
-            Ok(RowResolution::NoFact(reason)) => Some(*reason),
-            Ok(RowResolution::Fact { .. }) | Err(_) => None,
-        };
-        let basis = match &resolution {
-            Ok(RowResolution::Fact { basis, .. }) => Some(basis.clone()),
-            Ok(RowResolution::NoFact(_)) | Err(_) => None,
-        };
-        let operation = match resolution {
-            Ok(RowResolution::Fact { operation, .. }) => Ok(*operation),
-            Ok(RowResolution::NoFact(_)) => Err(Rejection {
-                field: "row".to_owned(),
-                expected: "a row that becomes a fact".to_owned(),
-                actual: "a row settled without one".to_owned(),
-            }),
-            Err(rejection) => Err(rejection),
-        };
-        // The origin is derived from the session and the account this row names,
-        // so that this function called twice — which is exactly what committing
-        // does — plans the same provenance both times. See [`session_origin`].
-        // The operation itself is kept beside the candidate because a row this
-        // commit declines is named in the coverage gap by what it would have
-        // moved (iaam-bufs), and a candidate that failed to normalise no longer
-        // says.
-        // What read this row, as its provenance will record it. Read off the
-        // intake rather than assumed, exactly as on the intake path above: a
-        // row the source-profile engine produced records
-        // `profile/<id>/<version>`, so the rows one profile version wrote are a
-        // query rather than an archaeology (decision 0019 §5). A row whose
-        // payload this build cannot parse at all has no reader to name and
-        // falls to the submitted version, which is what it would have carried.
-        let reader = intake.as_ref().map_or_else(
-            || ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
-            reader_of,
-        );
-        let candidate = operation.clone().and_then(|operation| {
-            let origin = session_origin(principal.owner, &contents.session, operation.account);
-            normalize(
-                &operation,
-                &NormalizationContext {
-                    owner: principal.owner,
-                    source: origin.source,
-                    parser_version: reader.clone(),
-                },
-            )
-            .map(|normalized| {
-                let mut event = normalized.event;
-                if let Some(import) = origin.import {
-                    event.provenance = event.provenance.with_import(import);
-                }
-                event
-            })
-        });
-        read_rows.push(ReadRow {
-            row: observation.row,
-            intake,
-            operation: operation.ok(),
-            row_key: observation.row_key.clone(),
-            payload: observation.payload.clone(),
-            candidate: if settled.is_some() {
-                None
-            } else {
-                Some(candidate)
-            },
-            settled,
-            basis,
-        });
-    }
-
-    // One movement this document printed on both of its accounts is one fact
-    // (decision 0031). Run **here**, over the whole session and after every row
-    // has been read: the pair is invisible to a reading of either row on its
-    // own, which is why the two legs used to reach the journal as two complete
-    // transfers, each carrying a leg on each account.
-    let mirrors = mirrored_rows(session, &read_rows, &contents.questions);
-    for read in &mut read_rows {
-        let Some(records) = mirrors.settled.get(&read.row).copied() else {
-            continue;
-        };
-        // Not a rejection and not a retention: the row was read, it is real,
-        // and the movement it states is already in the plan under another row.
-        // See [`NoFactReason::SecondLegOfOneMovement`].
-        read.candidate = None;
-        read.settled = Some(NoFactReason::SecondLegOfOneMovement { records });
-        read.basis = None;
-    }
+    let reading = SessionReading::of(services, principal, &contents).await?;
+    // What this reading settled without a word from the owner, folded once and
+    // read by everything below that asks whether a question is still his to
+    // answer. See [`QuestionSettlements`].
+    let settlements = reading.settlements();
+    let SessionReading {
+        resolver,
+        rows: read_rows,
+        ..
+    } = reading;
 
     let mut candidates = Vec::with_capacity(read_rows.len());
     let mut dispositions = Vec::with_capacity(read_rows.len());
@@ -3599,15 +3769,18 @@ pub async fn plan_session(
         .collect();
     let account_resolution = account_resolution(&resolver, &read_rows, &recorded_names);
     let scope_assessment = scope_assessment(&source_inventory.accounts, &contours, &exclusions);
-    // The mirror pass runs before the questions are published, so a question
-    // whose movement another row already settled is not published at all
-    // (0031), and the offers below are folded over what is genuinely still
-    // open rather than over both halves of one movement.
+    // The whole reading runs before the questions are published, so a question
+    // the reading itself settled is not published at all: the other leg already
+    // records the movement (0031), or a standing rule of his classifies the row
+    // (`iaam-m2oi`). The offers below are folded over what is genuinely still
+    // open — over neither half of one movement, and over no row a rule he has
+    // already written covers, which is what keeps an offer from growing every
+    // month while settling nothing new.
     let open_questions = open_questions(
         &resolver.directory,
         &contents.observations,
         &contents.questions,
-        &mirrors,
+        &settlements,
     );
     let offers = offers(&contents.observations, &open_questions);
     // The directory the resolution already read, in the shape an answer names an
@@ -4008,6 +4181,33 @@ struct ReadRow {
 }
 
 impl ReadRow {
+    /// What the reading made of this row, where the reading settled it at all.
+    ///
+    /// **The one definition of «settled», and it is on the row** (`iaam-m2oi`).
+    /// Two things ask it and they ask at two different moments:
+    /// [`QuestionSettlements::of`] asks after the mirror pass, to decide which
+    /// questions are still the owner's, and [`mirrored_rows`] asks before it, to
+    /// decide which rows are two sights of one movement and which of the two
+    /// sides is already a fact. A second spelling for the second caller was what
+    /// the mirror pass used to have — it read `ImportQuestionView::is_open`, so a
+    /// row his directory or a rule of his had settled into a complete transfer
+    /// counted as *not* settled while its stored question stayed open, and the
+    /// pair came out as «neither side settled». Held together with the commit's
+    /// new refusal that is a movement recorded twice, which is the very defect
+    /// decision 0031 exists to prevent.
+    ///
+    /// `None` covers the two states nothing has settled: a row still ambiguous,
+    /// and a row this build cannot read.
+    fn settlement(&self) -> Option<QuestionSettlement> {
+        match (self.settled, &self.candidate, &self.basis) {
+            (Some(reason), _, _) => Some(QuestionSettlement::NoFact { reason }),
+            (None, Some(Ok(_)), Some(basis)) => Some(QuestionSettlement::Fact {
+                basis: basis.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     /// The account the row is on, as the caller stated it.
     ///
     /// `None` only where the stored payload does not parse: a row this build
@@ -5061,6 +5261,62 @@ impl FactBasis {
     }
 }
 
+/// Why a question is no longer waiting on the owner, when he never answered it.
+///
+/// **This is `iaam-m2oi`, and it is deliberately not a vocabulary of its own.**
+/// The two arms are the two vocabularies this module already uses to say what
+/// became of a row — [`FactBasis`] for a row that settled into a fact and
+/// [`NoFactReason`] for one that correctly settled into none — and every word
+/// either of them can say is already published on [`PlannedFact::settled_by`]
+/// and [`SettledRow::reason`]. A third enumeration listing «rule», «mirror»,
+/// «directory» again would be a second answer to «what settled this row», and
+/// the two would come to disagree in front of the owner about the same row.
+/// Decision 0031 needed such a word once and extended `NoFactReason` with
+/// `second_leg_of_one_movement` rather than inventing one; this extends the
+/// same two, by naming them together.
+///
+/// **What it is not is «answered».** A question a standing rule of his settled
+/// is not a question he answered, and the difference is the whole of what he is
+/// entitled to see: he made one decision about a condition, and this row is one
+/// of the rows that decision reached. `FactBasis::Answered` is reachable here
+/// and means the ordinary thing — the row carries his answer — but a question
+/// carrying his answer is not open in the first place, so nothing reads this to
+/// find out whether he spoke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuestionSettlement {
+    /// The reading settled the row into a fact, on evidence that was not the
+    /// owner's answer to this question.
+    Fact { basis: FactBasis },
+    /// The reading settled the row into no fact at all.
+    NoFact { reason: NoFactReason },
+}
+
+impl QuestionSettlement {
+    /// Wire code. Delegated to the two vocabularies rather than spelled again,
+    /// so a caller matching on a row's disposition and a caller matching on a
+    /// question's settlement match on the same words.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Fact { basis } => basis.code(),
+            Self::NoFact { reason } => reason.code(),
+        }
+    }
+
+    /// The same determination in words, for the owner reading it.
+    ///
+    /// Decision 0035: what is published to be read out to him carries what he
+    /// can read beside the identifier, and the identifier here is a code no
+    /// person says out loud.
+    #[must_use]
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Fact { basis } => basis.describe(),
+            Self::NoFact { reason } => reason.describe(),
+        }
+    }
+}
+
 /// Why a row correctly produces nothing.
 ///
 /// A closed enumeration, and the closure is the point rather than an accident
@@ -5816,6 +6072,136 @@ impl MirroredRows {
     }
 }
 
+/// What this session's own reading has already settled, and what it has paired.
+///
+/// **The one place that decides whether a question is still waiting on the
+/// owner** (`iaam-m2oi`). Before this existed, every reader asked
+/// [`ImportQuestionView::is_open`], which reads one column of the questions
+/// table and therefore answers a different question: «has he answered it», not
+/// «does anything still need him to». The two came apart the moment he adopted
+/// an offered rule — the rule settles the rows, the stored questions do not
+/// move, and the assessment then named one row in `resolved` and in
+/// `open_questions` at once while the commit went on refusing over questions
+/// nothing needed answered. The offer's own sentence promised the opposite.
+///
+/// **Computed from the rows, never stored.** [`MirroredRows`] argues this for
+/// the pairing and the argument is the same one, with more force: a settlement
+/// recorded in the questions table would be a verdict about the owner's rules
+/// and his directory, and both move. He creates an account and a row that was a
+/// question resolves itself; he retires the rule and the row goes back to being
+/// one. A stored verdict is right at the moment it is written and stale
+/// afterwards, and the queue that publishes work already done is the one he
+/// learns to ignore — which is `account_named_by_document_completion`'s
+/// argument, held here. Retiring the rule then needs no compensating write in a
+/// table another port owns and no transaction spanning the two, which is the
+/// shape `iaam-77hk` was filed on: the next reading simply finds no rule, the
+/// row assesses as ambiguous again, and the question is waiting again.
+///
+/// **Folded over the rows as they were finally read**, mirror pass included, so
+/// there is exactly one computation and not one per reader. A row settles into
+/// a fact or into a deliberate no-fact; either way nothing is owed and the
+/// question about it is answered by the reading. A row that reached neither is
+/// a row whose question is genuinely still his to answer — including a row this
+/// build cannot read, whose question stays open because no rule can settle a
+/// row nothing can test a rule against.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuestionSettlements {
+    /// Row number to what settled it. A row absent here is a row the reading
+    /// could not settle.
+    settled: BTreeMap<u32, QuestionSettlement>,
+    /// The other leg, for the rows whose pair is still open on both sides.
+    ///
+    /// Carried here rather than beside it because a caller reading a question
+    /// reads both — whether it is still waiting, and which other question is
+    /// the same decision — and two arguments threaded through the same readers
+    /// are two things that can be passed from two different readings.
+    pairs: BTreeMap<u32, MirroredPair>,
+}
+
+impl QuestionSettlements {
+    /// Fold one reading of a session into what it settled.
+    fn of(rows: &[ReadRow], mirrors: &MirroredRows) -> Self {
+        let mut settled = BTreeMap::new();
+        for read in rows {
+            // Through [`ReadRow::settlement`], which is also what the mirror
+            // pass asks one step earlier. A row that became neither a fact nor a
+            // deliberate no-fact — unreadable, or read and still ambiguous —
+            // leaves its question where it was.
+            if let Some(settlement) = read.settlement() {
+                settled.insert(read.row, settlement);
+            }
+        }
+        let mut pairs = BTreeMap::new();
+        for read in rows {
+            if let Some(pair) = mirrors.pair_of(read.row) {
+                pairs.insert(read.row, pair);
+            }
+        }
+        Self { settled, pairs }
+    }
+
+    /// Whether this question is still his to answer.
+    ///
+    /// Both halves are necessary and neither is sufficient. `is_open` alone is
+    /// the defect this type exists for. The settlement alone would read an
+    /// answer the row cannot express — a stored answer whose `resolve_with`
+    /// rejects — as a question still waiting, which would refuse the commit
+    /// forever with no call that could clear it.
+    #[must_use]
+    pub fn awaits_answer(&self, question: &ImportQuestionView) -> bool {
+        question.is_open() && !self.settled.contains_key(&question.row)
+    }
+
+    /// How many of them are.
+    #[must_use]
+    pub fn awaiting(&self, questions: &[ImportQuestionView]) -> usize {
+        questions
+            .iter()
+            .filter(|question| self.awaits_answer(question))
+            .count()
+    }
+
+    /// What settled this question, where the reading settled it and he did not.
+    ///
+    /// `None` for a question still waiting **and** for one he answered: this
+    /// says why a question stopped waiting without him, and «he answered it» is
+    /// the other reason, which the question states itself through
+    /// `answered_at`.
+    #[must_use]
+    pub fn settlement_of(&self, question: &ImportQuestionView) -> Option<&QuestionSettlement> {
+        question
+            .is_open()
+            .then(|| self.settled.get(&question.row))
+            .flatten()
+    }
+
+    /// The pair this row's question belongs to, if it belongs to one.
+    fn pair_of(&self, row: u32) -> Option<MirroredPair> {
+        self.pairs.get(&row).copied()
+    }
+}
+
+/// Take the rows the mirror pass settled out of the fact pipeline.
+///
+/// Split out of [`plan_session`] so that a reading built for any other reason
+/// is the same reading — the questions a session is waiting on are decided from
+/// rows the mirror pass has already run over, and a caller that skipped it
+/// would publish both legs of one movement as two open questions after decision
+/// 0031 said they are one.
+fn settle_mirrored(rows: &mut [ReadRow], mirrors: &MirroredRows) {
+    for read in rows.iter_mut() {
+        let Some(records) = mirrors.settled.get(&read.row).copied() else {
+            continue;
+        };
+        // Not a rejection and not a retention: the row was read, it is real,
+        // and the movement it states is already in the plan under another row.
+        // See [`NoFactReason::SecondLegOfOneMovement`].
+        read.candidate = None;
+        read.settled = Some(NoFactReason::SecondLegOfOneMovement { records });
+        read.basis = None;
+    }
+}
+
 /// Pair the rows of this session that are one movement printed twice.
 ///
 /// The whole of the reasoning is in [`iaam_ingest::mirror`]; this is the part
@@ -5847,10 +6233,22 @@ fn mirrored_rows(
     rows: &[ReadRow],
     questions: &[ImportQuestionView],
 ) -> MirroredRows {
+    // A row is open here when its question is the owner's **and** this reading
+    // settled nothing for it. Both halves, and the second is `iaam-m2oi`: the
+    // set used to be read off `is_open` alone, so a row whose counterparty his
+    // directory has since recognised — or that a standing rule of his now
+    // classifies — counted as unsettled while carrying a complete transfer, and
+    // two such rows paired as «neither side settled» instead of one recording
+    // the movement for both. The stale question used to hide that behind a
+    // refused commit; it does not any more.
     let open: BTreeSet<u32> = questions
         .iter()
         .filter(|question| question.is_open())
         .map(|question| question.row)
+        .filter(|row| {
+            rows.iter()
+                .any(|read| read.row == *row && read.settlement().is_none())
+        })
         .collect();
     let sides: Vec<MirrorSide> = rows
         .iter()
@@ -5987,18 +6385,20 @@ fn open_questions(
     directory: &AccountDirectory,
     observations: &[ImportObservationView],
     questions: &[ImportQuestionView],
-    mirrors: &MirroredRows,
+    settlements: &QuestionSettlements,
 ) -> Vec<OpenQuestion> {
     let open: Vec<&ImportQuestionView> = questions
         .iter()
-        // A question the other leg's answer already settled is not open, and
-        // publishing it as open is the second half of `iaam-3qsq`: the owner
-        // answered one leg, the commit was then refused over the mirror row's
-        // question, and answering that one too recorded the movement twice. The
-        // store still holds it unanswered, because it is settled by a reading
-        // of the whole session and not by a word of his about that row — see
-        // [`MirroredRows`].
-        .filter(|question| question.is_open() && !mirrors.settled.contains_key(&question.row))
+        // A question this session's own reading has already settled is not
+        // open, however the questions table still reads. Two things settle one
+        // without a word from the owner and they are one test here rather than
+        // two filters, because they are one fact about the row: the other leg's
+        // answer already records the movement (`iaam-3qsq`), or a standing rule
+        // of his classifies it (`iaam-m2oi`). Publishing either as open is the
+        // same defect — the commit refused over a question nothing needed
+        // answered, and one row named in `resolved` and here at once. See
+        // [`QuestionSettlements`].
+        .filter(|question| settlements.awaits_answer(question))
         .collect();
     // The stored rows, parsed once for the whole list. What each question is a
     // decision *about* and what its row printed are two answers over one
@@ -6033,7 +6433,7 @@ fn open_questions(
                     .map(|(other, _)| other.row)
                     .collect()
             }),
-            pair: mirrors.pair_of(question.row),
+            pair: settlements.pair_of(question.row),
         })
         .collect()
 }
@@ -6581,7 +6981,7 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
         };
         if let Some(contains) = sole {
             offered.push(OfferedRule {
-                question: offered_rule_question(&category, covers.len()),
+                question: offered_rule_question(&category, covers.len(), &contains),
                 matcher: RuleMatcher {
                     counterparty_account: None,
                     description_contains: None,
@@ -6700,7 +7100,56 @@ fn withheld_offer_reason(category: &str, contains: &[RowShape]) -> String {
 /// amount and no description reaches this sentence — [`row_mark`] argues that at
 /// length for the per-row prompt, and an offer covering many rows has no single
 /// row to point at anyway.
-fn offered_rule_question(category: &str, covers: usize) -> OwnerQuestion {
+///
+/// # The sentence had to become true, and three parts of it were not
+///
+/// **«Settles all N of them at once» was false, and `iaam-m2oi` is that it was.**
+/// Adopting the offer wrote the rule and recomputed the journal and touched no
+/// import question, so the rows were re-read as facts while their stored
+/// questions stayed open: the assessment named one row as resolved and as still
+/// waiting in the same response, and the commit went on refusing over questions
+/// nothing needed answered. The wall he was promised relief from was still
+/// there, and he had made a standing decision about every row like these on the
+/// strength of a sentence that was false — which is worse than never offering
+/// the rule. [`QuestionSettlements`] is what makes the clause true; this comment
+/// exists so that a later change to either is checked against the other.
+///
+/// **«The same institution» was false too.** Decision 0026 §4 refuses to scope a
+/// category condition to a source and says why at length: every handle this
+/// journal holds scopes the wrong thing, and `SourceId` is an account and a
+/// channel rather than an institution. So the rule fires on any row any source
+/// files under exactly that word, and a sentence that said «the same
+/// institution» understated the reach in the direction that costs him — it
+/// described a narrower decision than the one he was making. The clause now says
+/// what the rule does.
+///
+/// **An answer that does not fit settles nothing, and he is told so.** The rows
+/// this covers are one [`RowShape`], so an outcome either fits all of them or
+/// none: `ObservedRow::resolve` refuses a fee that arrived and income that left,
+/// and a row that refuses is a row still waiting. That is the honest shape of
+/// the risk — a wrong answer here costs him the offer and not the rows — and it
+/// is stated as a property of the answer rather than as a table of which
+/// outcomes suit which lines, which would be a structure encoded as prose
+/// (`docs/api/conventions.md` §5).
+///
+/// The direction clause is the one exception, and it is one fact rather than a
+/// mapping: where the source stated no direction, four of the five outcomes
+/// carry one themselves and `Classification::ExternalFlow` carries none, so a
+/// rule stating it leaves every row of the group at
+/// `Question::UnresolvedDirection`. Naming it is the difference between an offer
+/// that keeps its promise and one that keeps four fifths of it in silence.
+fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> OwnerQuestion {
+    // The one thing about these rows the promise depends on. Every other
+    // attribute they share is the same for all of them by construction, and this
+    // one decides whether an answer finishes them or only classifies them.
+    let undecided_direction = contains.movement.is_none();
+    let direction = if undecided_direction {
+        " These lines do not say which way the money went. Four of the five answers decide that \
+         by themselves; «money you spent» does not, so it would record what the lines were and \
+         leave them still waiting to be told which way."
+    } else {
+        ""
+    };
     OwnerQuestion {
         ask: format!(
             "Your statement files {covers} of the lines still waiting on you under «{category}». \
@@ -6709,12 +7158,18 @@ fn offered_rule_question(category: &str, covers: usize) -> OwnerQuestion {
              accounts of your own?"
         ),
         consequence: format!(
-            "One answer here settles all {covers} of them at once, and every later line the same \
-             institution files under «{category}» is settled the same way without being put to \
-             you again. That is the risk as well as the saving: a word that also covers lines you \
-             would have decided differently files those wrongly, and you will not be asked about \
-             them. Withdrawing the decision afterwards re-files every line it decided, so being \
-             wrong costs a correction rather than a line nobody ever looks at again."
+            "One answer here settles all {covers} of them at once: they stop waiting on you and \
+             are recorded as what you say they are, without being put to you one at a time. It \
+             does not stop at this statement, and it does not stop at this institution — any \
+             later line filed under exactly «{category}», by whoever sends it, is settled the \
+             same way without being put to you again. That is the risk as well as the saving: a \
+             word that also covers lines you would have decided differently files those wrongly, \
+             and you will not be asked about them. Withdrawing the decision afterwards puts back \
+             what it decided — lines still waiting in an import go back to being put to you, and \
+             lines already recorded come back as a correction for you to approve — so being \
+             wrong costs a correction rather than a line nobody ever looks at again. An answer \
+             that does not fit these lines settles none of them and takes nothing away: they \
+             stay exactly as they are.{direction}"
         ),
     }
 }
@@ -7883,7 +8338,7 @@ mod tests {
             &no_accounts(),
             &observations,
             &questions,
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         assert_eq!(open[0].alike, vec![2]);
         assert_eq!(open[1].alike, vec![1]);
@@ -7920,7 +8375,7 @@ mod tests {
             &no_accounts(),
             &observations,
             &questions,
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         assert!(open[0].alike.is_empty(), "{open:?}");
         assert!(open[1].alike.is_empty(), "{open:?}");
@@ -7954,7 +8409,7 @@ mod tests {
             &no_accounts(),
             &observations,
             &questions,
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         assert!(open[0].alike.is_empty());
         assert!(open[1].alike.is_empty());
@@ -7982,7 +8437,7 @@ mod tests {
             &no_accounts(),
             &observations,
             &questions,
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         assert_eq!(open.len(), 1, "{open:?}");
         assert!(open[0].alike.is_empty(), "{open:?}");
@@ -8015,7 +8470,7 @@ mod tests {
             &no_accounts(),
             &observations,
             &questions,
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         assert!(open[0].alike.is_empty(), "{open:?}");
         assert!(
@@ -8071,6 +8526,18 @@ mod tests {
         }
     }
 
+    /// The settlements one reading of these rows yields, exactly as
+    /// [`SessionReading`] computes them.
+    ///
+    /// The mirror pass is applied to the rows first and the fold comes after,
+    /// in that order and through the same two functions the plan uses: a test
+    /// that folded before the pass would assert against a reading no caller can
+    /// ever get.
+    fn settlements(rows: &mut [ReadRow], mirrors: &MirroredRows) -> QuestionSettlements {
+        settle_mirrored(rows, mirrors);
+        QuestionSettlements::of(rows, mirrors)
+    }
+
     /// The two rows one movement between two of the owner's accounts prints.
     fn two_legs(main: AccountId, savings: AccountId) -> (ObservedRow, ObservedRow) {
         let day = time::macros::date!(2025 - 04 - 10);
@@ -8122,7 +8589,7 @@ mod tests {
         let main = account(1);
         let savings = account(2);
         let (departure, arrival) = two_legs(main, savings);
-        let rows = vec![
+        let mut rows = vec![
             read_row(
                 1,
                 &departure,
@@ -8136,9 +8603,10 @@ mod tests {
         )];
         let mirrors = mirrored_rows(ImportSessionId::new_random(), &rows, &questions);
         assert_eq!(mirrors.settled.get(&2), Some(&1));
+        let settled = settlements(&mut rows, &mirrors);
         let observations = vec![stored_row(2, &arrival)];
         assert!(
-            open_questions(&no_accounts(), &observations, &questions, &mirrors).is_empty(),
+            open_questions(&no_accounts(), &observations, &questions, &settled).is_empty(),
             "the answer to the other leg is the answer to this row"
         );
     }
@@ -8150,7 +8618,7 @@ mod tests {
         let main = account(1);
         let savings = account(2);
         let (departure, arrival) = two_legs(main, savings);
-        let rows = vec![read_row(1, &departure, None), read_row(2, &arrival, None)];
+        let mut rows = vec![read_row(1, &departure, None), read_row(2, &arrival, None)];
         let questions = vec![
             stored_question_about(1, &Question::IsOutflowAFee { account: main }),
             stored_question_about(2, &Question::IsInflowIncome { account: savings }),
@@ -8160,8 +8628,9 @@ mod tests {
             mirrors.settled.is_empty(),
             "a shape is not an answer, so nothing is recorded and nothing is suppressed"
         );
+        let settled = settlements(&mut rows, &mirrors);
         let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
-        let open = open_questions(&no_accounts(), &observations, &questions, &mirrors);
+        let open = open_questions(&no_accounts(), &observations, &questions, &settled);
         assert_eq!(open.len(), 2);
         let (first, second) = (
             open[0].pair.expect("the departure is one side of a pair"),
@@ -8186,7 +8655,7 @@ mod tests {
         let main = account(1);
         let savings = account(2);
         let (departure, arrival) = two_legs(main, savings);
-        let rows = vec![
+        let mut rows = vec![
             read_row(1, &departure, Some(Answer::Paid)),
             read_row(2, &arrival, None),
         ];
@@ -8196,9 +8665,10 @@ mod tests {
         )];
         let mirrors = mirrored_rows(ImportSessionId::new_random(), &rows, &questions);
         assert!(mirrors.settled.is_empty(), "{mirrors:?}");
+        let settled = settlements(&mut rows, &mirrors);
         let observations = vec![stored_row(2, &arrival)];
         assert_eq!(
-            open_questions(&no_accounts(), &observations, &questions, &mirrors).len(),
+            open_questions(&no_accounts(), &observations, &questions, &settled).len(),
             1,
             "and the arrival still has to be answered on its own"
         );
@@ -8414,6 +8884,18 @@ mod tests {
         assert_eq!(offered[0].covers, vec![2], "{offered:?}");
     }
 
+    /// One shape a word's rows can all have, for a test about the sentence.
+    ///
+    /// The rows themselves are not the subject here — the sentence is — so the
+    /// list is empty and the two attributes that decide the wording are stated.
+    fn shape_of(movement: Option<Movement>, counterparty_named: bool) -> RowShape {
+        RowShape {
+            movement,
+            counterparty_named,
+            rows: Vec::new(),
+        }
+    }
+
     /// The offer is put to the owner in his words, and says what turns on it.
     ///
     /// Decision 0027's register, checked the mechanical way it is checked in the
@@ -8422,7 +8904,7 @@ mod tests {
     /// and another rather than that the decision is his.
     #[test]
     fn an_offer_is_worded_for_a_person_and_says_what_his_answer_changes() {
-        let question = offered_rule_question("Groceries", 3);
+        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
         for internal in [
             "source_category",
             "matcher",
@@ -8450,6 +8932,89 @@ mod tests {
         assert!(
             question.consequence.contains("wrongly"),
             "and what it costs to be wrong, which is the half that gets dropped: {}",
+            question.consequence
+        );
+    }
+
+    /// The offer does not confine the decision to the institution that sent
+    /// these lines.
+    ///
+    /// Decision 0026 §4 refuses to scope a category condition to a source and
+    /// argues it at length: the rule fires on any row any source files under
+    /// exactly that word. The sentence used to say «the same institution», which
+    /// described a narrower standing decision than the one he was making — and
+    /// the whole purpose of the consequence clause is that he reads what he is
+    /// actually deciding.
+    #[test]
+    fn an_offer_says_the_decision_is_not_held_to_the_institution_that_sent_the_lines() {
+        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        assert!(
+            !question.consequence.contains("the same institution"),
+            "which is what it used to promise and is not what the rule does: {}",
+            question.consequence
+        );
+        assert!(
+            question
+                .consequence
+                .contains("does not stop at this institution"),
+            "and it says so, because he is deciding for every source: {}",
+            question.consequence
+        );
+    }
+
+    /// Where the lines say which way the money went, every answer finishes them.
+    ///
+    /// So there is no caveat, and its absence is asserted: a sentence that
+    /// warned about direction on rows that state one would be teaching him to
+    /// skip the warning that matters.
+    #[test]
+    fn an_offer_on_lines_that_state_a_direction_carries_no_caveat_about_direction() {
+        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        assert!(
+            !question.consequence.contains("which way the money went"),
+            "these lines say which way, so nothing about direction is open: {}",
+            question.consequence
+        );
+    }
+
+    /// Where they do not, the one answer that leaves them waiting is named.
+    ///
+    /// `Classification::ExternalFlow` carries no direction of its own and the
+    /// rows carry none either, so a rule stating it settles the classification
+    /// and leaves every row at `Question::UnresolvedDirection` — still waiting,
+    /// after the one act that was supposed to end the waiting. The other four
+    /// outcomes the offer names decide a direction themselves.
+    #[test]
+    fn an_offer_on_lines_that_state_no_direction_says_which_answer_does_not_finish_them() {
+        let question = offered_rule_question("Groceries", 3, &shape_of(None, false));
+        assert!(
+            question.consequence.contains("which way the money went"),
+            "the lines do not say, and that decides whether the offer keeps its \
+             promise: {}",
+            question.consequence
+        );
+        assert!(
+            question.consequence.contains("«money you spent»"),
+            "and the answer that would leave them waiting is named, in the words \
+             the question itself put to him: {}",
+            question.consequence
+        );
+    }
+
+    /// An answer that does not fit the lines settles none of them and costs him
+    /// nothing.
+    ///
+    /// One [`RowShape`] means one outcome for all of them: `ObservedRow::resolve`
+    /// refuses a fee that arrived and income that left, so a mismatched rule
+    /// leaves every row of the group exactly where it was. That is the honest
+    /// shape of the risk and it is stated, because «settles all of them at once»
+    /// read alone invites him to expect the rows to move whatever he says.
+    #[test]
+    fn an_offer_says_a_wrong_answer_settles_none_of_the_lines_rather_than_some() {
+        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::In), false));
+        assert!(
+            question.consequence.contains("settles none of them"),
+            "all or none, never some: {}",
             question.consequence
         );
     }
@@ -8656,7 +9221,7 @@ mod tests {
             &no_accounts(),
             &observations,
             &questions,
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         let printed = open[0].printed.as_ref().expect("the row it is about");
         assert_eq!(printed.account, main);
@@ -8691,7 +9256,7 @@ mod tests {
             &no_accounts(),
             &[stored_row(1, &observed)],
             &[stored_question_about(1, &asked)],
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         let printed = open[0].printed.as_ref().expect("the row it is about");
         assert_eq!(printed.movement, None);
@@ -8718,7 +9283,7 @@ mod tests {
             &no_accounts(),
             &[stored],
             &[stored_question_about(1, &asked)],
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         assert_eq!(open[0].printed, None);
         assert!(
@@ -8759,7 +9324,7 @@ mod tests {
             &directory,
             &observations,
             &questions,
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         let accounts = answer_accounts(&directory, &open);
         assert_eq!(accounts.len(), 2, "{accounts:?}");
@@ -8795,7 +9360,7 @@ mod tests {
                 &anonymous(row(main, "Shop One", None), -1_000),
             )],
             &[stored_question_about(1, &asked)],
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         assert!(
             open[0]
@@ -8830,7 +9395,7 @@ mod tests {
             &directory,
             &[stored_row(1, &row(main, "Shop One", None))],
             &[stored_question_about(1, &asked)],
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         let printed = open[0].printed.as_ref().expect("the row it is about");
         assert_eq!(
@@ -8861,7 +9426,7 @@ mod tests {
             &no_accounts(),
             &[stored_row(1, &row(main, "Shop One", None))],
             &[stored_question_about(1, &asked)],
-            &MirroredRows::default(),
+            &QuestionSettlements::default(),
         );
         let printed = open[0].printed.as_ref().expect("the row it is about");
         assert_eq!(printed.account, main, "which is still addressable");
@@ -8886,14 +9451,15 @@ mod tests {
         let main = account(1);
         let savings = account(2);
         let (departure, arrival) = two_legs(main, savings);
-        let rows = vec![read_row(1, &departure, None), read_row(2, &arrival, None)];
+        let mut rows = vec![read_row(1, &departure, None), read_row(2, &arrival, None)];
         let questions = vec![
             stored_question_about(1, &Question::IsOutflowAFee { account: main }),
             stored_question_about(2, &Question::IsInflowIncome { account: savings }),
         ];
         let mirrors = mirrored_rows(ImportSessionId::new_random(), &rows, &questions);
+        let settled = settlements(&mut rows, &mirrors);
         let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
-        let open = open_questions(&no_accounts(), &observations, &questions, &mirrors);
+        let open = open_questions(&no_accounts(), &observations, &questions, &settled);
         let (first, second) = (
             open[0].pair.expect("the departure is one side"),
             open[1].pair.expect("the arrival is the other"),
@@ -8908,6 +9474,413 @@ mod tests {
             first.row, open[0].row,
             "never its own row, which would say a row pairs with itself"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A question a standing rule settles stops being open (iaam-m2oi)
+    // -----------------------------------------------------------------------
+
+    /// One row as [`SessionReading`] reads it: through [`resolution_of`],
+    /// against the owner's directory and rules as they stand now.
+    ///
+    /// The one helper these tests share, because the whole claim under test is
+    /// that «still waiting on him» is decided by the reading and by nothing
+    /// else. A helper that set `settled` or `basis` by hand would assert
+    /// against a state no reading produces.
+    fn read_against(row: u32, observed: &ObservedRow, resolver: &Resolver) -> ReadRow {
+        let observation = stored_row(row, observed);
+        let resolution = resolution_of(&observation, resolver);
+        let settled = match &resolution {
+            Ok(RowResolution::NoFact(reason)) => Some(*reason),
+            Ok(RowResolution::Fact { .. }) | Err(_) => None,
+        };
+        let basis = match &resolution {
+            Ok(RowResolution::Fact { basis, .. }) => Some(basis.clone()),
+            Ok(RowResolution::NoFact(_)) | Err(_) => None,
+        };
+        let candidate = match resolution {
+            Ok(RowResolution::Fact { operation, .. }) => Some(
+                normalize(
+                    &operation,
+                    &NormalizationContext {
+                        owner: OwnerId(uuid::Uuid::from_bytes([9; 16])),
+                        source: SourceId(uuid::Uuid::from_bytes([9; 16])),
+                        parser_version: ParserVersion("ingest/manual/1".to_owned()),
+                    },
+                )
+                .map(|normalized| normalized.event),
+            ),
+            Ok(RowResolution::NoFact(_)) => None,
+            Err(rejection) => Some(Err(rejection)),
+        };
+        ReadRow {
+            row,
+            intake: Some(Intake::Observed {
+                row: Box::new(observed.clone()),
+                reader: None,
+            }),
+            operation: None,
+            row_key: None,
+            payload: observation.payload,
+            candidate,
+            settled,
+            basis,
+        }
+    }
+
+    /// The standing decision the owner adopts when he takes the offer: anything
+    /// this source filed under one of its own words is money that left the
+    /// perimeter.
+    fn rule_on_category(category: &str) -> ClassificationRule {
+        ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: None,
+                description_contains: None,
+                kind: None,
+                source_category: Some(category.to_owned()),
+            },
+            outcome: Classification::ExternalFlow,
+        }
+    }
+
+    /// Adopting the rule the session offered stops the questions it covers from
+    /// waiting on him.
+    ///
+    /// **The bead.** Questions are recorded at intake and the rule is written
+    /// afterwards, so nothing about the stored question changes: `answered_at`
+    /// stays empty for ever, because he never answered it. Read off that column
+    /// the session was as blocked after the one act that was meant to replace
+    /// hundreds of answers as it was before it, and the offer's own sentence
+    /// told him the opposite.
+    #[test]
+    fn a_question_a_standing_rule_settles_no_longer_waits_on_the_owner() {
+        let main = account(1);
+        let observed = filed_under(
+            row(main, "Shop One", Some(date!(2025 - 04 - 10))),
+            "Groceries",
+        );
+        let questions = vec![stored_question_about(
+            1,
+            &Question::IsTransferInternal {
+                account: main,
+                counterparty: "Shop One".to_owned(),
+            },
+        )];
+        let observations = vec![stored_row(1, &observed)];
+
+        let before = ruled(vec![detail(main, "Main")], Vec::new());
+        let mut rows = vec![read_against(1, &observed, &before)];
+        let settled = settlements(&mut rows, &MirroredRows::default());
+        assert_eq!(
+            settled.awaiting(&questions),
+            1,
+            "with no rule the row is his to decide"
+        );
+
+        let after = ruled(
+            vec![detail(main, "Main")],
+            vec![rule_on_category("Groceries")],
+        );
+        let mut rows = vec![read_against(1, &observed, &after)];
+        let settled = settlements(&mut rows, &MirroredRows::default());
+        assert_eq!(
+            settled.awaiting(&questions),
+            0,
+            "and with it the question is answered by his own standing decision"
+        );
+        assert!(
+            open_questions(&no_accounts(), &observations, &questions, &settled).is_empty(),
+            "so it is not published as one he still has to answer"
+        );
+    }
+
+    /// The row is in one list and not in both.
+    ///
+    /// Decision 0032 §1 says the resolved rows and the open questions are
+    /// disjoint by construction, and they were not: the row produced a planned
+    /// fact and its stored question was published beside it, so a caller
+    /// totalling the assessment counted one row as decided and as outstanding
+    /// at once.
+    #[test]
+    fn a_row_a_rule_settles_produces_a_fact_and_no_open_question() {
+        let main = account(1);
+        let observed = filed_under(
+            row(main, "Shop One", Some(date!(2025 - 04 - 10))),
+            "Groceries",
+        );
+        let questions = vec![stored_question_about(
+            1,
+            &Question::IsTransferInternal {
+                account: main,
+                counterparty: "Shop One".to_owned(),
+            },
+        )];
+        let resolver = ruled(
+            vec![detail(main, "Main")],
+            vec![rule_on_category("Groceries")],
+        );
+        let mut rows = vec![read_against(1, &observed, &resolver)];
+        assert!(
+            matches!(rows[0].candidate, Some(Ok(_))),
+            "the row becomes a fact: {:?}",
+            rows[0].candidate
+        );
+        let settled = settlements(&mut rows, &MirroredRows::default());
+        assert!(
+            open_questions(
+                &no_accounts(),
+                &[stored_row(1, &observed)],
+                &questions,
+                &settled
+            )
+            .is_empty(),
+            "and is therefore in neither the other list"
+        );
+    }
+
+    /// What settled it is the word the assessment puts on the same row.
+    ///
+    /// One vocabulary and not two: a caller that reads the question and the
+    /// planned fact reads one determination twice.
+    #[test]
+    fn a_settled_question_names_the_rule_in_the_words_the_fact_uses() {
+        let main = account(1);
+        let observed = filed_under(
+            row(main, "Shop One", Some(date!(2025 - 04 - 10))),
+            "Groceries",
+        );
+        let question = stored_question_about(
+            1,
+            &Question::IsTransferInternal {
+                account: main,
+                counterparty: "Shop One".to_owned(),
+            },
+        );
+        let resolver = ruled(
+            vec![detail(main, "Main")],
+            vec![rule_on_category("Groceries")],
+        );
+        let mut rows = vec![read_against(1, &observed, &resolver)];
+        let settled = settlements(&mut rows, &MirroredRows::default());
+        let settlement = settled
+            .settlement_of(&question)
+            .expect("the reading settled it");
+        assert_eq!(settlement.code(), "rule");
+        assert_eq!(
+            settlement.code(),
+            rows[0]
+                .basis
+                .as_ref()
+                .expect("the row was settled into a fact")
+                .code(),
+            "the question and the fact say the same word about the same row"
+        );
+        assert!(
+            question.answered_at.is_none(),
+            "and it is still not a question he answered, which is the distinction"
+        );
+    }
+
+    /// The mirror pass reaches the same readers through the same fold.
+    ///
+    /// Decision 0031's settlement was the first «settled by something other
+    /// than its own answer», and it was filtered out of the published questions
+    /// by a test of its own that no other reader shared. Both now go through
+    /// [`QuestionSettlements`], so a reader that learns one learns the other.
+    #[test]
+    fn the_other_leg_of_one_movement_settles_a_question_through_the_same_fold() {
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let mut rows = vec![
+            read_row(
+                1,
+                &departure,
+                Some(Answer::SentToOwnAccount { to: savings }),
+            ),
+            read_row(2, &arrival, None),
+        ];
+        let question = stored_question_about(2, &Question::IsInflowIncome { account: savings });
+        let mirrors = mirrored_rows(
+            ImportSessionId::new_random(),
+            &rows,
+            std::slice::from_ref(&question),
+        );
+        let settled = settlements(&mut rows, &mirrors);
+        assert_eq!(
+            settled
+                .settlement_of(&question)
+                .expect("the other leg settled it")
+                .code(),
+            "second_leg_of_one_movement",
+            "the word decision 0031 already had, and not a second one for questions"
+        );
+        assert_eq!(settled.awaiting(std::slice::from_ref(&question)), 0);
+    }
+
+    /// A movement his directory now recognises on both rows is still one fact.
+    ///
+    /// **The regression this decision could have caused, caught here.** Both
+    /// rows carry a question recorded at intake, when the directory could not
+    /// place the name the source printed. He then creates the account — or gives
+    /// one of his an alias — and both rows resolve into complete transfers, each
+    /// carrying a leg on each account, while their stored questions keep their
+    /// empty `answered_at` for ever.
+    ///
+    /// The mirror pass used to read those questions to decide which side of a
+    /// pair was already a fact, and answered «neither», so nothing was
+    /// suppressed and both rows would have committed — the movement twice, which
+    /// is what decision 0031 exists to prevent. It was hidden by the commit
+    /// refusing over the two stale questions. It does not refuse over them any
+    /// more, so the pass asks the reading instead, through the one predicate
+    /// every other reader of «settled» asks.
+    #[test]
+    fn two_legs_the_directory_now_places_are_one_fact_although_both_questions_stand() {
+        let main = account(1);
+        let savings = account(2);
+        let day = date!(2025 - 04 - 10);
+        let departure = row(main, "Savings", Some(day));
+        let arrival = arriving(row(savings, "Main", Some(day)));
+        // The directory as it stands now: both names place, which is what makes
+        // each row a complete transfer without a word from him.
+        let directory = resolver(vec![detail(main, "Main"), detail(savings, "Savings")]);
+        let rows = vec![
+            read_against(1, &departure, &directory),
+            read_against(2, &arrival, &directory),
+        ];
+        // The questions recorded before either name placed, and never answered.
+        let questions = vec![
+            stored_question_about(
+                1,
+                &Question::IsTransferInternal {
+                    account: main,
+                    counterparty: "Savings".to_owned(),
+                },
+            ),
+            stored_question_about(
+                2,
+                &Question::IsTransferInternal {
+                    account: savings,
+                    counterparty: "Main".to_owned(),
+                },
+            ),
+        ];
+
+        let mirrors = mirrored_rows(ImportSessionId::new_random(), &rows, &questions);
+        assert_eq!(
+            mirrors.settled.get(&2),
+            Some(&1),
+            "the arrival records nothing: the departure already carries a leg on \
+             each account"
+        );
+        assert!(
+            mirrors.open.is_empty(),
+            "and nothing is published as a decision he still has to make: {mirrors:?}"
+        );
+
+        let mut rows = rows;
+        let settled = settlements(&mut rows, &mirrors);
+        assert_eq!(
+            settled.awaiting(&questions),
+            0,
+            "so the commit is not refused over two questions nothing needs"
+        );
+        assert_eq!(
+            settled
+                .settlement_of(&questions[1])
+                .expect("the other leg settled it")
+                .code(),
+            "second_leg_of_one_movement"
+        );
+    }
+
+    /// Retiring the rule puts the question back.
+    ///
+    /// **Why this is the right behaviour and not a regression.** The row was
+    /// never decided by him; it was decided by a standing rule of his, and
+    /// withdrawing the rule withdraws the decision. Something has to happen to
+    /// the row, and the two candidates are «it comes back as a question» and
+    /// «it stays settled by a rule that no longer exists» — the second is a
+    /// decision nobody made still classifying his money.
+    ///
+    /// **And it is free, which is the argument for deciding this at read time.**
+    /// Nothing compensates, nothing is un-retired, and `retire_rule` — which
+    /// lives in another scenario and knows nothing about import sessions — needs
+    /// no knowledge of them: the next reading finds no rule, the row assesses as
+    /// ambiguous again, and the question is waiting again. A settlement recorded
+    /// in the questions table would need a second write across a port boundary
+    /// with no transaction spanning the two, which is the shape `iaam-77hk` was
+    /// filed on.
+    ///
+    /// A row already committed is not this case and does not come back: it is a
+    /// fact in the journal, and retiring the rule replans it as a correction the
+    /// owner approves. The session it came from is closed and does not reopen.
+    #[test]
+    fn retiring_the_rule_that_settled_a_question_puts_the_question_back() {
+        let main = account(1);
+        let observed = filed_under(
+            row(main, "Shop One", Some(date!(2025 - 04 - 10))),
+            "Groceries",
+        );
+        let question = stored_question_about(
+            1,
+            &Question::IsTransferInternal {
+                account: main,
+                counterparty: "Shop One".to_owned(),
+            },
+        );
+        // `Resolver::load` holds only the rules that are not retired, so a
+        // retired rule is a rule that is not here.
+        let retired = ruled(vec![detail(main, "Main")], Vec::new());
+        let mut rows = vec![read_against(1, &observed, &retired)];
+        let settled = settlements(&mut rows, &MirroredRows::default());
+        assert_eq!(
+            settled.awaiting(std::slice::from_ref(&question)),
+            1,
+            "the decision was withdrawn, so the row is his to decide again"
+        );
+        assert!(
+            settled.settlement_of(&question).is_none(),
+            "and nothing claims to have settled it"
+        );
+    }
+
+    /// An answer he gave outranks a rule, and the question stays answered.
+    ///
+    /// `resolution_of` reads the stored answer before it consults the rules at
+    /// all, so a row he spoke about is settled by his word whatever his rules
+    /// say about it. The published settlement must not overwrite that: what he
+    /// said is on the question, and this field is for the questions he never
+    /// answered.
+    #[test]
+    fn a_question_he_answered_is_not_reported_as_settled_by_something_else() {
+        let main = account(1);
+        let observed = filed_under(
+            row(main, "Shop One", Some(date!(2025 - 04 - 10))),
+            "Groceries",
+        );
+        let mut question = stored_question_about(
+            1,
+            &Question::IsTransferInternal {
+                account: main,
+                counterparty: "Shop One".to_owned(),
+            },
+        );
+        question.answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        question.answer = Some(serde_json::to_string(&Answer::Paid).expect("an answer"));
+        let resolver = ruled(
+            vec![detail(main, "Main")],
+            vec![rule_on_category("Groceries")],
+        );
+        let mut rows = vec![read_against(1, &observed, &resolver)];
+        let settled = settlements(&mut rows, &MirroredRows::default());
+        assert!(
+            settled.settlement_of(&question).is_none(),
+            "he answered it; nothing else has to explain why it stopped waiting"
+        );
+        assert_eq!(settled.awaiting(std::slice::from_ref(&question)), 0);
     }
 
     // -----------------------------------------------------------------------

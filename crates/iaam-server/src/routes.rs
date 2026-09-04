@@ -4162,10 +4162,17 @@ fn session_contents_dto(
             .iter()
             .map(ImportQuestionDto::from_domain)
             .collect(),
-        unanswered: contents
-            .questions
+        // Folded over the questions **as this response publishes them**, and not
+        // over the stored views a second time (`iaam-m2oi`). `is_open` reads
+        // one column of the questions table and answers «he never answered
+        // it», which stopped being the same thing as «it is still waiting on
+        // him» the moment a standing rule of his could settle the row: the
+        // count named a wall that was no longer there, in the same response
+        // whose questions said the rows were settled. One reading, so the
+        // figure and the list it summarises cannot disagree.
+        unanswered: questions
             .iter()
-            .filter(|question| question.is_open())
+            .filter(|question| question.awaits_answer())
             .count(),
         control_figures: contents
             .control_figures

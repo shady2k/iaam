@@ -156,8 +156,8 @@ retire it afterwards.
 ### One decision, many lines
 
 A statement names one shop on thirty lines and every one is the same question.
-Each unanswered question lists the other rows of that session raising **the same
-decision**, so you never work the grouping out by reading the prompts. Empty
+Each question still waiting lists the other rows of that session raising **the
+same decision**, so you never work the grouping out by reading the prompts. Empty
 means the decision is asked once.
 
 Two rows are the same decision only when the source also said the money ran the
@@ -167,8 +167,10 @@ arrival as a departure — in the very figure his report is read for. The system
 will not group those two, and neither should you.
 
 An answer can be told to reach all of them. Say so on the answer, and every
-question still open in that session which is the same decision is settled with
-it, in one call. The response names the other rows it settled; telling him which
+question that session is still waiting on which is the same decision is settled
+with it, in one call. It reaches exactly the rows the assessment listed beside
+the question and no others — a row a standing rule of his has already settled is
+not among them, because it is not waiting. The response names the other rows it settled; telling him which
 row he decided and which were decided with it is your job, not the response's.
 
 **Read what that does and does not claim.** It settles rows already in one
@@ -188,10 +190,29 @@ document says so: an institution files hundreds of counterparties under a dozen
 of its own words.
 
 The assessment publishes them in `offered_rules`. Per word the institution filed
-still-unanswered rows under, it gives the count, the rows, and the question to
-put to him in two parts. Read both to him: the second is where the risk is,
-because one answer settles every line filed that way, this month's and every
-later one.
+still-waiting rows under, it gives the count, the rows, and the question to put
+to him in two parts. Read both to him: the second is where the risk is, because
+one answer settles every line filed that way, this month's and every later one —
+and not only from this institution. A condition on the source's own word is
+scoped to nothing, so any later line any source files under exactly that word is
+settled the same way. That is the saving and it is the risk, and the sentence
+published with the offer says so; read it out rather than summarising it.
+
+**Adopting it removes the questions it covers, and you can see that it did.**
+Send the rule he decided on, then read the assessment again: the rows it matched
+move out of `open_questions` and into `resolved`, each saying `rule` as what
+settled it, and the count of what is waiting drops by exactly those rows. Nothing
+else has to be done to them and nothing else may be — do not answer the questions
+one by one afterwards to «finish the job», because there is no job left and each
+answer would record a decision he already made in one act.
+
+If a row he expected to be covered is still waiting, the answer he chose does not
+fit those lines. That is the whole of what went wrong: they settle all together
+or not at all, they are unchanged, and he can retire the rule and choose again.
+The commonest case is lines whose source stated no direction — an outcome that
+says only what the money was and nothing about which way it went leaves them
+exactly where they were, and the offer's own sentence names that answer when the
+lines are of that kind.
 
 What it publishes is the **condition** and never the outcome. What the lines have
 in common is a fact about his document; what they *are* is his decision, and it
@@ -252,9 +273,23 @@ Everything else follows from two properties:
   first costs nothing, and the second is a retraction that every report the
   owner has already read will stop counting.
 
-A session refuses to commit while any of its questions is unanswered. That
-refusal is the point of it: committing with a question open records exactly the
-guess the question exists to prevent.
+A session refuses to commit while any of its questions is still waiting on him.
+That refusal is the point of it: committing with a question open records exactly
+the guess the question exists to prevent.
+
+**«Still waiting on him» is not «he has not answered it».** A question can stop
+waiting without him ever answering it: a standing rule of his settles the row,
+his account directory recognises the party the source printed, or another row of
+the same session already records the movement. In every one of those the question
+keeps an empty `answered_at` for ever, because he never spoke about that row —
+and it needs nothing from him.
+
+So do not decide what is outstanding from `answered_at`. The session states the
+count directly, and each question says what settled it in `settled_without_answer`
+where something did, using the same word the assessment puts on the row and a
+sentence to read out beside it. A question carrying that word is one you must not
+put to him: it is a decision of his own, already made, coming back to him as a
+question.
 
 **A session you opened and did not end is not finished, and you do not have to
 remember it.** A session holding rows that has been neither committed nor
@@ -265,9 +300,16 @@ no journal and therefore in no report, with nothing on any figure saying so.
 
 Read that item rather than concluding from a quiet queue that the import landed —
 that conclusion is how the same statement gets imported twice. The item and the
-session listing both say how much is held and how much is unanswered, so neither
-costs a request per session. Abandoning closes the item as completely as
-committing: both end the session, which is what the item is about.
+session listing both say how much is held and how many questions have no answer
+recorded, so neither costs a request per session. Abandoning closes the item as
+completely as committing: both end the session, which is what the item is about.
+
+**That figure is the never-answered count and not the waiting count**, and the
+two differ where a standing rule of his has settled rows since the questions were
+recorded. It is never too small, so it is safe to act on as «this session may
+still need him»; it can be too large, so never read it out to him as how much is
+left. The session itself gives the count that is waiting, and the questions say
+which of them are settled and by what.
 
 A report can still be asked what the answer would look like with a session's
 rows in it, and it will not do so unless asked. Every report takes a `held`
@@ -277,8 +319,8 @@ include. The answer carries `held_rows` back: which sessions it folded, which
 reading of each one it folded, and how many held rows produced no fact at all.
 
 Read that last count before quoting any figure computed this way. A row whose
-question is unanswered becomes nothing, so such a figure is short by exactly the
-rows nobody has ruled on. Quote the count beside the number, never instead of it.
+question is still waiting becomes nothing, so such a figure is short by exactly
+the rows nobody has ruled on. Quote the count beside the number, never instead of it.
 
 Naming a session that has already committed is allowed and changes nothing: its
 rows are in the journal, so the answer says `already_in_journal` and counts them

@@ -152,6 +152,14 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         | OperationKey::RecordAccountTransferPartners
         | OperationKey::RecordAccountScope
         | OperationKey::RecordAccountRetirement => Scope::Owner,
+        // The same bullet, and the standing part of it is what decides the
+        // floor: a name declared not to be his account is a statement about
+        // every future statement that prints it, not about the records already
+        // refused. Next month's export prints the same counterparty, and this is
+        // the sentence that says it is still nobody's account of his. It is also
+        // the only thing keeping those records refused deliberately rather than
+        // provisionally, which is not a distinction an agent may draw for him.
+        OperationKey::RecordAccountNameDisposition => Scope::Owner,
         // A control balance is the owner's own statement of what an account
         // held, and reconciliation is computed against it: conventions §4.3,
         // «Record a control balance».
@@ -671,6 +679,48 @@ pub struct UnresolvedAccountView {
     pub records: u32,
 }
 
+/// The institution whose document printed a name this instance could not place.
+///
+/// **A join, not a fact anybody had to record twice** (`iaam-9i83`). The reading
+/// already wrote which document it was reading, and the kept document already
+/// carries who printed it, because the scenario that keeps a document read
+/// through a source profile writes that profile's own `issuer` beside the bytes.
+/// What was missing was that nothing asked the two questions together.
+///
+/// It is here so that the queue can **mint** the label that scopes a printed
+/// identifier instead of asking the owner to invent one. `provider`'s only
+/// property is that it differs between sources; a person cannot get such a value
+/// right in an interesting way, gains nothing by choosing it, and must then
+/// remember it forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedAccountSourceView {
+    /// SHA-256 of the document, in hexadecimal — the same name
+    /// [`UnresolvedAccountView::document_hash`] carries, and what joins the two.
+    pub document_hash: String,
+    /// The institution the profile that read the document declares it is from.
+    pub issuer: String,
+}
+
+/// One name the owner has said is not an account of his, with his reason.
+///
+/// **A decision and never a verdict about his directory** (`iaam-mk1n`).
+/// Whether the string still names no account of his is asked wherever this is
+/// read, against the accounts as they then stand; this says only that he was
+/// asked and answered. An account he creates afterwards that answers to the
+/// string beats it outright, and nothing here is consulted while it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclinedAccountNameView {
+    /// The cell as a document printed it.
+    pub printed: String,
+    /// His own sentence saying what the name is, since it is not an account.
+    ///
+    /// Required, for the reason [`AccountScopeExclusionView`]'s is: a name ruled
+    /// out without one is indistinguishable, a year later, from a name nobody
+    /// ever got round to — and here the records printed under it stay refused on
+    /// the strength of it.
+    pub reason: String,
+}
+
 /// Store for facts and reference data.
 #[async_trait]
 pub trait Store: Send + Sync {
@@ -800,6 +850,36 @@ pub trait Store: Send + Sync {
         &self,
         owner: OwnerId,
         account: AccountId,
+    ) -> Result<(), AppError>;
+
+    /// Every printed name the owner has said is no account of his, with his
+    /// reason (`iaam-mk1n`).
+    ///
+    /// Read beside the names his documents printed and never instead of them:
+    /// this says what he decided, and the directory says what is true now. The
+    /// second beats the first, so a name an account answers to raises nothing
+    /// whether or not a statement stands against it.
+    async fn list_declined_account_names(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<DeclinedAccountNameView>, AppError>;
+
+    /// Record, or replace, that statement for one printed name.
+    ///
+    /// Per owner and per string, not per document: the same counterparty is
+    /// printed again in next month's statement, and a statement keyed on the
+    /// reading would ask him about it every month.
+    async fn decline_account_name(
+        &self,
+        owner: OwnerId,
+        declined: DeclinedAccountNameView,
+    ) -> Result<(), AppError>;
+
+    /// Withdraw it, returning the name to being asked about.
+    async fn withdraw_declined_account_name(
+        &self,
+        owner: OwnerId,
+        printed: String,
     ) -> Result<(), AppError>;
 
     /// The products the owner has said ceased to exist, and the revision his
@@ -942,6 +1022,22 @@ pub trait Store: Send + Sync {
         &self,
         owner: OwnerId,
     ) -> Result<Vec<UnresolvedAccountView>, AppError>;
+
+    /// Who printed each of those names, by the document that printed it.
+    ///
+    /// The join the reading did not have to do and the queue does
+    /// (`iaam-9i83`). It is asked separately from the names themselves because
+    /// they answer different questions and a caller wanting one should not pay
+    /// for the other: the assessment of an import session wants the names, and
+    /// only the queue — which mints the label that scopes a printed identifier —
+    /// wants the institution.
+    ///
+    /// A name whose document this instance no longer keeps is simply absent
+    /// here, and the caller learns that as an absence rather than as a guess.
+    async fn list_unresolved_account_sources(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<UnresolvedAccountSourceView>, AppError>;
 
     async fn find_principal(&self, token_hash: String) -> Result<Option<Principal>, AppError>;
     async fn record_token_use(
@@ -1915,6 +2011,7 @@ mod tests {
             OperationKey::RecordAccountTransferPartners,
             OperationKey::RecordAccountScope,
             OperationKey::RecordAccountRetirement,
+            OperationKey::RecordAccountNameDisposition,
             OperationKey::SubmitCorrections,
         ] {
             assert_eq!(

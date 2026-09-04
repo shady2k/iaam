@@ -79,6 +79,31 @@ pub enum OperationKey {
     /// one that stands is refused, so the remedy is the withdrawal and never a
     /// repetition of the act that produced the caveat.
     RecordAccountRetirement,
+    /// Record, or withdraw, the owner's statement that a name a document
+    /// printed is not an account of his (`iaam-mk1n`).
+    ///
+    /// **The answer the queue could not represent.** A statement names accounts
+    /// that are not his at all — another party's account, somebody he pays —
+    /// and the item raised for such a name published exactly one way out,
+    /// [`Self::CreateAccount`], which is the act he has decided against. So the
+    /// name stood as required work against every report, forever, on account of
+    /// a decision already made.
+    ///
+    /// **Not [`Self::RecordAccountScope`]**, and the difference is that there is
+    /// no account. A scope decision is about an account of his that his reports
+    /// should leave out; this is about a string that names no account of his and
+    /// never will, so there is nothing for an identifier to point at and nothing
+    /// for a contour to hold.
+    ///
+    /// **Not [`Self::CreateAccount`] with something written into it either.**
+    /// Creating an account for a name that is not an account is putting
+    /// somebody else's money in his directory to make a queue item go away.
+    ///
+    /// The route carries both directions, which is why one key serves for both:
+    /// the statement is his and he may withdraw it, and the directory beats it
+    /// in any case — an account that answers to the string removes the item
+    /// whether or not the statement stands.
+    RecordAccountNameDisposition,
     /// Record operations directly into the journal, one fact each.
     ///
     /// **The only key in this vocabulary that writes a business fact without a
@@ -207,10 +232,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a nineteenth variant to
+    /// The declared length is the only thing holding a twentieth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -220,6 +245,7 @@ impl OperationKey {
         Self::RecordAccountTransferPartners,
         Self::RecordAccountScope,
         Self::RecordAccountRetirement,
+        Self::RecordAccountNameDisposition,
         Self::SubmitOperations,
         Self::OpenImportSession,
         Self::SyncBroker,
@@ -244,6 +270,7 @@ impl OperationKey {
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
             Self::RecordAccountScope => "record_account_scope",
             Self::RecordAccountRetirement => "record_account_retirement",
+            Self::RecordAccountNameDisposition => "record_account_name_disposition",
             Self::SubmitOperations => "ingest_operations",
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",

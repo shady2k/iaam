@@ -8389,13 +8389,16 @@ async fn every_field_the_queue_asks_the_owner_for_arrives_with_the_question_to_p
                         );
                         continue;
                     }
-                    // `/provider` is the one field published without a question,
-                    // and on purpose: whether a person should be asked to invent
-                    // a label whose only property is that it differs between
-                    // sources is `iaam-9i83`'s, not a phrasing debt.
-                    if input["pointer"] == "/provider" {
-                        continue;
-                    }
+                    // No exception any more. `/provider` was the one field
+                    // published without a question, because there was no
+                    // question a person could be asked about it; `iaam-9i83`
+                    // answered that the other way, and the field stopped being
+                    // his — the queue works the label out and asks him instead
+                    // where the account is held.
+                    assert_ne!(
+                        input["pointer"], "/provider",
+                        "a value this instance can work out is not asked of the owner: {input}"
+                    );
                     asked.insert(
                         input["pointer"]
                             .as_str()
@@ -23853,16 +23856,43 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
         .filter(|item| item["kind"] == "create_account_named_by_document")
         .collect();
     assert_eq!(wanted.len(), 1, "{queue}");
-    assert_eq!(wanted[0]["id"], "create_account_named_by_document:Outside");
-    assert_eq!(wanted[0]["target"]["operationId"], "create_account");
+    // The identity carries the institution as well as the name, because the fold
+    // does: two sources printing one string are two accounts, and one item for
+    // both would mint one identifier scope for both (`iaam-9i83`).
     assert_eq!(
-        wanted[0]["target"]["request"]["preset"]["provider_account_id"], "Outside",
+        wanted[0]["id"],
+        "create_account_named_by_document:T-Bank:Outside"
+    );
+
+    // Two ways out and not one (`iaam-mk1n`). A statement names accounts that are
+    // not the owner's at all, and while `create_account` was the only resolution
+    // the one act that closed the item was the one he had decided against — so
+    // each such name stood as required work against every report, permanently.
+    let options = wanted[0]["target"]["options"]
+        .as_array()
+        .expect("the item publishes both of its resolutions");
+    let offered: Vec<&Value> = options
+        .iter()
+        .map(|option| &option["operationId"])
+        .collect();
+    assert_eq!(
+        offered,
+        vec!["create_account", "record_account_name_disposition"],
         "{queue}"
     );
+    let create = &options[0];
+    assert_eq!(
+        create["request"]["preset"]["provider_account_id"], "Outside",
+        "{queue}"
+    );
+    // And the label that scopes it is minted from the institution the profile
+    // that read the document declares, rather than asked of a person who cannot
+    // get it wrong in an interesting way.
+    assert_eq!(create["request"]["preset"]["provider"], "T-Bank", "{queue}");
     assert!(
         wanted[0]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("Outside")),
+            .is_some_and(|reason| reason.contains("Outside") && reason.contains("T-Bank")),
         "{queue}"
     );
 
@@ -23873,7 +23903,7 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // question is about *that* account — and the consequence says what a rename
     // costs here, which is nothing, because the identity tier already holds the
     // printed string and beats a title.
-    let asked = &wanted[0]["target"]["request"]["missing"];
+    let asked = &create["request"]["missing"];
     let title = asked
         .as_array()
         .expect("missing inputs")
@@ -23890,17 +23920,53 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
          printed string being kept: {title}"
     );
 
-    // `provider` carries none, and that is the register entry rather than an
-    // omission: whether a person should be asked to invent a label whose only
-    // property is that it differs between sources is `iaam-9i83`'s question.
-    let provider = asked
+    // `/provider` is not asked at all any more, and `/institution` is
+    // (`iaam-9i83`). Told the label's only property was that it differs between
+    // sources, the owner asked why he was being asked for it and said what should
+    // have been asked instead — the bank, broker or organisation the account is
+    // held at, which is a different field of the same request and one a person
+    // can answer without being taught anything first.
+    assert!(
+        asked
+            .as_array()
+            .expect("missing inputs")
+            .iter()
+            .all(|input| input["pointer"] != "/provider"),
+        "the derived field is worked out, not asked: {asked}"
+    );
+    let institution = asked
         .as_array()
         .expect("missing inputs")
         .iter()
-        .find(|input| input["pointer"] == "/provider")
-        .expect("the provider is asked for");
-    assert_eq!(provider["provided_by"], "owner", "{provider}");
-    assert!(provider["prompt"].is_null(), "{provider}");
+        .find(|input| input["pointer"] == "/institution")
+        .expect("the question he can answer is published");
+    assert_eq!(institution["provided_by"], "owner", "{institution}");
+    assert!(
+        institution["prompt"]["ask"]
+            .as_str()
+            .is_some_and(|ask| ask.contains('?')),
+        "{institution}"
+    );
+
+    // The other resolution says the name is nobody's account of his, and asks
+    // for the one thing only he can supply: what it actually is. Everything else
+    // is preset, because an option that left the caller to guess the word would
+    // publish a route rather than a resolution.
+    let declining = &options[1];
+    assert_eq!(declining["request"]["preset"]["printed"], "Outside");
+    assert_eq!(declining["request"]["preset"]["disposition"], "not_mine");
+    assert_eq!(declining["requiredScope"], "owner", "{declining}");
+    let reasons = declining["request"]["missing"]
+        .as_array()
+        .expect("missing inputs");
+    assert_eq!(reasons.len(), 1, "{declining}");
+    assert_eq!(reasons[0]["pointer"], "/reason");
+    assert!(
+        reasons[0]["prompt"]["consequence"]
+            .as_str()
+            .is_some_and(|turns| !turns.is_empty()),
+        "a name ruled out has to say what ruling it out does: {declining}"
+    );
 
     // The document was kept under the profile that read it, so the remedy for a
     // corrected profile is to read the stored document again rather than to

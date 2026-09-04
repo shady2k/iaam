@@ -109,6 +109,8 @@ is how you match a term in them to the code.
 | Russian | English | Note |
 |---|---|---|
 | выгрузка (банка) | bank export | the file or page the institution hands the owner |
+| организация (где открыт счёт) | institution | the bank, broker or other organisation an account is held at, as the **owner** names it — `CreateAccountRequest.institution`. Free text this system does not interpret and matches nothing against; it is what he reads. Never a synonym for **provider** below, and the question put to him about an account is this one (decision 0030) |
+| метка источника | provider | `provider`; the label that scopes the identifier a source prints, so that two sources printing short sequential identifiers cannot collide (decision 0004). Not the institution above and never shown as one: it is derived, and where a source profile read the document the queue mints it from that profile's issuer rather than asking anybody (decision 0030) |
 | канал | channel | `SourceChannel`; how a fact reached us, not who stated it |
 | объявленный источник | declared source | `SourceId::declared(owner, account, channel)`; what deduplication is scoped by |
 | объявленный импорт | declared import | `ImportId::declared(owner, account, channel, label)`; one submission, and what an import correction is keyed on |

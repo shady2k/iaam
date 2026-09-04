@@ -57,7 +57,11 @@ Three steps, in order:
    A missing field of his that carries no `prompt` is not an invitation to
    compose one. It means this instance has not decided whether a person should
    be asked for that field at all; ask the owner about the fields that do carry
-   one, and leave that field to him or to whoever runs the instance.
+   one, and leave that field to him or to whoever runs the instance. There is at
+   present no such field, and the one there was is instructive: it asked him for
+   a label whose only property was that it differs between sources, which is a
+   value nobody can answer well and this instance can work out. It now works it
+   out, and asks him instead where the account is held.
 
    **Never read a `preset` value out to him.** `preset` is the request already
    filled in from what the instance worked out — an address in the route, a
@@ -151,6 +155,17 @@ read, so you need not provoke the refusals a second time.
 You do not have to guess a name and you must not. Creating an account whose title
 you invented does not make the records import; it makes a second account he did
 not ask for.
+
+**And some of those names are not his accounts at all.** A statement prints the
+account each record is on, and it also prints names that belong to somebody else
+— a party he paid, an account that is not his. For those, creating an account is
+the wrong act and it is not one you may take on his behalf. The queue's item for
+such a name offers two ways out and not one: create the account, or record his
+statement that the name is nobody's account of his, with the reason he gives you.
+Put both to him. What you must not do is leave the item standing because neither
+looked like something you could act on: while it stands it is graded as work
+between him and every report he asks for, it says nothing about which of the two
+he decided, and it will be there again next month with the same name on it.
 
 **Never a credential but your own**, whatever the document is. No broker token,
 no encryption key. An import that would need you to fetch the statement out of

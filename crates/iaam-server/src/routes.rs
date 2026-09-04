@@ -25,7 +25,7 @@ use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Ver
 use iaam_app::ports::{
     AccountAliasView, AccountCreated, AccountDeclarations, AccountDetailView, AccountIdentityView,
     AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Declared,
-    Principal, Scope, required_scope,
+    DeclinedAccountNameView, Principal, Scope, required_scope,
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
@@ -77,22 +77,23 @@ use crate::api_catalog::ApiCatalog;
 use crate::dto::{
     AccountAliasDto, AccountCandidateDto, AccountCashClassStatementDto, AccountDeclarationsDto,
     AccountDto, AccountIdentityNotDoneDto, AccountIdentityRepointedDto, AccountIdentityStatedDto,
-    AccountIdentityStatementDto, AccountNegativeBalanceExpectationStatementDto,
-    AccountScopeDispositionDto, AccountScopeDto, AccountTransferPartnersBatchDto,
-    AccountTransferPartnersDto, ActionDto, ActionSubjectDto, ActionTargetDto,
-    AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto, BrokerAccessDto,
-    BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto, CategoryGroupRequest,
-    CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest,
-    ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
-    ContourVersionDto, CorrectImportRequest, CreateAccountRequest, CreateContourVersionRequest,
-    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams,
-    FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
-    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
-    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
-    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
-    OwnerBalanceRequest, OwnerQuestionDto, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    AccountIdentityStatementDto, AccountNameDispositionDto,
+    AccountNegativeBalanceExpectationStatementDto, AccountScopeDispositionDto, AccountScopeDto,
+    AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
+    ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto,
+    BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto,
+    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
+    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
+    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
+    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredAccountDto,
+    DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto,
+    InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto, JournalPageDto,
+    MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
+    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    NegativeBalanceExpectationDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
+    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountNameDispositionRequest,
     RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
     RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
     ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
@@ -137,6 +138,12 @@ pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 /// different things about one account, and the report that motivated both needs
 /// a closed product to stay *inside* the perimeter.
 pub const RECORD_ACCOUNT_RETIREMENT_OPERATION_ID: &str = "record_account_retirement";
+/// What a name a document printed turned out to be, where it is not an account
+/// of the owner's at all (`iaam-mk1n`). Named apart from every account route
+/// above because there is no account: the subject is a string a statement
+/// printed, and the whole point of the call is that no account will answer to
+/// it.
+pub const RECORD_ACCOUNT_NAME_DISPOSITION_OPERATION_ID: &str = "record_account_name_disposition";
 pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
 pub const REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID: &str = "replace_account_declarations";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
@@ -2137,6 +2144,138 @@ pub async fn record_account_scope(
     }
 
     Ok(Json(account_scope_dto(&state, &principal, &named).await?))
+}
+
+/// Record what the owner says a name a document printed is (`iaam-mk1n`).
+///
+/// **The answer the queue could not represent.** A statement names accounts that
+/// are not his at all — another party's account, somebody he pays — and the item
+/// raised for each such name published exactly one resolution, `create_account`,
+/// which is the act he has decided against. So «this name is not an account of
+/// mine» was unrepresentable, each name stood as required work against every
+/// report goal forever, and an agent working a real import reasoned its way to
+/// the hole, found no way out, and left the items behind without saying so.
+///
+/// This is the second way out, and it is the shape `record_account_scope` has
+/// one route above: the same three-valued disposition, the same required reason,
+/// the same withdrawal spelled as `undecided`. What it is **not** is a scope
+/// decision — there is no account here for a contour to hold or a report to
+/// leave out, and there never will be.
+///
+/// **It is beaten by the directory and does not pretend otherwise.** The queue
+/// asks whether a printed name resolves against the accounts as they then stand,
+/// through the one implementation of decision 0004's tiering, and it goes on
+/// asking that whether or not a statement stands here. An account the owner
+/// creates afterwards that answers to the string removes the item outright, and
+/// this row is not consulted while it does.
+#[utoipa::path(
+    post,
+    path = "/v1/account-names/disposition",
+    operation_id = RECORD_ACCOUNT_NAME_DISPOSITION_OPERATION_ID,
+    request_body = RecordAccountNameDispositionRequest,
+    responses(
+        (status = 200, description = "Disposition recorded", body = PrintedAccountNameDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_name_disposition(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiJson(request): ApiJson<RecordAccountNameDispositionRequest>,
+) -> Result<Json<PrintedAccountNameDto>, ApiFailure> {
+    // Saying that a name is nobody's account of his is a standing statement
+    // about every statement that prints it from now on, and it is the only thing
+    // keeping those records refused deliberately rather than provisionally.
+    // Neither is a distinction an agent may draw for him.
+    require(&principal, OperationKey::RecordAccountNameDisposition)?;
+
+    // Trimmed on the way in for the reason the reading trims on the way out: the
+    // string recorded against a document is the cell trimmed and otherwise
+    // verbatim, and a statement carrying a stray space would be about a name no
+    // item ever publishes.
+    let printed = request.printed.trim();
+    if printed.is_empty() {
+        return Err(unprocessable(
+            "printed",
+            "the name as the document printed it",
+            "nothing",
+            "the name is the whole subject of this call: there is no account here \
+             to identify it by",
+        ));
+    }
+    let printed = printed.to_owned();
+
+    let reason = match request.disposition {
+        AccountNameDispositionDto::Mine => {
+            return Err(unprocessable(
+                "disposition",
+                "not_mine or undecided",
+                "mine",
+                "that one of your accounts answers to this name is said by giving \
+                 that account the identifier its source prints, which is what makes \
+                 the statement lines resolve; a flag recorded here would resolve \
+                 nothing",
+            ));
+        }
+        AccountNameDispositionDto::NotMine => {
+            let reason = request
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .ok_or_else(|| {
+                    unprocessable(
+                        "reason",
+                        "a non-empty reason",
+                        "nothing",
+                        "a name ruled out without a reason is indistinguishable, a \
+                         year later, from one nobody ever got round to — and the \
+                         records printed under this one stay refused on the strength \
+                         of it",
+                    )
+                })?
+                .to_owned();
+            state
+                .services
+                .store
+                .decline_account_name(
+                    principal.owner,
+                    DeclinedAccountNameView {
+                        printed: printed.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .await?;
+            Some(reason)
+        }
+        AccountNameDispositionDto::Undecided => {
+            if request.reason.is_some() {
+                return Err(unprocessable(
+                    "reason",
+                    "no reason",
+                    "a reason",
+                    "withdrawing a statement leaves nothing for a reason to explain",
+                ));
+            }
+            state
+                .services
+                .store
+                .withdraw_declined_account_name(principal.owner, printed.clone())
+                .await?;
+            None
+        }
+    };
+
+    Ok(Json(PrintedAccountNameDto {
+        printed,
+        disposition: request.disposition,
+        reason,
+    }))
 }
 
 /// Whether one of the owner's products still exists.

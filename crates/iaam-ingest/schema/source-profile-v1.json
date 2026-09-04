@@ -1,0 +1,522 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:iaam:schema:source-profile:1",
+  "title": "Source profile, schema version 1",
+
+  "description": "A source profile describes one document type printed by one institution: which column carries which cell, and which of that source's own words mean which of iaam's own words. It is data read by the import engine, never code and never an input to a calculation. Decision 0019 is the argument; this file is the vocabulary. What the engine decides, and what therefore has no key here: whether a cell is readable at all, whether a number fits the currency's minor unit, whether a date exists, whether a currency is known, what a row turned out to be, which category it falls in, which account a printed identity is, whether a row duplicates one already recorded, and what happens to a row that cannot be read. None of those is parameterised, so a profile that is valid against this schema cannot widen what the engine accepts; it can only be wrong about where a value sits, and a value read out of the wrong column is a value the engine still validates.",
+
+  "$comment": "Three invariants make the paragraph above checkable rather than promised, and a reviewer should check them before reading anything else. (1) CLOSURE. Every object in this file that describes a profile's own structure sets \"additionalProperties\": false. There is exactly one kind of exception, marked in place: a token map, where \"additionalProperties\" is the schema of the map's VALUES and \"propertyNames\" closes its keys. A widening a profile author wanted would have to be a new key, and there is no key to write. (2) LEAVES. Every leaf in a profile is one of exactly three kinds, each with its own $defs entry and no fourth: a LOCATOR (#/$defs/column, #/$defs/sheet_name, #/$defs/header_row) saying where in the document to look; a TOKEN (#/$defs/direction_token, #/$defs/far_side_token, #/$defs/date_format, #/$defs/time_format, #/$defs/negative_form, #/$defs/group_separator_dot_decimal, #/$defs/group_separator_comma_decimal, #/$defs/currency_code) drawn from a closed vocabulary of iaam's own words; and a LITERAL (#/$defs/source_literal) quoting the source's own printed text, which may appear only as a key of a token map. Nothing in a profile is a number the engine computes with, a regular expression, a format pattern, or a predicate. A leaf cannot denote engine behaviour because none of the three kinds can name any. (3) NO LENIENCY VOCABULARY. This file contains no key whose meaning is 'accept', 'tolerate', 'ignore', 'skip', 'default', 'fallback', 'on error', 'round' or 'coerce'. There is deliberately no way to say what should happen to a cell the engine cannot read, because the engine has one answer and it is not a profile's to change: the row is rejected, naming field, expected and actual, and the other rows of the document are read (specification section 10.1).",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "version",
+    "issuer",
+    "document",
+    "recognise",
+    "row"
+  ],
+
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "$comment": "The file states which vocabulary it claims to satisfy, so the loader picks a validator rather than guessing one. A profile validated against the wrong version is the silent acceptance this whole design exists to refuse."
+    },
+
+    "id": {
+      "$ref": "#/$defs/profile_id",
+      "description": "The profile's name, unique within an instance. Together with \"version\" it forms the ParserVersion every fact this profile produced carries: \"profile/<id>/<version>\"."
+    },
+
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The version of this profile's rules. A version is a name for a content: an instance refuses to load a different content under an (id, version) it has already recorded, so 'which rows did version 3 read' is answerable and the rows version 3 read are a set that can be retracted."
+    },
+
+    "issuer": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "The institution that prints this document, for a human reading a catalogue. Never an account, a number, or anything belonging to an owner."
+    },
+
+    "document_label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "What the issuer calls this document, for a human reading a catalogue."
+    },
+
+    "document": {
+      "description": "How the bytes are read into a table of cells, before any column means anything.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "encoding", "delimiter", "header_row"],
+          "properties": {
+            "format": { "const": "csv" },
+            "encoding": { "$ref": "#/$defs/encoding" },
+            "delimiter": { "$ref": "#/$defs/delimiter" },
+            "header_row": { "$ref": "#/$defs/header_row" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "sheet", "header_row"],
+          "properties": {
+            "format": { "const": "xlsx" },
+            "sheet": { "$ref": "#/$defs/sheet_name" },
+            "header_row": { "$ref": "#/$defs/header_row" }
+          }
+        }
+      ]
+    },
+
+    "recognise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["header_cells"],
+      "description": "How a document is matched to this profile when the caller names none. The engine refuses a document two profiles recognise, exactly as the report registry refuses a workbook two parsers recognise: two matches mean the criterion is too weak, and choosing either records facts read by the wrong profile.",
+      "properties": {
+        "header_cells": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/source_literal" },
+          "description": "Header cells that must all be present in the document's header row. They are the source's own printed headings."
+        }
+      }
+    },
+
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account", "dates", "amount", "currency", "direction"],
+      "description": "Which cell of a row carries which field of an observation. Everything named here is transcribed; nothing here is concluded. The engine's output is an observation — the row as the source stated it — and not an operation: what the row turned out to be is settled afterwards by the owner's directory, his classification rules, or his answer to a question.",
+      "properties": {
+
+        "account": {
+          "description": "Whose statement the row is on. A profile names a column or defers to the caller's declaration; it never names an account. There is no key here that takes an account identity, because a profile is a shipped artefact and an account identity belongs to an owner (decision 0005 retired the account map for the neighbouring reason). Whatever the column prints is resolved through the tiering of decision 0004 and 0010 — iaam's own identifier, then the identifier the account's source prints for it, then the owner's title.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from"],
+              "properties": { "from": { "const": "declaration" } },
+              "$comment": "The document is one account's statement and does not print which; the caller declares it, as the document channel already takes an account today."
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "column"],
+              "properties": {
+                "from": { "const": "column" },
+                "column": { "$ref": "#/$defs/column" }
+              },
+              "$comment": "The export spans several accounts and prints the identity on every row."
+            }
+          ]
+        },
+
+        "dates": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "description": "The day or days the source printed. Where the source prints one date the engine records it as both the trade date and the cash-posted date, as the in-tree CSV parser does; a profile cannot ask for one without the other, because a row with no posted day is a row no money-flow report can place in a month. Where the source prints two, each goes to its own field and neither is inferred from the other. There is no timezone key and no offset key: a day is what the document printed, and shifting it moves money between months.",
+          "properties": {
+            "trade": { "$ref": "#/$defs/dated_cell" },
+            "cash_posted": { "$ref": "#/$defs/dated_cell" }
+          }
+        },
+
+        "time": {
+          "description": "The time of day the source printed, when it prints one. Recorded as printed and never converted.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "date_field", "format"],
+              "properties": {
+                "from": { "const": "date_cell" },
+                "date_field": { "enum": ["trade", "cash_posted"] },
+                "format": { "$ref": "#/$defs/time_format" }
+              },
+              "$comment": "The named date cell carries a date and a time separated by a single space; the date's own format consumes the first half."
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "column", "format"],
+              "properties": {
+                "from": { "const": "column" },
+                "column": { "$ref": "#/$defs/column" },
+                "format": { "$ref": "#/$defs/time_format" }
+              }
+            }
+          ]
+        },
+
+        "amount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["decimal", "carried_by"],
+          "description": "The sum, with the sign the source printed. The engine records the magnitude the document shows and refuses a number with more precision than the currency's minor unit — it does not round, because rounding an input is a silent alteration of the fact — and refuses zero, because a row stating no movement is not a movement of zero. Neither refusal has a key.",
+          "properties": {
+            "decimal": { "$ref": "#/$defs/decimal" },
+            "carried_by": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["from", "column"],
+                  "properties": {
+                    "from": { "const": "signed_column" },
+                    "column": { "$ref": "#/$defs/column" }
+                  },
+                  "$comment": "One column, and its sign is the source's own statement about direction. The engine transcribes it and never re-signs it from a direction word."
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["from", "out_column", "in_column"],
+                  "properties": {
+                    "from": { "const": "debit_credit" },
+                    "out_column": { "$ref": "#/$defs/column" },
+                    "in_column": { "$ref": "#/$defs/column" }
+                  },
+                  "$comment": "Two columns of magnitudes. Exactly one must be filled on a row; both filled, or neither, is a rejection naming the row rather than a guess about which the source meant. This is the one place the engine writes a sign the document did not print: the source stated direction by choosing a column, and an observation carries one amount field, so the debit column's magnitude is recorded negative. The choice is the source's; the encoding is the engine's."
+                }
+              ]
+            }
+          }
+        },
+
+        "currency": {
+          "description": "Which currency the sum is in. The engine validates the resulting code against the currencies it knows and refuses an unknown one; a profile cannot say that an unknown currency passes.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "code"],
+              "properties": {
+                "from": { "const": "fixed" },
+                "code": { "$ref": "#/$defs/currency_code" }
+              },
+              "$comment": "The document is single-currency and does not print the currency on a row. This is a claim about the document, and a profile that makes it wrongly mislabels every row — which is why it is a separate branch a reviewer can see rather than a fallback for a missing column."
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "column"],
+              "properties": {
+                "from": { "const": "column" },
+                "column": { "$ref": "#/$defs/column" },
+                "spellings": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "maxProperties": 64,
+                  "propertyNames": { "$ref": "#/$defs/source_literal" },
+                  "additionalProperties": { "$ref": "#/$defs/currency_code" },
+                  "$comment": "TOKEN MAP: \"additionalProperties\" is the value schema, not a closure. Spelling only. It rewrites what the source printed into a code and decides nothing; the engine's own validation runs afterwards either way, so a spelling the map does not cover is still tried as a code and still refused if it is not one."
+                }
+              }
+            }
+          ]
+        },
+
+        "direction": {
+          "description": "Which way the source said the money went. Four words, and the fourth is not a default: \"unknown\" means the source named no direction, and \"inner\" means it named one that does not resolve to a direction — the word an institution prints for a movement it considers internal to itself.",
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from"],
+              "properties": { "from": { "const": "amount_sign" } },
+              "$comment": "The sign is the source's own direction word. Available only because the engine reads the document: negative is out, positive is in, and zero cannot occur because a zero amount is already refused."
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "column", "tokens"],
+              "properties": {
+                "from": { "const": "column" },
+                "column": { "$ref": "#/$defs/column" },
+                "tokens": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "maxProperties": 128,
+                  "propertyNames": { "$ref": "#/$defs/source_literal" },
+                  "additionalProperties": { "$ref": "#/$defs/direction_token" },
+                  "$comment": "TOKEN MAP: \"additionalProperties\" is the value schema, not a closure. The map is total over the words this source prints, and it has no catch-all entry — none can be written, because a key is a literal and \"*\" is a literal the source does not print. A word the map does not carry rejects the row and names the word, so the author sees exactly what to add. Mapping it to \"unknown\" instead was refused: \"unknown\" asserts that the source said nothing about direction, and here the source said something the profile could not read. Recording the second as the first is a false transcription, and it is the same refusal ObservedDirection::parse already makes of a caller that types \"outgoing\"."
+                }
+              }
+            }
+          ]
+        },
+
+        "far_side": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column", "tokens"],
+          "description": "What the source said about whose account is on the far side. Only two values exist and one of them says nothing, so this block exists for exactly one purpose: a source that asserts in words that the other side is an account of the owner's. A profile may set \"own_account\" only from such a word. Absent, every row of the document is \"unstated\", which is what a source that does not make the claim said.",
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "tokens": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 128,
+              "propertyNames": { "$ref": "#/$defs/source_literal" },
+              "additionalProperties": { "$ref": "#/$defs/far_side_token" },
+              "$comment": "TOKEN MAP: \"additionalProperties\" is the value schema, not a closure. Total, and with no catch-all, for the direction map's reason. Being wrong here is expensive in one direction only: a row wrongly carrying \"own_account\" is recorded as a movement between the owner's own accounts and raises no question, so it is the one mapping that can silence a question that should have been asked."
+            }
+          }
+        },
+
+        "counterparty": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column"],
+          "description": "The party the source named, transcribed exactly. A cell that is empty or only whitespace is 'the source named nobody', which is a value and not a failure. There is no extraction key: a source that packs a counterparty inside a free-text purpose line is read through \"description\" instead, and the owner's own description rules are what separate it — a rule he can see, correct and re-run, rather than a cut this profile froze into every fact it wrote.",
+          "properties": { "column": { "$ref": "#/$defs/column" } }
+        },
+
+        "description": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column"],
+          "description": "What the source printed as the description or payment purpose, transcribed exactly from one column. One column and not several: the joined string is what the owner's description rules match, so a join order would be a silent part of every rule he ever writes.",
+          "properties": { "column": { "$ref": "#/$defs/column" } }
+        },
+
+        "source_kind": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column"],
+          "description": "What the source called the operation, transcribed exactly. Evidence, kept beside the direction the profile read out of it rather than instead of it, so a wrong entry in the direction map is visible against the word it was made from.",
+          "properties": { "column": { "$ref": "#/$defs/column" } }
+        },
+
+        "source_category": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column"],
+          "description": "The category the source itself assigned to the row, transcribed exactly and never rewritten. A profile names the column and stops. There is no map from a source's category to one of the owner's, and there will not be: the owner's category rules already do that, they are his, they are editable, and they can be re-run over rows already recorded — while a mapping baked into a profile is frozen into every fact at the moment of import and correctable only by retracting the import. A profile carrying such a map would also be a shipped artefact that decides what somebody's spending was.",
+          "properties": { "column": { "$ref": "#/$defs/column" } }
+        },
+
+        "source_operation_id": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column"],
+          "description": "The identifier the source prints for the row, transcribed exactly. Where a source prints one, naming it is the single most valuable thing a profile does: it is the journal's first duplicate test, scoped by source, and it is what makes one statement fed twice come back as duplicates rather than as a second copy of a month.",
+          "properties": { "column": { "$ref": "#/$defs/column" } }
+        }
+      }
+    }
+  },
+
+  "$defs": {
+
+    "profile_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 64,
+      "$comment": "IDENTITY. Lower-case words joined by hyphens, conventionally issuer and document type. It appears verbatim inside a ParserVersion, so the character set is kept narrow enough to be greppable in a journal."
+    },
+
+    "column": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "$comment": "LOCATOR. The text of a heading in the document's header row. Matched after trimming leading and trailing whitespace, and otherwise exactly. A heading the document does not have is a profile that does not load, not a column that reads as empty."
+    },
+
+    "sheet_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "$comment": "LOCATOR. A worksheet's name, as the document names it."
+    },
+
+    "header_row": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "$comment": "LOCATOR. The one-based line or row that carries the headings. Lines above it are a preamble and are not rows. There is deliberately no counterpart for the end of the table: a trailing totals line is read as a row, fails to be one, and is rejected by name — while a count of lines to drop is a claim that is true of one export and false of the next, and when it is false it discards real movements silently."
+    },
+
+    "encoding": {
+      "enum": ["utf-8", "utf-8-bom", "windows-1251"],
+      "$comment": "TOKEN. A closed list. Adding an encoding is a change to the engine, reviewed and released — which is the point: an author cannot name a codec nobody has tested against this parser."
+    },
+
+    "delimiter": {
+      "enum": ["comma", "semicolon", "tab"],
+      "$comment": "TOKEN. Named rather than given as a character, so a profile cannot nominate a quote character, a newline, or a digit as the delimiter. Quoting is RFC 4180's and is not parameterised."
+    },
+
+    "date_format": {
+      "enum": [
+        "iso_date",
+        "day_month_year_dot",
+        "day_month_year_slash",
+        "month_day_year_slash"
+      ],
+      "$comment": "TOKEN. A name for exactly one acceptance set, fixed by the engine: iso_date is YYYY-MM-DD, and the other three take two-digit day and month with a four-digit year. A strptime-style pattern was refused — it is a small program, its acceptance set cannot be reviewed by looking at it, and %m/%d against %d/%m is indistinguishable on the first twelve days of every month, so the failure is a wrong date rather than a rejected one. There is no two-digit-year form, because a century inferred from two digits is a guess that dates a row a hundred years wrong without failing. Where a source prints unpadded components, that is a different named format the engine must add, and it is never a leniency flag on an existing one."
+    },
+
+    "time_format": {
+      "enum": ["hour_minute", "hour_minute_second"],
+      "$comment": "TOKEN. Twenty-four hour, colon separated. No offset and no timezone: converting one would change which day a row falls on, and therefore which month a sum lands in."
+    },
+
+    "negative_form": {
+      "enum": ["leading_minus", "trailing_minus", "parentheses"],
+      "$comment": "TOKEN. How the source writes a negative number. A leading plus is accepted by the engine in every profile and has no key: making its acceptance a choice would be a profile changing what the engine reads, which is the line this schema exists to hold."
+    },
+
+    "group_separator_dot_decimal": {
+      "enum": ["none", "space", "comma", "apostrophe"],
+      "$comment": "TOKEN. \"space\" covers an ordinary space, a non-breaking space and a narrow non-breaking space alike: which of the three an institution emits is not knowledge a profile author has, and requiring it would make correctness depend on a byte nobody can see."
+    },
+
+    "group_separator_comma_decimal": {
+      "enum": ["none", "space", "dot", "apostrophe"],
+      "$comment": "TOKEN. As above. The list differs from its sibling by exactly the separator the decimal point has taken, which is why the two exist rather than one: the schema refuses a profile whose group separator is its decimal separator, instead of leaving the contradiction to be discovered on a number that parses to the wrong value."
+    },
+
+    "currency_code": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "$comment": "TOKEN. The shape only. Whether the engine knows the currency is the engine's question and it is asked of every row; this pattern catches a typo at load time rather than deciding anything."
+    },
+
+    "direction_token": {
+      "enum": ["in", "out", "inner", "unknown"],
+      "$comment": "TOKEN. iaam's own four words for what a source said about direction. The list is the one the observation channel publishes; it is not extensible by a profile."
+    },
+
+    "far_side_token": {
+      "enum": ["unstated", "own_account"],
+      "$comment": "TOKEN. iaam's own two words for what a source said about whose account is on the far side. There is no token for 'the far side is this named account of the owner's': recognising a printed name as one of his accounts is a conclusion drawn against his directory, and a profile draws no conclusions."
+    },
+
+    "source_literal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "$comment": "LITERAL. Text the source itself prints, quoted so a token map can key on it. It appears only as a map key or as a required header cell, and it is compared after trimming leading and trailing whitespace and otherwise exactly. Case folding was refused: it is locale-dependent, and a key the author can read is better than one the engine reinterprets."
+    },
+
+    "dated_cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column", "format"],
+      "properties": {
+        "column": { "$ref": "#/$defs/column" },
+        "format": { "$ref": "#/$defs/date_format" }
+      }
+    },
+
+    "decimal": {
+      "description": "How the source writes a number. Two branches, tagged by the decimal separator, so that the group separator's list can exclude it.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["decimal_separator", "group_separator", "negative"],
+          "properties": {
+            "decimal_separator": { "const": "dot" },
+            "group_separator": { "$ref": "#/$defs/group_separator_dot_decimal" },
+            "negative": { "$ref": "#/$defs/negative_form" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["decimal_separator", "group_separator", "negative"],
+          "properties": {
+            "decimal_separator": { "const": "comma" },
+            "group_separator": { "$ref": "#/$defs/group_separator_comma_decimal" },
+            "negative": { "$ref": "#/$defs/negative_form" }
+          }
+        }
+      ]
+    }
+  },
+
+  "examples": [
+    {
+      "schema_version": 1,
+      "id": "example-bank-statement",
+      "version": 1,
+      "issuer": "Example Bank",
+      "document_label": "Account statement",
+      "document": {
+        "format": "csv",
+        "encoding": "utf-8",
+        "delimiter": "semicolon",
+        "header_row": 1
+      },
+      "recognise": {
+        "header_cells": ["Posted", "Operation", "Sum", "Ccy", "Payee"]
+      },
+      "row": {
+        "account": { "from": "declaration" },
+        "dates": {
+          "trade": { "column": "Operation date", "format": "day_month_year_dot" },
+          "cash_posted": { "column": "Posted", "format": "day_month_year_dot" }
+        },
+        "time": {
+          "from": "date_cell",
+          "date_field": "trade",
+          "format": "hour_minute_second"
+        },
+        "amount": {
+          "decimal": {
+            "decimal_separator": "comma",
+            "group_separator": "space",
+            "negative": "leading_minus"
+          },
+          "carried_by": { "from": "signed_column", "column": "Sum" }
+        },
+        "currency": {
+          "from": "column",
+          "column": "Ccy",
+          "spellings": { "RUR": "RUB" }
+        },
+        "direction": {
+          "from": "column",
+          "column": "Operation",
+          "tokens": {
+            "Debit": "out",
+            "Credit": "in",
+            "Internal transfer": "inner",
+            "Own account transfer": "inner"
+          }
+        },
+        "far_side": {
+          "column": "Operation",
+          "tokens": {
+            "Debit": "unstated",
+            "Credit": "unstated",
+            "Internal transfer": "unstated",
+            "Own account transfer": "own_account"
+          }
+        },
+        "counterparty": { "column": "Payee" },
+        "description": { "column": "Purpose" },
+        "source_kind": { "column": "Operation" },
+        "source_category": { "column": "Category" },
+        "source_operation_id": { "column": "Reference" }
+      }
+    }
+  ]
+}

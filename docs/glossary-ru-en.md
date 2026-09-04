@@ -114,6 +114,10 @@ is how you match a term in them to the code.
 | объявленный импорт | declared import | `ImportId::declared(owner, account, channel, label)`; one submission, and what an import correction is keyed on |
 | метка импорта | import label | the caller's name for one import within an account and channel |
 | маппинг колонок | column mapping | which export column feeds which field |
+| профиль источника | source profile | the JSON file describing one document type of one institution: column mapping plus a translation of that source's own words into iaam's. Data, never code, and it concludes nothing (decision 0019) |
+| движок импорта | import engine | the one in-tree reader that takes a document and a profile and produces observations. There is one of it; a profile does not parse, it describes |
+| каталог профилей | profile catalogue | what an instance publishes about the profiles it holds: id, version, digest, origin, and the reason any was refused |
+| карта слов | token map | a profile's mapping from a literal the source prints to one of iaam's own words. Total over the source's vocabulary, with no catch-all: an unmapped word rejects the row |
 | ключ строки | row key | the stable identity that makes a re-import idempotent |
 | нога (перевода) | leg | one of the two rows an internal transfer produces |
 | нога движения | cash leg | `CashLeg`; one side of a cash movement offered to the pairing matcher, which may or may not turn out to be a transfer leg |
@@ -122,7 +126,7 @@ is how you match a term in them to the code.
 | движение между своими счетами | own-account movement | `EventKind::OwnAccountMovement`; a movement whose far side is the owner's and unnamed. Distinct from a **transfer**, which names both accounts |
 | движение без направления | unresolved own-account movement | `EventKind::UnresolvedOwnAccountMovement`; the same movement with no direction stated, so it posts no leg |
 | строка без факта | settled without a fact | `RowResolution::NoFact`; a row read, understood and correctly producing no journal fact. Not a refusal and not a quarantine |
-| скилл импорта | import skill | per-institution knowledge held as an agent skill, never as code |
+| скилл импорта | import skill | per-institution knowledge held as an agent skill, never as code. Since decision 0019 it is no longer the only place such knowledge may live: a **source profile** holds the format half in the tree, and the skill keeps what the format cannot supply |
 | удержанная строка | held row | a row an import session holds and the journal does not. It becomes a fact only at commit, and until then it is outside every figure the system publishes unless the request asks for it (decision 0018) |
 | совокупность строк | held-row scope | `HeldScope`; which held rows, **beside** the journal, a report was asked to fold: none, every open session, or the sessions the request named. Never *instead of* the journal — there is no report over held rows alone |
 

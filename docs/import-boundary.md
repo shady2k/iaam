@@ -29,6 +29,11 @@ source's format sits for each.
 | `POST /v1/ingest/operations` | owner's converter | already-converted rows | outside the repository |
 | `POST /v1/import-sessions` … `/commit` | either | already-converted rows | outside the repository |
 | `POST /v1/ingest/journal-events` | owner | corporate actions and offers | — |
+| a document read by a **source profile** — decided, not yet built | owner | an institution's own export | `crates/iaam-ingest/schema/source-profile-v1.json` and one profile per document type, in tree or beside the deployment |
+
+The last row is the only one that is not a route today. Decision 0019 settles
+what a source profile is and what it may say; the channel that carries such a
+document is a separate bead, and §9 below is what the row means until it exists.
 
 Two of those rows are read wrongly often enough to be worth naming.
 
@@ -76,6 +81,10 @@ never objected to either.
 
 What keeps a bank export outside is that converting one needs a second kind of
 knowledge, and until recently the server had no home for it.
+
+The reason a *third* parser was not simply written is §8's second ground: every
+institution is another format, and every format would be another release. §9 is
+how decision 0019 answers that without moving the format back outside.
 
 ## 3. The conversion needs three kinds of knowledge, and they belong in three places
 
@@ -321,7 +330,9 @@ second half is decision 0005, and it is done.
   keeps arriving at it. Renaming breaks every caller to fix a word, so the
   documentation above was tried first. If exports still arrive, the answer is
   deleting the route rather than renaming it: a hand-writable format nobody
-  hand-writes is a route with no user.
+  hand-writes is a route with no user. Decision 0019 changes the arithmetic
+  rather than the question: once an export has a channel that reads it, sending
+  one here is a mistake with an obvious remedy instead of a mistake with none.
 
 ## 8. What was rejected
 
@@ -354,3 +365,53 @@ the parity gap; and it treated *naming the tool* and *naming a shape this API
 publishes* as one move. `iaam-tt71` settled it the other way: the item gains a
 sentence naming `unresolved_direction`, and `MissingInput` is unchanged. §5
 carries the reasoning.
+
+## 9. The third place format knowledge may live
+
+Every row of §1 puts a format in one of two places: in the tree, compiled into
+the server, or outside the repository entirely. Decision 0019 adds a third, and
+it is not a compromise between them — it is a different answer to the question
+§8 asked.
+
+§8 rejected teaching the server an institution's export format, on two grounds.
+The first — that a bank export needs the owner's judgement as well as its format
+— was answered by decisions 0006 and 0013, which gave the observation channel
+everything the conclusive one can say. The second stands and is what 0019 is
+built around: **every institution is another format, and every format would be
+another release of the server.**
+
+A source profile answers that objection by moving the format out of the release
+without moving it out of the product. It is a JSON file validated against
+`crates/iaam-ingest/schema/source-profile-v1.json`, and it names columns and
+translates the source's own words into iaam's own words. It computes nothing, it
+concludes nothing, and it cannot: the engine's output is an `ObservedRow` — the
+row as the source stated it — which has no operation kind and no classification
+to reach for. So the *format* becomes data and only the *engine* is released.
+
+Three consequences belong in this document rather than in the decision.
+
+**§4 stops being a handicap.** The agent is still handed no statement, no path
+to one, and no map. What changes is that the document now travels from the owner
+to his own server rather than to a converter on his laptop, so an agent holding
+nothing can open the session, read the assessment, relay the questions and
+commit. Until now that arrangement bought a poorer import than the one where he
+pasted rows; after 0019 it buys a better one.
+
+**The row keeps the identity it used to lose.** `csv_source::parse` derives a key
+for an unidentified row from the document digest and the row's own locator, and
+decision 0017 refused to do the same inside a session because the "document" a
+session knows is a name a caller typed. An engine that reads the bytes has a true
+digest and a true line number, so the protection §1's converter rows never had is
+restored — and the bytes are kept, so a corrected profile can read the same
+document again.
+
+**§8's other two rejections are untouched.** The rules are still in one copy —
+one profile per document type, in the tree or beside the deployment, and never a
+second copy in a document an agent reads. And the agent still does not open the
+owner's export "just to check".
+
+What 0019 does **not** settle is §6's questionnaire. A profile improves the
+evidence a row carries — the source's word for the operation, its own category,
+its description, the counterparty it printed, its claim about the far side — and
+improves nothing about how many questions a row nothing matches will raise. That
+remains decision 0008's ground.

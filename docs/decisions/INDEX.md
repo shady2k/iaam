@@ -22,3 +22,4 @@
 | [0016](0016-an-unfinished-import-is-quantified-over-the-session.md) | An unfinished import is quantified over the session | 2026-09-04 | proposed | `iaam-8ano` |
 | [0017](0017-a-row-with-no-key-is-disclosed-and-not-given-one.md) | A row with no key is disclosed, and not given one | 2026-09-04 | proposed | `iaam-1k9t` |
 | [0018](0018-a-figure-names-the-population-it-was-folded-over.md) | A figure names the population it was folded over | 2026-09-04 | proposed | `iaam-5put` |
+| [0019](0019-a-profile-describes-a-document-and-decides-nothing.md) | A profile describes a document, and decides nothing | 2026-09-04 | proposed | `iaam-ewty` |

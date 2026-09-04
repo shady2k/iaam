@@ -16,9 +16,9 @@ use crate::ports::{
     CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
     ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
     CustodyView, Declared, DocumentToKeep, ImportObservationView, ImportQuestionView,
-    ImportSessionState, ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView,
-    IssuedToken, JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store,
-    TokenAdmin, TokenView,
+    ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
+    InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, NewImportQuestion, Principal,
+    Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -55,7 +55,7 @@ use iaam_store::events::{
 };
 use iaam_store::import_session::{
     NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredControlFigures,
-    StoredObservation, StoredQuestion, StoredSession,
+    StoredObservation, StoredQuestion, StoredSession, StoredSessionSummary,
 };
 use iaam_store::reference::{
     AccountAliasRecord, AccountCreation, AccountDeclarations as StoredAccountDeclarations,
@@ -161,6 +161,14 @@ fn import_session_view(session: StoredSession) -> ImportSessionView {
         import: session.import,
         opened_at: session.opened_at,
         closed_at: session.closed_at,
+    }
+}
+
+fn import_session_summary_view(summary: StoredSessionSummary) -> ImportSessionSummaryView {
+    ImportSessionSummaryView {
+        session: import_session_view(summary.session),
+        row_count: summary.row_count,
+        unanswered: summary.unanswered,
     }
 }
 
@@ -948,11 +956,16 @@ impl Store for SqliteAdapter {
     async fn list_import_sessions(
         &self,
         owner: OwnerId,
-    ) -> Result<Vec<ImportSessionView>, AppError> {
+    ) -> Result<Vec<ImportSessionSummaryView>, AppError> {
         self.blocking(move |store| {
             store
                 .list_import_sessions(owner)
-                .map(|sessions| sessions.into_iter().map(import_session_view).collect())
+                .map(|sessions| {
+                    sessions
+                        .into_iter()
+                        .map(import_session_summary_view)
+                        .collect()
+                })
                 .map_err(store_error)
         })
         .await

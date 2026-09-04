@@ -102,8 +102,8 @@ use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
     CommitImportSessionRequest, ConfirmTransferPairingRequest, ConfirmedPairingDto,
     ControlSectionDto, CrossSourceMatchingDto, ImportCommitDto, ImportPlanDto, ImportQuestionDto,
-    ImportRowDto, ImportSessionContentsDto, ImportSessionDto, OpenImportSessionRequest,
-    RecordedEventDto, StateImportControlFiguresRequest,
+    ImportRowDto, ImportSessionContentsDto, ImportSessionDto, ImportSessionSummaryDto,
+    OpenImportSessionRequest, RecordedEventDto, StateImportControlFiguresRequest,
 };
 // Types added by wave K, in a block of their own for the reason the block above
 // states: this file is edited by several changes at once, and merging one name
@@ -3272,15 +3272,21 @@ pub async fn open_import_session(
     ))
 }
 
-/// Every import session of the owner's, newest first.
+/// Every import session of the owner's, newest first, with how much each holds.
 ///
 /// This is what makes a question survive the response that carried it: a caller
 /// that lost the response finds the session here and the question in it.
+///
+/// Each entry carries `row_count` and `unanswered` beside the header, so that
+/// «which of my imports is still waiting on me» is answered by this one request
+/// rather than by one more per session. The list used to answer only «which
+/// sessions exist», and a caller reading it had nothing to tell an import that
+/// had never been committed from one that had.
 #[utoipa::path(
     get,
     path = "/v1/import-sessions",
     responses(
-        (status = 200, description = "The owner's import sessions", body = Vec<ImportSessionDto>),
+        (status = 200, description = "The owner's import sessions, each with how much it holds", body = Vec<ImportSessionSummaryDto>),
         (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
@@ -3288,11 +3294,14 @@ pub async fn open_import_session(
 pub async fn list_import_sessions(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-) -> Result<Json<Vec<ImportSessionDto>>, ApiFailure> {
+) -> Result<Json<Vec<ImportSessionSummaryDto>>, ApiFailure> {
     let sessions =
         iaam_app::scenarios::import_session::list_sessions(&state.services, &principal).await?;
     Ok(Json(
-        sessions.iter().map(ImportSessionDto::from_domain).collect(),
+        sessions
+            .iter()
+            .map(ImportSessionSummaryDto::from_domain)
+            .collect(),
     ))
 }
 

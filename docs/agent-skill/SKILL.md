@@ -281,6 +281,25 @@ A session refuses to commit while any of its questions is unanswered. That
 refusal is the point of it: committing with a question open records exactly the
 guess the question exists to prevent.
 
+**A session you opened and did not end is not finished, and you do not have to
+remember it.** A session that holds rows and has been neither committed nor
+abandoned is an item in the outstanding-work queue, kind
+`import_session_unfinished`, one per session, naming both of the calls that end
+one. It is required work rather than a recommendation, because the rows it
+holds are in no journal and therefore in no report, with nothing on any figure
+saying so.
+
+Read that item rather than concluding from a quiet queue that the import
+landed. That conclusion is the mistake this item exists to make impossible: the
+rows sat where nobody could see them, and the next act was to import the same
+statement a second time. The queue's item and the session listing both say how
+much is held and how much is still unanswered, so neither costs you a request
+per session.
+
+Abandoning closes the item as completely as committing. They are different acts
+— one records the rows, the other says they were never facts — and both end the
+session, which is what the item is about.
+
 ## What a contour is
 
 A contour is the set of accounts the owner considers "his portfolio". The

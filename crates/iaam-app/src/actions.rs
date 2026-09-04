@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::ports::{
     AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
     ClassificationRuleStore, ContourView, ControlAssertionView, ImportQuestionView,
-    ImportSessionState, Scope, Store,
+    ImportSessionState, ImportSessionSummaryView, Scope, Store,
 };
 use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
 use crate::scenarios::import_session::{self, Generalisation};
@@ -59,6 +59,13 @@ pub enum ActionKind {
     /// [`actions_from_state`] emits it there and the frontier's order must be
     /// non-decreasing in this enum's order.
     AdoptClassificationRule,
+    /// An import session holds rows and has not ended. The rows are in no
+    /// journal, and only the owner can say whether they should be.
+    ///
+    /// Declared after the two items about a session's questions and before the
+    /// diagnostics, because [`actions_from_state`] emits it there and the
+    /// frontier's order must be non-decreasing in this enum's order.
+    ImportSessionUnfinished,
     CoverageGapUnrepaired,
     IndependentConfirmationMissing,
     DiscrepancyUnresolved,
@@ -87,6 +94,7 @@ impl ActionKind {
             Self::RetiredAccountNotEmpty => "retired_account_not_empty",
             Self::AnswerClassificationQuestion => "answer_classification_question",
             Self::AdoptClassificationRule => "adopt_classification_rule",
+            Self::ImportSessionUnfinished => "import_session_unfinished",
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
             Self::IndependentConfirmationMissing => "independent_confirmation_missing",
             Self::DiscrepancyUnresolved => "discrepancy_unresolved",
@@ -108,6 +116,7 @@ impl ActionKind {
         Self::RetiredAccountNotEmpty,
         Self::AnswerClassificationQuestion,
         Self::AdoptClassificationRule,
+        Self::ImportSessionUnfinished,
         Self::CoverageGapUnrepaired,
         Self::IndependentConfirmationMissing,
         Self::DiscrepancyUnresolved,
@@ -147,9 +156,15 @@ impl ActionKind {
     ///   cash whether or not its partner is known. **Not reconciliation**:
     ///   pairing rewrites two events as one with the same two legs, so observed
     ///   cash and turnover per account are unchanged.
-    /// - `StartAccountImport`, `AnswerClassificationQuestion` — a row that is in
-    ///   no journal is in no report, and an account with no facts has nothing
-    ///   for any of the four to say.
+    /// - `StartAccountImport`, `AnswerClassificationQuestion`,
+    ///   `ImportSessionUnfinished` — a row that is in no journal is in no
+    ///   report, and an account with no facts has nothing for any of the four
+    ///   to say. A session's rows are pre-journal by construction — nothing it
+    ///   holds reaches `events` until the commit writes them — so while it
+    ///   stands open every report is computed as though those rows did not
+    ///   exist, with nothing on the figure saying so. Abandoning satisfies the
+    ///   goal too, and does not contradict this grading: it is the owner saying
+    ///   the rows were never facts, after which no report is short of anything.
     /// - `ProvideControlAssertion` — the closing assertion is the claim side of
     ///   reconciliation, and the opening one is what makes the snapshot's cash a
     ///   balance: `reports::account_balances` decides `CashOpening::Asserted`
@@ -187,6 +202,7 @@ impl ActionKind {
             Self::ResolveTransferRelationships => ReportGoals::of(&[MoneyFlow, Returns]),
             Self::StartAccountImport
             | Self::AnswerClassificationQuestion
+            | Self::ImportSessionUnfinished
             | Self::PossibleDuplicateUndecided => ReportGoals::ALL,
             Self::ProvideControlAssertion => ReportGoals::of(&[AssetSnapshot, Reconciliation]),
             Self::RetiredAccountNotEmpty => ReportGoals::of(&[AssetSnapshot]),
@@ -979,18 +995,30 @@ pub async fn frontier(
     let exclusions = store.list_account_scope_exclusions(owner).await?;
     let transfers = store.list_account_transfer_statements(owner).await?;
     let activity = store.list_account_activity(owner).await?;
-    // The two reads that make a question outlive the response that raised it.
-    // Every session is asked, not only the open ones: eligibility is a property
-    // of the item and is decided beside the gap and the completion, not by
-    // narrowing what is loaded.
+    // The reads that make a question outlive the response that raised it, and
+    // that make a session outlive its questions. Every session is asked, not
+    // only the open ones: eligibility is a property of the item and is decided
+    // beside the gap and the completion, not by narrowing what is loaded.
+    //
+    // The listing carries how many rows each session holds and how many of its
+    // questions are unanswered, read in the store's own statement. That is what
+    // lets `import_session_unfinished` be decided for every session here
+    // without a request per session — and it is why the `continue` below is
+    // now only about the questions. It used to skip the session outright, which
+    // meant a session holding readable rows and no open question raised no item
+    // at all: the queue said nothing was outstanding while the rows sat in no
+    // journal, and the next act was to import the same statement again.
+    let sessions = store.list_import_sessions(owner).await?;
     let mut questions = Vec::new();
-    for session in store.list_import_sessions(owner).await? {
+    for summary in &sessions {
+        let session = &summary.session;
         let held = store.list_import_questions(owner, session.id).await?;
         if held.is_empty() {
             // The observations are read only to derive what a question's answer
             // generalised into, so a session that raised none is not read at
             // all. Every import the owner ever ran is listed here, and most of
-            // them asked nothing.
+            // them asked nothing. What the session itself holds is already in
+            // hand: it is the count the listing carried.
             continue;
         }
         let observations = store.list_import_observations(owner, session.id).await?;
@@ -1028,6 +1056,7 @@ pub async fn frontier(
         activity: &activity,
         assertions: &assertions,
         retired: &retired,
+        sessions: &sessions,
         questions: &questions,
         rules: &rules,
     })
@@ -1817,6 +1846,14 @@ struct OwnerState<'a> {
     /// is where most owners stay, and it is also what spares [`frontier`] the
     /// journal read this field is folded from.
     retired: &'a [RetiredProduct],
+    /// Every import session of the owner's, with how much each holds.
+    ///
+    /// Every session and not only the open ones, for the reason the questions
+    /// beside them are all here: whether an item is raised for one is decided
+    /// by an eligibility and a gap written beside its completion, and a list
+    /// narrowed on the way in would decide it twice — once in the reader, where
+    /// nothing says so, and once here.
+    sessions: &'a [ImportSessionSummaryView],
     questions: &'a [ClassificationQuestion],
     /// The owner's standing classification rules, as the classifier reads them.
     ///
@@ -1839,12 +1876,15 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
         activity,
         assertions,
         retired,
+        sessions,
         questions,
         rules,
     } = *state;
     let names = AccountNames::new(accounts);
     let mut actions = actions_from_views(accounts, contours, exclusions, transfers);
-    actions.reserve(activity.len() + assertions.len() + retired.len() + questions.len());
+    actions.reserve(
+        activity.len() + assertions.len() + retired.len() + questions.len() + sessions.len(),
+    );
     for account in activity
         .iter()
         .filter(|activity| account_import_eligibility(activity) && account_import_gap(activity))
@@ -1912,6 +1952,24 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
                 outcome,
             ));
         }
+    }
+    // And after those, for the same reason: the session is declared after the
+    // two items about its questions. The order is the queue's, not a ranking —
+    // a session with an open question raises both this item and that one, and
+    // they say different things: «this row is unclassified» and «this import
+    // has not ended».
+    for summary in sessions
+        .iter()
+        .filter(|summary| import_session_eligibility(summary) && import_session_gap(summary))
+    {
+        actions.push(import_session_unfinished_action(
+            summary,
+            summary
+                .session
+                .account
+                .map(|account| names.get(account))
+                .transpose()?,
+        ));
     }
     Ok(actions)
 }
@@ -2248,6 +2306,194 @@ fn adopt_classification_rule_action(
         },
     )
     .expect("adopt classification rule action has an operation target")
+}
+
+/// A session that holds rows is one there is something to decide about.
+///
+/// The eligibility, and it is what keeps the queue quiet about the sessions
+/// nothing is at stake in. A session holding nothing is what `open_session`
+/// hands back to a caller retrying the open call — it says so in as many words,
+/// and it refuses only the sessions that hold rows — so an item for one would
+/// be an item about no rows, closed by abandoning a session the owner never
+/// meant to open.
+///
+/// **Not the session's state.** That is the gap below, and the two must not be
+/// swapped: the state is what this item is waiting to change, and a condition
+/// this item is waiting on cannot also be what makes it apply.
+const fn import_session_eligibility(summary: &ImportSessionSummaryView) -> bool {
+    summary.row_count > 0
+}
+
+fn import_session_gap(summary: &ImportSessionSummaryView) -> bool {
+    !import_session_completion(summary)
+}
+
+/// The goal is that this session has stopped being open, and nothing else.
+///
+/// **Quantified over the session, not over its questions**, and that is the
+/// opposite shape to [`classification_question_completion`] — which is
+/// deliberately quantified over questions, because a new question of a session
+/// whose others are answered is new work and a session-wide predicate would
+/// have closed over it. Here the reverse holds. The item is about the session
+/// being open; a question answered does not end it, a question raised does not
+/// reopen it, and a completion asked of the questions would report an import
+/// finished the moment the last one was answered — which is the exact reading
+/// this item exists because a caller was entitled to make.
+///
+/// **Abandoning satisfies it.** «The owner committed the rows» and «the owner
+/// threw them away» are different facts, and the question item is right to
+/// refuse to read the second as the first: there, abandoning would stand in for
+/// the owner saying what a row was. Here the item makes no claim about any row.
+/// It says the session is open, and abandoning ends it as finally as committing
+/// does — after which the rows were never facts and no report is short of them.
+///
+/// Read from the state and not from the closing timestamp, because the state is
+/// what every other reader of a session checks and what the two routes write.
+fn import_session_completion(summary: &ImportSessionSummaryView) -> bool {
+    !matches!(summary.session.state, ImportSessionState::Open)
+}
+
+/// An import that was started, holds rows, and has not been ended.
+///
+/// **This is `iaam-8ano`.** The queue used to raise an item for such a session
+/// only through its unanswered questions, so a session whose questions were all
+/// answered — or that raised none, which is the ordinary outcome of a clean
+/// statement — stood open holding rows and appeared nowhere. `GET /v1/actions`
+/// is this system's published answer to «what next», and a caller that reads it
+/// and finds nothing outstanding is entitled to conclude the import finished.
+/// The rows were in no journal, so the next act was to import the same
+/// statement again, and that is how a queue that is merely incomplete
+/// manufactures duplicate work.
+///
+/// **Two resolutions, and they are the two ways a session ends.**
+/// [`OperationKey::CommitImportSession`] and
+/// [`OperationKey::AbandonImportSession`] say so themselves: «a refusal that
+/// offers one without the other tells the owner he must finish an import he may
+/// have decided against». Committing is first and abandoning second, never the
+/// other way round, for the reason `half_imported_refusal` orders them so:
+/// abandoning is the way out rather than the way on, and leading with «throw
+/// this away» invites a caller to discard rows the owner spent an evening
+/// answering questions about.
+///
+/// **Answering a question is not among them**, although the commit is refused
+/// while one is open. A resolution is a call that closes *this* item, and an
+/// answer leaves the session exactly as open as it found it. The unanswered
+/// count is in the reason instead, beside the item that does close on an
+/// answer.
+///
+/// **The assessment is named in prose and is not a target.** It is a GET with no
+/// request body, so it is not an [`OperationKey`] and could not be one; the
+/// session responses publish its address in their `assessment` field, which is
+/// where `ImportSessionDto::assessment` explains this at length. The reason
+/// names the field rather than spelling a path, so the queue does not become a
+/// second place the route's address is written down.
+///
+/// `RequiredForGoal`, not `Blocking`, on the same reading
+/// [`answer_classification_question_action`] is graded under. What an open
+/// session prevents is one call: opening another session for the same declared
+/// import, which is refused while this one holds rows. That refusal is not the
+/// system declining to accept work — it is this defect's own remedy, the thing
+/// that stops the same statement being imported twice — and a scope of one
+/// piece of work the owner controls is not `Blocking`.
+///
+/// `NeedsOwnerInput`, not `Ready`. Both calls are ones an agent may transmit,
+/// which is what `Scope::Agent` says; whether these rows become facts or are
+/// thrown away is not a choice anything but the owner may make on his behalf.
+fn import_session_unfinished_action(
+    summary: &ImportSessionSummaryView,
+    account: Option<&AccountView>,
+) -> Action {
+    let session = summary.session.id;
+    let mut preset = BTreeMap::new();
+    // The path segment of both routes, and it is the only thing either needs
+    // that the queue knows.
+    preset.insert("session".to_owned(), session.inner().to_string().into());
+    let commit = ResolutionOption {
+        operation: OperationKey::CommitImportSession,
+        request: RequestPlan {
+            preset: preset.clone(),
+            missing: vec![
+                // Optional in the schema and published as missing anyway, on
+                // the ground `start_account_import_action` publishes
+                // `/source/label` on: `missing` states what the plan needs
+                // supplied, and a commit sent without it writes whatever the
+                // session holds now rather than what its caller read.
+                //
+                // `Caller` and not `Owner`: the value is the stamp the
+                // assessment stamped on the reading this client fetched, so the
+                // client fills it in from what it already knows about its own
+                // run, without putting a question to the owner. Deciding to
+                // commit is his; quoting the revision he decided over is not.
+                MissingInput::plain("/revision", ProvidedBy::Caller),
+            ],
+        },
+    };
+    let abandon = ResolutionOption {
+        operation: OperationKey::AbandonImportSession,
+        request: RequestPlan {
+            preset,
+            missing: Vec::new(),
+        },
+    };
+
+    let held = match summary.row_count {
+        1 => "1 row, and it is in no journal and in no report".to_owned(),
+        rows => format!("{rows} rows, and they are in no journal and in no report"),
+    };
+    let waiting = match summary.unanswered {
+        0 => {
+            "Every question it raised is answered, so it can be committed as it stands.".to_owned()
+        }
+        1 => "1 of its questions is still unanswered, and the commit is refused until it is \
+              answered; the question is its own item in this queue."
+            .to_owned(),
+        open => format!(
+            "{open} of its questions are still unanswered, and the commit is refused until \
+             they are answered; each is its own item in this queue."
+        ),
+    };
+    let whose = match account {
+        Some(account) => format!(
+            " It was declared for account {} ({}).",
+            account.id.inner(),
+            account.title
+        ),
+        // A session opened without a declaration holds rows for as many
+        // accounts as its export covers, and naming one of them would name the
+        // first row's rather than the session's.
+        None => String::new(),
+    };
+
+    Action::new(
+        ActionFacts {
+            // One identity per session, so two half-finished imports are two
+            // items and an agent deduplicating by id never collapses them.
+            id: format!(
+                "{}:{}",
+                ActionKind::ImportSessionUnfinished.id(),
+                session.inner()
+            ),
+            kind: ActionKind::ImportSessionUnfinished,
+            category: ActionCategory::required_for(ActionKind::ImportSessionUnfinished),
+            state: ActionState::NeedsOwnerInput,
+            required_scope: Some(Scope::Agent),
+            subject: account.map(|account| ActionSubject::Account(AccountSubject::of(account))),
+        },
+        format!(
+            "Import session {session} has been open since {opened} and holds {held}.{whose} \
+             {waiting} Read what committing would record before recording it: every session \
+             response carries the address of its assessment in `assessment`, and the revision \
+             that answer stamps is what the commit is sent under. Abandoning ends the session \
+             instead and writes nothing — the rows were never facts, so there is nothing to \
+             retract — and it is how a statement imported by mistake is dropped. Until one of \
+             the two is called this session stays open, and opening another for the same \
+             declared import is refused rather than started alongside it.",
+            session = session.inner(),
+            opened = summary.session.opened_at,
+        ),
+        ActionTarget::from_options(vec![commit, abandon]),
+    )
+    .expect("import session action publishes both of the calls that end a session")
 }
 
 /// The `/answer` field, carrying the shapes **this** question admits.
@@ -2726,12 +2972,11 @@ fn start_account_import_action(account: &AccountView) -> Action {
              accounts and rules or asks him about it. Then read the assessment the \
              session publishes to see what committing would record and what it would \
              not, and commit under the revision that assessment carries; or synchronise \
-             a broker channel over an interval. An import already \
-             under way for this account is not something this item can see — a session \
-             records the source and the import it was opened for, and neither can be read \
-             back as an account — so opening one again is what finds it: the call refuses, \
-             names the session, and publishes the calls that end it. Import is \
-             continuous and never complete.",
+             a broker channel over an interval. An import already under way is its own \
+             item in this queue — a session holding rows that has not been committed or \
+             abandoned is published as `import_session_unfinished` — and opening one \
+             again finds it too: the call refuses, names the session, and publishes the \
+             calls that end it. Import is continuous and never complete.",
             account.id.inner(),
             account.title
         ),
@@ -3256,6 +3501,7 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
 mod tests {
     use super::*;
     use crate::adapters::sqlite::SqliteAdapter;
+    use crate::ports::ImportSessionView;
     use crate::ports::NewImportQuestion;
     use crate::ports::Store;
     use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
@@ -3338,10 +3584,13 @@ mod tests {
                 // turnover per account do not move.
                 ActionKind::ResolveTransferRelationships => &[MoneyFlow, Returns],
                 // A row in no journal is in no report; an account with no facts
-                // has nothing for any of the four to say; and a possible
-                // duplicate **is** recorded, so it may be the same money twice.
+                // has nothing for any of the four to say; a session's rows are
+                // pre-journal until it commits, so every report is computed as
+                // though they did not exist; and a possible duplicate **is**
+                // recorded, so it may be the same money twice.
                 ActionKind::StartAccountImport
                 | ActionKind::AnswerClassificationQuestion
+                | ActionKind::ImportSessionUnfinished
                 | ActionKind::PossibleDuplicateUndecided => {
                     &[AssetSnapshot, MoneyFlow, Returns, Reconciliation]
                 }
@@ -4136,6 +4385,7 @@ mod tests {
             activity: &[no_facts(account.id)],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4206,6 +4456,7 @@ mod tests {
             activity: &[no_facts(first), no_facts(second)],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4470,6 +4721,7 @@ mod tests {
             activity: &[no_facts(main.id), no_facts(savings.id)],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4541,6 +4793,7 @@ mod tests {
             activity: &[no_facts(account.id)],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4647,6 +4900,7 @@ mod tests {
             activity: std::slice::from_ref(&activity),
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4677,6 +4931,7 @@ mod tests {
                 activity: &[completed],
                 assertions: &[],
                 retired: &[],
+                sessions: &[],
                 questions: &[],
                 rules: &[],
             })
@@ -4706,6 +4961,7 @@ mod tests {
             activity: std::slice::from_ref(&activity),
             assertions: recorded,
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4876,6 +5132,7 @@ mod tests {
             activity: &activity,
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4906,6 +5163,7 @@ mod tests {
             activity: &[activity],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[],
             rules: &[],
         })
@@ -4924,6 +5182,7 @@ mod tests {
                 activity: &[],
                 assertions: &[],
                 retired: &[],
+                sessions: &[],
                 questions: &[],
                 rules: &[],
             })
@@ -6033,6 +6292,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -6073,6 +6333,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -6107,6 +6368,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -6149,6 +6411,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -6177,6 +6440,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -6228,6 +6492,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: std::slice::from_ref(&question),
             rules: &[],
         })
@@ -6258,6 +6523,7 @@ mod tests {
                 activity: &[],
                 assertions: &[],
                 retired: &[],
+                sessions: &[],
                 questions: std::slice::from_ref(&question),
                 rules: &[],
             })
@@ -6290,6 +6556,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: &[first.clone(), second.clone()],
             rules: &[],
         })
@@ -6446,6 +6713,7 @@ mod tests {
             activity: &[],
             assertions: &[],
             retired: &[],
+            sessions: &[],
             questions: std::slice::from_ref(question),
             rules,
         })
@@ -6662,6 +6930,54 @@ mod tests {
     fn queue_for_retirement(account: &AccountView, retired: &[RetiredProduct]) -> Vec<Action> {
         actions_from_state(&OwnerState {
             accounts: std::slice::from_ref(account),
+    // --- The unfinished import session in the queue (iaam-8ano) --------------
+    //
+    // The defect these cover: a session that held rows raised an item only
+    // through an unanswered question, so a session whose questions were all
+    // answered — or that raised none, which is what a clean statement does —
+    // stood open holding rows and appeared in no item. A caller that reads the
+    // queue and finds nothing outstanding concludes the import finished, and
+    // the next act is to import the same statement again.
+
+    fn session_summary(
+        state: ImportSessionState,
+        row_count: usize,
+        unanswered: usize,
+    ) -> ImportSessionSummaryView {
+        ImportSessionSummaryView {
+            session: ImportSessionView {
+                id: ImportSessionId::new_random(),
+                state,
+                account: None,
+                source: None,
+                import: None,
+                opened_at: "2026-03-01T00:00:00Z".to_owned(),
+                closed_at: match state {
+                    ImportSessionState::Open => None,
+                    ImportSessionState::Committed | ImportSessionState::Abandoned => {
+                        Some("2026-03-02T00:00:00Z".to_owned())
+                    }
+                },
+            },
+            row_count,
+            unanswered,
+        }
+    }
+
+    fn session_items(actions: &[Action]) -> Vec<&Action> {
+        actions
+            .iter()
+            .filter(|action| action.kind() == ActionKind::ImportSessionUnfinished)
+            .collect()
+    }
+
+    fn queue_for_sessions(
+        accounts: &[AccountView],
+        sessions: &[ImportSessionSummaryView],
+        questions: &[ClassificationQuestion],
+    ) -> Vec<Action> {
+        actions_from_state(&OwnerState {
+            accounts,
             contours: &[],
             exclusions: &[],
             transfers: &[],
@@ -6669,6 +6985,8 @@ mod tests {
             assertions: &[],
             retired,
             questions: &[],
+            sessions,
+            questions,
             rules: &[],
         })
         .expect("actions from state")
@@ -6830,5 +7148,233 @@ mod tests {
             .collect();
         assert_eq!(identities.len(), 2);
         assert_ne!(identities[0], identities[1]);
+    /// The defect, in one test: rows held, nothing to answer, nothing in the
+    /// queue.
+    #[test]
+    fn a_session_holding_rows_with_nothing_to_answer_is_still_an_item() {
+        let main = named("Main");
+        let held = session_summary(ImportSessionState::Open, 4, 0);
+
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&held),
+            &[],
+        );
+        let items = session_items(&actions);
+        assert_eq!(items.len(), 1, "{actions:#?}");
+        assert_eq!(
+            items[0].id(),
+            format!("import_session_unfinished:{}", held.session.id.inner()),
+            "one identity per session, so two half-finished imports never collapse"
+        );
+        assert_eq!(
+            items[0].category(),
+            ActionCategory::required_for(ActionKind::ImportSessionUnfinished),
+            "the rows are in no journal, so every report is computed without them"
+        );
+        assert_eq!(items[0].state(), ActionState::NeedsOwnerInput);
+        assert_eq!(items[0].required_scope(), Some(Scope::Agent));
+    }
+
+    /// The item publishes the two calls that end a session, and only those.
+    ///
+    /// Answering a question is not among them however many are open: a
+    /// resolution is a call that closes **this** item, and an answer leaves the
+    /// session exactly as open as it found it.
+    #[test]
+    fn the_item_offers_the_two_calls_that_end_a_session() {
+        let main = named("Main");
+        let held = session_summary(ImportSessionState::Open, 2, 0);
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&held),
+            &[],
+        );
+        let item = session_items(&actions)[0];
+
+        let resolutions = item.target().resolutions();
+        assert_eq!(
+            resolutions
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            vec![
+                OperationKey::CommitImportSession,
+                OperationKey::AbandonImportSession,
+            ],
+            "committing is the way on and abandoning the way out, in that order"
+        );
+        for (_, request) in &resolutions {
+            assert_eq!(
+                request.preset["session"],
+                serde_json::Value::from(held.session.id.inner().to_string()),
+                "both calls address the session this item is about"
+            );
+        }
+        // The assessment is a GET with no request body, so it is not an
+        // `OperationKey` and cannot be a target. It is named in the prose
+        // instead, by the field every session response publishes it in.
+        assert!(item.reason().contains("assessment"), "{}", item.reason());
+    }
+
+    /// A session that holds nothing is not work: it is what a caller retrying
+    /// the open call is handed back.
+    #[test]
+    fn an_empty_session_raises_nothing() {
+        let main = named("Main");
+        let empty = session_summary(ImportSessionState::Open, 0, 0);
+
+        assert!(!import_session_eligibility(&empty));
+        assert!(
+            session_items(&queue_for_sessions(
+                std::slice::from_ref(&main),
+                std::slice::from_ref(&empty),
+                &[],
+            ))
+            .is_empty()
+        );
+    }
+
+    /// The goal is that the session stopped being open, and both endings do it.
+    ///
+    /// Abandoning satisfies this where it deliberately does not satisfy the
+    /// question item: there it would stand in for the owner saying what a row
+    /// was, and here the item makes no claim about any row.
+    #[test]
+    fn committing_and_abandoning_both_close_the_item() {
+        let main = named("Main");
+        for ended in [ImportSessionState::Committed, ImportSessionState::Abandoned] {
+            let session = session_summary(ended, 7, 0);
+            assert!(import_session_completion(&session), "{ended:?}");
+            assert!(
+                session_items(&queue_for_sessions(
+                    std::slice::from_ref(&main),
+                    std::slice::from_ref(&session),
+                    &[],
+                ))
+                .is_empty(),
+                "{ended:?}"
+            );
+        }
+    }
+
+    /// A question does not stand in for the session, in either direction.
+    ///
+    /// The completion is quantified over the session and not over its
+    /// questions, which is the opposite of `classification_question_completion`
+    /// and for the opposite reason. So a session with an open question raises
+    /// **both** items — they say different things — and answering that question
+    /// leaves this one where it was.
+    #[test]
+    fn answering_the_last_question_does_not_end_the_session() {
+        let main = named("Main");
+        let mut waiting = session_summary(ImportSessionState::Open, 3, 1);
+        let question = asked(waiting.session.id, main.id, 1);
+
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&waiting),
+            std::slice::from_ref(&question),
+        );
+        assert_eq!(session_items(&actions).len(), 1, "{actions:#?}");
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.kind() == ActionKind::AnswerClassificationQuestion)
+                .count(),
+            1,
+            "the row and the session are two facts, and each has its own item"
+        );
+
+        // Every question answered, the session unchanged: the item stands.
+        waiting.unanswered = 0;
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&waiting),
+            &[],
+        );
+        assert_eq!(session_items(&actions).len(), 1, "{actions:#?}");
+    }
+
+    /// Two sessions are two items, whatever they hold.
+    ///
+    /// Identity is what an agent deduplicates and tracks by, and one shared
+    /// identity would make the second import invisible — which is this item's
+    /// own defect, one level down.
+    #[test]
+    fn two_open_sessions_are_two_items_with_distinct_identities() {
+        let main = named("Main");
+        let sessions = [
+            session_summary(ImportSessionState::Open, 1, 0),
+            session_summary(ImportSessionState::Open, 9, 2),
+        ];
+
+        let actions = queue_for_sessions(std::slice::from_ref(&main), &sessions, &[]);
+        let items = session_items(&actions);
+        assert_eq!(items.len(), 2, "{actions:#?}");
+        assert_ne!(items[0].id(), items[1].id());
+    }
+
+    /// A declared session names the account it was declared for; a free one
+    /// names none rather than the account of whichever row came first.
+    #[test]
+    fn the_item_names_the_account_the_session_was_declared_for() {
+        let main = named("Main");
+        let mut declared = session_summary(ImportSessionState::Open, 2, 0);
+        declared.session.account = Some(main.id);
+
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&declared),
+            &[],
+        );
+        assert_eq!(
+            session_items(&actions)[0]
+                .subject()
+                .and_then(ActionSubject::account),
+            Some(main.id)
+        );
+
+        let free = session_summary(ImportSessionState::Open, 2, 0);
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&free),
+            &[],
+        );
+        assert!(session_items(&actions)[0].subject().is_none());
+    }
+
+    /// The queue says how much is at stake without being asked again.
+    ///
+    /// The counts are why the listing carries them: an item that said only
+    /// «a session is open» would send its reader back to fetch the session to
+    /// find out whether anything is in it.
+    #[test]
+    fn the_reason_says_what_is_held_and_what_is_unanswered() {
+        let main = named("Main");
+        let waiting = session_summary(ImportSessionState::Open, 5, 2);
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&waiting),
+            &[],
+        );
+        let reason = session_items(&actions)[0].reason().to_owned();
+
+        assert!(reason.contains("5 rows"), "{reason}");
+        assert!(reason.contains("2 of its questions"), "{reason}");
+        assert!(
+            reason.contains(&waiting.session.id.inner().to_string()),
+            "{reason}"
+        );
+
+        let settled = session_summary(ImportSessionState::Open, 1, 0);
+        let actions = queue_for_sessions(
+            std::slice::from_ref(&main),
+            std::slice::from_ref(&settled),
+            &[],
+        );
+        let reason = session_items(&actions)[0].reason().to_owned();
+        assert!(reason.contains("1 row"), "{reason}");
+        assert!(reason.contains("can be committed"), "{reason}");
     }
 }

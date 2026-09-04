@@ -73,6 +73,30 @@ pub struct StoredSession {
     pub closed_at: Option<String>,
 }
 
+/// A session in a listing, with how much it holds.
+///
+/// Two counts, and not the rows themselves. A listing carrying the rows would
+/// be a second rendering of what a session holds beside the one
+/// `list_import_observations` already answers; the counts are what tells an
+/// import still under way from one that is finished, and a number cannot
+/// disagree with a row about what that row would become.
+///
+/// Counted in the statement that reads the sessions rather than by a query per
+/// session: this listing returns every import the owner has ever run, and a
+/// reader that must ask twice more per entry is a reader that does not ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSessionSummary {
+    pub session: StoredSession,
+    /// How many lines the session holds, conclusive and observed together.
+    ///
+    /// `row_count` and not `rows`, for the reason the application publishes it
+    /// under that name: a plural noun reads as the list of rows, and this is a
+    /// number.
+    pub row_count: usize,
+    /// How many of its questions are still unanswered.
+    pub unanswered: usize,
+}
+
 /// One submitted line held in a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredObservation {
@@ -257,31 +281,52 @@ impl SqliteStore {
             .transpose()
     }
 
-    /// Every session of the owner's, newest first.
+    /// Every session of the owner's, newest first, with how much each holds.
     ///
     /// This is what makes a question survive the response that carried it: a
     /// caller that lost the response finds the session here and the question in
     /// it.
-    pub fn list_import_sessions(&self, owner: OwnerId) -> Result<Vec<StoredSession>, StoreError> {
+    ///
+    /// The two counts are read in this statement rather than by a query per
+    /// session, and that is what lets every reader of the listing have them.
+    /// The action queue reads this list to find the imports still under way; a
+    /// count it had to fetch per session would have been a count it fetched for
+    /// none of them.
+    pub fn list_import_sessions(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<StoredSessionSummary>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, state, account, source, import, opened_at, closed_at
-             FROM import_sessions WHERE owner = ?1
-             ORDER BY opened_at DESC, id",
+            "SELECT s.id, s.state, s.account, s.source, s.import, s.opened_at, s.closed_at,
+                    (SELECT COUNT(*) FROM import_observations o WHERE o.session = s.id),
+                    (SELECT COUNT(*) FROM import_questions q
+                      WHERE q.session = s.id AND q.answered_at IS NULL)
+             FROM import_sessions s WHERE s.owner = ?1
+             ORDER BY s.opened_at DESC, s.id",
         )?;
         let rows = statement.query_map([owner.inner().to_string()], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
+                (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ),
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?;
         let mut sessions = Vec::new();
         for row in rows {
-            sessions.push(session_from(owner, row?)?);
+            let (columns, row_count, unanswered) = row?;
+            sessions.push(StoredSessionSummary {
+                session: session_from(owner, columns)?,
+                row_count: count_from(row_count, "import observation count")?,
+                unanswered: count_from(unanswered, "unanswered import question count")?,
+            });
         }
         Ok(sessions)
     }
@@ -988,6 +1033,19 @@ fn session_from(owner: OwnerId, row: SessionColumns) -> Result<StoredSession, St
             .map(ImportId),
         opened_at,
         closed_at,
+    })
+}
+
+/// A `COUNT(*)` as the application counts things.
+///
+/// An error rather than a saturating cast: SQLite counts in `i64` and this
+/// crate hands out `usize`, and a count that did not fit would be published as
+/// some other number — a session reported as holding no rows is exactly the
+/// answer this listing exists to stop being wrong about.
+fn count_from(value: i64, field: &'static str) -> Result<usize, StoreError> {
+    usize::try_from(value).map_err(|_| StoreError::InvalidValue {
+        field,
+        value: value.to_string(),
     })
 }
 

@@ -851,7 +851,7 @@ async fn health_is_public_and_reports_versions() {
     // silent bump would tell that agent nothing had changed, and a silent
     // omission would tell it nothing had changed when a new event kind
     // appeared.
-    assert_eq!(body["schema_version"], 12);
+    assert_eq!(body["schema_version"], 13);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version

@@ -30,7 +30,7 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Classification, ClassificationResult, ClassificationRule,
-    ClassificationSubject, FarSide, Movement, Question, RuleMatcher, classify,
+    ClassificationSubject, Movement, Question, RuleMatcher, classify,
 };
 use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
 use iaam_ingest::observation::{Intake, ObservedRow};
@@ -1981,6 +1981,12 @@ pub struct CommitDelta {
     pub duplicates: Vec<PlannedFact>,
     /// Rows the session keeps and the journal will not receive.
     pub retained_unrecorded: Vec<RetainedRow>,
+    /// Rows the commit read and deliberately recorded nothing for.
+    ///
+    /// Published beside the facts because a plan that showed a row neither as a
+    /// fact nor as retained would show a row that vanished. Empty is the
+    /// ordinary case.
+    pub settled_without_fact: Vec<SettledRow>,
     /// The provenance each account's `facts` will be written under.
     ///
     /// **Per account, because that is where the answer is true.** The origin is
@@ -2046,6 +2052,19 @@ pub struct PlannedOrigin {
 pub struct RetainedRow {
     pub row: u32,
     pub reason: RetentionReason,
+}
+
+/// A row the commit read, understood, and deliberately recorded nothing for.
+///
+/// Beside [`RetainedRow`] and deliberately not one of its reasons: a retained
+/// row is one the commit owes the journal and could not give it, which is why a
+/// coverage gap names the interval it fell in. This row owes nothing. Told
+/// apart at the type and not by a variant, so a reader folding the retained
+/// rows into a gap cannot pick this one up by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRow {
+    pub row: u32,
+    pub reason: NoFactReason,
 }
 
 /// Why a row records nothing.
@@ -3319,6 +3338,7 @@ pub async fn abandon_session(
 // ---------------------------------------------------------------------------
 
 /// What the owner's directory and rules make of one observed row.
+#[derive(Debug)]
 enum Assessment {
     Settled {
         classification: Classification,
@@ -4173,6 +4193,7 @@ mod tests {
     use super::*;
     use crate::ports::AccountAliasView;
     use iaam_core::event::kind::FeeOrigin;
+    use iaam_ingest::classification::FarSide;
     use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, RowIdentity};
     use iaam_ingest::operation::OperationDates;
     use time::macros::date;

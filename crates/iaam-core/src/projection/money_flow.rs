@@ -1105,7 +1105,7 @@ mod tests {
                     amount: rub(-480_000),
                 },
                 vec![Leg::cash(card, rub(-480_000))],
-                date!(2025 - 08 - 12),
+                date!(2026 - 08 - 12),
             ),
             &contour,
             august(),
@@ -1140,7 +1140,7 @@ mod tests {
             // has none — which is the point of it.
             &event_with(
                 card,
-                date!(2025 - 08 - 12),
+                date!(2026 - 08 - 12),
                 1,
                 EventKind::UnresolvedOwnAccountMovement {
                     amount: rub(480_000),

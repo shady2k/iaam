@@ -3349,7 +3349,14 @@ mod tests {
         //        import it declared, so a fact naming no declarer must refuse
         //        rather than be claimed. The number is what tells a reader that
         //        «no principal» means «written before anyone was recorded».
-        assert_eq!(SCHEMA_VERSION, 12);
+        // 12 → 13: added the variants `EventKind::OwnAccountMovement` and
+        //        `EventKind::UnresolvedOwnAccountMovement` (iaam-fmih). Older
+        //        facts stay readable — no existing variant changed shape — and
+        //        the number is what tells software that does not know them that
+        //        it may now meet a fact it cannot place: one whose far side is
+        //        an account of the owner's that no contour can prove it holds,
+        //        and one that posts no leg at all.
+        assert_eq!(SCHEMA_VERSION, 13);
     }
 
     #[test]

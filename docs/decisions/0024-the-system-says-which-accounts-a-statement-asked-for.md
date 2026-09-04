@@ -270,7 +270,9 @@ about an account you hold".
   is, neither this item nor `create_first_account` can publish it as a
   resolution, and both say in prose what they would rather say in a target.
 - **`start_account_import` still offers only the fallback for a cash account**
-  (`iaam-j5oz`). Unchanged here, and the same bead.
+  (`iaam-j5oz`). Unchanged here, and the same bead. *Closed since, by decision
+  0025: the item publishes four resolutions and the document channel is the
+  second of them.*
 - **A document that names its account in a preamble cell** is still outside
   profile schema version 1, so such a statement raises none of these items — it
   is refused whole, for want of a declaration, which is decision 0019's

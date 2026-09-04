@@ -3347,11 +3347,22 @@ pub async fn get_import_session(
     Ok(Json(session_contents_dto(&contents, &questions)))
 }
 
-/// Feed rows into a session.
+/// Feed rows into a session, in iaam's own shape.
 ///
 /// Nothing reaches the journal here, whatever the rows say — including a row the
 /// caller concluded. That is what a session is for: both legs of one transfer
 /// can sit in it before either is recorded.
+///
+/// The sibling of `POST /v1/import-sessions/{session}/document`, and the choice
+/// between them is which vocabulary the caller holds the rows in: an
+/// institution's own file goes to that one, where a reviewed profile says which
+/// column carried which cell, and rows already written in this API's words come
+/// here. The session is the same session afterwards.
+///
+/// The floor is the one `iaam_app::ports::required_scope` states for
+/// [`OperationKey::AddImportRows`], which is the same floor its sibling keeps:
+/// the rows are held out of the journal either way, so which shape they arrived
+/// in must not decide what the caller is allowed to say.
 #[utoipa::path(
     post,
     path = "/v1/import-sessions/{session}/rows",
@@ -3374,9 +3385,7 @@ pub async fn add_import_rows(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(request): ApiJson<AddImportRowsRequest>,
 ) -> Result<Json<Vec<ImportRowDto>>, ApiFailure> {
-    if !principal.scope.may_submit() {
-        return Err(ApiFailure::forbidden(principal.scope.code()));
-    }
+    require(&principal, OperationKey::AddImportRows)?;
     // An unreadable row does not invalidate the others (§10.1), and it is
     // reported against its position in the request: it never reached the
     // session, so it has no position in that.
@@ -5172,6 +5181,137 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
     }
 }
 
+/// Every write route that is deliberately not an [`OperationKey`], and why.
+///
+/// **The defect this closes is not that these routes are unofferable; it is that
+/// nothing recorded which of two things was meant** (`iaam-ripl`). A route
+/// outside the vocabulary is one of «decided not to be a key» or «nobody has
+/// asked for it yet», and the two want opposite things from the next reader: the
+/// first is an argument to answer before adding one, the second is an invitation
+/// to. Written nowhere, both looked identical — a route with no key beside it —
+/// and `iaam-1tij` is what that cost. The document channel sat here for a wave
+/// looking exactly like a decision, and it was an omission; an agent learned the
+/// ordinary way to import a cash statement from a specification or not at all.
+///
+/// So: a write route is either a key, or it is named here with the reason. The
+/// two sets together must cover every write this file declares, which is what
+/// `every_write_route_is_a_key_or_says_why_it_is_not` refuses to let drift.
+///
+/// **A write is a POST, a PUT, a DELETE or a PATCH**, because that is what a
+/// guard can see. Three of the entries below are that method carrying no write
+/// at all — a lookup, a preview, a report given exchange rates — and saying so
+/// here is the point: «this changes nothing» is a judgement, and a judgement
+/// belongs in a table rather than in whoever last read the handler.
+///
+/// The reason is one sentence and it names the thing it turns on. «Nobody asked»
+/// is a legitimate entry and the most likely to become wrong, which is why it
+/// says *what would have to be true* for the key to be wanted rather than
+/// merely that nothing wants it today.
+///
+/// Owner-only administration — accounts' aliases and declarations, categories
+/// and groups, instruments, tokens, broker access — shares one reason and it is
+/// the reason [`require_admin`] states: the queue and the caveat register are
+/// about the owner's money and these are about the shape of the instance, so
+/// there is no second reader of their authority for a floor to disagree with.
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
+    (
+        "resolve_instrument",
+        "A read that takes a body: it answers which instrument a namespace, a value and a date name, and records nothing. A target is a call that changes something — see list_source_profiles.",
+    ),
+    (
+        "preview_category_rule_route",
+        "A read that takes a body: it says what a rule would match and writes no rule.",
+    ),
+    (
+        "returns_report_with_rates",
+        "A read that takes a body: the exchange rates are an input to the answer and are not kept.",
+    ),
+    (
+        "correct_import",
+        "Decided against. What an agent may retract depends on what the journal says it declared (conventions 4.5), and that bound is settled in iaam_app::scenarios::correction against the same read the reversal is computed from. A key states a floor and nothing else, so one here would publish an authority that is right for the owner and wrong for the agent on every import that is not its own.",
+    ),
+    (
+        "sync_market",
+        "Not asked for, and the register is where the argument has to start: the caveats for an unpriced position and an unvalued holding close on nothing on purpose, because this API records prices from sources and refuses to accept a value for a holding. Whether fetching a series closes one of them is that decision, not this one.",
+    ),
+    (
+        "state_import_control_figures",
+        "Not asked for. provide_control_assertion offers record_owner_balance, which is the owner stating what an account held; this states what a document printed, and no computed state is about a control section nobody has transcribed. It becomes a key when a session's assessment publishes an item for the figures it was never given.",
+    ),
+    (
+        "ingest_journal_events",
+        "Not asked for. It takes facts already shaped as journal events, where ingest_operations — which is a key, and the one every item points at — takes them as operations; offering both from one item would be two spellings of one act in one list.",
+    ),
+    (
+        "ingest_csv",
+        "Not asked for. It takes iaam's own CSV and not an institution's export, and the queue's answer for a document is read_import_document, which reads one through a reviewed profile. A key here would offer a caller the channel that rejects the file it is holding.",
+    ),
+    (
+        "upload_document",
+        "Not asked for. The report channel records as it reads, and no computed state is about a broker report nobody sent: start_account_import offers sync_broker for the accounts that have a channel.",
+    ),
+    (
+        "reparse_document",
+        "Not asked for. It reads a kept document again after a parser is fixed, which is a repair the operator reaches for; nothing in the journal says a document should be read a second time.",
+    ),
+    (
+        "repair_custody",
+        "Not asked for. The state it repairs is published in a report's own diagnostics, and an item for it would be a second place saying so.",
+    ),
+    (
+        "confirm_transfer_pairing",
+        "Not asked for as a target. The pairing is proposed on the read that finds it, and what it writes is two corrections, gated where every correction is.",
+    ),
+    (
+        "create_instrument",
+        "Reference data the owner curates. Nothing outstanding is about a missing instrument: the caveats for an unpriced position and an unvalued holding close on nothing, and minting one would not price it.",
+    ),
+    (
+        "delete_classification_rule",
+        "Owner-only administration: retiring a standing decision of his, which no computed state asks for.",
+    ),
+    (
+        "create_category_group_route",
+        "Owner-only administration: the shape of his own vocabulary.",
+    ),
+    (
+        "create_category_route",
+        "Owner-only administration: the shape of his own vocabulary. The item about an undecomposed outflow offers create_category_rule, which files an event under a category that exists.",
+    ),
+    (
+        "delete_category",
+        "Owner-only administration: the shape of his own vocabulary.",
+    ),
+    (
+        "replace_account_aliases",
+        "Owner-only administration: how a source's word for an account is read, which is a property of the instance and not of his money.",
+    ),
+    (
+        "replace_account_declarations",
+        "Owner-only administration: the identity a source prints for an account.",
+    ),
+    (
+        "record_account_transfer_partners_batch",
+        "The batch spelling of record_account_transfer_partners, which is the key. resolve_transfer_relationships is per account and its target is the per-account route; a second key for the same statement would let two items disagree about which call makes it.",
+    ),
+    (
+        "clear_account_transfer_partners",
+        "It withdraws the statement record_account_transfer_partners makes, and no computed state is about a statement that should be taken back.",
+    ),
+    (
+        "revoke_broker_access",
+        "Owner-only administration: who this instance may fetch from.",
+    ),
+    (
+        "create_token",
+        "Owner-only administration: who may call at all.",
+    ),
+    (
+        "revoke_token",
+        "Owner-only administration: who may call at all.",
+    ),
+];
+
 /// Name lookup for document parsing.
 ///
 /// A place of custody is resolved by the owner's title for it, and nothing else
@@ -5245,8 +5385,24 @@ mod tests {
     struct Handler<'a> {
         operation_id: String,
         name: &'a str,
+        /// The HTTP method the route declares, upper-cased.
+        ///
+        /// Read because it is the only thing a source scan can see about
+        /// whether a route writes. It over-approximates — three POSTs in this
+        /// file change nothing — and that is why
+        /// [`WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY`] carries a reason for each
+        /// of them rather than the sweep quietly skipping them.
+        method: String,
         body: Vec<&'a str>,
     }
+
+    /// The methods that may change something, as this file declares them.
+    const WRITE_METHODS: [&str; 4] = ["POST", "PUT", "DELETE", "PATCH"];
+
+    /// The methods that may not. Listed beside the writes rather than derived
+    /// from their absence: the parser recognises a method by seeing one, and a
+    /// method it recognises as neither is a route it would silently skip.
+    const READ_METHODS: [&str; 4] = ["GET", "HEAD", "OPTIONS", "TRACE"];
 
     /// The `pub const … : &str = "…";` declarations this file uses for its
     /// operation identifiers, so that `operation_id = SOME_CONST` resolves.
@@ -5289,8 +5445,18 @@ mod tests {
                 continue;
             }
             let mut declared: Option<String> = None;
+            let mut method: Option<String> = None;
             index += 1;
             while index < lines.len() && lines[index].trim() != ")]" {
+                let bare = lines[index].trim().trim_end_matches(',');
+                if method.is_none()
+                    && WRITE_METHODS
+                        .iter()
+                        .chain(READ_METHODS.iter())
+                        .any(|candidate| candidate.eq_ignore_ascii_case(bare))
+                {
+                    method = Some(bare.to_ascii_uppercase());
+                }
                 if let Some(value) = lines[index].trim().strip_prefix("operation_id = ") {
                     let token = value.trim_end_matches(',');
                     declared = Some(if token.starts_with('"') {
@@ -5330,6 +5496,7 @@ mod tests {
             handlers.push(Handler {
                 operation_id: declared.unwrap_or_else(|| name.to_owned()),
                 name,
+                method: method.unwrap_or_else(|| panic!("{name} declares no HTTP method")),
                 body,
             });
         }
@@ -5411,6 +5578,153 @@ mod tests {
             .find(|handler| handler.operation_id == "submit_corrections")
             .expect("submit_corrections was not found by the scan");
         assert_eq!(by_default.name, "submit_corrections");
+    }
+
+    /// Every write route is an [`OperationKey`] or says why it is not
+    /// (`iaam-ripl`).
+    ///
+    /// The other half of `iaam_app::actions`'s coverage guard, and the two are
+    /// only worth something together. That one refuses a key nothing offers, so
+    /// a name cannot be added and forgotten; this one refuses a write nothing
+    /// names, so a channel cannot stay unofferable by staying unmentioned.
+    /// `iaam-1tij` slipped between them: `read_import_document` was a write with
+    /// no key, which nothing checked, and so no resolution could point at it,
+    /// which nothing checked either.
+    ///
+    /// Method rather than consequence, because method is what a source scan can
+    /// see. The over-approximation is answered in the table, not here: a POST
+    /// that changes nothing is declared with that as its reason, which puts the
+    /// judgement somewhere a reader can disagree with it.
+    ///
+    /// Both directions are swept. A route named in the table **and** carrying a
+    /// key is the drift this guard exists to catch — it would mean the reason
+    /// stopped being true when the key was added — and a table entry naming no
+    /// route at all is a reason kept for a handler that has been deleted or
+    /// renamed.
+    #[test]
+    fn every_write_route_is_a_key_or_says_why_it_is_not() {
+        let handlers = documented_handlers();
+        let declared: BTreeMap<&str, &str> = WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            declared.len(),
+            WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY.len(),
+            "a route is declared out of the vocabulary once, with one reason"
+        );
+
+        let mut writes = 0_usize;
+        for handler in &handlers {
+            if !WRITE_METHODS.contains(&handler.method.as_str()) {
+                assert!(
+                    !declared.contains_key(handler.operation_id.as_str()),
+                    "{} is a read and needs no entry: a target is a call that \
+                     changes something, which `list_source_profiles` states once",
+                    handler.operation_id
+                );
+                continue;
+            }
+            writes += 1;
+            let is_key = OperationKey::ALL
+                .iter()
+                .any(|key| key.as_str() == handler.operation_id);
+            let is_declared = declared.contains_key(handler.operation_id.as_str());
+            assert!(
+                is_key || is_declared,
+                "{} writes and is neither an OperationKey nor declared not to \
+                 be one. Say which: a key, so an item or a caveat can offer it, \
+                 or an entry in WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY saying \
+                 whether that was decided or merely never asked",
+                handler.operation_id
+            );
+            assert!(
+                !(is_key && is_declared),
+                "{} is a key and is also declared not to be one",
+                handler.operation_id
+            );
+        }
+
+        // Every reason belongs to a route that exists.
+        for (operation_id, _) in WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY {
+            assert!(
+                handlers
+                    .iter()
+                    .any(|handler| handler.operation_id == operation_id),
+                "{operation_id} is declared out of the vocabulary and this file \
+                 declares no such route"
+            );
+        }
+
+        // The two sets are the whole of it, so a write that stopped being
+        // either cannot hide in the arithmetic.
+        assert_eq!(
+            writes,
+            OperationKey::ALL.len() + WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY.len(),
+            "every write is a key or is declared, and every key is a write"
+        );
+    }
+
+    /// The sweep above reads the methods it claims to read.
+    ///
+    /// The same argument `the_source_scan_finds_the_handlers_it_claims_to_check`
+    /// makes about operation identifiers, made about the field the write sweep
+    /// turns on: a parse that read every method as `GET` would sweep nothing and
+    /// pass. So both halves are pinned against routes known to be each, and the
+    /// count is checked against a file that plainly holds both.
+    #[test]
+    fn the_source_scan_reads_the_method_each_route_declares() {
+        let handlers = documented_handlers();
+        let method_of = |operation_id: &str| {
+            handlers
+                .iter()
+                .find(|handler| handler.operation_id == operation_id)
+                .unwrap_or_else(|| panic!("{operation_id} was not found by the scan"))
+                .method
+                .clone()
+        };
+        assert_eq!(method_of("add_import_rows"), "POST");
+        assert_eq!(method_of("record_account_transfer_partners"), "PUT");
+        assert_eq!(method_of("revoke_token"), "DELETE");
+        assert_eq!(method_of("list_source_profiles"), "GET");
+
+        let writes = handlers
+            .iter()
+            .filter(|handler| WRITE_METHODS.contains(&handler.method.as_str()))
+            .count();
+        assert!(
+            writes > 0 && writes < handlers.len(),
+            "this file declares both reads and writes, and the scan must \
+             separate them: {writes} of {}",
+            handlers.len()
+        );
+    }
+
+    /// Feeding a session row by row is a call an item can offer (`iaam-ripl`).
+    ///
+    /// It is pinned here rather than left to the sweep because it is the defect
+    /// the sweep was built around: `POST /v1/import-sessions/{session}/rows` is
+    /// the other way rows enter a session, it is the call
+    /// `start_account_import` has told callers to make since the item existed,
+    /// and no resolution could name it. The identifier is the handler's own
+    /// name — utoipa defaults `operation_id` to the function it documents — so
+    /// the key's wire code and the route's identifier are pinned together.
+    #[test]
+    fn the_row_channel_is_an_operation_key_named_by_the_route_that_answers_it() {
+        assert_eq!(OperationKey::AddImportRows.as_str(), "add_import_rows");
+        let handlers = documented_handlers();
+        let handler = handlers
+            .iter()
+            .find(|handler| handler.operation_id == "add_import_rows")
+            .expect("add_import_rows was not found by the scan");
+        assert_eq!(handler.name, "add_import_rows");
+        assert_eq!(handler.method, "POST");
+        assert_eq!(
+            required_scope(OperationKey::AddImportRows),
+            required_scope(OperationKey::ReadImportDocument),
+            "the two ways into a session cannot differ in authority: which \
+             shape the rows arrived in must not decide what a caller may say"
+        );
     }
 
     /// `require` is the refusal the two removed tests made, and it must make it

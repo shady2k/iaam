@@ -27,3 +27,4 @@
 | [0021](0021-the-authority-a-call-demands-is-a-property-of-the-call.md) | The authority a call demands is a property of the call | 2026-09-04 | proposed | `iaam-woeh` |
 | [0022](0022-an-agent-may-convey-a-document-and-may-not-interpret-one.md) | An agent may convey a document, and may not interpret one | 2026-09-04 | proposed | `iaam-cw3k` |
 | [0024](0024-the-system-says-which-accounts-a-statement-asked-for.md) | The system says which accounts a statement asked for | 2026-09-04 | proposed | `iaam-x9ls` |
+| [0025](0025-a-write-route-is-an-operation-key-or-says-why-it-is-not.md) | A write route is an operation key, or says why it is not | 2026-09-04 | proposed | `iaam-ripl` |

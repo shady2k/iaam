@@ -146,6 +146,33 @@ pub enum OperationKey {
     /// key no item could offer it, and an agent learned the ordinary way to
     /// import a statement from a document or not at all.
     ReadImportDocument,
+    /// Put rows into an open session in iaam's own shape, one row each.
+    ///
+    /// The other way into a session, and the case for a name of its own is the
+    /// same one [`Self::ReadImportDocument`] makes from the other side. That key
+    /// conveys an institution's file and lets a reviewed profile say which
+    /// column carried which cell; this one is for a caller that already holds
+    /// the rows in this API's own vocabulary — pasted, transcribed, or produced
+    /// by the owner's own converter — and for which no profile exists or none
+    /// is wanted. A session fed by either is the same session afterwards.
+    ///
+    /// Not [`Self::SubmitOperations`], and the difference is where the row
+    /// lands rather than what it looks like. That key writes a business fact
+    /// into the journal at once, on the caller's word that it is one. This one
+    /// writes nothing there: the rows are held, questioned and settled, and
+    /// they become facts at [`Self::CommitImportSession`] or at no point at
+    /// all. Both legs of one transfer can sit in a session before either is
+    /// recorded, which is the whole reason the session exists, and a caller
+    /// that reached for the journal route instead has already recorded the
+    /// first leg by the time it reads the second.
+    ///
+    /// Named here because it was reachable and unofferable, which is what
+    /// `iaam-1tij` said of its neighbour and was equally true of this one
+    /// (`iaam-ripl`). The queue's `start_account_import` told a caller to open
+    /// a session and feed it the rows, and the call that feeds it was not a
+    /// name a resolution could hold — so the sentence was prose an agent had to
+    /// resolve against the specification by itself.
+    AddImportRows,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
     /// Write everything one import session holds into the journal, once.
@@ -180,10 +207,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding an eighteenth variant to
+    /// The declared length is the only thing holding a nineteenth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -197,6 +224,7 @@ impl OperationKey {
         Self::OpenImportSession,
         Self::SyncBroker,
         Self::ReadImportDocument,
+        Self::AddImportRows,
         Self::AnswerImportQuestion,
         Self::CommitImportSession,
         Self::AbandonImportSession,
@@ -220,6 +248,7 @@ impl OperationKey {
             Self::OpenImportSession => "open_import_session",
             Self::SyncBroker => "sync_broker",
             Self::ReadImportDocument => "read_import_document",
+            Self::AddImportRows => "add_import_rows",
             Self::AnswerImportQuestion => "answer_import_question",
             Self::CommitImportSession => "commit_import_session",
             Self::AbandonImportSession => "abandon_import_session",

@@ -45,6 +45,25 @@ Three steps, in order:
    `providedBy` on a missing field is a separate question — who holds the value,
    not who may transmit it.
 
+   **A field the owner must fill in arrives with the question to put to him, and
+   that question is the whole of what you show him.** Each missing field marked
+   as his carries a `prompt` with two parts: `ask`, which is what he is being
+   asked and why, and `consequence`, which is what is different depending on how
+   he answers. Relay both. Do not put the field's pointer to him, and do not
+   read him the field descriptions out of the contract — those are written for
+   whoever implements a client, and an agent that showed him one showed him a
+   wire field name and left him asking what the question even was.
+
+   A missing field of his that carries no `prompt` is not an invitation to
+   compose one. It means this instance has not decided whether a person should
+   be asked for that field at all; ask the owner about the fields that do carry
+   one, and leave that field to him or to whoever runs the instance.
+
+   **Never read a `preset` value out to him.** `preset` is the request already
+   filled in from what the instance worked out — an address in the route, a
+   composition, an identifier a document printed — and none of it is a question.
+   Send it as it stands.
+
 A credential is not obtained through the API. It is issued at the console by
 whoever runs the instance and handed to you; no call produces one. If a call is
 refused for want of one, say so — there is no other route to try.

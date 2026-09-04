@@ -29,3 +29,4 @@
 | [0024](0024-the-system-says-which-accounts-a-statement-asked-for.md) | The system says which accounts a statement asked for | 2026-09-04 | proposed | `iaam-x9ls` |
 | [0025](0025-a-write-route-is-an-operation-key-or-says-why-it-is-not.md) | A write route is an operation key, or says why it is not | 2026-09-04 | proposed | `iaam-ripl` |
 | [0026](0026-a-rule-may-ask-what-the-source-filed-the-row-under.md) | A rule may ask what the source filed the row under, and it is not scoped to a source | 2026-09-04 | proposed | `iaam-93lz` |
+| [0027](0027-a-field-the-owner-fills-in-carries-the-question-to-put-to-him.md) | A field the owner fills in carries the question to put to him | 2026-09-04 | proposed | `iaam-ytvf` |

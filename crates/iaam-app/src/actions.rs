@@ -665,11 +665,449 @@ pub struct AccountCandidate {
     pub institution: Option<String>,
 }
 
+/// The question this system puts to the owner about one field it cannot fill.
+///
+/// **[`ProvidedBy::Owner`] says who supplies a value and never says what to ask
+/// him** (`iaam-ytvf`). An agent relaying a queue item to a person held one
+/// string per field — the JSON pointer — so it showed him the pointer, and
+/// beside it the schema descriptions, which are written for whoever implements a
+/// client. The agent was not careless; those were the only strings this surface
+/// gave it.
+///
+/// **A closed vocabulary whose variants are fields of calls, not pointers.**
+/// `/title` is an account's title on one route and a perimeter's on another, so
+/// a table keyed by the pointer would answer one of them with the other's
+/// sentence. Each variant therefore names its call ([`Self::asked_by`]) and
+/// derives its pointer ([`Self::pointer`]) instead of being written beside one,
+/// and two items asking for the same field of the same call ask it in the same
+/// words. That is the arrangement
+/// [`iaam_ingest::classification::AnswerShape::consequence`] already has, and it
+/// is here for the same reason: two publishers of one question will eventually
+/// disagree about it.
+///
+/// **An item specialises by handing over what it knows, never by writing a
+/// second sentence.** [`Self::AccountTitle`] carries the string a document
+/// printed, because the item that document raised is asking about *that*
+/// account and a bare «what do you call this account?» would leave the owner to
+/// work out which one. Both shapes of the question still live here, so the
+/// default and the specialisation cannot drift apart — an item supplies the
+/// datum and this type supplies the words.
+///
+/// **Not the item's `reason`.** `iaam-tt71` found that a mapping from field to
+/// question, gathered into one prose sentence, has to be taken apart again by
+/// the caller that must show the owner **one** field. That is
+/// `docs/api/conventions.md` §5's objection to a structure sent as a string, and
+/// it is written a second time on [`InputAlternative::consequence`], which
+/// exists because a consequence per alternative gathered into one sentence is
+/// the same mistake.
+///
+/// **The register is the owner's own rule**, and he wrote it: every question
+/// put to him is asked so that he understands it, with none of our internal
+/// words, saying what it is for and what his decision changes. The third
+/// obligation is why [`OwnerQuestion`] has two parts rather than one string —
+/// the half that says what turns on the answer is the half that gets folded
+/// away into a sentence that already reads as finished.
+///
+/// `a_question_for_a_person_is_not_a_field_name` states the mechanical part of
+/// that register and is proved against the strings the field report actually
+/// carried. The rest of it — that a person who has never read this codebase can
+/// answer the question — is not a property a test can hold, and decision 0027
+/// says so rather than pretending otherwise.
+///
+/// Decision 0027.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerPrompt {
+    /// His own name for an account, and the string a document printed for it
+    /// where one did.
+    ///
+    /// The one variant that carries a datum, and the asymmetry decision 0004
+    /// argues for is why. `provider_account_id` is preset from the printed
+    /// string and the title deliberately is not — a title can be renamed and
+    /// would silently stop a statement importing — and that reasoning is
+    /// invisible to a caller, which is how an agent came to show the owner a
+    /// filled-in field he has no business seeing. Said in the question, it stops
+    /// being invisible without the preset having to grow a shape of its own.
+    AccountTitle { printed: Option<String> },
+    /// His name for a reporting perimeter.
+    ContourTitle,
+    /// Which accounts a new perimeter holds.
+    ContourAccounts,
+    /// Which perimeter an account joins, where he has more than one.
+    MembershipContour,
+    /// The composition a perimeter has once the account joins it.
+    MembershipAccounts,
+    /// Why an account is deliberately outside every perimeter.
+    ExclusionReason,
+    /// Which of his other accounts money moves directly between this one and.
+    TransferPartners,
+    /// Which broker holds an account.
+    BrokerChannel,
+    /// The first date a broker is asked about.
+    SyncFrom,
+    /// The last date a broker is asked about.
+    SyncTo,
+    /// Which recorded facts should stop counting, and what stands instead.
+    Corrections,
+    /// That he accepts what the correction retracts.
+    AcknowledgeRetraction,
+    /// The cash figure he is asserting against the journal.
+    OwnerBalanceCash,
+    /// What an account held before this system knew anything about it.
+    OpeningAmount,
+    /// The currency that opening figure is in.
+    OpeningCurrency,
+    /// The date that opening figure speaks about.
+    OpeningDate,
+    /// What the rows a rule is for have in common.
+    RuleMatcher,
+    /// What those rows were for.
+    RuleCategory,
+    /// What one held row of an import was.
+    ImportAnswer,
+    /// Which of his accounts is the far side of a movement.
+    TransferFarSide,
+}
+
+impl OwnerPrompt {
+    /// The field this question is about, as a JSON pointer into the request.
+    ///
+    /// Derived rather than written beside the question, so that an item cannot
+    /// publish one field's pointer with another field's words. It is also what
+    /// makes reusing the wrong variant visible: the pointer changes with it, and
+    /// the route rejects a request built from it.
+    #[must_use]
+    pub const fn pointer(&self) -> &'static str {
+        match self {
+            Self::AccountTitle { .. } | Self::ContourTitle => "/title",
+            Self::ContourAccounts | Self::MembershipAccounts => "/accounts",
+            Self::MembershipContour => "/contour",
+            Self::ExclusionReason => "/reason",
+            Self::TransferPartners => "/partners",
+            Self::BrokerChannel => "/broker",
+            Self::SyncFrom => "/from",
+            Self::SyncTo => "/to",
+            Self::Corrections => "/corrections",
+            Self::AcknowledgeRetraction => "/acknowledge_retraction",
+            Self::OwnerBalanceCash => "/cash",
+            Self::OpeningAmount => "/operations/0/amount",
+            Self::OpeningCurrency => "/operations/0/currency",
+            Self::OpeningDate => "/operations/0/dates/cash_posted",
+            Self::RuleMatcher => "/matcher",
+            Self::RuleCategory => "/category",
+            Self::ImportAnswer => "/answer",
+            Self::TransferFarSide => "/account",
+        }
+    }
+
+    /// The call this field belongs to.
+    ///
+    /// A pointer is not an identity — `/title` is two different questions — so
+    /// the key is the pair, and this is the half a pointer cannot carry. The
+    /// guard reads it back: a question published on a resolution that calls
+    /// something else is a question about a field that request does not have.
+    #[must_use]
+    pub const fn asked_by(&self) -> OperationKey {
+        match self {
+            Self::AccountTitle { .. } => OperationKey::CreateAccount,
+            Self::ContourTitle | Self::ContourAccounts => OperationKey::CreateContour,
+            Self::MembershipContour | Self::MembershipAccounts => OperationKey::AddContourVersion,
+            Self::ExclusionReason => OperationKey::RecordAccountScope,
+            Self::TransferPartners => OperationKey::RecordAccountTransferPartners,
+            Self::BrokerChannel | Self::SyncFrom | Self::SyncTo => OperationKey::SyncBroker,
+            Self::Corrections | Self::AcknowledgeRetraction => OperationKey::SubmitCorrections,
+            Self::OwnerBalanceCash => OperationKey::RecordOwnerBalance,
+            Self::OpeningAmount | Self::OpeningCurrency | Self::OpeningDate => {
+                OperationKey::SubmitOperations
+            }
+            Self::RuleMatcher | Self::RuleCategory => OperationKey::CreateCategoryRule,
+            Self::ImportAnswer | Self::TransferFarSide => OperationKey::AnswerImportQuestion,
+        }
+    }
+
+    /// The words put to the owner: what is being asked, and what turns on it.
+    ///
+    /// **Two strings and not one**, and the owner wrote the rule they answer to:
+    /// every question put to him is to be asked so that he understands it,
+    /// without our internal words, saying what it is for and what his decision
+    /// changes. The third obligation is the one that gets dropped — an item that
+    /// kept the first two told him a title was his own and that he could change
+    /// it whenever he liked, and he asked what the question even was and what it
+    /// affected — and it is dropped because it is easy to drop when it is a
+    /// clause at the end of a sentence that already reads as finished.
+    ///
+    /// It is also the half that legitimately varies. What a name is *for* is the
+    /// same wherever it is asked; what turns on it is not, and
+    /// [`Self::AccountTitle`] is the case: an account created from a document
+    /// already carries the string that document printed, so a later rename moves
+    /// nothing but the label he reads, while an account carrying no printed
+    /// string is found by its name and a rename can stop a statement lining up
+    /// with it. Splitting the two lets an item vary the second without three
+    /// items inventing three answers to the first.
+    ///
+    /// Beside the field for the reason [`InputAlternative::consequence`] sits
+    /// beside the value it belongs to, and it is the same word for the same
+    /// idea: what changes if you answer this way rather than that.
+    #[must_use]
+    pub fn question(&self) -> OwnerQuestion {
+        let (ask, consequence): (String, String) = match self {
+            Self::AccountTitle { printed: None } => (
+                "What do you want to call this account? Use the name you would use for it \
+                 yourself — it is the name you will see on every report and in every list this \
+                 system shows you."
+                    .to_owned(),
+                "Nothing else depends on it, with one exception. When a statement arrives for \
+                 an account this system holds no account number for, the name printed on the \
+                 line is what it is matched against — so while this account has no number \
+                 recorded, renaming it can stop a statement lining up with it, and the way out \
+                 of that is to record the number rather than to name the account back."
+                    .to_owned(),
+            ),
+            Self::AccountTitle {
+                printed: Some(printed),
+            } => (
+                format!(
+                    "What do you want to call the account that a document of yours calls \
+                     «{printed}»? Use the name you would use for it yourself — it is the name \
+                     you will see on every report and in every list this system shows you."
+                ),
+                format!(
+                    "«{printed}» is kept with the account too, so lines printed that way find \
+                     it whatever you call it. Your answer therefore changes only what you read: \
+                     renaming the account later moves the labels on your reports, moves no \
+                     figure, and breaks no import."
+                ),
+            ),
+            Self::ContourTitle => (
+                "What do you want to call this group of accounts — the group whose money your \
+                 reports are about?"
+                    .to_owned(),
+                "The name is only what you read on the reports; no figure depends on it. Which \
+                 accounts the group holds is the next question, and that is the one that \
+                 decides the figures."
+                    .to_owned(),
+            ),
+            Self::ContourAccounts => (
+                "Which of your accounts belong in that group?".to_owned(),
+                "Only the accounts you name are counted in your reports. Money moving between \
+                 two of them counts as your own money moving and as neither spending nor \
+                 income; money going anywhere else counts as having left you. An account you \
+                 leave out is in none of the figures — the reports say which accounts they left \
+                 out, but they do not add it in."
+                    .to_owned(),
+            ),
+            Self::MembershipContour => (
+                "Which of your groups of accounts should this one join? You keep more than one, \
+                 so nothing here can choose for you."
+                    .to_owned(),
+                "This account's money starts counting in the reports for the group you name, \
+                 and in no other. If you keep separate groups for separate purposes, this is \
+                 what decides which set of figures its spending and its income turn up in."
+                    .to_owned(),
+            ),
+            Self::MembershipAccounts => (
+                "Which accounts should that group hold once this one has joined it?".to_owned(),
+                "The answer replaces the group's membership outright, so it has to be the whole \
+                 list and not only the account being added: any account you leave off is left \
+                 out of the group, and out of the figures its reports show, from now on."
+                    .to_owned(),
+            ),
+            Self::ExclusionReason => (
+                "Why does this account not belong in any of your groups?".to_owned(),
+                "No figure moves either way — the account is already outside them. What the \
+                 sentence buys you is a year from now: it is the only thing that tells an \
+                 account you left out on purpose from one nobody ever got round to, and this \
+                 system stops asking about this one once you have said it."
+                    .to_owned(),
+            ),
+            Self::TransferPartners => (
+                "Which of your other accounts does money move directly between this one and? \
+                 Name all of them, or say that none of them does."
+                    .to_owned(),
+                "One movement between two banks is printed twice, once by each of them, and \
+                 nothing in the two lines says they are the same movement. Naming the accounts \
+                 lets the two be paired, and the money then counts as having moved between your \
+                 own accounts. Until then each line is counted separately, as money leaving you \
+                 and as money arriving from outside — so both your spending and your income \
+                 read larger than they were."
+                    .to_owned(),
+            ),
+            Self::BrokerChannel => (
+                "Which broker holds this account?".to_owned(),
+                "Naming it lets this system ask that broker directly for what the account holds \
+                 and what it did, instead of you fetching a file and handing it over. Nothing \
+                 here knows which one it is, so until you say, nothing can be fetched and this \
+                 account stays empty."
+                    .to_owned(),
+            ),
+            Self::SyncFrom => (
+                "From which date should the broker be asked about this account?".to_owned(),
+                "Everything the broker reports from that date onward is taken in, and anything \
+                 before it is not. A date later than the account's real beginning leaves the \
+                 earlier part missing, and every figure is then about the part that was fetched \
+                 rather than about the account. Nothing here can propose a date: this account \
+                 has no history recorded yet, so there is nothing to read one off."
+                    .to_owned(),
+            ),
+            Self::SyncTo => (
+                "Up to which date should the broker be asked about this account?".to_owned(),
+                "Anything after that date is not fetched, so it is in none of your figures \
+                 until you ask again over a later stretch. Asking twice over the same stretch \
+                 is safe: what was already taken in is not taken in twice."
+                    .to_owned(),
+            ),
+            Self::Corrections => (
+                "Which of the things already recorded should stop counting, and what should \
+                 stand in their place?"
+                    .to_owned(),
+                "Whatever you name stops being counted and what you put in its place counts \
+                 instead, so every report that included it changes. Nothing is erased: the \
+                 original stays recorded and marked as no longer counting, which is what lets \
+                 the change be seen afterwards and undone."
+                    .to_owned(),
+            ),
+            Self::AcknowledgeRetraction => (
+                "Do you accept that this withdraws things that were already recorded?".to_owned(),
+                "Saying yes lets the change through, and figures you have already read will \
+                 move. Saying no leaves everything as it stands and records nothing. It is \
+                 asked apart from the correction itself because a change that quietly withdrew \
+                 what was recorded would move figures you had acted on without telling you."
+                    .to_owned(),
+            ),
+            Self::OwnerBalanceCash => (
+                "How much money did this account hold on that date?".to_owned(),
+                "The figure is compared with what this system worked out from everything it has \
+                 recorded for the account. If the two agree, that stretch is confirmed and you \
+                 stop being asked about it. If they disagree, the difference is kept and shown \
+                 to you rather than smoothed away — your figure does not overwrite the worked-out \
+                 one, and neither of the two is assumed to be the right one."
+                    .to_owned(),
+            ),
+            Self::OpeningAmount => (
+                "How much did this account hold before this system knew anything about it?"
+                    .to_owned(),
+                "Everything recorded since is movement, and movement alone says only how much \
+                 the amount changed, never what it is. Give this and the account's balances \
+                 come out right from that point on; leave it and every one of them is wrong by \
+                 exactly what was there at the start."
+                    .to_owned(),
+            ),
+            Self::OpeningCurrency => (
+                "Which currency is that starting figure in?".to_owned(),
+                "It is held and counted in that currency and converted only when a report is \
+                 drawn up in another one. Naming a currency the account does not hold makes the \
+                 starting figure a different sum of money from the one you meant."
+                    .to_owned(),
+            ),
+            Self::OpeningDate => (
+                "From which date is that starting figure true?".to_owned(),
+                "It has to fall before the earliest movement recorded for this account: put it \
+                 later and there is a stretch of movements with nothing behind them, and the \
+                 figure explains none of them. Whatever happened before that date is not \
+                 counted separately at all — the starting figure stands in for all of it."
+                    .to_owned(),
+            ),
+            Self::RuleMatcher => (
+                "What do those payments have in common that could be recognised automatically?"
+                    .to_owned(),
+                "What you give is applied to every payment that matches it — the ones already \
+                 recorded and the ones still to come — so you are not asked about them one at a \
+                 time. Something too broad catches payments you did not mean and files them \
+                 wrongly; something too narrow leaves them where they are, unexplained."
+                    .to_owned(),
+            ),
+            Self::RuleCategory => (
+                "What were those payments for?".to_owned(),
+                "Your answer is the heading they are counted under in the report of where your \
+                 money went. Until they have one they appear there only as money that left with \
+                 nothing to explain it, which is why they were raised with you at all."
+                    .to_owned(),
+            ),
+            Self::ImportAnswer => (
+                "What was this line on the statement?".to_owned(),
+                "Each answer offered says in its own words what counting the line that way does \
+                 to your report of money in and money out. The line is in none of your figures \
+                 until you choose, and choosing is what lets the rest of the statement finish."
+                    .to_owned(),
+            ),
+            Self::TransferFarSide => (
+                "Which of your accounts is the other side of this movement?".to_owned(),
+                "Both accounts get their side of it, and the money counts as having moved \
+                 between accounts of yours rather than as spending or as income. It has to be \
+                 an account of yours: money that went to somebody else is one of the other \
+                 answers, and answering this way about somebody else's account would hide real \
+                 spending as an internal move."
+                    .to_owned(),
+            ),
+        };
+        OwnerQuestion { ask, consequence }
+    }
+}
+
+/// One question put to the owner about one field.
+///
+/// Two parts, because the owner's rule has three obligations and the third is
+/// the one that gets dropped: a question is to be asked in words he
+/// understands, saying what it is for and what his answer changes. The first two
+/// live in [`Self::ask`] and the third in [`Self::consequence`], and they are
+/// separate values so that the third cannot be lost by being folded into a
+/// sentence that already reads as finished — which is how an item came to tell
+/// him a name was his to change and leave him asking what the question was for
+/// (`iaam-ytvf`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerQuestion {
+    /// What he is asked, and why he is being asked it.
+    pub ask: String,
+    /// What is different depending on how he answers.
+    ///
+    /// Never «this is yours to decide» and never «you can change it later»:
+    /// both are true of almost every field here and neither tells him anything
+    /// about his choice. Where the honest answer is that nothing turns on it,
+    /// it says so **and** names the one case where something would.
+    pub consequence: String,
+}
+
+/// Fields the owner is asked for that carry no question, and the bead deciding
+/// whether they should be asked at all.
+///
+/// **The second way the guard below is satisfied, and it is not a phrasing
+/// debt.** `create_account`'s `provider` is the owner's label for a source, and
+/// its only property is that it differs between sources. A value whose whole
+/// purpose is uniqueness is one this instance should mint rather than one a
+/// person invents and then has to remember forever, and the question a person
+/// can actually answer — what the institution is called — is a different field
+/// of the same request. `iaam-9i83` owns both halves of that.
+///
+/// The entry exists because a guard that can only be satisfied by writing prose
+/// would have bought a fluent question for a question that should not be asked.
+/// Registering it says the field is unanswered on purpose and names who is
+/// deciding; leaving it silent is the only thing refused.
+pub const QUESTIONS_UNDER_REVIEW: &[(OperationKey, &str)] =
+    &[(OperationKey::CreateAccount, "/provider")];
+
 /// One required request field not supplied by the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingInput {
     pub pointer: String,
     pub provided_by: ProvidedBy,
+    /// The question to put to the owner, where the owner is who fills this in.
+    ///
+    /// **Beside `provided_by` and not inside it** (`iaam-ytvf`). [`ProvidedBy`]
+    /// argues at length that each of its three words names *who supplies a
+    /// value* and that a word answering a second question would stop a caller
+    /// being able to read whom to ask off it; hanging the question inside
+    /// `Owner` would do exactly that to the variant that matters most. So the
+    /// pair sits where a reader already looks, and the pairing is kept by a
+    /// guard rather than by the type.
+    ///
+    /// **`None` means one of two things, and they are not the same.** For a
+    /// field a document or the caller supplies, nobody is asked, so there is
+    /// nothing to ask. For a field marked [`ProvidedBy::Owner`] it means the
+    /// field is in [`QUESTIONS_UNDER_REVIEW`] — a question whose existence is
+    /// itself in question. Silence outside those two cases is the state this
+    /// bead was filed on, and
+    /// `every_field_the_owner_fills_in_carries_the_question_to_put_to_him`
+    /// refuses it.
+    pub prompt: Option<OwnerPrompt>,
     pub candidates: Option<Vec<AccountCandidate>>,
     /// The literal values this field admits, when it admits a closed set.
     ///
@@ -729,17 +1167,97 @@ pub struct InputAlternative {
 pub struct RequiredInput {
     pub pointer: String,
     pub provided_by: ProvidedBy,
+    /// The question to put to the owner, read exactly as [`MissingInput::prompt`].
+    ///
+    /// **This type needed one too, and the doc above nearly said otherwise**
+    /// (`iaam-ytvf`). «It carries no alternatives» is a statement about a second
+    /// closed choice and says nothing about prose; the one field this type
+    /// carries today is `/account`, one of the owner's own accounts chosen from
+    /// `candidates`, and «which of your accounts» is as much a question for a
+    /// person as a title is. A pointer reading `/account` is exactly as mute as
+    /// one reading `/title`.
+    pub prompt: Option<OwnerPrompt>,
     pub candidates: Option<Vec<AccountCandidate>>,
 }
 
 impl MissingInput {
-    /// A field with no closed value set and no account candidates.
-    fn plain(pointer: &str, provided_by: ProvidedBy) -> Self {
+    /// A field the owner fills in, published with the question to put to him.
+    ///
+    /// The pointer comes from the question, which is the whole of why this is a
+    /// constructor: written separately they can disagree, and the field report
+    /// behind `iaam-ytvf` is what a caller does when the pointer is all it has.
+    #[must_use]
+    pub fn asked(prompt: OwnerPrompt) -> Self {
         Self {
-            pointer: pointer.to_owned(),
-            provided_by,
+            pointer: prompt.pointer().to_owned(),
+            provided_by: ProvidedBy::Owner,
+            prompt: Some(prompt),
             candidates: None,
             alternatives: Vec::new(),
+        }
+    }
+
+    /// The same, for a field whose answer is one of the owner's own accounts.
+    #[must_use]
+    pub fn asked_from(prompt: OwnerPrompt, candidates: Vec<AccountCandidate>) -> Self {
+        Self {
+            candidates: Some(candidates),
+            ..Self::asked(prompt)
+        }
+    }
+
+    /// A field the owner fills in for which no question is written.
+    ///
+    /// The pointer is passed rather than derived, because there is no
+    /// [`OwnerPrompt`] to derive it from, and that is the point: the pair must
+    /// be in [`QUESTIONS_UNDER_REVIEW`], which names the bead deciding whether
+    /// the field is asked for at all. Reach for this only to record that
+    /// decision, never to postpone writing a sentence.
+    #[must_use]
+    pub fn asked_without_a_question(pointer: &str) -> Self {
+        Self {
+            pointer: pointer.to_owned(),
+            provided_by: ProvidedBy::Owner,
+            prompt: None,
+            candidates: None,
+            alternatives: Vec::new(),
+        }
+    }
+
+    /// A field nobody is asked about: a document holds it, or the caller does.
+    ///
+    /// [`ProvidedBy::Owner`] is deliberately not reachable through this
+    /// constructor. A field the owner fills in goes through [`Self::asked`],
+    /// which cannot be called without a question, or through
+    /// [`Self::asked_without_a_question`], which says so in its name.
+    fn plain(pointer: &str, provided_by: NobodyIsAsked) -> Self {
+        Self {
+            pointer: pointer.to_owned(),
+            provided_by: provided_by.into(),
+            prompt: None,
+            candidates: None,
+            alternatives: Vec::new(),
+        }
+    }
+}
+
+/// The two sources that put no question to anybody.
+///
+/// [`ProvidedBy`] minus [`ProvidedBy::Owner`], and it exists so that
+/// [`MissingInput::plain`] cannot be handed the one word that obliges a
+/// question. A guard would catch it afterwards; a parameter type means there is
+/// nothing to catch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NobodyIsAsked {
+    ExternalDocument,
+    Caller,
+}
+
+impl From<NobodyIsAsked> for ProvidedBy {
+    fn from(source: NobodyIsAsked) -> Self {
+        match source {
+            NobodyIsAsked::ExternalDocument => Self::ExternalDocument,
+            NobodyIsAsked::Caller => Self::Caller,
         }
     }
 }
@@ -1713,7 +2231,7 @@ fn independent_confirmation_action(
                 // `start_account_import_action` publishes it: which broker holds
                 // this account is the owner's to name, and the ledger does not
                 // record it.
-                missing: vec![MissingInput::plain("/broker", ProvidedBy::Owner)],
+                missing: vec![MissingInput::asked(OwnerPrompt::BrokerChannel)],
             },
         },
     )
@@ -1795,8 +2313,8 @@ fn discrepancy_action(
                 // figures, and the request names events.
                 preset: BTreeMap::new(),
                 missing: vec![
-                    MissingInput::plain("/corrections", ProvidedBy::Owner),
-                    MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                    MissingInput::asked(OwnerPrompt::Corrections),
+                    MissingInput::asked(OwnerPrompt::AcknowledgeRetraction),
                 ],
             },
         },
@@ -1952,18 +2470,8 @@ fn undecomposed_outflows_action(
             request: RequestPlan {
                 preset: BTreeMap::new(),
                 missing: vec![
-                    MissingInput {
-                        pointer: "/matcher".into(),
-                        provided_by: ProvidedBy::Owner,
-                        candidates: None,
-                        alternatives: Vec::new(),
-                    },
-                    MissingInput {
-                        pointer: "/category".into(),
-                        provided_by: ProvidedBy::Owner,
-                        candidates: None,
-                        alternatives: Vec::new(),
-                    },
+                    MissingInput::asked(OwnerPrompt::RuleMatcher),
+                    MissingInput::asked(OwnerPrompt::RuleCategory),
                 ],
             },
         },
@@ -2732,7 +3240,7 @@ fn import_session_unfinished_action(
                 // client fills it in from what it already knows about its own
                 // run, without putting a question to the owner. Deciding to
                 // commit is his; quoting the revision he decided over is not.
-                MissingInput::plain("/revision", ProvidedBy::Caller),
+                MissingInput::plain("/revision", NobodyIsAsked::Caller),
             ],
         },
     };
@@ -2823,9 +3331,6 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
     let others = answer_account_candidates(asked, accounts);
 
     MissingInput {
-        pointer: "/answer".to_owned(),
-        provided_by: ProvidedBy::Owner,
-        candidates: None,
         alternatives: asked
             .alternatives()
             .into_iter()
@@ -2837,8 +3342,9 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
                 // of an account nothing asked it about.
                 requires: if shape.needs_account() {
                     vec![RequiredInput {
-                        pointer: "/account".to_owned(),
+                        pointer: OwnerPrompt::TransferFarSide.pointer().to_owned(),
                         provided_by: ProvidedBy::Owner,
+                        prompt: Some(OwnerPrompt::TransferFarSide),
                         candidates: Some(others.clone()),
                     }]
                 } else {
@@ -2852,6 +3358,7 @@ pub fn answer_input(asked: &Question, accounts: &[AccountView]) -> MissingInput 
                 consequence: Some(shape.consequence().to_owned()),
             })
             .collect(),
+        ..MissingInput::asked(OwnerPrompt::ImportAnswer)
     }
 }
 
@@ -3129,18 +3636,16 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
                 // The owner's other accounts, and only those: this statement is
                 // about two accounts of his own, and a counterparty who is not
                 // him is the classification rules' question.
-                missing: vec![MissingInput {
-                    pointer: "/partners".into(),
-                    provided_by: ProvidedBy::Owner,
-                    candidates: Some(account_candidates(
+                missing: vec![MissingInput::asked_from(
+                    OwnerPrompt::TransferPartners,
+                    account_candidates(
                         &accounts
                             .iter()
                             .filter(|candidate| candidate.id != account.id)
                             .cloned()
                             .collect::<Vec<_>>(),
-                    )),
-                    alternatives: Vec::new(),
-                }],
+                    ),
+                )],
             },
         },
     )
@@ -3266,7 +3771,7 @@ fn start_account_import_action(account: &AccountView) -> Action {
                 // is the caller's to state. No alternatives: the route takes any
                 // short name, and publishing three would claim a closed set the
                 // server does not enforce.
-                MissingInput::plain("/source/channel", ProvidedBy::Caller),
+                MissingInput::plain("/source/channel", NobodyIsAsked::Caller),
                 // The label is what makes this import retractable on its own,
                 // and it is a statement period or an export file name — it is
                 // read off the document the owner fetched, which is why this is
@@ -3276,7 +3781,7 @@ fn start_account_import_action(account: &AccountView) -> Action {
                 // plan needs supplied, and a plan that quietly omitted it would
                 // produce unlabelled rows retractable only together with every
                 // other unlabelled row of the same account and channel.
-                MissingInput::plain("/source/label", ProvidedBy::ExternalDocument),
+                MissingInput::plain("/source/label", NobodyIsAsked::ExternalDocument),
             ],
         },
     };
@@ -3302,7 +3807,7 @@ fn start_account_import_action(account: &AccountView) -> Action {
                 // a body that has no fields could not be satisfied by filling
                 // anything in. The route's own description says what the body
                 // is, and this item's reason says who fetches it.
-                MissingInput::plain("/session", ProvidedBy::Caller),
+                MissingInput::plain("/session", NobodyIsAsked::Caller),
             ],
         },
     };
@@ -3314,14 +3819,14 @@ fn start_account_import_action(account: &AccountView) -> Action {
         request: RequestPlan {
             preset: BTreeMap::new(),
             missing: vec![
-                MissingInput::plain("/session", ProvidedBy::Caller),
+                MissingInput::plain("/session", NobodyIsAsked::Caller),
                 // `ExternalDocument` and not a fourth word for whatever produced
                 // them: the axis is who holds the value, and the statement holds
                 // it however much converting it took to type. That is the
                 // sentence on [`ProvidedBy`], and this is the request it was
                 // waiting for — the rows are a field of *this* call, so the
                 // queue can now point at them instead of describing them.
-                MissingInput::plain("/operations", ProvidedBy::ExternalDocument),
+                MissingInput::plain("/operations", NobodyIsAsked::ExternalDocument),
             ],
         },
     };
@@ -3339,9 +3844,9 @@ fn start_account_import_action(account: &AccountView) -> Action {
         request: RequestPlan {
             preset: sync_preset,
             missing: vec![
-                MissingInput::plain("/broker", ProvidedBy::Owner),
-                MissingInput::plain("/from", ProvidedBy::Owner),
-                MissingInput::plain("/to", ProvidedBy::Owner),
+                MissingInput::asked(OwnerPrompt::BrokerChannel),
+                MissingInput::asked(OwnerPrompt::SyncFrom),
+                MissingInput::asked(OwnerPrompt::SyncTo),
             ],
         },
     };
@@ -3478,7 +3983,7 @@ fn provide_control_assertion_action(
                 // `/cash` is the one chosen input, so the request cannot be empty:
                 // the scenario rejects a balance carrying neither cash nor positions.
                 preset,
-                missing: vec![MissingInput::plain("/cash", ProvidedBy::Owner)],
+                missing: vec![MissingInput::asked(OwnerPrompt::OwnerBalanceCash)],
             },
         },
     )
@@ -3610,13 +4115,13 @@ fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Ac
         request: RequestPlan {
             preset: opening_preset,
             missing: vec![
-                MissingInput::plain("/operations/0/amount", ProvidedBy::Owner),
-                MissingInput::plain("/operations/0/currency", ProvidedBy::Owner),
-                MissingInput::plain("/operations/0/dates/cash_posted", ProvidedBy::Owner),
+                MissingInput::asked(OwnerPrompt::OpeningAmount),
+                MissingInput::asked(OwnerPrompt::OpeningCurrency),
+                MissingInput::asked(OwnerPrompt::OpeningDate),
                 // A name for the fact so that sending it twice records it once.
                 // The caller's, not the owner's: it says which transmission this
                 // is and asks him nothing.
-                MissingInput::plain("/operations/0/idempotency_key", ProvidedBy::Caller),
+                MissingInput::plain("/operations/0/idempotency_key", NobodyIsAsked::Caller),
             ],
         },
     };
@@ -3630,8 +4135,8 @@ fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Ac
         request: RequestPlan {
             preset: BTreeMap::new(),
             missing: vec![
-                MissingInput::plain("/corrections", ProvidedBy::Owner),
-                MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                MissingInput::asked(OwnerPrompt::Corrections),
+                MissingInput::asked(OwnerPrompt::AcknowledgeRetraction),
             ],
         },
     };
@@ -3751,8 +4256,8 @@ fn retirement_not_assessed_action(refusal: &str) -> Action {
             request: RequestPlan {
                 preset: BTreeMap::new(),
                 missing: vec![
-                    MissingInput::plain("/corrections", ProvidedBy::Owner),
-                    MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                    MissingInput::asked(OwnerPrompt::Corrections),
+                    MissingInput::asked(OwnerPrompt::AcknowledgeRetraction),
                 ],
             },
         },
@@ -3807,7 +4312,7 @@ fn first_account_action() -> Action {
             operation: OperationKey::CreateAccount,
             request: RequestPlan {
                 preset: BTreeMap::new(),
-                missing: vec![MissingInput::plain("/title", ProvidedBy::Owner)],
+                missing: vec![MissingInput::asked(OwnerPrompt::AccountTitle { printed: None })],
             },
         },
     )
@@ -3911,8 +4416,20 @@ fn account_named_by_document_action(wanted: &AccountNamedByDocument) -> Action {
             request: RequestPlan {
                 preset,
                 missing: vec![
-                    MissingInput::plain("/title", ProvidedBy::Owner),
-                    MissingInput::plain("/provider", ProvidedBy::Owner),
+                    // The printed string travels *in the question*, not as a
+                    // second preset: what is preset is the identifier, and
+                    // saying so to the owner is what stops a caller showing him
+                    // the preset instead (`iaam-ytvf`).
+                    MissingInput::asked(OwnerPrompt::AccountTitle {
+                        printed: Some(wanted.printed.clone()),
+                    }),
+                    // No question, on purpose. `provider` is a label whose only
+                    // property is that it differs between sources, and whether
+                    // a person should be asked to invent one at all is
+                    // `iaam-9i83`'s — see `QUESTIONS_UNDER_REVIEW`. A fluent
+                    // sentence written here would have settled that question by
+                    // making it comfortable.
+                    MissingInput::asked_without_a_question("/provider"),
                 ],
             },
         },
@@ -4023,18 +4540,11 @@ fn account_scope_action(
         _ => (
             BTreeMap::new(),
             vec![
-                MissingInput {
-                    pointer: "/contour".into(),
-                    provided_by: ProvidedBy::Owner,
-                    candidates: None,
-                    alternatives: Vec::new(),
-                },
-                MissingInput {
-                    pointer: "/accounts".into(),
-                    provided_by: ProvidedBy::Owner,
-                    candidates: Some(account_candidates(accounts)),
-                    alternatives: Vec::new(),
-                },
+                MissingInput::asked(OwnerPrompt::MembershipContour),
+                MissingInput::asked_from(
+                    OwnerPrompt::MembershipAccounts,
+                    account_candidates(accounts),
+                ),
             ],
         ),
     };
@@ -4054,7 +4564,7 @@ fn account_scope_action(
         operation: OperationKey::RecordAccountScope,
         request: RequestPlan {
             preset: exclusion_preset,
-            missing: vec![MissingInput::plain("/reason", ProvidedBy::Owner)],
+            missing: vec![MissingInput::asked(OwnerPrompt::ExclusionReason)],
         },
     };
 
@@ -4124,18 +4634,8 @@ fn first_contour_action(accounts: &[AccountView]) -> Action {
             request: RequestPlan {
                 preset: BTreeMap::new(),
                 missing: vec![
-                    MissingInput {
-                        pointer: "/title".into(),
-                        provided_by: ProvidedBy::Owner,
-                        candidates: None,
-                        alternatives: Vec::new(),
-                    },
-                    MissingInput {
-                        pointer: "/accounts".into(),
-                        provided_by: ProvidedBy::Owner,
-                        candidates: Some(candidates),
-                        alternatives: Vec::new(),
-                    },
+                    MissingInput::asked(OwnerPrompt::ContourTitle),
+                    MissingInput::asked_from(OwnerPrompt::ContourAccounts, candidates),
                 ],
             },
         },
@@ -4340,6 +4840,580 @@ mod tests {
             refusals.len() < OperationKey::ALL.len(),
             "a scan that found every key in every file would pass by matching \
              everything: {refusals:?}"
+        );
+    }
+
+    // --- The question put to the owner about a field (iaam-ytvf) ------------
+    //
+    // The defect these cover, in one sentence: an agent relaying a queue item to
+    // the owner had one string per field, the JSON pointer, so it showed him
+    // `provider_account_id` and this API's own schema descriptions, which are
+    // written for whoever implements a client.
+
+    /// Why a string is not a question this system may put to a person.
+    ///
+    /// Six refusals rather than a boolean, so that a check that passed for the
+    /// wrong reason can be told from one that passed for the right one: the
+    /// non-vacuity proof below asserts *which* rule fired on each specimen. They
+    /// are the mechanical half of the owner's own rule — no internal words, say
+    /// what it is for, say what the decision changes — and only the half a rule
+    /// can hold. Whether a person who has never read this codebase can answer
+    /// the question is not decidable here, and decision 0027 says who decides
+    /// it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum NotAsked {
+        /// It names a place in a request rather than a thing in his life.
+        APointer,
+        /// It carries an identifier spelled for a program: `snake_case` or a
+        /// camelCase hump.
+        AWireName,
+        /// It opens by telling him something instead of asking him something.
+        NotAQuestion,
+        /// It asks him something where it was to tell him what his answer does.
+        AsksAgain,
+        /// It is a label, not a sentence.
+        NotASentence,
+        /// It says his answer is his, or that he may change it, which is true
+        /// of nearly every field here and tells him nothing about this one.
+        SaysNothingTurnsOnIt,
+    }
+
+    /// The part of a string this system wrote, with the source's words removed.
+    ///
+    /// The register it goes on to pin is the one `iaam-ytvf` is about: «field
+    /// name written for a client implementer» against «question written for a
+    /// person». Language is not the axis — the surface is English by repository
+    /// rule and the owner reads it — so nothing here looks at vocabulary; it
+    /// looks at shape, which is the half a rule can hold.
+    ///
+    /// **A quoted span is exempt.** A value a source printed travels inside
+    /// «…», and inside those marks it is the document's word and not ours: a
+    /// bank that prints `acct_1` must not make this check read our sentence as
+    /// having named a field.
+    fn wording_of_ours(text: &str) -> Result<String, NotAsked> {
+        let mut ours = String::with_capacity(text.len());
+        let mut quoted = false;
+        for character in text.chars() {
+            match character {
+                '«' => quoted = true,
+                '»' => quoted = false,
+                _ if !quoted => ours.push(character),
+                _ => {}
+            }
+        }
+
+        let characters: Vec<char> = ours.chars().collect();
+        for pair in characters.windows(2) {
+            if pair[0] == '/' && pair[1].is_ascii_alphabetic() {
+                return Err(NotAsked::APointer);
+            }
+            if pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase() {
+                return Err(NotAsked::AWireName);
+            }
+        }
+        for triple in characters.windows(3) {
+            let joined = triple[1] == '_';
+            let word =
+                |character: char| character.is_ascii_lowercase() || character.is_ascii_digit();
+            if joined && word(triple[0]) && word(triple[2]) {
+                return Err(NotAsked::AWireName);
+            }
+        }
+        if ours.split_whitespace().count() < 5 {
+            return Err(NotAsked::NotASentence);
+        }
+        Ok(ours)
+    }
+
+    /// Whether a string opens by asking the owner something.
+    ///
+    /// The **first** sentence is the question and what follows it is
+    /// qualification. A rule reading only the last character would refuse every
+    /// question that goes on to say anything, and one reading «is there a
+    /// question mark anywhere» would admit a paragraph that asks nothing until
+    /// its end — which is a description of the value, which is what a schema
+    /// already publishes and what the owner was shown.
+    fn opens_by_asking(text: &str) -> bool {
+        matches!(text.find(['?', '.', '!']), Some(end) if text[end..].starts_with('?'))
+    }
+
+    /// Whether a string says what is different depending on how he answers.
+    ///
+    /// The two refusals are the two answers he has already been given and
+    /// rejected. «It is yours to decide» and «you can change it later» are true
+    /// of nearly every field in this vocabulary, so neither is about the field
+    /// it is written on, and an item that said the second is what produced
+    /// «what does this question even affect».
+    fn says_what_turns_on_the_answer(text: &str) -> Result<(), NotAsked> {
+        let ours = wording_of_ours(text)?;
+        if opens_by_asking(&ours) {
+            return Err(NotAsked::AsksAgain);
+        }
+        let folded = ours.to_lowercase();
+        for empty in [
+            "yours to",
+            "your own to",
+            "change it later",
+            "change this later",
+        ] {
+            if folded.contains(empty) {
+                return Err(NotAsked::SaysNothingTurnsOnIt);
+            }
+        }
+        Ok(())
+    }
+
+    /// The whole question: it asks, and it says what the answer does.
+    fn puts_a_question_to_a_person(question: &OwnerQuestion) -> Result<(), NotAsked> {
+        let ask = wording_of_ours(&question.ask)?;
+        if !opens_by_asking(&ask) {
+            return Err(NotAsked::NotAQuestion);
+        }
+        says_what_turns_on_the_answer(&question.consequence)
+    }
+
+    /// One question written for this test, so the refusals below are one change.
+    fn asking(ask: &str, consequence: &str) -> OwnerQuestion {
+        OwnerQuestion {
+            ask: ask.to_owned(),
+            consequence: consequence.to_owned(),
+        }
+    }
+
+    /// A consequence that is not what is under test, so that the `ask` is.
+    const A_REAL_CONSEQUENCE: &str = "Every report that names this account shows whatever you answer, and nothing else \
+         reads it.";
+
+    /// A question that is not what is under test, so that the consequence is.
+    const A_REAL_ASK: &str = "What do you want to call this account?";
+
+    /// The check refuses the strings the field report actually carried.
+    ///
+    /// **A guard that passes vacuously is worse than none** — `iaam-3nqt` exists
+    /// because existence was all that was checked, and the wave before this one
+    /// makes the same argument at
+    /// `the_offer_scan_reads_resolutions_and_not_prose_or_fixtures`. So each
+    /// rule is made against an input written here, where what the answer should
+    /// be is not in question, and the *reason* is asserted rather than the
+    /// refusal: a check that refused everything would pass a test that only
+    /// asked whether it refused. Every specimen differs from a passing question
+    /// in exactly one way, so the rule that fires is the rule being proved.
+    ///
+    /// The first two are what the owner was shown. The third is this API's own
+    /// description of that same field: fluent English, no field name in it, and
+    /// still nothing a person could answer — the defect was never that the
+    /// surface had no prose on it. The last two are the answers he was given
+    /// when the prose improved and still told him nothing about his choice, and
+    /// they are the reason a consequence is a value of its own.
+    #[test]
+    fn a_question_for_a_person_is_not_a_field_name() {
+        assert_eq!(
+            puts_a_question_to_a_person(&asking("provider_account_id", A_REAL_CONSEQUENCE)),
+            Err(NotAsked::AWireName)
+        );
+        assert_eq!(
+            puts_a_question_to_a_person(&asking("/title", A_REAL_CONSEQUENCE)),
+            Err(NotAsked::APointer)
+        );
+        assert_eq!(
+            puts_a_question_to_a_person(&asking(
+                "Whatever the source prints for this account.",
+                A_REAL_CONSEQUENCE
+            )),
+            Err(NotAsked::NotAQuestion)
+        );
+        assert_eq!(
+            puts_a_question_to_a_person(&asking("Which?", A_REAL_CONSEQUENCE)),
+            Err(NotAsked::NotASentence)
+        );
+        assert_eq!(
+            puts_a_question_to_a_person(&asking(
+                A_REAL_ASK,
+                "The title is yours to decide and nobody else writes it."
+            )),
+            Err(NotAsked::SaysNothingTurnsOnIt)
+        );
+        assert_eq!(
+            puts_a_question_to_a_person(&asking(
+                A_REAL_ASK,
+                "You can change it later, so nothing is lost by guessing now."
+            )),
+            Err(NotAsked::SaysNothingTurnsOnIt)
+        );
+        assert_eq!(
+            puts_a_question_to_a_person(&asking(
+                A_REAL_ASK,
+                "What happens if you call it something else? Very little, mostly."
+            )),
+            Err(NotAsked::AsksAgain)
+        );
+        assert_eq!(
+            puts_a_question_to_a_person(&asking(A_REAL_ASK, A_REAL_CONSEQUENCE)),
+            Ok(())
+        );
+        // And the exemption is real: a source may print anything at all, and the
+        // printed string is the reason this question can be answered.
+        assert_eq!(
+            puts_a_question_to_a_person(&asking(
+                "What do you call the account a document prints «acct_1/2» for?",
+                A_REAL_CONSEQUENCE
+            )),
+            Ok(())
+        );
+    }
+
+    /// One of each question, with the specialised shapes written out.
+    ///
+    /// A list and not a derivation: [`OwnerPrompt::AccountTitle`] carries a
+    /// datum, so «every variant» is not a set this type can hand over, and the
+    /// shape that carries the datum is exactly the one a walk over bare variants
+    /// would skip. `every_question_is_written_out_once` keeps it complete.
+    fn specimens() -> Vec<OwnerPrompt> {
+        vec![
+            OwnerPrompt::AccountTitle { printed: None },
+            OwnerPrompt::AccountTitle {
+                printed: Some("Shop One".to_owned()),
+            },
+            OwnerPrompt::ContourTitle,
+            OwnerPrompt::ContourAccounts,
+            OwnerPrompt::MembershipContour,
+            OwnerPrompt::MembershipAccounts,
+            OwnerPrompt::ExclusionReason,
+            OwnerPrompt::TransferPartners,
+            OwnerPrompt::BrokerChannel,
+            OwnerPrompt::SyncFrom,
+            OwnerPrompt::SyncTo,
+            OwnerPrompt::Corrections,
+            OwnerPrompt::AcknowledgeRetraction,
+            OwnerPrompt::OwnerBalanceCash,
+            OwnerPrompt::OpeningAmount,
+            OwnerPrompt::OpeningCurrency,
+            OwnerPrompt::OpeningDate,
+            OwnerPrompt::RuleMatcher,
+            OwnerPrompt::RuleCategory,
+            OwnerPrompt::ImportAnswer,
+            OwnerPrompt::TransferFarSide,
+        ]
+    }
+
+    /// The name of one question, and the `match` that keeps the list above honest.
+    ///
+    /// Exhaustive on purpose, and that is what stops this going stale: a
+    /// twenty-second question does not slip through — it stops the test from
+    /// compiling, so whoever adds one answers, here, that it is written out and
+    /// swept before the queue can publish a field with no words on it.
+    fn question_name(prompt: &OwnerPrompt) -> &'static str {
+        match prompt {
+            OwnerPrompt::AccountTitle { .. } => "AccountTitle",
+            OwnerPrompt::ContourTitle => "ContourTitle",
+            OwnerPrompt::ContourAccounts => "ContourAccounts",
+            OwnerPrompt::MembershipContour => "MembershipContour",
+            OwnerPrompt::MembershipAccounts => "MembershipAccounts",
+            OwnerPrompt::ExclusionReason => "ExclusionReason",
+            OwnerPrompt::TransferPartners => "TransferPartners",
+            OwnerPrompt::BrokerChannel => "BrokerChannel",
+            OwnerPrompt::SyncFrom => "SyncFrom",
+            OwnerPrompt::SyncTo => "SyncTo",
+            OwnerPrompt::Corrections => "Corrections",
+            OwnerPrompt::AcknowledgeRetraction => "AcknowledgeRetraction",
+            OwnerPrompt::OwnerBalanceCash => "OwnerBalanceCash",
+            OwnerPrompt::OpeningAmount => "OpeningAmount",
+            OwnerPrompt::OpeningCurrency => "OpeningCurrency",
+            OwnerPrompt::OpeningDate => "OpeningDate",
+            OwnerPrompt::RuleMatcher => "RuleMatcher",
+            OwnerPrompt::RuleCategory => "RuleCategory",
+            OwnerPrompt::ImportAnswer => "ImportAnswer",
+            OwnerPrompt::TransferFarSide => "TransferFarSide",
+        }
+    }
+
+    /// Every question is written out once, and the specialised shape too.
+    #[test]
+    fn every_question_is_written_out_once() {
+        let names: BTreeSet<&str> = specimens().iter().map(question_name).collect();
+        assert_eq!(
+            names.len(),
+            20,
+            "a question was added to the vocabulary and not to the list the guards run over"
+        );
+        assert_eq!(
+            specimens().len(),
+            21,
+            "the account title is asked in two shapes and both are swept"
+        );
+    }
+
+    /// Every question is written for the owner and not for a client author.
+    ///
+    /// Distinctness is asserted on both halves and it is not tidiness: two
+    /// fields carrying one sentence means one of them is being described in the
+    /// other's words, and two fields carrying one consequence means at least one
+    /// of them is not saying what turns on *its* answer. That is the defect
+    /// wearing better prose, which is the form it took when the prose improved
+    /// and the owner asked what the question affected.
+    #[test]
+    fn every_question_the_owner_is_put_is_written_for_him() {
+        let mut asks: BTreeSet<String> = BTreeSet::new();
+        let mut consequences: BTreeSet<String> = BTreeSet::new();
+        for prompt in specimens() {
+            let question = prompt.question();
+            assert_eq!(
+                puts_a_question_to_a_person(&question),
+                Ok(()),
+                "{} does not put a question to a person: {question:?}",
+                question_name(&prompt)
+            );
+            assert!(
+                !question.ask.contains(prompt.pointer())
+                    && !question.consequence.contains(prompt.pointer()),
+                "{} shows the owner the pointer it is published on",
+                question_name(&prompt)
+            );
+            assert!(
+                asks.insert(question.ask.clone()),
+                "{} asks in another field's words: {}",
+                question_name(&prompt),
+                question.ask
+            );
+            assert!(
+                consequences.insert(question.consequence.clone()),
+                "{} borrows another field's consequence: {}",
+                question_name(&prompt),
+                question.consequence
+            );
+        }
+    }
+
+    /// What turns on a name is not the same on both accounts, and it may not be.
+    ///
+    /// **The one place obligation three legitimately varies by item**, and the
+    /// test that keeps the other two from varying with it. A name is for the
+    /// same thing wherever it is asked, so the two questions open the same way;
+    /// what a rename costs is decided by whether the account already carries the
+    /// string a document printed for it, and `AccountNames::candidates` in
+    /// `iaam_ingest::csv_source` is where that is decided — a printed identifier
+    /// is matched before a title is, and returns early, so on an account created
+    /// from a document the title is never reached and a rename is free, while on
+    /// an account with no printed identifier the title is the only thing a
+    /// statement line can find it by.
+    ///
+    /// So this asserts the split rather than the sameness: one field of one
+    /// call, one shape of question, two answers to «what does this change».
+    #[test]
+    fn what_a_rename_costs_depends_on_whether_a_document_named_the_account() {
+        let alone = OwnerPrompt::AccountTitle { printed: None };
+        let named_by_a_document = OwnerPrompt::AccountTitle {
+            printed: Some("Shop One".to_owned()),
+        };
+
+        assert_eq!(alone.pointer(), named_by_a_document.pointer());
+        assert_eq!(alone.asked_by(), named_by_a_document.asked_by());
+        assert_ne!(
+            alone.question().consequence,
+            named_by_a_document.question().consequence,
+            "a rename is free on one of these and is not on the other, and the \
+             owner is the one who has to be told which"
+        );
+    }
+
+    /// Every state this queue can reach, as one heap of items.
+    ///
+    /// Several states rather than one, because the interesting ones exclude each
+    /// other: an owner with no account is asked to create one, and an owner with
+    /// accounts is asked everything else. The union is what the sweep needs, and
+    /// `the_sweep_sees_every_question_this_vocabulary_has` proves the union is
+    /// not a subset.
+    fn every_queue_item() -> Vec<Action> {
+        let main = named("Main");
+        let savings = named("Savings");
+        let term = named("Term");
+        let mut items = Vec::new();
+
+        // Nothing described, and a document that named an account.
+        items.extend(queue_wanting(&[], &[wanted("Shop One", 3, 1)]));
+
+        // One account, no perimeter, no facts: the first perimeter, the
+        // transfer statement, and the routes that begin an import.
+        items.extend(
+            actions_from_state(&OwnerState {
+                accounts: &[main.clone(), savings.clone()],
+                contours: &[],
+                exclusions: &[],
+                transfers: &[],
+                activity: &[no_facts(main.id), no_facts(savings.id)],
+                assertions: &[],
+                retired: RetirementAssessment::Assessed(&[]),
+                sessions: &[],
+                questions: &[],
+                rules: &[],
+                wanted_accounts: &[],
+            })
+            .expect("actions from state"),
+        );
+
+        // Two perimeters and an account inside neither: membership, or a reason
+        // for staying out.
+        let perimeters = [
+            ContourView {
+                id: ContourId::new_random(),
+                version: ContourVersion(1),
+                title: "Household".into(),
+                accounts: vec![main.id],
+            },
+            ContourView {
+                id: ContourId::new_random(),
+                version: ContourVersion(1),
+                title: "Business".into(),
+                accounts: vec![],
+            },
+        ];
+        items.extend(actions_from_views(
+            &[main.clone(), savings.clone()],
+            &perimeters,
+            &[],
+            &[],
+            &[],
+        ));
+
+        // An account with facts and no control assertion.
+        items.extend(assertion_queue(&main, august(), &[]));
+
+        // A product he retired that the journal still shows a figure for.
+        items.extend(queue_for_retirement(&term, &[ceased(term.id, false)]));
+
+        // A session holding a row nobody has said what it was.
+        let session = ImportSessionId::new_random();
+        items.extend(queue_for_sessions(
+            std::slice::from_ref(&main),
+            &[session_summary(ImportSessionState::Open, 1, 1)],
+            &[asked(session, main.id, 1)],
+        ));
+
+        // The diagnostics: an unexplained outflow wants a rule, a discrepancy
+        // wants a correction, and an unconfirmed period wants a broker.
+        items.extend(every_diagnostic());
+        items
+    }
+
+    /// Every field the owner fills in carries the question to put to him.
+    ///
+    /// **The guard the bead asked for**, and the type does half of it already:
+    /// [`ProvidedBy::Owner`] cannot reach a [`MissingInput`] through
+    /// [`MissingInput::plain`] at all, because that constructor takes the two
+    /// words that ask nobody anything. What is left for a test is the half a
+    /// signature cannot hold — that a struct literal, or
+    /// [`MissingInput::asked_without_a_question`], did not put the field back in
+    /// the state this bead was filed on.
+    ///
+    /// **Satisfied three ways, and that is deliberate.** A field carries a
+    /// question; or it is in [`QUESTIONS_UNDER_REVIEW`], which says the question
+    /// itself is undecided and names the bead deciding; or it stops being the
+    /// owner's, which is what happens when a value this instance can work out is
+    /// worked out instead of asked for. A guard satisfiable only by writing
+    /// prose would push the next author into writing a fluent question for a
+    /// question that should not be asked — which is `iaam-9i83`, and it was
+    /// found on the very field this bead was reported against.
+    ///
+    /// The pointer and the call are checked against the question rather than
+    /// taken on trust: a question published on a resolution that calls something
+    /// else is a question about a field that request does not have.
+    #[test]
+    fn every_field_the_owner_fills_in_carries_the_question_to_put_to_him() {
+        for action in every_queue_item() {
+            for (operation, request) in action.target().resolutions() {
+                let owned: Vec<(&str, &Option<OwnerPrompt>)> = request
+                    .missing
+                    .iter()
+                    .filter(|missing| missing.provided_by == ProvidedBy::Owner)
+                    .map(|missing| (missing.pointer.as_str(), &missing.prompt))
+                    .chain(
+                        request
+                            .missing
+                            .iter()
+                            .flat_map(|missing| &missing.alternatives)
+                            .flat_map(|alternative| &alternative.requires)
+                            .filter(|required| required.provided_by == ProvidedBy::Owner)
+                            .map(|required| (required.pointer.as_str(), &required.prompt)),
+                    )
+                    .collect();
+
+                for (pointer, prompt) in owned {
+                    let Some(prompt) = prompt else {
+                        assert!(
+                            QUESTIONS_UNDER_REVIEW.contains(&(operation, pointer)),
+                            "{} asks the owner for {pointer} and gives whoever has to put it \
+                             to him nothing but the pointer. Write the question, or work the \
+                             value out instead of asking, or register the field and name the \
+                             bead deciding which",
+                            action.id()
+                        );
+                        continue;
+                    };
+                    assert_eq!(
+                        prompt.pointer(),
+                        pointer,
+                        "{} publishes {pointer} with the question for {}",
+                        action.id(),
+                        prompt.pointer()
+                    );
+                    assert_eq!(
+                        prompt.asked_by(),
+                        operation,
+                        "{} asks {pointer} of {operation:?}, and that question is a field of {:?}",
+                        action.id(),
+                        prompt.asked_by()
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the sweep sees every question this vocabulary has.
+    ///
+    /// The other half of the same argument, in the shape
+    /// `the_offer_scan_finds_the_resolutions_the_crate_builds` takes: the guard
+    /// above could be satisfied by a heap of items that asks the owner nothing,
+    /// and it would report every field covered. So the fields the heap actually
+    /// witnesses are compared against the fields the vocabulary declares, in
+    /// both directions — a question no item publishes is prose nothing asks, and
+    /// an owner field the heap does not reach is a field the guard above never
+    /// ran on.
+    #[test]
+    fn the_sweep_sees_every_question_this_vocabulary_has() {
+        let mut witnessed: BTreeSet<(OperationKey, String)> = BTreeSet::new();
+        for action in every_queue_item() {
+            for (operation, request) in action.target().resolutions() {
+                for missing in &request.missing {
+                    if missing.provided_by == ProvidedBy::Owner {
+                        witnessed.insert((operation, missing.pointer.clone()));
+                    }
+                    for required in missing
+                        .alternatives
+                        .iter()
+                        .flat_map(|alternative| &alternative.requires)
+                    {
+                        if required.provided_by == ProvidedBy::Owner {
+                            witnessed.insert((operation, required.pointer.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut declared: BTreeSet<(OperationKey, String)> = specimens()
+            .iter()
+            .map(|prompt| (prompt.asked_by(), prompt.pointer().to_owned()))
+            .collect();
+        declared.extend(
+            QUESTIONS_UNDER_REVIEW
+                .iter()
+                .map(|(operation, pointer)| (*operation, (*pointer).to_owned())),
+        );
+
+        assert_eq!(
+            witnessed, declared,
+            "the fields the queue asks the owner for and the questions this \
+             vocabulary holds have come apart"
         );
     }
 
@@ -5406,7 +6480,9 @@ mod tests {
             operation: OperationKey::CreateAccount,
             request: RequestPlan {
                 preset: BTreeMap::new(),
-                missing: vec![MissingInput::plain("/title", ProvidedBy::Owner)],
+                missing: vec![MissingInput::asked(OwnerPrompt::AccountTitle {
+                    printed: None,
+                })],
             },
         };
         assert!(matches!(
@@ -8290,8 +9366,8 @@ mod tests {
                 &RequestPlan {
                     preset: BTreeMap::new(),
                     missing: vec![
-                        MissingInput::plain("/corrections", ProvidedBy::Owner),
-                        MissingInput::plain("/acknowledge_retraction", ProvidedBy::Owner),
+                        MissingInput::asked(OwnerPrompt::Corrections),
+                        MissingInput::asked(OwnerPrompt::AcknowledgeRetraction),
                     ],
                 },
             )]

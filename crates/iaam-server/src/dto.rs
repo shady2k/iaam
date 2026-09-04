@@ -4362,22 +4362,61 @@ pub struct ResolutionOptionDto {
 /// Request fields that the policy cannot fill.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestPlanDto {
+    /// Request fields the policy has already filled in, as wire name to value.
+    ///
+    /// **Spread into the request body and never shown to the owner**
+    /// (`iaam-ytvf`). Every entry is either a path segment of the route or a
+    /// value this instance worked out — the account a session is for, the
+    /// composition a perimeter would have, the identifier a document printed —
+    /// and none of it is a question. An agent that relayed a preset to the
+    /// owner showed him a filled-in field he has no business seeing; the fields
+    /// to put to him are the `missing` ones marked `owner`, and each of those
+    /// carries the question to ask.
+    ///
+    /// A plain map of values rather than objects carrying a reason apiece, and
+    /// §5 of `docs/api/conventions.md` is why: this is the shape the write route
+    /// accepts, so a client copies it into the body unchanged. Wrapping each
+    /// value would oblige every client to unwrap it, and would buy a per-entry
+    /// explanation nobody is meant to read out.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub preset: BTreeMap<String, serde_json::Value>,
     pub missing: Vec<MissingInputDto>,
 }
 
-/// One missing request field and its source.
+/// One missing request field, its source, and what to ask the owner about it.
 ///
 /// `provided_by` is a vocabulary and not a bare string. It arrived as one, with
 /// three codes written out in the transport and nothing in the document to say
 /// what any of them meant, and a reader who could not see that the word names
 /// the *holder* of the value read it as naming the *work* of obtaining one —
 /// and concluded a fourth code was missing (`iaam-k6l7`).
+///
+/// `prompt` is what a client shows a person. It arrived because the field had
+/// nothing of the sort: an agent relaying an item to the owner had the pointer
+/// and this schema's own descriptions, which are written for whoever implements
+/// a client, and so it showed him a wire field name (`iaam-ytvf`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MissingInputDto {
     pub pointer: String,
     pub provided_by: ProvidedByDto,
+    /// The question to put to the owner about this field, in his words.
+    ///
+    /// Present whenever `provided_by` is `owner`, and absent otherwise: nobody
+    /// is asked about a field a document or the client itself supplies, so
+    /// there is nothing to ask. It is what a person is shown — `pointer` and the
+    /// descriptions in this schema are for whoever writes a client, and showing
+    /// either of those to the owner is the defect this field closes.
+    ///
+    /// One field of one call has one question, whichever queue item raises it,
+    /// because it is read from a single vocabulary in the domain rather than
+    /// written per item. Where a question needs something only the item knows —
+    /// the string a document printed — it is already in the wording.
+    ///
+    /// Absent on an `owner` field means the question itself is under review: the
+    /// field exists for the implementation's sake and whether a person should be
+    /// asked for it at all is undecided. Do not write one for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<OwnerQuestionDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<AccountCandidateDto>>,
     /// The literal values this field admits, when it admits a closed set.
@@ -4421,6 +4460,35 @@ pub struct InputAlternativeDto {
     pub consequence: Option<String>,
 }
 
+/// One question put to the owner, and what his answer changes.
+///
+/// **Two strings and not one sentence**, and the split is the owner's rule
+/// rather than a preference: a question is to be asked in words he uses, saying
+/// what it is for and what his decision changes, and the third of those is the
+/// one that gets dropped when it is a clause at the end of a sentence that
+/// already reads as finished. A client that renders only `ask` has dropped it,
+/// and an item that told him a name was his own to change and said nothing else
+/// is what this field exists because of (`iaam-ytvf`).
+///
+/// `consequence` is the same word `InputAlternativeDto` uses one type away, and
+/// the same idea: what is different depending on how this is answered. There it
+/// belongs to one value of a closed choice; here it belongs to the field, and it
+/// may differ between two items asking for the same field — what a rename costs
+/// is not the same on an account a document already identifies as on one it does
+/// not. `ask` does not differ that way.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OwnerQuestionDto {
+    /// What he is asked, and why he is being asked it. Show this to him.
+    pub ask: String,
+    /// What is different depending on how he answers. Show this to him too.
+    ///
+    /// Never «this is yours to decide» and never «you can change it later»:
+    /// both are true of nearly every field the owner fills in, so neither says
+    /// anything about this one. Where nothing turns on the answer it says so
+    /// and names the one case where something would.
+    pub consequence: String,
+}
+
 /// A field one alternative requires. It carries no alternatives of its own.
 ///
 /// `MissingInputDto` without the `alternatives`, so the two do not nest. A
@@ -4431,6 +4499,13 @@ pub struct InputAlternativeDto {
 pub struct RequiredInputDto {
     pub pointer: String,
     pub provided_by: ProvidedByDto,
+    /// The question to put to the owner, read exactly as on `MissingInputDto`.
+    ///
+    /// This type carries it for the same reason and not by symmetry: its one
+    /// field today names one of the owner's accounts, and «which of your
+    /// accounts» is a question for a person however closed the set is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<OwnerQuestionDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<AccountCandidateDto>>,
 }
@@ -4658,7 +4733,30 @@ pub struct AccountTransferPartnersBatchDto {
 /// caller would discover it only on the re-import that duplicated the account.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateAccountRequest {
+    /// The owner's own name for the account: what he calls it and what every
+    /// report and list prints back to him.
+    ///
+    /// **The one field here a person fills in, and it was the only one with no
+    /// description at all** (`iaam-ytvf`). Every field below carries one because
+    /// the machinery needs explaining; this one carries none because it seemed
+    /// obvious, and an agent putting the question to the owner built it out of
+    /// the nearest prose there was — decision 0004's paragraph about
+    /// `provider_account_id` — and asked him about printed identifiers instead
+    /// of about the name he will read.
+    ///
+    /// It is not an identifier and nothing is scoped by it. It does take part in
+    /// resolving which account a statement line names, and only where nothing
+    /// better does: `provider_account_id` is matched first, so an account
+    /// carrying one is found by that and a rename costs nothing, while an
+    /// account carrying none is found by this and a rename can stop a statement
+    /// resolving. A client putting this question to the owner says that much —
+    /// the queue's own wording for it is in `MissingInputDto.prompt`.
     pub title: String,
+    /// The institution the account is held at, as the owner names it.
+    ///
+    /// Free text this system does not interpret, and distinct from `provider`
+    /// below: this is the bank, and `provider` is a label scoping the
+    /// identifiers some client derived. A person can answer this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub institution: Option<String>,
     /// The client's own label for the source. iaam does not interpret it; it
@@ -4674,6 +4772,11 @@ pub struct CreateAccountRequest {
     /// rather than as new accounts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_account_id: Option<String>,
+    /// What kind of cash the account holds, where the owner has said.
+    ///
+    /// Optional, and absent means he has not said. It is read by the asset
+    /// snapshot, which groups cash by class; nothing about importing depends on
+    /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cash_class: Option<CashAssetClassDto>,
     /// What a negative balance on this account would mean. Optional, and
@@ -4681,6 +4784,12 @@ pub struct CreateAccountRequest {
     /// and never read off `cash_class`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative_balance_expectation: Option<NegativeBalanceExpectationDto>,
+    /// Further identifiers this account is reached by, each in a namespace.
+    ///
+    /// Not a second spelling of `provider_account_id`, which is the identity one
+    /// source prints and takes part in the upsert above. These are additional
+    /// handles — a card, a contract number — and they are replaced as a whole
+    /// set by their own route rather than merged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<AccountAliasDto>,
 }

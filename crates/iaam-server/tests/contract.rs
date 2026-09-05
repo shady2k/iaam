@@ -11335,6 +11335,258 @@ async fn a_conflicting_replacement_is_refused_and_leaves_the_journal_untouched()
     let _ = std::fs::remove_file(path);
 }
 
+/// Correcting one row of a group a rule filed leaves the rule standing, and the
+/// correction's own answer says so (`iaam-hbxz`).
+///
+/// The owner's case, in his own words: a rule was made for a group and applied
+/// automatically, all the operations are right except one. Correcting that one
+/// was already possible. What nothing said was that the standing decision behind
+/// it survived the correction untouched, so next month a row of the same shape
+/// is filed the same way and nothing warned him.
+///
+/// The answer names the rule, says how much of his journal it still decides, and
+/// performs neither of the acts that would change that: the rule is still in
+/// force when the correction is done, because retiring it is his own act.
+#[tokio::test]
+async fn correcting_a_row_a_rule_filed_says_the_rule_behind_it_is_still_standing() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    // One row he has to answer, and the answer generalises into a rule.
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "hbxz-asked")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    let rule = answered["generalisation"]["rule"]
+        .as_str()
+        .expect("the rule the answer wrote")
+        .to_owned();
+
+    // Two more rows of the same shape, which the rule now files without asking.
+    let mut filed = Vec::new();
+    for key in ["hbxz-filed-one", "hbxz-filed-two"] {
+        let (status, again) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "source": { "account": account, "channel": "file", "label": "april" },
+                    "operations": [directed_row(account, key, "out")],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        filed.push(again[0]["event_id"].as_str().expect("event").to_owned());
+    }
+
+    // One of them is wrong. He corrects that row and only that row.
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": filed[0] }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["verdict"], "provisional", "{body}");
+
+    let standing = &body[0]["standing_rule"];
+    assert_eq!(
+        standing["rule"],
+        json!(rule),
+        "the correction names the rule that filed the row: {body}"
+    );
+    assert!(
+        standing["version"].is_u64(),
+        "and the version of it that filed the row: {body}"
+    );
+    assert_eq!(
+        standing["still_filed"], 1,
+        "the other row it filed, which this correction leaves exactly as it is: {body}"
+    );
+    for sentence in ["explanation", "changing_it"] {
+        assert!(
+            standing[sentence]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{sentence} is read out to him and must be a sentence: {body}"
+        );
+    }
+
+    // Neither act was performed. The rule is in force, and the row it filed that
+    // he did not name is still counted as its own.
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    let stored = rules
+        .as_array()
+        .expect("rules")
+        .iter()
+        .find(|stored| stored["id"] == json!(rule))
+        .expect("the rule the answer wrote is still listed");
+    assert!(
+        stored["retired_at"].is_null(),
+        "a correction retires nothing: {rules}"
+    );
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?settled_by_rule={rule}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let keys: Vec<&str> = page["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|row| row["idempotency_key"].as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["hbxz-filed-one", "hbxz-filed-two"],
+        "the rule's own group is untouched; one of its rows now has a reversal \
+         against it, and the rule went on standing behind both: {page}"
+    );
+}
+
+/// The two states that are not «a rule filed this» both leave the answer silent,
+/// and they are not the same state (`iaam-hbxz`).
+///
+/// A fact that records «a reading ran and no rule of mine matched» has no
+/// standing decision behind it, so there is nothing to name. A fact that records
+/// nothing about rules at all — every fact written before that recording
+/// existed, and every path that writes without reading a row against the rules,
+/// a correction included — is not evidence that no rule filed it. Turning that
+/// silence into «no rule of yours filed this row» would tell him he had decided
+/// by hand a row one of his rules may well have decided for him.
+#[tokio::test]
+async fn a_correction_names_no_rule_where_the_fact_records_none_and_where_it_records_nothing() {
+    let harness = harness();
+    let stated = seed_correctable_deposit(&harness, "file", "hbxz-stated", "100.00").await;
+
+    // The first state, asserted rather than assumed: the reading ran and settled
+    // the row without any rule of his.
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=hbxz-stated",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page["rows"][0]["rule_settlement"]["settled_by"], "no_rule",
+        "{page}"
+    );
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{
+                    "relation": "replacement",
+                    "target": stated,
+                    "operation": {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "120.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "hbxz-replacement",
+                    },
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body[0].get("standing_rule").is_none(),
+        "no rule stands behind a row the rules did not settle: {body}"
+    );
+
+    // The second state. The replacement was written by the correction itself,
+    // which reads no row against his rules and therefore records nothing about
+    // them — the state every fact from before the recording existed is in.
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=hbxz-replacement",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(
+        page["rows"][0].get("rule_settlement").is_none(),
+        "the state under test is the fact that records nothing at all: {page}"
+    );
+    let replacement = page["rows"][0]["event"].as_str().expect("event").to_owned();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": replacement }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body[0].get("standing_rule").is_none(),
+        "nothing was recorded, so nothing is claimed either way: {body}"
+    );
+}
+
 /// Reversing an event that is not a fact changes nothing, and saying so is
 /// better than writing a correction whose effect the owner cannot observe.
 #[tokio::test]

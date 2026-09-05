@@ -378,7 +378,7 @@ pub async fn confirm_journal_pairing(
         })?;
 
     let operation = transfer_for(candidate, outgoing, incoming);
-    let verdicts = correct_events(
+    let outcomes = correct_events(
         services,
         principal,
         acknowledge_retraction,
@@ -395,9 +395,9 @@ pub async fn confirm_journal_pairing(
     Ok(ConfirmedPairing {
         outgoing,
         incoming,
-        transfer: verdicts.first().and_then(|verdict| match verdict {
+        transfer: outcomes.first().and_then(|outcome| match outcome.verdict {
             iaam_ingest::Verdict::Provisional { event }
-            | iaam_ingest::Verdict::Accepted { event } => Some(*event),
+            | iaam_ingest::Verdict::Accepted { event } => Some(event),
             _ => None,
         }),
     })

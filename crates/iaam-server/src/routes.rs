@@ -85,21 +85,22 @@ use crate::dto::{
     CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
     CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
-    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredAccountDto,
-    DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto,
-    InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto, JournalPageDto,
-    MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
-    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    NegativeBalanceExpectationDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
-    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
-    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
-    RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
-    RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
-    ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest, RequestPlanDto,
-    RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
+    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
+    CustodyRepairRequest, DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams,
+    FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
+    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
+    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
+    OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto, ProposedAnswerDto,
+    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountNameDispositionRequest,
+    RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
+    RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
+    ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -667,7 +668,7 @@ pub async fn repair_custody(
     path = "/v1/corrections",
     request_body = SubmitCorrectionsRequest,
     responses(
-        (status = 200, description = "Verdict for each correction", body = Vec<VerdictDto>),
+        (status = 200, description = "Verdict for each correction, with the standing rule behind the row it corrected", body = Vec<CorrectionVerdictDto>),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 409, description = "A correction key is held by an unrelated event", body = ApiError),
         (status = 422, description = "The correction would not resolve, or the acknowledgement is missing", body = ApiError),
@@ -680,7 +681,7 @@ pub async fn submit_corrections(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiBytes(body): ApiBytes,
-) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
+) -> Result<Json<Vec<CorrectionVerdictDto>>, ApiFailure> {
     require(&principal, OperationKey::SubmitCorrections)?;
     let request: SubmitCorrectionsRequest = serde_json::from_slice(&body)
         .map_err(|error| invalid_field("body", "correction JSON object", error.to_string()))?;
@@ -700,7 +701,7 @@ pub async fn submit_corrections(
         corrections.push(domain);
     }
 
-    let verdicts = correct_events(
+    let outcomes = correct_events(
         &state.services,
         &principal,
         request.acknowledge_retraction,
@@ -708,10 +709,10 @@ pub async fn submit_corrections(
     )
     .await?;
     Ok(Json(
-        verdicts
+        outcomes
             .iter()
             .enumerate()
-            .map(|(index, verdict)| VerdictDto::from_domain(index + 1, verdict))
+            .map(|(index, outcome)| CorrectionVerdictDto::from_domain(index + 1, outcome))
             .collect(),
     ))
 }

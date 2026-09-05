@@ -213,7 +213,7 @@ things. Read it as the lookup table for §1.
 | `POST /v1/ingest/operations` | `[VerdictDto]` | bare array | one verdict per submitted row, in the caller's own order |
 | `POST /v1/ingest/journal-events` | `[VerdictDto]` | bare array | one verdict per submitted row |
 | `POST /v1/ingest/csv` | `[VerdictDto]` | bare array | one verdict per parsed row |
-| `POST /v1/corrections` | `[VerdictDto]` | bare array | one verdict per submitted correction |
+| `POST /v1/corrections` | `[CorrectionVerdictDto]` | bare array | one verdict per submitted correction, each carrying `standing_rule` where the corrected row was filed by a standing rule of the owner's — the rule survives the correction untouched, and the answer that says a fact was wrong is where that is worth naming |
 | `POST /v1/reconciliation/balance` | `OwnerBalanceOutcomeDto` | object, `statuses` | `control_assertions` — whether each claim reached the journal or was already held there, which no status row can say |
 | `POST /v1/import-sessions/{session}/rows` | `[ImportRowDto]` | bare array | one outcome per fed row; nothing was recorded |
 | `POST /v1/documents` | `DocumentDto` | object, `rows` | the document hash, source, parser version and period |

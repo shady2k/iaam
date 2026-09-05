@@ -28,7 +28,9 @@ use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyI
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
 };
-use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
+use iaam_app::scenarios::correction::{
+    CorrectionOutcome, CorrectionRequest, ImportCorrectionOutcome, StandingRule,
+};
 use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::{
     AnswerableQuestion, ControlReconciliation, FactBasis, HeldRow, ImportPlan, NoFactReason,
@@ -1230,6 +1232,112 @@ impl CorrectionDto {
             },
         })
     }
+}
+
+/// Verdict for one correction, and the standing decision behind the row it
+/// touched.
+///
+/// The verdict is flattened rather than nested, so a caller reading this route
+/// reads the same object every other write route answers with, plus one field.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CorrectionVerdictDto {
+    #[serde(flatten)]
+    pub verdict: VerdictDto,
+    /// The standing rule that filed the row you corrected, where the recorded
+    /// fact names one.
+    ///
+    /// **Absent says nothing about rules, and never «no rule filed this».** It
+    /// covers a row whose reading matched none of your rules — there is no
+    /// standing decision behind such a row to name — and equally a row whose
+    /// fact records nothing about rules at all: everything recorded before that
+    /// recording existed, and everything written without reading a row against
+    /// your rules, a correction included. A rule may well have filed such a row
+    /// and nobody wrote down that it did, so nothing here claims either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standing_rule: Option<StandingRuleDto>,
+}
+
+/// A rule that filed the corrected row and that the correction left standing.
+///
+/// It is a statement and not an offer. Correcting a row and retiring the rule
+/// behind it are two acts: the first says one fact was wrong, the second changes
+/// what happens to every row of that shape from now on. This names the second
+/// and performs no part of it — nothing here retires a rule, edits one, or asks
+/// permission to.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StandingRuleDto {
+    /// The rule that filed the row.
+    ///
+    /// The identifier is published because it is what the act this notice does
+    /// not perform takes: `DELETE /v1/classification-rules/{id}` retires a rule,
+    /// and `POST /v1/classification-rules` with `replaces` set to this value
+    /// rewrites one. Both are the owner's own acts, under his own credential.
+    pub rule: Uuid,
+    /// The version of the rule the row was filed under.
+    pub version: u32,
+    /// Other rows this rule filed that still count once this correction is
+    /// written.
+    ///
+    /// Rows the same request corrects are not among them, nor are rows already
+    /// retracted: the number is what retiring or rewriting the rule would leave
+    /// behind, and a row that has already stopped counting is not left behind.
+    pub still_filed: usize,
+    /// What the correction did, and what it left alone.
+    pub explanation: String,
+    /// What retiring the rule or rewriting it would cost. Neither has happened.
+    pub changing_it: String,
+}
+
+impl CorrectionVerdictDto {
+    #[must_use]
+    pub fn from_domain(row: usize, outcome: &CorrectionOutcome) -> Self {
+        Self {
+            verdict: VerdictDto::from_domain(row, &outcome.verdict),
+            standing_rule: outcome.standing_rule.map(StandingRuleDto::from_domain),
+        }
+    }
+}
+
+impl StandingRuleDto {
+    #[must_use]
+    pub fn from_domain(standing: StandingRule) -> Self {
+        Self {
+            rule: standing.rule.inner(),
+            version: standing.version,
+            still_filed: standing.still_filed,
+            explanation: CORRECTION_LEAVES_THE_RULE_STANDING.to_owned(),
+            changing_it: changing_a_standing_rule_costs(standing.still_filed),
+        }
+    }
+}
+
+/// The one sentence for the one thing a correction does to a standing rule,
+/// published from one place so that two readers of it cannot be told two
+/// different things.
+const CORRECTION_LEAVES_THE_RULE_STANDING: &str = "You corrected one row. The standing rule that filed it is untouched and \
+     still in force, so the next row it matches will be filed the same way.";
+
+/// What the two acts this notice does not perform would cost, as a sentence.
+///
+/// Composed here rather than left to the caller: the number alone does not say
+/// which way it cuts, and a caller inventing the sentence for it is a second
+/// author of what the owner is read out.
+fn changing_a_standing_rule_costs(still_filed: usize) -> String {
+    let left_behind = match still_filed {
+        0 => "no other row it has already filed still counts.".to_owned(),
+        1 => "the one other row it has already filed stays exactly as it is, and \
+              correcting that one is an act of its own."
+            .to_owned(),
+        many => format!(
+            "the {many} other rows it has already filed stay exactly as they are, \
+             and each one you disagree with is an act of its own."
+        ),
+    };
+    format!(
+        "Retiring this rule, or rewriting it, is a separate step you take yourself, \
+         and nothing here has taken it. It would change only how rows are read from \
+         now on: {left_behind}"
+    )
 }
 
 impl ImportCorrectionDto {

@@ -2854,6 +2854,84 @@ async fn an_instrument_keeps_its_three_currencies_apart() {
     }
 }
 
+/// Retracting an import is checked against a bound, not taken on trust that the
+/// caller still has the standing it once had.
+///
+/// A caller that reads only the label and the account can ask to take back an
+/// import that something has since been built on — a row reversed by someone
+/// else, or a balance reconciled against the interval it covers — and a
+/// retraction that succeeded anyway would silently undo work that was never
+/// the caller's to undo.
+#[tokio::test]
+async fn retracting_an_import_is_checked_against_a_bound_not_trusted() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CorrectImportRequest", "source");
+    for owed in [
+        "still in force",
+        "nothing has been built on it",
+        "reversed or replaced",
+        "reconciled",
+        "refusal names",
+        "twice",
+    ] {
+        assert!(
+            described.contains(owed),
+            "CorrectImportRequest.source says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A correction batch is diagnosed from the journal read back per row, and a
+/// correction proposed from a report's aggregate is a guess about which rows
+/// are wrong.
+///
+/// The field already says the batch is applied together or not at all; it said
+/// nothing about where the rows named in it are supposed to come from, and a
+/// caller that fills a correction from a report total rather than from the
+/// journal is guessing which facts to retract.
+#[tokio::test]
+async fn corrections_are_diagnosed_from_the_journal_not_guessed_from_a_total() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "SubmitCorrectionsRequest", "corrections");
+    for owed in ["journal", "read back", "aggregate", "guess"] {
+        assert!(
+            described.contains(owed),
+            "SubmitCorrectionsRequest.corrections says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An owner's own assertion of a balance is what the journal is reconciled
+/// against, not a second, independent source confirming it.
+///
+/// `accepted_internal` reads like a confirmation, and a caller that reports it
+/// as one tells the owner two sources agree when the second "source" was his
+/// own recollection of the same figure the statement gave him.
+#[tokio::test]
+async fn an_owners_balance_is_not_an_independent_confirmation() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "NavCoverageDto", "accepted_internal");
+    for owed in [
+        "reconciled against",
+        "not a second",
+        "independently confirmed",
+    ] {
+        assert!(
+            described.contains(owed),
+            "NavCoverageDto.accepted_internal says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_published_code_is_the_code_the_response_carries() {
     // The vocabularies enumerate; they must enumerate what actually arrives.

@@ -1127,6 +1127,14 @@ pub struct SubmitCorrectionsRequest {
     pub acknowledge_retraction: bool,
     /// Applied together or not at all: a correction batch is one deliberate act,
     /// unlike an import, whose rows are judged one by one.
+    ///
+    /// **Diagnose before proposing.** The journal can be read back per row, so
+    /// name the events a correction affects from what that reading found.
+    /// Every target named here should already be known, not inferred: a
+    /// correction proposed from a report's aggregate — "the total is off by
+    /// this much, so retract something that size" — is a guess about which
+    /// rows are wrong, and this field has no way to tell a diagnosed target
+    /// from a guessed one.
     pub corrections: Vec<CorrectionDto>,
 }
 
@@ -1145,6 +1153,15 @@ pub struct CorrectImportRequest {
     /// what is retracted is every row of that account and channel that named
     /// no import — which is what rows recorded before imports could be named
     /// look like, and is the only way to reach them.
+    ///
+    /// **The bound is checked, not trusted.** This import is retracted only
+    /// while its rows are still in force and nothing has been built on it: no
+    /// row of it has been reversed or replaced by anyone, and no balance the
+    /// owner named has been reconciled against the interval those rows fall
+    /// in. Anything wider than that is his to undo, and a refusal names
+    /// exactly which condition failed. Retracting the same import twice is
+    /// refused too — the second attempt reporting the rows as already
+    /// reversed is also the answer to whether the first attempt landed.
     pub source: DeclaredSourceDto,
 }
 
@@ -2137,6 +2154,15 @@ pub struct BondPositionAttributesDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NavCoverageDto {
     pub accepted_independent: String,
+    /// Share of NAV where an assertion the owner made himself is what the
+    /// journal was reconciled against.
+    ///
+    /// A balance he names is not a second, independent source confirming a
+    /// figure — it is the thing being checked. Agreement between the journal
+    /// and what he stated gives this share rather than `accepted_independent`,
+    /// and it must never be reported as independently confirmed: he usually
+    /// remembers the balance from the same application the statement came
+    /// from, so the two agreeing proves less than a second source would.
     pub accepted_internal: String,
     pub provisional: String,
     pub discrepant: String,

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "tbank-operations-csv",
-  "version": 1,
+  "version": 2,
   "issuer": "T-Bank",
   "document_label": "Operations export",
   "document": {

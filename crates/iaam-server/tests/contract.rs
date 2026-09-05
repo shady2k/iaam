@@ -25551,12 +25551,12 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // The profile is named on the answer, with the reader every fact out of
     // this document would record.
     assert_eq!(read["profile"]["id"], "tbank-operations-csv");
-    assert_eq!(read["profile"]["version"], 1);
+    assert_eq!(read["profile"]["version"], 2);
     assert_eq!(read["profile"]["issuer"], "T-Bank");
     assert_eq!(read["profile"]["origin"], "bundled");
     assert_eq!(
         read["profile"]["parser_version"],
-        "profile/tbank-operations-csv/1"
+        "profile/tbank-operations-csv/2"
     );
     assert_eq!(read["profile"]["digest"].as_str().map(str::len), Some(64));
     assert_eq!(read["session"], id);
@@ -25891,7 +25891,7 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // retracted, which is what keeps a corrected profile from doubling a month.
     assert_eq!(
         again["profile"]["parser_version"],
-        "profile/tbank-operations-csv/1"
+        "profile/tbank-operations-csv/2"
     );
 }
 

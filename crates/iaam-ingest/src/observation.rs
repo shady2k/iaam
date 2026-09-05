@@ -217,6 +217,47 @@ pub struct ObservedRow {
     /// source category at all.
     #[serde(default)]
     pub source_category: Option<String>,
+    /// The category the **owner himself** filed the row under, at the source,
+    /// verbatim.
+    ///
+    /// A different fact from [`Self::source_category`] above it, and the
+    /// difference is whose decision it is. That one is the institution's own
+    /// word for what the movement was for; this one is the owner's, taken in
+    /// his institution's app and printed back in the export. Asking him again
+    /// for what he has already told his bank is the worst question this system
+    /// can ask, and it was asked once per row because nothing read this field.
+    ///
+    /// **Transcribed and never interpreted**, which is decision 0028's rule and
+    /// is most at risk here, because the value looks like a conclusion and is
+    /// not. It is his decision *in his bank's vocabulary*, not in his categories
+    /// here, so nothing maps it: what it is called here is one question per
+    /// distinct value, whose answer reaches every row carrying that value.
+    ///
+    /// `#[serde(default)]` because a row stored by an earlier build carries no
+    /// such field, and `None` is what such a row meant: there was no way to
+    /// state it at all.
+    #[serde(default)]
+    pub owner_category: Option<String>,
+    /// The standardised code the source printed for the row, verbatim.
+    ///
+    /// The one word on the row that is not one institution's private
+    /// vocabulary: the code is assigned by the payment network, so a rule
+    /// written on it holds across institutions, where a rule written on a
+    /// source's own category holds for one bank until it renames something. As
+    /// the ground for a rule it covers a whole kind of spending where the
+    /// printed description covers one merchant string.
+    ///
+    /// **Text and never a number.** It is an identifier printed with leading
+    /// zeros, and a number loses them.
+    ///
+    /// **Nothing requires it.** The source leaves it empty on rows it assigns
+    /// no code to — a transfer between the owner's own accounts is not a
+    /// purchase from a merchant — and a profile that demanded it would refuse
+    /// rows that are perfectly readable.
+    ///
+    /// `#[serde(default)]` for [`Self::owner_category`]'s reason.
+    #[serde(default)]
+    pub source_code: Option<String>,
     /// What the source printed as the description or payment purpose, verbatim.
     pub description: Option<String>,
     pub dates: OperationDates,
@@ -250,6 +291,12 @@ impl ObservedRow {
             // channel and still not write a rule on it — which is the half of
             // decision 0019 §6 that was missing (`iaam-93lz`).
             source_category: self.source_category.clone(),
+            // Carried for `source_category`'s reason and one of its own: this
+            // is the answer the instance would otherwise ask him for once per
+            // row, so a row that reaches `classify` without it is a row whose
+            // own evidence was dropped on the way in.
+            owner_category: self.owner_category.clone(),
+            source_code: self.source_code.clone(),
             movement: self.movement(),
             far_side: self.far_side,
         }
@@ -504,6 +551,8 @@ impl ObservedRow {
             // owner's category rules matched the wrong rows in silence
             // (`iaam-p683`).
             source_category: self.source_category.clone(),
+            owner_category: self.owner_category.clone(),
+            source_code: self.source_code.clone(),
             source_kind: self.source_kind.clone(),
             description: self.description.clone(),
         }

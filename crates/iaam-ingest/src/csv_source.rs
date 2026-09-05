@@ -618,6 +618,8 @@ fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperati
         source_operation_id: None,
         // The category column arrives with the mapping importer.
         source_category: None,
+        owner_category: None,
+        source_code: None,
         source_kind: None,
         description: None,
     })

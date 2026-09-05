@@ -180,8 +180,14 @@ pub async fn list_actions(
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
 ) -> Result<Json<ActionsResponseDto>, ApiFailure> {
+    // The caller's authority, asked once of the principal this route already
+    // holds and handed down (`iaam-sh6m`). The queue says what an answer to a
+    // held classification question will keep, and that differs between the owner
+    // and an agent relaying his answers; the predicate is the scenario's, so the
+    // route names it rather than reading `scope` itself.
     let actions = iaam_app::actions::frontier(
         principal.owner,
+        iaam_app::scenarios::import_session::may_generalise(&principal),
         state.services.store.as_ref(),
         state.services.rules.as_ref(),
     )

@@ -89,7 +89,7 @@
           "maxItems": 32,
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/source_literal" },
-          "description": "Header cells that must all be present in the document's header row. They are the source's own printed headings."
+          "description": "Header cells that must all be present in the document's header row. They are the source's own printed headings.\n\nEvery heading the \"row\" block names must be listed here, and a profile may list more. The engine refuses a document that does not print a heading the row shape names, so a heading named there and absent here is a document this profile recognises and then refuses at read -- the wrong answer twice: recognition promised a reading the engine will not give, where the honest answer was that no installed profile reads this document. Listing more is the discrimination this block is for: a heading no field is read out of still tells two of an institution's exports apart."
         }
       }
     },
@@ -348,6 +348,22 @@
           "properties": { "column": { "$ref": "#/$defs/column" } }
         },
 
+        "owner_category": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column"],
+          "description": "The category the OWNER HIMSELF filed the row under, at the source, transcribed exactly and never rewritten. A different fact from \"source_category\" beside it, and the difference is whose decision it is: that one is the institution's own word for what the movement was for, this one is a decision the owner took in the institution's app and the export prints back. It is transcribed for the same reason and under the same rule -- a profile names the column and stops -- and it is emphatically not a map into the owner's categories here: his decision is in his bank's vocabulary, and what it is called here is one question per distinct value, asked once and answered once, never a conclusion drawn per row.",
+          "properties": { "column": { "$ref": "#/$defs/column" } }
+        },
+
+        "source_code": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["column"],
+          "description": "The standardised code the source prints for the row, transcribed exactly and as text. It is the one word on the row that is not one institution's private vocabulary -- the code is assigned by the payment network -- so a rule written on it holds across institutions, and as the ground for a rule it covers a whole kind of spending where a description covers one merchant string. Text and never a number: it is an identifier printed with leading zeros and a number loses them. Nothing requires it, here or anywhere: a source leaves it empty on rows it assigns no code to, and a row that prints none is read with the field saying the source printed none.",
+          "properties": { "column": { "$ref": "#/$defs/column" } }
+        },
+
         "source_operation_id": {
           "type": "object",
           "additionalProperties": false,
@@ -509,7 +525,20 @@
         "header_row": 1
       },
       "recognise": {
-        "header_cells": ["Posted", "Operation", "Sum", "Ccy", "Payee"]
+        "header_cells": [
+          "Posted",
+          "Operation date",
+          "Operation",
+          "Sum",
+          "Ccy",
+          "State",
+          "Payee",
+          "Purpose",
+          "Category",
+          "Your category",
+          "Code",
+          "Reference"
+        ]
       },
       "row": {
         "account": { "from": "declaration" },
@@ -566,6 +595,8 @@
         "description": { "column": "Purpose" },
         "source_kind": { "column": "Operation" },
         "source_category": { "column": "Category" },
+        "owner_category": { "column": "Your category" },
+        "source_code": { "column": "Code" },
         "source_operation_id": { "column": "Reference" }
       }
     }

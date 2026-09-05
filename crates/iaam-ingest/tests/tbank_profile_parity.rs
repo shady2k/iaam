@@ -137,7 +137,7 @@ fn the_export_is_recognised_by_exactly_one_installed_profile() {
     assert_eq!(installed.profile.issuer(), "T-Bank");
     assert_eq!(
         installed.profile.parser_version().0,
-        "profile/tbank-operations-csv/1"
+        "profile/tbank-operations-csv/3"
     );
 }
 
@@ -276,6 +276,13 @@ fn a_row_is_transcribed_cell_by_cell() {
     // and never mapped to one of the owner's. His category rules do that, they
     // are his, and they can be re-run over rows already recorded.
     assert_eq!(row.source_category.as_deref(), Some("Супермаркеты"));
+    // The category the owner himself filed the row under at his bank — his
+    // decision, already made and recorded there — and the standardised code the
+    // payment network assigned it. Both are transcribed and neither is
+    // interpreted: the instance used to ask him, once per row, for the answer
+    // sitting in the first of these.
+    assert_eq!(row.owner_category.as_deref(), Some("Everyday"));
+    assert_eq!(row.source_code.as_deref(), Some("5411"));
     // The export prints no operation-type word at all, so there is nothing to
     // transcribe here and the profile names no column for it. A rule written on
     // an operation word will not match a row of this export, and that is the
@@ -435,6 +442,66 @@ fn a_positive_row_carrying_a_spending_category_is_read_and_not_concluded() {
     assert!(categories.contains(&"Бонусы"), "{categories:?}");
 }
 
+/// The owner's own category and the standardised code are read off the shipped
+/// profile, and neither is required.
+///
+/// **The category is his decision, already made.** He took it in his bank's app
+/// and the export prints it back; the profile read seven of the export's
+/// sixteen columns and this was not one of them, so the instance went on to ask
+/// him, once per row, for what he had already told his bank.
+///
+/// **The code is empty on some rows and nothing may require it.** The source
+/// assigns none to a movement between the owner's own accounts, because that is
+/// not a purchase from a merchant. A profile that demanded it would refuse rows
+/// that are perfectly readable, so the row is read and the field says the
+/// source printed nothing.
+///
+/// Both are transcribed and neither is interpreted. Two rows filed by the owner
+/// under one word of his are two rows carrying that word, and what it is called
+/// here is one question — not a conclusion this reading draws.
+#[test]
+fn the_owners_own_category_and_the_standardised_code_are_read_and_required_of_nothing() {
+    let directory = directory();
+    let rows = read(&directory);
+    let observed = observations(&rows);
+
+    let owned: Vec<(u64, &str)> = observed
+        .iter()
+        .filter_map(|(locator, row)| Some((*locator, row.owner_category.as_deref()?)))
+        .collect();
+    assert_eq!(
+        owned,
+        vec![(2, "Everyday"), (3, "Eating out"), (4, "Everyday")],
+        "the owner's own word, on the rows he filed under it and on no others"
+    );
+
+    // One word of his, two rows: the reach an answer about that word has, and
+    // the reason the question is asked once rather than twice.
+    let everyday: Vec<u64> = owned
+        .iter()
+        .filter(|(_, category)| *category == "Everyday")
+        .map(|(locator, _)| *locator)
+        .collect();
+    assert_eq!(everyday, vec![2, 4]);
+
+    // The code where the source assigned one, and nothing where it did not.
+    let coded: Vec<(u64, Option<&str>)> = observed
+        .iter()
+        .map(|(locator, row)| (*locator, row.source_code.as_deref()))
+        .collect();
+    assert!(coded.contains(&(2, Some("5411"))), "{coded:?}");
+    assert!(coded.contains(&(3, Some("5812"))), "{coded:?}");
+    // The internal-transfer legs carry no code, and they are read all the same.
+    assert!(coded.contains(&(5, None)), "{coded:?}");
+    assert!(coded.contains(&(6, None)), "{coded:?}");
+    assert_eq!(
+        observed.len(),
+        coded.iter().filter(|(_, code)| code.is_none()).count()
+            + coded.iter().filter(|(_, code)| code.is_some()).count(),
+        "every row is read, with a code or without one"
+    );
+}
+
 /// Two identical purchases on one day are two facts and keep two identities.
 ///
 /// The converter needs an ordinal inside its key to say so, because its key is
@@ -474,5 +541,48 @@ fn two_identical_rows_are_two_identities_without_an_ordinal() {
             !key.contains("tbank"),
             "the key names neither the profile nor its version: {keys:?}"
         );
+    }
+}
+
+/// A row the source did not complete is not a fact about the owner's money.
+/// The profile read every row as completed because it declared no status
+/// column.
+///
+/// This is a document of its own rather than a line added to the converter's
+/// fixture: every row of that export carries the completed word, so the case
+/// a status block exists to refuse has no counterpart there to add.
+#[test]
+fn a_row_whose_status_word_is_not_in_the_map_is_refused_by_name() {
+    let directory = directory();
+    let catalogue = ProfileCatalogue::bundled();
+    let installed = catalogue
+        .get("tbank-operations-csv")
+        .expect("the T-Bank operations export ships");
+    let document = "\"Имя счёта\";\"Дата операции\";\"Сумма в валюте счёта\";\"Валюта счёта\";\
+                     \"Статус\";\"Категория по-умолчанию\";\"Ваша категория\";\"MCC\";\
+                     \"Описание\"\n\
+                     \"Main\";\"05.08.2026 10:00:00\";\"-100,00\";\"RUB\";\"НеОк\";\
+                     \"Супермаркеты\";\"\";\"\";\"Shop One\"\n";
+    let reading = engine::read(
+        document.as_bytes(),
+        &installed.profile,
+        &ReadContext {
+            accounts: &directory.names,
+            declared: None,
+        },
+    )
+    .expect("a document this profile reads even though its one row refuses");
+    assert_eq!(reading.rows.len(), 1);
+    match &reading.rows[0] {
+        ReadOutcome::Rejected { rejection, .. } => {
+            assert_eq!(rejection.field, "status");
+            assert!(
+                rejection.actual.contains("НеОк"),
+                "the refusal names the word the source printed: {rejection:?}"
+            );
+        }
+        ReadOutcome::Observed { .. } => {
+            panic!("a row with an unknown status word was accepted")
+        }
     }
 }

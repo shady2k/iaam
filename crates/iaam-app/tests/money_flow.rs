@@ -113,6 +113,8 @@ fn cash_operation(account: AccountId, kind: OperationKind, on: Date) -> Submitte
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         source_kind: None,
         description: None,
     }
@@ -282,6 +284,8 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
             idempotency_key: None,
             source_operation_id: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
             source_kind: None,
             description: None,
         },

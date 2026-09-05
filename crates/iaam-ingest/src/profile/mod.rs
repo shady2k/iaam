@@ -151,6 +151,19 @@ impl SourceProfile {
     /// What the engine checks the document's header row against: a heading the
     /// document does not have is a document this profile does not read, not a
     /// column that reads as empty.
+    ///
+    /// **Every heading here must also be one the profile recognises on**
+    /// ([`Self::recognised_by`]), and the reason is that this list is a
+    /// refusal: a heading named here and absent there is a document the
+    /// catalogue hands to this profile and the profile then refuses, where the
+    /// honest answer was that no installed profile reads it. The converse is
+    /// not required — recognition may name a heading no field is read out of,
+    /// which is how two of one institution's exports are told apart.
+    ///
+    /// The requirement is on the **column** and never on a cell. A transcribed
+    /// field whose cell is empty reads as "the source printed none"; nothing
+    /// here makes a value mandatory, which is what
+    /// [`RowShape::source_code`]'s "nothing may require it" says.
     #[must_use]
     pub fn columns(&self) -> Vec<&str> {
         let row = &self.row;
@@ -194,6 +207,8 @@ impl SourceProfile {
             row.description.as_deref(),
             row.source_kind.as_deref(),
             row.source_category.as_deref(),
+            row.owner_category.as_deref(),
+            row.source_code.as_deref(),
             row.source_operation_id.as_deref(),
         ]
         .into_iter()
@@ -283,6 +298,18 @@ pub struct RowShape {
     pub description: Option<String>,
     pub source_kind: Option<String>,
     pub source_category: Option<String>,
+    /// The column holding the category the **owner himself** filed the row
+    /// under at the source — his decision, already made and recorded there.
+    ///
+    /// Named for what it is rather than for one institution's heading, and kept
+    /// apart from [`Self::source_category`] beside it because the two differ in
+    /// whose decision they carry. Transcribed and never mapped: decision 0028.
+    pub owner_category: Option<String>,
+    /// The column holding the source's standardised code for the row.
+    ///
+    /// Empty on rows the source assigns no code to, which is why it is
+    /// `Option` on the observation and why nothing may require it.
+    pub source_code: Option<String>,
     pub source_operation_id: Option<String>,
 }
 

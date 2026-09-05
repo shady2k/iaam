@@ -7,12 +7,14 @@ use crate::ports::{
     ImportSessionState, ImportSessionSummaryView, Scope, Store, required_scope,
 };
 use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
-use crate::scenarios::import_session::{self, Generalisation};
+use crate::scenarios::import_session::{
+    self, Generalisation, MovementLeg, OneMovement, generalisation_ahead,
+};
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::source_row::RowName;
 use iaam_core::ids::{AccountId, EventId, OwnerId};
-use iaam_core::money::{CurrencyCode, Money};
+use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::projection::ProjectionError;
 use iaam_core::projection::balances::Balances;
 use iaam_core::projection::money_flow::UndecomposedCause;
@@ -2181,6 +2183,19 @@ pub struct ClassificationQuestion {
     /// build cannot read the row, which is the same row the generalisation calls
     /// `Impossible`.
     pub subject: Option<ClassificationSubject>,
+    /// The movement this row is one of the two legs of, where the session's
+    /// reading pairs it with another row (`iaam-lkvb`, decision 0031).
+    ///
+    /// Read through [`import_session::mirrored_movements_of`] for the reason
+    /// [`Self::generalisation`] is read through `generalisation_of`, and it is
+    /// the reason with the sharpest edge of the three: a pairing derived a
+    /// second time here would eventually pair rows the assessment does not, and
+    /// the two surfaces would disagree about how many decisions the owner has
+    /// left — one of them while telling him that answering settles both.
+    ///
+    /// `None` is «this row is half of nothing this reading can see», which is
+    /// the ordinary row and stays the ordinary item.
+    pub pair: Option<OneMovement>,
 }
 
 /// Compute every currently outstanding setup action for an owner.
@@ -2203,8 +2218,18 @@ pub struct ClassificationQuestion {
 /// from and a request that fails takes the recovery with it. The one content
 /// failure still left propagating is a stored import question this build cannot
 /// parse, and [`ClassificationQuestion`] says why it is where it is.
+///
+/// **`may_generalise` is the caller's authority, and it arrives as a `bool`**
+/// (`iaam-sh6m`). One item — the one for a held classification question — has to
+/// say what *this* caller's answer will keep, and that is not the same sentence
+/// for the owner and for an agent relaying his answers. The scope stops at the
+/// route, which holds a `Principal` and asks
+/// [`crate::scenarios::import_session::may_generalise`] of it; nothing in this
+/// module reads a token. The queue's business is to say what may be called, and
+/// who is asking is the caller's fact to supply.
 pub async fn frontier(
     owner: OwnerId,
+    may_generalise: bool,
     store: &dyn Store,
     rules: &dyn ClassificationRuleStore,
 ) -> Result<Vec<Action>, AppError> {
@@ -2240,6 +2265,11 @@ pub async fn frontier(
             continue;
         }
         let observations = store.list_import_observations(owner, session.id).await?;
+        // Over the whole session and before the loop, because a pair is
+        // invisible to a reading of either of its rows on its own — which is
+        // exactly why the queue used to publish one movement as two items. The
+        // scenario derives it; nothing here re-derives it.
+        let pairs = import_session::mirrored_movements_of(session.id, &observations, &held);
         for view in held {
             let asked = serde_json::from_str(&view.question).map_err(|error| {
                 AppError::Store(format!("stored import question could not be read: {error}"))
@@ -2247,6 +2277,7 @@ pub async fn frontier(
             questions.push(ClassificationQuestion {
                 generalisation: import_session::generalisation_of(&observations, &view),
                 subject: import_session::subject_of(&observations, &view),
+                pair: pairs.get(&view.row).copied(),
                 view,
                 session_state: session.state,
                 asked,
@@ -2277,6 +2308,7 @@ pub async fn frontier(
         retired: retirements.as_assessment(),
         sessions: &sessions,
         questions: &questions,
+        may_generalise,
         rules: &rules,
         wanted_accounts: &wanted_accounts,
     })
@@ -3251,6 +3283,17 @@ struct OwnerState<'a> {
     /// nothing says so, and once here.
     sessions: &'a [ImportSessionSummaryView],
     questions: &'a [ClassificationQuestion],
+    /// Whether the caller reading this queue may turn an answer into a standing
+    /// rule (`iaam-hnod`).
+    ///
+    /// **Supplied, never read here** (`iaam-sh6m`). The queue's business is to
+    /// say what may be called, and who is asking is the caller's own fact: the
+    /// route holds the principal and asks
+    /// [`crate::scenarios::import_session::may_generalise`] of it once. A token
+    /// read inside this module would be a second place deciding the same gate,
+    /// and the item for a classification question has to state what *this*
+    /// caller's answer will keep.
+    may_generalise: bool,
     /// The owner's standing classification rules, as the classifier reads them.
     ///
     /// Read for one purpose: to find out whether a proposal the queue would
@@ -3286,6 +3329,7 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
         retired,
         sessions,
         questions,
+        may_generalise,
         rules,
         wanted_accounts,
     } = *state;
@@ -3352,12 +3396,25 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
     // Last, so the frontier's kinds stay non-decreasing in `ActionKind`'s own
     // order: this kind is declared after the control assertion.
     for question in questions.iter().filter(|question| {
-        classification_question_eligibility(question) && classification_question_gap(question)
+        classification_question_eligibility(question)
+            && classification_question_gap(question)
+            && !second_leg_of_one_movement(question)
     }) {
+        // The other leg's account, where this row has one. Read from the same
+        // list the near account is read from, so a movement between two accounts
+        // is named on both sides or the queue refuses over it — an item that
+        // said «and one other row, somewhere» would be the silence the pairing
+        // exists to break.
+        let far = match waiting_far_leg(question) {
+            Some(leg) => Some(names.get(leg.account)?),
+            None => None,
+        };
         actions.push(answer_classification_question_action(
             question,
             names.get(question.asked.account())?,
+            far,
             accounts,
+            may_generalise,
         ));
     }
     // After them, for the same reason and in the same order: an answered
@@ -3460,6 +3517,30 @@ fn classification_question_gap(question: &ClassificationQuestion) -> bool {
     !classification_question_completion(question)
 }
 
+/// Whether this question is the far half of a movement another item already
+/// publishes.
+///
+/// **Not an eligibility and not a completion** (`iaam-lkvb`). Both of those say
+/// something about the work: that the owner cannot do it, or that it is done.
+/// Neither is true here — the row is open, it is his to answer, and answering it
+/// is exactly what is wanted. What is false is that it is a *second* piece of
+/// work. One answer settles both legs, so the pair is one item, and this decides
+/// which of the two carries it.
+///
+/// The departure carries it, for the reason the mirror pass keeps the
+/// departure's fact: a transfer is recorded from its sending side everywhere
+/// else in this system. Either would have served for suppression; picking the
+/// same side twice is what keeps the two from disagreeing.
+const fn second_leg_of_one_movement(question: &ClassificationQuestion) -> bool {
+    match &question.pair {
+        Some(OneMovement::Waiting(pair)) => pair.arrival.row == question.view.row,
+        // A row with no counterpart is nobody's second leg: there is no first
+        // one. It is one row and one item, and it is published because of what
+        // it is not paired with rather than despite it.
+        Some(OneMovement::Recorded { .. } | OneMovement::NoCounterpart(_)) | None => false,
+    }
+}
+
 /// The goal is satisfied by an answer to **this** question and by nothing else.
 ///
 /// Quantified over the questions, not over the sessions. «This session has no
@@ -3473,7 +3554,14 @@ fn classification_question_gap(question: &ClassificationQuestion) -> bool {
 /// the eligibility above, and «the owner said what the row was» and «the owner
 /// threw the row away» are different facts that must not read as one.
 fn classification_question_completion(question: &ClassificationQuestion) -> bool {
-    !question.view.is_open()
+    // The other leg's answer is an answer to this row (`iaam-lkvb`). One
+    // movement printed on both of its accounts is one fact, so the answer that
+    // records it records this row's half too and nothing here is owed — which is
+    // what the session's own reading already concluded, as
+    // `NoFactReason::SecondLegOfOneMovement`. Held here beside «he answered it»
+    // rather than in the eligibility, because it is the goal being satisfied and
+    // not work he cannot do.
+    !question.view.is_open() || matches!(question.pair, Some(OneMovement::Recorded { .. }))
 }
 
 /// A row the source described too thinly to classify, waiting on the owner.
@@ -3506,11 +3594,34 @@ fn classification_question_completion(question: &ClassificationQuestion) -> bool
 /// tell an agent it may not send a request the server would accept. Who decides
 /// the answer and who may transmit it are different questions, and
 /// `NeedsOwnerInput` is where the first one is already answered.
+///
+/// **`far` is the other half of one movement, and it makes this item the pair's
+/// item** (`iaam-lkvb`). Where it is present the far row raises no item of its
+/// own — [`second_leg_of_one_movement`] withholds it — so this one is the only
+/// place either row is published, and it names both. The pair is still a
+/// hypothesis: `mirror.rs` is explicit that two unrelated payments of one amount
+/// on one day exist, so nothing is taken out of the answer's alternatives and
+/// the sentence says which of them refuses the pairing.
 fn answer_classification_question_action(
     question: &ClassificationQuestion,
     account: &AccountView,
+    far: Option<&AccountView>,
     accounts: &[AccountView],
+    may_generalise: bool,
 ) -> Action {
+    // What the answer keeps beyond this session, and the one thing about this
+    // item that is not the same for every caller (`iaam-sh6m`). It used to be a
+    // clause of the sentence below, stating flatly that a rule is written — true
+    // of the owner answering about a row a matcher can be built from, and false
+    // of the other two cases, which the reader had no way to distinguish. The
+    // assessment's group proposal stated the opposite just as flatly. Both now
+    // read the same derivation, and it is stated in the scenario that owns
+    // `Generalisation` rather than a second time here.
+    let kept = generalisation_ahead(question.subject.as_ref(), may_generalise).reported();
+    // What the two rows are to each other, where they are anything. Empty for
+    // the ordinary row, which is one row and one decision and needs no clause
+    // saying so.
+    let pairing = one_movement_text(question, account, far);
     let mut preset = BTreeMap::new();
     // Both are path segments of the answering route, and both are known: the
     // question is the subject of this item and the session is on its row.
@@ -3528,10 +3639,20 @@ fn answer_classification_question_action(
             // One identity per question, so a second question is a second item
             // and an agent deduplicating by id never collapses them — the same
             // rule `start_account_import` follows per account.
+            //
+            // Per **pair** where there is one, which is the same rule applied to
+            // the unit of work: the two legs are one decision, so they are one
+            // identity, and it is the pair's own — derived from the session and
+            // the two rows by the scenario, so two readings of an unchanged
+            // session publish the same one and a caller deduplicating by id does
+            // not see the item move.
             id: format!(
                 "{}:{}",
                 ActionKind::AnswerClassificationQuestion.id(),
-                question.view.id.inner()
+                match question.pair {
+                    Some(OneMovement::Waiting(pair)) if far.is_some() => pair.id.to_string(),
+                    _ => question.view.id.inner().to_string(),
+                }
             ),
             kind: ActionKind::AnswerClassificationQuestion,
             category: ActionCategory::required_for(ActionKind::AnswerClassificationQuestion),
@@ -3539,10 +3660,9 @@ fn answer_classification_question_action(
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         format!(
-            "Account {} ({}) has row {} of import session {} held unclassified. {} Nothing else \
-             is refused while it stands, but the row is in no journal and in no report, and the \
-             session holding it will not commit until it is answered. The answer is written as a \
-             rule, so a row matching it settles by itself next time.",
+            "Account {} ({}) has row {} of import session {} held unclassified. {pairing}{} \
+             Nothing else is refused while it stands, but the row is in no journal and in no \
+             report, and the session holding it will not commit until it is answered. {kept}",
             account.id.inner(),
             account.title,
             question.view.row,
@@ -3558,6 +3678,96 @@ fn answer_classification_question_action(
         },
     )
     .expect("classification question action has an operation target")
+}
+
+/// The other leg's row, where this question is half of a movement both of whose
+/// rows are still waiting on the owner.
+///
+/// `None` for the ordinary row and for one whose movement another row already
+/// records: that row raises no item, so there is nothing for it to name.
+const fn waiting_far_leg(question: &ClassificationQuestion) -> Option<MovementLeg> {
+    match question.pair {
+        Some(OneMovement::Waiting(pair)) => pair.far_of(question.view.row),
+        Some(OneMovement::Recorded { .. } | OneMovement::NoCounterpart(_)) | None => None,
+    }
+}
+
+/// What this item says about the two rows it publishes together, where it
+/// publishes two.
+///
+/// Empty for a row that is half of nothing, so the ordinary item reads exactly
+/// as it did: a clause about a pairing on every item would be a sentence about
+/// what is *not* the case, on the surface whose whole business is what is.
+///
+/// **Three things it has to say, and the third is the one that is easy to drop.**
+/// That the two rows are one movement; that one answer settles both, so nothing
+/// is left half done; and that the pairing is a hypothesis and how to refuse it.
+/// `iaam-ingest::mirror` is explicit on the last: two unrelated payments of one
+/// amount on one day have exactly this shape, and an item that could not be
+/// refused would be worse than the two items this replaces. The refusal is not a
+/// word of its own — the answering vocabulary already has it — so the sentence
+/// names the shape of it rather than inventing a code the route would reject.
+fn one_movement_text(
+    question: &ClassificationQuestion,
+    account: &AccountView,
+    far: Option<&AccountView>,
+) -> String {
+    // A row this document holds no other half for (`iaam-0evk`). Said here
+    // because it is the same clause answering the same question — what these
+    // rows are to each other — and its answer is «nothing, and here is why»,
+    // which the item has to carry for the reason it carries the pairing: the
+    // ordinary alternatives are both wrong for such a row, and nothing else on
+    // the item distinguishes it from a row they are right for. **Relayed and
+    // never rewritten**: the wording is the scenario's, so the queue cannot
+    // come to say one thing about this row while another surface says another.
+    if let Some(OneMovement::NoCounterpart(reason)) = question.pair {
+        return format!("{} ", reason.reported());
+    }
+    let (Some(OneMovement::Waiting(pair)), Some(far_account)) = (question.pair, far) else {
+        return String::new();
+    };
+    let (Some(near), Some(other)) = (
+        pair.leg_of(question.view.row),
+        pair.far_of(question.view.row),
+    ) else {
+        return String::new();
+    };
+    format!(
+        "It and row {} on account {} ({}) look like one movement this document printed twice — \
+         {near_text}, and {far_text} — so the two are one decision and this is the item for it: \
+         one answer settles both, and the other row raises no item of its own. If they are not \
+         one movement, and two unrelated lines of one sum on one day look exactly like this, any \
+         answer that does not name the other row's account leaves them as two rows with two \
+         questions and keeps nothing of the pairing. ",
+        other.row,
+        far_account.id.inner(),
+        far_account.title,
+        near_text = movement_leg_text(near, &account.title),
+        far_text = movement_leg_text(other, &far_account.title),
+    )
+}
+
+/// One leg of such a movement, named the way a row is named to the owner.
+///
+/// **The day the source dated it and the amount it printed, never the row number
+/// alone.** The number addresses the answering call and tells a person nothing:
+/// several lines of one month can be identical in every other respect, and a
+/// reader holding «row 4» cannot find the line on the statement in front of him.
+///
+/// The sign is the source's own and is left on, for the reason
+/// `PrintedRow::amount_minor` states: it is the evidence the owner matches
+/// against his statement, and on a pair it is also what makes the two rows
+/// visibly opposite halves rather than two charges.
+fn movement_leg_text(leg: MovementLeg, title: &str) -> String {
+    format!(
+        "row {}, {} {} on «{title}», dated {}",
+        leg.row,
+        Money::new(PostedMinor::new(leg.amount_minor), leg.currency)
+            .to_calc_dec()
+            .inner(),
+        leg.currency.code(),
+        leg.date,
+    )
 }
 
 /// Which answered questions have a rule the owner could still adopt.
@@ -6175,6 +6385,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -6694,7 +6905,9 @@ mod tests {
     async fn an_empty_owner_isoffered_the_first_account_action() {
         let owner = OwnerId::new_random();
         let store = store();
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
 
         assert_eq!(actions.len(), 1);
         let action = &actions[0];
@@ -6747,6 +6960,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: wanted,
         })
@@ -7597,7 +7811,7 @@ mod tests {
             .await
             .expect("record");
 
-        let before: Vec<String> = frontier(owner, &store, &store)
+        let before: Vec<String> = frontier(owner, true, &store, &store)
             .await
             .expect("frontier")
             .iter()
@@ -7611,7 +7825,7 @@ mod tests {
             .await
             .expect("account");
 
-        let after: Vec<String> = frontier(owner, &store, &store)
+        let after: Vec<String> = frontier(owner, true, &store, &store)
             .await
             .expect("frontier")
             .iter()
@@ -7655,7 +7869,9 @@ mod tests {
             .await
             .expect("record");
 
-        let required = frontier(owner, &store, &store).await.expect("frontier");
+        let required = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let before = named_by_document(&required);
         assert!(matches!(
             before.category(),
@@ -7674,7 +7890,9 @@ mod tests {
             .await
             .expect("declined");
 
-        let settled = frontier(owner, &store, &store).await.expect("frontier");
+        let settled = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let after = named_by_document(&settled);
         assert_eq!(
             after.id(),
@@ -7693,7 +7911,9 @@ mod tests {
             .await
             .expect("withdrawn");
 
-        let asked_again = frontier(owner, &store, &store).await.expect("frontier");
+        let asked_again = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(matches!(
             named_by_document(&asked_again).category(),
             ActionCategory::RequiredForGoal(_)
@@ -7733,7 +7953,7 @@ mod tests {
             .expect("second reading");
 
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -7756,7 +7976,7 @@ mod tests {
         assert!(!accounts.is_empty());
         assert!(account_completion(&accounts));
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -7774,7 +7994,9 @@ mod tests {
             .await
             .expect("account");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::CreateFirstContour)
@@ -7837,7 +8059,7 @@ mod tests {
         assert!(!contours.is_empty());
         assert!(contour_completion(&contours));
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -7877,7 +8099,9 @@ mod tests {
                 .expect("contour");
         }
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(
             actions.iter().any(|action| action
                 .target()
@@ -7976,7 +8200,9 @@ mod tests {
             .await
             .expect("contour");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
@@ -8040,7 +8266,9 @@ mod tests {
             .await
             .expect("contour");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
@@ -8118,7 +8346,7 @@ mod tests {
             .await
             .expect("contour");
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -8132,7 +8360,9 @@ mod tests {
             .await
             .expect("account");
 
-        let reopened = frontier(owner, &store, &store).await.expect("frontier");
+        let reopened = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert_eq!(
             reopened
                 .iter()
@@ -8178,7 +8408,9 @@ mod tests {
             .await
             .expect("exclusion");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(
             actions
                 .iter()
@@ -8193,7 +8425,7 @@ mod tests {
             .await
             .expect("cleared");
         assert_eq!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -8305,6 +8537,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8379,6 +8612,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8651,6 +8885,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8695,8 +8930,12 @@ mod tests {
             .await
             .expect("account");
 
-        let first = frontier(owner, &store, &store).await.expect("frontier");
-        let second = frontier(owner, &store, &store).await.expect("frontier");
+        let first = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
+        let second = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert_eq!(first, second);
         assert!(
             first
@@ -8728,6 +8967,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8885,6 +9125,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8917,6 +9158,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -8948,6 +9190,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -9120,6 +9363,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -9152,6 +9396,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -9172,6 +9417,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -10495,6 +10741,10 @@ mod tests {
             // about is not consulted while that is true.
             generalisation: Generalisation::Unanswered,
             subject: None,
+            // One row of this session and half of nothing. The pairing is
+            // exercised where it is derived and through the queue's own
+            // published items, not by asserting a relation into a fixture.
+            pair: None,
         }
     }
 
@@ -10535,6 +10785,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10577,6 +10828,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10613,6 +10865,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10657,6 +10910,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10687,6 +10941,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10740,6 +10995,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10772,6 +11028,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: std::slice::from_ref(&question),
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -10806,6 +11063,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[first.clone(), second.clone()],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10858,7 +11116,9 @@ mod tests {
             .await
             .expect("question recorded");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let item = only_question_item(&actions);
         assert_eq!(
             item.id(),
@@ -10879,7 +11139,9 @@ mod tests {
             .await
             .expect("answered");
 
-        let after = frontier(owner, &store, &store).await.expect("frontier");
+        let after = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(
             after
                 .iter()
@@ -10903,6 +11165,8 @@ mod tests {
             description: Some("card purchase 0001".to_owned()),
             source_kind: Some("card".to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             movement: None,
             far_side: FarSide::Unstated,
         }
@@ -10915,6 +11179,8 @@ mod tests {
             description_contains: None,
             kind: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
     }
 
@@ -10966,6 +11232,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(question),
+            may_generalise: true,
             rules,
             wanted_accounts: &[],
         })
@@ -11076,6 +11343,8 @@ mod tests {
                 description_contains: Some("card purchase".to_owned()),
                 kind: None,
                 source_category: None,
+                owner_category: None,
+                source_code: None,
             },
             Classification::ExternalFlow,
         );
@@ -11191,6 +11460,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(retired),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -11253,6 +11523,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions,
             questions,
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -11352,6 +11623,7 @@ mod tests {
             retired: RetirementAssessment::NotAssessed("event A references non-existent B"),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -11523,6 +11795,7 @@ mod tests {
             ]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })

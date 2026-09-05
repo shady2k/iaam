@@ -143,6 +143,8 @@ impl BrokerChannel for PopulatedChannel {
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
                 source_category: None,
+                owner_category: None,
+                source_code: None,
                 source_kind: None,
                 description: None,
             }],
@@ -10750,6 +10752,8 @@ impl BrokerChannel for TwinRowsChannel {
             idempotency_key: None,
             source_operation_id: Some(operation_id.to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             source_kind: None,
             description: None,
         };
@@ -20100,6 +20104,645 @@ async fn the_session_list_says_what_each_session_holds() {
     assert_eq!(contents["unanswered"], listed["unanswered"], "{contents}");
 }
 
+/// A document covering two of the owner's own accounts, printing one movement
+/// between them.
+///
+/// A departure on one account and the arrival on the other: same day, same
+/// magnitude, opposite signs, neither of them saying who the far side is. Every
+/// value is invented for this file, and the session declares no account because
+/// the case is a single document that covers two of them.
+///
+/// Returns the session and the account the arrival is on, which is the far side
+/// an answer that accepts the pair has to name.
+async fn a_session_with_one_mirrored_movement(harness: &Harness) -> (String, Uuid) {
+    let main = another_account(harness, "Main").await;
+    let savings = another_account(harness, "Savings").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(main, "mirrored-departure", "2025-04-10", "-2500.00"),
+                    unresolved_row_dated(savings, "mirrored-arrival", "2025-04-10", "2500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    for row in rows.as_array().expect("rows") {
+        assert_eq!(
+            row["state"], "needs_classification",
+            "the fixture needs both legs waiting on the owner: {rows}"
+        );
+    }
+    (id, savings)
+}
+
+/// One movement a document printed twice is one decision (iaam-lkvb).
+///
+/// Two items grade it as two pieces of work and leave open the act that records
+/// the movement twice: an agent working the queue answers both legs separately,
+/// and the journal then holds one movement twice or one leg as an orphan. The
+/// assessment has paired the two rows and raised one question about the pair
+/// since decision 0031; the queue never consulted the pairing at all.
+#[tokio::test]
+async fn a_movement_printed_on_both_of_its_accounts_is_one_item() {
+    let harness = harness();
+    let (session, _) = a_session_with_one_mirrored_movement(&harness).await;
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "the two legs of one movement are published as {} items: {items:#?}",
+        items.len()
+    );
+    let item = &items[0];
+    assert_eq!(item["kind"], "answer_classification_question", "{item}");
+    assert_eq!(
+        item["target"]["request"]["preset"]["session"],
+        json!(session),
+        "{item}"
+    );
+
+    // Both rows are named the way a row is named to the owner: the day the
+    // source dated it and the amount it printed. A row number alone tells
+    // nobody which line this is — several lines of one month can be identical
+    // in every other respect.
+    let reason = item["reason"].as_str().expect("a reason");
+    for (amount, title) in [("-2500.00", "Main"), ("2500.00", "Savings")] {
+        assert!(
+            reason.contains(&format!("{amount} RUB on «{title}», dated 2025-04-10")),
+            "each leg is named by the day its source dated it and the amount it \
+             printed: {reason}"
+        );
+    }
+    // And by the number the answering call takes, so the reader can act on
+    // either — the number beside the printed line, never instead of it.
+    assert!(reason.contains("row 2"), "{reason}");
+
+    // And the identity does not move under a caller that reads the queue twice.
+    let again = open_question_items(&harness).await;
+    assert_eq!(again.len(), 1, "{again:#?}");
+    assert_eq!(again[0]["id"], item["id"], "{again:#?}");
+}
+
+/// A row already settled is still weighed when the queue pairs (iaam-y5ww).
+///
+/// `mirrored`'s refusal to choose between two candidate counterparts is a
+/// function of the whole side set, so two passes handed different sets disagree
+/// about the same two rows. The queue built its sides from the stored questions
+/// alone; the assessment builds them from every row it has read, a row the
+/// owner's directory settled included. An open departure, an open arrival, and a
+/// settled arrival of the same amount on the same day on a third account: the
+/// assessment found two candidates and refused, while the queue paired the two
+/// open rows, published one item saying the other raises none of its own, and
+/// suppressed it — asserting a pairing the other surface denies and hiding an
+/// open question behind it.
+///
+/// Every value is invented for this file. The third row is settled the way a row
+/// settles without anybody being asked: it names a counterparty the owner's
+/// directory recognises as one of his own accounts.
+#[tokio::test]
+async fn a_settled_row_of_the_same_shape_stops_the_queue_pairing_the_two_open_ones() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+    let reserve = another_account(&harness, "Reserve").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    // The third row states its direction and names «Main», so the directory
+    // settles it into a movement between two of his own accounts and it raises
+    // no question at all.
+    let mut settled = unresolved_row_dated(reserve, "third-arrival", "2025-04-10", "2500.00");
+    settled["direction"] = json!("in");
+    settled["counterparty"] = json!("Main");
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(main, "open-departure", "2025-04-10", "-2500.00"),
+                    unresolved_row_dated(savings, "open-arrival", "2025-04-10", "2500.00"),
+                    settled,
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let states: Vec<&str> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["state"].as_str().expect("a state"))
+        .collect();
+    assert_eq!(
+        states,
+        vec!["needs_classification", "needs_classification", "held"],
+        "the fixture needs two rows waiting on him and a third settled without \
+         him: {rows}"
+    );
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(
+        items.len(),
+        2,
+        "the queue pairs two rows a third makes undecidable, and hides one of \
+         the two open questions behind the pairing: {items:#?}"
+    );
+    for item in &items {
+        let reason = item["reason"].as_str().expect("a reason");
+        assert!(
+            !reason.contains("look like one movement"),
+            "a pairing the assessment refuses is published as one it made: {reason}"
+        );
+        // And neither is told this document holds no counterpart for it: it
+        // holds two that could be, and states nothing that chooses.
+        assert!(
+            !reason.contains("holds no counterpart for it"),
+            "an undecidable pairing is published as an absent one: {reason}"
+        );
+    }
+}
+
+/// A pair is a hypothesis, and refusing it stays sayable (iaam-lkvb).
+///
+/// Two unrelated payments of one amount on one day have exactly this shape, so
+/// an item that could not be refused would be worse than two items. The refusal
+/// is any answer that does not name the other row's account, and the vocabulary
+/// already publishes those words.
+#[tokio::test]
+async fn one_item_for_a_pair_can_still_be_answered_they_are_two_different_things() {
+    let harness = harness();
+    let _ = a_session_with_one_mirrored_movement(&harness).await;
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let answer = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .expect("the answer field")
+        .clone();
+    let shapes: Vec<&str> = answer["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert!(
+        shapes.contains(&"paid") && shapes.contains(&"received"),
+        "«no, these are two different things» must remain sayable: {shapes:?}"
+    );
+
+    // And the item says so in words, which is what makes the refusal an offer
+    // rather than something a reader has to work out from the vocabulary. This
+    // is the assertion the test was missing (iaam-y5ww): everything above holds
+    // of an item that never mentions the refusal at all.
+    let reason = items[0]["reason"].as_str().expect("a reason").to_owned();
+    assert!(
+        reason.contains(
+            "any answer that does not name the other row's account leaves them as two rows \
+             with two questions"
+        ),
+        "the item does not say that refusing the pairing is an answer it takes: {reason}"
+    );
+    assert!(
+        reason.contains("keeps nothing of the pairing"),
+        "the item does not say what refusing the pairing costs: {reason}"
+    );
+
+    // And saying it leaves two rows with two questions, which is the state the
+    // pair was only ever a hypothesis about.
+    let session = items[0]["target"]["request"]["preset"]["session"]
+        .as_str()
+        .expect("the session is preset")
+        .to_owned();
+    let question = items[0]["target"]["request"]["preset"]["question"]
+        .as_str()
+        .expect("the question is preset")
+        .to_owned();
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let left = open_question_items(&harness).await;
+    assert_eq!(
+        left.len(),
+        1,
+        "the other row is still a row with a question of its own: {left:#?}"
+    );
+    // The far leg is back as **its own** question, which is the state the
+    // refusal puts the two rows in. Counting the items would hold of a queue
+    // that had simply moved the pair onto the row he did not answer.
+    let far = &left[0];
+    assert_ne!(
+        far["target"]["request"]["preset"]["question"],
+        json!(question),
+        "the row still open is the one he answered: {far}"
+    );
+    assert_eq!(
+        far["target"]["request"]["preset"]["session"],
+        json!(session),
+        "{far}"
+    );
+    let far_reason = far["reason"].as_str().expect("a reason");
+    assert!(
+        !far_reason.contains("look like one movement"),
+        "the far leg is still published as half of a pairing he refused: {far_reason}"
+    );
+    // And it is asked about on its own terms: nothing in this document is left
+    // that could be its other half, because the row that mirrored it is now a
+    // payment out.
+    assert!(
+        far_reason.contains("holds no counterpart for it"),
+        "the far leg is published as an ordinary row although the only row that \
+         mirrored it has been answered as something else: {far_reason}"
+    );
+}
+
+/// Answering the pair settles both legs, and the queue lists neither again.
+#[tokio::test]
+async fn answering_one_item_for_a_pair_settles_both_of_its_legs() {
+    let harness = harness();
+    let (_, savings) = a_session_with_one_mirrored_movement(&harness).await;
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let session = items[0]["target"]["request"]["preset"]["session"]
+        .as_str()
+        .expect("the session is preset")
+        .to_owned();
+    let question = items[0]["target"]["request"]["preset"]["question"]
+        .as_str()
+        .expect("the question is preset")
+        .to_owned();
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    assert!(
+        open_question_items(&harness).await.is_empty(),
+        "one answer settles the movement, so neither leg is still asked about"
+    );
+}
+
+/// A leg this document holds no counterpart for says so, and says why
+/// (iaam-0evk).
+///
+/// A statement of one account cannot hold the far half of a movement between
+/// two of them: the pairing reads one document by construction, and a movement
+/// prints one half on each account. Before this, such a row reached the queue
+/// among the ordinary ones with the ordinary alternatives, and both of them
+/// write a wrong fact — naming a far account records a movement whose other half
+/// is not there, and «the money left the perimeter» files an internal move as
+/// spending.
+///
+/// Every value is invented for this file: one account of the harness's own and
+/// one row nothing in the document mirrors.
+#[tokio::test]
+async fn a_leg_a_one_account_document_holds_no_counterpart_for_says_which_and_why() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "lone" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(account, "lone-leg", "2025-04-10", "-2500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let reason = items[0]["reason"].as_str().expect("a reason").to_owned();
+
+    assert!(
+        reason.contains("holds no counterpart for it"),
+        "the row is published as any other row: {reason}"
+    );
+    // «In this document» and never «nowhere». The far half may be in a statement
+    // he has not brought yet, or on an account he did not put in his group, and
+    // the second is the ordinary case.
+    assert!(
+        reason.contains("«not in this document»"),
+        "the sentence does not say which document it is speaking about: {reason}"
+    );
+    assert!(
+        reason.contains("on a statement not yet handed over")
+            && reason.contains("not in his directory"),
+        "the sentence does not say where the far half may be instead: {reason}"
+    );
+    for denial in ["does not exist", "never existed", "there is no other half"] {
+        assert!(
+            !reason.contains(denial),
+            "the sentence denies a far half it cannot see: {reason}"
+        );
+    }
+    // And the narrower thing, where the instance knows it: a document of one
+    // account never held the other half. That is what tells him what to do next.
+    assert!(
+        reason.contains("every row of this session is on one account"),
+        "the document covers one account and the sentence does not say so: {reason}"
+    );
+
+    // The answer it steers to is still a word the question admits: nothing is
+    // taken out of the alternatives, because the row may yet be a payment.
+    let shapes: Vec<&str> = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .expect("the answer field")["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert!(
+        shapes.contains(&"sent_to_own_account") && shapes.contains(&"paid"),
+        "the row that raises this sentence is one an own-account answer is offered for: {shapes:?}"
+    );
+}
+
+/// The same row in a document of several accounts says the bare fact and not the
+/// narrow one (iaam-0evk).
+///
+/// Several accounts *could* have held the far half and none of them did, which
+/// says nothing about why — so the sentence says nothing about why, rather than
+/// borrowing an explanation that is false here.
+///
+/// **The two rows are legs because the source said so, and only because of
+/// that** (iaam-y5ww). Each names a merchant the owner's directory does not
+/// recognise, and each is printed under the word the source uses for a movement
+/// internal to itself — so the named party does not make them ordinary rows and
+/// the transfer word is the whole of what makes them legs. The fixture used to
+/// name nobody at all, which is a second thing that makes a row leg-shaped, and
+/// a test resting on two of them cannot say which one it is pinning.
+#[tokio::test]
+async fn a_leg_a_many_account_document_holds_no_counterpart_for_says_only_that() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    // Two rows on two accounts and of two magnitudes, so neither is the other's
+    // other half and the document still covers more than one account.
+    let mut departure = unresolved_row_dated(main, "wide-departure", "2025-04-10", "-2500.00");
+    departure["direction"] = json!("inner");
+    departure["counterparty"] = json!("Shop One");
+    let mut arrival = unresolved_row_dated(savings, "wide-arrival", "2025-04-10", "1000.00");
+    arrival["direction"] = json!("inner");
+    arrival["counterparty"] = json!("Shop Two");
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [departure, arrival] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 2, "{items:#?}");
+    for item in &items {
+        let reason = item["reason"].as_str().expect("a reason");
+        assert!(
+            reason.contains("holds no counterpart for it")
+                && reason.contains("«not in this document»"),
+            "the row is published as any other row: {reason}"
+        );
+        assert!(
+            reason.contains("it covers more than one account"),
+            "the sentence does not say what it knows about the document: {reason}"
+        );
+        assert!(
+            !reason.contains("every row of this session is on one account"),
+            "the sentence explains the absence with something false of it: {reason}"
+        );
+        // And it says «available» rather than «there is none» (iaam-y5ww): the
+        // leftover of several identical sides lands on this same sentence, and
+        // a row of the document *is* its opposite half — spent on an earlier
+        // pairing.
+        assert!(
+            reason.contains("available to be the opposite half"),
+            "the sentence denies a row the document printed: {reason}"
+        );
+    }
+}
+
+/// A payment to a named merchant is not a leg and is not told about one
+/// (iaam-y5ww).
+///
+/// The gate was «the question admits an own-account answer», and
+/// `Question::IsTransferInternal` admits one: it is raised for any row with a
+/// named counterparty and a stated direction. So on an import that pairs
+/// nothing — a single account's card statement is the ordinary case — nearly
+/// every open row was handed a ninety-word paragraph about a counterpart the
+/// document does not hold. A card payment is not the near half of anything.
+///
+/// Every value is invented for this file.
+#[tokio::test]
+async fn a_payment_to_a_named_merchant_is_not_told_the_document_holds_no_counterpart() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "card" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    // The source said which way the money went and who it went to, and the name
+    // is nobody the owner's directory knows.
+    let mut payment = unresolved_row_dated(account, "card-payment", "2025-04-10", "-2500.00");
+    payment["direction"] = json!("out");
+    payment["counterparty"] = json!("Shop One");
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [payment] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let reason = items[0]["reason"].as_str().expect("a reason");
+    assert!(
+        !reason.contains("holds no counterpart for it"),
+        "an ordinary payment is told this document holds no counterpart for it: {reason}"
+    );
+    // And it is still the question it always was, so nothing was taken away
+    // with the paragraph.
+    let shapes: Vec<&str> = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .expect("the answer field")["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert!(
+        shapes.contains(&"paid") && shapes.contains(&"sent_to_own_account"),
+        "the row stopped being answerable as what it may yet be: {shapes:?}"
+    );
+}
+
+/// A row the document could not choose a partner for is not a row it holds none
+/// for (iaam-0evk).
+///
+/// The refusal `iaam_ingest::mirror` already makes, kept apart from the absence.
+/// This document prints two rows that could be the departure's other half and
+/// nothing that chooses between them, so telling the owner there is no
+/// counterpart here would deny rows the document printed.
+///
+/// **A fourth row carries the positive half** (iaam-y5ww). What the three rows
+/// above pin is an absence, and an absence passes if the whole publication is
+/// deleted; the fourth is a leg of the same document that nothing mirrors at
+/// all, and it must be told. One test, because the two halves are one rule:
+/// which of the two things happened to a row decides which sentence it gets.
+#[tokio::test]
+async fn an_ambiguous_leg_is_not_told_the_document_holds_no_counterpart() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+    let reserve = another_account(&harness, "Reserve").await;
+    let holding = another_account(&harness, "Holding").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(main, "two-ways-out", "2025-04-10", "-2500.00"),
+                    unresolved_row_dated(savings, "two-ways-one", "2025-04-10", "2500.00"),
+                    unresolved_row_dated(reserve, "two-ways-two", "2025-04-10", "2500.00"),
+                    // A leg of one magnitude nothing else in this document
+                    // shares, so nothing mirrors it and nothing is undecidable
+                    // about it.
+                    unresolved_row_dated(holding, "lone-leg", "2025-04-10", "-700.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 4, "{items:#?}");
+    let mut told = 0;
+    for item in &items {
+        let reason = item["reason"].as_str().expect("a reason");
+        let lone = reason.contains("-700.00 RUB");
+        if lone {
+            told += 1;
+            assert!(
+                reason.contains("holds no counterpart for it"),
+                "a leg this document holds no other half for is published as an \
+                 ordinary row: {reason}"
+            );
+        } else {
+            assert!(
+                !reason.contains("holds no counterpart for it"),
+                "an undecidable pairing is published as an absent one: {reason}"
+            );
+        }
+    }
+    assert_eq!(
+        told, 1,
+        "the fixture must hold exactly one row that is told: {items:#?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The assessment, and the revision commit checks (iaam-k1xa)
 // ---------------------------------------------------------------------------
@@ -21977,7 +22620,11 @@ async fn a_word_that_holds_two_things_is_published_with_its_contents_and_no_rule
         .as_array()
         .expect("withheld offers");
     assert_eq!(withheld.len(), 1, "{plan}");
-    assert_eq!(withheld[0]["source_category"], "Transfer", "{plan}");
+    assert_eq!(withheld[0]["filed_under"], "Transfer", "{plan}");
+    // Whose filing the word is, published beside it: the sentence a caller
+    // shows differs between the institution's word and one of the owner's, and
+    // a withheld entry carries no matcher to read the ground off.
+    assert_eq!(withheld[0]["filed_by"], "source_category", "{plan}");
     assert_eq!(withheld[0]["covers"], json!([1, 2, 3]), "{plan}");
     let contains = withheld[0]["contains"].as_array().expect("what it holds");
     assert_eq!(
@@ -25551,12 +26198,16 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // The profile is named on the answer, with the reader every fact out of
     // this document would record.
     assert_eq!(read["profile"]["id"], "tbank-operations-csv");
-    assert_eq!(read["profile"]["version"], 1);
+    // Version 3: the profile reads the category the owner himself filed the row
+    // under and the standardised code, so its reading changed and a version
+    // must name a content — otherwise «the rows version 2 read» is not a set
+    // and a buggy profile's facts stop being findable and retractable.
+    assert_eq!(read["profile"]["version"], 3);
     assert_eq!(read["profile"]["issuer"], "T-Bank");
     assert_eq!(read["profile"]["origin"], "bundled");
     assert_eq!(
         read["profile"]["parser_version"],
-        "profile/tbank-operations-csv/1"
+        "profile/tbank-operations-csv/3"
     );
     assert_eq!(read["profile"]["digest"].as_str().map(str::len), Some(64));
     assert_eq!(read["session"], id);
@@ -25891,7 +26542,7 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // retracted, which is what keeps a corrected profile from doubling a month.
     assert_eq!(
         again["profile"]["parser_version"],
-        "profile/tbank-operations-csv/1"
+        "profile/tbank-operations-csv/3"
     );
 }
 
@@ -26282,4 +26933,140 @@ async fn an_agent_token_reads_an_institution_s_export_into_a_session() {
         read["rows"].as_array().is_some_and(|rows| !rows.is_empty()),
         "{read}"
     );
+}
+
+/// The queue and the assessment say the same thing about what an answer keeps.
+///
+/// **The defect.** Two published sentences described one act with opposite
+/// persistence and neither was conditional: the queue's item stated flatly that
+/// the answer is written as a rule and a row matching it settles by itself next
+/// time, and the assessment's decision group stated flatly that no standing
+/// decision is kept. Neither was stale — each was right about a different case —
+/// so a caller that read both had to pick one, which is how an owner came to be
+/// told a rule would not exist that would exist.
+///
+/// Both are now read off one derivation, and the derivation takes the asking
+/// authority: the owner may generalise and an agent may not (`iaam-hnod`), so
+/// the same session answers differently to the two tokens and says so on both
+/// surfaces at once.
+///
+/// Everything here is invented: the account is the harness's own `Main`, and the
+/// rows were made up for this test.
+#[tokio::test]
+async fn the_queue_and_the_assessment_agree_on_what_an_answer_keeps() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "kept" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    // Two rows the source says the same thing about, so they raise one decision
+    // and the assessment publishes the group whose sentence is the other half of
+    // this test. Both print `INNER`, so a rule can be built from either.
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row(account, "kept-one"),
+                    unresolved_row(account, "kept-two"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let owner_reason = classification_item_reason(&harness, &harness.owner_token).await;
+    let owner_consequence = decision_group_consequence(&harness, &harness.owner_token, &id).await;
+
+    // The owner's token may generalise, so both surfaces owe the same answer.
+    assert!(
+        owner_reason.contains("settles by itself next time"),
+        "the queue does not say the rule will stand: {owner_reason}"
+    );
+    assert!(
+        !owner_consequence.contains("no standing decision is kept"),
+        "the group still denies what the queue promises: {owner_consequence}"
+    );
+    assert!(
+        owner_consequence.contains("without asking you again"),
+        "the group does not say the rule will stand: {owner_consequence}"
+    );
+
+    // The agent's token may not, and neither surface promises him a rule.
+    let agent_reason = classification_item_reason(&harness, &harness.agent_token).await;
+    let agent_consequence = decision_group_consequence(&harness, &harness.agent_token, &id).await;
+    assert!(
+        !agent_reason.contains("settles by itself next time"),
+        "the queue promises an agent a rule it will not write: {agent_reason}"
+    );
+    assert!(
+        agent_reason.contains("writes no rule"),
+        "the queue does not say why no rule stands: {agent_reason}"
+    );
+    assert!(
+        !agent_consequence.contains("without asking you again"),
+        "the group promises an agent a rule it will not write: {agent_consequence}"
+    );
+    assert!(
+        agent_consequence.contains("keeps no standing decision"),
+        "the group does not say why no rule stands: {agent_consequence}"
+    );
+
+    // One group, and it is still the group's own fact how many lines one answer
+    // settles — that half of the sentence is what the persistence clause was
+    // welded to, and it stays.
+    for consequence in [&owner_consequence, &agent_consequence] {
+        assert!(
+            consequence.contains("all 2 of these lines together"),
+            "the group stopped saying how far one answer reaches: {consequence}"
+        );
+    }
+}
+
+/// The reason the queue publishes on the item for a held classification question.
+async fn classification_item_reason(harness: &Harness, token: &str) -> String {
+    let (status, actions) = call(&harness.router, get("/v1/actions", Some(token))).await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .find(|item| item["kind"] == "answer_classification_question")
+        .and_then(|item| item["reason"].as_str())
+        .expect("an item for a held classification question")
+        .to_owned()
+}
+
+/// What the assessment tells a person turns on answering one decision group.
+async fn decision_group_consequence(harness: &Harness, token: &str, session: &str) -> String {
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}/assessment"),
+            Some(token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    plan["interpretation"]["groups"]
+        .as_array()
+        .expect("row groups")
+        .iter()
+        .find(|group| group["basis"] == "one_decision")
+        .and_then(|group| group["question"]["consequence"].as_str())
+        .expect("a decision group with a sentence")
+        .to_owned()
 }

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "tbank-operations-csv",
-  "version": 1,
+  "version": 3,
   "issuer": "T-Bank",
   "document_label": "Operations export",
   "document": {
@@ -17,7 +17,10 @@
       "Дата операции",
       "Сумма в валюте счёта",
       "Валюта счёта",
+      "Статус",
       "Категория по-умолчанию",
+      "Ваша категория",
+      "MCC",
       "Описание"
     ]
   },
@@ -55,6 +58,12 @@
     "direction": {
       "from": "amount_sign"
     },
+    "status": {
+      "column": "Статус",
+      "tokens": {
+        "Ок": "completed"
+      }
+    },
     "counterparty": {
       "column": "Описание"
     },
@@ -63,6 +72,12 @@
     },
     "source_category": {
       "column": "Категория по-умолчанию"
+    },
+    "owner_category": {
+      "column": "Ваша категория"
+    },
+    "source_code": {
+      "column": "MCC"
     }
   }
 }

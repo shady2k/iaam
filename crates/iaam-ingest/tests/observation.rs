@@ -26,6 +26,8 @@ fn inner_row(account: AccountId) -> ObservedRow {
         far_side: FarSide::Unstated,
         source_kind: Some("INNER".to_owned()),
         source_category: None,
+        owner_category: None,
+        source_code: None,
         description: None,
         dates: OperationDates {
             cash_posted: Some(date!(2025 - 03 - 18)),
@@ -101,6 +103,8 @@ fn the_category_the_source_filed_the_row_under_reaches_the_classifier() {
     let row = ObservedRow {
         source_kind: None,
         source_category: Some("Bank interest".to_owned()),
+        owner_category: None,
+        source_code: None,
         direction: ObservedDirection::In,
         ..inner_row(account)
     };
@@ -126,6 +130,8 @@ fn a_row_naming_only_a_category_settles_under_the_owners_standing_rule() {
     let row = ObservedRow {
         source_kind: None,
         source_category: Some("Bank interest".to_owned()),
+        owner_category: None,
+        source_code: None,
         direction: ObservedDirection::In,
         ..inner_row(account)
     };
@@ -137,6 +143,8 @@ fn a_row_naming_only_a_category_settles_under_the_owners_standing_rule() {
             description_contains: None,
             kind: None,
             source_category: Some("Bank interest".to_owned()),
+            owner_category: None,
+            source_code: None,
         },
         outcome: Classification::Income {
             kind: Some(IncomeKind::DepositInterest),
@@ -183,6 +191,8 @@ fn a_rule_the_owner_already_wrote_settles_the_row_without_asking_again() {
             description_contains: None,
             kind: Some("INNER".to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
         },
         outcome: Classification::InternalTransfer { to: savings },
     };
@@ -492,6 +502,8 @@ fn merchant_inflow(account: AccountId) -> ObservedRow {
         far_side: FarSide::Unstated,
         source_kind: Some("RETURN".to_owned()),
         source_category: None,
+        owner_category: None,
+        source_code: None,
         description: None,
         dates: OperationDates {
             cash_posted: Some(date!(2025 - 03 - 20)),
@@ -720,6 +732,8 @@ fn the_operation_word_and_the_source_category_survive_resolution_in_their_own_fi
         direction: ObservedDirection::Out,
         source_kind: Some("card payment".to_owned()),
         source_category: Some("Groceries".to_owned()),
+        owner_category: None,
+        source_code: None,
         ..inner_row(account)
     };
 
@@ -771,6 +785,8 @@ fn both_words_survive_a_transfer_submitted_from_the_far_side() {
         direction: ObservedDirection::In,
         source_kind: Some("transfer".to_owned()),
         source_category: Some("Between own accounts".to_owned()),
+        owner_category: None,
+        source_code: None,
         ..inner_row(account)
     };
 

@@ -124,6 +124,8 @@ fn affected_trade(owner: OwnerId, account: AccountId, instrument: InstrumentId) 
         idempotency_key: None,
         source_operation_id: Some(format!("old-{instrument:?}")),
         source_category: None,
+        owner_category: None,
+        source_code: None,
         source_kind: None,
         description: None,
     };

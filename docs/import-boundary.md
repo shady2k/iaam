@@ -582,8 +582,10 @@ not prose an owner reads: it is fields the classifier acts on.
 The rule is one line. **A converter relays what the source printed, and asserts
 nothing the source did not.** Every field of an observation is a transcription:
 the direction is the source's word or the source's sign, the counterparty is the
-string it printed, `source_kind` and `source_category` are its own two words, and
-the description is its purpose line as it stands. Nothing in the shape is a
+string it printed, `source_kind` and `source_category` are its own two words,
+`owner_category` is the word the **owner himself** filed the row under there and
+`source_code` the standardised code the payment network assigned it, and the
+description is its purpose line as it stands. Nothing in the shape is a
 conclusion, and that is deliberate — decision 0019 §1 is the argument, and the
 type is the enforcement: an `ObservedRow` has no operation kind, no
 classification and no category, so there is nothing for a converter to conclude
@@ -617,6 +619,23 @@ So, precisely:
 - It may not set it to make an import quieter. That is not a caricature: it is the
   first thing anybody tries when a two-hundred-row export asks two hundred
   questions, and it works.
+
+**`owner_category` is the one field a converter must not fill in, for the
+opposite reason.** It is not the institution's word: it is a decision the owner
+took himself, in the institution's app, which the export prints back. A
+converter writing one is a converter deciding what his money was and signing his
+name to it — and unlike a wrong `far_side`, which is at least a claim about the
+document, a fabricated one would be evidence *of his own decision* that he never
+made. So it is relayed where the document prints it, verbatim, and left absent
+everywhere else. Nothing maps it either: it is his decision in his bank's
+vocabulary, and what it is called in this system is a question asked once per
+distinct value, whose answer reaches every row carrying that value.
+
+`source_code` needs no such warning and carries one caution of its own: it is
+text, never a number, because it is an identifier printed with leading zeros.
+Nothing requires it — a source assigns none to a row that is not a purchase from
+a merchant, and a converter that demanded it would refuse rows that are
+perfectly readable.
 
 A profile is a converter that cannot break the first rule by accident: the only
 way to write the field is `own_account_words`, quoting the source's own printed

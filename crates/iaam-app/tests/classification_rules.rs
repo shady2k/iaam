@@ -89,6 +89,8 @@ fn proposal() -> (RuleMatcher, Classification) {
             description_contains: Some("Shop One".to_owned()),
             kind: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
         },
         Classification::ExternalFlow,
     )

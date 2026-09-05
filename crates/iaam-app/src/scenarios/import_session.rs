@@ -30,11 +30,12 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Basis, Classification, ClassificationResult, ClassificationRule,
-    ClassificationSubject, Movement, Question, QuestionSubject, RuleMatcher, classify,
+    ClassificationSubject, Counterparty, Movement, Question, QuestionSubject, RuleMatcher,
+    classify,
 };
 use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
-use iaam_ingest::mirror::{MirrorSide, mirrored};
-use iaam_ingest::observation::{Intake, ObservedRow};
+use iaam_ingest::mirror::{MirrorSide, Unpaired, mirrored};
+use iaam_ingest::observation::{Intake, ObservedDirection, ObservedRow};
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Rejection, SubmittedOperation, Verdict, normalize};
 use sha2::{Digest, Sha256};
@@ -1126,6 +1127,108 @@ impl Generalisation {
             Self::Available { .. } => "available",
             Self::Impossible => "impossible",
         }
+    }
+}
+
+/// What answering will decide beyond this session, before it is answered.
+///
+/// [`Generalisation`] is the same question asked afterwards, and it cannot
+/// answer this one: an unanswered question is [`Generalisation::Unanswered`] by
+/// construction. Two things are known before the answer and they are the whole
+/// of it — whether the row can ground a matcher at all, and whether the caller
+/// may generalise (`iaam-hnod`).
+///
+/// **One derivation, because two sentences.** The queue's item and the
+/// assessment's group proposal both have to say this. They said opposite things
+/// — the queue that the answer is written as a rule, the group that no standing
+/// decision is kept — while each was right about one case and neither was
+/// conditional, so a reader had no way to tell which case he was in. A caller
+/// that read both had to choose, and choosing wrong is how an owner came to be
+/// told a rule would not exist that would exist.
+///
+/// **The sentences differ and the value does not.** A surface reporting *about*
+/// the owner and a surface speaking *to* him are two registers, and one string
+/// serving both would be wrong in one of them; so the two spellings live here,
+/// side by side, off one value. Nothing downstream re-derives which of the three
+/// it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneralisationProspect {
+    /// The answer is written as a rule, and a row matching it settles by itself
+    /// next time.
+    WillStand,
+    /// The answer settles this row and writes no rule, because the answerer may
+    /// not generalise. The rule is the owner's to make stand.
+    NeedsHisAdoption,
+    /// No rule can be built from this row under any token: a matcher that asks
+    /// nothing matches nothing.
+    NoneFromThisRow,
+}
+
+impl GeneralisationProspect {
+    /// The sentence for a surface reporting about the owner.
+    #[must_use]
+    pub const fn reported(self) -> &'static str {
+        match self {
+            Self::WillStand => {
+                "The answer is written as a rule, so a row matching it settles by itself next time."
+            }
+            Self::NeedsHisAdoption => {
+                "The answer settles this row and writes no rule: the rule it would have been is \
+                 published with the answer, and making it stand is the owner's own act."
+            }
+            Self::NoneFromThisRow => {
+                "The answer settles this row and nothing else: this row carries nothing a rule \
+                 could match on, so no later row settles by itself because of it."
+            }
+        }
+    }
+
+    /// The same fact in the second person, for a sentence the owner is read.
+    ///
+    /// **Not the sentence above with the pronouns changed.** Decision 0027's
+    /// register holds here and is enforced mechanically — «rule» is this
+    /// system's word for what he calls a standing decision, and the guard on
+    /// [`decision_group_question`] refuses it along with every other word that
+    /// exists only because of how this is built.
+    #[must_use]
+    pub const fn addressed(self) -> &'static str {
+        match self {
+            Self::WillStand => {
+                "Your answer is also kept as a standing decision, so a line matching it in a \
+                 later statement is settled without asking you again."
+            }
+            Self::NeedsHisAdoption => {
+                "Your answer keeps no standing decision, because only you may make one: the \
+                 standing decision it would have been is published beside the answer, and one \
+                 call of your own makes it stand."
+            }
+            Self::NoneFromThisRow => {
+                "Your answer keeps no standing decision, because these lines carry nothing a \
+                 later line could be matched against: no line of a later statement is settled \
+                 by it."
+            }
+        }
+    }
+}
+
+/// What answering one question will decide beyond this session.
+///
+/// The two facts it reads are the two that exist before an answer does. The
+/// subject is `None` where this build cannot read the row, and a row it can read
+/// still grounds no rule when it prints nothing a matcher could ask about — both
+/// are «no rule can be built from this», which is the same pair
+/// [`generalisation_of`] folds into [`Generalisation::Impossible`]. Groundedness
+/// is asked of [`matcher_from`] and not restated here, because a second spelling
+/// of that field policy is a second answer to what a rule can be built from.
+#[must_use]
+pub fn generalisation_ahead(
+    subject: Option<&ClassificationSubject>,
+    may_generalise: bool,
+) -> GeneralisationProspect {
+    match subject.and_then(matcher_from) {
+        None => GeneralisationProspect::NoneFromThisRow,
+        Some(_) if may_generalise => GeneralisationProspect::WillStand,
+        Some(_) => GeneralisationProspect::NeedsHisAdoption,
     }
 }
 
@@ -2735,6 +2838,15 @@ pub struct PrintedRow {
     /// caller reading a withheld offer can see which word each open row belongs
     /// to without joining two lists by row number.
     pub source_category: Option<String>,
+    /// The word the **owner himself** filed the row under, at the source,
+    /// verbatim, when the source printed one.
+    ///
+    /// Beside [`Self::source_category`] for its reason and never instead of it:
+    /// both ground a group, so a caller reading an offer or a withheld entry
+    /// keyed on his own word needs the same join. It is a decision he already
+    /// took, so publishing it discloses nothing he did not himself write down —
+    /// and it is the one field here he will recognise at a glance.
+    pub owner_category: Option<String>,
 }
 
 /// One standing decision the session's own rows offer, stated as a condition.
@@ -2795,7 +2907,45 @@ pub struct OfferedRule {
     pub contains: RowShape,
 }
 
-/// A word the source filed rows under whose rows are not one thing, and the
+/// Whose filing a group of rows is keyed by.
+///
+/// **Two vocabularies and never one**, which is the whole reason this exists.
+/// An institution files by its own purposes; the owner files by his, in the
+/// institution's app, and the export prints both back. A group keyed by one of
+/// them is a group keyed by a decision one party made, and which party it was
+/// decides what may truthfully be said about the group and which field of a
+/// [`RuleMatcher`] a condition on it goes in.
+///
+/// Ordered so that a listing does not reorder itself between two readings, and
+/// the institution's word comes first for no better reason than that it is the
+/// one every profile has always transcribed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FiledBy {
+    /// The institution's own word for what the movement was for.
+    Source,
+    /// The owner's own word, taken in the institution's app and printed back.
+    ///
+    /// **His decision, already made.** It is the strongest evidence a statement
+    /// carries about what a row was, and it is still only evidence: it is his
+    /// decision in his *bank's* vocabulary, and what it is called here is the
+    /// question the offer puts — once for the word, never once per row.
+    Owner,
+}
+
+impl FiledBy {
+    /// The word for the wire, one place so the transport cannot spell it
+    /// differently. It is the field of a condition on this ground, which is
+    /// what makes an offer and a withheld entry joinable.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Source => "source_category",
+            Self::Owner => "owner_category",
+        }
+    }
+}
+
+/// A word rows were filed under whose rows are not one thing, and the
 /// rule that is therefore not offered on it.
 ///
 /// **This is `iaam-xchm`.** On a real export one word the institution files by
@@ -2840,8 +2990,18 @@ pub struct OfferedRule {
 /// wording is the owner's protection for the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithheldOffer {
-    /// The word the source filed these rows under, verbatim.
-    pub source_category: String,
+    /// Whose filing the word is — the institution's or the owner's.
+    ///
+    /// **Published because the sentence beside it would otherwise be false in
+    /// one of the two cases.** An offer withheld on a word of the owner's own is
+    /// withheld on a decision he took, and telling him «your statement files
+    /// these under …» would hand his own filing back to him as the bank's.
+    /// [`OfferedRule`] needs no such field: its condition names the field it
+    /// asks about, so its ground is already readable off the matcher.
+    pub filed_by: FiledBy,
+    /// The word these rows were filed under, verbatim, by whoever
+    /// [`Self::filed_by`] says filed them.
+    pub filed_under: String,
     /// The rows of this session, in order, that no offer covers because of it.
     /// The union of [`Self::contains`]'s rows.
     pub covers: Vec<u32>,
@@ -3795,7 +3955,12 @@ pub async fn plan_session(
     // questions one decision. The directory is the same one every row of this
     // plan was resolved against, because a group names its account the way the
     // owner reads it.
-    let groups = row_groups(&contents.observations, &open_questions, &resolver.directory);
+    let groups = row_groups(
+        &contents.observations,
+        &open_questions,
+        &resolver.directory,
+        may_generalise(principal),
+    );
 
     let mut facts = Vec::new();
     let mut duplicates = Vec::new();
@@ -6052,6 +6217,536 @@ pub struct MirroredPair {
     pub row: u32,
 }
 
+/// One movement a document printed on both of its accounts, with both of its
+/// rows named (`iaam-lkvb`).
+///
+/// **[`MirroredPair`] read from outside one question, and that is the whole
+/// difference.** A caller walking a session's open questions one at a time holds
+/// the row it is on and asks what the other one is; a caller that publishes
+/// **one** piece of work for the two holds neither yet and has to name both — so
+/// it needs the two legs together, not the relation from one side.
+///
+/// Named by what each source line printed, because that is how a row is named to
+/// the owner. A row number is enough for a call and is not enough for a person:
+/// several lines of one month can be identical in everything the number does not
+/// say, and «row 4» tells nobody which line of the statement in front of him
+/// this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirroredMovement {
+    /// The identifier both rows carry, and no other row of the session does.
+    ///
+    /// [`pair_identity`]'s, so it is the same identifier the assessment
+    /// publishes on the two questions and is a function of the session and the
+    /// two rows alone — a caller that deduplicates by it sees nothing move
+    /// between two readings of an unchanged session.
+    pub id: Uuid,
+    /// The row on the account the money left.
+    ///
+    /// The one of the two a caller acts on, wherever it must pick one: a
+    /// transfer is recorded from its sending side everywhere else in this
+    /// system, and `mirrored_rows` keeps the departure's fact for the same
+    /// reason.
+    pub departure: MovementLeg,
+    /// The row on the account the money reached.
+    pub arrival: MovementLeg,
+}
+
+impl MirroredMovement {
+    /// This row's own leg.
+    ///
+    /// Beside [`Self::far_of`] rather than left to the caller to pick by
+    /// comparing row numbers: a caller that publishes the two together names
+    /// both, and the two lookups are one question — which of the two is this —
+    /// answered once here.
+    #[must_use]
+    pub const fn leg_of(&self, row: u32) -> Option<MovementLeg> {
+        if self.departure.row == row {
+            Some(self.departure)
+        } else if self.arrival.row == row {
+            Some(self.arrival)
+        } else {
+            None
+        }
+    }
+
+    /// The leg that is not this row's.
+    ///
+    /// `None` for a row this movement does not hold, which is the same answer
+    /// [`MirroredRows::pair_of`] gives such a row.
+    #[must_use]
+    pub const fn far_of(&self, row: u32) -> Option<MovementLeg> {
+        if self.departure.row == row {
+            Some(self.arrival)
+        } else if self.arrival.row == row {
+            Some(self.departure)
+        } else {
+            None
+        }
+    }
+}
+
+/// One leg of such a movement, as the source printed the row.
+///
+/// Nothing here is normalised, for [`PrintedRow`]'s reason: every field says
+/// what the document said, so that the owner can match it against the line in
+/// front of him.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MovementLeg {
+    /// The row's position in its session, which is what the answering call
+    /// takes.
+    pub row: u32,
+    /// The account whose statement printed it.
+    pub account: AccountId,
+    /// The day the source dated the row.
+    ///
+    /// Not an `Option`, unlike [`PrintedRow::date`]: a row the source left
+    /// undated is not a side of anything — [`mirrored`] pairs on an exact day —
+    /// so a leg with no day cannot exist.
+    pub date: time::Date,
+    /// The amount **with the sign the source printed**, for
+    /// [`PrintedRow::amount_minor`]'s reason.
+    pub amount_minor: i64,
+    pub currency: CurrencyCode,
+}
+
+/// What one row of a session is to a movement its document printed twice.
+///
+/// Two states and not one, because a caller publishing work about the row owes a
+/// different sentence for each: two rows that are one question, and a row that
+/// is no longer a question at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneMovement {
+    /// This row and one other are the two legs, and both are still the owner's
+    /// to answer. One answer settles both, so they are one decision and belong
+    /// in one piece of work.
+    Waiting(MirroredMovement),
+    /// The other leg's answer already records the movement, so this row has
+    /// nothing of its own left to record.
+    ///
+    /// [`NoFactReason::SecondLegOfOneMovement`] as a caller that has not read
+    /// the whole session can see it, and the row it names is the row that
+    /// records the movement — which is what makes it a statement rather than a
+    /// disappearance.
+    Recorded { by: u32 },
+    /// This row could be one leg, and this document holds no other half for it
+    /// (`iaam-0evk`).
+    ///
+    /// **A third state and not the absence of the first two.** A row half of
+    /// nothing this reading can see publishes no [`OneMovement`] at all, and
+    /// that is the ordinary row: a card payment is not the near half of
+    /// anything and has nothing to be told about. This is the row that *is*
+    /// leg-shaped — the owner may answer it «money I moved to my own account»,
+    /// because that is one of the words the question admits — and whose other
+    /// half no row of this document is. Answered as an ordinary row it produces
+    /// one of two wrong facts: a transfer whose far leg is not there, or a
+    /// movement between his own accounts filed as spending.
+    NoCounterpart(NoCounterpart),
+}
+
+/// Why this row has no other half here, said as narrowly as it is known.
+///
+/// **«In this document» and never «nowhere».** The far half may be in a
+/// statement the owner has not brought yet, or on an account he did not put in
+/// his group — the second is the ordinary case and it looks exactly like the
+/// first from here. Nothing published from this value says the movement had no
+/// other half, only that this document does not hold it.
+///
+/// Where the document covered one account the reason is known and is worth
+/// saying: a movement between two accounts prints its halves on two accounts, so
+/// a document holding one of them never held the other. That is a different
+/// conversation from a bare «no counterpart», because it tells him what to do —
+/// bring the other account's statement, or name the account he has not declared
+/// — rather than leaving him to search a file that cannot contain the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCounterpart {
+    /// Every row this session holds is on one account, so no row of it could
+    /// have been the far half of a movement between two.
+    ///
+    /// The narrower thing, and it is arithmetic over the rows rather than a
+    /// conclusion: the accounts their own statements printed them on, counted.
+    OneAccount,
+    /// The document covered more than one account and no row of it is
+    /// **available** to be this row's other half.
+    ///
+    /// The bare fact, said where nothing explains it. It is deliberately not
+    /// dressed up as the first: several accounts *could* have held the far half
+    /// and none of them did, which says nothing about why.
+    ///
+    /// **«Available» and not «there is none»** (`iaam-y5ww`). This is
+    /// [`Unpaired::NoCounterpart`] relayed, and that value covers two
+    /// situations: nothing in the document mirrors the row at all, or everything
+    /// that does is already the other half of another movement — one arrival
+    /// cannot be the far half of two departures, so the leftover departure of
+    /// several identical ones lands here with a row of the document that *is*
+    /// its opposite half, spent on an earlier pairing. A sentence saying no row
+    /// of the document is that half would deny a row the document printed.
+    SeveralAccounts,
+}
+
+impl NoCounterpart {
+    /// The sentence for a surface reporting about the owner.
+    ///
+    /// **Beside the value rather than at the surface**, which is
+    /// [`GeneralisationProspect::reported`]'s reason held here: a wording
+    /// written where an item is built is a second answer to a question this
+    /// enum already answers, and the two disagree the moment one of them is
+    /// edited. What a publisher does is relay it.
+    ///
+    /// Both sentences say **in this document**, and neither says the far half
+    /// does not exist. That is not a nicety of tone: a movement between two
+    /// accounts prints its halves on two accounts, this reading sees one
+    /// document, and the half it cannot see is ordinarily on an account the
+    /// owner has not declared. Asserting its absence would be the fabrication
+    /// [`iaam_ingest::mirror`] refuses in the other direction.
+    ///
+    /// Both also say what the two ordinary answers would do, because that is
+    /// what makes this a different question rather than a warning label. The
+    /// question the row raises is where the other half went; «name the far
+    /// account» and «this left the perimeter» are answers to a question nobody
+    /// asked of it.
+    #[must_use]
+    pub const fn reported(self) -> &'static str {
+        match self {
+            Self::OneAccount => {
+                "This document holds no counterpart for it, and why is known: every row of this \
+                 session is on one account, and a movement between two accounts prints one half \
+                 on each — so a statement of one of them never held the other. That is «not in \
+                 this document» and not «nowhere»: if this row was money moved between the \
+                 owner's own accounts, the far half is on a statement not yet handed over, or on \
+                 an account that is not in his directory. Naming a far account in the answer \
+                 records the whole movement from this row alone, and answering that the money \
+                 left the perimeter files it as spending — so what this row needs settled is \
+                 where the other half went, and not which of the ordinary alternatives fits."
+            }
+            Self::SeveralAccounts => {
+                "This document holds no counterpart for it: it covers more than one account, and \
+                 no row on any of them is available to be the opposite half of the same amount \
+                 on the same day — either no row of it mirrors this one, or the one that does is \
+                 already the other half of another movement. That is «not in this document» and \
+                 not «nowhere»: if this row was money moved between the owner's own accounts, \
+                 the far half is on a statement not yet handed \
+                 over, or on an account that is not in his directory. Naming a far account in \
+                 the answer records the whole movement from this row alone, and answering that \
+                 the money left the perimeter files it as spending — so what this row needs \
+                 settled is where the other half went, and not which of the ordinary \
+                 alternatives fits."
+            }
+        }
+    }
+}
+
+/// What a session's questions are to the movements its document printed twice
+/// (`iaam-lkvb`).
+///
+/// **The queue's reader for the pairing, and not a second derivation of it.**
+/// The action queue publishes an item per open question and never consulted the
+/// pairing at all, so one movement a document printed twice reached the owner as
+/// two independent items — and an agent working them answered both legs
+/// separately, which records the movement twice or leaves one leg an orphan. The
+/// fix could have been a pairing written beside the queue; two derivations of
+/// one fact on two surfaces is the defect one level up, so this goes through
+/// [`mirrored`], [`unanswered_side`] and [`pair_identity`] — the three the
+/// assessment's own pass is built from — and splits the result the three ways
+/// [`mirrored_rows`] splits it.
+///
+/// **It sees less than [`mirrored_rows`] and says so.** That pass runs over rows
+/// already read against the owner's directory and his standing rules, so a leg
+/// his directory recognised is a named side of it. This has the session's
+/// observations and its stored questions and nothing else — which is exactly
+/// what [`crate::actions`] holds, and it holds them without loading a session —
+/// so the far sides it can name are the ones a question states on its own: a row
+/// he answered as a movement to or from one of his own accounts names the far
+/// side in the answer itself, and nothing else here names one at all.
+///
+/// **It asks [`mirrored`] about every readable row of the session all the same,
+/// and not only about the questioned ones** (`iaam-y5ww`). What stood here
+/// before was the claim that a pair this finds is a pair the deep pass finds,
+/// «because both ask [`mirrored`] the same question about the same two rows»,
+/// and it was false: [`mirrored`]'s ambiguity refusal is a function of the whole
+/// side set and not of two rows, and the two passes were handed different sets.
+/// An open departure, an open arrival, and a third arrival of the same amount on
+/// the same day that a rule or the directory had already settled: this pass saw
+/// two sides and paired them, the deep pass saw three, found two candidate
+/// counterparts and refused — so the queue published a pairing the assessment
+/// denied and suppressed the arrival's own open question behind it. That is this
+/// wave's own defect one level up, and the fix is to weigh the same rows.
+///
+/// A row carrying no question was settled by something this pass cannot see — a
+/// rule of his, his directory, the source's own word — so it is read as its
+/// source printed it, with no far side named. That is the widest reading of it,
+/// and widening can only add candidate counterparts, which can only make
+/// [`mirrored`] refuse. What remains of the difference therefore runs one way:
+/// this pass refuses pairs the deep pass makes, and a row it refuses about is
+/// published as it always has been, which is where this started rather than
+/// something it breaks.
+///
+/// **A pair whose far half carries no question publishes nothing**, for the same
+/// reason. `Recorded` names the row that records the movement, and this pass
+/// cannot know what a row it never questioned was settled as — a fee, income,
+/// money that left the perimeter. Naming it as the row that records this
+/// movement would be the fabrication the whole module is written against, so the
+/// near row is published as the ordinary row it was published as before.
+#[must_use]
+pub fn mirrored_movements_of(
+    session: ImportSessionId,
+    observations: &[ImportObservationView],
+    questions: &[ImportQuestionView],
+) -> BTreeMap<u32, OneMovement> {
+    let rows: BTreeMap<u32, ObservedRow> = observations
+        .iter()
+        .filter_map(|observation| match parse_intake(&observation.payload) {
+            // A row the caller concluded is not an observation and is no side
+            // of anything: it states what it was, and this pass has nothing to
+            // add to it.
+            Ok(Intake::Observed { row, .. }) => Some((observation.row, *row)),
+            Ok(Intake::Concluded { .. }) | Err(_) => None,
+        })
+        .collect();
+    let asked: BTreeMap<u32, &ImportQuestionView> = questions
+        .iter()
+        .map(|question| (question.row, question))
+        .collect();
+    let mut open: BTreeSet<u32> = BTreeSet::new();
+    let mut sides: Vec<MirrorSide> = Vec::new();
+    for (row, observed) in &rows {
+        match asked.get(row) {
+            Some(question) if question.is_open() => {
+                open.insert(*row);
+                sides.extend(unanswered_side(*row, observed));
+            }
+            Some(question) => sides.extend(answered_side(*row, observed, question)),
+            // Settled by something this pass cannot see, and read at its widest
+            // for the reason above.
+            None => sides.extend(unanswered_side(*row, observed)),
+        }
+    }
+    let mut movements = BTreeMap::new();
+    let reading = mirrored(&sides);
+    for mirror in reading.pairs {
+        // The three outcomes [`mirrored_rows`] decides, decided the same way and
+        // on the same question: how many of the two sides are already answered.
+        // A pair with one side answered is one movement already recorded, and
+        // the other side has nothing of its own to add.
+        match (
+            open.contains(&mirror.outgoing),
+            open.contains(&mirror.incoming),
+        ) {
+            (true, true) => {
+                let (Some(departure), Some(arrival)) = (
+                    rows.get(&mirror.outgoing)
+                        .and_then(|observed| movement_leg(mirror.outgoing, observed)),
+                    rows.get(&mirror.incoming)
+                        .and_then(|observed| movement_leg(mirror.incoming, observed)),
+                ) else {
+                    continue;
+                };
+                let movement = OneMovement::Waiting(MirroredMovement {
+                    id: pair_identity(session, mirror.outgoing, mirror.incoming),
+                    departure,
+                    arrival,
+                });
+                movements.insert(mirror.outgoing, movement);
+                movements.insert(mirror.incoming, movement);
+            }
+            // The far half is settled, and `Recorded` names it as the row that
+            // records the movement. Only a row this pass questioned may be
+            // named that way: a row it never questioned was settled by
+            // something it cannot see, and «that row records this movement» is
+            // then a claim about a fact nobody here has read.
+            (true, false) if asked.contains_key(&mirror.incoming) => {
+                movements.insert(
+                    mirror.outgoing,
+                    OneMovement::Recorded {
+                        by: mirror.incoming,
+                    },
+                );
+            }
+            (false, true) if asked.contains_key(&mirror.outgoing) => {
+                movements.insert(
+                    mirror.incoming,
+                    OneMovement::Recorded {
+                        by: mirror.outgoing,
+                    },
+                );
+            }
+            (true, false) | (false, true) => {}
+            // Both answered. Each states the movement in the owner's own words
+            // and the deep pass decides which of the two records it; nothing
+            // here is published about either, because neither is work.
+            (false, false) => {}
+        }
+    }
+    // The sides no pair holds (`iaam-0evk`). Absence from the pairs published
+    // nothing, so a leg whose other half this document does not hold reached the
+    // owner among the ordinary rows with the ordinary alternatives — and both of
+    // the ordinary answers write a wrong fact for it.
+    let one_account = covers_one_account(observations);
+    for unpaired in reading.unpaired {
+        // Only the two the reason names, and only the first of them. An
+        // ambiguous row is **not** a row with no counterpart — this document
+        // holds more than one row that could be its other half and states
+        // nothing that chooses — so it is left as it was rather than told the
+        // opposite of the truth. Saying that to him is its own item and its own
+        // sentence, and it is not this one.
+        if unpaired.reason != Unpaired::NoCounterpart {
+            continue;
+        }
+        // Still his to answer. A row he has already answered is not work, and
+        // this says nothing a settled row needs.
+        if !open.contains(&unpaired.row) {
+            continue;
+        }
+        // And only where «money I moved to my own account» is a word the
+        // question admits. That is the whole harm: an answer naming a far
+        // account records a movement whose other half is not in the document,
+        // and the alternatives are what say whether he can give one. A question
+        // that offers no such word — an outflow that is either a fee or a
+        // payment, an inflow that is either income or a receipt — cannot produce
+        // the fact this warns about, and a clause on it would be a sentence
+        // about something that is not the case.
+        let Some(question) = questions
+            .iter()
+            .find(|question| question.row == unpaired.row)
+        else {
+            continue;
+        };
+        if !stored_alternatives(question)
+            .iter()
+            .any(|shape| shape.needs_account())
+        {
+            continue;
+        }
+        // And only where the **source** left the row leg-shaped. The
+        // alternatives alone were the gate until `iaam-y5ww` and they are far
+        // too wide: `Question::IsTransferInternal` admits an own-account answer
+        // and is raised for any row with a named counterparty and a stated
+        // direction, a card payment to a merchant the directory does not
+        // recognise included. On a one-account import nothing pairs, so nearly
+        // every open row was handed the paragraph — which contradicts what
+        // [`OneMovement::NoCounterpart`] says about itself.
+        let Some(observed) = rows.get(&unpaired.row) else {
+            continue;
+        };
+        if !leg_shaped(observed) {
+            continue;
+        }
+        movements.insert(
+            unpaired.row,
+            OneMovement::NoCounterpart(if one_account {
+                NoCounterpart::OneAccount
+            } else {
+                NoCounterpart::SeveralAccounts
+            }),
+        );
+    }
+    movements
+}
+
+/// Whether the source's own statement leaves this row the near half of a
+/// movement between two accounts (`iaam-y5ww`).
+///
+/// **Read off the source and not off the alternatives.** What a question admits
+/// says whether the owner *could* answer «money I moved to my own account»; it
+/// does not say the row looks like a leg. Three things a source can say do, and
+/// they are three separate fields of its own statement:
+///
+/// - it asserted the far side is one of the owner's own accounts;
+/// - it named no counterparty at all, so nothing on the row says the money went
+///   to anybody outside;
+/// - it used its own word for a movement internal to itself, which is what
+///   [`ObservedDirection::Inner`] transcribes.
+///
+/// A merchant printed by name beside a stated direction is **not** any of the
+/// three. It is the ordinary row, it is half of nothing this reading can see,
+/// and it has nothing to be told about.
+///
+/// The first arm fires on no row today, and it is written rather than left out:
+/// `classify` settles a row whose source asserted an own-account far side into
+/// `Classification::OwnAccountMovement` before any question is raised about it,
+/// so such a row reaches this function only if that ever stops being true. It is
+/// the strongest of the three and would be wrong to answer `false` for.
+fn leg_shaped(observed: &ObservedRow) -> bool {
+    observed.far_side.is_own_account()
+        || observed.counterparty_name().is_none()
+        || observed.direction == ObservedDirection::Inner
+}
+
+/// Whether every row of this session was printed on one account.
+///
+/// **Arithmetic over the rows and never a conclusion**, which is what lets the
+/// sentence built from it be narrow: counting the accounts the rows themselves
+/// name says how many statements this session was handed, and one is the case
+/// where the missing half is explained rather than merely reported.
+///
+/// **A row this build cannot read is an account, not nothing** (`iaam-y5ww`).
+/// Dropping it used to be called the safe direction, and it is the opposite:
+/// dropping rows *shrinks* the set, and a smaller set is what makes «every row
+/// of this session is on one account» come out — the **narrower** of the two
+/// sentences, and false the moment the row that was dropped was on a second
+/// account. So an unreadable row counts as an account this reading cannot name,
+/// and a session holding one is never a session of one account.
+fn covers_one_account(observations: &[ImportObservationView]) -> bool {
+    let mut accounts: BTreeSet<AccountId> = BTreeSet::new();
+    for observation in observations {
+        let Ok(intake) = parse_intake(&observation.payload) else {
+            return false;
+        };
+        accounts.insert(intake.account());
+    }
+    accounts.len() == 1
+}
+
+/// A row the owner has answered as a movement between two of his own accounts,
+/// as the mirror test reads it.
+///
+/// **The far side comes from his answer, which is the only named far side a
+/// caller without the session's reading has.** [`mirror_side`]'s first branch
+/// reads it off the `CashTransfer` such an answer resolves into, and the two
+/// cannot disagree: the transfer's far account *is* the account the answer
+/// named — `Answer::SentToOwnAccount`'s and `ReceivedFromOwnAccount`'s whole
+/// content.
+///
+/// Every other answer yields no side, which is [`mirror_side`]'s rule word for
+/// word: money that left the perimeter, income, a fee or a refund is a row his
+/// answer already said what it was, and a shape it happens to share with another
+/// row does not overrule it.
+fn answered_side(
+    row: u32,
+    observed: &ObservedRow,
+    question: &ImportQuestionView,
+) -> Option<MirrorSide> {
+    let answer: Answer = serde_json::from_str(question.answer.as_deref()?).ok()?;
+    let (direction, far_side) = match answer {
+        Answer::SentToOwnAccount { to } => (Movement::Out, to),
+        Answer::ReceivedFromOwnAccount { from } => (Movement::In, from),
+        Answer::Paid
+        | Answer::Received
+        | Answer::Fee { .. }
+        | Answer::Income { .. }
+        | Answer::Refund => return None,
+    };
+    Some(MirrorSide {
+        row,
+        account: observed.account,
+        direction,
+        amount_minor: observed.amount_minor.checked_abs().filter(|it| *it > 0)?,
+        currency: observed.currency,
+        date: observed.dates.effective_date()?,
+        far_side: Some(far_side),
+    })
+}
+
+/// One leg named by what its line printed.
+fn movement_leg(row: u32, observed: &ObservedRow) -> Option<MovementLeg> {
+    Some(MovementLeg {
+        row,
+        account: observed.account,
+        date: observed.dates.effective_date()?,
+        amount_minor: observed.amount_minor,
+        currency: observed.currency,
+    })
+}
+
 impl MirroredRows {
     /// The pair this row's question belongs to, if it belongs to one.
     fn pair_of(&self, row: u32) -> Option<MirroredPair> {
@@ -6255,7 +6950,7 @@ fn mirrored_rows(
         .filter_map(|read| mirror_side(read, open.contains(&read.row)))
         .collect();
     let mut paired = MirroredRows::default();
-    for mirror in mirrored(&sides) {
+    for mirror in mirrored(&sides).pairs {
         let outgoing_settled = !open.contains(&mirror.outgoing);
         let incoming_settled = !open.contains(&mirror.incoming);
         match (outgoing_settled, incoming_settled) {
@@ -6341,26 +7036,46 @@ fn mirror_side(read: &ReadRow, questioned: bool) -> Option<MirrorSide> {
             let Intake::Observed { row, .. } = read.intake.as_ref()? else {
                 return None;
             };
-            let direction = match row.movement() {
-                Some(movement) => movement,
-                None => match row.amount_minor.signum() {
-                    1 => Movement::In,
-                    -1 => Movement::Out,
-                    _ => return None,
-                },
-            };
-            Some(MirrorSide {
-                row: read.row,
-                account,
-                direction,
-                amount_minor: row.amount_minor.checked_abs().filter(|it| *it > 0)?,
-                currency: row.currency,
-                date,
-                far_side: None,
-            })
+            // The account and the day above are `ReadRow`'s readings of this
+            // same intake — `Intake::account` is `row.account` and
+            // `ReadRow::stated_day` is `row.dates.effective_date()` — so nothing
+            // is lost by letting the shared function read them off the row.
+            unanswered_side(read.row, row)
         }
         None => None,
     }
+}
+
+/// One row still waiting on the owner, as the mirror test reads it.
+///
+/// **Shared with [`mirrored_movements_of`] rather than spelled twice**
+/// (`iaam-lkvb`). The action queue pairs the same rows from the observations
+/// alone, and the one thing that must not differ between the two readings is
+/// what a row still waiting on him *is* — the sign read as a direction included.
+///
+/// The direction comes from the source's own direction word, and from the **sign
+/// it printed** where it used no word, which is the one place in this system
+/// that reads the sign as evidence. See [`mirror_side`] for why it is allowed
+/// to: a sign read wrongly can only fail to pair two rows or offer a pair the
+/// owner then refuses.
+fn unanswered_side(row: u32, observed: &ObservedRow) -> Option<MirrorSide> {
+    let direction = match observed.movement() {
+        Some(movement) => movement,
+        None => match observed.amount_minor.signum() {
+            1 => Movement::In,
+            -1 => Movement::Out,
+            _ => return None,
+        },
+    };
+    Some(MirrorSide {
+        row,
+        account: observed.account,
+        direction,
+        amount_minor: observed.amount_minor.checked_abs().filter(|it| *it > 0)?,
+        currency: observed.currency,
+        date: observed.dates.effective_date()?,
+        far_side: None,
+    })
 }
 
 /// The questions still waiting, each carrying what may be said to it and which
@@ -6462,6 +7177,7 @@ fn printed_row(directory: &AccountDirectory, row: &ObservedRow) -> PrintedRow {
         movement: row.movement(),
         counterparty: row.counterparty_name().map(str::to_owned),
         source_category: row.source_category.clone(),
+        owner_category: row.owner_category.clone(),
     }
 }
 
@@ -6538,10 +7254,16 @@ fn answer_accounts(directory: &AccountDirectory, open: &[OpenQuestion]) -> Vec<A
 /// none of whose rows this build can read is published not at all, because a
 /// group is a claim about what its members have in common and there is nothing to
 /// make the claim out of.
+///
+/// **`may_generalise` is a parameter and not a read** (`iaam-sh6m`). A decision
+/// group's sentence has to say what answering it keeps, and that depends on who
+/// is answering; the caller holds the principal and hands the one bit down,
+/// rather than this fold acquiring an authority of its own.
 fn row_groups(
     observations: &[ImportObservationView],
     open: &[OpenQuestion],
     directory: &AccountDirectory,
+    may_generalise: bool,
 ) -> Vec<RowGroup> {
     let mut sets: Vec<(GroupBasis, Vec<u32>)> = Vec::new();
     let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
@@ -6595,7 +7317,30 @@ fn row_groups(
         let amounts = common.currency.and_then(|_| amount_span(&members));
         let question = match basis {
             GroupBasis::OneDecision => {
-                decision_group_question(rows.len(), &common, days.as_ref(), amounts.as_ref())
+                // The group's prospect is the weakest of its members'. One
+                // answer covers every one of them, so a single member no rule
+                // could be built from is a member the answer settles and
+                // nothing more — and a sentence promising a standing rule to
+                // the set would be false of that one. Where they all ground a
+                // rule they ground the same kind of one, because what makes
+                // them a group is the question their rows raise.
+                let subjects: Vec<ClassificationSubject> =
+                    members.iter().map(|member| member.subject(None)).collect();
+                let ground = if subjects
+                    .iter()
+                    .all(|subject| matcher_from(subject).is_some())
+                {
+                    subjects.first()
+                } else {
+                    None
+                };
+                decision_group_question(
+                    rows.len(),
+                    &common,
+                    days.as_ref(),
+                    amounts.as_ref(),
+                    generalisation_ahead(ground, may_generalise),
+                )
             }
             GroupBasis::OneMovement => movement_group_question(&members, directory),
         };
@@ -6810,11 +7555,21 @@ fn group_mark(
 /// bead about a question published without them; a group that carried its own
 /// copy would be a fifth publisher of one stored list, which is the thing that
 /// bead's one reader exists to prevent.
+///
+/// **The persistence half is not written here either** (`iaam-sh6m`). How many
+/// of this session's lines one answer settles is the group's own fact and is
+/// stated below. Whether the answer also becomes a standing rule is not: it
+/// depends on the row and on who is answering, this sentence used to assert one
+/// of the three cases flatly — «no standing decision is kept» — and the queue
+/// asserted a different one about the same act. It is now
+/// [`GeneralisationProspect`], derived once and spoken here in the second
+/// person.
 fn decision_group_question(
     count: usize,
     common: &SharedRow,
     days: Option<&DaySpan>,
     amounts: Option<&AmountSpan>,
+    prospect: GeneralisationProspect,
 ) -> OwnerQuestion {
     let mark = group_mark(count, common, days, amounts);
     let ask = match (common.movement, common.counterparty.as_deref()) {
@@ -6845,14 +7600,14 @@ fn decision_group_question(
         ask,
         consequence: format!(
             "One answer here decides all {count} of these lines together instead of one at a \
-             time, and decides nothing outside them: no line of a later statement is settled by \
-             it and no standing decision is kept. Your statement says the same thing about every \
-             one of them, but only you know whether they were the same thing — answered as a \
-             group, a line that was something else is decided wrongly along with the rest, and \
-             the way to keep it out is to answer that one on its own first. Which figure of your \
-             money-flow report each line moves depends on the word you choose, and every one of \
-             these lines is published with the words that answer it and what each of them \
-             decides. Nothing is written until you commit this import."
+             time. {kept} Your statement says the same thing about every one of them, but only \
+             you know whether they were the same thing — answered as a group, a line that was \
+             something else is decided wrongly along with the rest, and the way to keep it out \
+             is to answer that one on its own first. Which figure of your money-flow report each \
+             line moves depends on the word you choose, and every one of these lines is \
+             published with the words that answer it and what each of them decides. Nothing is \
+             written until you commit this import.",
+            kept = prospect.addressed(),
         ),
     }
 }
@@ -6942,22 +7697,42 @@ fn movement_group_question(members: &[ObservedRow], directory: &AccountDirectory
 /// the list does not reorder itself between two readings of one session. Both
 /// lists are ordered that way, because a caller reads them together.
 fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offers {
-    let mut by_category: BTreeMap<String, Vec<(u32, RowShapeKey)>> = BTreeMap::new();
+    let mut by_category: BTreeMap<(FiledBy, String), Vec<(u32, RowShapeKey)>> = BTreeMap::new();
     for question in open {
         let Ok(row) = observed_row(observations, question.row) else {
             continue;
         };
-        let Some(category) = row.source_category.clone() else {
-            continue;
-        };
-        by_category
-            .entry(category)
-            .or_default()
-            .push((question.row, shape_key(&row)));
+        // Both words, and a row carrying both is counted under both. They are
+        // two conditions over two vocabularies, either of which he may prefer,
+        // and each offer covers exactly the open rows its own condition matches
+        // — so two offers overlapping is two ways to settle one set and not a
+        // claim made twice.
+        //
+        // **Adopting both is not free where they overlap** (`iaam-y5ww`).
+        // `classify` takes `max_by_key(version)` among matching rules and a
+        // version is per-owner increasing, so on a row both conditions match the
+        // rule he adopted **later** wins — silently, whichever of the two he
+        // meant to hold there. That costs nothing only while he answers the two
+        // the same way. A caller publishing both therefore owes the reader that
+        // sentence rather than presenting them as independent, and a caller that
+        // wants the overlap settled by a condition it can name adopts one of
+        // them and leaves the other.
+        for (filed_by, word) in [
+            (FiledBy::Source, row.source_category.clone()),
+            (FiledBy::Owner, row.owner_category.clone()),
+        ] {
+            let Some(word) = word else {
+                continue;
+            };
+            by_category
+                .entry((filed_by, word))
+                .or_default()
+                .push((question.row, shape_key(&row)));
+        }
     }
     let mut offered: Vec<OfferedRule> = Vec::new();
     let mut withheld: Vec<WithheldOffer> = Vec::new();
-    for (category, mut rows) in by_category {
+    for ((filed_by, category), mut rows) in by_category {
         rows.sort_unstable();
         let covers: Vec<u32> = rows.iter().map(|(row, _)| *row).collect();
         let mut shapes = shapes_of(&rows);
@@ -6980,41 +7755,64 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
             None
         };
         if let Some(contains) = sole {
+            // The word goes in the field that asks about the party who filed
+            // it. A condition carrying the owner's own word in the source's
+            // field would fire on rows the institution filed under it and he
+            // did not, which is the defect decision 0020 §2 took two words out
+            // of one slot to end.
+            let (source_category, owner_category) = match filed_by {
+                FiledBy::Source => (Some(category.clone()), None),
+                FiledBy::Owner => (None, Some(category.clone())),
+            };
             offered.push(OfferedRule {
-                question: offered_rule_question(&category, covers.len(), &contains),
+                question: offered_rule_question(filed_by, &category, covers.len(), &contains),
                 matcher: RuleMatcher {
                     counterparty_account: None,
                     description_contains: None,
                     kind: None,
-                    source_category: Some(category),
+                    source_category,
+                    owner_category,
+                    source_code: None,
                 },
                 covers,
                 contains,
             });
         } else {
             withheld.push(WithheldOffer {
-                reason: withheld_offer_reason(&category, &shapes),
-                source_category: category,
+                reason: withheld_offer_reason(filed_by, &category, &shapes),
+                filed_by,
+                filed_under: category,
                 covers,
                 contains: shapes,
             });
         }
     }
     offered.sort_by(|left, right| {
-        right.covers.len().cmp(&left.covers.len()).then_with(|| {
-            left.matcher
-                .source_category
-                .cmp(&right.matcher.source_category)
-        })
-    });
-    withheld.sort_by(|left, right| {
         right
             .covers
             .len()
             .cmp(&left.covers.len())
-            .then_with(|| left.source_category.cmp(&right.source_category))
+            .then_with(|| offered_ground(left).cmp(&offered_ground(right)))
+    });
+    withheld.sort_by(|left, right| {
+        right.covers.len().cmp(&left.covers.len()).then_with(|| {
+            (left.filed_by, &left.filed_under).cmp(&(right.filed_by, &right.filed_under))
+        })
     });
     Offers { offered, withheld }
+}
+
+/// The ground an offer is keyed by, read off the condition it publishes.
+///
+/// One reader, so the order two offers are listed in and the field a caller
+/// reads the word out of cannot come apart. [`OfferedRule`] keeps no ground of
+/// its own for exactly this reason: the matcher already says which word it asks
+/// about, and a second statement of it is a second answer that can disagree.
+fn offered_ground(offer: &OfferedRule) -> (FiledBy, Option<&String>) {
+    offer.matcher.owner_category.as_ref().map_or(
+        (FiledBy::Source, offer.matcher.source_category.as_ref()),
+        |word| (FiledBy::Owner, Some(word)),
+    )
 }
 
 /// What one word the source files by turned out to be worth, both ways.
@@ -7072,11 +7870,18 @@ fn shapes_of(rows: &[(u32, RowShapeKey)]) -> Vec<RowShape> {
 /// the rows themselves are published beside it, and a sentence that listed them
 /// would be a structure encoded as prose, which `docs/api/conventions.md` §5
 /// refuses and which is the defect one bead over (`iaam-pm4w`).
-fn withheld_offer_reason(category: &str, contains: &[RowShape]) -> String {
+fn withheld_offer_reason(filed_by: FiledBy, category: &str, contains: &[RowShape]) -> String {
     let shapes = contains.len();
     let covers: usize = contains.iter().map(|shape| shape.rows.len()).sum();
+    // Whose filing it was, said plainly. The word is a decision one party took,
+    // and telling him his statement filed rows he filed himself would hand his
+    // own decision back to him as the institution's.
+    let files = match filed_by {
+        FiledBy::Source => "Your statement files",
+        FiledBy::Owner => "You file",
+    };
     format!(
-        "Your statement files {covers} of the lines still waiting on you under «{category}», and \
+        "{files} {covers} of the lines still waiting on you under «{category}», and \
          they are not all the same thing: they fall into {shapes} groups by which way the money \
          went and whether the statement named anyone on the other side. One answer for the whole \
          word would be wrong for some of them and you would not be asked about those again, so \
@@ -7138,7 +7943,12 @@ fn withheld_offer_reason(category: &str, contains: &[RowShape]) -> String {
 /// rule stating it leaves every row of the group at
 /// `Question::UnresolvedDirection`. Naming it is the difference between an offer
 /// that keeps its promise and one that keeps four fifths of it in silence.
-fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> OwnerQuestion {
+fn offered_rule_question(
+    filed_by: FiledBy,
+    category: &str,
+    covers: usize,
+    contains: &RowShape,
+) -> OwnerQuestion {
     // The one thing about these rows the promise depends on. Every other
     // attribute they share is the same for all of them by construction, and this
     // one decides whether an answer finishes them or only classifies them.
@@ -7150,9 +7960,26 @@ fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> 
     } else {
         ""
     };
+    // Whose word it is, and it changes both halves. A word of the owner's own is
+    // a decision he already took, so the question is not «what did your bank
+    // mean by this» but «what you call this, what is it here» — and the
+    // sentence must not tell him his statement filed what he filed himself.
+    let (files, later) = match filed_by {
+        FiledBy::Source => (
+            "Your statement files",
+            "any later line filed under exactly «{category}», by whoever sends it, is settled the \
+             same way",
+        ),
+        FiledBy::Owner => (
+            "You file",
+            "any later line you file under exactly «{category}», at whichever institution, is \
+             settled the same way",
+        ),
+    };
+    let later = later.replace("{category}", category);
     OwnerQuestion {
         ask: format!(
-            "Your statement files {covers} of the lines still waiting on you under «{category}». \
+            "{files} {covers} of the lines still waiting on you under «{category}». \
              What is a line filed that way — money you spent, a charge the institution made, \
              money someone gave back, something your money earned, or money moving between \
              accounts of your own?"
@@ -7160,9 +7987,8 @@ fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> 
         consequence: format!(
             "One answer here settles all {covers} of them at once: they stop waiting on you and \
              are recorded as what you say they are, without being put to you one at a time. It \
-             does not stop at this statement, and it does not stop at this institution — any \
-             later line filed under exactly «{category}», by whoever sends it, is settled the \
-             same way without being put to you again. That is the risk as well as the saving: a \
+             does not stop at this statement, and it does not stop at this institution — {later} \
+             without being put to you again. That is the risk as well as the saving: a \
              word that also covers lines you would have decided differently files those wrongly, \
              and you will not be asked about them. Withdrawing the decision afterwards puts back \
              what it decided — lines still waiting in an import go back to being put to you, and \
@@ -7236,33 +8062,57 @@ fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> 
 /// classifier could **not** settle, so the field it proposes is one that had no
 /// standing rule on it.
 fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
-    let matcher = if let Some(counterparty) = row.counterparty_name() {
+    // Through the subject, because the subject is the shape the whole field
+    // policy below is written about and it is what `generalisation_ahead` holds.
+    // `ObservedRow::subject(None)` is the reading a rule is tested under — the
+    // counterparty stays the name the source printed — which is the same reading
+    // `subject_of` publishes and the same one this function has always taken.
+    matcher_from(&row.subject(None))
+}
+
+/// The same policy, asked of the row as the classifier sees it.
+///
+/// Split out so that «can a rule be built from this row at all» has one answer.
+/// [`generalisation_ahead`] needs exactly that question and holds a
+/// [`ClassificationSubject`] rather than an [`ObservedRow`]; a predicate of its
+/// own beside this would be a second statement of which fields ground a rule,
+/// and the two would drift the first time a fifth field is admitted.
+fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
+    let matcher = if let Counterparty::Named(counterparty) = &subject.counterparty {
         RuleMatcher {
-            counterparty_account: Some(counterparty.to_owned()),
+            counterparty_account: Some(counterparty.clone()),
             description_contains: None,
             kind: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
-    } else if let Some(kind) = row.source_kind.clone() {
+    } else if let Some(kind) = subject.source_kind.clone() {
         RuleMatcher {
             counterparty_account: None,
             description_contains: None,
             kind: Some(kind),
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
-    } else if let Some(category) = row.source_category.clone() {
+    } else if let Some(category) = subject.source_category.clone() {
         RuleMatcher {
             counterparty_account: None,
             description_contains: None,
             kind: None,
             source_category: Some(category),
+            owner_category: None,
+            source_code: None,
         }
     } else {
         RuleMatcher {
             counterparty_account: None,
-            description_contains: row.description.clone(),
+            description_contains: subject.description.clone(),
             kind: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
     };
     // Still the last word, and deliberately not replaced by one more branch
@@ -7408,7 +8258,15 @@ fn require_submit(principal: &Principal) -> Result<(), AppError> {
 /// It reads [`crate::ports::Scope::may_administer`] and not a gate of its own:
 /// this **is** the administer decision, arriving by another door, and a second
 /// predicate beside it would be a second place for the two to drift apart.
-fn may_generalise(principal: &Principal) -> bool {
+///
+/// **Public since `iaam-sh6m`,** because the queue must say what a caller's
+/// answer will keep and the authority is the caller's fact to supply: the route
+/// asks this one question of the principal it already holds and hands the answer
+/// to `frontier` as a `bool`. Exporting the predicate rather than letting a
+/// second surface read `may_administer` itself is what keeps the gate stated
+/// once.
+#[must_use]
+pub fn may_generalise(principal: &Principal) -> bool {
     principal.scope.may_administer()
 }
 
@@ -7593,6 +8451,8 @@ mod tests {
             far_side: FarSide::Unstated,
             source_kind: Some("transfer".to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             description: None,
             dates: OperationDates {
                 cash_posted: posted,
@@ -8152,6 +9012,8 @@ mod tests {
                 description_contains: None,
                 kind: None,
                 source_category: None,
+                owner_category: None,
+                source_code: None,
             },
             outcome: learned.classification(),
         };
@@ -8243,6 +9105,8 @@ mod tests {
                     description_contains: None,
                     kind: None,
                     source_category: None,
+                    owner_category: None,
+                    source_code: None,
                 },
                 outcome: Classification::Fee {
                     origin: FeeOrigin::AccountMaintenance,
@@ -8674,6 +9538,338 @@ mod tests {
         );
     }
 
+    /// The same pair, read by a caller that has not loaded the session.
+    ///
+    /// This is what the action queue holds: the session's observations and its
+    /// stored questions, and no reading of the owner's directory or his rules.
+    /// The two legs must come out as one decision there too, or the queue
+    /// publishes the two rows as two items and an agent answers both — which is
+    /// the movement recorded twice that decision 0031 exists to prevent.
+    #[test]
+    fn the_two_legs_are_one_decision_to_a_caller_holding_only_the_questions() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
+        let questions = vec![
+            stored_question_about(1, &Question::IsOutflowAFee { account: main }),
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+
+        let movements = mirrored_movements_of(session, &observations, &questions);
+        let OneMovement::Waiting(pair) = movements[&1] else {
+            panic!("the departure is one leg of a movement still waiting: {movements:?}")
+        };
+        assert_eq!(movements[&2], OneMovement::Waiting(pair));
+        assert_eq!(
+            pair.id,
+            pair_identity(session, 1, 2),
+            "and under the identifier the assessment publishes, so the two \
+             surfaces name one decision"
+        );
+        assert_eq!((pair.departure.row, pair.arrival.row), (1, 2));
+        assert_eq!(
+            (pair.departure.amount_minor, pair.arrival.amount_minor),
+            (departure.amount_minor, arrival.amount_minor),
+            "each leg carries the amount its own line printed, sign included"
+        );
+    }
+
+    /// One leg answered leaves the other with nothing of its own to record.
+    ///
+    /// The far side comes out of the answer rather than out of a reading: it is
+    /// the account he named, and it is what makes the queue stop asking about
+    /// the second row instead of asking him to record the movement again.
+    #[test]
+    fn an_answered_leg_leaves_the_other_recording_nothing_of_its_own() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
+        let mut answered = stored_question_about(1, &Question::IsOutflowAFee { account: main });
+        answered.answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        answered.answer = Some(
+            serde_json::to_string(&Answer::SentToOwnAccount { to: savings }).expect("an answer"),
+        );
+        let questions = vec![
+            answered,
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+
+        let movements = mirrored_movements_of(session, &observations, &questions);
+        assert_eq!(movements.get(&2), Some(&OneMovement::Recorded { by: 1 }));
+        assert!(
+            !movements.contains_key(&1),
+            "the row he answered records the movement and is not published as \
+             half of anything: {movements:?}"
+        );
+    }
+
+    /// «No, these are two different things» leaves two rows and two questions.
+    ///
+    /// The refusal `iaam_ingest::mirror` insists on, at this surface: an answer
+    /// naming no account of his own says the row was something else, and a shape
+    /// two rows happen to share does not overrule it.
+    #[test]
+    fn an_answer_naming_no_own_account_pairs_nothing_for_the_queue() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
+        let mut answered = stored_question_about(1, &Question::IsOutflowAFee { account: main });
+        answered.answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        answered.answer = Some(serde_json::to_string(&Answer::Paid).expect("an answer"));
+        let questions = vec![
+            answered,
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+
+        // The property the emptiness rests on, stated rather than relied on.
+        // `is_empty` holds for any reason at all, and the reason here is meant
+        // to be «no pair»: the arrival's own question offers no own-account
+        // word, so the other thing this function publishes about a lone row —
+        // the sentence that this document holds no counterpart for it — is not
+        // due about it either, and the map is empty for the one reason the test
+        // is named for.
+        assert!(
+            !Question::IsInflowIncome { account: savings }
+                .alternatives()
+                .iter()
+                .any(|shape| shape.needs_account()),
+            "the fixture's arrival admits an own-account answer, so an empty map \
+             would no longer mean «no pair»"
+        );
+        assert!(
+            mirrored_movements_of(session, &observations, &questions).is_empty(),
+            "the arrival is still a row with a question of its own"
+        );
+    }
+
+    /// A merchant beside a direction is not the near half of anything
+    /// (`iaam-y5ww`).
+    ///
+    /// The gate used to be «the question admits an own-account answer», and
+    /// [`Question::IsTransferInternal`] admits one — it is raised for any row
+    /// with a named counterparty and a stated direction, a card payment
+    /// included. On a one-account import nothing pairs, so nearly every open
+    /// row was handed the paragraph about a counterpart the document does not
+    /// hold. A card payment is not the near half of anything and has nothing to
+    /// be told about.
+    #[test]
+    fn a_merchant_row_the_source_stated_a_direction_for_is_not_a_leg() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let observations = vec![stored_row(
+            1,
+            &row(main, "Shop One", Some(date!(2025 - 04 - 10))),
+        )];
+        let questions = vec![stored_question_about(
+            1,
+            &Question::IsTransferInternal {
+                account: main,
+                counterparty: "Shop One".to_owned(),
+            },
+        )];
+
+        assert!(
+            mirrored_movements_of(session, &observations, &questions).is_empty(),
+            "an ordinary payment to a named merchant is told this document holds \
+             no counterpart for it"
+        );
+    }
+
+    /// The three shapes that *are* a leg still say so.
+    ///
+    /// The companion to the test above, and it is what keeps that one from
+    /// passing by the whole publication being deleted: each of the three things
+    /// a source can say that leaves a row leg-shaped is a row that gets the
+    /// sentence.
+    #[test]
+    fn what_the_source_says_about_a_leg_is_what_publishes_the_sentence() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let day = date!(2025 - 04 - 10);
+        // Named nobody at all.
+        let mut nameless = row(main, "Shop One", Some(day));
+        nameless.counterparty = ObservedCounterparty::Unknown;
+        // The source's own word for a movement internal to itself.
+        let inner = directionless(row(main, "Shop One", Some(day)));
+        // The source asserting the far side is one of his own accounts.
+        let mut asserted = row(main, "Shop One", Some(day));
+        asserted.far_side = FarSide::OwnAccount;
+
+        for (what, observed) in [
+            ("a row the source named nobody on", nameless),
+            ("a row the source called internal to itself", inner),
+            ("a row the source said runs to his own account", asserted),
+        ] {
+            let observations = vec![stored_row(1, &observed)];
+            let questions = vec![stored_question_about(
+                1,
+                &Question::UnresolvedDirection {
+                    account: main,
+                    stated: observed.source_kind.clone(),
+                    counterparty: observed.counterparty_name().map(str::to_owned),
+                },
+            )];
+            assert_eq!(
+                mirrored_movements_of(session, &observations, &questions).get(&1),
+                Some(&OneMovement::NoCounterpart(NoCounterpart::OneAccount)),
+                "{what} is not told this document holds no counterpart for it"
+            );
+        }
+    }
+
+    /// The queue weighs every row of the session, not only the questioned ones
+    /// (`iaam-y5ww`).
+    ///
+    /// `mirrored`'s ambiguity refusal is a function of the whole side set, so
+    /// two passes handed different sets disagree about the same two rows. An
+    /// open departure, an open arrival, and a third arrival of the same amount
+    /// on the same day that something already settled: the deep pass saw three
+    /// sides, found two candidate counterparts and refused; the queue saw two,
+    /// paired them, published one item saying the other row raises none of its
+    /// own, and suppressed it. That is a pairing one surface asserts and the
+    /// other denies, with an open question hidden behind it.
+    #[test]
+    fn a_settled_third_side_makes_the_queue_refuse_what_the_assessment_refuses() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let reserve = account(3);
+        let (departure, arrival) = two_legs(main, savings);
+        // The same arrival on a third account, settled by something the queue
+        // cannot see — here the owner's own answer on a row that raised no
+        // question of its own, which is what a rule or his directory does.
+        let mut elsewhere = arrival.clone();
+        elsewhere.account = reserve;
+        let observations = vec![
+            stored_row(1, &departure),
+            stored_row(2, &arrival),
+            stored_row(3, &elsewhere),
+        ];
+        let questions = vec![
+            stored_question_about(1, &Question::IsOutflowAFee { account: main }),
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+
+        let rows = vec![
+            read_row(1, &departure, None),
+            read_row(2, &arrival, None),
+            read_row(
+                3,
+                &elsewhere,
+                Some(Answer::ReceivedFromOwnAccount { from: main }),
+            ),
+        ];
+        let mirrors = mirrored_rows(session, &rows, &questions);
+        assert!(
+            mirrors.open.is_empty() && mirrors.settled.is_empty(),
+            "the fixture is meant to be one the assessment refuses to pair: {mirrors:?}"
+        );
+
+        assert!(
+            mirrored_movements_of(session, &observations, &questions).is_empty(),
+            "the queue pairs two rows the assessment refuses to pair, and hides \
+             the arrival's own open question behind the pairing"
+        );
+    }
+
+    /// A row this build cannot read is an account, not nothing (`iaam-y5ww`).
+    ///
+    /// Dropping it shrinks the set of accounts the session covers, which makes
+    /// «every row of this session is on one account» *more* likely — the
+    /// narrower of the two sentences, and false wherever the row it dropped was
+    /// on a second account.
+    #[test]
+    fn a_row_this_build_cannot_read_is_not_a_session_of_one_account() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let (departure, _) = two_legs(main, savings);
+        let unreadable = ImportObservationView {
+            row: 2,
+            row_key: None,
+            concluded: false,
+            payload: "{".to_owned(),
+            answer: None,
+        };
+        let observations = vec![stored_row(1, &departure), unreadable];
+        let questions = vec![stored_question_about(
+            1,
+            &Question::UnresolvedDirection {
+                account: main,
+                stated: departure.source_kind.clone(),
+                counterparty: None,
+            },
+        )];
+
+        assert_eq!(
+            mirrored_movements_of(session, &observations, &questions).get(&1),
+            Some(&OneMovement::NoCounterpart(NoCounterpart::SeveralAccounts)),
+            "a session holding a row nobody can read is told every row of it is \
+             on one account"
+        );
+    }
+
+    /// The sentence does not deny a row an earlier pairing spent (`iaam-y5ww`).
+    ///
+    /// [`why_unpaired`] classifies the leftover of several identical sides as
+    /// [`Unpaired::NoCounterpart`], and in that case a row of the document
+    /// **is** the opposite half of this one — it was spent on an earlier
+    /// pairing. A sentence saying no row of the document is that half denies a
+    /// row the document printed.
+    #[test]
+    fn the_no_counterpart_sentence_does_not_deny_a_row_an_earlier_pairing_spent() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let day = date!(2025 - 04 - 10);
+        // Two identical departures on one account and one arrival on the other,
+        // each printed under the source's own word for a movement internal to
+        // itself and naming nobody. The pairing spends the arrival on the first
+        // departure; the second is the leftover this sentence is about.
+        let departure = anonymous(directionless(row(main, "Anything", Some(day))), -1_000);
+        let arrival = anonymous(directionless(row(savings, "Anything", Some(day))), 1_000);
+        let observations = vec![
+            stored_row(1, &departure),
+            stored_row(2, &departure),
+            stored_row(3, &arrival),
+        ];
+        let asked = |account| Question::UnresolvedDirection {
+            account,
+            stated: Some("INNER".to_owned()),
+            counterparty: None,
+        };
+        let questions = vec![
+            stored_question_about(1, &asked(main)),
+            stored_question_about(2, &asked(main)),
+            stored_question_about(3, &asked(savings)),
+        ];
+        let movements = mirrored_movements_of(session, &observations, &questions);
+        assert_eq!(
+            movements.get(&2),
+            Some(&OneMovement::NoCounterpart(NoCounterpart::SeveralAccounts)),
+            "the second departure is the leftover of two identical sides: {movements:?}"
+        );
+
+        let said = NoCounterpart::SeveralAccounts.reported();
+        assert!(
+            !said.contains("is the opposite half of the same amount on the same day"),
+            "the arrival on the other account *is* the opposite half of this row; \
+             what the document does not hold is a second one still free to be \
+             it: {said}"
+        );
+        assert!(
+            said.contains("available"),
+            "the sentence says what `Unpaired::NoCounterpart` means — no row of \
+             this document is available to be its other half: {said}"
+        );
+    }
+
     /// A pair identifier is a function of the session and the two rows.
     ///
     /// Not a minted value: the assessment's revision stamp is computed over the
@@ -8800,6 +9996,118 @@ mod tests {
         observed
     }
 
+    /// The same row, with the word the **owner himself** filed it under there.
+    fn owner_filed_under(mut observed: ObservedRow, category: &str) -> ObservedRow {
+        observed.owner_category = Some(category.to_owned());
+        observed
+    }
+
+    /// The word the owner himself filed rows under grounds an offer of its own,
+    /// asked once for the word rather than once for each row carrying it.
+    ///
+    /// **This is the worst question this system asks, and this is its end.** The
+    /// category is his decision, already made and recorded at his institution;
+    /// the export prints it back on every row he took it on; and until the
+    /// profile read the column he was asked, once per row, for what he had
+    /// already told his bank. One question per distinct value is the reach one
+    /// answer already has over a set — a handful of questions where there were
+    /// as many as there are rows.
+    ///
+    /// **The offer is on his word and the bank's word both**, because they are
+    /// two different conditions over two different vocabularies and either may
+    /// be the one he wants. Each offer covers exactly the open rows its own
+    /// condition matches, which is what makes the two comparable rather than
+    /// rivalrous.
+    #[test]
+    fn the_word_the_owner_filed_rows_under_is_offered_once_for_the_word() {
+        let main = account(1);
+        let observations = vec![
+            stored_row(
+                1,
+                &owner_filed_under(
+                    filed_under(row(main, "Shop One", None), "Groceries"),
+                    "Mine",
+                ),
+            ),
+            stored_row(
+                2,
+                &owner_filed_under(
+                    filed_under(row(main, "Shop Two", None), "Groceries"),
+                    "Mine",
+                ),
+            ),
+            stored_row(
+                3,
+                &owner_filed_under(
+                    filed_under(row(main, "Shop Three", None), "Groceries"),
+                    "Ours",
+                ),
+            ),
+        ];
+        let open: Vec<OpenQuestion> = (1..=3).map(open_about).collect();
+        let offered = offers(&observations, &open).offered;
+
+        // Three rows, one word of the bank's and two of his: three offers and
+        // never three questions per row.
+        let his: Vec<&OfferedRule> = offered
+            .iter()
+            .filter(|offer| offer.matcher.owner_category.is_some())
+            .collect();
+        assert_eq!(his.len(), 2, "one offer per word of his: {offered:?}");
+        assert_eq!(his[0].matcher.owner_category.as_deref(), Some("Mine"));
+        assert_eq!(his[0].covers, vec![1, 2]);
+        assert_eq!(
+            his[0].matcher.source_category, None,
+            "his word is not the bank's word and the condition says which it asks about"
+        );
+        assert_eq!(his[1].matcher.owner_category.as_deref(), Some("Ours"));
+        assert_eq!(his[1].covers, vec![3]);
+
+        // And the bank's own word still grounds its own offer beside them.
+        let theirs: Vec<&OfferedRule> = offered
+            .iter()
+            .filter(|offer| offer.matcher.source_category.is_some())
+            .collect();
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].covers, vec![1, 2, 3]);
+
+        // The question is put in his register and quotes his own word, because
+        // it is his: asking him what his bank called it would be asking him
+        // about a word he did not choose.
+        assert!(his[0].question.ask.contains("«Mine»"), "{:?}", his[0]);
+    }
+
+    /// A word of his whose rows are not one thing is withheld, and the withheld
+    /// entry says whose word it was.
+    ///
+    /// Without that, a caller shows him «your statement files these under
+    /// «Mine»» — which is false twice over: the statement did not file them, he
+    /// did, and the sentence would hand his own decision back to him as the
+    /// bank's.
+    #[test]
+    fn a_word_of_his_whose_rows_disagree_is_withheld_and_named_as_his() {
+        let main = account(1);
+        let mut arrived = row(main, "Someone", None);
+        arrived.direction = ObservedDirection::In;
+        arrived.amount_minor = 1_000;
+        let observations = vec![
+            stored_row(1, &owner_filed_under(row(main, "Shop One", None), "Mine")),
+            stored_row(2, &owner_filed_under(arrived, "Mine")),
+        ];
+        let offers = offers(&observations, &[open_about(1), open_about(2)]);
+        assert!(offers.offered.is_empty(), "{:?}", offers.offered);
+        assert_eq!(offers.withheld.len(), 1);
+        let withheld = &offers.withheld[0];
+        assert_eq!(withheld.filed_under, "Mine");
+        assert_eq!(withheld.filed_by, FiledBy::Owner);
+        assert_eq!(withheld.covers, vec![1, 2]);
+        assert!(
+            withheld.reason.contains("You file"),
+            "the sentence says it was his own filing: {}",
+            withheld.reason
+        );
+    }
+
     /// A statement's own categories are offered once each, whatever the parties.
     ///
     /// The complaint this answers: a first import asks about every row, two
@@ -8904,7 +10212,12 @@ mod tests {
     /// and another rather than that the decision is his.
     #[test]
     fn an_offer_is_worded_for_a_person_and_says_what_his_answer_changes() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::Out), true),
+        );
         for internal in [
             "source_category",
             "matcher",
@@ -8947,7 +10260,12 @@ mod tests {
     /// actually deciding.
     #[test]
     fn an_offer_says_the_decision_is_not_held_to_the_institution_that_sent_the_lines() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::Out), true),
+        );
         assert!(
             !question.consequence.contains("the same institution"),
             "which is what it used to promise and is not what the rule does: {}",
@@ -8969,7 +10287,12 @@ mod tests {
     /// skip the warning that matters.
     #[test]
     fn an_offer_on_lines_that_state_a_direction_carries_no_caveat_about_direction() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::Out), true),
+        );
         assert!(
             !question.consequence.contains("which way the money went"),
             "these lines say which way, so nothing about direction is open: {}",
@@ -8986,7 +10309,8 @@ mod tests {
     /// outcomes the offer names decide a direction themselves.
     #[test]
     fn an_offer_on_lines_that_state_no_direction_says_which_answer_does_not_finish_them() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(None, false));
+        let question =
+            offered_rule_question(FiledBy::Source, "Groceries", 3, &shape_of(None, false));
         assert!(
             question.consequence.contains("which way the money went"),
             "the lines do not say, and that decides whether the offer keeps its \
@@ -9011,7 +10335,12 @@ mod tests {
     /// read alone invites him to expect the rows to move whatever he says.
     #[test]
     fn an_offer_says_a_wrong_answer_settles_none_of_the_lines_rather_than_some() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::In), false));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::In), false),
+        );
         assert!(
             question.consequence.contains("settles none of them"),
             "all or none, never some: {}",
@@ -9050,7 +10379,8 @@ mod tests {
             offers.offered
         );
         let withheld = &offers.withheld[0];
-        assert_eq!(withheld.source_category, "Transfer");
+        assert_eq!(withheld.filed_under, "Transfer");
+        assert_eq!(withheld.filed_by, FiledBy::Source);
         assert_eq!(withheld.covers, vec![1, 2, 3]);
         assert_eq!(withheld.contains.len(), 2, "{:?}", withheld.contains);
         assert_eq!(
@@ -9163,6 +10493,7 @@ mod tests {
     #[test]
     fn an_offer_withheld_says_why_without_a_word_of_ours() {
         let reason = withheld_offer_reason(
+            FiledBy::Source,
             "Transfer",
             &[
                 RowShape {
@@ -9214,7 +10545,10 @@ mod tests {
         };
         let observations = vec![stored_row(
             1,
-            &filed_under(row(main, "Shop One", Some(day)), "Transfer"),
+            &owner_filed_under(
+                filed_under(row(main, "Shop One", Some(day)), "Transfer"),
+                "Mine",
+            ),
         )];
         let questions = vec![stored_question_about(1, &asked)];
         let open = open_questions(
@@ -9234,6 +10568,11 @@ mod tests {
         assert_eq!(printed.movement, Some(Movement::Out));
         assert_eq!(printed.counterparty.as_deref(), Some("Shop One"));
         assert_eq!(printed.source_category.as_deref(), Some("Transfer"));
+        // Both words, because both ground a group: a caller reading an offer or
+        // a withheld entry keyed on the owner's own word can see which open row
+        // carries it without joining two lists by row number, exactly as it can
+        // for the institution's.
+        assert_eq!(printed.owner_category.as_deref(), Some("Mine"));
     }
 
     /// A row the source stated no direction for says so, and does not guess.
@@ -9540,6 +10879,8 @@ mod tests {
                 description_contains: None,
                 kind: None,
                 source_category: Some(category.to_owned()),
+                owner_category: None,
+                source_code: None,
             },
             outcome: Classification::ExternalFlow,
         }
@@ -10213,6 +11554,44 @@ mod tests {
         assert_eq!(proposed.kind, None);
     }
 
+    /// What an answer will keep, before anyone has answered (`iaam-sh6m`).
+    ///
+    /// The three cases the queue and the assessment used each to assert one of,
+    /// flatly, in two sentences that contradicted each other. The last is the
+    /// one no authority changes, and the one a test of the enum alone would miss:
+    /// a row this build reads perfectly well and that still grounds nothing.
+    #[test]
+    fn what_an_answer_will_keep_is_read_off_the_row_and_the_authority() {
+        let grounded = row(account(1), "Shop One", None).subject(None);
+        assert_eq!(
+            generalisation_ahead(Some(&grounded), true),
+            GeneralisationProspect::WillStand
+        );
+        assert_eq!(
+            generalisation_ahead(Some(&grounded), false),
+            GeneralisationProspect::NeedsHisAdoption,
+            "the row would ground one; the answerer may not write it"
+        );
+
+        // Read, and still nothing to build a standing decision from — so no
+        // token makes this one stand.
+        let bare = unmatchable(account(1)).subject(None);
+        for authority in [true, false] {
+            assert_eq!(
+                generalisation_ahead(Some(&bare), authority),
+                GeneralisationProspect::NoneFromThisRow,
+                "a row that asks nothing grounds nothing under any token"
+            );
+        }
+
+        // And the row this build cannot read at all, which is the absence
+        // `subject_of` publishes.
+        assert_eq!(
+            generalisation_ahead(None, true),
+            GeneralisationProspect::NoneFromThisRow
+        );
+    }
+
     /// The one row that still generalises into nothing, unchanged by the field
     /// policy above: a matcher that asks nothing matches nothing.
     #[test]
@@ -10310,6 +11689,8 @@ mod tests {
                     description_contains: None,
                     kind: None,
                     source_category: None,
+                    owner_category: None,
+                    source_code: None,
                 },
                 outcome: Classification::ExternalFlow,
             }
@@ -10412,6 +11793,7 @@ mod tests {
             &one_party_three_times(main),
             &three_alike(),
             &held(vec![detail(main, "Main")]),
+            true,
         );
         assert_eq!(groups.len(), 1, "one decision is one group: {groups:?}");
         let group = &groups[0];
@@ -10473,7 +11855,7 @@ mod tests {
         let directory = held(vec![detail(main, "Main")]);
 
         let agreeing = vec![stored_row(1, &one), stored_row(2, &two)];
-        let groups = row_groups(&agreeing, &open, &directory);
+        let groups = row_groups(&agreeing, &open, &directory, true);
         assert_eq!(
             groups[0].common.description.as_deref(),
             Some(printed),
@@ -10487,7 +11869,7 @@ mod tests {
 
         two.description = Some("Something else the statement printed".to_owned());
         let differing = vec![stored_row(1, &one), stored_row(2, &two)];
-        let groups = row_groups(&differing, &open, &directory);
+        let groups = row_groups(&differing, &open, &directory, true);
         assert_eq!(
             groups[0].common.description, None,
             "a text one member does not carry is that member's and not the group's"
@@ -10505,14 +11887,15 @@ mod tests {
         let observations = vec![stored_row(1, &row(main, "Shop One", None))];
         let directory = held(vec![detail(main, "Main")]);
         assert!(
-            row_groups(&observations, &[open_about(1)], &directory).is_empty(),
+            row_groups(&observations, &[open_about(1)], &directory, true).is_empty(),
             "a question nothing else is alike to is published as itself"
         );
         assert!(
             row_groups(
                 &observations,
                 &[open_paired(1, Uuid::from_bytes([7; 16]), 2)],
-                &directory
+                &directory,
+                true
             )
             .is_empty(),
             "and a movement whose other leg an answer already settled is one \
@@ -10550,6 +11933,7 @@ mod tests {
             &observations,
             &open,
             &held(vec![detail(main, "Main"), detail(savings, "Savings")]),
+            true,
         );
         assert_eq!(groups.len(), 2, "{groups:?}");
         let decision = groups
@@ -10601,6 +11985,7 @@ mod tests {
             &one_party_three_times(main),
             &three_alike(),
             &held(vec![detail(main, "Main")]),
+            true,
         );
         let question = &groups[0].question;
         for internal in [
@@ -10651,7 +12036,12 @@ mod tests {
         two.currency = CurrencyCode::Usd;
         let observations = vec![stored_row(1, &one), stored_row(2, &two)];
         let open = vec![open_alike(1, vec![2]), open_alike(2, vec![1])];
-        let groups = row_groups(&observations, &open, &held(vec![detail(main, "Main")]));
+        let groups = row_groups(
+            &observations,
+            &open,
+            &held(vec![detail(main, "Main")]),
+            true,
+        );
         assert_eq!(groups[0].common.currency, None);
         assert_eq!(
             groups[0].amounts, None,
@@ -10676,7 +12066,7 @@ mod tests {
         known.institution = Some("Institution One".to_owned());
         let observations = one_party_three_times(main);
         let open = three_alike();
-        let groups = row_groups(&observations, &open, &held(vec![known]));
+        let groups = row_groups(&observations, &open, &held(vec![known]), true);
         let named = groups[0]
             .common
             .account
@@ -10686,7 +12076,7 @@ mod tests {
         assert_eq!(named.title, "Main");
         assert_eq!(named.institution.as_deref(), Some("Institution One"));
 
-        let stranger = row_groups(&observations, &open, &held(Vec::new()));
+        let stranger = row_groups(&observations, &open, &held(Vec::new()), true);
         assert_eq!(
             stranger[0].common.account, None,
             "an identifier this instance cannot put a title on is not something \
@@ -10733,7 +12123,13 @@ mod tests {
             "the word is still worth one condition"
         );
         assert!(
-            row_groups(&observations, &open, &held(vec![detail(main, "Main")])).is_empty(),
+            row_groups(
+                &observations,
+                &open,
+                &held(vec![detail(main, "Main")]),
+                true
+            )
+            .is_empty(),
             "and it is not a group: no one answer settles two parties"
         );
     }
@@ -10752,7 +12148,12 @@ mod tests {
         let mut open = three_alike();
         open.push(open_alike(4, vec![5]));
         open.push(open_alike(5, vec![4]));
-        let groups = row_groups(&observations, &open, &held(vec![detail(main, "Main")]));
+        let groups = row_groups(
+            &observations,
+            &open,
+            &held(vec![detail(main, "Main")]),
+            true,
+        );
         assert_eq!(groups.len(), 2, "{groups:?}");
         assert_eq!(groups[0].rows, vec![1, 2, 3]);
         assert_eq!(groups[1].rows, vec![4, 5]);
@@ -10769,7 +12170,15 @@ mod tests {
         let main = account(1);
         let observations = vec![stored_row(1, &row(main, "Shop One", None))];
         let open = vec![open_alike(1, vec![2]), open_alike(2, vec![1])];
-        assert!(row_groups(&observations, &open, &held(vec![detail(main, "Main")])).is_empty());
+        assert!(
+            row_groups(
+                &observations,
+                &open,
+                &held(vec![detail(main, "Main")]),
+                true
+            )
+            .is_empty()
+        );
     }
 }
 
@@ -10815,6 +12224,8 @@ mod recorded_identities {
             idempotency_key: idempotency_key.map(str::to_owned),
             source_operation_id: source_operation_id.map(str::to_owned),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             source_kind: None,
             description: None,
         };

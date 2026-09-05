@@ -36,6 +36,19 @@
 //! everything *including* the two accounts are a different case and are matched
 //! one-to-one, because whichever way they are matched the facts come out the
 //! same — see [`mirrored`].
+//!
+//! **A side that pairs with nothing is reported, and the two ways it can fail
+//! to pair are two sentences** (`iaam-0evk`). The pairs alone said nothing about
+//! the rows left out of them, and a caller cannot recover the difference: a
+//! departure whose arrival this document does not hold looks, from a list of
+//! pairs, exactly like a card payment that was never a side of anything. So the
+//! reading names them — [`Unpaired::NoCounterpart`] for a row this document
+//! holds no other half for, [`Unpaired::Ambiguous`] for the refusal above — and
+//! the first of the two is «not in **this** document» and never «nowhere». This
+//! module reads one document by construction, a movement between two accounts
+//! prints its halves on two accounts, and the far half may be in a statement
+//! nobody has brought here or on an account the owner never named. Denying it
+//! would be the same fabrication as picking a partner.
 
 use iaam_core::ids::AccountId;
 use iaam_core::money::CurrencyCode;
@@ -161,6 +174,72 @@ impl Mirror {
     }
 }
 
+/// What one reading of a document's rows made of every one of them.
+///
+/// **The pairs and the sides that found none, because absence published nowhere
+/// is a fact this module knows and nobody else can recover** (`iaam-0evk`). A
+/// side left out of [`Self::pairs`] used to be indistinguishable, at every
+/// surface downstream, from a row that was never leg-shaped at all — so a
+/// departure whose arrival this document does not hold was offered the ordinary
+/// alternatives, and both of the ordinary answers are wrong for it: naming a far
+/// account records a movement whose other half is not there, and «I paid
+/// somebody» files a movement between the owner's own accounts as spending.
+///
+/// Returned together from one pass rather than computed twice, for the reason
+/// the caller's own pairing is derived and never stored: two answers to «is this
+/// row half of anything» can disagree, and the one place they would disagree is
+/// the row nobody paired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mirroring {
+    /// The rows this reading concluded are two sights of one movement.
+    pub pairs: Vec<Mirror>,
+    /// The sides it left in no pair, each with which of the two that is, in row
+    /// order.
+    pub unpaired: Vec<UnpairedSide>,
+}
+
+/// One side no pair of this reading holds, and why it holds none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnpairedSide {
+    /// The row's number within its session, which is what the caller acts on.
+    pub row: u32,
+    pub reason: Unpaired,
+}
+
+/// Why a side of this document is in no pair.
+///
+/// **Two values, and folding them into one word would publish the wrong thing
+/// about both.** They are opposites: one says this document holds nothing that
+/// could be the other half, the other says it holds more than one and states
+/// nothing that chooses. A caller that told the owner «there is no counterpart
+/// here» about an ambiguous row would be denying rows the document printed; one
+/// that told him «this could not be decided» about a lone row would send him
+/// looking through a statement for something that is not in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unpaired {
+    /// No row of this document is available to be the other half of this one.
+    ///
+    /// Two situations and they are one fact about the row. Nothing in the
+    /// document mirrors it at all; or everything that does is already the other
+    /// half of another movement — one arrival cannot be the far half of two
+    /// departures, so the departure left over is a departure whose counterpart
+    /// this document does not hold.
+    ///
+    /// **It is «not in this document» and never «nowhere».** This module reads
+    /// one document by construction, and a movement between two accounts prints
+    /// its halves on two accounts: the far half may sit in a statement nobody
+    /// has brought here, or on an account the owner never put in his directory.
+    /// Neither is visible from here, and neither is denied.
+    NoCounterpart,
+    /// More than one row could be the other half, and the document states
+    /// nothing that chooses between them.
+    ///
+    /// [`mirrored`]'s existing refusal, reported rather than made silent. The
+    /// doubt belongs to the pair and not to whichever side is read first, so a
+    /// row whose only candidate is itself undecidable is undecidable too.
+    Ambiguous,
+}
+
 /// Pair the rows of one document that are one movement seen twice.
 ///
 /// Two sides mirror each other when they are on two different accounts, agree
@@ -189,7 +268,7 @@ impl Mirror {
 /// either side keeps its own fact. Refusing them would double-count exactly the
 /// document that stated itself most completely.
 #[must_use]
-pub fn mirrored(sides: &[MirrorSide]) -> Vec<Mirror> {
+pub fn mirrored(sides: &[MirrorSide]) -> Mirroring {
     let mut pairs = Vec::new();
     for outgoing in sides.iter().filter(|side| side.direction == Movement::Out) {
         // The accounts this side could have moved to. More than one and it is
@@ -235,7 +314,52 @@ pub fn mirrored(sides: &[MirrorSide]) -> Vec<Mirror> {
             evidence: evidence(outgoing, incoming),
         });
     }
-    matched
+    // Every side no pair holds, in row order, each with which of the two
+    // reasons it is. Read off the same pass rather than recomputed by a caller:
+    // the taken sets above *are* the answer to «did this row find a partner»,
+    // and a second reader deriving it from the pairs would have to reconstruct
+    // which rows were sides at all — the one thing a list of pairs cannot say.
+    let mut unpaired: Vec<UnpairedSide> = sides
+        .iter()
+        .filter(|side| !taken_out.contains(&side.row) && !taken_in.contains(&side.row))
+        .map(|side| UnpairedSide {
+            row: side.row,
+            reason: why_unpaired(sides, side),
+        })
+        .collect();
+    unpaired.sort_unstable_by_key(|side| side.row);
+    Mirroring {
+        pairs: matched,
+        unpaired,
+    }
+}
+
+/// Which of the two reasons this side is in no pair.
+///
+/// **Decided by what the document holds, not by what the pass happened to do
+/// with it.** A side is [`Unpaired::Ambiguous`] where it could be the near half
+/// of movements on more than one account — the refusal [`mirrored`] already
+/// makes — and where the only rows that mirror it are themselves undecidable,
+/// because the doubt belongs to the pair and not to whichever side is read
+/// first. That second clause is what keeps the two arrivals of one ambiguous
+/// departure from being told, each on its own, that this document holds nothing
+/// for them: it holds the departure, and what it does not hold is a way to
+/// choose.
+///
+/// Everything else is [`Unpaired::NoCounterpart`], the leftover of several
+/// identical sides included. One arrival cannot be the other half of two
+/// departures, so once the pairing has spent it the departure left over is a
+/// departure this document holds no counterpart for — which is the same
+/// sentence as a departure nothing mirrored at all, because it is the same fact
+/// about the row.
+fn why_unpaired(sides: &[MirrorSide], side: &MirrorSide) -> Unpaired {
+    if counterpart_accounts(sides, side).len() > 1
+        || counterparts(sides, side).any(|other| counterpart_accounts(sides, other).len() > 1)
+    {
+        Unpaired::Ambiguous
+    } else {
+        Unpaired::NoCounterpart
+    }
 }
 
 /// The accounts a side could be the near half of a movement to or from.
@@ -245,18 +369,30 @@ pub fn mirrored(sides: &[MirrorSide]) -> Vec<Mirror> {
 /// account, and matching the departure with either of them writes the same
 /// fact.
 fn counterpart_accounts(sides: &[MirrorSide], side: &MirrorSide) -> Vec<AccountId> {
-    let mut accounts: Vec<AccountId> = sides
-        .iter()
-        .filter(|other| other.direction != side.direction)
-        .filter(|other| match side.direction {
-            Movement::Out => mirrors(side, other),
-            Movement::In => mirrors(other, side),
-        })
+    let mut accounts: Vec<AccountId> = counterparts(sides, side)
         .map(|other| other.account)
         .collect();
     accounts.sort_unstable();
     accounts.dedup();
     accounts
+}
+
+/// The rows of this document that could be the other half of this one.
+///
+/// The direction is read from the side being asked about rather than fixed,
+/// because [`mirrors`] takes the departure first and the question is asked from
+/// both sides.
+fn counterparts<'a>(
+    sides: &'a [MirrorSide],
+    side: &'a MirrorSide,
+) -> impl Iterator<Item = &'a MirrorSide> {
+    sides
+        .iter()
+        .filter(move |other| other.direction != side.direction)
+        .filter(move |other| match side.direction {
+            Movement::Out => mirrors(side, other),
+            Movement::In => mirrors(other, side),
+        })
 }
 
 /// Whether these two sides are the two halves of one movement.
@@ -312,7 +448,8 @@ mod tests {
         let mirrors = mirrored(&[
             side(1, main, Movement::Out, 250_000),
             side(2, savings, Movement::In, 250_000),
-        ]);
+        ])
+        .pairs;
         assert_eq!(
             mirrors,
             vec![Mirror {
@@ -331,7 +468,7 @@ mod tests {
         out.far_side = Some(savings);
         let mut into = side(2, savings, Movement::In, 250_000);
         into.far_side = Some(main);
-        let mirrors = mirrored(&[out, into]);
+        let mirrors = mirrored(&[out, into]).pairs;
         assert_eq!(mirrors.len(), 1);
         assert_eq!(mirrors[0].evidence, MirrorEvidence::BothSidesNamed);
         assert!(mirrors[0].evidence.is_named());
@@ -344,7 +481,11 @@ mod tests {
         let reserve = AccountId::new_random();
         let mut out = side(1, main, Movement::Out, 250_000);
         out.far_side = Some(reserve);
-        assert!(mirrored(&[out, side(2, savings, Movement::In, 250_000)]).is_empty());
+        assert!(
+            mirrored(&[out, side(2, savings, Movement::In, 250_000)])
+                .pairs
+                .is_empty()
+        );
     }
 
     #[test]
@@ -361,6 +502,7 @@ mod tests {
                 side(2, savings, Movement::In, 250_000),
                 side(3, reserve, Movement::In, 250_000),
             ])
+            .pairs
             .is_empty()
         );
     }
@@ -377,7 +519,8 @@ mod tests {
             side(2, main, Movement::Out, 250_000),
             side(3, savings, Movement::In, 250_000),
             side(4, savings, Movement::In, 250_000),
-        ]);
+        ])
+        .pairs;
         assert_eq!(
             mirrors
                 .iter()
@@ -395,7 +538,8 @@ mod tests {
             side(1, main, Movement::Out, 250_000),
             side(2, main, Movement::Out, 250_000),
             side(3, savings, Movement::In, 250_000),
-        ]);
+        ])
+        .pairs;
         assert_eq!(mirrors.len(), 1);
         assert_eq!((mirrors[0].outgoing, mirrors[0].incoming), (1, 3));
     }
@@ -408,6 +552,7 @@ mod tests {
                 side(1, main, Movement::Out, 250_000),
                 side(2, main, Movement::In, 250_000),
             ])
+            .pairs
             .is_empty()
         );
     }
@@ -418,7 +563,11 @@ mod tests {
         let savings = AccountId::new_random();
         let mut into = side(2, savings, Movement::In, 250_000);
         into.date = date!(2025 - 04 - 11);
-        assert!(mirrored(&[side(1, main, Movement::Out, 250_000), into]).is_empty());
+        assert!(
+            mirrored(&[side(1, main, Movement::Out, 250_000), into])
+                .pairs
+                .is_empty()
+        );
     }
 
     #[test]
@@ -427,7 +576,11 @@ mod tests {
         let savings = AccountId::new_random();
         let mut into = side(2, savings, Movement::In, 250_000);
         into.currency = CurrencyCode::Usd;
-        assert!(mirrored(&[side(1, main, Movement::Out, 250_000), into]).is_empty());
+        assert!(
+            mirrored(&[side(1, main, Movement::Out, 250_000), into])
+                .pairs
+                .is_empty()
+        );
     }
 
     #[test]
@@ -439,6 +592,7 @@ mod tests {
                 side(1, main, Movement::Out, 250_000),
                 side(2, savings, Movement::Out, 250_000),
             ])
+            .pairs
             .is_empty()
         );
     }
@@ -449,9 +603,94 @@ mod tests {
         let savings = AccountId::new_random();
         let mut out = side(1, main, Movement::Out, 250_000);
         out.far_side = Some(savings);
-        let mirrors = mirrored(&[out, side(2, savings, Movement::In, 250_000)]);
+        let mirrors = mirrored(&[out, side(2, savings, Movement::In, 250_000)]).pairs;
         assert_eq!(mirrors[0].evidence, MirrorEvidence::OneSideNamed);
         assert!(mirrors[0].evidence.is_named());
+    }
+
+    #[test]
+    fn a_departure_with_no_arrival_is_reported_rather_than_left_out() {
+        // Answered as an ordinary row it records a movement whose other half
+        // does not exist, or files an internal move as spending. Absence from
+        // the pairs said neither.
+        let main = AccountId::new_random();
+        let read = mirrored(&[side(1, main, Movement::Out, 250_000)]);
+        assert!(read.pairs.is_empty());
+        assert_eq!(
+            read.unpaired,
+            vec![UnpairedSide {
+                row: 1,
+                reason: Unpaired::NoCounterpart,
+            }],
+        );
+    }
+
+    #[test]
+    fn a_departure_that_could_have_gone_to_two_accounts_is_ambiguous_and_not_uncounterparted() {
+        // The refusal this module already makes, said in its own word. This
+        // document holds two rows that could be its other half, which is the
+        // opposite of holding none, and one sentence for the two would tell the
+        // owner the wrong thing about both.
+        let main = AccountId::new_random();
+        let savings = AccountId::new_random();
+        let reserve = AccountId::new_random();
+        let read = mirrored(&[
+            side(1, main, Movement::Out, 250_000),
+            side(2, savings, Movement::In, 250_000),
+            side(3, reserve, Movement::In, 250_000),
+        ]);
+        assert!(read.pairs.is_empty());
+        assert_eq!(
+            read.unpaired,
+            vec![
+                UnpairedSide {
+                    row: 1,
+                    reason: Unpaired::Ambiguous,
+                },
+                UnpairedSide {
+                    row: 2,
+                    reason: Unpaired::Ambiguous,
+                },
+                UnpairedSide {
+                    row: 3,
+                    reason: Unpaired::Ambiguous,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn the_leftover_of_two_identical_departures_has_no_counterpart() {
+        // One arrival cannot be the other half of two departures, so the
+        // departure left over is a departure this document holds no counterpart
+        // for — not a departure the document could not choose a partner for.
+        let main = AccountId::new_random();
+        let savings = AccountId::new_random();
+        let read = mirrored(&[
+            side(1, main, Movement::Out, 250_000),
+            side(2, main, Movement::Out, 250_000),
+            side(3, savings, Movement::In, 250_000),
+        ]);
+        assert_eq!(read.pairs.len(), 1);
+        assert_eq!(
+            read.unpaired,
+            vec![UnpairedSide {
+                row: 2,
+                reason: Unpaired::NoCounterpart,
+            }],
+        );
+    }
+
+    #[test]
+    fn a_paired_side_is_not_reported_as_unpaired() {
+        let main = AccountId::new_random();
+        let savings = AccountId::new_random();
+        let read = mirrored(&[
+            side(1, main, Movement::Out, 250_000),
+            side(2, savings, Movement::In, 250_000),
+        ]);
+        assert_eq!(read.pairs.len(), 1);
+        assert!(read.unpaired.is_empty());
     }
 
     #[test]

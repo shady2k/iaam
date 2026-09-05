@@ -20287,6 +20287,211 @@ async fn answering_one_item_for_a_pair_settles_both_of_its_legs() {
     );
 }
 
+/// A leg this document holds no counterpart for says so, and says why
+/// (iaam-0evk).
+///
+/// A statement of one account cannot hold the far half of a movement between
+/// two of them: the pairing reads one document by construction, and a movement
+/// prints one half on each account. Before this, such a row reached the queue
+/// among the ordinary ones with the ordinary alternatives, and both of them
+/// write a wrong fact — naming a far account records a movement whose other half
+/// is not there, and «the money left the perimeter» files an internal move as
+/// spending.
+///
+/// Every value is invented for this file: one account of the harness's own and
+/// one row nothing in the document mirrors.
+#[tokio::test]
+async fn a_leg_a_one_account_document_holds_no_counterpart_for_says_which_and_why() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "lone" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(account, "lone-leg", "2025-04-10", "-2500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let reason = items[0]["reason"].as_str().expect("a reason").to_owned();
+
+    assert!(
+        reason.contains("holds no counterpart for it"),
+        "the row is published as any other row: {reason}"
+    );
+    // «In this document» and never «nowhere». The far half may be in a statement
+    // he has not brought yet, or on an account he did not put in his group, and
+    // the second is the ordinary case.
+    assert!(
+        reason.contains("«not in this document»"),
+        "the sentence does not say which document it is speaking about: {reason}"
+    );
+    assert!(
+        reason.contains("on a statement not yet handed over")
+            && reason.contains("not in his directory"),
+        "the sentence does not say where the far half may be instead: {reason}"
+    );
+    for denial in ["does not exist", "never existed", "there is no other half"] {
+        assert!(
+            !reason.contains(denial),
+            "the sentence denies a far half it cannot see: {reason}"
+        );
+    }
+    // And the narrower thing, where the instance knows it: a document of one
+    // account never held the other half. That is what tells him what to do next.
+    assert!(
+        reason.contains("every row of this session is on one account"),
+        "the document covers one account and the sentence does not say so: {reason}"
+    );
+
+    // The answer it steers to is still a word the question admits: nothing is
+    // taken out of the alternatives, because the row may yet be a payment.
+    let shapes: Vec<&str> = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .expect("the answer field")["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert!(
+        shapes.contains(&"sent_to_own_account") && shapes.contains(&"paid"),
+        "the row that raises this sentence is one an own-account answer is offered for: {shapes:?}"
+    );
+}
+
+/// The same row in a document of several accounts says the bare fact and not the
+/// narrow one (iaam-0evk).
+///
+/// Several accounts *could* have held the far half and none of them did, which
+/// says nothing about why — so the sentence says nothing about why, rather than
+/// borrowing an explanation that is false here.
+#[tokio::test]
+async fn a_leg_a_many_account_document_holds_no_counterpart_for_says_only_that() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    // Two rows on two accounts and of two magnitudes, so neither is the other's
+    // other half and the document still covers more than one account.
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(main, "wide-departure", "2025-04-10", "-2500.00"),
+                    unresolved_row_dated(savings, "wide-arrival", "2025-04-10", "1000.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 2, "{items:#?}");
+    for item in &items {
+        let reason = item["reason"].as_str().expect("a reason");
+        assert!(
+            reason.contains("holds no counterpart for it")
+                && reason.contains("«not in this document»"),
+            "the row is published as any other row: {reason}"
+        );
+        assert!(
+            reason.contains("it covers more than one account"),
+            "the sentence does not say what it knows about the document: {reason}"
+        );
+        assert!(
+            !reason.contains("every row of this session is on one account"),
+            "the sentence explains the absence with something false of it: {reason}"
+        );
+    }
+}
+
+/// A row the document could not choose a partner for is not a row it holds none
+/// for (iaam-0evk).
+///
+/// The refusal `iaam_ingest::mirror` already makes, kept apart from the absence.
+/// This document prints two rows that could be the departure's other half and
+/// nothing that chooses between them, so telling the owner there is no
+/// counterpart here would deny rows the document printed.
+#[tokio::test]
+async fn an_ambiguous_leg_is_not_told_the_document_holds_no_counterpart() {
+    let harness = harness();
+    let main = another_account(&harness, "Main").await;
+    let savings = another_account(&harness, "Savings").await;
+    let reserve = another_account(&harness, "Reserve").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(main, "two-ways-out", "2025-04-10", "-2500.00"),
+                    unresolved_row_dated(savings, "two-ways-one", "2025-04-10", "2500.00"),
+                    unresolved_row_dated(reserve, "two-ways-two", "2025-04-10", "2500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 3, "{items:#?}");
+    for item in &items {
+        let reason = item["reason"].as_str().expect("a reason");
+        assert!(
+            !reason.contains("holds no counterpart for it"),
+            "an undecidable pairing is published as an absent one: {reason}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The assessment, and the revision commit checks (iaam-k1xa)
 // ---------------------------------------------------------------------------

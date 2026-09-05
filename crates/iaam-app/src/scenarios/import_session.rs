@@ -34,7 +34,7 @@ use iaam_ingest::classification::{
     classify,
 };
 use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
-use iaam_ingest::mirror::{MirrorSide, mirrored};
+use iaam_ingest::mirror::{MirrorSide, Unpaired, mirrored};
 use iaam_ingest::observation::{Intake, ObservedRow};
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Rejection, SubmittedOperation, Verdict, normalize};
@@ -6271,6 +6271,100 @@ pub enum OneMovement {
     /// records the movement — which is what makes it a statement rather than a
     /// disappearance.
     Recorded { by: u32 },
+    /// This row could be one leg, and this document holds no other half for it
+    /// (`iaam-0evk`).
+    ///
+    /// **A third state and not the absence of the first two.** A row half of
+    /// nothing this reading can see publishes no [`OneMovement`] at all, and
+    /// that is the ordinary row: a card payment is not the near half of
+    /// anything and has nothing to be told about. This is the row that *is*
+    /// leg-shaped — the owner may answer it «money I moved to my own account»,
+    /// because that is one of the words the question admits — and whose other
+    /// half no row of this document is. Answered as an ordinary row it produces
+    /// one of two wrong facts: a transfer whose far leg is not there, or a
+    /// movement between his own accounts filed as spending.
+    NoCounterpart(NoCounterpart),
+}
+
+/// Why this row has no other half here, said as narrowly as it is known.
+///
+/// **«In this document» and never «nowhere».** The far half may be in a
+/// statement the owner has not brought yet, or on an account he did not put in
+/// his group — the second is the ordinary case and it looks exactly like the
+/// first from here. Nothing published from this value says the movement had no
+/// other half, only that this document does not hold it.
+///
+/// Where the document covered one account the reason is known and is worth
+/// saying: a movement between two accounts prints its halves on two accounts, so
+/// a document holding one of them never held the other. That is a different
+/// conversation from a bare «no counterpart», because it tells him what to do —
+/// bring the other account's statement, or name the account he has not declared
+/// — rather than leaving him to search a file that cannot contain the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCounterpart {
+    /// Every row this session holds is on one account, so no row of it could
+    /// have been the far half of a movement between two.
+    ///
+    /// The narrower thing, and it is arithmetic over the rows rather than a
+    /// conclusion: the accounts their own statements printed them on, counted.
+    OneAccount,
+    /// The document covered more than one account and no row of it is this
+    /// row's other half.
+    ///
+    /// The bare fact, said where nothing explains it. It is deliberately not
+    /// dressed up as the first: several accounts *could* have held the far half
+    /// and none of them did, which says nothing about why.
+    SeveralAccounts,
+}
+
+impl NoCounterpart {
+    /// The sentence for a surface reporting about the owner.
+    ///
+    /// **Beside the value rather than at the surface**, which is
+    /// [`GeneralisationProspect::reported`]'s reason held here: a wording
+    /// written where an item is built is a second answer to a question this
+    /// enum already answers, and the two disagree the moment one of them is
+    /// edited. What a publisher does is relay it.
+    ///
+    /// Both sentences say **in this document**, and neither says the far half
+    /// does not exist. That is not a nicety of tone: a movement between two
+    /// accounts prints its halves on two accounts, this reading sees one
+    /// document, and the half it cannot see is ordinarily on an account the
+    /// owner has not declared. Asserting its absence would be the fabrication
+    /// [`iaam_ingest::mirror`] refuses in the other direction.
+    ///
+    /// Both also say what the two ordinary answers would do, because that is
+    /// what makes this a different question rather than a warning label. The
+    /// question the row raises is where the other half went; «name the far
+    /// account» and «this left the perimeter» are answers to a question nobody
+    /// asked of it.
+    #[must_use]
+    pub const fn reported(self) -> &'static str {
+        match self {
+            Self::OneAccount => {
+                "This document holds no counterpart for it, and why is known: every row of this \
+                 session is on one account, and a movement between two accounts prints one half \
+                 on each — so a statement of one of them never held the other. That is «not in \
+                 this document» and not «nowhere»: if this row was money moved between the \
+                 owner's own accounts, the far half is on a statement not yet handed over, or on \
+                 an account that is not in his directory. Naming a far account in the answer \
+                 records the whole movement from this row alone, and answering that the money \
+                 left the perimeter files it as spending — so what this row needs settled is \
+                 where the other half went, and not which of the ordinary alternatives fits."
+            }
+            Self::SeveralAccounts => {
+                "This document holds no counterpart for it: it covers more than one account, and \
+                 no row on any of them is the opposite half of the same amount on the same day. \
+                 That is «not in this document» and not «nowhere»: if this row was money moved \
+                 between the owner's own accounts, the far half is on a statement not yet handed \
+                 over, or on an account that is not in his directory. Naming a far account in \
+                 the answer records the whole movement from this row alone, and answering that \
+                 the money left the perimeter files it as spending — so what this row needs \
+                 settled is where the other half went, and not which of the ordinary \
+                 alternatives fits."
+            }
+        }
+    }
 }
 
 /// What a session's questions are to the movements its document printed twice
@@ -6330,7 +6424,8 @@ pub fn mirrored_movements_of(
         }
     }
     let mut movements = BTreeMap::new();
-    for mirror in mirrored(&sides) {
+    let reading = mirrored(&sides);
+    for mirror in reading.pairs {
         // The three outcomes [`mirrored_rows`] decides, decided the same way and
         // on the same question: how many of the two sides are already answered.
         // A pair with one side answered is one movement already recorded, and
@@ -6378,7 +6473,73 @@ pub fn mirrored_movements_of(
             (false, false) => {}
         }
     }
+    // The sides no pair holds (`iaam-0evk`). Absence from the pairs published
+    // nothing, so a leg whose other half this document does not hold reached the
+    // owner among the ordinary rows with the ordinary alternatives — and both of
+    // the ordinary answers write a wrong fact for it.
+    let covered = accounts_covered(observations);
+    for unpaired in reading.unpaired {
+        // Only the two the reason names, and only the first of them. An
+        // ambiguous row is **not** a row with no counterpart — this document
+        // holds more than one row that could be its other half and states
+        // nothing that chooses — so it is left as it was rather than told the
+        // opposite of the truth. Saying that to him is its own item and its own
+        // sentence, and it is not this one.
+        if unpaired.reason != Unpaired::NoCounterpart {
+            continue;
+        }
+        // Still his to answer. A row he has already answered is not work, and
+        // this says nothing a settled row needs.
+        if !open.contains(&unpaired.row) {
+            continue;
+        }
+        // And only where «money I moved to my own account» is a word the
+        // question admits. That is the whole harm: an answer naming a far
+        // account records a movement whose other half is not in the document,
+        // and the alternatives are what say whether he can give one. A question
+        // that offers no such word — an outflow that is either a fee or a
+        // payment, an inflow that is either income or a receipt — cannot produce
+        // the fact this warns about, and a clause on it would be a sentence
+        // about something that is not the case.
+        let Some(question) = questions
+            .iter()
+            .find(|question| question.row == unpaired.row)
+        else {
+            continue;
+        };
+        if !stored_alternatives(question)
+            .iter()
+            .any(|shape| shape.needs_account())
+        {
+            continue;
+        }
+        movements.insert(
+            unpaired.row,
+            OneMovement::NoCounterpart(if covered.len() == 1 {
+                NoCounterpart::OneAccount
+            } else {
+                NoCounterpart::SeveralAccounts
+            }),
+        );
+    }
     movements
+}
+
+/// The accounts whose statements this session's rows were printed on.
+///
+/// **Arithmetic over the rows and never a conclusion**, which is what lets the
+/// sentence built from it be narrow: counting the accounts the rows themselves
+/// name says how many statements this session was handed, and one is the case
+/// where the missing half is explained rather than merely reported. A row this
+/// build cannot read counts as nothing — it names no account here — and the
+/// effect of that is only ever to make the published sentence the wider of the
+/// two, which is the safe direction.
+fn accounts_covered(observations: &[ImportObservationView]) -> BTreeSet<AccountId> {
+    observations
+        .iter()
+        .filter_map(|observation| parse_intake(&observation.payload).ok())
+        .map(|intake| intake.account())
+        .collect()
 }
 
 /// A row the owner has answered as a movement between two of his own accounts,
@@ -6635,7 +6796,7 @@ fn mirrored_rows(
         .filter_map(|read| mirror_side(read, open.contains(&read.row)))
         .collect();
     let mut paired = MirroredRows::default();
-    for mirror in mirrored(&sides) {
+    for mirror in mirrored(&sides).pairs {
         let outgoing_settled = !open.contains(&mirror.outgoing);
         let incoming_settled = !open.contains(&mirror.incoming);
         match (outgoing_settled, incoming_settled) {

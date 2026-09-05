@@ -3534,7 +3534,10 @@ fn classification_question_gap(question: &ClassificationQuestion) -> bool {
 const fn second_leg_of_one_movement(question: &ClassificationQuestion) -> bool {
     match &question.pair {
         Some(OneMovement::Waiting(pair)) => pair.arrival.row == question.view.row,
-        Some(OneMovement::Recorded { .. }) | None => false,
+        // A row with no counterpart is nobody's second leg: there is no first
+        // one. It is one row and one item, and it is published because of what
+        // it is not paired with rather than despite it.
+        Some(OneMovement::Recorded { .. } | OneMovement::NoCounterpart(_)) | None => false,
     }
 }
 
@@ -3685,7 +3688,7 @@ fn answer_classification_question_action(
 const fn waiting_far_leg(question: &ClassificationQuestion) -> Option<MovementLeg> {
     match question.pair {
         Some(OneMovement::Waiting(pair)) => pair.far_of(question.view.row),
-        Some(OneMovement::Recorded { .. }) | None => None,
+        Some(OneMovement::Recorded { .. } | OneMovement::NoCounterpart(_)) | None => None,
     }
 }
 
@@ -3709,6 +3712,17 @@ fn one_movement_text(
     account: &AccountView,
     far: Option<&AccountView>,
 ) -> String {
+    // A row this document holds no other half for (`iaam-0evk`). Said here
+    // because it is the same clause answering the same question — what these
+    // rows are to each other — and its answer is «nothing, and here is why»,
+    // which the item has to carry for the reason it carries the pairing: the
+    // ordinary alternatives are both wrong for such a row, and nothing else on
+    // the item distinguishes it from a row they are right for. **Relayed and
+    // never rewritten**: the wording is the scenario's, so the queue cannot
+    // come to say one thing about this row while another surface says another.
+    if let Some(OneMovement::NoCounterpart(reason)) = question.pair {
+        return format!("{} ", reason.reported());
+    }
     let (Some(OneMovement::Waiting(pair)), Some(far_account)) = (question.pair, far) else {
         return String::new();
     };

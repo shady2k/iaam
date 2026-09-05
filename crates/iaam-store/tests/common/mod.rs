@@ -29,6 +29,10 @@ pub fn apply_migrations_through(conn: &Connection, through: u32) {
         include_str!("../../migrations/0022_import_control_figures.sql"),
         include_str!("../../migrations/0023_event_import_session.sql"),
         include_str!("../../migrations/0024_import_session_account.sql"),
+        include_str!("../../migrations/0025_account_retirements.sql"),
+        include_str!("../../migrations/0026_document_unresolved_accounts.sql"),
+        include_str!("../../migrations/0027_declined_account_names.sql"),
+        include_str!("../../migrations/0028_source_profile_versions.sql"),
     ];
     assert!(
         through <= migrations.len() as u32,

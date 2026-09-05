@@ -8934,6 +8934,75 @@ pub struct JournalEventReadDto {
     /// session exists».
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_session: Option<Uuid>,
+    /// Which of your standing classification rules filed this row.
+    ///
+    /// The one thing about a recorded fact that nothing else here answers.
+    /// Every other field says what the source printed or which submission
+    /// brought the row in; this says why it was filed the way it was, and it is
+    /// what `?settled_by_rule=` on this route selects by.
+    ///
+    /// **Absent means nothing was recorded about it, and never «no rule filed
+    /// this».** A row settled without a rule carries the object with
+    /// `settled_by` reading `no_rule`, which is a statement; absence covers
+    /// every fact recorded before this field existed and every route that writes
+    /// without reading the row against your rules — a correction, a broker
+    /// synchronisation. Reading absence as «you decided this one yourself» says
+    /// something the journal never did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_settlement: Option<JournalRuleSettlementDto>,
+}
+
+/// What a fact records about the rule that filed it.
+///
+/// One object rather than fields spread across the row, because it is one
+/// statement: the word, the sentence for it, and the rule it names are true
+/// together or not at all.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JournalRuleSettlementDto {
+    /// `rule` where one of your standing rules filed the row, `no_rule` where
+    /// the row was read against them and none matched — you answered it
+    /// yourself, your account directory recognised the other side, the source
+    /// asserted it, or the operation arrived already decided.
+    pub settled_by: String,
+    /// The same determination in words.
+    pub explanation: String,
+    /// The rule that filed the row, where one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Uuid>,
+    /// The version of that rule at the time it filed the row.
+    ///
+    /// Recorded because a rule can be edited: after an edit, «the rows this rule
+    /// filed» and «the rows the version I have just replaced filed» are
+    /// different sets, and only the second is the one to review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+impl JournalRuleSettlementDto {
+    #[must_use]
+    pub fn from_domain(settlement: &iaam_core::event::provenance::RuleSettlement) -> Self {
+        Self {
+            settled_by: settlement.code().to_owned(),
+            explanation: settlement_explanation(settlement).to_owned(),
+            rule: settlement.rule().map(|(rule, _)| rule.inner()),
+            version: settlement.rule().map(|(_, version)| version),
+        }
+    }
+}
+
+/// One static sentence per word, published from one function, so two readers of
+/// the same value cannot be told two different things about it.
+const fn settlement_explanation(
+    settlement: &iaam_core::event::provenance::RuleSettlement,
+) -> &'static str {
+    match settlement {
+        iaam_core::event::provenance::RuleSettlement::NoRule => {
+            "no standing rule of yours filed this row; it was settled some other way"
+        }
+        iaam_core::event::provenance::RuleSettlement::Rule { .. } => {
+            "a standing rule of yours matched the row and filed it"
+        }
+    }
 }
 
 /// The semantic dates a journal event carries. Absent means unknown, which is
@@ -9126,6 +9195,10 @@ impl JournalEventReadDto {
             source_kind: view.source_kind.clone(),
             description: view.description.clone(),
             import_session: view.import_session.map(|session| session.inner()),
+            rule_settlement: view
+                .rule_settlement
+                .as_ref()
+                .map(JournalRuleSettlementDto::from_domain),
         }
     }
 }

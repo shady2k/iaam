@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ImportId, ImportSessionId, PrincipalId, SourceId};
+use crate::ids::{ClassificationRuleId, ImportId, ImportSessionId, PrincipalId, SourceId};
 
 /// Hash of the raw source record. A hexadecimal SHA-256 string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,6 +45,62 @@ pub struct RowLocator {
     pub document: RawHash,
     pub sheet: Option<String>,
     pub row: u64,
+}
+
+/// What one of the owner's standing classification rules did to this row.
+///
+/// **Two values, and the absence of the whole thing is a third state**
+/// ([`Provenance::rule_settlement`]). A row an owner reviews is one of a group
+/// a single decision of his reached, and the group is defined by the rule — so
+/// the fact has to say which rule, or the group can only be found by reading a
+/// whole import by eye.
+///
+/// [`Self::NoRule`] and «nothing recorded» are different claims and are never
+/// merged: the first says a reading ran and no rule of his matched, the second
+/// says nothing at all. A reader that treats the second as the first tells him
+/// a row he never touched was decided by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "settled_by", rename_all = "snake_case")]
+pub enum RuleSettlement {
+    /// The row was read against the owner's standing rules and none settled it.
+    ///
+    /// It covers every other way a row can come to be settled — his own answer,
+    /// his account directory recognising the far side, the source asserting it,
+    /// and a caller that submitted a finished operation. What those have in
+    /// common is the only thing this field claims: no rule of his filed the row.
+    /// Which of them it was is the reading's own vocabulary and is published by
+    /// the import assessment, not here.
+    NoRule,
+    /// This rule, at this version, settled the row.
+    ///
+    /// The version is recorded beside the identifier because a rule can be
+    /// edited, and «the rows rule R filed» and «the rows version 3 of R filed»
+    /// are different questions. Recording only the identifier would make the
+    /// second unanswerable, and the second is the one asked after an edit.
+    Rule {
+        rule: ClassificationRuleId,
+        version: u32,
+    },
+}
+
+impl RuleSettlement {
+    /// Wire code. One place, so two publishers cannot spell it differently.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NoRule => "no_rule",
+            Self::Rule { .. } => "rule",
+        }
+    }
+
+    /// The rule and the version, where a rule settled the row.
+    #[must_use]
+    pub const fn rule(&self) -> Option<(ClassificationRuleId, u32)> {
+        match self {
+            Self::NoRule => None,
+            Self::Rule { rule, version } => Some((*rule, *version)),
+        }
+    }
 }
 
 /// Provenance. Cannot be constructed without a raw data hash and parser version.
@@ -198,6 +254,26 @@ pub struct Provenance {
     /// a missing session is not evidence of its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     import_session: Option<ImportSessionId>,
+    /// Which of the owner's standing classification rules settled this row.
+    ///
+    /// The one thing about a fact that nothing else here can answer: every
+    /// other field says what the source printed or which act admitted the row,
+    /// and none of them says **why it was filed the way it was**. A rule made
+    /// from one answer applies to a group of rows the owner never saw one by
+    /// one, and reviewing that group means finding it — which, without this
+    /// field, means reading a whole import by eye.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field. `None` therefore means «not
+    /// recorded» and never «no rule settled it» — the second is
+    /// [`RuleSettlement::NoRule`], which is a statement a reading made. Absence
+    /// covers every fact written before this field existed and every path that
+    /// writes without reading a row against the rules at all: a correction
+    /// minted by this code, a broker synchronisation. A caller that reads the
+    /// absence as «he decided this one himself» is stating something the
+    /// journal never said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rule_settlement: Option<RuleSettlement>,
     row: Option<RowLocator>,
 }
 
@@ -221,6 +297,7 @@ impl Provenance {
             import: None,
             declared_by: None,
             import_session: None,
+            rule_settlement: None,
             row: None,
         }
     }
@@ -305,6 +382,21 @@ impl Provenance {
         self
     }
 
+    /// Stamp what the owner's standing rules made of this row.
+    ///
+    /// Applied after normalisation, like the import session and the declaring
+    /// principal, and for a reason of its own: normalisation turns a settled
+    /// operation into a fact, and by then the reading that settled it has
+    /// already happened somewhere the normaliser cannot see. Only the caller
+    /// that ran the reading knows whether a rule was involved, so only it may
+    /// say — and a path that never read the row against the rules says nothing,
+    /// which is what the absence means.
+    #[must_use]
+    pub const fn with_rule_settlement(mut self, settlement: RuleSettlement) -> Self {
+        self.rule_settlement = Some(settlement);
+        self
+    }
+
     #[must_use]
     pub fn with_row(mut self, row: RowLocator) -> Self {
         self.row = Some(row);
@@ -345,6 +437,30 @@ impl Provenance {
     #[must_use]
     pub const fn import_session(&self) -> Option<ImportSessionId> {
         self.import_session
+    }
+
+    /// What the owner's standing rules made of this row, when a reading said.
+    ///
+    /// `None` is «not recorded» and must never be read as «no rule settled it»:
+    /// that one is [`RuleSettlement::NoRule`], and the difference is the whole
+    /// point of the field being an option over an enumeration rather than an
+    /// option over a rule identifier.
+    #[must_use]
+    pub const fn rule_settlement(&self) -> Option<&RuleSettlement> {
+        self.rule_settlement.as_ref()
+    }
+
+    /// The rule and version that settled this row, where one did.
+    ///
+    /// Answers `None` for both of the other two states, so a caller that only
+    /// wants to know «which rule» need not distinguish them — and a caller that
+    /// must distinguish them reads [`Self::rule_settlement`] instead.
+    #[must_use]
+    pub const fn settling_rule(&self) -> Option<(ClassificationRuleId, u32)> {
+        match self.rule_settlement {
+            Some(settlement) => settlement.rule(),
+            None => None,
+        }
     }
 
     #[must_use]
@@ -409,7 +525,7 @@ impl Provenance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{AccountId, OwnerId};
+    use crate::ids::{AccountId, ClassificationRuleId, OwnerId};
 
     fn hash(seed: &str) -> RawHash {
         RawHash::parse(&seed.repeat(64)).unwrap()
@@ -590,6 +706,78 @@ mod tests {
         let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
 
         assert_eq!(provenance.import_session(), None);
+    }
+
+    #[test]
+    fn the_rule_that_settled_the_row_is_kept_and_read_back() {
+        let rule = ClassificationRuleId::new_random();
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_rule_settlement(RuleSettlement::Rule { rule, version: 3 });
+
+        assert_eq!(
+            provenance.rule_settlement(),
+            Some(&RuleSettlement::Rule { rule, version: 3 })
+        );
+        assert_eq!(provenance.settling_rule(), Some((rule, 3)));
+    }
+
+    #[test]
+    fn a_row_no_rule_settled_is_not_a_row_whose_rule_was_never_recorded() {
+        // The three states this field exists for. A fact that says «no rule» was
+        // read by a build that looks for one and found none; a fact that says
+        // nothing was written by a path that never asked, or before the field
+        // existed. Reading the second as the first would tell the owner that a
+        // row a rule of his filed was decided by hand.
+        let no_rule = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_rule_settlement(RuleSettlement::NoRule);
+        let unrecorded = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        );
+
+        assert_eq!(no_rule.rule_settlement(), Some(&RuleSettlement::NoRule));
+        assert_eq!(no_rule.settling_rule(), None);
+        assert_eq!(unrecorded.rule_settlement(), None);
+        assert_eq!(unrecorded.settling_rule(), None);
+    }
+
+    #[test]
+    fn provenance_written_before_a_rule_settlement_was_recorded_names_nothing() {
+        // The load-bearing half: an event from before the field existed must read
+        // as «not recorded», never as «no rule settled it». The journal is
+        // append-only and nothing rewrites such a fact, so the absence is the
+        // whole of what it can say.
+        let stored = r#"{"source":"00000000-0000-0000-0000-000000000000",
+        "raw_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parser_version":"test"}"#;
+        let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
+
+        assert_eq!(provenance.rule_settlement(), None);
+    }
+
+    #[test]
+    fn a_recorded_rule_settlement_survives_a_round_trip() {
+        let rule = ClassificationRuleId::new_random();
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_rule_settlement(RuleSettlement::Rule { rule, version: 7 });
+
+        let stored = serde_json::to_string(&provenance).expect("provenance encodes");
+        let read: Provenance = serde_json::from_str(&stored).expect("provenance decodes");
+
+        assert_eq!(read.settling_rule(), Some((rule, 7)));
     }
 
     #[test]

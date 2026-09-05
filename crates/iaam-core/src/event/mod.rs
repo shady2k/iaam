@@ -211,7 +211,17 @@ pub struct Event {
 /// holds an operation word keeps it, because provenance records what a path
 /// meant at the time and a repair would be this software guessing what a
 /// source said.
-pub const SCHEMA_VERSION: u32 = 14;
+/// Version 15 adds the optional rule settlement inside [`Provenance`]: which of
+/// the owner's standing classification rules filed the row, at which version of
+/// that rule, or that a reading ran and none did. It defaults to absent, so
+/// facts already in the journal stay readable — and the absence is load-bearing
+/// for the reason version 12's is, one step further: «no rule» is a statement a
+/// reading made, «nothing recorded» is a fact written before the field existed
+/// or by a path that never read the row against any rule, and the number is
+/// what tells the two apart. Nothing is back-filled, because nothing could be:
+/// the rule that settled a row was never recorded, so inventing one would name
+/// a decision the owner never made.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// The version from which [`provenance::Provenance::source_category`] holds a
 /// source's **category** on every path, and nothing else.
@@ -3392,7 +3402,15 @@ mod tests {
         //        this version whose `source_category` holds an operation word
         //        keeps it, because a repair would be this software guessing
         //        what a source said.
-        assert_eq!(SCHEMA_VERSION, 14);
+        // 14 → 15: added the optional rule settlement in `Provenance`
+        //        (iaam-k4qu). Older facts stay readable because the field
+        //        defaults to absent, and the absence is the answer rather than
+        //        a gap: it says nothing was recorded about which rule filed the
+        //        row, which is a different claim from «no rule filed it». The
+        //        number is what tells a reader which of the two an absent field
+        //        means, and nothing is back-filled — the rule that settled an
+        //        older row was never recorded anywhere to back-fill it from.
+        assert_eq!(SCHEMA_VERSION, 15);
     }
 
     #[test]

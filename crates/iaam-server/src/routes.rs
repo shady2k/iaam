@@ -54,8 +54,8 @@ use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposa
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
-    AccountId, CategoryId, CategoryRuleId, CustodyId, EventId, ImportId, ImportQuestionId,
-    ImportSessionId, InstrumentId, SourceId,
+    AccountId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId, EventId, ImportId,
+    ImportQuestionId, ImportSessionId, InstrumentId, SourceId,
 };
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
@@ -5032,6 +5032,32 @@ pub struct JournalParams {
     /// `POST /v1/import-sessions` returned and every row here carries back.
     #[serde(default)]
     pub import_session: Option<Uuid>,
+    /// The standing classification rule that filed the rows.
+    ///
+    /// One decision of yours becomes a rule, and the rule then files rows
+    /// automatically — rows you never see one by one. This returns that group,
+    /// so a row that turns out wrong can be found among the others the same
+    /// decision reached instead of by reading a whole import.
+    ///
+    /// It narrows alongside the other filters rather than replacing them: an
+    /// account, a date interval and a rule together ask what that rule did on
+    /// that account in that month.
+    ///
+    /// Rows the rule did not file are outside every value of it, including rows
+    /// nothing recorded a settlement for at all. Each row returned by this route
+    /// carries `rule_settlement`, which says which of those it is.
+    #[serde(default)]
+    pub settled_by_rule: Option<Uuid>,
+    /// One version of that rule.
+    ///
+    /// A rule can be edited, and its version counts its own revisions. «What
+    /// this rule filed» and «what version 3 of it filed» are different
+    /// questions, and after an edit the second is usually the one being asked.
+    ///
+    /// Supplied together with `settled_by_rule`. On its own it names nothing, so
+    /// it is refused rather than quietly ignored.
+    #[serde(default)]
+    pub settled_by_rule_version: Option<u32>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date)]
@@ -5100,6 +5126,8 @@ pub async fn list_journal_events(
             account: params.account.map(AccountId),
             source,
             import_session: params.import_session.map(ImportSessionId),
+            settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
+            settled_by_rule_version: params.settled_by_rule_version,
             from,
             to,
             after: params.after,

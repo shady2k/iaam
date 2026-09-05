@@ -3,9 +3,11 @@
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
-use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, EventId, ImportSessionId, OwnerId, SourceId, TransferId};
+use iaam_core::ids::{
+    AccountId, ClassificationRuleId, EventId, ImportSessionId, OwnerId, SourceId, TransferId,
+};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -77,6 +79,15 @@ impl Ctx {
             confidence: Confidence::Known,
             idempotency_key: None,
         }
+    }
+}
+
+impl Ctx {
+    /// A deposit carrying what the owner's standing rules made of the row.
+    fn settled_by(&self, sequence: u32, settlement: RuleSettlement) -> Event {
+        let mut event = self.deposit(sequence, i64::from(sequence) * 100_000);
+        event.provenance = event.provenance.with_rule_settlement(settlement);
+        event
     }
 }
 
@@ -183,6 +194,139 @@ fn the_journal_narrows_to_the_import_session_that_wrote_it() {
         )
         .unwrap();
     assert_eq!(everything.len(), 2, "the unnarrowed page still holds both");
+}
+
+/// A page of the journal can be narrowed to the rows one standing rule filed.
+///
+/// This is the owner's own review: a rule made from one answer applies to a
+/// group of rows automatically, one of them is wrong, and finding the wrong one
+/// means seeing the group. The group is defined by the rule, so the rule has to
+/// be a handle the journal takes — reading a whole import by eye does not scale
+/// past a page.
+///
+/// The settlement travels inside the payload as part of the event's provenance,
+/// and a filter applied after the page was selected would return short pages and
+/// a cursor that skips rows — so the rule is lifted into a column and bound here.
+/// What is checked is that the column agrees with the provenance, and that
+/// neither a row another rule filed, nor one a reading settled without a rule,
+/// nor one recorded before rules were recorded at all is swept in beside it.
+#[test]
+fn the_journal_narrows_to_the_rule_that_settled_the_row() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let rule = ClassificationRuleId::new_random();
+    let other = ClassificationRuleId::new_random();
+
+    let settled = ctx.settled_by(1, RuleSettlement::Rule { rule, version: 3 });
+    let by_another = ctx.settled_by(
+        2,
+        RuleSettlement::Rule {
+            rule: other,
+            version: 1,
+        },
+    );
+    let without_a_rule = ctx.settled_by(3, RuleSettlement::NoRule);
+    let never_recorded = ctx.deposit(4, 400_000);
+    for event in [&settled, &by_another, &without_a_rule, &never_recorded] {
+        store.append_event(event, IdentityScope::Source).unwrap();
+    }
+
+    let narrowed = store
+        .list_journal_events(
+            ctx.owner,
+            &JournalQuery {
+                settled_by_rule: Some(rule),
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        narrowed.iter().map(|event| event.id).collect::<Vec<_>>(),
+        vec![settled.id],
+        "only the rows that rule filed"
+    );
+    assert_eq!(
+        narrowed[0].provenance.settling_rule(),
+        Some((rule, 3)),
+        "the column and the provenance name one rule"
+    );
+
+    let everything = store
+        .list_journal_events(
+            ctx.owner,
+            &JournalQuery {
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        everything.len(),
+        4,
+        "the unnarrowed page still holds all four"
+    );
+}
+
+/// A rule can be edited, so «what rule R filed» and «what version 3 of R filed»
+/// are two questions, and the second is the one asked after an edit.
+#[test]
+fn the_journal_narrows_to_one_version_of_a_rule() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let rule = ClassificationRuleId::new_random();
+
+    let older = ctx.settled_by(1, RuleSettlement::Rule { rule, version: 2 });
+    let newer = ctx.settled_by(2, RuleSettlement::Rule { rule, version: 3 });
+    for event in [&older, &newer] {
+        store.append_event(event, IdentityScope::Source).unwrap();
+    }
+
+    let narrowed = store
+        .list_journal_events(
+            ctx.owner,
+            &JournalQuery {
+                settled_by_rule: Some(rule),
+                settled_by_rule_version: Some(3),
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        narrowed.iter().map(|event| event.id).collect::<Vec<_>>(),
+        vec![newer.id],
+        "one version of one rule"
+    );
+}
+
+/// The column cannot tell «no rule» from «nothing recorded», and the payload can.
+///
+/// Both are NULL in the column, which is honest — the column exists to select a
+/// named rule, and neither of these is one. The distinction the owner needs is
+/// on the fact itself, so it is asserted where it lives.
+#[test]
+fn a_row_no_rule_settled_reads_apart_from_one_recorded_before_rules_were() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+
+    let without_a_rule = ctx.settled_by(1, RuleSettlement::NoRule);
+    let never_recorded = ctx.deposit(2, 200_000);
+    for event in [&without_a_rule, &never_recorded] {
+        store.append_event(event, IdentityScope::Source).unwrap();
+    }
+
+    let loaded = store.load_events(ctx.owner).unwrap();
+    assert_eq!(
+        loaded[0].provenance.rule_settlement(),
+        Some(&RuleSettlement::NoRule),
+        "a reading that found no rule said so"
+    );
+    assert_eq!(
+        loaded[1].provenance.rule_settlement(),
+        None,
+        "a fact nothing said anything about stays silent"
+    );
 }
 
 #[test]

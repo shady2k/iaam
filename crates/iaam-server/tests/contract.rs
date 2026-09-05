@@ -889,8 +889,13 @@ async fn health_is_public_and_reports_versions() {
     // appeared. Version 14 gave the source's own operation word a field of its
     // own inside Provenance: it used to be written through the source
     // category's slot, so a category rule could never match a row submitted as
-    // an observation.
-    assert_eq!(body["schema_version"], 14);
+    // an observation. Version 15 gave Provenance the rule settlement: which
+    // standing rule of the owner's filed the row, at which version of that
+    // rule, or that a reading ran and none did — so an agent can ask the
+    // journal for the group one decision of his reached instead of reading a
+    // whole import. An agent that does not know the field reads every fact as
+    // though nothing were recorded about it, which is why the number moves.
+    assert_eq!(body["schema_version"], 15);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version
@@ -17599,6 +17604,206 @@ async fn a_session_publishes_its_row_count_under_a_name_no_client_can_index() {
     assert!(
         plan["source_inventory"].get("rows").is_none(),
         "the inventory's count sits between two lists and must not read as a third: {plan}"
+    );
+}
+
+/// The journal can be asked which rows a rule filed, and each row says (`iaam-k4qu`).
+///
+/// The owner's own scenario: he answers one question, a rule is written from it,
+/// the rule files a group of rows automatically, and one of them turns out
+/// wrong. Correcting it was already possible — a correction is addressed by
+/// event identifier — so what was missing was **finding** the group, and the
+/// group is defined by the rule. Reading a whole import by eye does not scale
+/// past a page.
+///
+/// Three states are checked and they are three, not two. A row a rule filed
+/// names the rule and the version of it. A row settled some other way says so.
+/// A row recorded before any of this says nothing at all, which is the state
+/// this test cannot produce and the core's own tests hold.
+#[tokio::test]
+async fn the_journal_returns_the_rows_one_rule_filed_and_each_row_names_it() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "filed-one")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    let rule = answered["generalisation"]["rule"]
+        .as_str()
+        .expect("the rule the answer wrote")
+        .to_owned();
+
+    // Two more rows of the same shape, this time with the source stating the
+    // direction, so the rule settles both without asking. These are the group.
+    for key in ["filed-two", "filed-three"] {
+        let (status, again) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "source": { "account": account, "channel": "file", "label": "april" },
+                    "operations": [directed_row(account, key, "out")],
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{again}");
+        assert!(again[0]["event_id"].is_string(), "{again}");
+    }
+
+    // And one row nothing classified: the caller stated the operation itself.
+    let (status, stated) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "april" },
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "1000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-03-19" },
+                    "idempotency_key": "stated-one",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stated}");
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?settled_by_rule={rule}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let keys: Vec<&str> = page["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|row| row["idempotency_key"].as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["filed-two", "filed-three"],
+        "the group the rule filed, and only it: {page}"
+    );
+    let filed = &page["rows"][0];
+    assert_eq!(filed["rule_settlement"]["settled_by"], "rule", "{page}");
+    assert_eq!(filed["rule_settlement"]["rule"], json!(rule), "{page}");
+    assert!(
+        filed["rule_settlement"]["version"].is_u64(),
+        "the version is on the fact, because a rule can be edited: {page}"
+    );
+    assert!(
+        filed["rule_settlement"]["explanation"]
+            .as_str()
+            .is_some_and(|sentence| !sentence.is_empty()),
+        "a code word carries its sentence: {page}"
+    );
+
+    // The filter composes with the ones that were already there rather than
+    // replacing them: what this rule did in one interval is one question.
+    let (status, narrowed) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?settled_by_rule={rule}&from=2020-01-01&to=2020-12-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{narrowed}");
+    assert!(
+        narrowed["rows"].as_array().expect("rows").is_empty(),
+        "the rule filed nothing in that year: {narrowed}"
+    );
+
+    // The row nothing classified says so, and it is not the same statement as
+    // silence: it says a reading ran and no rule of his matched.
+    let (status, stated_row) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=stated-one",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stated_row}");
+    assert_eq!(
+        stated_row["rows"][0]["rule_settlement"]["settled_by"], "no_rule",
+        "{stated_row}"
+    );
+    assert!(
+        stated_row["rows"][0]["rule_settlement"]
+            .get("rule")
+            .is_none(),
+        "a settlement that names no rule prints none: {stated_row}"
+    );
+
+    // A version narrows further, and a version alone narrows nothing because it
+    // names nothing.
+    let (status, wrong_version) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?settled_by_rule={rule}&settled_by_rule_version=99"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{wrong_version}");
+    assert!(
+        wrong_version["rows"].as_array().expect("rows").is_empty(),
+        "no version 99 of that rule filed anything: {wrong_version}"
+    );
+
+    let (status, lone_version) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?settled_by_rule_version=1",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a version numbers one rule's revisions, so it names nothing alone: {lone_version}"
     );
 }
 

@@ -19,11 +19,12 @@ use iaam_core::batch::{
 };
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
-use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{
-    AccountId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId,
+    AccountId, ClassificationRuleId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId,
+    SourceId,
 };
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
@@ -339,7 +340,13 @@ pub async fn submit_intake(
     // session at all: a session per import is state the owner has to look at,
     // and creating one for a batch that raised no question would fill the list
     // with nothing.
-    let mut settled: Vec<Option<Result<SubmittedOperation, Rejection>>> = Vec::new();
+    // The settlement travels beside the operation rather than inside it, for
+    // `RowResolution::Fact`'s reason: the operation is what will be written, and
+    // this is why it was written that way. It is carried this far rather than
+    // read off the assessment again at the end, because by then the row is a
+    // normalised event and the reading that settled it is gone.
+    let mut settled: Vec<Option<(Result<SubmittedOperation, Rejection>, RuleSettlement)>> =
+        Vec::new();
     let mut pending: Vec<Option<(&ObservedRow, Question)>> = Vec::new();
     // The third outcome, kept in its own list rather than folded into either of
     // the two above: such a row opens no session, because there is nothing to
@@ -348,7 +355,13 @@ pub async fn submit_intake(
     for intake in rows {
         match intake {
             Intake::Concluded { operation } => {
-                settled.push(Some(Ok((**operation).clone())));
+                // A caller that concluded settled the row itself, so no rule of
+                // his filed it. That is a statement, not a silence: it is the
+                // reading this route performed, and the fact records it.
+                settled.push(Some((
+                    Ok((**operation).clone()),
+                    FactBasis::Concluded.rule_settlement(),
+                )));
                 pending.push(None);
                 no_fact.push(None);
             }
@@ -356,9 +369,12 @@ pub async fn submit_intake(
                 Assessment::Settled {
                     classification,
                     movement,
-                    ..
+                    basis,
                 } => {
-                    settled.push(Some(row.resolve(classification, movement)));
+                    settled.push(Some((
+                        row.resolve(classification, movement),
+                        FactBasis::of(&basis).rule_settlement(),
+                    )));
                     pending.push(None);
                     no_fact.push(None);
                 }
@@ -396,8 +412,12 @@ pub async fn submit_intake(
     let candidates: Vec<Result<iaam_core::event::Event, Rejection>> = settled
         .iter()
         .zip(rows)
-        .filter_map(|(settled, intake)| settled.as_ref().map(|operation| (operation, intake)))
-        .map(|(operation, intake)| {
+        .filter_map(|(settled, intake)| {
+            settled
+                .as_ref()
+                .map(|(operation, settlement)| (operation, *settlement, intake))
+        })
+        .map(|(operation, settlement, intake)| {
             operation.clone().and_then(|operation| {
                 normalize(
                     &operation,
@@ -419,6 +439,7 @@ pub async fn submit_intake(
                     if let Some(import) = import {
                         event.provenance = event.provenance.with_import(import);
                     }
+                    event.provenance = event.provenance.with_rule_settlement(settlement);
                     event
                 })
             })
@@ -3783,6 +3804,16 @@ impl SessionReading {
                     if let Some(import) = origin.import {
                         event.provenance = event.provenance.with_import(import);
                     }
+                    // What filed the row, recorded on the fact itself. The
+                    // reading already established it — it is what the plan
+                    // publishes as `settled_by` — and until now it stopped at
+                    // the plan, so the journal could be asked which import wrote
+                    // a row and never which decision of his did.
+                    if let Some(basis) = &basis {
+                        event.provenance = event
+                            .provenance
+                            .with_rule_settlement(basis.rule_settlement());
+                    }
                     event
                 })
             });
@@ -5433,6 +5464,36 @@ impl FactBasis {
                 rule: rule.inner().to_string(),
                 version: *version,
             },
+        }
+    }
+
+    /// What the fact records about the rule that filed the row (`iaam-k4qu`).
+    ///
+    /// A narrower vocabulary than this one and deliberately so: the journal is
+    /// asked «which rule filed this», and the four bases that name no rule
+    /// answer that question identically. Which of the four it was belongs to the
+    /// import assessment, which publishes this whole enumeration; putting it on
+    /// the fact as well would be a second answer to «what settled this row» in a
+    /// second place, and the two would come to disagree in front of the owner.
+    ///
+    /// Every arm answers something, and none answers «nothing recorded». That
+    /// state is reserved for facts no reading of this kind produced — one
+    /// written before the field existed, a correction, a broker
+    /// synchronisation — and it is the absence of the whole value rather than a
+    /// member of this vocabulary.
+    #[must_use]
+    pub fn rule_settlement(&self) -> RuleSettlement {
+        match self {
+            Self::Rule { rule, version } => {
+                rule.parse::<uuid::Uuid>()
+                    .map_or(RuleSettlement::NoRule, |rule| RuleSettlement::Rule {
+                        rule: ClassificationRuleId(rule),
+                        version: *version,
+                    })
+            }
+            Self::Concluded | Self::Directory | Self::SourceAsserted | Self::Answered => {
+                RuleSettlement::NoRule
+            }
         }
     }
 
@@ -11338,6 +11399,57 @@ mod tests {
             "he answered it; nothing else has to explain why it stopped waiting"
         );
         assert_eq!(settled.awaiting(std::slice::from_ref(&question)), 0);
+    }
+
+    /// What a fact records about the rule that filed it (`iaam-k4qu`).
+    ///
+    /// Only one of the five bases names a rule, and it is the one whose rows the
+    /// owner reviews as a group. The other four are not a gap: each of them is a
+    /// reading that ran and found no rule of his, which is a statement the fact
+    /// records rather than a silence. The silence is reserved for the facts no
+    /// reading here produced at all.
+    #[test]
+    fn a_fact_records_the_rule_that_filed_it_and_says_so_when_none_did() {
+        let rule = iaam_core::ids::ClassificationRuleId::new_random();
+        assert_eq!(
+            FactBasis::Rule {
+                rule: rule.inner().to_string(),
+                version: 4,
+            }
+            .rule_settlement(),
+            RuleSettlement::Rule { rule, version: 4 }
+        );
+        for basis in [
+            FactBasis::Concluded,
+            FactBasis::Directory,
+            FactBasis::SourceAsserted,
+            FactBasis::Answered,
+        ] {
+            assert_eq!(
+                basis.rule_settlement(),
+                RuleSettlement::NoRule,
+                "a reading that found no rule says so: {basis:?}"
+            );
+        }
+    }
+
+    /// A rule identifier this build cannot read names no rule.
+    ///
+    /// The basis carries the rule as text because that is what the plan
+    /// publishes. A value that is not an identifier cannot be turned into one,
+    /// and inventing a random one would file the row under a decision nobody
+    /// made — so the fact records that no rule was named rather than a rule that
+    /// does not exist.
+    #[test]
+    fn a_basis_naming_an_unreadable_rule_records_no_rule() {
+        assert_eq!(
+            FactBasis::Rule {
+                rule: "not an identifier".to_owned(),
+                version: 1,
+            }
+            .rule_settlement(),
+            RuleSettlement::NoRule
+        );
     }
 
     // -----------------------------------------------------------------------

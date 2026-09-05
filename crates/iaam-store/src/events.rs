@@ -5,7 +5,9 @@ use iaam_core::event::kind::{
     CASH_TRANSFER_KIND, CONTROL_ASSERTION_KIND, EventKind, FlowEndpoints, IMPORT_COVERAGE_GAP_KIND,
 };
 use iaam_core::event::{Event, Relation};
-use iaam_core::ids::{AccountId, EventId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::ids::{
+    AccountId, ClassificationRuleId, EventId, ImportSessionId, OwnerId, SourceId,
+};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::IdentityScope;
@@ -377,8 +379,10 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
         "INSERT INTO events (
              id, schema_version, owner, account, kind, effective_date, sequence, source_time,
              relation_kind, relation_target, source, source_operation_id,
-             idempotency_key, raw_hash, payload, recorded_at, import_session
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             idempotency_key, raw_hash, payload, recorded_at, import_session,
+             settled_by_rule, settled_by_rule_version
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                   ?18, ?19)",
         params![
             event.id.inner().to_string(),
             event.schema_version,
@@ -405,6 +409,18 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
                 .provenance
                 .import_session()
                 .map(|session| session.inner().to_string()),
+            // Lifted out of the payload for the same reason and written from
+            // the event for the same one: a caller that could pass a rule other
+            // than the one the fact carries is a caller that can make the
+            // column disagree with the provenance. Both columns stay NULL where
+            // the fact names no rule — including where it says a reading found
+            // none, which the payload records and the column deliberately does
+            // not.
+            event
+                .provenance
+                .settling_rule()
+                .map(|(rule, _)| rule.inner().to_string()),
+            event.provenance.settling_rule().map(|(_, version)| version),
         ],
     )?;
     Ok(())
@@ -507,6 +523,20 @@ pub struct JournalQuery {
     pub source: Option<SourceId>,
     /// Only facts committed out of this import session.
     pub import_session: Option<ImportSessionId>,
+    /// Only facts one of the owner's standing classification rules filed.
+    ///
+    /// A fact whose reading found no rule, and a fact recorded before the rule
+    /// was recorded at all, are both outside every value of this filter: they
+    /// name no rule, and this selects by a named one. What tells those two
+    /// apart is the fact's own provenance, not this handle.
+    pub settled_by_rule: Option<ClassificationRuleId>,
+    /// Narrower still: only the facts **that version** of the rule filed.
+    ///
+    /// Meaningless without the rule beside it, because a version numbers one
+    /// rule's own revisions and nothing else. The caller that refuses the pair
+    /// is the application; a second copy of that refusal here would drift from
+    /// the first.
+    pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -585,6 +615,20 @@ fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rus
             &mut sql,
             " AND import_session = ?",
             Box::new(session.inner().to_string()),
+        );
+    }
+    if let Some(rule) = query.settled_by_rule {
+        bind(
+            &mut sql,
+            " AND settled_by_rule = ?",
+            Box::new(rule.inner().to_string()),
+        );
+    }
+    if let Some(version) = query.settled_by_rule_version {
+        bind(
+            &mut sql,
+            " AND settled_by_rule_version = ?",
+            Box::new(version),
         );
     }
     if let Some(from) = query.from {

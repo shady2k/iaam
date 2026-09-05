@@ -37,7 +37,9 @@ use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::import_session::{HeldRow, IntakeOutcome, SessionContents, submit_intake};
 use iaam_app::scenarios::ingest::RowOrigin;
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
-use iaam_app::scenarios::journal::{DeclaredSource, JournalReadQuery, read_journal};
+use iaam_app::scenarios::journal::{
+    DeclaredSource, JournalReadQuery, read_journal, read_operation_history,
+};
 use iaam_app::scenarios::market_reference::{
     MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
     list_market_key_rate as read_market_key_rate, list_market_prices as read_market_prices,
@@ -92,15 +94,15 @@ use crate::dto::{
     JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
     MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
     MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
-    OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto, ProposedAnswerDto,
-    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
-    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountNameDispositionRequest,
-    RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
-    RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
-    ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
-    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
-    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
-    VerdictDto,
+    OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
+    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
+    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
+    RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
+    ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest, RequestPlanDto,
+    RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
+    ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -5129,12 +5131,19 @@ pub struct JournalParams {
     pub settled_by_rule: Option<Uuid>,
     /// One version of that rule.
     ///
-    /// A rule can be edited, and its version counts its own revisions. «What
-    /// this rule filed» and «what version 3 of it filed» are different
-    /// questions, and after an edit the second is usually the one being asked.
+    /// A version counts the owner's decisions, not a rule's own revisions:
+    /// every rule he writes takes the next number in his sequence, and editing
+    /// one retires it and writes a new rule under a new identifier and the next
+    /// number. So a rule and its version are fixed together the moment it is
+    /// written, and a fact records the pair as it stood when the row was filed.
     ///
-    /// Supplied together with `settled_by_rule`. On its own it names nothing, so
-    /// it is refused rather than quietly ignored.
+    /// Naming both here therefore asks for exactly the decision meant, and a
+    /// version that is not the named rule's matches no fact rather than falling
+    /// back to the rule's own rows.
+    ///
+    /// Supplied together with `settled_by_rule`. On its own it is a position in
+    /// his sequence and not a name for a rule, so it is refused rather than
+    /// quietly ignored.
     #[serde(default)]
     pub settled_by_rule_version: Option<u32>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
@@ -5222,6 +5231,58 @@ pub async fn list_journal_events(
             .collect(),
         next: page.next,
     }))
+}
+
+/// One operation's life: what it was when it arrived, and every act since.
+///
+/// The sibling of `GET /v1/journal/events`, and a different question rather than
+/// a filter on it: the listing answers «which rows are there», this answers
+/// «what happened to this one». Each step publishes the fact as it stood after
+/// the act, in exactly the shape the listing returns, so the two routes can
+/// never describe one fact differently.
+///
+/// **Any identifier of the operation opens the same history.** The original, the
+/// replacement standing now and every reversal written along the way all name
+/// one operation, so all of them answer alike: which handle the caller happens
+/// to hold — the one an import returned, or the one a correction just handed
+/// back — must not decide which question it may ask.
+///
+/// **Steps are oldest first**, because a history is read forwards: he wants to
+/// see what the operation was before he sees what it became.
+///
+/// **There is no pagination, and none is coming.** The chain is one operation's
+/// corrections; its length is the number of times the owner changed his mind
+/// about one row, and a page boundary falling in the middle of a history would
+/// hide the very thing the history exists to show. There is no `limit` and no
+/// `after` here, and a caller written against the listing must not expect one.
+///
+/// What this does not show is a category. A category is not recorded on the fact
+/// — it is decided by the owner's category rules when a report is computed — so
+/// «I filed this under the wrong category» is not a correction of an operation
+/// and will never appear here.
+#[utoipa::path(
+    get,
+    path = "/v1/journal/events/{event}/history",
+    params(("event" = Uuid, Path, description = "Any event identifier of the operation: the original, the fact standing now, or a reversal written along the way")),
+    responses(
+        (status = 200, description = "The operation's acts, oldest first, and the fact that counts now", body = OperationHistoryDto),
+        (status = 404, description = "An identifier that addresses no event of yours. An event of another owner reads the same way, deliberately: telling the two apart would confirm that a stranger's event exists", body = ApiError),
+        (status = 422, description = "An identifier that could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn read_journal_event_history(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(event): ApiPath<Uuid>,
+) -> Result<Json<OperationHistoryDto>, ApiFailure> {
+    let history = read_operation_history(
+        state.services.store.as_ref(),
+        principal.owner,
+        EventId(event),
+    )
+    .await?;
+    Ok(Json(OperationHistoryDto::from_domain(&history)))
 }
 
 /// The two halves of a declared source travel together.

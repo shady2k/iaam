@@ -221,7 +221,16 @@ pub struct Event {
 /// what tells the two apart. Nothing is back-filled, because nothing could be:
 /// the rule that settled a row was never recorded, so inventing one would name
 /// a decision the owner never made.
-pub const SCHEMA_VERSION: u32 = 15;
+/// Version 16 adds [`crate::event::provenance::RuleSettlement::AnsweredMintingRule`]:
+/// the owner answered, and that same answer also minted the rule the answer's
+/// own group is filed by. This is neither version 15's «a standing rule filed
+/// it» nor its «a reading ran and none did» — it is a third thing a rule can
+/// have done to a row, and a build that does not know the variant cannot parse
+/// a fact carrying it. Nothing is back-filled: a row settled before this
+/// version by an answer that minted a rule keeps recording plain
+/// [`crate::event::provenance::RuleSettlement::NoRule`], because that is what
+/// was actually written down at the time.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// The version from which [`provenance::Provenance::source_category`] holds a
 /// source's **category** on every path, and nothing else.
@@ -3410,7 +3419,13 @@ mod tests {
         //        number is what tells a reader which of the two an absent field
         //        means, and nothing is back-filled — the rule that settled an
         //        older row was never recorded anywhere to back-fill it from.
-        assert_eq!(SCHEMA_VERSION, 15);
+        // 15 → 16: `RuleSettlement` gained `AnsweredMintingRule` (iaam-vhr4): the
+        //        owner answered, and that same answer also minted the rule, which
+        //        is neither «a rule already standing filed this» nor «no rule
+        //        filed this». A build that does not know the value cannot parse
+        //        a fact carrying it, so the number moves rather than letting
+        //        such a build silently misread the settlement as absent.
+        assert_eq!(SCHEMA_VERSION, 16);
     }
 
     #[test]

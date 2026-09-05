@@ -7,10 +7,14 @@
 -- Without this column that means reading a whole import by eye, which does not
 -- scale past a page.
 --
--- The version is a column of its own rather than folded into the identifier: a
--- rule can be edited, and «the rows rule R filed» and «the rows version 3 of R
--- filed» are two questions. One column holding `rule/version` would answer only
--- the second, and the second is not the one asked most often.
+-- The version is a column of its own rather than folded into the identifier,
+-- because the two are selected on separately: «the rows rule R filed» names no
+-- version, and one column holding `rule/version` would have to be taken apart
+-- to answer it. The version counts the owner's decisions rather than the rule's
+-- own revisions — every rule he writes takes the next number in his sequence,
+-- and an edit retires the rule and writes a new one under a new identifier —
+-- so the pair recorded here is fixed at the moment the row is filed and stays
+-- readable without consulting the rules, including for a rule since retired.
 --
 -- Filtering in Rust after the fact was the alternative and is not one: the
 -- listing is paginated in SQL, so a filter applied afterwards would return short

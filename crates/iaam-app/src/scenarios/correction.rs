@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::correction::{CorrectionError, resolve};
 use iaam_core::event::kind::EventKind;
-use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
+use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, ImportId, PrincipalId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
@@ -141,15 +141,19 @@ impl ImportTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorrectionOutcome {
     pub verdict: Verdict,
-    /// The rule that filed the corrected row, where the fact records one.
+    /// The rule that filed the corrected row, where the fact names one.
     ///
-    /// `None` in both of the other two states, and they are different states.
-    /// A fact saying a reading ran and no rule matched has no standing decision
-    /// behind it, so there is nothing to name. A fact recording nothing about
-    /// rules at all — every fact written before that recording existed, and
-    /// every path that writes without reading a row against the rules — is not
-    /// evidence that no rule filed it, and nothing here turns the silence into
-    /// the claim that he decided the row by hand.
+    /// `Some` for a row a standing rule filed and for a row settled by the
+    /// owner's own answer that also minted a rule — both are, per
+    /// [`iaam_core::event::provenance::RuleSettlement::rule`], a rule behind
+    /// the row. `None` in the other two states, which are different states
+    /// from each other and from both of these. A fact saying a reading ran
+    /// and no rule matched has no standing decision behind it, so there is
+    /// nothing to name. A fact recording nothing about rules at all — every
+    /// fact written before that recording existed, and every path that
+    /// writes without reading a row against the rules — is not evidence that
+    /// no rule filed it, and nothing here turns the silence into the claim
+    /// that he decided the row by hand.
     pub standing_rule: Option<StandingRule>,
 }
 
@@ -172,10 +176,12 @@ pub struct StandingRule {
     /// now on and nothing else: these stay exactly as they are, and each one he
     /// disagrees with is a correction of its own.
     ///
-    /// Counted over every recorded version of the rule, because retiring is by
-    /// rule. Rows this same request corrects are excluded — he has just dealt
-    /// with them — and so are rows already reversed or replaced, which stopped
-    /// counting before he asked.
+    /// Counted over every recorded version of the rule and over both ways a row
+    /// can carry it — filed by the standing rule on its own, or settled by the
+    /// answer that minted it — because retiring the rule is by rule, not by how
+    /// each row came to be filed. Rows this same request corrects are excluded
+    /// — he has just dealt with them — and so are rows already reversed or
+    /// replaced, which stopped counting before he asked.
     pub still_filed: usize,
 }
 
@@ -255,9 +261,14 @@ pub async fn correct_events(
 /// The standing rule behind each corrected row, in the order they were asked for.
 ///
 /// The journal is resolved a second time here, and only when it buys something:
-/// a request none of whose targets records a rule has nothing to count, and
-/// folding a whole journal to answer «nothing» is the cost every correction
-/// would pay for the notice a few of them carry.
+/// a request none of whose targets names a rule — under
+/// [`iaam_core::event::provenance::RuleSettlement::rule`], which reads a rule
+/// out of a standing [`iaam_core::event::provenance::RuleSettlement::Rule`]
+/// and out of an
+/// [`iaam_core::event::provenance::RuleSettlement::AnsweredMintingRule`]
+/// alike — has nothing to count, and folding a whole journal to answer
+/// «nothing» is the cost every correction would pay for the notice a few of
+/// them carry.
 ///
 /// A target the journal does not hold cannot reach this — `candidate_for` has
 /// already refused the request — and if one somehow did, it says nothing rather
@@ -271,12 +282,11 @@ fn standing_rules(
         .iter()
         .map(|correction| by_id.get(&correction.target()).copied())
         .collect();
-    if !targets.iter().flatten().any(|target| {
-        matches!(
-            target.provenance.rule_settlement(),
-            Some(RuleSettlement::Rule { .. })
-        )
-    }) {
+    if !targets
+        .iter()
+        .flatten()
+        .any(|target| target.provenance.settling_rule().is_some())
+    {
         return Ok(vec![None; corrections.len()]);
     }
 
@@ -290,20 +300,25 @@ fn standing_rules(
 
 /// The rule behind one corrected row, and what it still files.
 ///
-/// The three states a fact can be in reach the answer as themselves. A rule
-/// names itself. A reading that matched none of his rules leaves nothing to
-/// name. And a fact that records nothing is not the second one: reading the
-/// silence as «no rule filed this» would tell him he had decided by hand a row
-/// one of his rules may well have decided for him.
+/// The four states a fact can be in reach the answer as themselves, through
+/// [`iaam_core::event::provenance::RuleSettlement::rule`]: a standing
+/// [`iaam_core::event::provenance::RuleSettlement::Rule`] names itself, and
+/// so does an
+/// [`iaam_core::event::provenance::RuleSettlement::AnsweredMintingRule`] —
+/// the owner's own answer minted it, and the group that one decision reached
+/// is exactly the rows the answer settled plus the rows the rule went on to
+/// file, so both route through the same name.
+/// [`iaam_core::event::provenance::RuleSettlement::NoRule`] is a reading
+/// that matched none of his rules and leaves nothing to name. And a fact
+/// that records nothing is not that one either: reading the silence as «no
+/// rule filed this» would tell him he had decided by hand a row one of his
+/// rules may well have decided for him.
 fn standing_rule_for(
     target: &Event,
     effective: &[&Event],
     corrected: &BTreeSet<EventId>,
 ) -> Option<StandingRule> {
-    let (rule, version) = match target.provenance.rule_settlement() {
-        Some(RuleSettlement::Rule { rule, version }) => (*rule, *version),
-        Some(RuleSettlement::NoRule) | None => return None,
-    };
+    let (rule, version) = target.provenance.settling_rule()?;
     let still_filed = effective
         .iter()
         .filter(|event| !corrected.contains(&event.id))
@@ -872,6 +887,7 @@ mod tests {
     use iaam_core::event::Confidence;
     use iaam_core::event::kind::EventKind;
     use iaam_core::event::leg::Leg;
+    use iaam_core::event::provenance::RuleSettlement;
     use iaam_core::ids::{AccountId, ClassificationRuleId, OwnerId};
     use iaam_core::money::{CurrencyCode, Money, PostedMinor};
     use time::macros::date;
@@ -1023,14 +1039,17 @@ mod tests {
         );
     }
 
+    /// A row settled the way `settlement` says, for tests that need a state
+    /// [`filed_by_rule`] does not build.
+    fn settled_by(id: u128, settlement: RuleSettlement) -> Event {
+        let mut event = deposit(id, SourceId::new_random());
+        event.provenance = event.provenance.clone().with_rule_settlement(settlement);
+        event
+    }
+
     /// A row one of the owner's standing rules filed, at that version of it.
     fn filed_by_rule(id: u128, rule: ClassificationRuleId, version: u32) -> Event {
-        let mut event = deposit(id, SourceId::new_random());
-        event.provenance = event
-            .provenance
-            .clone()
-            .with_rule_settlement(RuleSettlement::Rule { rule, version });
-        event
+        settled_by(id, RuleSettlement::Rule { rule, version })
     }
 
     /// The owner's own case: a rule filed a group and one row of it is wrong.
@@ -1056,6 +1075,24 @@ mod tests {
             standing.still_filed, 1,
             "the sibling, and not the row being corrected nor the row no rule filed"
         );
+    }
+
+    /// His own case, and the one the previous wave left uncovered: the row he
+    /// answered is part of the group, so correcting it must name the standing
+    /// decision exactly as correcting a row the rule filed later does.
+    #[test]
+    fn a_corrected_row_his_answer_minted_a_rule_from_names_that_rule() {
+        let rule = ClassificationRuleId(uuid::Uuid::from_u128(11));
+        let corrected = settled_by(1, RuleSettlement::AnsweredMintingRule { rule, version: 1 });
+        let filed_later = filed_by_rule(2, rule, 1);
+        let journal = vec![corrected.clone(), filed_later];
+        let effective = resolve(&journal).expect("a journal that resolves");
+
+        let standing = standing_rule_for(&corrected, &effective, &BTreeSet::from([corrected.id]))
+            .expect("the rule his answer minted is still standing");
+
+        assert_eq!(standing.rule, rule);
+        assert_eq!(standing.still_filed, 1, "the row the rule filed afterwards");
     }
 
     /// A reading ran and none of his rules matched: he settled the row himself,

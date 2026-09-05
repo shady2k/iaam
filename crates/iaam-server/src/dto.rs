@@ -8542,6 +8542,16 @@ pub struct AmountDto {
 }
 
 impl AmountDto {
+    /// A posted sum on its way out, rendered the way a leg's is: major units as
+    /// a decimal string, because binary floating-point loses pennies.
+    #[must_use]
+    pub fn from_money(money: Money) -> Self {
+        Self {
+            amount: money.to_calc_dec().inner().to_string(),
+            currency: CurrencyDto::from_domain(money.currency()),
+        }
+    }
+
     fn to_money(&self, field: &str) -> Result<Money, Rejection> {
         Ok(Money::new(
             PostedMinor::new(minor(&self.amount, self.currency, field)?),
@@ -8973,6 +8983,22 @@ pub struct JournalEventReadDto {
     /// The movement, leg by leg, exactly as recorded. Nothing here is summed:
     /// a total would be a computed number, and this route computes none.
     pub legs: Vec<JournalLegDto>,
+    /// The sum the fact states about itself, where it posts no leg that states
+    /// one.
+    ///
+    /// A fact with legs says its money in them, and `legs` above is where you
+    /// read it. A fact with none says it only in what it is, and one family does
+    /// exactly that: a movement between two accounts of yours whose direction
+    /// the source never stated posts nothing at all — nothing can be debited or
+    /// credited on a direction nobody gave — and yet the fact records the
+    /// magnitude the source printed. Without this field two such facts at
+    /// different sums read identically, and correcting one into the other would
+    /// change nothing you could see.
+    ///
+    /// **Not a total, and never a leg repeated.** Absent wherever a leg already
+    /// carries the money, so that no number has two places here to be read from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<AmountDto>,
     pub relation: JournalRelationDto,
     pub confidence: JournalConfidenceDto,
     /// The client key supplied at ingest, if one was.
@@ -9070,10 +9096,22 @@ pub struct JournalEventReadDto {
 /// together or not at all.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JournalRuleSettlementDto {
-    /// `rule` where one of your standing rules filed the row, `no_rule` where
-    /// the row was read against them and none matched — you answered it
-    /// yourself, your account directory recognised the other side, the source
-    /// asserted it, or the operation arrived already decided.
+    /// `rule` where one of your standing rules filed the row,
+    /// `answered_minting_rule` where you answered the row yourself and that
+    /// same answer became the rule, and `no_rule` where the row was read
+    /// against your rules and none matched — your account directory recognised
+    /// the other side, the source asserted it, you answered and the answer
+    /// generalised into nothing, or the operation arrived already decided.
+    ///
+    /// The first two both name a rule in `rule` below, and they are the rows
+    /// `settled_by_rule` returns together: they are one decision of yours, and
+    /// the group it reached is the rows your answer settled plus the rows the
+    /// rule went on to file. They stay two words because they are two different
+    /// claims about **who decided** — under `rule` you were never asked.
+    ///
+    /// The whole object being absent is a fourth state and is none of these: it
+    /// means nothing was recorded about rules for that fact, which is never
+    /// evidence that no rule was involved.
     pub settled_by: String,
     /// The same determination in words.
     pub explanation: String,
@@ -9082,9 +9120,13 @@ pub struct JournalRuleSettlementDto {
     pub rule: Option<Uuid>,
     /// The version of that rule at the time it filed the row.
     ///
-    /// Recorded because a rule can be edited: after an edit, «the rows this rule
-    /// filed» and «the rows the version I have just replaced filed» are
-    /// different sets, and only the second is the one to review.
+    /// A version counts your decisions, not a rule's own revisions: every rule
+    /// you write takes the next number in your sequence, and editing one
+    /// retires it and writes a new rule under a new identifier and the next
+    /// number. Recorded beside the identifier because the pair is what names
+    /// the decision — a rule you retire later still names the decision that
+    /// filed this row, and `?settled_by_rule=` with `?settled_by_rule_version=`
+    /// asks for exactly it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
 }
@@ -9112,6 +9154,10 @@ const fn settlement_explanation(
         }
         iaam_core::event::provenance::RuleSettlement::Rule { .. } => {
             "a standing rule of yours matched the row and filed it"
+        }
+        iaam_core::event::provenance::RuleSettlement::AnsweredMintingRule { .. } => {
+            "you answered this row yourself, and that same answer became the standing rule named \
+             here"
         }
     }
 }
@@ -9296,6 +9342,7 @@ impl JournalEventReadDto {
             kind: view.kind.to_owned(),
             dates: JournalEventDatesDto::from_domain(view.dates),
             legs: view.legs.iter().map(JournalLegDto::from_domain).collect(),
+            amount: view.amount.map(AmountDto::from_money),
             relation: JournalRelationDto::from_domain(view.relation),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
@@ -9320,6 +9367,251 @@ impl JournalEventReadDto {
 fn format_source_time(time: time::Time) -> String {
     let (hour, minute, second) = time.as_hms();
     format!("{hour:02}:{minute:02}:{second:02}")
+}
+
+// ---------------------------------------------------------------------------
+// An operation's history (iaam-rzh0)
+// ---------------------------------------------------------------------------
+
+/// One operation's life: what it was when it arrived, and every act since.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OperationHistoryDto {
+    /// The acts, **oldest first**, because a history is read forwards: he wants
+    /// to see what the operation was before he sees what it became.
+    ///
+    /// The whole of it, always. There is no pagination here and no page size to
+    /// pass, on purpose: the length of this list is the number of times the
+    /// owner changed his mind about one row, and a page boundary falling in the
+    /// middle of a history would hide the very thing the history exists to show.
+    pub steps: Vec<OperationHistoryStepDto>,
+    /// The fact that counts now.
+    ///
+    /// Absent where the operation ends in a retraction, because nothing stands
+    /// after one. It is the identifier of the last step's `state`, published
+    /// beside the steps so that a caller about to act on the operation —
+    /// correcting it once more — need not work out which step that is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<Uuid>,
+}
+
+/// One act the owner took, with the state it left behind.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OperationHistoryStepDto {
+    /// Which of the three things happened.
+    pub act: HistoryActDto,
+    /// When the act was **recorded by this instance**, RFC 3339.
+    ///
+    /// Not when the operation happened, and never an effective date. A
+    /// correction written in March to a fact effective in January is a March act
+    /// about a January fact, and a reader that confused the two would date the
+    /// owner's change of mind to the day of the operation he changed his mind
+    /// about. The effective date is on `state`, where it belongs.
+    ///
+    /// One act can be two facts, each carrying its own stamp; the earlier of the
+    /// two is published, because that is when the act reached the journal and a
+    /// caller is free to send the two halves in either order.
+    pub at: String,
+    /// The fact as it stands after this act.
+    ///
+    /// Absent after a retraction, because nothing stands after one. It is the
+    /// same view `GET /v1/journal/events` returns, so the two routes can never
+    /// describe one fact differently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<JournalEventReadDto>,
+    /// Which aspects of the fact this act made different from the previous
+    /// state.
+    ///
+    /// Empty on an arrival, which changed nothing because there was nothing
+    /// before it, and after a retraction, which left no state to compare. The
+    /// one arrival where empty does not mean that is a history beginning at a
+    /// fact whose target this journal does not hold — see `arrived` in the
+    /// vocabulary below.
+    ///
+    /// It **names** where the difference is and is deliberately not a rendered
+    /// before-and-after: the state before and the state after are both published
+    /// beside it, so rendering the difference as well would be a second answer
+    /// to the same question, and the two would come to disagree in front of the
+    /// reader.
+    ///
+    /// «Both states» is as much of each fact as this route publishes, which is
+    /// not the whole of it: the raw-row hash, the parser version and the row
+    /// locator are left out, because they answer «which line of which document
+    /// produced this» and nothing here names them. One aspect is named without
+    /// being published on its own, and it is stated rather than hidden — see
+    /// `kind` on the vocabulary below.
+    pub changed: Vec<HistoryChangedAspectDto>,
+    /// The reversal this act wrote, where it wrote one.
+    ///
+    /// Published so that every entry of the history is addressable by name: a
+    /// correction of a correction can then be asked about on its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reversal: Option<Uuid>,
+    /// The replacement this act wrote, where it wrote one.
+    ///
+    /// Absent on an arrival and on a retraction, and that absence is the whole
+    /// difference between a retraction and a correction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<Uuid>,
+}
+
+/// One thing the owner did to an operation, as opposed to one fact the journal
+/// holds.
+///
+/// A correction is normally two facts — a reversal of the target and a
+/// replacement of it — and publishing them raw would show two entries for one
+/// thing he did and leave the reader to work out that they are one act. The
+/// folding is done once, here, and there are three words for it and no more.
+/// Where only one half of a correction was written, the act still gets one
+/// entry and says which half it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryActDto {
+    /// The fact entered the journal. The first step of every history, and the
+    /// only step of most of them.
+    ///
+    /// It is also the word for a history that begins at a fact naming a target
+    /// this journal does not hold. The walk backwards stops at such a target
+    /// rather than failing over it, because from here a target that was never
+    /// written, one belonging to another owner and one lost to a corrupt
+    /// database cannot be told apart: a step saying «there was more before
+    /// this» would claim what nothing supports, and one saying «there was not»
+    /// would be false.
+    ///
+    /// `changed` is empty on this step as on any arrival, and here that
+    /// emptiness is not the statement it is elsewhere — something did precede
+    /// the fact, and this route cannot see it. What speaks about it is
+    /// `relation` on `state`, published exactly as the fact carries it, and on
+    /// such a step it is the only thing that does.
+    Arrived,
+    /// A replacement of the target, and the reversal beside it where one was
+    /// written: another fact took the target's place. `state` is the
+    /// replacement.
+    ///
+    /// The replacement is what makes the act; the reversal is not required
+    /// beside it. A correction is normally the pair and `POST /v1/corrections`
+    /// takes both halves in one call, but a replacement submitted on its own is
+    /// accepted — the two halves may be sent in separate calls, and a replaced
+    /// fact stops counting because it was replaced, not because a reversal
+    /// names it. Such an act is published under this word with `reversal`
+    /// absent, which is what happened: something took the fact's place.
+    Corrected,
+    /// A reversal with no replacement: the fact stopped counting and nothing
+    /// took its place, so there is no `state` after it.
+    ///
+    /// A whole import taken back writes exactly the reversal one corrected row
+    /// does, and this is the same word for both: what you are looking at is one
+    /// operation, and «this was taken back» is the same fact about it either
+    /// way. Which act it belonged to is read off the state before the
+    /// retraction, which names the import the fact arrived in.
+    Retracted,
+}
+
+/// Which aspect of the fact an act made different.
+///
+/// A closed vocabulary, computed from the two facts and not from the two
+/// published states beside it. A `state` carries the kind as a word and the
+/// legs; the scalars that tell two facts of one family apart are published
+/// nowhere on their own, and comparing only what is published would report an
+/// empty `changed` on a correction that changed one of them — see `kind` below.
+///
+/// **A category is not among them, and that is a real limit rather than an
+/// omission.** A category is not recorded on the fact at all — it is decided by
+/// the owner's category rules when a report is computed — so «I filed this under
+/// the wrong category» is not a correction of an operation, and this history
+/// will not show it. An empty `changed` that quietly meant «we do not record
+/// that» would report that nothing had happened.
+///
+/// Provenance is not among them either, for the opposite reason: a replacement
+/// is a new fact and necessarily carries its own source and its own idempotency
+/// key, so calling those changed would mark every correction as having changed
+/// them and would say nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryChangedAspectDto {
+    /// The event family — `cash_in`, `trade`, `income` and so on — and the
+    /// scalars that tell two facts of one family apart: the side of a trade, the
+    /// sort of an income, what a fee was for, whether a tax was withheld or
+    /// paid.
+    ///
+    /// Those scalars are the one thing this vocabulary names that the two states
+    /// do not publish on their own: you are told the sort of the fact changed
+    /// and read the two states to see how. Naming it is still the better
+    /// failure, because the alternative is an empty `changed` on a correction
+    /// that really did change something.
+    Kind,
+    /// What moved: the money and the quantity the legs carry, the instrument
+    /// they name, and the figures the fact itself states — which, for a fact
+    /// that posts no leg, are the whole of what it says. `amount` on the state
+    /// is where you read that one.
+    Amount,
+    /// Where it moved: the account the fact is filed under, and the account and
+    /// custody each leg posts to.
+    Account,
+    /// When it happened: the date the journal orders the fact by, the time of
+    /// day the source stated, and the semantic dates the fact carries.
+    Dates,
+    /// Who the far side was, as the source printed it on the row.
+    Counterparty,
+    /// How sure the fact is — and, on a reconstructed opening or a valuation,
+    /// what the fact itself asserts about how sure it is.
+    Confidence,
+}
+
+impl OperationHistoryDto {
+    #[must_use]
+    pub fn from_domain(history: &iaam_app::scenarios::journal::OperationHistory) -> Self {
+        Self {
+            steps: history
+                .steps
+                .iter()
+                .map(OperationHistoryStepDto::from_domain)
+                .collect(),
+            current: history.current.map(|event| event.inner()),
+        }
+    }
+}
+
+impl OperationHistoryStepDto {
+    #[must_use]
+    pub fn from_domain(step: &iaam_app::scenarios::journal::HistoryStep) -> Self {
+        Self {
+            act: HistoryActDto::from_domain(step.act),
+            at: step.at.clone(),
+            state: step.state.as_ref().map(JournalEventReadDto::from_domain),
+            changed: step
+                .changed
+                .iter()
+                .copied()
+                .map(HistoryChangedAspectDto::from_domain)
+                .collect(),
+            reversal: step.reversal.map(|event| event.inner()),
+            replacement: step.replacement.map(|event| event.inner()),
+        }
+    }
+}
+
+impl HistoryActDto {
+    const fn from_domain(act: iaam_app::scenarios::journal::HistoryAct) -> Self {
+        match act {
+            iaam_app::scenarios::journal::HistoryAct::Arrived => Self::Arrived,
+            iaam_app::scenarios::journal::HistoryAct::Corrected => Self::Corrected,
+            iaam_app::scenarios::journal::HistoryAct::Retracted => Self::Retracted,
+        }
+    }
+}
+
+impl HistoryChangedAspectDto {
+    const fn from_domain(aspect: iaam_app::scenarios::journal::ChangedAspect) -> Self {
+        use iaam_app::scenarios::journal::ChangedAspect;
+        match aspect {
+            ChangedAspect::Kind => Self::Kind,
+            ChangedAspect::Amount => Self::Amount,
+            ChangedAspect::Account => Self::Account,
+            ChangedAspect::Dates => Self::Dates,
+            ChangedAspect::Counterparty => Self::Counterparty,
+            ChangedAspect::Confidence => Self::Confidence,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9662,17 +9954,20 @@ pub struct ImportQuestionDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QuestionSettlementDto {
     /// `rule`, `directory`, `source_asserted`, `answered`,
-    /// `one_account_two_instruments` or `second_leg_of_one_movement`.
+    /// `answered_minting_rule`, `one_account_two_instruments` or
+    /// `second_leg_of_one_movement`.
     ///
     /// Which of them can appear depends on what is being described, and the
     /// difference is not a gap:
     ///
     /// - on a question, `settled_without_answer` exists for the questions with
-    ///   no `answered_at`, so `answered` never reaches it — the question says
-    ///   that about itself;
-    /// - on a line of a forecast, `answered` is one of the words, because there
-    ///   the question is what settles the line rather than why it stopped
-    ///   waiting.
+    ///   no `answered_at`, so neither `answered` nor `answered_minting_rule`
+    ///   ever reaches it — the question says that about itself;
+    /// - on a line of a forecast, both answered words are available, because
+    ///   there the question is what settles the line rather than why it stopped
+    ///   waiting. They differ in what the line belongs to: under
+    ///   `answered_minting_rule` the answer also became a standing rule, so the
+    ///   line is one of the group that rule files.
     ///
     /// `concluded` reaches neither: a caller that submitted a finished
     /// operation raises no question, and a forecast is never tested against
@@ -11376,7 +11671,13 @@ pub struct PlannedFactDto {
     /// the two were one word until `iaam-rdya`.
     pub records_as: String,
     /// On whose word this row was settled: `concluded`, `directory`,
-    /// `source_asserted`, `rule` or `answered`.
+    /// `source_asserted`, `rule`, `answered` or `answered_minting_rule`.
+    ///
+    /// The last two are both your own answer, and they differ in what the row
+    /// belongs to: under `answered_minting_rule` that answer also became a
+    /// standing rule, so the row is one of the group that rule files and
+    /// `settled_by_rule` names it. Under `answered` the answer generalised into
+    /// nothing and the row stands alone.
     ///
     /// **`source_asserted` is the value this field was added for.** A source
     /// that asserts the far side of a row is one of the owner's accounts
@@ -11389,7 +11690,12 @@ pub struct PlannedFactDto {
     pub settled_by: String,
     /// The same determination in words.
     pub settled_by_explanation: String,
-    /// The standing rule that settled the row, where one did.
+    /// The rule this row will be filed under, where there is one.
+    ///
+    /// Present for `rule` and for `answered_minting_rule` alike, because it
+    /// answers «which rule is behind this row» and for both of those there is
+    /// one. `settled_by` beside it is what says whether the rule filed the row
+    /// or your answer to it minted the rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_by_rule: Option<String>,
     /// Signed cash this row moves on its own account, as a decimal string.
@@ -12001,7 +12307,9 @@ impl PlannedFactDto {
             settled_by: fact.settled_by.code().to_owned(),
             settled_by_explanation: fact.settled_by.describe().to_owned(),
             settled_by_rule: match &fact.settled_by {
-                FactBasis::Rule { rule, .. } => Some(rule.inner().to_string()),
+                FactBasis::Rule { rule, .. } | FactBasis::AnsweredMintingRule { rule, .. } => {
+                    Some(rule.inner().to_string())
+                }
                 FactBasis::Concluded
                 | FactBasis::Directory
                 | FactBasis::SourceAsserted

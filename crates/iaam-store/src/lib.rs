@@ -104,6 +104,18 @@ pub enum StoreError {
         #[source]
         source: serde_json::Error,
     },
+    /// A correction chain that comes back to a fact it already holds.
+    ///
+    /// `iaam_core::event::correction::resolve` refuses to write one, so a
+    /// database holding one is corrupt. It is an error rather than a shorter
+    /// chain because the two are indistinguishable to whoever reads the answer:
+    /// a fragment of a history returned as though it were the whole of it is a
+    /// wrong answer given confidently, and the walk would keep giving it.
+    #[error(
+        "the correction chain returns to event {event}: the journal holds a cycle, \
+         and no whole history can be read out of it"
+    )]
+    CorrectionChainCycle { event: String },
 }
 /// Why the instrument could not be resolved by external code.
 ///

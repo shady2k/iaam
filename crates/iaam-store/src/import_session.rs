@@ -9,7 +9,9 @@
 //! and the application reads them. It validates that they parse, because a
 //! payload the application cannot read must not be written silently.
 
-use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::ids::{
+    AccountId, ClassificationRuleId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{SqliteStore, StoreError, now};
@@ -97,6 +99,28 @@ pub struct StoredSessionSummary {
     pub unanswered: usize,
 }
 
+/// The standing rule the owner's own answer minted, and the version it was
+/// minted at.
+///
+/// **One value and never two nullable columns' worth of fields.** A rule held
+/// as something a caller can get half-right — an identifier with no version, a
+/// version naming no rule — is a state with no truthful answer, and `iaam-r0qk`
+/// is what it cost the last time one existed. The pair makes it
+/// unrepresentable.
+///
+/// The version is the one that stood **when the rule was minted**, and it is the
+/// only one that rule will ever carry: a version is the owner's decision number
+/// in sequence, and an edit retires the rule and writes a new one under a new
+/// identifier and the next number rather than raising the old one's. Recording
+/// it beside the identifier is therefore not a guard against a number that
+/// moves — it is what lets a reader say which decision of his filed the row
+/// without consulting the rules, including once that rule has been retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredAnswerRule {
+    pub rule: ClassificationRuleId,
+    pub version: u32,
+}
+
 /// One submitted line held in a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredObservation {
@@ -106,6 +130,13 @@ pub struct StoredObservation {
     pub concluded: bool,
     pub payload: String,
     pub answer: Option<String>,
+    /// The rule the owner's answer to this row minted, where it minted one.
+    ///
+    /// `None` on every row nobody answered, on every row whose answer
+    /// generalised into nothing, and on every row recorded before the columns
+    /// existed — nothing is back-filled, so silence here is silence and never a
+    /// claim.
+    pub answer_rule: Option<StoredAnswerRule>,
 }
 
 /// A question about to be written: its typed form, its alternatives, its wording.
@@ -379,6 +410,9 @@ impl SqliteStore {
             concluded,
             payload: payload.to_owned(),
             answer: None,
+            // Nothing is minted at intake, and nothing is back-filled: a row
+            // names a rule only once an answer of his has written one.
+            answer_rule: None,
         };
         transaction.execute(
             "INSERT INTO import_observations (session, row, row_key, concluded, payload, answer)
@@ -401,20 +435,25 @@ impl SqliteStore {
         session: ImportSessionId,
     ) -> Result<Vec<StoredObservation>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT row, row_key, concluded, payload, answer
+            "SELECT row, row_key, concluded, payload, answer, answer_rule, answer_rule_version
              FROM import_observations WHERE session = ?1 ORDER BY row",
         )?;
         let rows = statement.query_map([session.inner().to_string()], |row| {
-            Ok(StoredObservation {
-                row: row.get(0)?,
-                row_key: row.get(1)?,
-                concluded: row.get::<_, i64>(2)? != 0,
-                payload: row.get(3)?,
-                answer: row.get(4)?,
-            })
+            Ok((
+                StoredObservation {
+                    row: row.get(0)?,
+                    row_key: row.get(1)?,
+                    concluded: row.get::<_, i64>(2)? != 0,
+                    payload: row.get(3)?,
+                    answer: row.get(4)?,
+                    answer_rule: None,
+                },
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
+            ))
         })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        rows.map(|row| row.map_err(StoreError::from).and_then(with_answer_rule))
+            .collect()
     }
 
     /// Record the question one row raises, or return the one it already raised.
@@ -634,6 +673,70 @@ impl SqliteStore {
             })?;
         transaction.commit()?;
         Ok(stored)
+    }
+
+    /// Stamp the rule one answer minted onto every row that answer settled.
+    ///
+    /// The observation and not the question, and that is decision §3.4. Commit
+    /// reads the answer off the **observation**, so the rule has to be recorded
+    /// where the answer already is. Attaching it to the sibling *questions*
+    /// would carry it too, and it would change what the assessment says about
+    /// each of them — a question that reported no recorded generalisation would
+    /// start reporting one, and the owner would be told a dozen times that a
+    /// rule was written from one answer.
+    ///
+    /// All the rows in one transaction, for the reason
+    /// [`Self::state_import_control_figures`] writes a statement's sections
+    /// together: the rows are one decision of his. Half of them stamped would
+    /// split the group in two, and «show me everything this decision did» would
+    /// answer with part of it.
+    ///
+    /// `answer IS NOT NULL AND answer_rule IS NULL` is the condition, the same
+    /// one [`Self::attach_import_question_rule`] writes under and for the same
+    /// reason: this may not invent a generalisation for a row nobody answered,
+    /// and it may not overwrite one already recorded. A row that no longer meets
+    /// it is a `NotFound`, and the refusal takes the whole call with it.
+    ///
+    /// The version is the caller's, taken at the moment the rule was minted, and
+    /// it is deliberately not read back from the rule store at commit. Not
+    /// because it could have changed — a rule keeps the version it was written
+    /// under, since an edit retires it and writes a new rule with a new
+    /// identifier — but because the pair the answer established is the whole of
+    /// what this records. Reading it back would make the write depend on a rule
+    /// the owner may since have retired.
+    pub fn attach_import_answer_rule(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        rows: &[u32],
+        rule: ClassificationRuleId,
+        version: u32,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_open(&transaction, owner, session)?;
+        for row in rows {
+            let updated = transaction.execute(
+                "UPDATE import_observations SET answer_rule = ?3, answer_rule_version = ?4
+                 WHERE session = ?1 AND row = ?2
+                   AND answer IS NOT NULL AND answer_rule IS NULL",
+                params![
+                    session.inner().to_string(),
+                    row,
+                    rule.inner().to_string(),
+                    version,
+                ],
+            )?;
+            if updated == 0 {
+                return Err(StoreError::NotFound {
+                    what: "an answered import row without a minted rule",
+                    id: row.to_string(),
+                });
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Record what a source printed about itself, replacing what it printed
@@ -925,21 +1028,28 @@ fn observation_by_key(
     key: &str,
 ) -> Result<Option<StoredObservation>, StoreError> {
     conn.query_row(
-        "SELECT row, row_key, concluded, payload, answer
+        "SELECT row, row_key, concluded, payload, answer, answer_rule, answer_rule_version
          FROM import_observations WHERE session = ?1 AND row_key = ?2",
         params![session.inner().to_string(), key],
         |row| {
-            Ok(StoredObservation {
-                row: row.get(0)?,
-                row_key: row.get(1)?,
-                concluded: row.get::<_, i64>(2)? != 0,
-                payload: row.get(3)?,
-                answer: row.get(4)?,
-            })
+            Ok((
+                StoredObservation {
+                    row: row.get(0)?,
+                    row_key: row.get(1)?,
+                    concluded: row.get::<_, i64>(2)? != 0,
+                    payload: row.get(3)?,
+                    answer: row.get(4)?,
+                    answer_rule: None,
+                },
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
+            ))
         },
     )
     .optional()
-    .map_err(StoreError::from)
+    .map_err(StoreError::from)?
+    .map(with_answer_rule)
+    .transpose()
 }
 
 fn question_for_row(
@@ -1062,6 +1172,33 @@ fn check_json(value: &str, field: &'static str) -> Result<(), StoreError> {
     serde_json::from_str::<serde_json::Value>(value)
         .map(|_| ())
         .map_err(|source| StoreError::RuleNotJson { field, source })
+}
+
+/// Put the two stored columns back together into the one value they are.
+///
+/// A rule with no version, or a version naming no rule, is a half-written row
+/// this store never writes — both columns are set in one statement — so it is
+/// refused here rather than handed on as a pair a reader has to second-guess.
+fn with_answer_rule(
+    (observation, rule, version): (StoredObservation, Option<String>, Option<u32>),
+) -> Result<StoredObservation, StoreError> {
+    let answer_rule = match (rule, version) {
+        (None, None) => None,
+        (Some(rule), Some(version)) => Some(StoredAnswerRule {
+            rule: ClassificationRuleId(parse_uuid(&rule, "a minted classification rule")?),
+            version,
+        }),
+        (rule, version) => {
+            return Err(StoreError::InvalidValue {
+                field: "answer_rule",
+                value: format!("{rule:?} at version {version:?}"),
+            });
+        }
+    };
+    Ok(StoredObservation {
+        answer_rule,
+        ..observation
+    })
 }
 
 fn parse_uuid(value: &str, what: &'static str) -> Result<uuid::Uuid, StoreError> {

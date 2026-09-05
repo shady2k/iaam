@@ -7,9 +7,11 @@
 //!
 //! Every account, label and identifier below is invented for this file.
 
-use iaam_core::ids::{AccountId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::ids::{
+    AccountId, ClassificationRuleId, ImportId, ImportQuestionId, ImportSessionId, OwnerId, SourceId,
+};
 use iaam_store::SqliteStore;
-use iaam_store::import_session::{NewQuestion, SessionState};
+use iaam_store::import_session::{NewQuestion, SessionState, StoredAnswerRule};
 
 fn store() -> SqliteStore {
     SqliteStore::open_in_memory().expect("in-memory database")
@@ -514,4 +516,151 @@ fn the_listing_counts_the_rows_and_the_open_questions_of_each_session() {
         .expect("the session is listed");
     assert_eq!(held.unanswered, 1);
     assert_eq!(held.row_count, 3);
+}
+
+/// The rule one answer minted reaches every row that answer settled.
+///
+/// The rows are stamped together, in one call, because they are one decision.
+/// Stamped one at a time by the caller, a failure half-way would leave the
+/// group split between the rows that name the rule and the rows that do not,
+/// and «show me everything this decision did» would answer with part of it.
+#[test]
+fn the_rule_an_answer_minted_is_stamped_on_every_row_that_answer_settled() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let mut answered = Vec::new();
+    for key in ["row/1", "row/2"] {
+        let row = store
+            .add_import_observation(owner, session, Some(key), false, "{}")
+            .expect("row added")
+            .row;
+        let question = store
+            .record_import_question(owner, session, row, &asking())
+            .expect("question recorded");
+        store
+            .answer_import_question(owner, session, question.id, r#"{"answer":"paid"}"#)
+            .expect("answer recorded");
+        answered.push(row);
+    }
+    // A third row nobody answered. It must come out of this untouched: an
+    // answer speaks for the rows it settled and for no others.
+    let untouched = store
+        .add_import_observation(owner, session, Some("row/3"), false, "{}")
+        .expect("row added")
+        .row;
+
+    let rule = ClassificationRuleId::new_random();
+    store
+        .attach_import_answer_rule(owner, session, &answered, rule, 1)
+        .expect("the minted rule is stamped on the rows the answer settled");
+
+    let rows = store.list_import_observations(session).expect("rows");
+    for row in &rows {
+        let stamped = row.answer_rule;
+        if answered.contains(&row.row) {
+            assert_eq!(
+                stamped,
+                Some(StoredAnswerRule { rule, version: 1 }),
+                "the row the answer settled names the rule it minted"
+            );
+        } else {
+            assert_eq!(row.row, untouched);
+            assert_eq!(stamped, None, "no row carries a rule it did not get");
+        }
+    }
+}
+
+/// An unanswered row, and a row already naming a rule, are both refused — and
+/// the refusal takes the whole call with it.
+///
+/// The same condition `attach_import_question_rule` writes under, for the same
+/// reason: this may not invent a generalisation for a row nobody answered, and
+/// it may not overwrite one already recorded. Refusing the whole call rather
+/// than the offending row keeps the group whole either way.
+#[test]
+fn stamping_a_minted_rule_refuses_an_unanswered_row_and_writes_nothing() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let answered = store
+        .add_import_observation(owner, session, Some("row/1"), false, "{}")
+        .expect("row added")
+        .row;
+    let question = store
+        .record_import_question(owner, session, answered, &asking())
+        .expect("question recorded");
+    store
+        .answer_import_question(owner, session, question.id, r#"{"answer":"paid"}"#)
+        .expect("answer recorded");
+    let open = store
+        .add_import_observation(owner, session, Some("row/2"), false, "{}")
+        .expect("row added")
+        .row;
+
+    let rule = ClassificationRuleId::new_random();
+    assert!(
+        store
+            .attach_import_answer_rule(owner, session, &[answered, open], rule, 1)
+            .is_err(),
+        "a row nobody answered is not a row an answer's rule may be stamped on"
+    );
+    let rows = store.list_import_observations(session).expect("rows");
+    assert!(
+        rows.iter().all(|row| row.answer_rule.is_none()),
+        "the refusal left half the group stamped: {rows:?}"
+    );
+
+    store
+        .attach_import_answer_rule(owner, session, &[answered], rule, 1)
+        .expect("the answered row alone is stamped");
+    assert!(
+        store
+            .attach_import_answer_rule(owner, session, &[answered], rule, 2)
+            .is_err(),
+        "a row already naming a minted rule is not renamed: the fact must record \
+         the version it was filed under"
+    );
+}
+
+/// A closed session takes no stamp, exactly as it takes no answer.
+#[test]
+fn a_closed_session_takes_no_minted_rule() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let row = store
+        .add_import_observation(owner, session, Some("row/1"), false, "{}")
+        .expect("row added")
+        .row;
+    let question = store
+        .record_import_question(owner, session, row, &asking())
+        .expect("question recorded");
+    store
+        .answer_import_question(owner, session, question.id, r#"{"answer":"paid"}"#)
+        .expect("answer recorded");
+    store
+        .close_import_session(owner, session, SessionState::Committed)
+        .expect("session closes");
+
+    assert!(
+        store
+            .attach_import_answer_rule(
+                owner,
+                session,
+                &[row],
+                ClassificationRuleId::new_random(),
+                1
+            )
+            .is_err()
+    );
 }

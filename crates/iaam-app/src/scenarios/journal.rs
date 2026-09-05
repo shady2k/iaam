@@ -15,16 +15,22 @@
 //! leaving an agent to discover it from the field names.
 
 use iaam_core::dates::EventDates;
-use iaam_core::event::leg::Leg;
-use iaam_core::event::provenance::RuleSettlement;
-use iaam_core::event::{Confidence, Relation};
-use iaam_core::ids::{
-    AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
+use iaam_core::event::kind::{
+    EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TaxOrigin, TradeSide,
 };
+use iaam_core::event::leg::{Leg, LegKind};
+use iaam_core::event::provenance::RuleSettlement;
+use iaam_core::event::{Confidence, Event, Relation};
+use iaam_core::ids::{
+    AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId, InstrumentId,
+    OwnerId, SourceId,
+};
+use iaam_core::money::{CalcMoney, Money, PerUnitAmount, Quantity};
+use iaam_core::valuation::PriceQuality;
 use time::{Date, Time};
 
 use crate::error::AppError;
-use crate::ports::{JournalCursor, JournalQuery, Store};
+use crate::ports::{JournalCursor, JournalQuery, RecordedEvent, Store};
 
 /// Rows returned when the caller names no size.
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
@@ -78,10 +84,13 @@ pub struct JournalReadQuery {
     pub settled_by_rule: Option<ClassificationRuleId>,
     /// One version of that rule, where the caller wants only its rows.
     ///
-    /// A rule can be edited, so «the rows rule R filed» and «the rows version 3
-    /// of R filed» are different questions, and after an edit the second is the
-    /// one asked. Supplied together with the rule; a version on its own names
-    /// nothing and is refused rather than ignored.
+    /// A version counts his decisions rather than one rule's revisions: every
+    /// rule he writes takes the next number in his sequence, and an edit retires
+    /// the rule and writes a new one under a new identifier and the next number.
+    /// A fact records the pair as it stood when the row was filed, so naming
+    /// both asks for exactly one decision of his. Supplied together with the
+    /// rule; a version on its own is a position in that sequence and not a name
+    /// for a rule, and is refused rather than ignored.
     pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
@@ -127,6 +136,23 @@ pub struct JournalEventView {
     /// The movement, leg by leg, exactly as recorded. No leg is added up here:
     /// a total is a computed number and this route computes none.
     pub legs: Vec<Leg>,
+    /// The sum the fact states about itself, where it posts no leg that states
+    /// one.
+    ///
+    /// A fact with legs says its money in them and they are published above; a
+    /// fact with none says it only in its kind, and without this field the whole
+    /// of what such a fact says would be missing here. One family carries it
+    /// today, and it is the family that needs it: a movement between the owner's
+    /// own accounts whose direction the source never stated posts nothing at all
+    /// — the journal will not debit or credit an account on a direction nobody
+    /// gave — and yet the fact records the magnitude the source printed. Without
+    /// this, two such facts at different sums read identically.
+    ///
+    /// **Not a total, and never a leg repeated.** This route adds nothing up,
+    /// as `legs` says; the value here is one figure the fact itself holds, and
+    /// it is `None` wherever a leg already carries the money, so that no number
+    /// has two places to be read from.
+    pub amount: Option<Money>,
     /// Whether this event reverses or replaces another. A reader who cannot see
     /// that an event was reversed reads a retracted fact as a live one.
     pub relation: Relation,
@@ -178,14 +204,19 @@ pub struct JournalEventView {
     pub import_session: Option<ImportSessionId>,
     /// What the owner's standing rules made of this row, when a reading said.
     ///
-    /// Three states and not two, and the third is the one he must be able to
-    /// see. A rule names itself and its version — that is the group one decision
-    /// of his reached. `no_rule` says a reading ran and none of his rules
-    /// matched, so the row was settled some other way: he answered it, his
-    /// account directory recognised the far side, the source asserted it, or the
-    /// caller submitted a finished operation. Absence says nothing was recorded
-    /// at all — every fact written before this field existed, and every route
-    /// that writes without reading a row against the rules.
+    /// Four states, and the ones past «a rule filed it» are the ones he must be
+    /// able to see. `rule` names a rule and its version: the group one standing
+    /// decision of his reached without asking him again.
+    /// `answered_minting_rule` names a rule and its version too, and says he
+    /// answered this row by hand and that same answer became the rule — the two
+    /// are different claims about **who decided**, which is why they stay two
+    /// words. `no_rule` says a reading ran and none of his rules matched, so the
+    /// row was settled some other way: his account directory recognised the far
+    /// side, the source asserted it, the caller submitted a finished operation,
+    /// or he answered it and the answer generalised into nothing. Absence is the
+    /// fourth and is none of these: nothing was recorded about rules at all —
+    /// every fact written before this field existed, and every route that writes
+    /// without reading a row against the rules.
     ///
     /// Absence is therefore never «no rule filed this». Reading it that way
     /// tells him a row one of his rules did file was decided by hand.
@@ -270,6 +301,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         kind: event.kind.discriminant(),
         dates: event.dates,
         legs: event.legs.clone(),
+        amount: stated_amount(event),
         relation: event.relation,
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
@@ -284,12 +316,639 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
     }
 }
 
+/// One thing the owner did to an operation, as opposed to one fact the journal
+/// holds.
+///
+/// A correction is normally two facts — a reversal of the target and a
+/// replacement of it — and publishing them raw would show him two entries for
+/// one thing he did and leave him to work out that they are one act. The
+/// folding is unambiguous, because both name the same target and `resolve`
+/// refuses a second replacement of an event, so it is done once, here, and
+/// every reader downstream is handed acts. Where only one half was written the
+/// act is still one entry, and which half it holds is on the step.
+///
+/// Three of them, and no more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAct {
+    /// The fact entered the journal. The first step of every history, and the
+    /// only step of most of them.
+    ///
+    /// It is also where a history begins when the head of the chain names a
+    /// target this owner's journal does not hold — see
+    /// [`read_operation_history`] for why that ends the walk rather than
+    /// failing it.
+    Arrived,
+    /// A replacement of the target, and the reversal beside it where one was
+    /// written: another fact took the target's place. The state after the act
+    /// is the replacement.
+    ///
+    /// The replacement is what makes the act, and a reversal beside it is not
+    /// required. `candidate_for` in [`crate::scenarios::correction`] checks
+    /// only that a replacement's target exists, and
+    /// [`iaam_core::event::correction::resolve`] drops a replaced fact from the
+    /// effective set because it was replaced, not because a reversal names it —
+    /// so the two halves may be submitted in separate calls, and a replacement
+    /// alone is a correction. [`acts_of`] publishes such an act under this word
+    /// with no `reversal`, which says what happened: something took the fact's
+    /// place.
+    Corrected,
+    /// A reversal with no replacement: the fact stopped counting and nothing
+    /// took its place, so there is no state after it.
+    ///
+    /// A whole import taken back writes exactly the reversal one corrected row
+    /// does, and this says the same word for both. What the owner is looking at
+    /// is his operation, and «this was taken back» is the same fact about it
+    /// either way; which act it belonged to he reads off the state before the
+    /// retraction, which names the import the fact arrived in.
+    Retracted,
+}
+
+/// Which aspect of the fact an act made different.
+///
+/// A closed vocabulary, and **not a rendered before-and-after**. The state
+/// before and the state after are both published beside it, so rendering the
+/// difference as well would be a second answer to the same question, and the two
+/// would come to disagree in front of the owner. These name where the difference
+/// is; what it is, he reads off the states themselves.
+///
+/// «Both states» is as much of each fact as this route publishes, which is
+/// deliberately not the whole of it: [`JournalEventView`] leaves out the raw-row
+/// hash, the parser version and the row locator, because they answer a different
+/// question. None of those is an aspect below, so the argument holds — with one
+/// exception, stated here rather than hidden. The scalars that tell two facts of
+/// one family apart are compared under [`Self::Kind`] and are published on their
+/// own nowhere: he is told the sort of the fact changed and must read the two
+/// states to see how. Naming it is still the better failure, because the
+/// alternative is silence, and silence reports that a correction changed
+/// nothing.
+///
+/// **A category is deliberately not among them.** A category is not recorded on
+/// the fact at all — it is decided by the owner's category rules when a report
+/// is computed — so «I filed this under the wrong category» is not a correction
+/// of an operation, and this history will not show it. Saying so is the point:
+/// an empty `changed` that quietly meant «we do not record that» would tell him
+/// nothing had happened.
+///
+/// Provenance is not among them either, for the opposite reason. A replacement
+/// is a new fact and necessarily carries its own source and its own idempotency
+/// key, so calling those changed would mark every correction as having changed
+/// them and would say nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangedAspect {
+    /// The event family — `cash_in`, `trade`, `income` and so on — and the
+    /// scalars that tell two facts of one family apart: the side of a trade,
+    /// the sort of an income, what a fee was for, whether a tax was withheld or
+    /// paid. None of those changes the family word, and a correction that
+    /// changed one of them and nothing else would otherwise read as no
+    /// correction at all.
+    Kind,
+    /// What moved: the money and the quantity the legs carry, the instrument
+    /// they name, and the figures the fact's own kind states — which, for a
+    /// fact that posts no leg, are the whole of what it says.
+    Amount,
+    /// Where it moved: the account the fact is filed under, and the account and
+    /// custody each leg posts to.
+    Account,
+    /// When it happened: the date the journal orders the fact by, the time of
+    /// day the source stated, and the semantic dates the fact carries.
+    Dates,
+    /// Who the far side was, as the source printed it on the row.
+    Counterparty,
+    /// How sure the fact is — and, on a reconstructed opening or a valuation,
+    /// what the fact itself asserts about how sure it is.
+    Confidence,
+}
+
+/// One act, with the state it left behind.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryStep {
+    /// Which of the three things happened.
+    pub act: HistoryAct,
+    /// When the act was recorded: this instance's own clock at the moment it
+    /// wrote the fact down, RFC 3339.
+    ///
+    /// **Not the effective date, and never published as one.** A correction
+    /// written in March to a fact effective in January is a March act about a
+    /// January fact, and a reader that confused the two would date the owner's
+    /// change of mind to the day of the operation he changed his mind about.
+    /// The effective date is on the state, where it belongs.
+    ///
+    /// An act can be two facts and each carries a stamp. The earlier of the two
+    /// is when the act reached the journal; taking the replacement's would date
+    /// a correction by whichever half happened to be written second, and a
+    /// caller is free to send the two in either order.
+    pub at: String,
+    /// The fact as it stands after this act.
+    ///
+    /// `None` after a retraction, because nothing stands after one. It is the
+    /// same view the journal listing returns, so that the two routes can never
+    /// describe one fact differently.
+    pub state: Option<JournalEventView>,
+    /// Which aspects this act made different from the previous state.
+    ///
+    /// Empty on an arrival, which changed nothing because there was nothing
+    /// before it, and after a retraction, which left no state to compare. The
+    /// one arrival where empty does not mean that is a chain whose head names a
+    /// target this owner's journal does not hold — see [`HistoryAct::Arrived`].
+    pub changed: Vec<ChangedAspect>,
+    /// The reversal this act wrote, where it wrote one.
+    ///
+    /// Published so that every entry of the history is addressable by name: a
+    /// correction of a correction can then be asked about on its own.
+    pub reversal: Option<EventId>,
+    /// The replacement this act wrote, where it wrote one.
+    ///
+    /// `None` on an arrival and on a retraction, and that absence is the whole
+    /// difference between a retraction and a correction.
+    pub replacement: Option<EventId>,
+}
+
+/// One operation's life: what it was when it arrived, and every act since.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationHistory {
+    /// The acts, oldest first, because a history is read forwards: he wants to
+    /// see what the operation was before he sees what it became.
+    pub steps: Vec<HistoryStep>,
+    /// The fact that counts now.
+    ///
+    /// `None` where the operation ends in a retraction. It is the identifier of
+    /// the last step's state, published beside the steps so that a caller about
+    /// to act on the operation — correcting it once more — need not work out
+    /// which step that is.
+    pub current: Option<EventId>,
+}
+
+/// One operation's history, entered by any identifier in it.
+///
+/// The original, the replacement standing now and every reversal written along
+/// the way all name the same operation, so all of them answer with the same
+/// history: which handle he happens to hold must not decide which question he
+/// may ask. [`Store::event_chain`] does the walking; this turns the facts it
+/// returns into the acts that wrote them.
+///
+/// An identifier that addresses no event of his is an [`AppError::NotFound`] —
+/// the same refusal [`read_journal`] gives an idempotency key that addresses
+/// nothing, and the same refusal for an event of somebody else's, deliberately,
+/// since telling those two apart would confirm that a stranger's event exists.
+///
+/// **A head that names a target outside his journal.** The backward walk stops
+/// at a `relation.target` this owner's journal does not hold rather than
+/// failing over it, so such a fact becomes the head of the chain and is
+/// published here as an arrival. The history says nothing further about it, on
+/// purpose: from here a target that was never written, one that belongs to
+/// another owner and one lost to a corrupt database are indistinguishable, so a
+/// step phrased as «there was more before this» would be a claim nothing
+/// supports, and one phrased as «there was not» would be false. What the reader
+/// gets instead is the head's own `relation`, published verbatim on the state,
+/// which says exactly what the fact says and no more.
+pub async fn read_operation_history(
+    store: &dyn Store,
+    owner: OwnerId,
+    event: EventId,
+) -> Result<OperationHistory, AppError> {
+    let chain = store.event_chain(owner, event).await?;
+    let Some(head) = chain.first() else {
+        return Err(AppError::NotFound {
+            what: "journal event",
+            id: event.inner().to_string(),
+        });
+    };
+    Ok(acts_of(head, &chain))
+}
+
+/// Fold a chain of facts into the acts that wrote it.
+///
+/// One pass forward from the head, pairing at each step the reversal and the
+/// replacement that name the fact standing there.
+fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> OperationHistory {
+    let mut standing = &head.event;
+    let mut steps = vec![HistoryStep {
+        act: HistoryAct::Arrived,
+        at: head.recorded_at.clone(),
+        state: Some(journal_event_view(&head.event)),
+        changed: Vec::new(),
+        reversal: None,
+        replacement: None,
+    }];
+    let mut current = Some(head.event.id);
+
+    // Every act consumes at least one fact of the chain, so the chain's length
+    // bounds the number of acts. The bound is what stops a database the core
+    // could not have written from being walked forever.
+    for _ in 0..chain.len() {
+        let Some(target) = current else { break };
+        let reversal = reversal_of(chain, target);
+        let Some(replacement) = replacement_of(chain, target) else {
+            let Some(reversal) = reversal else { break };
+            steps.push(HistoryStep {
+                act: HistoryAct::Retracted,
+                at: reversal.recorded_at.clone(),
+                state: None,
+                changed: Vec::new(),
+                reversal: Some(reversal.event.id),
+                replacement: None,
+            });
+            current = None;
+            break;
+        };
+        steps.push(HistoryStep {
+            act: HistoryAct::Corrected,
+            at: recorded_first(reversal, replacement),
+            changed: changed_aspects(standing, &replacement.event),
+            state: Some(journal_event_view(&replacement.event)),
+            reversal: reversal.map(|reversal| reversal.event.id),
+            replacement: Some(replacement.event.id),
+        });
+        current = Some(replacement.event.id);
+        standing = &replacement.event;
+    }
+
+    OperationHistory { steps, current }
+}
+
+/// The fact that reverses the named one, where the chain holds it.
+///
+/// The first such fact, not every one of them: a second reversal of one target
+/// is a second fact but not a second retraction, and a database that holds one
+/// must not turn into two acts about the same target.
+fn reversal_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEvent> {
+    chain.iter().find(
+        |recorded| matches!(recorded.event.relation, Relation::Reversal { target: named } if named == target),
+    )
+}
+
+/// The fact that replaces the named one, where the chain holds it.
+///
+/// The first, for the reason [`reversal_of`] takes the first: `resolve` refuses
+/// to admit a second replacement of one event, so a chain holding two is a
+/// database nothing here can have written, and following both would publish two
+/// futures for one fact.
+fn replacement_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEvent> {
+    chain.iter().find(
+        |recorded| matches!(recorded.event.relation, Relation::Replacement { target: named } if named == target),
+    )
+}
+
+/// When an act of two facts reached the journal: the earlier of the two stamps.
+///
+/// Compared as text, which is what they are, and text order is time order for
+/// every pair whose stamps differ by a whole second or more: each is written by
+/// this instance at UTC in the one RFC 3339 form, so the fields line up
+/// character by character down to the seconds.
+///
+/// **Past the seconds it is not.** The writer omits the fractional part when
+/// the nanoseconds are zero and trims its trailing zeros otherwise, so the
+/// stamps are of variable width and `…:00.4Z` sorts before `…:00Z` on `'.'`
+/// against `'Z'`. Two stamps can therefore come back in the wrong order, but
+/// only when they fall inside one second — the prefix before the fractional
+/// part is what decides every other pair — and only the value chosen is
+/// affected, never a position: the steps of a history are ordered by the walk
+/// and not by this, and the two halves of one act are one step. Parsing both
+/// to compare them as instants would buy a sub-second distinction that nothing
+/// reads.
+fn recorded_first(reversal: Option<&RecordedEvent>, replacement: &RecordedEvent) -> String {
+    reversal.map_or_else(
+        || replacement.recorded_at.clone(),
+        |reversal| {
+            reversal
+                .recorded_at
+                .clone()
+                .min(replacement.recorded_at.clone())
+        },
+    )
+}
+
+/// The aspects two facts differ in, in the order they are declared.
+///
+/// Read off the **facts**, and that is deliberate rather than incidental. An
+/// earlier reading compared only the two published views, which carry the family
+/// word and the legs — so every payload inside [`EventKind`] was invisible to
+/// it: the sort of an income, the origin of a fee, and the sum of a fact that
+/// posts no leg at all. Correcting such a fact answered «you corrected this» and
+/// «nothing changed» in one breath, which is exactly the silence
+/// [`ChangedAspect`] excludes a category loudly to avoid.
+///
+/// What keeps this answer and the states beside it from disagreeing is not that
+/// both are computed from the same input, but that what is named here is
+/// published there: [`JournalEventView::amount`] exists for the one fact whose
+/// sum lives nowhere else. The single thing named and not published is the
+/// scalar that tells two facts of one family apart, and naming it is still the
+/// better failure — see [`ChangedAspect::Kind`].
+fn changed_aspects(before: &Event, after: &Event) -> Vec<ChangedAspect> {
+    let (was, now) = (kind_aspects(&before.kind), kind_aspects(&after.kind));
+    let mut changed = Vec::new();
+    if before.kind.discriminant() != after.kind.discriminant() || was.word != now.word {
+        changed.push(ChangedAspect::Kind);
+    }
+    if what_moved(before) != what_moved(after) || was.moved != now.moved {
+        changed.push(ChangedAspect::Amount);
+    }
+    if where_it_moved(before) != where_it_moved(after) {
+        changed.push(ChangedAspect::Account);
+    }
+    if (
+        before.order.date(),
+        before.order.source_time(),
+        before.dates,
+    ) != (after.order.date(), after.order.source_time(), after.dates)
+    {
+        changed.push(ChangedAspect::Dates);
+    }
+    if before.provenance.description() != after.provenance.description() {
+        changed.push(ChangedAspect::Counterparty);
+    }
+    if before.confidence != after.confidence || was.confidence != now.confidence {
+        changed.push(ChangedAspect::Confidence);
+    }
+    changed
+}
+
+/// What one leg moved, with where it moved left out.
+type Moved = (
+    LegKind,
+    Option<Money>,
+    Option<Quantity>,
+    Option<InstrumentId>,
+);
+
+/// Where one leg posted.
+type Posted = (AccountId, Option<CustodyId>);
+
+/// What moved, leg by leg.
+fn what_moved(event: &Event) -> Vec<Moved> {
+    event
+        .legs
+        .iter()
+        .map(|leg| (leg.kind, leg.money, leg.quantity, leg.instrument))
+        .collect()
+}
+
+/// Where it moved: the account the fact is filed under, and every leg's.
+///
+/// The fact's own account is compared beside the legs' rather than instead of
+/// them: a fact with no leg at all — a valuation, a control assertion — still
+/// names the account it is about, and moving one from `Main` to `Savings` is a
+/// change the owner must be shown.
+fn where_it_moved(event: &Event) -> (AccountId, Vec<Posted>) {
+    (
+        event.account,
+        event
+            .legs
+            .iter()
+            .map(|leg| (leg.account, leg.custody))
+            .collect(),
+    )
+}
+
+/// What a fact's own kind carries, sorted into the aspects it can differ in.
+///
+/// The legs say what was posted and the view publishes them; the kind says what
+/// the fact claims, and for a fact that posts nothing the kind says all of it.
+#[derive(Debug, Clone, PartialEq)]
+struct KindAspects {
+    /// Scalars that tell two facts of one family apart, for [`ChangedAspect::Kind`].
+    word: Vec<KindWord>,
+    /// Figures the payload states, for [`ChangedAspect::Amount`].
+    moved: Vec<KindFigure>,
+    /// What the fact asserts about how sure it is, for [`ChangedAspect::Confidence`].
+    confidence: Vec<KindConfidence>,
+}
+
+/// A scalar two facts of one family are told apart by.
+///
+/// None of these changes the family word, so a correction that changes one of
+/// them and nothing else would otherwise read as no correction at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KindWord {
+    /// Bought or sold.
+    Side(TradeSide),
+    /// Coupon, dividend, interest — or, as `None`, a source that named none.
+    Income(Option<IncomeKind>),
+    /// What the fee was for.
+    Fee(FeeOrigin),
+    /// Withheld at source or paid by the owner.
+    Tax(TaxOrigin),
+}
+
+/// A figure a fact's kind states.
+#[derive(Debug, Clone, PartialEq)]
+enum KindFigure {
+    /// A posted sum the payload declares.
+    Money(Money),
+    /// The unrounded source commission behind a posted basis fee. Compared
+    /// beside that fee rather than instead of it: the two can differ from each
+    /// other, and the rounded one is the only one anything else reads.
+    Exact(CalcMoney),
+    /// A quantity of a security.
+    Quantity(Quantity),
+    /// The security the fact is about.
+    Instrument(InstrumentId),
+    /// A per-unit price, which is not a posted sum and is not typed as one.
+    Price(PerUnitAmount),
+    /// A payload compared entire, for the families whose figures are not picked
+    /// out one by one — see [`kind_aspects`] for which and why.
+    Whole(EventKind),
+}
+
+/// What a fact asserts about how sure it is of what it states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KindConfidence {
+    /// How a valuation's price was obtained.
+    Price(PriceQuality),
+    /// What a reconstructed opening asserts about itself.
+    ///
+    /// The set carries an acquisition date among its items, and it goes here
+    /// rather than with [`ChangedAspect::Dates`] because what the set states is
+    /// how sure the reconstruction is of each item, the date included. `Dates`
+    /// is the dates the journal orders and reports by.
+    Opening(OpeningAssertions),
+}
+
+/// Sort what a kind carries into the aspects it can differ in.
+///
+/// **An exhaustive match with no `_` arm, on purpose.** A variant added to
+/// [`EventKind`] and not placed here would carry a payload that could change
+/// under the owner without this route saying so, and the whole of what a
+/// legless fact says is such a payload. Breaking the build is how the next
+/// variant announces itself.
+fn kind_aspects(kind: &EventKind) -> KindAspects {
+    match kind {
+        EventKind::Trade {
+            side,
+            instrument,
+            quantity,
+            gross,
+            fee,
+            basis_fee,
+            basis_fee_exact,
+            accrued_interest,
+        } => KindAspects {
+            word: vec![KindWord::Side(*side)],
+            moved: figures([
+                Some(KindFigure::Instrument(*instrument)),
+                Some(KindFigure::Quantity(*quantity)),
+                Some(KindFigure::Money(*gross)),
+                fee.map(KindFigure::Money),
+                basis_fee.map(KindFigure::Money),
+                basis_fee_exact.map(KindFigure::Exact),
+                accrued_interest.map(KindFigure::Money),
+            ]),
+            confidence: Vec::new(),
+        },
+        // Six families whose whole claim is one sum. The unresolved own-account
+        // movement is the one that posts no leg to repeat it.
+        EventKind::CashIn { amount }
+        | EventKind::CashOut { amount }
+        | EventKind::Refund { amount }
+        | EventKind::OwnAccountMovement { amount }
+        | EventKind::UnresolvedOwnAccountMovement { amount }
+        | EventKind::OpeningCash { amount } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        // `transfer_id` is an identity rather than an aspect, and the two
+        // accounts are already compared by `where_it_moved`: a transfer posts a
+        // leg on each of them, and validation refuses one that does not.
+        EventKind::CashTransfer {
+            transfer_id: _,
+            from: _,
+            to: _,
+            amount,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        EventKind::Income {
+            instrument,
+            gross,
+            kind,
+        } => KindAspects {
+            word: vec![KindWord::Income(*kind)],
+            moved: figures([
+                instrument.map(KindFigure::Instrument),
+                Some(KindFigure::Money(*gross)),
+            ]),
+            confidence: Vec::new(),
+        },
+        EventKind::Fee { amount, origin } => KindAspects {
+            word: vec![KindWord::Fee(*origin)],
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        EventKind::Tax { amount, origin } => KindAspects {
+            word: vec![KindWord::Tax(*origin)],
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        EventKind::OpeningPosition {
+            instrument,
+            quantity,
+            cost_basis,
+            assertions,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: figures([
+                Some(KindFigure::Instrument(*instrument)),
+                Some(KindFigure::Quantity(*quantity)),
+                cost_basis.map(KindFigure::Money),
+            ]),
+            confidence: vec![KindConfidence::Opening(*assertions)],
+        },
+        // **A valuation's price goes with `Amount`.** It is the one figure the
+        // fact states — a valuation posts no leg — and what a corrected price
+        // makes different is the number, not the sort of thing the fact is;
+        // calling it `Kind` would tell the owner his valuation became some other
+        // family of fact. It is carried as a per-unit amount and not as money,
+        // because that is what it is: a price per security, not a posted sum,
+        // and it is published nowhere as one. Its `quality` says how the price
+        // was obtained, which is how sure the fact is of it, so that goes with
+        // `Confidence`.
+        EventKind::Valuation {
+            instrument,
+            price,
+            currency,
+            quality,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: vec![
+                KindFigure::Instrument(*instrument),
+                KindFigure::Price(PerUnitAmount::new(*price, *currency)),
+            ],
+            confidence: vec![KindConfidence::Price(*quality)],
+        },
+        // Four families whose payload is compared **whole**, under `Amount`.
+        //
+        // A corporate action and an offer exercise each carry a typed family of
+        // their own, and everything in one of them describes the movement it
+        // made; picking figures out of it would mean a second exhaustive match
+        // over a family that grows, for a distinction the owner does not draw
+        // reading one line of his history. A control assertion and a coverage
+        // gap state nothing about an operation at all, and neither can ever be
+        // written as a replacement — those are built from a submitted operation
+        // — so the only way one of them faces another fact here is across a
+        // change of family, which the discriminant already names.
+        //
+        // `..` elides nothing that could go unnoticed, and only here: what is
+        // compared is the payload entire, so a field added to one of these is
+        // compared the day it is added.
+        EventKind::CorporateAction { .. }
+        | EventKind::OfferExercise { .. }
+        | EventKind::ControlAssertion { .. }
+        | EventKind::ImportCoverageGap { .. } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Whole(kind.clone())],
+            confidence: Vec::new(),
+        },
+    }
+}
+
+/// The figures that are there, of the places one could be.
+fn figures<const N: usize>(places: [Option<KindFigure>; N]) -> Vec<KindFigure> {
+    places.into_iter().flatten().collect()
+}
+
+/// The money a fact states about itself when it posts nothing.
+///
+/// A fact with legs says its money in them and the view publishes those; a fact
+/// with none says it only in its kind, and without this the whole of what such a
+/// fact says would go unpublished. That is the case [`JournalEventView::amount`]
+/// exists for, and the condition is the honest one: not a list of families, but
+/// «this fact posted nothing, so read what it claims».
+///
+/// Exactly one figure or none. «The amount» of a legless fact that stated two
+/// would be a choice nobody asked for, and choosing between them here would be
+/// the arithmetic this route does not do.
+fn stated_amount(event: &Event) -> Option<Money> {
+    if !event.legs.is_empty() {
+        return None;
+    }
+    let stated: Vec<Money> = kind_aspects(&event.kind)
+        .moved
+        .into_iter()
+        .filter_map(|figure| match figure {
+            KindFigure::Money(money) => Some(money),
+            KindFigure::Exact(_)
+            | KindFigure::Quantity(_)
+            | KindFigure::Instrument(_)
+            | KindFigure::Price(_)
+            | KindFigure::Whole(_) => None,
+        })
+        .collect();
+    match stated.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
 /// The rule narrowing, with the pair checked before either half is used.
 ///
-/// A version numbers one rule's own revisions, so a version with no rule beside
-/// it names nothing at all. Accepting it and ignoring it would answer a question
-/// nobody asked — every version's rows under a request for one — and the caller
-/// would have no way to tell that from a rule genuinely edited only once.
+/// A version is a position in the owner's sequence of decisions, not a name for
+/// a rule, so a version with no rule beside it addresses nothing a caller could
+/// have meant. Accepting it and ignoring it would answer a question nobody asked
+/// — every rule's rows under a request for one decision's — and the caller would
+/// have no way to tell that from a genuinely wide result.
 fn rule_filter(
     rule: Option<ClassificationRuleId>,
     version: Option<u32>,
@@ -298,8 +957,8 @@ fn rule_filter(
         if let Some(version) = version {
             return Err(AppError::Invalid {
                 field: "settled_by_rule_version".to_owned(),
-                expected: "a rule named beside the version, because a version numbers one \
-                           rule's own revisions"
+                expected: "a rule named beside the version, because a version is a position in \
+                           your sequence of decisions and not a name for a rule"
                     .to_owned(),
                 actual: version.to_string(),
             });
@@ -378,8 +1037,23 @@ fn parse_cursor(value: &str) -> Result<JournalCursor, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
+    use iaam_core::dates::{CashPostedDate, EffectiveOrder};
+    use iaam_core::event::kind::EventKind;
+    use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+    use iaam_core::money::{CurrencyCode, PostedMinor};
+    use iaam_core::reconciliation::evidence::IdentityScope;
+    use iaam_store::SqliteStore;
     use time::macros::date;
+
+    use super::*;
+    use crate::AppServices;
+    use crate::adapters::sqlite::SqliteAdapter;
+    use crate::ports::{Clock, Principal, Scope};
+    use crate::scenarios::correction::{
+        CorrectionRequest, ImportTarget, correct_events, correct_import,
+    };
 
     #[test]
     fn an_absent_page_size_is_the_default_and_zero_is_refused() {
@@ -467,9 +1141,10 @@ mod tests {
 
     #[test]
     fn a_rule_version_with_no_rule_beside_it_is_refused() {
-        // A version numbers one rule's own revisions, so «version 3» on its own
-        // names nothing. Accepting it and ignoring it would hand back every
-        // version's rows under a question that asked for one.
+        // A version is a position in the owner's sequence of decisions, so
+        // «version 3» on its own names no rule. Accepting it and ignoring it
+        // would hand back every rule's rows under a question that asked for
+        // one decision's.
         let error = rule_filter(None, Some(3)).expect_err("a version alone is refused");
         let AppError::Invalid { field, actual, .. } = error else {
             panic!("a lone version is refused as an invalid field");
@@ -505,5 +1180,548 @@ mod tests {
             panic!("an empty channel is refused as an invalid field");
         };
         assert_eq!(field, "source_channel");
+    }
+
+    // An operation's history: the acts, not the facts.
+
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn today(&self) -> Date {
+            date!(2021 - 06 - 30)
+        }
+    }
+
+    /// One owner, two accounts of his, and a journal to write facts into.
+    ///
+    /// Every name and figure below is invented: `Main` and `Savings` are the
+    /// accounts, `Shop One` is what the source printed on the row.
+    struct Ctx {
+        owner: OwnerId,
+        main: AccountId,
+        savings: AccountId,
+        source: SourceId,
+        services: AppServices,
+        principal: Principal,
+    }
+
+    impl Ctx {
+        fn new() -> Self {
+            let adapter = Arc::new(SqliteAdapter::new(
+                SqliteStore::open_in_memory().expect("an in-memory journal"),
+            ));
+            let owner = OwnerId::new_random();
+            Self {
+                owner,
+                main: AccountId::new_random(),
+                savings: AccountId::new_random(),
+                source: SourceId::new_random(),
+                services: AppServices::new(
+                    adapter.clone(),
+                    adapter.clone(),
+                    adapter.clone(),
+                    adapter,
+                    Arc::new(FixedClock),
+                ),
+                principal: Principal {
+                    token_id: uuid::Uuid::new_v4(),
+                    owner,
+                    scope: Scope::Owner,
+                },
+            }
+        }
+
+        fn store(&self) -> &dyn Store {
+            self.services.store.as_ref()
+        }
+
+        /// A deposit at one of his accounts, with `hash` making each fixture a
+        /// distinct row of the journal.
+        fn recorded(
+            &self,
+            hash: u8,
+            minor: i64,
+            account: AccountId,
+            import: Option<ImportId>,
+        ) -> iaam_core::event::Event {
+            let amount = Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
+            let day = date!(2021 - 03 - 02);
+            let mut provenance = Provenance::new(
+                self.source,
+                RawHash::parse(&format!("{hash:064x}")).expect("a raw hash"),
+                ParserVersion("manual/1".into()),
+            )
+            .with_description("Shop One");
+            if let Some(import) = import {
+                provenance = provenance.with_import(import);
+            }
+            iaam_core::event::Event {
+                id: EventId::new_random(),
+                schema_version: iaam_core::event::SCHEMA_VERSION,
+                owner: self.owner,
+                account,
+                kind: EventKind::CashIn { amount },
+                dates: EventDates::for_cash(CashPostedDate(day)),
+                order: EffectiveOrder::new(day, 0),
+                legs: vec![Leg::cash(account, amount)],
+                provenance,
+                relation: Relation::None,
+                confidence: Confidence::Known,
+                idempotency_key: None,
+            }
+        }
+
+        fn deposit(&self, hash: u8, minor: i64, account: AccountId) -> iaam_core::event::Event {
+            self.recorded(hash, minor, account, None)
+        }
+
+        /// A movement between two accounts of his that the source asserted and
+        /// did not name, with the direction it never stated.
+        ///
+        /// **It posts no leg at all**, and cannot: the journal will not debit
+        /// or credit an account on a movement whose direction nobody gave. So
+        /// the whole of what this fact says is in its kind, which is exactly
+        /// what makes it the sharpest case for a history to get right.
+        fn unstated(&self, hash: u8, minor: i64) -> iaam_core::event::Event {
+            let amount = Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
+            iaam_core::event::Event {
+                kind: EventKind::UnresolvedOwnAccountMovement { amount },
+                legs: Vec::new(),
+                ..self.recorded(hash, minor, self.main, None)
+            }
+        }
+
+        fn imported(&self, hash: u8, minor: i64, import: ImportId) -> iaam_core::event::Event {
+            self.recorded(hash, minor, self.main, Some(import))
+        }
+
+        async fn write(&self, events: &[iaam_core::event::Event]) {
+            self.services
+                .store
+                .append_events(events.to_vec(), IdentityScope::Source)
+                .await
+                .expect("the journal accepts the facts");
+        }
+
+        async fn history(&self, event: EventId) -> OperationHistory {
+            read_operation_history(self.store(), self.owner, event)
+                .await
+                .expect("a history of an operation of his")
+        }
+
+        /// One correction is a reversal and a replacement of the same target,
+        /// so an operation corrected twice is five facts. The first correction
+        /// fixes the sum; the second says it landed at `Savings`.
+        async fn corrected_twice(&self) -> [iaam_core::event::Event; 5] {
+            let original = self.deposit(1, 4_500, self.main);
+            let first_reversal = iaam_core::event::Event {
+                relation: Relation::Reversal {
+                    target: original.id,
+                },
+                ..self.deposit(2, 4_500, self.main)
+            };
+            let first_replacement = iaam_core::event::Event {
+                relation: Relation::Replacement {
+                    target: original.id,
+                },
+                ..self.deposit(3, 5_200, self.main)
+            };
+            let second_reversal = iaam_core::event::Event {
+                relation: Relation::Reversal {
+                    target: first_replacement.id,
+                },
+                ..self.deposit(4, 5_200, self.main)
+            };
+            let second_replacement = iaam_core::event::Event {
+                relation: Relation::Replacement {
+                    target: first_replacement.id,
+                },
+                ..self.deposit(5, 5_200, self.savings)
+            };
+            let written = [
+                original,
+                first_reversal,
+                first_replacement,
+                second_reversal,
+                second_replacement,
+            ];
+            self.write(&written).await;
+            written
+        }
+    }
+
+    /// The identifier he most often holds is the one a correction just handed
+    /// back to him, and the one his import gave him names the same operation.
+    /// Which handle he happens to hold must not decide which question he may
+    /// ask.
+    #[tokio::test]
+    async fn every_identifier_of_an_operation_reads_the_same_history() {
+        let ctx = Ctx::new();
+        let written = ctx.corrected_twice().await;
+        let expected = ctx.history(written[0].id).await;
+
+        for entered in &written {
+            assert_eq!(
+                ctx.history(entered.id).await,
+                expected,
+                "entering by {} answered a different question",
+                entered.id.inner()
+            );
+        }
+    }
+
+    /// Four facts on top of the original, and two things he did. He must be
+    /// shown the two, each with when it happened and what it made different.
+    #[tokio::test]
+    async fn an_operation_corrected_twice_reads_as_three_states_and_two_corrections() {
+        let ctx = Ctx::new();
+        let written = ctx.corrected_twice().await;
+        let history = ctx.history(written[0].id).await;
+
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            vec![
+                HistoryAct::Arrived,
+                HistoryAct::Corrected,
+                HistoryAct::Corrected
+            ],
+        );
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .filter_map(|step| step.state.as_ref().map(|state| state.event))
+                .collect::<Vec<_>>(),
+            vec![written[0].id, written[2].id, written[4].id],
+            "three states, oldest first"
+        );
+
+        assert!(
+            history.steps[0].changed.is_empty(),
+            "an arrival changed nothing, because there was nothing before it"
+        );
+        assert_eq!(
+            history.steps[1].changed,
+            vec![ChangedAspect::Amount],
+            "the first correction fixed the sum and nothing else"
+        );
+        assert_eq!(
+            history.steps[2].changed,
+            vec![ChangedAspect::Account],
+            "the second said it had landed at the other account"
+        );
+
+        assert_eq!(history.steps[1].reversal, Some(written[1].id));
+        assert_eq!(history.steps[1].replacement, Some(written[2].id));
+        assert_eq!(history.steps[2].reversal, Some(written[3].id));
+        assert_eq!(history.steps[2].replacement, Some(written[4].id));
+        assert_eq!(history.current, Some(written[4].id));
+
+        for step in &history.steps {
+            assert!(
+                step.at.contains('T') && step.at.len() >= 20,
+                "every act says when it was recorded: {}",
+                step.at
+            );
+            assert!(
+                !step.at.starts_with("2021-03-02"),
+                "the recorded moment is this instance's clock, never the effective date: {}",
+                step.at
+            );
+        }
+    }
+
+    /// A retraction leaves nothing standing. A reader offered a state after one
+    /// would count a fact the owner took back.
+    #[tokio::test]
+    async fn a_retracted_operation_ends_with_nothing_standing() {
+        let ctx = Ctx::new();
+        let original = ctx.deposit(1, 4_500, ctx.main);
+        let reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.deposit(2, 4_500, ctx.main)
+        };
+        ctx.write(&[original.clone(), reversal.clone()]).await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            vec![HistoryAct::Arrived, HistoryAct::Retracted],
+        );
+        let last = history.steps.last().expect("a last step");
+        assert!(last.state.is_none(), "nothing stands after a retraction");
+        assert!(
+            last.changed.is_empty(),
+            "a retraction left no state to compare"
+        );
+        assert_eq!(last.reversal, Some(reversal.id));
+        assert_eq!(last.replacement, None);
+        assert_eq!(
+            history.current, None,
+            "no fact of this operation counts now"
+        );
+    }
+
+    /// Most of his journal is this: a fact that arrived and was never touched.
+    /// Nothing about it may be phrased as a change.
+    #[tokio::test]
+    async fn an_operation_nothing_ever_touched_is_one_arrival() {
+        let ctx = Ctx::new();
+        let untouched = ctx.deposit(1, 4_500, ctx.main);
+        ctx.write(std::slice::from_ref(&untouched)).await;
+
+        let history = ctx.history(untouched.id).await;
+
+        assert_eq!(history.steps.len(), 1);
+        let step = &history.steps[0];
+        assert_eq!(step.act, HistoryAct::Arrived);
+        assert!(step.changed.is_empty(), "an arrival is not a change");
+        assert_eq!(step.reversal, None);
+        assert_eq!(step.replacement, None);
+        assert_eq!(
+            step.state.as_ref().map(|state| state.event),
+            Some(untouched.id)
+        );
+        assert_eq!(history.current, Some(untouched.id));
+    }
+
+    /// A whole import taken back writes exactly the reversal one corrected row
+    /// does. What the owner is looking at is his operation, and «this was taken
+    /// back» is the same fact about it either way.
+    #[tokio::test]
+    async fn a_row_retracted_with_its_import_reads_as_one_retracted_alone() {
+        let ctx = Ctx::new();
+        let batch = ImportId::new_random();
+        let alone = ctx.imported(1, 4_500, ImportId::new_random());
+        let in_batch = ctx.imported(2, 6_100, batch);
+        ctx.write(&[alone.clone(), in_batch.clone()]).await;
+
+        correct_events(
+            &ctx.services,
+            &ctx.principal,
+            true,
+            &[CorrectionRequest::Reversal { target: alone.id }],
+        )
+        .await
+        .expect("one row taken back on its own");
+        correct_import(
+            &ctx.services,
+            &ctx.principal,
+            true,
+            ImportTarget::Named {
+                source: ctx.source,
+                import: batch,
+            },
+        )
+        .await
+        .expect("the whole import taken back");
+
+        let one_row = ctx.history(alone.id).await;
+        let whole_import = ctx.history(in_batch.id).await;
+
+        assert_eq!(
+            whole_import
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            one_row
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            "a row taken back with its import reads as one taken back alone"
+        );
+        let last = whole_import.steps.last().expect("a last step");
+        assert_eq!(last.act, HistoryAct::Retracted);
+        assert!(last.state.is_none());
+        assert_eq!(whole_import.current, None);
+    }
+
+    /// Task 5 ends the backward walk at a `relation.target` this owner's
+    /// journal does not hold, so the fact naming it is the head. The history
+    /// publishes it as an arrival and claims nothing further about the target:
+    /// the state carries the relation verbatim, which says exactly what the
+    /// fact says and no more.
+    #[tokio::test]
+    async fn a_fact_naming_a_target_outside_his_journal_is_where_his_history_begins() {
+        let ctx = Ctx::new();
+        let stranger = EventId::new_random();
+        let head = iaam_core::event::Event {
+            relation: Relation::Replacement { target: stranger },
+            ..ctx.deposit(1, 4_500, ctx.main)
+        };
+        ctx.write(std::slice::from_ref(&head)).await;
+
+        let history = ctx.history(head.id).await;
+
+        assert_eq!(history.steps.len(), 1);
+        assert_eq!(history.steps[0].act, HistoryAct::Arrived);
+        assert!(
+            history.steps[0].changed.is_empty(),
+            "there is no earlier state of his for it to have changed from"
+        );
+        assert_eq!(
+            history.steps[0].state.as_ref().map(|state| state.relation),
+            Some(Relation::Replacement { target: stranger }),
+            "the head's own relation is published verbatim"
+        );
+        assert_eq!(history.current, Some(head.id));
+    }
+
+    /// An event identifier is a UUID, and a UUID confers no right to read
+    /// someone else's journal. Holding one of another owner's must read exactly
+    /// as holding an identifier of nothing at all — the refusal the listing
+    /// gives an idempotency key that addresses nothing.
+    #[tokio::test]
+    async fn an_event_of_another_owner_is_not_found() {
+        let ctx = Ctx::new();
+        let his = ctx.deposit(1, 4_500, ctx.main);
+        ctx.write(std::slice::from_ref(&his)).await;
+
+        let error = read_operation_history(ctx.store(), OwnerId::new_random(), his.id)
+            .await
+            .expect_err("another owner's event is not his to read");
+
+        let AppError::NotFound { id, .. } = error else {
+            panic!("an identifier that addresses nothing is a missing resource");
+        };
+        assert_eq!(id, his.id.inner().to_string());
+    }
+
+    /// A fact that posts nothing is still a fact, and correcting its sum is
+    /// still a correction of the sum.
+    ///
+    /// Everything such a fact says lives in its kind, so a comparison that read
+    /// only the legs would find two empty lists, name no aspect at all, and
+    /// publish two states nobody could tell apart. The owner would be told that
+    /// he corrected the row and never told what he corrected — the very failure
+    /// [`ChangedAspect`] excludes a category loudly to avoid.
+    #[tokio::test]
+    async fn a_fact_that_posts_nothing_still_says_its_sum_changed() {
+        let ctx = Ctx::new();
+        let original = ctx.unstated(1, 250_000);
+        let reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.unstated(2, 250_000)
+        };
+        let replacement = iaam_core::event::Event {
+            relation: Relation::Replacement {
+                target: original.id,
+            },
+            ..ctx.unstated(3, 340_000)
+        };
+        ctx.write(&[original.clone(), reversal.clone(), replacement.clone()])
+            .await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(history.steps[1].act, HistoryAct::Corrected);
+        assert_eq!(
+            history.steps[1].changed,
+            vec![ChangedAspect::Amount],
+            "he re-stated the sum of a fact whose sum is the only thing it has"
+        );
+
+        // And naming the aspect is half an answer while the two states he is
+        // shown are indistinguishable. The sum is on each of them.
+        let sums: Vec<Option<Money>> = history
+            .steps
+            .iter()
+            .filter_map(|step| step.state.as_ref().map(|state| state.amount))
+            .collect();
+        assert_eq!(
+            sums,
+            vec![
+                Some(Money::new(PostedMinor::new(250_000), CurrencyCode::Rub)),
+                Some(Money::new(PostedMinor::new(340_000), CurrencyCode::Rub)),
+            ],
+            "what it said before, and what it says now"
+        );
+    }
+
+    /// A fact that posts a leg says its money there, and the view publishes the
+    /// leg. Repeating it beside the leg would give one number two places to be
+    /// read from, and the first reader to find them disagreeing would be right
+    /// to distrust both.
+    #[tokio::test]
+    async fn a_fact_that_posts_its_money_does_not_state_it_twice() {
+        let ctx = Ctx::new();
+        let posted = ctx.deposit(1, 4_500, ctx.main);
+
+        let view = journal_event_view(&posted);
+
+        assert_eq!(view.legs.len(), 1, "the deposit posts its money");
+        assert_eq!(view.amount, None, "and states it nowhere else");
+    }
+
+    /// Coupon corrected to dividend: the family word is `income` before and
+    /// after, so a comparison that read only the word would find nothing. What
+    /// he changed is what sort of thing the fact is, which is `kind`.
+    #[tokio::test]
+    async fn the_sort_of_an_income_is_a_change_of_kind_and_not_of_sum() {
+        let ctx = Ctx::new();
+        let gross = Money::new(PostedMinor::new(4_500), CurrencyCode::Rub);
+        let coupon = iaam_core::event::Event {
+            kind: EventKind::Income {
+                instrument: None,
+                gross,
+                kind: Some(IncomeKind::Coupon),
+            },
+            ..ctx.deposit(1, 4_500, ctx.main)
+        };
+        let dividend = iaam_core::event::Event {
+            kind: EventKind::Income {
+                instrument: None,
+                gross,
+                kind: Some(IncomeKind::Dividend),
+            },
+            ..ctx.deposit(2, 4_500, ctx.main)
+        };
+
+        assert_eq!(coupon.kind.discriminant(), dividend.kind.discriminant());
+        assert_eq!(
+            changed_aspects(&coupon, &dividend),
+            vec![ChangedAspect::Kind],
+            "the sum did not move, and the sort of the income did"
+        );
+    }
+
+    /// The same for the two other scalars a family is told apart by: what a fee
+    /// was for, and whether a tax was withheld or paid.
+    #[tokio::test]
+    async fn what_a_fee_was_for_and_who_paid_a_tax_are_changes_of_kind() {
+        let ctx = Ctx::new();
+        let amount = Money::new(PostedMinor::new(-1_200), CurrencyCode::Rub);
+        let fee = |origin| iaam_core::event::Event {
+            kind: EventKind::Fee { amount, origin },
+            ..ctx.deposit(1, -1_200, ctx.main)
+        };
+        let tax = |origin| iaam_core::event::Event {
+            kind: EventKind::Tax { amount, origin },
+            ..ctx.deposit(2, -1_200, ctx.main)
+        };
+
+        assert_eq!(
+            changed_aspects(&fee(FeeOrigin::Brokerage), &fee(FeeOrigin::Depositary)),
+            vec![ChangedAspect::Kind],
+        );
+        assert_eq!(
+            changed_aspects(&tax(TaxOrigin::WithheldAtSource), &tax(TaxOrigin::SelfPaid)),
+            vec![ChangedAspect::Kind],
+        );
     }
 }

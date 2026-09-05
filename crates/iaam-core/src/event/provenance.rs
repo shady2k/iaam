@@ -49,16 +49,25 @@ pub struct RowLocator {
 
 /// What one of the owner's standing classification rules did to this row.
 ///
-/// **Two values, and the absence of the whole thing is a third state**
+/// **Four states, and only three of them are values of this type**
 /// ([`Provenance::rule_settlement`]). A row an owner reviews is one of a group
 /// a single decision of his reached, and the group is defined by the rule — so
 /// the fact has to say which rule, or the group can only be found by reading a
-/// whole import by eye.
+/// whole import by eye. In the order the type lists them:
 ///
-/// [`Self::NoRule`] and «nothing recorded» are different claims and are never
-/// merged: the first says a reading ran and no rule of his matched, the second
-/// says nothing at all. A reader that treats the second as the first tells him
-/// a row he never touched was decided by hand.
+/// - [`Self::Rule`] — a rule already standing filed the row, and the owner was
+///   not asked.
+/// - [`Self::AnsweredMintingRule`] — the owner answered, and that same answer
+///   also became the rule.
+/// - [`Self::NoRule`] — a reading ran, none of his rules matched, and the
+///   answer minted nothing.
+/// - absence — nothing was recorded, which is evidence for none of the three.
+///
+/// Absence and «nothing recorded» are never merged with any value above: each
+/// value is a claim a reading made, and the fourth state is the claim that no
+/// reading spoke at all. A reader that treats the fourth as one of the other
+/// three tells the owner a row he never touched was decided by hand, or the
+/// reverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "settled_by", rename_all = "snake_case")]
 pub enum RuleSettlement {
@@ -73,11 +82,32 @@ pub enum RuleSettlement {
     NoRule,
     /// This rule, at this version, settled the row.
     ///
-    /// The version is recorded beside the identifier because a rule can be
-    /// edited, and «the rows rule R filed» and «the rows version 3 of R filed»
-    /// are different questions. Recording only the identifier would make the
-    /// second unanswerable, and the second is the one asked after an edit.
+    /// The version counts the owner's decisions rather than this rule's own
+    /// revisions: every rule he writes takes the next number in his sequence,
+    /// and an edit retires the rule and writes a new one under a new identifier
+    /// and the next number. It is recorded beside the identifier because the
+    /// pair is what names the decision, and it is recorded on the fact so that
+    /// «which decision filed this row» stays answerable from the journal alone
+    /// — including for a rule he has since retired, which the rules no longer
+    /// offer.
     Rule {
+        rule: ClassificationRuleId,
+        version: u32,
+    },
+    /// The owner answered the question this row raised, and that same answer
+    /// minted this rule at this version.
+    ///
+    /// Kept apart from [`Self::Rule`] because they are different claims about
+    /// who decided: here the owner decided by hand, and the rule is a
+    /// side-effect of that one decision rather than something that filed the
+    /// row on its own. [`Self::rule`] answers it as a rule all the same,
+    /// because every caller of [`Self::rule`] is asking «which rule is behind
+    /// this row», and for a row settled this way the answer is this one — the
+    /// group that one decision of his reached is exactly the rows the answer
+    /// itself settled plus the rows the rule went on to file. [`Self::code`]
+    /// keeps the two apart, because every caller of [`Self::code`] is asking
+    /// «who decided», and for these rows it was the owner, not the rule.
+    AnsweredMintingRule {
         rule: ClassificationRuleId,
         version: u32,
     },
@@ -90,15 +120,20 @@ impl RuleSettlement {
         match self {
             Self::NoRule => "no_rule",
             Self::Rule { .. } => "rule",
+            Self::AnsweredMintingRule { .. } => "answered_minting_rule",
         }
     }
 
-    /// The rule and the version, where a rule settled the row.
+    /// The rule and the version, where a rule settled the row — including a
+    /// rule the owner's own answer minted, per [`Self::AnsweredMintingRule`]'s
+    /// doc comment.
     #[must_use]
     pub const fn rule(&self) -> Option<(ClassificationRuleId, u32)> {
         match self {
             Self::NoRule => None,
-            Self::Rule { rule, version } => Some((*rule, *version)),
+            Self::Rule { rule, version } | Self::AnsweredMintingRule { rule, version } => {
+                Some((*rule, *version))
+            }
         }
     }
 }
@@ -762,6 +797,43 @@ mod tests {
         let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
 
         assert_eq!(provenance.rule_settlement(), None);
+    }
+
+    #[test]
+    fn an_answer_that_minted_a_rule_is_neither_a_standing_rule_nor_no_rule() {
+        let rule = ClassificationRuleId(uuid::Uuid::from_u128(7));
+        let minted = RuleSettlement::AnsweredMintingRule { rule, version: 1 };
+
+        assert_eq!(minted.code(), "answered_minting_rule");
+        assert_ne!(
+            minted.code(),
+            RuleSettlement::Rule { rule, version: 1 }.code()
+        );
+        assert_ne!(minted.code(), RuleSettlement::NoRule.code());
+    }
+
+    /// Every caller of `rule()` asks which rule is behind the row, and for this
+    /// value there is one: the group a single decision of his reached is exactly
+    /// the rows the answer settled plus the rows the rule filed afterwards.
+    #[test]
+    fn an_answer_that_minted_a_rule_names_that_rule() {
+        let rule = ClassificationRuleId(uuid::Uuid::from_u128(7));
+        let minted = RuleSettlement::AnsweredMintingRule { rule, version: 4 };
+
+        assert_eq!(minted.rule(), Some((rule, 4)));
+    }
+
+    #[test]
+    fn an_answer_that_minted_a_rule_survives_the_wire() {
+        let rule = ClassificationRuleId(uuid::Uuid::from_u128(7));
+        let minted = RuleSettlement::AnsweredMintingRule { rule, version: 4 };
+
+        let json = serde_json::to_value(minted).expect("serialisable");
+        assert_eq!(json["settled_by"], "answered_minting_rule");
+        assert_eq!(
+            serde_json::from_value::<RuleSettlement>(json).expect("readable"),
+            minted
+        );
     }
 
     #[test]

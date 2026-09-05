@@ -801,7 +801,10 @@ mod tests {
         let minted = RuleSettlement::AnsweredMintingRule { rule, version: 1 };
 
         assert_eq!(minted.code(), "answered_minting_rule");
-        assert_ne!(minted.code(), RuleSettlement::Rule { rule, version: 1 }.code());
+        assert_ne!(
+            minted.code(),
+            RuleSettlement::Rule { rule, version: 1 }.code()
+        );
         assert_ne!(minted.code(), RuleSettlement::NoRule.code());
     }
 

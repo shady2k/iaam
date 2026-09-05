@@ -9422,7 +9422,10 @@ pub struct OperationHistoryStepDto {
     /// state.
     ///
     /// Empty on an arrival, which changed nothing because there was nothing
-    /// before it, and after a retraction, which left no state to compare.
+    /// before it, and after a retraction, which left no state to compare. The
+    /// one arrival where empty does not mean that is a history beginning at a
+    /// fact whose target this journal does not hold — see `arrived` in the
+    /// vocabulary below.
     ///
     /// It **names** where the difference is and is deliberately not a rendered
     /// before-and-after: the state before and the state after are both published

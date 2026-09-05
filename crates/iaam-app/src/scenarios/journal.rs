@@ -447,7 +447,9 @@ pub struct HistoryStep {
     /// Which aspects this act made different from the previous state.
     ///
     /// Empty on an arrival, which changed nothing because there was nothing
-    /// before it, and after a retraction, which left no state to compare.
+    /// before it, and after a retraction, which left no state to compare. The
+    /// one arrival where empty does not mean that is a chain whose head names a
+    /// target this owner's journal does not hold — see [`HistoryAct::Arrived`].
     pub changed: Vec<ChangedAspect>,
     /// The reversal this act wrote, where it wrote one.
     ///

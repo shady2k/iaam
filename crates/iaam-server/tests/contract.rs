@@ -18428,6 +18428,176 @@ async fn the_journal_returns_the_rows_one_rule_filed_and_each_row_names_it() {
     );
 }
 
+/// «Show me everything this decision did» includes the rows he decided
+/// (`iaam-73xv`, spec criterion 6).
+///
+/// One answer of his, given over two alike rows of one session, settles both
+/// and mints a standing rule. A third row of the same shape arrives later and
+/// the rule files it without asking him. All three belong to that one decision,
+/// and the filter on the rule has to return all three — a filter that returned
+/// only the third would answer «what did this decision do» with everything
+/// except the rows he actually decided.
+///
+/// And each row says **which** of the two it is, because they are different
+/// claims about who decided: under `rule` he was never asked, and under
+/// `answered_minting_rule` he answered by hand and the answer became the rule.
+///
+/// Every account, amount, date and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_rules_group_holds_the_rows_the_answer_that_minted_it_settled_and_says_which() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    // Two alike rows in one batch, so one session holds two questions that are
+    // the same decision.
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [
+                    unresolved_row(account, "he-answered-one"),
+                    unresolved_row_dated(account, "he-answered-two", "2025-03-19", "2500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+    assert!(
+        verdicts[1]["question_id"].is_string(),
+        "both rows are his to decide: {verdicts}"
+    );
+
+    // One answer, reaching every like row of the session. It settles both and
+    // mints the rule.
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({
+                "answer": "sent_to_own_account",
+                "account": savings,
+                "settles": "every_like_row_in_this_session",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(
+        answered["also_settled"].as_array().map(Vec::len),
+        Some(1),
+        "the reach carried his answer to the other row: {answered}"
+    );
+    let rule = answered["generalisation"]["rule"]
+        .as_str()
+        .expect("the rule the answer wrote")
+        .to_owned();
+
+    let committed = commit_session(&harness, &session).await;
+    assert_eq!(
+        committed["rows"].as_array().map(Vec::len),
+        Some(2),
+        "{committed}"
+    );
+
+    // A third row of the same shape, this time with the source stating the
+    // direction, so the rule settles it and nobody is asked.
+    let (status, again) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "april" },
+                "operations": [directed_row(account, "the-rule-filed", "out")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert!(again[0]["event_id"].is_string(), "{again}");
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?settled_by_rule={rule}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let mut group: Vec<(String, String)> = page["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|row| {
+            Some((
+                row["idempotency_key"].as_str()?.to_owned(),
+                row["rule_settlement"]["settled_by"].as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    group.sort();
+    assert_eq!(
+        group,
+        vec![
+            (
+                "he-answered-one".to_owned(),
+                "answered_minting_rule".to_owned()
+            ),
+            (
+                "he-answered-two".to_owned(),
+                "answered_minting_rule".to_owned()
+            ),
+            ("the-rule-filed".to_owned(), "rule".to_owned()),
+        ],
+        "one decision, three rows, and each says who decided it: {page}"
+    );
+
+    // Every row of the group names the rule and the version it was filed under,
+    // whichever of the two words it carries, and carries a sentence for the word.
+    for row in page["rows"].as_array().expect("rows") {
+        let settlement = &row["rule_settlement"];
+        assert_eq!(settlement["rule"], json!(rule), "{page}");
+        assert!(
+            settlement["version"].is_u64(),
+            "a rule can be edited, so the version is on the fact: {page}"
+        );
+        assert!(
+            settlement["explanation"]
+                .as_str()
+                .is_some_and(|sentence| !sentence.is_empty()),
+            "a code word carries its sentence: {page}"
+        );
+    }
+    let answered_words: Vec<&str> = page["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter(|row| row["rule_settlement"]["settled_by"] == "answered_minting_rule")
+        .filter_map(|row| row["rule_settlement"]["explanation"].as_str())
+        .collect();
+    assert!(
+        answered_words
+            .iter()
+            .all(|sentence| sentence.contains("you answered")),
+        "the sentence for a row he answered says he answered it: {answered_words:?}"
+    );
+}
+
 /// The answer is a durable rule, and what the rule makes durable is **what the
 /// row is** — not which way the next one runs.
 ///
@@ -25667,6 +25837,30 @@ async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
     assert_eq!(status, StatusCode::OK, "{committed}");
     assert_eq!(journal_rows(&harness).await, before + 1, "{committed}");
 
+    // And the fact says no rule filed it, because none did. `iaam-73xv` gave
+    // an answer a second word to carry — the rule that answer minted — and no
+    // rule was minted here, so nothing may claim one: the row settled on his
+    // word relayed by the agent and belongs to no group.
+    let (status, agents_row) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=agent-inner",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{agents_row}");
+    assert_eq!(
+        agents_row["rows"][0]["rule_settlement"]["settled_by"], "no_rule",
+        "{agents_row}"
+    );
+    assert!(
+        agents_row["rows"][0]["rule_settlement"]
+            .get("rule")
+            .is_none(),
+        "no row carries a rule it did not get: {agents_row}"
+    );
+
     // And the same act under the owner's token does generalise.
     let (session, question) = ask_one_question(&harness, &harness.owner_token, "owner-inner").await;
     let (status, answered) = call(
@@ -26249,6 +26443,14 @@ async fn a_source_that_names_the_far_side_as_the_owners_records_a_fact_and_asks_
     assert!(
         row["legs"].as_array().expect("legs").is_empty(),
         "nothing may be posted on a direction nobody stated: {row}"
+    );
+    // And it names no rule, because his answer minted none (`iaam-73xv`). The
+    // fact still says a reading ran and found no rule of his, which is not the
+    // same statement as saying nothing at all.
+    assert_eq!(row["rule_settlement"]["settled_by"], "no_rule", "{row}");
+    assert!(
+        row["rule_settlement"].get("rule").is_none(),
+        "no row carries a rule it did not get: {row}"
     );
 }
 

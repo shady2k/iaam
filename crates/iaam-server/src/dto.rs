@@ -9070,10 +9070,22 @@ pub struct JournalEventReadDto {
 /// together or not at all.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JournalRuleSettlementDto {
-    /// `rule` where one of your standing rules filed the row, `no_rule` where
-    /// the row was read against them and none matched — you answered it
-    /// yourself, your account directory recognised the other side, the source
-    /// asserted it, or the operation arrived already decided.
+    /// `rule` where one of your standing rules filed the row,
+    /// `answered_minting_rule` where you answered the row yourself and that
+    /// same answer became the rule, and `no_rule` where the row was read
+    /// against your rules and none matched — your account directory recognised
+    /// the other side, the source asserted it, you answered and the answer
+    /// generalised into nothing, or the operation arrived already decided.
+    ///
+    /// The first two both name a rule in `rule` below, and they are the rows
+    /// `settled_by_rule` returns together: they are one decision of yours, and
+    /// the group it reached is the rows your answer settled plus the rows the
+    /// rule went on to file. They stay two words because they are two different
+    /// claims about **who decided** — under `rule` you were never asked.
+    ///
+    /// The whole object being absent is a fourth state and is none of these: it
+    /// means nothing was recorded about rules for that fact, which is never
+    /// evidence that no rule was involved.
     pub settled_by: String,
     /// The same determination in words.
     pub explanation: String,
@@ -9112,6 +9124,10 @@ const fn settlement_explanation(
         }
         iaam_core::event::provenance::RuleSettlement::Rule { .. } => {
             "a standing rule of yours matched the row and filed it"
+        }
+        iaam_core::event::provenance::RuleSettlement::AnsweredMintingRule { .. } => {
+            "you answered this row yourself, and that same answer became the standing rule named \
+             here"
         }
     }
 }
@@ -9662,17 +9678,20 @@ pub struct ImportQuestionDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QuestionSettlementDto {
     /// `rule`, `directory`, `source_asserted`, `answered`,
-    /// `one_account_two_instruments` or `second_leg_of_one_movement`.
+    /// `answered_minting_rule`, `one_account_two_instruments` or
+    /// `second_leg_of_one_movement`.
     ///
     /// Which of them can appear depends on what is being described, and the
     /// difference is not a gap:
     ///
     /// - on a question, `settled_without_answer` exists for the questions with
-    ///   no `answered_at`, so `answered` never reaches it — the question says
-    ///   that about itself;
-    /// - on a line of a forecast, `answered` is one of the words, because there
-    ///   the question is what settles the line rather than why it stopped
-    ///   waiting.
+    ///   no `answered_at`, so neither `answered` nor `answered_minting_rule`
+    ///   ever reaches it — the question says that about itself;
+    /// - on a line of a forecast, both answered words are available, because
+    ///   there the question is what settles the line rather than why it stopped
+    ///   waiting. They differ in what the line belongs to: under
+    ///   `answered_minting_rule` the answer also became a standing rule, so the
+    ///   line is one of the group that rule files.
     ///
     /// `concluded` reaches neither: a caller that submitted a finished
     /// operation raises no question, and a forecast is never tested against
@@ -11376,7 +11395,13 @@ pub struct PlannedFactDto {
     /// the two were one word until `iaam-rdya`.
     pub records_as: String,
     /// On whose word this row was settled: `concluded`, `directory`,
-    /// `source_asserted`, `rule` or `answered`.
+    /// `source_asserted`, `rule`, `answered` or `answered_minting_rule`.
+    ///
+    /// The last two are both your own answer, and they differ in what the row
+    /// belongs to: under `answered_minting_rule` that answer also became a
+    /// standing rule, so the row is one of the group that rule files and
+    /// `settled_by_rule` names it. Under `answered` the answer generalised into
+    /// nothing and the row stands alone.
     ///
     /// **`source_asserted` is the value this field was added for.** A source
     /// that asserts the far side of a row is one of the owner's accounts
@@ -11389,7 +11414,12 @@ pub struct PlannedFactDto {
     pub settled_by: String,
     /// The same determination in words.
     pub settled_by_explanation: String,
-    /// The standing rule that settled the row, where one did.
+    /// The rule this row will be filed under, where there is one.
+    ///
+    /// Present for `rule` and for `answered_minting_rule` alike, because it
+    /// answers «which rule is behind this row» and for both of those there is
+    /// one. `settled_by` beside it is what says whether the rule filed the row
+    /// or your answer to it minted the rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_by_rule: Option<String>,
     /// Signed cash this row moves on its own account, as a decimal string.
@@ -12001,7 +12031,9 @@ impl PlannedFactDto {
             settled_by: fact.settled_by.code().to_owned(),
             settled_by_explanation: fact.settled_by.describe().to_owned(),
             settled_by_rule: match &fact.settled_by {
-                FactBasis::Rule { rule, .. } => Some(rule.inner().to_string()),
+                FactBasis::Rule { rule, .. } | FactBasis::AnsweredMintingRule { rule, .. } => {
+                    Some(rule.inner().to_string())
+                }
                 FactBasis::Concluded
                 | FactBasis::Directory
                 | FactBasis::SourceAsserted

@@ -53,10 +53,15 @@ impl OutboundHttp for HttpOutbound {
                     });
                 }
                 Ok(response) => {
-                    if let Retry::After(delay) = self
-                        .retry
-                        .decide(attempt, &Outcome::Status(response.status))
-                    {
+                    // The source's own `Retry-After`, where it named one:
+                    // waiting what it said beats waiting our doubling guess,
+                    // and this is the only place the header can still reach the
+                    // decision, which is a pure function over the outcome.
+                    let outcome = match response.retry_after {
+                        Some(after) => Outcome::status_with_retry_after(response.status, after),
+                        None => Outcome::status(response.status),
+                    };
+                    if let Retry::After(delay) = self.retry.decide(attempt, &outcome) {
                         tokio::time::sleep(delay).await;
                         attempt = attempt.saturating_add(1);
                         continue;

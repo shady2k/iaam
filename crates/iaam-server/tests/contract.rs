@@ -2805,28 +2805,50 @@ async fn two_figures_over_different_contour_versions_are_not_comparable() {
 /// that reads the first and stops quotes a percentage of face as money, or
 /// quotes as settled a basis the source contradicts itself about.
 ///
-/// **One carrier, and the name says so.** The rule about all three is written
-/// on the basis in force, which is the field a caller reads first and the only
-/// one of the three that could state it without repeating itself. Of the
-/// siblings, one publishes a bare line about itself and the other publishes
-/// nothing, and neither states this rule — so the test is named for the carrier
-/// it reads rather than for the three fields the rule is about.
+/// **Three carriers, because a reader meets whichever comes first.** The rule
+/// holding the three together is written on the basis in force; each sibling
+/// carries the part a reader of *that* field needs — what it states, and which
+/// of the other two states it is not — so no order of reading leaves a caller
+/// with a word it can mistake for the whole answer.
 #[tokio::test]
-async fn the_basis_in_force_says_the_other_two_statements_need_not_agree() {
+async fn a_price_says_its_three_statements_of_the_basis_need_not_agree() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let described = property_description(&spec, "MarketPriceDto", "quotation_basis");
-    for owed in [
-        "recorded_quotation_basis",
-        "quotation_basis_status",
-        "contradicts itself",
+    for (property, owed) in [
+        (
+            "quotation_basis",
+            &[
+                "recorded_quotation_basis",
+                "quotation_basis_status",
+                "contradicts itself",
+            ][..],
+        ),
+        (
+            "recorded_quotation_basis",
+            &[
+                "as it stands in the source's own record",
+                "not the basis to compute with",
+                "quietly corrected into another",
+            ][..],
+        ),
+        (
+            "quotation_basis_status",
+            &[
+                "evidence confirms the record",
+                "not one state worn twice",
+                "a record that was never complete",
+            ][..],
+        ),
     ] {
-        assert!(
-            described.contains(owed),
-            "the quotation basis says nothing about «{owed}»: {described}"
-        );
+        let described = property_description(&spec, "MarketPriceDto", property);
+        for phrase in owed {
+            assert!(
+                described.contains(phrase),
+                "`{property}` says nothing about «{phrase}»: {described}"
+            );
+        }
     }
 }
 
@@ -3081,27 +3103,51 @@ async fn a_dated_resolution_keeps_its_two_refusals_apart() {
 /// first states a holding in money the owner never held. The currency a report
 /// is drawn in belongs to the report and to no instrument.
 ///
-/// **One carrier, and the name says so.** The rule naming all three is written
-/// on the first of them, where a caller reading the fields in order meets it
-/// before it can pick wrongly. The siblings publish no description at all, so a
-/// test named for three carriers would promise proof of two that do not exist.
+/// **Three carriers, because a reader meets whichever comes first.** The rule
+/// naming all three is written on the first of them; each sibling carries the
+/// part a reader of *that* field needs — what that currency is, and which of
+/// the other two it must not be taken for — so a caller that meets a sibling
+/// first learns the same thing rather than nothing.
 #[tokio::test]
-async fn the_denomination_currency_says_the_other_two_are_not_it() {
+async fn an_instrument_keeps_its_three_currencies_apart() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
-    let described = property_description(&spec, "InstrumentDto", "denomination_currency");
-    for owed in [
-        "settlement_currency",
-        "quote_currency",
-        "diverge",
-        "property of the report",
+    for (property, owed) in [
+        (
+            "denomination_currency",
+            &[
+                "settlement_currency",
+                "quote_currency",
+                "diverge",
+                "property of the report",
+            ][..],
+        ),
+        (
+            "settlement_currency",
+            &[
+                "The currency the money actually moves in",
+                "is discharged in another",
+                "names money that never moved",
+            ][..],
+        ),
+        (
+            "quote_currency",
+            &[
+                "The money a board's number is a number of",
+                "all three are different currencies at once",
+                "money nobody quoted it in",
+            ][..],
+        ),
     ] {
-        assert!(
-            described.contains(owed),
-            "the denomination currency says nothing about «{owed}»: {described}"
-        );
+        let described = property_description(&spec, "InstrumentDto", property);
+        for phrase in owed {
+            assert!(
+                described.contains(phrase),
+                "`{property}` says nothing about «{phrase}»: {described}"
+            );
+        }
     }
 }
 

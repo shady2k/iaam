@@ -5747,8 +5747,24 @@ pub struct MarketPriceDto {
     /// none of them stands for the other two.
     #[serde(default)]
     pub quotation_basis: QuotationBasisDto,
-    /// Basis exactly as recorded by the source.
+    /// The basis exactly as it stands in the source's own record, before
+    /// anything was checked against it.
+    ///
+    /// It is not the basis to compute with — `quotation_basis` is. Where the
+    /// evidence the source publishes beside this record disagrees with it,
+    /// the basis in force falls to `unknown` while this field goes on reading
+    /// what was recorded, so that a reader sees the source contradicting
+    /// itself instead of one value quietly corrected into another.
     pub recorded_quotation_basis: String,
+    /// How well the basis in force is proven: `proven` — the source's own
+    /// evidence confirms the record; `contradicts` — that evidence says
+    /// something else; `not_proven` — there is no evidence either way.
+    ///
+    /// The last two are not one state worn twice. `contradicts` is a defect
+    /// in the source and `not_proven` a record that was never complete, and
+    /// they lead to different work. Under either, `quotation_basis` reads
+    /// `unknown` and the price is not converted into money; this field is the
+    /// only one that says which of the two put it there.
     pub quotation_basis_status: QuotationBasisStatusDto,
     #[serde(default)]
     pub basis_evidence: Option<String>,
@@ -8138,7 +8154,21 @@ pub struct InstrumentDto {
     /// chosen when the report is asked for, and no field of an instrument
     /// answers it.
     pub denomination_currency: String,
+    /// The currency the money actually moves in — what is paid for the paper
+    /// and what comes back from it.
+    ///
+    /// It is not the currency the paper is denominated in. On a replacement
+    /// bond an obligation written in one currency is discharged in another,
+    /// and neither of those two is what the board quotes. A caller that takes
+    /// a settled sum for `denomination_currency` names money that never moved.
     pub settlement_currency: String,
+    /// The money a board's number is a number of — the currency a price for
+    /// this paper is quoted in.
+    ///
+    /// It is neither the currency the paper is denominated in nor the one it
+    /// settles in: on some papers all three are different currencies at once.
+    /// A quotation read as though it stood in either sibling states the
+    /// position in money nobody quoted it in.
     pub quote_currency: String,
 }
 

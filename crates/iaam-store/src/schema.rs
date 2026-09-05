@@ -98,10 +98,7 @@ const MIGRATIONS: [(u32, &str); 30] = [
         29,
         include_str!("../migrations/0029_event_settled_by_rule.sql"),
     ),
-    (
-        30,
-        include_str!("../migrations/0030_operation_history.sql"),
-    ),
+    (30, include_str!("../migrations/0030_operation_history.sql")),
 ];
 
 /// Apply missing migrations.

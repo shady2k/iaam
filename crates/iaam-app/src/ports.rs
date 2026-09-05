@@ -6,8 +6,8 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{
-    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, CustodyId, ImportId, ImportQuestionId,
-    ImportSessionId, InstrumentId, OwnerId, SourceId,
+    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId,
+    ImportId, ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, SourceId,
 };
 use iaam_core::operation::OperationKey;
 use iaam_core::projection::Snapshot;
@@ -633,7 +633,7 @@ pub struct JournalQuery {
     /// rule is stamped on the event's provenance where a reading settled the row
     /// by one, so this narrows to the group a single decision of his reached —
     /// which no other handle here can assemble.
-    pub settled_by_rule: Option<iaam_core::ids::ClassificationRuleId>,
+    pub settled_by_rule: Option<ClassificationRuleId>,
     /// Only the facts that version of the rule filed. Supplied with the rule;
     /// the refusal for a version named on its own is the scenario's.
     pub settled_by_rule_version: Option<u32>,
@@ -1190,6 +1190,37 @@ pub trait Store: Send + Sync {
         rule: String,
     ) -> Result<ImportQuestionView, AppError>;
 
+    /// Stamp the rule one answer minted onto every row that answer settled.
+    ///
+    /// The observation and not the question, and the two are not alternatives:
+    /// commit reads the answer off the **observation**, so the rule has to be
+    /// recorded where the answer already is. The question keeps naming the rule
+    /// exactly as it did — that is what the assessment shows the owner — and
+    /// this is what the fact is written from.
+    ///
+    /// **`rows` is the row the caller addressed and every row the answer's reach
+    /// settled, in one call.** They are one decision of his, and stamping them
+    /// one at a time would let a failure split the group between the rows that
+    /// name the rule and the rows that do not — leaving «show me everything this
+    /// decision did» answering with part of it.
+    ///
+    /// `version` is the version the rule was **minted** at. It is deliberately
+    /// passed in rather than read back at commit: a rule can be edited between
+    /// the answer and the commit, and the fact must record the version it was
+    /// filed under.
+    ///
+    /// Refused for a row nobody answered and for a row already naming a minted
+    /// rule, exactly as [`Self::attach_import_question_rule`] is, and the
+    /// refusal takes the whole call with it.
+    async fn attach_import_answer_rule(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        rows: &[u32],
+        rule: ClassificationRuleId,
+        version: u32,
+    ) -> Result<(), AppError>;
+
     /// Record the control figures the session's source printed about itself,
     /// replacing any it printed before for the same account and currency.
     ///
@@ -1311,6 +1342,32 @@ pub struct ImportObservationView {
     pub concluded: bool,
     pub payload: String,
     pub answer: Option<String>,
+    /// The standing rule this row's own answer minted, where it minted one.
+    ///
+    /// What tells the commit that a row settled by his answer belongs to the
+    /// group that answer's rule files, rather than to no rule at all. `None`
+    /// covers three different rows and claims nothing about which: one nobody
+    /// answered, one whose answer generalised into nothing, and one recorded
+    /// before the columns existed. Nothing is back-filled, so silence here is
+    /// silence.
+    pub answer_rule: Option<AnswerRule>,
+}
+
+/// The standing rule an answer minted, and the version it was minted at.
+///
+/// **One value, never two independent `Option`s.** `iaam-r0qk` is the
+/// precedent: a rule held as something a caller can get half-right — an
+/// identifier with no version, a version naming no rule — is a state with no
+/// truthful answer to give about it. The pair makes it unrepresentable.
+///
+/// The version is the one that stood when the rule was minted, which is what
+/// the fact records. It is not the version the rule carries at commit: a rule
+/// can be edited in between, and «the rows this rule filed» and «the rows the
+/// version I have just replaced filed» are different questions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnswerRule {
+    pub rule: ClassificationRuleId,
+    pub version: u32,
 }
 
 /// A question about to be written: its typed form, its alternatives, its wording.

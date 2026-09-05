@@ -12,14 +12,14 @@ use crate::ports::{
     AccountActivityView, AccountAliasView, AccountCreated, AccountDeclarations,
     AccountDeclarationsRecorded, AccountDetailView, AccountIdentityView, AccountRetirementsView,
     AccountScopeExclusionView, AccountTransferStatementView, AccountView, AliasUpsert, AliasView,
-    BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment, BrokerVault,
-    CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore, CategoryView,
-    ClassificationRuleStore, ClassificationRuleView, ContourView, ControlAssertionView,
-    CustodyView, Declared, DeclinedAccountNameView, DocumentToKeep, ImportObservationView,
-    ImportQuestionView, ImportSessionState, ImportSessionSummaryView, ImportSessionView,
-    InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery,
-    NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin, TokenView,
-    UnresolvedAccountSourceView, UnresolvedAccountView,
+    AnswerRule, BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment,
+    BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore,
+    CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
+    ControlAssertionView, CustodyView, Declared, DeclinedAccountNameView, DocumentToKeep,
+    ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
+    ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
+    JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin,
+    TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -181,6 +181,10 @@ fn import_observation_view(observation: StoredObservation) -> ImportObservationV
         concluded: observation.concluded,
         payload: observation.payload,
         answer: observation.answer,
+        answer_rule: observation.answer_rule.map(|minted| AnswerRule {
+            rule: minted.rule,
+            version: minted.version,
+        }),
     }
 }
 
@@ -1196,6 +1200,25 @@ impl Store for SqliteAdapter {
             store
                 .attach_import_question_rule(owner, session, question, &rule)
                 .map(import_question_view)
+                .map_err(import_session_error)
+        })
+        .await
+    }
+
+    async fn attach_import_answer_rule(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        rows: &[u32],
+        rule: ClassificationRuleId,
+        version: u32,
+    ) -> Result<(), AppError> {
+        // Owned before the closure, because the closure outlives the borrow the
+        // caller lent: `blocking` hands the work to another thread.
+        let rows = rows.to_vec();
+        self.blocking(move |store| {
+            store
+                .attach_import_answer_rule(owner, session, &rows, rule, version)
                 .map_err(import_session_error)
         })
         .await

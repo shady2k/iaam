@@ -10716,6 +10716,7 @@ mod tests {
             concluded: false,
             payload: "{".to_owned(),
             answer: None,
+            answer_rule: None,
         };
         let observations = vec![stored_row(1, &departure), unreadable];
         let questions = vec![stored_question_about(
@@ -10895,6 +10896,7 @@ mod tests {
             })
             .expect("an intake"),
             answer: None,
+            answer_rule: None,
         }
     }
 
@@ -12244,6 +12246,7 @@ mod tests {
                 concluded: false,
                 payload: serde_json::to_string(&intake).expect("an intake"),
                 answer: answered.clone(),
+                answer_rule: None,
             }],
             questions: vec![ImportQuestionView {
                 id: ImportQuestionId::new_random(),
@@ -13217,6 +13220,7 @@ mod tests {
             concluded: false,
             payload: "{".to_owned(),
             answer: None,
+            answer_rule: None,
         }
     }
 
@@ -13228,6 +13232,7 @@ mod tests {
     fn answered_row(number: u32, line: &ObservedRow, answer: Answer) -> ImportObservationView {
         ImportObservationView {
             answer: Some(serde_json::to_string(&answer).expect("an answer")),
+            answer_rule: None,
             ..stored_row(number, line)
         }
     }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use iaam_app::AppServices;
 use iaam_app::adapters::market::HttpOutbound;
+use iaam_app::adapters::profile_ledger::StoreVersionLedger;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ingest::profile::ProfileCatalogue;
 use iaam_app::ports::{
@@ -376,6 +377,33 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         ))),
     ));
 
+    // Assembled once, here, because the catalogue belongs to the deployment.
+    // Bundled profiles always; the operator's directory only where he named
+    // one, and never from a default path.
+    //
+    // Bound against this instance's own record before the store is handed on,
+    // and before anything reads a document. A version is a name for a content
+    // (decision 0019 §5): a profile whose content changed under a version this
+    // instance already recorded is refused here, rather than stamping a second
+    // content on a `ParserVersion` that facts in the journal already carry.
+    let profiles = Arc::new(
+        match &config.source_profiles {
+            Some(directory) => ProfileCatalogue::with_local(directory),
+            None => ProfileCatalogue::bundled(),
+        }
+        .bound_by(&mut StoreVersionLedger::new(&store)),
+    );
+    // Published on the catalogue route as well, but an operator whose import
+    // stopped working reads the log first, and a refusal nobody sees is the
+    // silence this whole arrangement exists to break.
+    for refused in profiles.refused() {
+        tracing::warn!(
+            profile = refused.id.as_deref().unwrap_or("unnamed"),
+            reason = %refused.reason,
+            "a source profile was refused and will not read documents"
+        );
+    }
+
     // The same adapter serves as both fact storage and broker-access
     // storage: both use one database connection, and a second instance
     // would mean a second writer.
@@ -397,13 +425,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         http,
         broker_dictionary,
         market_store: Arc::new(tokio::sync::Mutex::new(market_store)),
-        // Assembled once, here, because the catalogue belongs to the
-        // deployment. Bundled profiles always; the operator's directory only
-        // where he named one, and never from a default path.
-        profiles: Arc::new(match &config.source_profiles {
-            Some(directory) => ProfileCatalogue::with_local(directory),
-            None => ProfileCatalogue::bundled(),
-        }),
+        profiles,
     });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);

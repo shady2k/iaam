@@ -89,7 +89,7 @@
           "maxItems": 32,
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/source_literal" },
-          "description": "Header cells that must all be present in the document's header row. They are the source's own printed headings."
+          "description": "Header cells that must all be present in the document's header row. They are the source's own printed headings.\n\nEvery heading the \"row\" block names must be listed here, and a profile may list more. The engine refuses a document that does not print a heading the row shape names, so a heading named there and absent here is a document this profile recognises and then refuses at read -- the wrong answer twice: recognition promised a reading the engine will not give, where the honest answer was that no installed profile reads this document. Listing more is the discrimination this block is for: a heading no field is read out of still tells two of an institution's exports apart."
         }
       }
     },
@@ -525,7 +525,20 @@
         "header_row": 1
       },
       "recognise": {
-        "header_cells": ["Posted", "Operation", "Sum", "Ccy", "Payee"]
+        "header_cells": [
+          "Posted",
+          "Operation date",
+          "Operation",
+          "Sum",
+          "Ccy",
+          "State",
+          "Payee",
+          "Purpose",
+          "Category",
+          "Your category",
+          "Code",
+          "Reference"
+        ]
       },
       "row": {
         "account": { "from": "declaration" },

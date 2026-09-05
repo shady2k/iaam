@@ -1044,6 +1044,16 @@ mod tests {
             profile.parser_version().0,
             "profile/example-bank-statement/1"
         );
+        // And it recognises on every column it names, as the "recognise" block
+        // says a profile must: an example that claimed a document and then
+        // refused it at read would teach the defect it warns about.
+        let recognised: Vec<&str> = profile.recognised_by().iter().map(String::as_str).collect();
+        for required in profile.columns() {
+            assert!(
+                recognised.contains(&required),
+                "the example names «{required}» and does not recognise on it"
+            );
+        }
     }
 
     /// Every widening a well-meaning author would write, and the place each is

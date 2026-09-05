@@ -421,4 +421,52 @@ mod tests {
             "{refusal:?}"
         );
     }
+
+    /// A document carrying every heading a bundled profile recognises on, but
+    /// missing one the profile names in its row shape, is **recognised and then
+    /// refused at read** — which is the wrong answer twice over.
+    ///
+    /// Recognition says "this profile reads this document" and the read then
+    /// says it does not. The honest answer is the one the catalogue gives a
+    /// document nothing reads, so recognition must be at least as demanding as
+    /// the reading it promises.
+    #[test]
+    fn a_bundled_profile_recognises_on_every_column_it_requires() {
+        for installed in ProfileCatalogue::bundled().installed() {
+            let profile = &installed.profile;
+            let recognised: Vec<&str> =
+                profile.recognised_by().iter().map(String::as_str).collect();
+            for required in profile.columns() {
+                assert!(
+                    recognised.contains(&required),
+                    "«{required}» is a column «{id}» refuses a document for, and not one it \
+                     recognises on: such a document is recognised and then refused at read, \
+                     instead of falling through to a document no profile reads",
+                    id = profile.id(),
+                );
+            }
+        }
+    }
+
+    /// The T-Bank export prints a standardised code for a row and leaves it
+    /// empty on rows it assigns none; the profile transcribes that column.
+    /// A document that does not print the column **at all** is a different
+    /// document, and this profile says so rather than reading it and refusing
+    /// every row.
+    ///
+    /// An empty cell and a missing column are not the same thing: a row that
+    /// prints no code is read, and the field says the source printed none
+    /// (`engine::transcribed`). Nothing requires the *value*. What the missing
+    /// heading settles is whether this profile reads this document at all.
+    #[test]
+    fn a_document_without_the_code_column_is_not_this_profile_s() {
+        let catalogue = ProfileCatalogue::bundled();
+        let header = "Имя счёта;Номер карты;Дата операции;Сумма в валюте счёта;\
+                      Валюта счёта;Статус;Категория по-умолчанию;Ваша категория;Описание\n";
+        let refusal = catalogue
+            .recognise(header.as_bytes())
+            .expect_err("an export that prints no code column is not this profile's document");
+        assert_eq!(refusal.field, "document");
+        assert_eq!(refusal.actual, "a document none of them recognises");
+    }
 }

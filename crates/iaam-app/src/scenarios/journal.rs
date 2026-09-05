@@ -15,14 +15,18 @@
 //! leaving an agent to discover it from the field names.
 
 use iaam_core::dates::EventDates;
+use iaam_core::event::kind::{
+    EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TaxOrigin, TradeSide,
+};
 use iaam_core::event::leg::{Leg, LegKind};
 use iaam_core::event::provenance::RuleSettlement;
-use iaam_core::event::{Confidence, Relation};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId, InstrumentId,
     OwnerId, SourceId,
 };
-use iaam_core::money::{Money, Quantity};
+use iaam_core::money::{CalcMoney, Money, PerUnitAmount, Quantity};
+use iaam_core::valuation::PriceQuality;
 use time::{Date, Time};
 
 use crate::error::AppError;
@@ -129,6 +133,23 @@ pub struct JournalEventView {
     /// The movement, leg by leg, exactly as recorded. No leg is added up here:
     /// a total is a computed number and this route computes none.
     pub legs: Vec<Leg>,
+    /// The sum the fact states about itself, where it posts no leg that states
+    /// one.
+    ///
+    /// A fact with legs says its money in them and they are published above; a
+    /// fact with none says it only in its kind, and without this field the whole
+    /// of what such a fact says would be missing here. One family carries it
+    /// today, and it is the family that needs it: a movement between the owner's
+    /// own accounts whose direction the source never stated posts nothing at all
+    /// — the journal will not debit or credit an account on a direction nobody
+    /// gave — and yet the fact records the magnitude the source printed. Without
+    /// this, two such facts at different sums read identically.
+    ///
+    /// **Not a total, and never a leg repeated.** This route adds nothing up,
+    /// as `legs` says; the value here is one figure the fact itself holds, and
+    /// it is `None` wherever a leg already carries the money, so that no number
+    /// has two places to be read from.
+    pub amount: Option<Money>,
     /// Whether this event reverses or replaces another. A reader who cannot see
     /// that an event was reversed reads a retracted fact as a live one.
     pub relation: Relation,
@@ -272,6 +293,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         kind: event.kind.discriminant(),
         dates: event.dates,
         legs: event.legs.clone(),
+        amount: stated_amount(event),
         relation: event.relation,
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
@@ -324,11 +346,22 @@ pub enum HistoryAct {
 
 /// Which aspect of the fact an act made different.
 ///
-/// A closed vocabulary computed from the two published states, and **not a
-/// rendered before-and-after**. Both states are published in full, so rendering
-/// the difference as well would be a second answer to the same question, and
-/// the two would come to disagree in front of the owner. These name where the
-/// difference is; what it is, he reads off the states themselves.
+/// A closed vocabulary, and **not a rendered before-and-after**. The state
+/// before and the state after are both published beside it, so rendering the
+/// difference as well would be a second answer to the same question, and the two
+/// would come to disagree in front of the owner. These name where the difference
+/// is; what it is, he reads off the states themselves.
+///
+/// «Both states» is as much of each fact as this route publishes, which is
+/// deliberately not the whole of it: [`JournalEventView`] leaves out the raw-row
+/// hash, the parser version and the row locator, because they answer a different
+/// question. None of those is an aspect below, so the argument holds — with one
+/// exception, stated here rather than hidden. The scalars that tell two facts of
+/// one family apart are compared under [`Self::Kind`] and are published on their
+/// own nowhere: he is told the sort of the fact changed and must read the two
+/// states to see how. Naming it is still the better failure, because the
+/// alternative is silence, and silence reports that a correction changed
+/// nothing.
 ///
 /// **A category is deliberately not among them.** A category is not recorded on
 /// the fact at all — it is decided by the owner's category rules when a report
@@ -343,10 +376,16 @@ pub enum HistoryAct {
 /// them and would say nothing at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangedAspect {
-    /// The event family — `cash_in`, `trade`, `income` and so on.
+    /// The event family — `cash_in`, `trade`, `income` and so on — and the
+    /// scalars that tell two facts of one family apart: the side of a trade,
+    /// the sort of an income, what a fee was for, whether a tax was withheld or
+    /// paid. None of those changes the family word, and a correction that
+    /// changed one of them and nothing else would otherwise read as no
+    /// correction at all.
     Kind,
-    /// What moved: the money and the quantity the legs carry, and the
-    /// instrument they name.
+    /// What moved: the money and the quantity the legs carry, the instrument
+    /// they name, and the figures the fact's own kind states — which, for a
+    /// fact that posts no leg, are the whole of what it says.
     Amount,
     /// Where it moved: the account the fact is filed under, and the account and
     /// custody each leg posts to.
@@ -356,7 +395,8 @@ pub enum ChangedAspect {
     Dates,
     /// Who the far side was, as the source printed it on the row.
     Counterparty,
-    /// How sure the fact is.
+    /// How sure the fact is — and, on a reconstructed opening or a valuation,
+    /// what the fact itself asserts about how sure it is.
     Confidence,
 }
 
@@ -459,12 +499,12 @@ pub async fn read_operation_history(
 ///
 /// One pass forward from the head, pairing at each step the reversal and the
 /// replacement that name the fact standing there.
-fn acts_of(head: &RecordedEvent, chain: &[RecordedEvent]) -> OperationHistory {
-    let mut standing = journal_event_view(&head.event);
+fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> OperationHistory {
+    let mut standing = &head.event;
     let mut steps = vec![HistoryStep {
         act: HistoryAct::Arrived,
         at: head.recorded_at.clone(),
-        state: Some(standing.clone()),
+        state: Some(journal_event_view(&head.event)),
         changed: Vec::new(),
         reversal: None,
         replacement: None,
@@ -490,17 +530,16 @@ fn acts_of(head: &RecordedEvent, chain: &[RecordedEvent]) -> OperationHistory {
             current = None;
             break;
         };
-        let state = journal_event_view(&replacement.event);
         steps.push(HistoryStep {
             act: HistoryAct::Corrected,
             at: recorded_first(reversal, replacement),
-            changed: changed_aspects(&standing, &state),
-            state: Some(state.clone()),
+            changed: changed_aspects(standing, &replacement.event),
+            state: Some(journal_event_view(&replacement.event)),
             reversal: reversal.map(|reversal| reversal.event.id),
             replacement: Some(replacement.event.id),
         });
         current = Some(replacement.event.id);
-        standing = state;
+        standing = &replacement.event;
     }
 
     OperationHistory { steps, current }
@@ -546,32 +585,46 @@ fn recorded_first(reversal: Option<&RecordedEvent>, replacement: &RecordedEvent)
     )
 }
 
-/// The aspects two published states differ in, in the order they are declared.
+/// The aspects two facts differ in, in the order they are declared.
 ///
-/// Computed from the views the caller is handed and from nothing else. Read off
-/// the underlying facts instead, it could name a difference the caller cannot
-/// see in what he was shown — and then the difference and the states would
-/// disagree, which is exactly what publishing both was meant to prevent.
-fn changed_aspects(before: &JournalEventView, after: &JournalEventView) -> Vec<ChangedAspect> {
+/// Read off the **facts**, and that is deliberate rather than incidental. An
+/// earlier reading compared only the two published views, which carry the family
+/// word and the legs — so every payload inside [`EventKind`] was invisible to
+/// it: the sort of an income, the origin of a fee, and the sum of a fact that
+/// posts no leg at all. Correcting such a fact answered «you corrected this» and
+/// «nothing changed» in one breath, which is exactly the silence
+/// [`ChangedAspect`] excludes a category loudly to avoid.
+///
+/// What keeps this answer and the states beside it from disagreeing is not that
+/// both are computed from the same input, but that what is named here is
+/// published there: [`JournalEventView::amount`] exists for the one fact whose
+/// sum lives nowhere else. The single thing named and not published is the
+/// scalar that tells two facts of one family apart, and naming it is still the
+/// better failure — see [`ChangedAspect::Kind`].
+fn changed_aspects(before: &Event, after: &Event) -> Vec<ChangedAspect> {
+    let (was, now) = (kind_aspects(&before.kind), kind_aspects(&after.kind));
     let mut changed = Vec::new();
-    if before.kind != after.kind {
+    if before.kind.discriminant() != after.kind.discriminant() || was.word != now.word {
         changed.push(ChangedAspect::Kind);
     }
-    if what_moved(before) != what_moved(after) {
+    if what_moved(before) != what_moved(after) || was.moved != now.moved {
         changed.push(ChangedAspect::Amount);
     }
     if where_it_moved(before) != where_it_moved(after) {
         changed.push(ChangedAspect::Account);
     }
-    if (before.effective_date, before.source_time, before.dates)
-        != (after.effective_date, after.source_time, after.dates)
+    if (
+        before.order.date(),
+        before.order.source_time(),
+        before.dates,
+    ) != (after.order.date(), after.order.source_time(), after.dates)
     {
         changed.push(ChangedAspect::Dates);
     }
-    if before.description != after.description {
+    if before.provenance.description() != after.provenance.description() {
         changed.push(ChangedAspect::Counterparty);
     }
-    if before.confidence != after.confidence {
+    if before.confidence != after.confidence || was.confidence != now.confidence {
         changed.push(ChangedAspect::Confidence);
     }
     changed
@@ -589,8 +642,9 @@ type Moved = (
 type Posted = (AccountId, Option<CustodyId>);
 
 /// What moved, leg by leg.
-fn what_moved(view: &JournalEventView) -> Vec<Moved> {
-    view.legs
+fn what_moved(event: &Event) -> Vec<Moved> {
+    event
+        .legs
         .iter()
         .map(|leg| (leg.kind, leg.money, leg.quantity, leg.instrument))
         .collect()
@@ -602,14 +656,257 @@ fn what_moved(view: &JournalEventView) -> Vec<Moved> {
 /// them: a fact with no leg at all — a valuation, a control assertion — still
 /// names the account it is about, and moving one from `Main` to `Savings` is a
 /// change the owner must be shown.
-fn where_it_moved(view: &JournalEventView) -> (AccountId, Vec<Posted>) {
+fn where_it_moved(event: &Event) -> (AccountId, Vec<Posted>) {
     (
-        view.account,
-        view.legs
+        event.account,
+        event
+            .legs
             .iter()
             .map(|leg| (leg.account, leg.custody))
             .collect(),
     )
+}
+
+/// What a fact's own kind carries, sorted into the aspects it can differ in.
+///
+/// The legs say what was posted and the view publishes them; the kind says what
+/// the fact claims, and for a fact that posts nothing the kind says all of it.
+#[derive(Debug, Clone, PartialEq)]
+struct KindAspects {
+    /// Scalars that tell two facts of one family apart, for [`ChangedAspect::Kind`].
+    word: Vec<KindWord>,
+    /// Figures the payload states, for [`ChangedAspect::Amount`].
+    moved: Vec<KindFigure>,
+    /// What the fact asserts about how sure it is, for [`ChangedAspect::Confidence`].
+    confidence: Vec<KindConfidence>,
+}
+
+/// A scalar two facts of one family are told apart by.
+///
+/// None of these changes the family word, so a correction that changes one of
+/// them and nothing else would otherwise read as no correction at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KindWord {
+    /// Bought or sold.
+    Side(TradeSide),
+    /// Coupon, dividend, interest — or, as `None`, a source that named none.
+    Income(Option<IncomeKind>),
+    /// What the fee was for.
+    Fee(FeeOrigin),
+    /// Withheld at source or paid by the owner.
+    Tax(TaxOrigin),
+}
+
+/// A figure a fact's kind states.
+#[derive(Debug, Clone, PartialEq)]
+enum KindFigure {
+    /// A posted sum the payload declares.
+    Money(Money),
+    /// The unrounded source commission behind a posted basis fee. Compared
+    /// beside that fee rather than instead of it: the two can differ from each
+    /// other, and the rounded one is the only one anything else reads.
+    Exact(CalcMoney),
+    /// A quantity of a security.
+    Quantity(Quantity),
+    /// The security the fact is about.
+    Instrument(InstrumentId),
+    /// A per-unit price, which is not a posted sum and is not typed as one.
+    Price(PerUnitAmount),
+    /// A payload compared entire, for the families whose figures are not picked
+    /// out one by one — see [`kind_aspects`] for which and why.
+    Whole(EventKind),
+}
+
+/// What a fact asserts about how sure it is of what it states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KindConfidence {
+    /// How a valuation's price was obtained.
+    Price(PriceQuality),
+    /// What a reconstructed opening asserts about itself.
+    ///
+    /// The set carries an acquisition date among its items, and it goes here
+    /// rather than with [`ChangedAspect::Dates`] because what the set states is
+    /// how sure the reconstruction is of each item, the date included. `Dates`
+    /// is the dates the journal orders and reports by.
+    Opening(OpeningAssertions),
+}
+
+/// Sort what a kind carries into the aspects it can differ in.
+///
+/// **An exhaustive match with no `_` arm, on purpose.** A variant added to
+/// [`EventKind`] and not placed here would carry a payload that could change
+/// under the owner without this route saying so, and the whole of what a
+/// legless fact says is such a payload. Breaking the build is how the next
+/// variant announces itself.
+fn kind_aspects(kind: &EventKind) -> KindAspects {
+    match kind {
+        EventKind::Trade {
+            side,
+            instrument,
+            quantity,
+            gross,
+            fee,
+            basis_fee,
+            basis_fee_exact,
+            accrued_interest,
+        } => KindAspects {
+            word: vec![KindWord::Side(*side)],
+            moved: figures([
+                Some(KindFigure::Instrument(*instrument)),
+                Some(KindFigure::Quantity(*quantity)),
+                Some(KindFigure::Money(*gross)),
+                fee.map(KindFigure::Money),
+                basis_fee.map(KindFigure::Money),
+                basis_fee_exact.map(KindFigure::Exact),
+                accrued_interest.map(KindFigure::Money),
+            ]),
+            confidence: Vec::new(),
+        },
+        // Six families whose whole claim is one sum. The unresolved own-account
+        // movement is the one that posts no leg to repeat it.
+        EventKind::CashIn { amount }
+        | EventKind::CashOut { amount }
+        | EventKind::Refund { amount }
+        | EventKind::OwnAccountMovement { amount }
+        | EventKind::UnresolvedOwnAccountMovement { amount }
+        | EventKind::OpeningCash { amount } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        // `transfer_id` is an identity rather than an aspect, and the two
+        // accounts are already compared by `where_it_moved`: a transfer posts a
+        // leg on each of them, and validation refuses one that does not.
+        EventKind::CashTransfer {
+            transfer_id: _,
+            from: _,
+            to: _,
+            amount,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        EventKind::Income {
+            instrument,
+            gross,
+            kind,
+        } => KindAspects {
+            word: vec![KindWord::Income(*kind)],
+            moved: figures([
+                instrument.map(KindFigure::Instrument),
+                Some(KindFigure::Money(*gross)),
+            ]),
+            confidence: Vec::new(),
+        },
+        EventKind::Fee { amount, origin } => KindAspects {
+            word: vec![KindWord::Fee(*origin)],
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        EventKind::Tax { amount, origin } => KindAspects {
+            word: vec![KindWord::Tax(*origin)],
+            moved: vec![KindFigure::Money(*amount)],
+            confidence: Vec::new(),
+        },
+        EventKind::OpeningPosition {
+            instrument,
+            quantity,
+            cost_basis,
+            assertions,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: figures([
+                Some(KindFigure::Instrument(*instrument)),
+                Some(KindFigure::Quantity(*quantity)),
+                cost_basis.map(KindFigure::Money),
+            ]),
+            confidence: vec![KindConfidence::Opening(*assertions)],
+        },
+        // **A valuation's price goes with `Amount`.** It is the one figure the
+        // fact states — a valuation posts no leg — and what a corrected price
+        // makes different is the number, not the sort of thing the fact is;
+        // calling it `Kind` would tell the owner his valuation became some other
+        // family of fact. It is carried as a per-unit amount and not as money,
+        // because that is what it is: a price per security, not a posted sum,
+        // and it is published nowhere as one. Its `quality` says how the price
+        // was obtained, which is how sure the fact is of it, so that goes with
+        // `Confidence`.
+        EventKind::Valuation {
+            instrument,
+            price,
+            currency,
+            quality,
+        } => KindAspects {
+            word: Vec::new(),
+            moved: vec![
+                KindFigure::Instrument(*instrument),
+                KindFigure::Price(PerUnitAmount::new(*price, *currency)),
+            ],
+            confidence: vec![KindConfidence::Price(*quality)],
+        },
+        // Four families whose payload is compared **whole**, under `Amount`.
+        //
+        // A corporate action and an offer exercise each carry a typed family of
+        // their own, and everything in one of them describes the movement it
+        // made; picking figures out of it would mean a second exhaustive match
+        // over a family that grows, for a distinction the owner does not draw
+        // reading one line of his history. A control assertion and a coverage
+        // gap state nothing about an operation at all, and neither can ever be
+        // written as a replacement — those are built from a submitted operation
+        // — so the only way one of them faces another fact here is across a
+        // change of family, which the discriminant already names.
+        //
+        // `..` elides nothing that could go unnoticed, and only here: what is
+        // compared is the payload entire, so a field added to one of these is
+        // compared the day it is added.
+        EventKind::CorporateAction { .. }
+        | EventKind::OfferExercise { .. }
+        | EventKind::ControlAssertion { .. }
+        | EventKind::ImportCoverageGap { .. } => KindAspects {
+            word: Vec::new(),
+            moved: vec![KindFigure::Whole(kind.clone())],
+            confidence: Vec::new(),
+        },
+    }
+}
+
+/// The figures that are there, of the places one could be.
+fn figures<const N: usize>(places: [Option<KindFigure>; N]) -> Vec<KindFigure> {
+    places.into_iter().flatten().collect()
+}
+
+/// The money a fact states about itself when it posts nothing.
+///
+/// A fact with legs says its money in them and the view publishes those; a fact
+/// with none says it only in its kind, and without this the whole of what such a
+/// fact says would go unpublished. That is the case [`JournalEventView::amount`]
+/// exists for, and the condition is the honest one: not a list of families, but
+/// «this fact posted nothing, so read what it claims».
+///
+/// Exactly one figure or none. «The amount» of a legless fact that stated two
+/// would be a choice nobody asked for, and choosing between them here would be
+/// the arithmetic this route does not do.
+fn stated_amount(event: &Event) -> Option<Money> {
+    if !event.legs.is_empty() {
+        return None;
+    }
+    let stated: Vec<Money> = kind_aspects(&event.kind)
+        .moved
+        .into_iter()
+        .filter_map(|figure| match figure {
+            KindFigure::Money(money) => Some(money),
+            KindFigure::Exact(_)
+            | KindFigure::Quantity(_)
+            | KindFigure::Instrument(_)
+            | KindFigure::Price(_)
+            | KindFigure::Whole(_) => None,
+        })
+        .collect();
+    match stated.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
 }
 
 /// The rule narrowing, with the pair checked before either half is used.
@@ -943,6 +1240,22 @@ mod tests {
             self.recorded(hash, minor, account, None)
         }
 
+        /// A movement between two accounts of his that the source asserted and
+        /// did not name, with the direction it never stated.
+        ///
+        /// **It posts no leg at all**, and cannot: the journal will not debit
+        /// or credit an account on a movement whose direction nobody gave. So
+        /// the whole of what this fact says is in its kind, which is exactly
+        /// what makes it the sharpest case for a history to get right.
+        fn unstated(&self, hash: u8, minor: i64) -> iaam_core::event::Event {
+            let amount = Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
+            iaam_core::event::Event {
+                kind: EventKind::UnresolvedOwnAccountMovement { amount },
+                legs: Vec::new(),
+                ..self.recorded(hash, minor, self.main, None)
+            }
+        }
+
         fn imported(&self, hash: u8, minor: i64, import: ImportId) -> iaam_core::event::Event {
             self.recorded(hash, minor, self.main, Some(import))
         }
@@ -1250,5 +1563,130 @@ mod tests {
             panic!("an identifier that addresses nothing is a missing resource");
         };
         assert_eq!(id, his.id.inner().to_string());
+    }
+
+    /// A fact that posts nothing is still a fact, and correcting its sum is
+    /// still a correction of the sum.
+    ///
+    /// Everything such a fact says lives in its kind, so a comparison that read
+    /// only the legs would find two empty lists, name no aspect at all, and
+    /// publish two states nobody could tell apart. The owner would be told that
+    /// he corrected the row and never told what he corrected — the very failure
+    /// [`ChangedAspect`] excludes a category loudly to avoid.
+    #[tokio::test]
+    async fn a_fact_that_posts_nothing_still_says_its_sum_changed() {
+        let ctx = Ctx::new();
+        let original = ctx.unstated(1, 250_000);
+        let reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.unstated(2, 250_000)
+        };
+        let replacement = iaam_core::event::Event {
+            relation: Relation::Replacement {
+                target: original.id,
+            },
+            ..ctx.unstated(3, 340_000)
+        };
+        ctx.write(&[original.clone(), reversal.clone(), replacement.clone()])
+            .await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(history.steps[1].act, HistoryAct::Corrected);
+        assert_eq!(
+            history.steps[1].changed,
+            vec![ChangedAspect::Amount],
+            "he re-stated the sum of a fact whose sum is the only thing it has"
+        );
+
+        // And naming the aspect is half an answer while the two states he is
+        // shown are indistinguishable. The sum is on each of them.
+        let sums: Vec<Option<Money>> = history
+            .steps
+            .iter()
+            .filter_map(|step| step.state.as_ref().map(|state| state.amount))
+            .collect();
+        assert_eq!(
+            sums,
+            vec![
+                Some(Money::new(PostedMinor::new(250_000), CurrencyCode::Rub)),
+                Some(Money::new(PostedMinor::new(340_000), CurrencyCode::Rub)),
+            ],
+            "what it said before, and what it says now"
+        );
+    }
+
+    /// A fact that posts a leg says its money there, and the view publishes the
+    /// leg. Repeating it beside the leg would give one number two places to be
+    /// read from, and the first reader to find them disagreeing would be right
+    /// to distrust both.
+    #[tokio::test]
+    async fn a_fact_that_posts_its_money_does_not_state_it_twice() {
+        let ctx = Ctx::new();
+        let posted = ctx.deposit(1, 4_500, ctx.main);
+
+        let view = journal_event_view(&posted);
+
+        assert_eq!(view.legs.len(), 1, "the deposit posts its money");
+        assert_eq!(view.amount, None, "and states it nowhere else");
+    }
+
+    /// Coupon corrected to dividend: the family word is `income` before and
+    /// after, so a comparison that read only the word would find nothing. What
+    /// he changed is what sort of thing the fact is, which is `kind`.
+    #[tokio::test]
+    async fn the_sort_of_an_income_is_a_change_of_kind_and_not_of_sum() {
+        let ctx = Ctx::new();
+        let gross = Money::new(PostedMinor::new(4_500), CurrencyCode::Rub);
+        let coupon = iaam_core::event::Event {
+            kind: EventKind::Income {
+                instrument: None,
+                gross,
+                kind: Some(IncomeKind::Coupon),
+            },
+            ..ctx.deposit(1, 4_500, ctx.main)
+        };
+        let dividend = iaam_core::event::Event {
+            kind: EventKind::Income {
+                instrument: None,
+                gross,
+                kind: Some(IncomeKind::Dividend),
+            },
+            ..ctx.deposit(2, 4_500, ctx.main)
+        };
+
+        assert_eq!(coupon.kind.discriminant(), dividend.kind.discriminant());
+        assert_eq!(
+            changed_aspects(&coupon, &dividend),
+            vec![ChangedAspect::Kind],
+            "the sum did not move, and the sort of the income did"
+        );
+    }
+
+    /// The same for the two other scalars a family is told apart by: what a fee
+    /// was for, and whether a tax was withheld or paid.
+    #[tokio::test]
+    async fn what_a_fee_was_for_and_who_paid_a_tax_are_changes_of_kind() {
+        let ctx = Ctx::new();
+        let amount = Money::new(PostedMinor::new(-1_200), CurrencyCode::Rub);
+        let fee = |origin| iaam_core::event::Event {
+            kind: EventKind::Fee { amount, origin },
+            ..ctx.deposit(1, -1_200, ctx.main)
+        };
+        let tax = |origin| iaam_core::event::Event {
+            kind: EventKind::Tax { amount, origin },
+            ..ctx.deposit(2, -1_200, ctx.main)
+        };
+
+        assert_eq!(
+            changed_aspects(&fee(FeeOrigin::Brokerage), &fee(FeeOrigin::Depositary)),
+            vec![ChangedAspect::Kind],
+        );
+        assert_eq!(
+            changed_aspects(&tax(TaxOrigin::WithheldAtSource), &tax(TaxOrigin::SelfPaid)),
+            vec![ChangedAspect::Kind],
+        );
     }
 }

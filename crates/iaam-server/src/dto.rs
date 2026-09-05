@@ -8542,6 +8542,16 @@ pub struct AmountDto {
 }
 
 impl AmountDto {
+    /// A posted sum on its way out, rendered the way a leg's is: major units as
+    /// a decimal string, because binary floating-point loses pennies.
+    #[must_use]
+    pub fn from_money(money: Money) -> Self {
+        Self {
+            amount: money.to_calc_dec().inner().to_string(),
+            currency: CurrencyDto::from_domain(money.currency()),
+        }
+    }
+
     fn to_money(&self, field: &str) -> Result<Money, Rejection> {
         Ok(Money::new(
             PostedMinor::new(minor(&self.amount, self.currency, field)?),
@@ -8973,6 +8983,22 @@ pub struct JournalEventReadDto {
     /// The movement, leg by leg, exactly as recorded. Nothing here is summed:
     /// a total would be a computed number, and this route computes none.
     pub legs: Vec<JournalLegDto>,
+    /// The sum the fact states about itself, where it posts no leg that states
+    /// one.
+    ///
+    /// A fact with legs says its money in them, and `legs` above is where you
+    /// read it. A fact with none says it only in what it is, and one family does
+    /// exactly that: a movement between two accounts of yours whose direction
+    /// the source never stated posts nothing at all — nothing can be debited or
+    /// credited on a direction nobody gave — and yet the fact records the
+    /// magnitude the source printed. Without this field two such facts at
+    /// different sums read identically, and correcting one into the other would
+    /// change nothing you could see.
+    ///
+    /// **Not a total, and never a leg repeated.** Absent wherever a leg already
+    /// carries the money, so that no number has two places here to be read from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<AmountDto>,
     pub relation: JournalRelationDto,
     pub confidence: JournalConfidenceDto,
     /// The client key supplied at ingest, if one was.
@@ -9312,6 +9338,7 @@ impl JournalEventReadDto {
             kind: view.kind.to_owned(),
             dates: JournalEventDatesDto::from_domain(view.dates),
             legs: view.legs.iter().map(JournalLegDto::from_domain).collect(),
+            amount: view.amount.map(AmountDto::from_money),
             relation: JournalRelationDto::from_domain(view.relation),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
@@ -9394,9 +9421,17 @@ pub struct OperationHistoryStepDto {
     /// before it, and after a retraction, which left no state to compare.
     ///
     /// It **names** where the difference is and is deliberately not a rendered
-    /// before-and-after: both states are published here in full, so rendering
-    /// the difference as well would be a second answer to the same question, and
-    /// the two would come to disagree in front of the reader.
+    /// before-and-after: the state before and the state after are both published
+    /// beside it, so rendering the difference as well would be a second answer
+    /// to the same question, and the two would come to disagree in front of the
+    /// reader.
+    ///
+    /// «Both states» is as much of each fact as this route publishes, which is
+    /// not the whole of it: the raw-row hash, the parser version and the row
+    /// locator are left out, because they answer «which line of which document
+    /// produced this» and nothing here names them. One aspect is named without
+    /// being published on its own, and it is stated rather than hidden — see
+    /// `kind` on the vocabulary below.
     pub changed: Vec<HistoryChangedAspectDto>,
     /// The reversal this act wrote, where it wrote one.
     ///
@@ -9457,10 +9492,21 @@ pub enum HistoryActDto {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryChangedAspectDto {
-    /// The event family — `cash_in`, `trade`, `income` and so on.
+    /// The event family — `cash_in`, `trade`, `income` and so on — and the
+    /// scalars that tell two facts of one family apart: the side of a trade, the
+    /// sort of an income, what a fee was for, whether a tax was withheld or
+    /// paid.
+    ///
+    /// Those scalars are the one thing this vocabulary names that the two states
+    /// do not publish on their own: you are told the sort of the fact changed
+    /// and read the two states to see how. Naming it is still the better
+    /// failure, because the alternative is an empty `changed` on a correction
+    /// that really did change something.
     Kind,
-    /// What moved: the money and the quantity the legs carry, and the instrument
-    /// they name.
+    /// What moved: the money and the quantity the legs carry, the instrument
+    /// they name, and the figures the fact itself states — which, for a fact
+    /// that posts no leg, are the whole of what it says. `amount` on the state
+    /// is where you read that one.
     Amount,
     /// Where it moved: the account the fact is filed under, and the account and
     /// custody each leg posts to.
@@ -9470,7 +9516,8 @@ pub enum HistoryChangedAspectDto {
     Dates,
     /// Who the far side was, as the source printed it on the row.
     Counterparty,
-    /// How sure the fact is.
+    /// How sure the fact is — and, on a reconstructed opening or a valuation,
+    /// what the fact itself asserts about how sure it is.
     Confidence,
 }
 

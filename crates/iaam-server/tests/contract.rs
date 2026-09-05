@@ -18567,14 +18567,33 @@ async fn a_rules_group_holds_the_rows_the_answer_that_minted_it_settled_and_says
         "one decision, three rows, and each says who decided it: {page}"
     );
 
+    // The version the rule actually stands at. A fact carrying *a* number is not
+    // the claim being made here: the claim is that the fact says which revision
+    // of the rule filed it, and a wrong number is worse than none — it would send
+    // him to review the wrong version of his own decision.
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    let minted = rules
+        .as_array()
+        .expect("his rules")
+        .iter()
+        .find(|listed| listed["id"] == json!(rule))
+        .and_then(|listed| listed["version"].as_u64())
+        .expect("the rule his answer minted, at the version it stands at");
+
     // Every row of the group names the rule and the version it was filed under,
     // whichever of the two words it carries, and carries a sentence for the word.
     for row in page["rows"].as_array().expect("rows") {
         let settlement = &row["rule_settlement"];
         assert_eq!(settlement["rule"], json!(rule), "{page}");
-        assert!(
-            settlement["version"].is_u64(),
-            "a rule can be edited, so the version is on the fact: {page}"
+        assert_eq!(
+            settlement["version"].as_u64(),
+            Some(minted),
+            "a rule can be edited, so the fact says which version filed it: {page}"
         );
         assert!(
             settlement["explanation"]
@@ -26451,6 +26470,160 @@ async fn a_source_that_names_the_far_side_as_the_owners_records_a_fact_and_asks_
     assert!(
         row["rule_settlement"].get("rule").is_none(),
         "no row carries a rule it did not get: {row}"
+    );
+}
+
+/// A fact that posts nothing publishes the sum it states, and a correction the
+/// legs cannot see is still named (`iaam-k3z1`).
+///
+/// Two halves of one defect, and either alone is half an answer. The history
+/// compared only what the two published states carry, and a state carried the
+/// family word and the legs — so every figure and every scalar inside the fact
+/// itself was invisible to it, and a correction that moved one of them reported
+/// that nothing had changed. Beneath that, a fact that posts no leg at all —
+/// a movement between his own accounts whose direction the source never stated —
+/// published no sum anywhere, so even a named difference would have left him two
+/// states he could not tell apart.
+///
+/// Every account, amount, date and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn a_change_the_legs_cannot_see_is_named_and_a_sum_no_leg_carries_is_shown() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    // 1. A fact that posts nothing still says how much.
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [own_account_row(account, "k3z1-unstated")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let recorded = journal_events(&harness).await;
+    let unstated = recorded
+        .iter()
+        .find(|row| row["idempotency_key"] == "k3z1-unstated")
+        .unwrap_or_else(|| panic!("the fact is in the journal: {recorded:?}"));
+    assert!(
+        unstated["legs"].as_array().expect("legs").is_empty(),
+        "nothing is posted on a direction nobody stated: {unstated}"
+    );
+    assert_eq!(
+        unstated["amount"],
+        json!({ "amount": "2500.00", "currency": "RUB" }),
+        "and the sum it states is published, because no leg carries it: {unstated}"
+    );
+
+    let (status, life) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/journal/events/{}/history",
+                unstated["event"].as_str().expect("event")
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{life}");
+    assert_eq!(
+        life["steps"][0]["state"]["amount"],
+        json!({ "amount": "2500.00", "currency": "RUB" }),
+        "the history describes the fact exactly as the listing does: {life}"
+    );
+
+    // 2. A coupon he re-states as a dividend, for the same sum on the same day.
+    //    The family word is `income` before and after and the leg is the same
+    //    leg, so this is a difference only the fact itself carries.
+    let coupon = json!({
+        "account": account,
+        "type": "income",
+        "instrument": harness.instrument.inner(),
+        "amount": "5.00",
+        "currency": "RUB",
+        "kind": "coupon",
+        "dates": { "cash_posted": "2025-03-18" },
+        "idempotency_key": "k3z1-coupon",
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [coupon.clone()],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let arrived = verdicts[0]["event_id"]
+        .as_str()
+        .expect("the fact ingest wrote")
+        .to_owned();
+
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": arrived }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+
+    let mut dividend = coupon;
+    dividend["kind"] = json!("dividend");
+    dividend["idempotency_key"] = json!("k3z1-dividend");
+    let (status, restated) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{
+                    "relation": "replacement",
+                    "target": arrived,
+                    "operation": dividend,
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{restated}");
+
+    let (status, history) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events/{arrived}/history"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let steps = history["steps"].as_array().expect("steps");
+    assert_eq!(
+        steps.iter().map(|step| &step["act"]).collect::<Vec<_>>(),
+        vec![&json!("arrived"), &json!("corrected")],
+        "{history}"
+    );
+    assert_eq!(
+        steps[1]["changed"],
+        json!(["kind"]),
+        "he changed what sort of income it was, and nothing else: {history}"
     );
 }
 

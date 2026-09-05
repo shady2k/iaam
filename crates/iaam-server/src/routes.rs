@@ -109,6 +109,9 @@ use crate::dto::{
     ImportRowDto, ImportSessionContentsDto, ImportSessionDto, ImportSessionSummaryDto,
     OpenImportSessionRequest, RecordedEventDto, StateImportControlFiguresRequest,
 };
+// What one answer's standing decision would settle before it stands
+// (`iaam-uibl`), in a block of its own for the reason the block above gives.
+use crate::dto::{AnswerRuleForecastDto, PreviewAnswerRequest};
 // Types added by wave K, in a block of their own for the reason the block above
 // states: this file is edited by several changes at once, and merging one name
 // into a wrapped list reflows lines nothing else touched.
@@ -3875,6 +3878,74 @@ pub async fn answer_import_question(
     Ok(Json(ImportQuestionDto::from_answered(&answered)))
 }
 
+/// What the standing decision one answer would keep would settle, before it
+/// stands.
+///
+/// The owner asked it in his own words: what if every one of the operations is
+/// right except one? He answers a line, a standing decision appears, and it
+/// files a group of lines he never sees one by one. What that decision reaches
+/// was published nowhere until after it stood.
+///
+/// This answers it before. The condition is the one the answering call would
+/// write, and beside it come the lines of this import it would cover and the
+/// movements already recorded that it would cover — each of the second naming
+/// the fact a correction is addressed to, so the one that was something else can
+/// be found before the decision stands rather than a month after.
+///
+/// **It writes nothing.** No standing decision is made, nothing already recorded
+/// is changed, the question stays exactly as open as it was, and the answering
+/// call is unaffected by this one. Correcting a movement and changing the
+/// standing decision behind it stay two acts; this performs neither.
+///
+/// What could not be decided either way is listed with its reason rather than
+/// left out, because an omission here would read as «nothing else is affected».
+///
+/// The body is the answering call's body without `settles`: what that word
+/// reaches is a fact about the answer, not about the standing decision.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/questions/{question}/answer/preview",
+    params(
+        ("session" = Uuid, Path, description = "Import session identifier"),
+        ("question" = Uuid, Path, description = "Question identifier")
+    ),
+    request_body = PreviewAnswerRequest,
+    responses(
+        (status = 200, description = "What the answer's standing decision would settle", body = AnswerRuleForecastDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such session or question", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "The answer is not one this question admits, or it carries a field its own word does not take", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn preview_import_answer(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath((session, question)): ApiPath<(Uuid, Uuid)>,
+    ApiJson(request): ApiJson<PreviewAnswerRequest>,
+) -> Result<Json<AnswerRuleForecastDto>, ApiFailure> {
+    // The authority the **answering** call demands, and no operation key: this
+    // is the call it describes, asked in advance, so an answerer that could not
+    // answer must not be handed the forecast either. Nothing is written, so
+    // there is nothing to make idempotent (decision 0025).
+    require(&principal, OperationKey::AnswerImportQuestion)?;
+    let answer = request.to_domain().map_err(|rejection| {
+        invalid_field(rejection.field, &rejection.expected, rejection.actual)
+    })?;
+    let forecast = iaam_app::scenarios::import_session::preview_answer_rule(
+        &state.services,
+        &principal,
+        ImportSessionId(session),
+        ImportQuestionId(question),
+        answer,
+    )
+    .await?;
+    Ok(Json(AnswerRuleForecastDto::from_domain(&forecast)))
+}
+
 /// What committing this session would do, before it does it (iaam-k1xa).
 ///
 /// Computed by the code that commits, not beside it. That is the whole property:
@@ -5484,7 +5555,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// the reason [`require_admin`] states: the queue and the caveat register are
 /// about the owner's money and these are about the shape of the instance, so
 /// there is no second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 25] = [
     (
         "resolve_instrument",
         "A read that takes a body: it answers which instrument a namespace, a value and a date name, and records nothing. A target is a call that changes something — see list_source_profiles.",
@@ -5492,6 +5563,10 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
     (
         "preview_category_rule_route",
         "A read that takes a body: it says what a rule would match and writes no rule.",
+    ),
+    (
+        "preview_import_answer",
+        "A read that takes a body: it says what the standing decision an answer would keep would settle, and it keeps none, answers nothing and corrects nothing. It publishes the floor of the call it describes — answer_import_question — because an answerer that could not answer has no use for its forecast; that is the answering route's own key, read once, not a second authority stated here.",
     ),
     (
         "returns_report_with_rates",

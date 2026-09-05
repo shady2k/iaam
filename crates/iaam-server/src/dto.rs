@@ -52,6 +52,9 @@ use iaam_app::scenarios::import_session::PlannedOrigin;
 // to a wrapped list reflows every line of it.
 use iaam_app::actions::{OwnerQuestion, ReportStanding};
 use iaam_app::scenarios::import_session::{AnswerReach, AnsweredQuestions, stored_alternatives};
+// What one answer's standing decision would settle before it stands
+// (`iaam-uibl`), in a block of its own for the reason the blocks above give.
+use iaam_app::scenarios::import_session::{AnswerRuleForecast, Undecided};
 // Wave Y's own names, in a block of their own for the reason the blocks above
 // give: this file is edited by several changes at once, and a name added to a
 // wrapped list reflows every line of it.
@@ -12752,5 +12755,264 @@ mod question_publishers {
             published.answered_at.is_none(),
             "settled is not answered: he never spoke about this row"
         );
+    }
+}
+
+/// The answer a forecast is asked about.
+///
+/// The same four fields `AnswerImportQuestionRequest` takes, minus `settles`,
+/// and read by that type's own conversion rather than by a second one: what a
+/// forecast describes is the standing decision an answer keeps, and `settles`
+/// says how many lines the **answer** disposes of, which is a different fact
+/// this call would have to either ignore or restate. A field silently ignored
+/// is worse than a field that is not there.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PreviewAnswerRequest {
+    /// One of the words the question published in its alternatives.
+    pub answer: String,
+    /// The owner's account on the other side, for `sent_to_own_account` and
+    /// `received_from_own_account` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    /// Where a fee came from, for the `fee` answer only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<FeeOriginDto>,
+    /// Which earning this was, for the `income` answer only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub income_kind: Option<IncomeKindDto>,
+}
+
+impl PreviewAnswerRequest {
+    /// Conversion to the owner's decision, through the answering call's own
+    /// reader.
+    ///
+    /// One reader, so a word this forecast accepts and the answering call
+    /// refuses — or the other way round — is not representable.
+    pub fn to_domain(&self) -> Result<Answer, Rejection> {
+        AnswerImportQuestionRequest {
+            answer: self.answer.clone(),
+            settles: None,
+            account: self.account,
+            origin: self.origin,
+            income_kind: self.income_kind,
+        }
+        .to_domain()
+    }
+}
+
+/// One line of this import a standing decision would cover.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ForecastedLineDto {
+    /// The line's position among what this import took, in submission order,
+    /// stable across a re-reading. **Not the document's line number**, which is
+    /// `locator` on the reading's own response.
+    pub row: u32,
+    /// What the source printed on it, in the shape an open question publishes.
+    pub printed: PrintedRowDto,
+    /// Whether this import is still waiting on an answer for it. `false` for a
+    /// line already settled, and for one that raised no question.
+    pub awaiting_answer: bool,
+}
+
+/// One movement already recorded that a standing decision would cover.
+///
+/// It says the condition reaches the movement and what is recorded about it
+/// today. It deliberately does **not** say what the movement would become:
+/// which of the owner's standing decisions wins over a recorded fact is settled
+/// by the version the store assigns when the decision is actually made, and a
+/// second model of that here would drift into a plan he acted on.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ForecastedMovementDto {
+    /// The fact, as `POST /v1/corrections` addresses it.
+    pub event: Uuid,
+    /// The account it is recorded on.
+    pub account: Uuid,
+    /// What the owner calls that account. Absent for an account his directory
+    /// does not hold; never the identifier printed where a name belongs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The day it is effective on. Absent for a fact that carries none.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub date: Option<Date>,
+    /// The amount as a decimal string, with the sign the journal holds.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    /// What is recorded about it today, in the words a standing decision is
+    /// written in. Absent for a fact no standing decision classifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<ClassifiedAsDto>,
+}
+
+/// Something the forecast could not decide either way, and why.
+///
+/// **Published rather than omitted.** A forecast that dropped these would read
+/// as «nothing else is affected», silently, in the response the owner is about
+/// to answer from.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UndecidedDto {
+    /// `unreadable_row` — a line of this import whose stored text this build
+    /// cannot read at all; or `fact_without_the_word` — a movement recorded
+    /// before the source's word for what an operation **was** and its word for
+    /// what the operation was **for** were kept in separate fields, against a
+    /// condition asking about one of them. The word is absent from the field
+    /// the condition asks about and may be sitting in the other, so neither
+    /// answer would be true; or `recorded_movements_would_not_fold` — nothing
+    /// already recorded could be judged at all, because the whole of it could
+    /// not be folded into what is currently in force. That last word carries no
+    /// identifier, because it is about all of them at once, and where it appears
+    /// `already_recorded` is empty for that reason and not because nothing is
+    /// covered.
+    pub state: String,
+    /// The line of this import, for `unreadable_row`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<u32>,
+    /// The recorded fact, for `fact_without_the_word`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Uuid>,
+    /// The account that fact is on, for `fact_without_the_word`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    /// What the owner calls that account, where his directory holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The day that fact is effective on.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub date: Option<Date>,
+    /// Why it could not be judged, in one sentence to read out to him.
+    pub explanation: String,
+}
+
+impl UndecidedDto {
+    #[must_use]
+    pub fn from_domain(undecided: &Undecided) -> Self {
+        let (row, event, account, date, title) = match undecided {
+            Undecided::UnreadableRow { row } => (Some(*row), None, None, None, None),
+            Undecided::RecordedMovementsWouldNotFold => (None, None, None, None, None),
+            Undecided::FactWithoutTheWord {
+                event,
+                account,
+                title,
+                date,
+            } => (
+                None,
+                Some(event.0),
+                Some(account.inner()),
+                *date,
+                title.clone(),
+            ),
+        };
+        Self {
+            state: undecided.code().to_owned(),
+            row,
+            event,
+            account,
+            title,
+            date,
+            explanation: undecided.why().to_owned(),
+        }
+    }
+}
+
+/// What the standing decision one answer would keep would settle, before it
+/// stands.
+///
+/// Nothing here has been written: no standing decision was made, nothing already
+/// recorded was changed, and the question is as open as it was. It is the
+/// counterpart of `POST /v1/category-rules/preview` for the other kind of
+/// standing decision, and it keeps the same promise.
+///
+/// Correcting one movement and changing the standing decision behind it stay
+/// two acts, and this call performs neither. What it removes is the discovery a
+/// month later.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnswerRuleForecastDto {
+    /// `written` — answering under this token writes the standing decision;
+    /// `for_his_adoption` — answering writes nothing and publishes it, because
+    /// only the owner may make one, and one call of his own makes it stand;
+    /// `not_from_this_answer` — this answer is never kept as a standing
+    /// decision, whoever gives it; `not_from_this_row` — this line prints
+    /// nothing a later line could be matched against, so no token produces one.
+    ///
+    /// The last two both publish empty lists, and the word is what says which
+    /// of the two reasons it is. They are different facts: the first is about
+    /// the answer and a different answer to the same line may well keep one.
+    pub state: String,
+    /// The standing decision itself, in the exact body
+    /// `POST /v1/classification-rules` takes. Present exactly when `state` is
+    /// `written` or `for_his_adoption`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ClassificationRuleRequest>,
+    /// The lines of this import it would cover, in submission order, including
+    /// the line asked about. Empty where `state` says no standing decision comes
+    /// of this answer.
+    pub in_this_import: Vec<ForecastedLineDto>,
+    /// The movements already recorded that it would cover, in the order they
+    /// are held.
+    pub already_recorded: Vec<ForecastedMovementDto>,
+    /// What could not be decided either way, each saying why. Always present,
+    /// empty included: an absent list and an empty one would say the same thing
+    /// about two different situations.
+    pub undecided: Vec<UndecidedDto>,
+    /// The whole of the above in one statement, to read out to him.
+    ///
+    /// It is `state`'s sentence as well as the counts': a client showing him a
+    /// forecast shows him this rather than the word, and the two cannot come to
+    /// disagree because one function composes the sentence off the word. Where
+    /// the two lists are empty it says which of the reasons that is.
+    pub notice: String,
+}
+
+impl AnswerRuleForecastDto {
+    #[must_use]
+    pub fn from_domain(forecast: &AnswerRuleForecast) -> Self {
+        Self {
+            state: forecast.stands.code().to_owned(),
+            proposal: forecast
+                .stands
+                .proposed()
+                .map(|proposed| ClassificationRuleRequest {
+                    matcher: RuleMatcherDto::from_domain(&proposed.matcher),
+                    outcome: ClassifiedAsDto::from_domain(classified_as(proposed.outcome)),
+                    replaces: None,
+                }),
+            in_this_import: forecast
+                .in_this_import
+                .iter()
+                .map(|line| ForecastedLineDto {
+                    row: line.row,
+                    printed: PrintedRowDto::from_domain(&line.printed),
+                    awaiting_answer: line.awaiting_answer,
+                })
+                .collect(),
+            already_recorded: forecast
+                .already_recorded
+                .iter()
+                .map(|movement| ForecastedMovementDto {
+                    event: movement.event.0,
+                    account: movement.account.inner(),
+                    title: movement.title.clone(),
+                    date: movement.date,
+                    amount: minor_amount(movement.amount_minor, movement.currency),
+                    currency: CurrencyDto::from_domain(movement.currency),
+                    now: movement.now.clone().map(ClassifiedAsDto::from_domain),
+                })
+                .collect(),
+            undecided: forecast
+                .undecided
+                .iter()
+                .map(UndecidedDto::from_domain)
+                .collect(),
+            notice: forecast.notice.clone(),
+        }
     }
 }

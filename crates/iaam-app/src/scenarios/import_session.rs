@@ -18,10 +18,13 @@ use iaam_core::batch::{
     self, BatchMovement, BatchTotal, ControlCheck, ControlComparison, ControlSection,
 };
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
+use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
-use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
+use iaam_core::event::{
+    Confidence, Event, Relation, SCHEMA_VERSION, SOURCE_CATEGORY_IS_A_CATEGORY_FROM,
+};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId,
     SourceId,
@@ -32,7 +35,7 @@ use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlCla
 use iaam_ingest::classification::{
     Answer, AnswerShape, Basis, Classification, ClassificationResult, ClassificationRule,
     ClassificationSubject, Counterparty, Movement, Question, QuestionSubject, RuleMatcher,
-    classify,
+    classification_of, classify,
 };
 use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
 use iaam_ingest::mirror::{MirrorSide, Unpaired, mirrored};
@@ -55,7 +58,9 @@ use crate::ports::{
     ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
     ImportSessionView, NewImportQuestion, Principal, Recorded, UnresolvedAccountView,
 };
-use crate::scenarios::classification::{matcher_json, outcome_json};
+use crate::scenarios::classification::{
+    ClassifiedAs, classified_as, matcher_json, outcome_json, subject,
+};
 use crate::scenarios::coverage_gap;
 use crate::scenarios::ingest::{RowOrigin, submit_candidates};
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
@@ -8405,6 +8410,653 @@ pub fn may_generalise(principal: &Principal) -> bool {
     principal.scope.may_administer()
 }
 
+/// The standing decision one answer would keep, as its condition and its
+/// outcome.
+///
+/// The pair [`Generalisation::Available`] already publishes after the fact,
+/// under a name that says the tense: this is the same object asked about
+/// **before** the answer is given, so nothing here has been written and nothing
+/// has been offered for adoption yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedRule {
+    /// The condition, in the shape `POST /v1/classification-rules` takes.
+    pub matcher: RuleMatcher,
+    /// What the rows it matches would be settled as.
+    pub outcome: Classification,
+}
+
+/// What answering one question this way would do to the owner's standing
+/// decisions, before it is answered.
+///
+/// **Four states, and they are [`Generalisation`]'s four minus the one that
+/// cannot be true yet.** `recorded` is what a written rule reports afterwards
+/// and has no forward tense; the other three are here, with `available` split
+/// in two — because before the act the difference between «this call writes it»
+/// and «it is published for you to adopt» is a fact the caller can act on, and
+/// after the act only the second is ever reported.
+///
+/// **Why the two absences stay apart.** [`Self::NotFromThisAnswer`] is a claim
+/// about the **answer** — one of the eight is not a claim about every row like
+/// this one (`AnswerShape::generalises`) — and [`Self::NotFromThisRow`] is a
+/// claim about the **row**, that it prints nothing a condition could ask about.
+/// Folded together they would tell the owner that no answer of his could ever
+/// keep a standing decision about these lines, which is false of the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WouldStand {
+    /// Answering writes it, because the answerer may generalise.
+    Written(ProposedRule),
+    /// Answering writes nothing and publishes it, because only the owner may
+    /// make a standing decision (`iaam-hnod`). One call of his own makes it
+    /// stand, and this forecast does not make it.
+    ForHisAdoption(ProposedRule),
+    /// This answer is not one to generalise, so no standing decision comes of
+    /// it under any token (`AnswerShape::generalises`).
+    NotFromThisAnswer,
+    /// This row grounds no condition, so no standing decision comes of it under
+    /// any token: a condition that asks about nothing matches nothing.
+    NotFromThisRow,
+}
+
+impl WouldStand {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Written(_) => "written",
+            Self::ForHisAdoption(_) => "for_his_adoption",
+            Self::NotFromThisAnswer => "not_from_this_answer",
+            Self::NotFromThisRow => "not_from_this_row",
+        }
+    }
+
+    /// The standing decision itself, where there would be one.
+    #[must_use]
+    pub const fn proposed(&self) -> Option<&ProposedRule> {
+        match self {
+            Self::Written(rule) | Self::ForHisAdoption(rule) => Some(rule),
+            Self::NotFromThisAnswer | Self::NotFromThisRow => None,
+        }
+    }
+}
+
+/// One line of this import the condition reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachedRow {
+    /// The line's position among what this import took, in submission order.
+    /// Not the document's line, which is `locator` (decision 0035 §4).
+    pub row: u32,
+    /// What the source printed on it, in the same shape a question publishes.
+    pub printed: PrintedRow,
+    /// Whether this import is still waiting on an answer for it.
+    ///
+    /// Read from the same reading `answer_question` reads its own reach from,
+    /// so «what is still waiting» is answered once. A line that raised no
+    /// question, and a line something already settled, both answer `false`.
+    pub awaiting_answer: bool,
+}
+
+/// One movement already recorded that the condition reaches.
+///
+/// **What it is, and not what it would become.** Which of the owner's standing
+/// decisions wins over a fact is settled by the version the store assigns, and
+/// modelling that here would be a second model of the store's own behaviour —
+/// which `refuse_unreadable_rules` argues against at the one place a plan is
+/// actually computed. So this says the condition reaches the movement and says
+/// what the journal records it as today, and the two together are what let the
+/// owner find the one that was something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachedFact {
+    /// The fact, as a correction addresses it.
+    pub event: EventId,
+    /// The account it is recorded on.
+    pub account: AccountId,
+    /// What the owner calls that account, where his directory holds it
+    /// (decision 0035 §1). Never the identifier rendered as a name.
+    pub title: Option<String>,
+    /// The day it is effective on, where it has one.
+    pub date: Option<time::Date>,
+    /// The amount as the journal holds it, with its sign.
+    pub amount_minor: i64,
+    pub currency: CurrencyCode,
+    /// What the journal records it as today, in the words a standing decision
+    /// is written in. `None` for a fact no standing decision classifies.
+    pub now: Option<ClassifiedAs>,
+}
+
+/// Something the condition could not be tested against, and why.
+///
+/// **Published rather than omitted, and that is the whole of this type.** A
+/// forecast that dropped these would read as «nothing else is affected», which
+/// is the one false thing it must not say — and it would say it silently, in
+/// the response the owner is about to answer from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Undecided {
+    /// A line of this import whose stored text this build cannot read, so
+    /// nothing can be tested against it.
+    UnreadableRow { row: u32 },
+    /// A movement recorded before the journal kept the source's two words
+    /// apart (decision 0020 §3), against a condition that asks about one of
+    /// them.
+    ///
+    /// The word is not in the field the condition asks about and may be sitting
+    /// in the other one, so «it does not match» would be a false negative and
+    /// «it matches» would be a guess.
+    FactWithoutTheWord {
+        event: EventId,
+        account: AccountId,
+        title: Option<String>,
+        date: Option<time::Date>,
+    },
+    /// Everything already recorded, because the whole of it could not be folded
+    /// into what is currently in force.
+    ///
+    /// A correction reverses or replaces a fact, so what a condition would reach
+    /// is the set that survives those — which is what the recomputation reads,
+    /// and which a journal with a dangling or doubled correction has no answer
+    /// for. **Reported and not raised**: a fold that fails is a fact about the
+    /// journal and not about the answer he is about to give, and refusing the
+    /// whole forecast over it would take the half that works away with it.
+    RecordedMovementsWouldNotFold,
+}
+
+impl Undecided {
+    /// Wire code. One place, so two routes cannot spell it differently.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnreadableRow { .. } => "unreadable_row",
+            Self::FactWithoutTheWord { .. } => "fact_without_the_word",
+            Self::RecordedMovementsWouldNotFold => "recorded_movements_would_not_fold",
+        }
+    }
+
+    /// Why it could not be judged, in the register the owner reads
+    /// (decision 0035 §3).
+    #[must_use]
+    pub const fn why(&self) -> &'static str {
+        match self {
+            Self::UnreadableRow { .. } => {
+                "This line of your statement cannot be read here at all, so nothing can be said \
+                 about whether this standing decision would cover it."
+            }
+            Self::FactWithoutTheWord { .. } => {
+                "This movement was recorded before what your institution called an operation and \
+                 what it filed the operation under were kept in separate places, so the word this \
+                 standing decision asks about cannot be told from the other one. It is neither \
+                 included nor excluded."
+            }
+            Self::RecordedMovementsWouldNotFold => {
+                "What you have already recorded could not be read here as a whole, because \
+                 something you put right earlier no longer lines up with what it was putting \
+                 right. Nothing of it was judged, and none of it is included or excluded."
+            }
+        }
+    }
+}
+
+/// What the standing decision one answer would keep would settle, before it
+/// stands.
+///
+/// **This is `preview_category_rule`'s promise for the other kind of standing
+/// decision, and deliberately the same promise**: read-only, writing nothing and
+/// standing nothing, saying what the condition would move rather than moving it.
+/// The owner asked it in his own words — a decision was made from one answer, it
+/// covered a group automatically, and one line of the group is wrong — and the
+/// two halves after the fact already exist. This is the half before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerRuleForecast {
+    /// What would stand, and whose act would make it stand.
+    pub stands: WouldStand,
+    /// The lines of this import the condition reaches, in submission order,
+    /// including the line asked about.
+    ///
+    /// Empty where [`Self::stands`] says no standing decision comes of this,
+    /// and that state is what says why — never an empty list on its own.
+    pub in_this_import: Vec<ReachedRow>,
+    /// The movements already recorded that the condition reaches, in the order
+    /// the journal holds them.
+    pub already_recorded: Vec<ReachedFact>,
+    /// What could not be judged either way, each saying why.
+    pub undecided: Vec<Undecided>,
+    /// The whole of the above in one statement, in the owner's register
+    /// (decision 0035).
+    pub notice: String,
+}
+
+/// What answering this way would keep, asked of the answer before the row.
+///
+/// The order is [`generalisation_of`]'s and for its reason: whether an answer is
+/// one to generalise is a property of the word he said and of nothing else, so a
+/// row that grounds no condition does not turn the truthful «this answer keeps
+/// none» into the false «this line grounds none».
+fn would_stand(observed: &ObservedRow, answer: Answer, may_generalise: bool) -> WouldStand {
+    if !answer.shape().generalises() {
+        return WouldStand::NotFromThisAnswer;
+    }
+    let Some(matcher) = matcher_for(observed) else {
+        return WouldStand::NotFromThisRow;
+    };
+    let proposed = ProposedRule {
+        matcher,
+        outcome: answer.classification(),
+    };
+    if may_generalise {
+        WouldStand::Written(proposed)
+    } else {
+        WouldStand::ForHisAdoption(proposed)
+    }
+}
+
+/// One session as a forecast reads it: its lines, the questions they raised,
+/// and what the reading has already settled.
+///
+/// The three travel together because a forecast asks one thing of them — which
+/// lines a condition covers and which of those this import is still waiting on —
+/// and passing them separately is three arguments a caller can pair wrongly,
+/// with the settlements taken from one reading and the questions from another.
+struct SessionAsRead<'a> {
+    observations: &'a [ImportObservationView],
+    questions: &'a [ImportQuestionView],
+    settlements: &'a QuestionSettlements,
+}
+
+/// The lines of one import a condition reaches, and the ones it cannot be
+/// tested against.
+fn reach_over_session(
+    session: &SessionAsRead<'_>,
+    matcher: &RuleMatcher,
+    directory: &AccountDirectory,
+) -> (Vec<ReachedRow>, Vec<Undecided>) {
+    let mut reached = Vec::new();
+    let mut undecided = Vec::new();
+    for observation in session.observations {
+        // Three dispositions and not two. A line the caller concluded is a line
+        // no standing decision of his is ever tested against — it arrived with
+        // its answer — so it is left out and the leaving out is decided, not
+        // failed. A line this build cannot read is neither reached nor ruled
+        // out, and it is declared.
+        match parse_intake(&observation.payload) {
+            Err(_) => undecided.push(Undecided::UnreadableRow {
+                row: observation.row,
+            }),
+            Ok(Intake::Concluded { .. }) => {}
+            Ok(Intake::Observed { row, .. }) => {
+                // The reading a standing decision is tested under, and the same
+                // one `matcher_for` proposes from: the counterparty stays the
+                // name the source printed, because that is what a condition
+                // compares against.
+                if matcher.matches(&row.subject(None)) {
+                    reached.push(ReachedRow {
+                        row: observation.row,
+                        printed: printed_row(directory, &row),
+                        awaiting_answer: session
+                            .questions
+                            .iter()
+                            .filter(|question| question.row == observation.row)
+                            .any(|question| session.settlements.awaits_answer(question)),
+                    });
+                }
+            }
+        }
+    }
+    (reached, undecided)
+}
+
+/// The movements already recorded that a condition reaches, and the ones it
+/// cannot be tested against.
+fn reach_over_journal(
+    events: &[Event],
+    matcher: &RuleMatcher,
+    directory: &AccountDirectory,
+) -> (Vec<ReachedFact>, Vec<Undecided>) {
+    let mut reached = Vec::new();
+    let mut undecided = Vec::new();
+    // What is in force, which is what the recomputation reads — a fact a
+    // correction reversed or replaced is not something a standing decision would
+    // settle, and counting it would name a movement he has already put right as
+    // one he still has to look at.
+    let Ok(in_force) = resolve(events) else {
+        return (Vec::new(), vec![Undecided::RecordedMovementsWouldNotFold]);
+    };
+    for event in in_force {
+        // Through the one reader of a fact as a condition's subject, which is
+        // the reader the recomputation replays history with. A second one here
+        // would answer «this condition reaches that movement» differently from
+        // the code that would actually classify it.
+        let Some(read) = subject(event) else {
+            continue;
+        };
+        let title = directory
+            .held(event.account)
+            .map(|account| account.title.clone());
+        if unvouched_word(matcher, event, &read) {
+            undecided.push(Undecided::FactWithoutTheWord {
+                event: event.id,
+                account: event.account,
+                title,
+                date: event.dates.effective_date(),
+            });
+            continue;
+        }
+        if !matcher.matches(&read) {
+            continue;
+        }
+        let Some(amount) = cash_amount(&event.kind) else {
+            continue;
+        };
+        reached.push(ReachedFact {
+            event: event.id,
+            account: event.account,
+            title,
+            date: event.dates.effective_date(),
+            amount_minor: amount.amount().raw(),
+            currency: amount.currency(),
+            now: classification_of(event).map(classified_as),
+        });
+    }
+    (reached, undecided)
+}
+
+/// Whether this condition asks about a word this fact's journal entry cannot
+/// vouch for.
+///
+/// **Decision 0020 §3, read forwards.** A fact below
+/// [`SOURCE_CATEGORY_IS_A_CATEGORY_FROM`] carries no operation word at all and
+/// may carry one in the category's slot, and the two cannot be told apart
+/// afterwards — so `subject` blanks the category and the operation word is
+/// absent, and a condition asking about either gets a **false negative** off it.
+/// The recomputation takes that false negative deliberately, because a rule that
+/// does not fire leaves a fact exactly as the owner already accepted it. A
+/// forecast cannot: the same silence there reads as «nothing else is affected»,
+/// which is the one thing it must not say.
+///
+/// The other clauses are asked first, and that is what keeps the declaration
+/// small and true. A condition's fields join with «and», so one clause the fact
+/// plainly fails settles it as a non-match whatever the unreadable word says;
+/// only a fact the rest of the condition holds for is genuinely undecided. A
+/// condition made of nothing **but** the doubtful words has no rest, and every
+/// other clause is then vacuously true.
+fn unvouched_word(matcher: &RuleMatcher, event: &Event, read: &ClassificationSubject) -> bool {
+    if event.schema_version >= SOURCE_CATEGORY_IS_A_CATEGORY_FROM {
+        return false;
+    }
+    if matcher.kind.is_none() && matcher.source_category.is_none() {
+        return false;
+    }
+    let rest = RuleMatcher {
+        kind: None,
+        source_category: None,
+        ..matcher.clone()
+    };
+    rest.asks_nothing() || rest.matches(read)
+}
+
+/// The cash a fact moved, for the seven kinds a standing decision classifies.
+///
+/// `None` for a fact that carries no single cash amount, which is every kind
+/// [`subject`] already returns nothing for — asked again here rather than
+/// assumed, because a kind admitted there and not here must fail to be listed
+/// rather than be listed with an invented amount.
+const fn cash_amount(kind: &EventKind) -> Option<Money> {
+    match kind {
+        EventKind::CashIn { amount }
+        | EventKind::CashOut { amount }
+        | EventKind::Refund { amount }
+        | EventKind::CashTransfer { amount, .. }
+        | EventKind::OwnAccountMovement { amount }
+        | EventKind::UnresolvedOwnAccountMovement { amount }
+        | EventKind::Fee { amount, .. } => Some(*amount),
+        EventKind::Income { gross, .. } => Some(*gross),
+        _ => None,
+    }
+}
+
+/// The forecast in one statement, in the register the owner reads.
+fn forecast_notice(
+    stands: &WouldStand,
+    asked_row: u32,
+    in_this_import: &[ReachedRow],
+    already_recorded: &[ReachedFact],
+    undecided: &[Undecided],
+) -> String {
+    let kept = match stands {
+        WouldStand::Written(_) => GeneralisationProspect::WillStand.addressed(),
+        WouldStand::ForHisAdoption(_) => GeneralisationProspect::NeedsHisAdoption.addressed(),
+        WouldStand::NotFromThisRow => {
+            return GeneralisationProspect::NoneFromThisRow
+                .addressed()
+                .to_owned();
+        }
+        WouldStand::NotFromThisAnswer => {
+            return "Your answer keeps no standing decision, and it is your answer rather than \
+                    these lines that keeps none: what you would be saying is what this statement \
+                    did not contain, not what every line like these was, so there is nothing here \
+                    for a later line to be matched against."
+                .to_owned();
+        }
+    };
+    let others = in_this_import
+        .iter()
+        .filter(|line| line.row != asked_row)
+        .count();
+    // The count of what is already recorded is not published where none of it
+    // could be folded: zero would then read as «nothing of yours is affected»,
+    // which is the one sentence a forecast must never compose out of a failure.
+    let recorded = if undecided
+        .iter()
+        .any(|entry| matches!(entry, Undecided::RecordedMovementsWouldNotFold))
+    {
+        "none of what you have already recorded, because none of it could be read here".to_owned()
+    } else {
+        format!(
+            "{} you have already recorded",
+            counted(
+                already_recorded.len(),
+                "no movement",
+                "1 movement",
+                "movements"
+            )
+        )
+    };
+    format!(
+        "{kept} Before it stands, this is everything it would cover. Besides the line you were \
+         asked about it covers {others} of this import, and {recorded}. {left_out} Read them \
+         before you answer: your statement says the same thing about every one of them, but only \
+         you know whether they were the same thing — one that was something else is decided \
+         wrongly along with the rest, and the way to keep it out is to answer that one on its own \
+         first. Nothing is written by asking this: no standing decision is made, nothing you have \
+         already recorded is changed, and putting one of those movements right stays an act of \
+         its own, separate from changing the standing decision behind it.",
+        others = counted(others, "no other line", "1 other line", "other lines"),
+        left_out = left_out(undecided),
+    )
+}
+
+/// What the two lists above could not decide, said rather than omitted.
+fn left_out(undecided: &[Undecided]) -> String {
+    let unreadable = undecided
+        .iter()
+        .filter(|entry| matches!(entry, Undecided::UnreadableRow { .. }))
+        .count();
+    let would_not_fold = undecided
+        .iter()
+        .any(|entry| matches!(entry, Undecided::RecordedMovementsWouldNotFold));
+    let unvouched = undecided.len() - unreadable - usize::from(would_not_fold);
+    if undecided.is_empty() {
+        return "Nothing was left out of those two counts.".to_owned();
+    }
+    let mut clauses = Vec::new();
+    if would_not_fold {
+        clauses.push(
+            "what you have already recorded could not be read as a whole, because something you \
+             put right earlier no longer lines up with what it was putting right"
+                .to_owned(),
+        );
+    }
+    if unreadable > 0 {
+        clauses.push(format!(
+            "{} of this import cannot be read here",
+            counted(unreadable, "", "1 line", "lines")
+        ));
+    }
+    if unvouched > 0 {
+        clauses.push(format!(
+            "{} you have already recorded cannot be judged either way, because it was written \
+             before what your institution called an operation and what it filed the operation \
+             under were kept in separate places",
+            counted(unvouched, "", "1 movement", "movements")
+        ));
+    }
+    format!(
+        "{} — each is named beside this with its reason, and none of them is included or \
+         excluded.",
+        clauses.join(", and ")
+    )
+}
+
+/// A count in words, so that none and one do not read as a defect.
+fn counted(count: usize, none: &str, one: &str, many: &str) -> String {
+    match count {
+        0 => none.to_owned(),
+        1 => one.to_owned(),
+        _ => format!("{count} {many}"),
+    }
+}
+
+/// The whole forecast, out of what a caller has already read.
+///
+/// Pure, and the store reading is [`preview_answer_rule`]'s: what this call must
+/// not do is write, and the way to hold that is for the deciding half to have
+/// nothing to write with.
+fn forecast(
+    stands: WouldStand,
+    asked_row: u32,
+    session: &SessionAsRead<'_>,
+    events: &[Event],
+    directory: &AccountDirectory,
+) -> AnswerRuleForecast {
+    let (in_this_import, already_recorded, mut undecided) = match stands.proposed() {
+        None => (Vec::new(), Vec::new(), Vec::new()),
+        Some(proposed) => {
+            let (rows, unreadable) = reach_over_session(session, &proposed.matcher, directory);
+            let (facts, unvouched) = reach_over_journal(events, &proposed.matcher, directory);
+            (rows, facts, [unreadable, unvouched].concat())
+        }
+    };
+    undecided.sort_by_key(|entry| match entry {
+        Undecided::UnreadableRow { row } => (0, u64::from(*row), EventId(Uuid::nil())),
+        Undecided::FactWithoutTheWord { event, .. } => (1, 0, *event),
+        Undecided::RecordedMovementsWouldNotFold => (2, 0, EventId(Uuid::nil())),
+    });
+    let notice = forecast_notice(
+        &stands,
+        asked_row,
+        &in_this_import,
+        &already_recorded,
+        &undecided,
+    );
+    AnswerRuleForecast {
+        stands,
+        in_this_import,
+        already_recorded,
+        undecided,
+        notice,
+    }
+}
+
+/// What the standing decision an answer would keep would settle, before it
+/// stands.
+///
+/// **Read-only, and it stands the decision no sooner.** Nothing is written,
+/// nothing is retired and nothing is adopted: the store is read three times —
+/// the session, the owner's directory, the journal — and the deciding half is a
+/// pure fold over what those reads returned. That is the same promise
+/// `preview_category_rule` makes for a category rule, kept the same way.
+///
+/// **It does not merge two acts into one.** Answering is still `answer_question`
+/// and correcting a recorded movement is still a correction; this call performs
+/// neither, and its whole purpose is that the second is an informed choice
+/// rather than a discovery next month.
+///
+/// The answer is checked against what the question admits, exactly as answering
+/// checks it: a forecast for an answer that cannot be given describes an act
+/// nobody can perform.
+pub async fn preview_answer_rule(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+    question: ImportQuestionId,
+    answer: Answer,
+) -> Result<AnswerRuleForecast, AppError> {
+    let contents = read_session(services, principal, session).await?;
+    let stored = contents
+        .questions
+        .iter()
+        .find(|candidate| candidate.id == question)
+        .ok_or(AppError::NotFound {
+            what: "an import question",
+            id: question.inner().to_string(),
+        })?;
+    let asked: Question = serde_json::from_str(&stored.question).map_err(|error| {
+        AppError::Store(format!("stored import question could not be read: {error}"))
+    })?;
+    if !asked.admits(&answer) {
+        return Err(FieldRejection::new(
+            "answer",
+            asked
+                .alternatives()
+                .iter()
+                .map(|shape| shape.code())
+                .collect::<Vec<_>>()
+                .join(", "),
+            answer.shape().code(),
+        )
+        .into());
+    }
+    let observed = observed_row(&contents.observations, stored.row)?;
+    let stands = would_stand(&observed, answer, may_generalise(principal));
+    // Nothing is read that nothing would be said about. A forecast with no
+    // standing decision in it has an empty reach whatever the journal holds, and
+    // the state says why it is empty — so the three reads below are skipped
+    // rather than performed and discarded.
+    if stands.proposed().is_none() {
+        return Ok(forecast(
+            stands,
+            stored.row,
+            &SessionAsRead {
+                observations: &contents.observations,
+                questions: &contents.questions,
+                settlements: &QuestionSettlements::default(),
+            },
+            &[],
+            &AccountDirectory::from_accounts(Vec::new()),
+        ));
+    }
+    let directory = AccountDirectory::load(services, principal.owner).await?;
+    // The same reading `answer_question` takes to decide what its own reach
+    // settles, rather than `is_open` alone: a line a standing decision of his
+    // already settles is not one this import is waiting on, and saying it is
+    // would be the reading `iaam-m2oi` replaced.
+    let settlements = SessionReading::of(services, principal, &contents)
+        .await?
+        .settlements();
+    let events = services
+        .store
+        .load_events_through(principal.owner, time::Date::MAX)
+        .await?;
+    Ok(forecast(
+        stands,
+        stored.row,
+        &SessionAsRead {
+            observations: &contents.observations,
+            questions: &contents.questions,
+            settlements: &settlements,
+        },
+        &events,
+        &directory,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12435,6 +13087,448 @@ mod tests {
                 true
             )
             .is_empty()
+        );
+    }
+
+    // --- What one answer's standing decision would settle, before it stands --
+    //
+    // The owner's question, in his own words: «а если все операции верные,
+    // кроме одной?» — a decision made from one answer covered a group and one
+    // line of the group was wrong. Every account, word, amount and date below is
+    // invented (CLAUDE.md).
+
+    /// A line whose direction the source did not state, filed under one word,
+    /// with nobody named on the other side.
+    fn inner_line(on: AccountId, amount_minor: i64) -> ObservedRow {
+        anonymous(
+            directionless(row(on, "Anything", Some(date!(2026 - 03 - 01)))),
+            amount_minor,
+        )
+    }
+
+    /// A line of the same import whose stored text this build cannot read.
+    fn unreadable_line(number: u32) -> ImportObservationView {
+        ImportObservationView {
+            row: number,
+            row_key: None,
+            concluded: false,
+            payload: "{".to_owned(),
+            answer: None,
+        }
+    }
+
+    fn asked_about(number: u32, line: &ObservedRow, on: AccountId) -> ImportQuestionView {
+        stored_question_about(
+            number,
+            &Question::UnresolvedDirection {
+                account: on,
+                stated: line.source_kind.clone(),
+                counterparty: None,
+            },
+        )
+    }
+
+    /// One movement already recorded, as the journal holds it.
+    fn movement(
+        on: AccountId,
+        source_kind: Option<&str>,
+        source_category: Option<&str>,
+        amount_minor: i64,
+    ) -> Event {
+        let operation = SubmittedOperation {
+            account: on,
+            kind: iaam_ingest::operation::OperationKind::Withdrawal {
+                amount_minor,
+                currency: CurrencyCode::Rub,
+            },
+            dates: OperationDates {
+                cash_posted: Some(date!(2026 - 02 - 04)),
+                ..OperationDates::default()
+            },
+            source_time: None,
+            idempotency_key: None,
+            source_operation_id: None,
+            source_category: source_category.map(str::to_owned),
+            owner_category: None,
+            source_code: None,
+            source_kind: source_kind.map(str::to_owned),
+            description: None,
+        };
+        normalize(
+            &operation,
+            &NormalizationContext {
+                owner: OwnerId(uuid::Uuid::from_bytes([9; 16])),
+                source: SourceId(uuid::Uuid::from_bytes([9; 16])),
+                parser_version: ParserVersion(SUBMITTED_PARSER_VERSION.to_owned()),
+            },
+        )
+        .expect("a movement this test states completely")
+        .event
+    }
+
+    /// The forecast names the other lines of the import and the movements
+    /// already recorded that the same decision would reach.
+    ///
+    /// The half he had was the answer's own row. What was missing is everything
+    /// else the decision covers, which is the only thing that makes «all of them
+    /// are right except one» answerable before the decision stands rather than a
+    /// month after it.
+    #[test]
+    fn a_standing_decision_from_one_answer_names_what_it_would_settle() {
+        let main = account(1);
+        let asked = inner_line(main, 1_000);
+        let alike = inner_line(main, 2_000);
+        let mut filed_otherwise = inner_line(main, 3_000);
+        filed_otherwise.source_kind = Some("OUTER".to_owned());
+
+        let observations = vec![
+            stored_row(1, &asked),
+            stored_row(2, &alike),
+            stored_row(3, &filed_otherwise),
+            unreadable_line(4),
+        ];
+        let questions = vec![
+            asked_about(1, &asked, main),
+            asked_about(2, &alike, main),
+            asked_about(3, &filed_otherwise, main),
+        ];
+        let journal = vec![
+            movement(main, Some("INNER"), None, 4_000),
+            movement(main, Some("OUTER"), None, 5_000),
+        ];
+
+        let forecast = forecast(
+            would_stand(&asked, Answer::Paid, true),
+            1,
+            &SessionAsRead {
+                observations: &observations,
+                questions: &questions,
+                settlements: &QuestionSettlements::default(),
+            },
+            &journal,
+            &held(vec![detail(main, "Main")]),
+        );
+
+        assert_eq!(forecast.stands.code(), "written");
+        assert_eq!(
+            forecast
+                .stands
+                .proposed()
+                .expect("a standing decision")
+                .matcher
+                .kind
+                .as_deref(),
+            Some("INNER"),
+            "the condition is the one the answering call would write"
+        );
+
+        assert_eq!(
+            forecast
+                .in_this_import
+                .iter()
+                .map(|line| line.row)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "the line asked about and the one like it, and not the one filed \
+             under another word"
+        );
+        assert!(
+            forecast
+                .in_this_import
+                .iter()
+                .all(|line| line.awaiting_answer),
+            "both are still waiting on him"
+        );
+        assert_eq!(forecast.in_this_import[1].printed.amount_minor, 2_000);
+        assert_eq!(
+            forecast.in_this_import[1].printed.title.as_deref(),
+            Some("Main"),
+            "an account he is shown carries what he calls it"
+        );
+
+        assert_eq!(
+            forecast
+                .already_recorded
+                .iter()
+                .map(|fact| fact.event)
+                .collect::<Vec<_>>(),
+            vec![journal[0].id],
+            "the recorded movement the same condition reaches, and only it"
+        );
+        assert_eq!(forecast.already_recorded[0].title.as_deref(), Some("Main"));
+        assert_eq!(
+            forecast.already_recorded[0]
+                .now
+                .as_ref()
+                .map(|now| now.kind),
+            Some("external_flow"),
+            "what the journal records it as today is what tells him it is wrong"
+        );
+
+        assert_eq!(
+            forecast.undecided,
+            vec![Undecided::UnreadableRow { row: 4 }],
+            "a line nothing can read is declared, never passed over"
+        );
+    }
+
+    /// A movement recorded before the source's two words were kept apart is
+    /// declared rather than dropped.
+    ///
+    /// This is the falsification, and it is the specimen that matters: such a
+    /// fact answers «no» to a condition asking about the operation word, because
+    /// the word it carries is in the other slot and the reader blanks it below
+    /// schema version 14. Counted as a non-match it disappears — and a forecast
+    /// that drops it tells him nothing else is affected, which is the one false
+    /// thing it must not say.
+    #[test]
+    fn a_movement_recorded_before_the_two_words_were_kept_apart_is_declared() {
+        let main = account(1);
+        let asked = inner_line(main, 1_000);
+        let mut older = movement(main, None, Some("INNER"), 6_000);
+        older.schema_version = SOURCE_CATEGORY_IS_A_CATEGORY_FROM - 1;
+        let elsewhere = movement(main, Some("OUTER"), None, 7_000);
+
+        let forecast = forecast(
+            would_stand(&asked, Answer::Paid, true),
+            1,
+            &SessionAsRead {
+                observations: &[stored_row(1, &asked)],
+                questions: &[asked_about(1, &asked, main)],
+                settlements: &QuestionSettlements::default(),
+            },
+            &[older.clone(), elsewhere],
+            &held(vec![detail(main, "Main")]),
+        );
+
+        assert!(
+            forecast.already_recorded.is_empty(),
+            "nothing is claimed about a word the journal cannot vouch for"
+        );
+        assert_eq!(
+            forecast.undecided,
+            vec![Undecided::FactWithoutTheWord {
+                event: older.id,
+                account: main,
+                title: Some("Main".to_owned()),
+                date: Some(date!(2026 - 02 - 04)),
+            }],
+            "and the movement it could not judge is named, with the one it \
+             could judge left out"
+        );
+        assert!(
+            forecast.notice.contains('1'),
+            "and what could not be judged is in the sentence he is read: {}",
+            forecast.notice
+        );
+    }
+
+    /// A movement he has already put right is not one the decision still
+    /// settles.
+    ///
+    /// What a condition would reach is what is **in force**, which is what the
+    /// recomputation reads. A fold over the raw record instead would hand him a
+    /// movement to look at that he had already corrected, in the one list whose
+    /// whole purpose is to be short enough to read.
+    #[test]
+    fn a_movement_already_put_right_is_not_one_the_decision_still_settles() {
+        let main = account(1);
+        let asked = inner_line(main, 1_000);
+        let filed = movement(main, Some("INNER"), None, 4_000);
+        let reversal = Event {
+            id: EventId::new_random(),
+            relation: Relation::Reversal { target: filed.id },
+            ..filed.clone()
+        };
+
+        let forecast = forecast(
+            would_stand(&asked, Answer::Paid, true),
+            1,
+            &SessionAsRead {
+                observations: &[stored_row(1, &asked)],
+                questions: &[asked_about(1, &asked, main)],
+                settlements: &QuestionSettlements::default(),
+            },
+            &[filed, reversal],
+            &held(vec![detail(main, "Main")]),
+        );
+
+        assert!(
+            forecast.already_recorded.is_empty(),
+            "a movement he has already put right is not left behind by anything"
+        );
+        assert!(forecast.undecided.is_empty());
+    }
+
+    /// A record that will not fold is declared, and the count is not published
+    /// as none.
+    ///
+    /// The failure mode this refuses is the quiet one: a fold that gives up
+    /// leaves an empty list, and an empty list beside «no movement you have
+    /// already recorded» tells him nothing of his is affected — which is a
+    /// sentence composed out of a failure.
+    #[test]
+    fn a_record_that_will_not_fold_is_declared_rather_than_counted_as_none() {
+        let main = account(1);
+        let asked = inner_line(main, 1_000);
+        let filed = movement(main, Some("INNER"), None, 4_000);
+        let dangling = Event {
+            id: EventId::new_random(),
+            relation: Relation::Reversal {
+                target: EventId::new_random(),
+            },
+            ..filed.clone()
+        };
+
+        let forecast = forecast(
+            would_stand(&asked, Answer::Paid, true),
+            1,
+            &SessionAsRead {
+                observations: &[stored_row(1, &asked)],
+                questions: &[asked_about(1, &asked, main)],
+                settlements: &QuestionSettlements::default(),
+            },
+            &[filed, dangling],
+            &held(vec![detail(main, "Main")]),
+        );
+
+        assert!(forecast.already_recorded.is_empty());
+        assert_eq!(
+            forecast.undecided,
+            vec![Undecided::RecordedMovementsWouldNotFold]
+        );
+        assert!(
+            !forecast.notice.contains("no movement"),
+            "nothing of his is counted as unaffected on the strength of a \
+             failure: {}",
+            forecast.notice
+        );
+        assert!(
+            forecast.notice.contains("could not be read"),
+            "and he is told why the count is missing: {}",
+            forecast.notice
+        );
+    }
+
+    /// The three ways no standing decision comes of an answer, each saying
+    /// which one it is.
+    ///
+    /// An empty reach is published by all three, so the state is the only thing
+    /// that says why it is empty — and «this answer keeps none» and «this line
+    /// grounds none» are different facts with different remedies.
+    #[test]
+    fn an_answer_that_keeps_no_standing_decision_says_which_of_the_reasons_it_is() {
+        let main = account(1);
+        let asked = inner_line(main, 1_000);
+
+        assert_eq!(
+            would_stand(&asked, Answer::BetweenOwnAccounts, true).code(),
+            "not_from_this_answer",
+            "the one answer that is not a claim about every line like this one"
+        );
+        assert_eq!(
+            would_stand(&unmatchable(main), Answer::Paid, true).code(),
+            "not_from_this_row",
+            "a line that prints nothing a later line could be matched against"
+        );
+        assert_eq!(
+            would_stand(&asked, Answer::Paid, false).code(),
+            "for_his_adoption",
+            "an answerer who may not make a standing decision is told what it \
+             would be, not that there is none"
+        );
+
+        let forecast = forecast(
+            would_stand(&asked, Answer::BetweenOwnAccounts, true),
+            1,
+            &SessionAsRead {
+                observations: &[stored_row(1, &asked)],
+                questions: &[asked_about(1, &asked, main)],
+                settlements: &QuestionSettlements::default(),
+            },
+            &[movement(main, Some("INNER"), None, 4_000)],
+            &held(vec![detail(main, "Main")]),
+        );
+        assert!(forecast.in_this_import.is_empty());
+        assert!(forecast.already_recorded.is_empty());
+        assert!(
+            !forecast.notice.is_empty(),
+            "the empty lists are explained rather than left to be read as «nothing else is affected»"
+        );
+    }
+
+    /// The forecast is read out to a person, so it is in his words.
+    ///
+    /// Checked the mechanical way the group's question beside it is checked: no
+    /// field name, and no word that exists only because of how this is built.
+    #[test]
+    fn what_the_forecast_reads_out_is_in_his_words() {
+        let main = account(1);
+        let asked = inner_line(main, 1_000);
+        let alike = inner_line(main, 2_000);
+        let forecast = forecast(
+            would_stand(&asked, Answer::Paid, true),
+            1,
+            &SessionAsRead {
+                observations: &[stored_row(1, &asked), stored_row(2, &alike)],
+                questions: &[asked_about(1, &asked, main), asked_about(2, &alike, main)],
+                settlements: &QuestionSettlements::default(),
+            },
+            &[movement(main, Some("INNER"), None, 4_000)],
+            &held(vec![detail(main, "Main")]),
+        );
+
+        // Every sentence this forecast can compose, and not only the ones this
+        // one happens to hold: a reason published for a state no fixture
+        // reaches is exactly the sentence nobody rereads.
+        let sentences = std::iter::once(forecast.notice.clone())
+            .chain(
+                [
+                    Undecided::UnreadableRow { row: 1 },
+                    Undecided::FactWithoutTheWord {
+                        event: EventId::new_random(),
+                        account: main,
+                        title: None,
+                        date: None,
+                    },
+                    Undecided::RecordedMovementsWouldNotFold,
+                ]
+                .iter()
+                .map(|entry| entry.why().to_owned()),
+            )
+            .chain(
+                [
+                    would_stand(&asked, Answer::Paid, false),
+                    would_stand(&asked, Answer::BetweenOwnAccounts, true),
+                    would_stand(&unmatchable(main), Answer::Paid, true),
+                ]
+                .iter()
+                .map(|stands| forecast_notice(stands, 1, &[], &[], &[])),
+            )
+            .collect::<Vec<_>>();
+        for sentence in &sentences {
+            for internal in [
+                "source_category",
+                "matcher",
+                "classification",
+                "session",
+                "row",
+                "rule",
+                "alike",
+                "subject",
+                "reach",
+                "journal",
+            ] {
+                assert!(
+                    !sentence.to_lowercase().contains(internal),
+                    "«{internal}» is our word, not his: {sentence}"
+                );
+            }
+        }
+        assert!(
+            forecast.notice.contains('1'),
+            "he is told how many other lines of this import one answer covers: {}",
+            forecast.notice
         );
     }
 }

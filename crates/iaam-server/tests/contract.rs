@@ -17276,6 +17276,358 @@ fn directed_row(account: Uuid, key: &str, direction: &str) -> Value {
     row
 }
 
+/// A movement the caller states completely, filed under one word.
+///
+/// It reaches the journal without a question, which is what makes it the half
+/// of a forecast that reads what is already recorded. Every account, word,
+/// amount and date is invented (CLAUDE.md).
+fn recorded_under(account: Uuid, key: &str, word: &str, amount: &str) -> Value {
+    json!({
+        "account": account,
+        "type": "withdrawal",
+        "amount": amount,
+        "currency": "RUB",
+        "dates": { "cash_posted": "2025-02-11" },
+        "source_kind": word,
+        "idempotency_key": key,
+    })
+}
+
+/// Before the standing decision made from one answer stands, what it would
+/// settle is shown to him (`iaam-uibl`).
+///
+/// His question, in his own words: what if every one of the operations is right
+/// except one? He answers a line, a standing decision appears, it files a group
+/// automatically — and what else it reaches was not published anywhere before he
+/// answered. The two halves after the fact already existed: he can ask what a
+/// standing decision filed, and a correction tells him it is still standing.
+/// This is the half before, and it writes nothing.
+#[tokio::test]
+async fn an_answers_standing_decision_shows_what_it_would_settle_before_it_stands() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    // Two movements already recorded under the word a decision would be made
+    // about, and one under another word.
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "february" },
+                "operations": [
+                    recorded_under(account, "uibl-recorded-one", "INNER", "1500.00"),
+                    recorded_under(account, "uibl-recorded-two", "INNER", "2500.00"),
+                    recorded_under(account, "uibl-recorded-other", "OUTER", "3500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+    let already: Vec<String> = recorded
+        .as_array()
+        .expect("verdicts")
+        .iter()
+        .filter_map(|verdict| verdict["event_id"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(already.len(), 3, "{recorded}");
+    let journal_before = journal_rows(&harness).await;
+
+    // Three lines of one import raising the same open question.
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [
+                    unresolved_row(account, "uibl-asked"),
+                    unresolved_row_dated(account, "uibl-alike-one", "2025-03-19", "2600.00"),
+                    unresolved_row_dated(account, "uibl-alike-two", "2025-03-20", "2700.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, forecast) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer/preview"),
+            &harness.owner_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{forecast}");
+
+    assert_eq!(forecast["state"], "written", "{forecast}");
+    assert_eq!(
+        forecast["proposal"]["matcher"]["kind"], "INNER",
+        "the condition is the one answering would write: {forecast}"
+    );
+    assert_eq!(
+        forecast["proposal"]["outcome"]["kind"], "external_flow",
+        "{forecast}"
+    );
+
+    let lines = forecast["in_this_import"]
+        .as_array()
+        .expect("the lines of this import it would cover");
+    assert_eq!(
+        lines.len(),
+        3,
+        "the line he was asked about and the two like it: {forecast}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| line["awaiting_answer"] == json!(true)),
+        "all three are still waiting on him: {forecast}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| line["printed"]["title"] == "Brokerage"),
+        "an account he is read out carries what he calls it: {forecast}"
+    );
+
+    let movements = forecast["already_recorded"]
+        .as_array()
+        .expect("the movements already recorded it would cover");
+    assert_eq!(
+        movements.len(),
+        2,
+        "the two filed under that word, and not the third: {forecast}"
+    );
+    assert!(
+        movements
+            .iter()
+            .all(|movement| already
+                .contains(&movement["event"].as_str().expect("an event").to_owned())),
+        "each names the fact a correction is addressed to: {forecast}"
+    );
+    assert!(
+        movements
+            .iter()
+            .all(|movement| movement["now"]["kind"] == "external_flow"),
+        "and what is recorded about it today: {forecast}"
+    );
+
+    assert_eq!(
+        forecast["undecided"].as_array().expect("undecided").len(),
+        0,
+        "{forecast}"
+    );
+    let notice = forecast["notice"].as_str().expect("a sentence he is read");
+    for internal in [
+        "matcher",
+        "classification",
+        "session",
+        "row",
+        "rule",
+        "alike",
+        "subject",
+        "journal",
+    ] {
+        assert!(
+            !notice.to_lowercase().contains(internal),
+            "«{internal}» is our word, not his: {notice}"
+        );
+    }
+
+    // Nothing was written, and that is the whole promise. No standing decision
+    // was made, nothing reached the journal, and the question is exactly as open
+    // as it was.
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert!(
+        rules.as_array().expect("rules").is_empty(),
+        "a forecast stands no standing decision: {rules}"
+    );
+    assert_eq!(
+        journal_rows(&harness).await,
+        journal_before,
+        "and writes nothing to what is already recorded"
+    );
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let asked = contents["questions"]
+        .as_array()
+        .expect("questions")
+        .iter()
+        .find(|stored| stored["question"] == json!(question))
+        .expect("the question the forecast was about")
+        .clone();
+    assert!(
+        asked["answered_at"].is_null(),
+        "and answers nothing: {asked}"
+    );
+    assert_eq!(
+        asked["generalisation"]["state"], "unanswered",
+        "so the question has generalised into nothing yet: {asked}"
+    );
+}
+
+/// The answer that keeps no standing decision says so, rather than publishing
+/// an empty set that reads as «nothing else is affected».
+///
+/// `between_own_accounts` is a fact about what this statement did not contain,
+/// so it is never kept as a standing decision — and the forecast for it must
+/// name that reason rather than show two empty lists.
+#[tokio::test]
+async fn a_forecast_for_an_answer_that_keeps_no_standing_decision_says_which_reason_it_is() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [unresolved_row(account, "uibl-declines")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"].as_str().expect("session");
+    let question = verdicts[0]["question_id"].as_str().expect("question");
+
+    let (status, forecast) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer/preview"),
+            &harness.owner_token,
+            &json!({ "answer": "between_own_accounts" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{forecast}");
+    assert_eq!(
+        forecast["state"], "not_from_this_answer",
+        "the answer keeps none — the line is not the reason: {forecast}"
+    );
+    assert!(forecast.get("proposal").is_none(), "{forecast}");
+    assert_eq!(
+        forecast["in_this_import"]
+            .as_array()
+            .expect("in_this_import")
+            .len(),
+        0,
+        "{forecast}"
+    );
+    assert!(
+        forecast["notice"]
+            .as_str()
+            .is_some_and(|notice| !notice.is_empty()),
+        "the empty lists are explained rather than left to be read: {forecast}"
+    );
+
+    // An answer the question does not admit is refused here exactly as it is
+    // refused by the call this describes.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer/preview"),
+            &harness.owner_token,
+            &json!({ "answer": "not_a_word_of_this_vocabulary" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+}
+
+/// The forecast is in the contract, with the shapes a client reads it by.
+///
+/// A route registered and a schema left out is a `$ref` a generator cannot
+/// resolve, and the client that finds out is the one being built.
+#[tokio::test]
+async fn the_contract_publishes_the_forecast_and_the_shapes_it_is_read_by() {
+    let harness = harness();
+    let document = serde_json::to_value(&harness.api).expect("OpenAPI JSON");
+    let path = document["paths"]
+        ["/v1/import-sessions/{session}/questions/{question}/answer/preview"]["post"]
+        .clone();
+    assert_eq!(path["operationId"], "preview_import_answer", "{path}");
+    assert_eq!(
+        path["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/AnswerRuleForecastDto",
+        "{path}"
+    );
+    let schemas = &document["components"]["schemas"];
+    for shape in [
+        "AnswerRuleForecastDto",
+        "PreviewAnswerRequest",
+        "ForecastedLineDto",
+        "ForecastedMovementDto",
+        "UndecidedDto",
+    ] {
+        assert!(
+            schemas.get(shape).is_some(),
+            "{shape} is referenced by the contract and must be in it"
+        );
+    }
+
+    // Nothing published to be read cites a document its reader has no copy of:
+    // no decision number and no bead identifier reaches the shipped contract.
+    // The descriptions are asserted to be there first, or the sweep below would
+    // pass by having nothing to sweep.
+    let published = serde_json::to_string(&json!([
+        path,
+        schemas["AnswerRuleForecastDto"],
+        schemas["PreviewAnswerRequest"],
+        schemas["ForecastedLineDto"],
+        schemas["ForecastedMovementDto"],
+        schemas["UndecidedDto"]
+    ]))
+    .expect("published text");
+    assert!(
+        path["description"]
+            .as_str()
+            .is_some_and(|text| text.len() > 200),
+        "the route's own prose is published as its description: {path}"
+    );
+    assert!(
+        schemas["AnswerRuleForecastDto"]["properties"]["state"]["description"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "and a field's prose as the field's description"
+    );
+    for citation in ["iaam-", "decision 0", "Decision 0"] {
+        assert!(
+            !published.contains(citation),
+            "«{citation}» is ours and the contract's reader has no copy of it"
+        );
+    }
+}
+
 /// The journal as the API serves it, row by row.
 async fn journal_events(harness: &Harness) -> Vec<Value> {
     let (status, page) = call(

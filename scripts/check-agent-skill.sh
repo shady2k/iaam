@@ -10,8 +10,8 @@
 # CANNOT make the claim. A running instance answers what it serves through
 # `/.well-known/api-catalog` and the contract behind it; the document explains
 # meaning. So this guard refuses a versioned route path, an HTTP method spelled
-# as an instruction, an HTTP status code, and the name of a payload field,
-# anywhere in the skill.
+# as an instruction, an HTTP status code, and a payload field name it can tell
+# from prose, anywhere in the skill.
 #
 # Like the privacy guard, it checks SHAPES. It needs no list of routes, so it
 # cannot itself go stale when the API changes — which is the whole point.
@@ -60,6 +60,17 @@ STATUS_SHAPE='\b(200|201|202|204|301|302|304|400|401|403|404|405|409|410|415|422
 # and a copy here is a claim that rots. Matched as a shape — a backticked
 # identifier in snake_case or lowerCamelCase — so it needs no list of fields and
 # cannot go stale when the API changes.
+#
+# **The underscore or the internal capital is the whole signal, and a field
+# named in one lowercase word is invisible to it.** `preset`, `covers`,
+# `prompt`, `consequence` and `goal` are all real field names that pass; `goal`
+# is backticked in the entry-point section of the document today and refused by
+# nothing. That is a bound rather than a bug to fix. Nothing in the string
+# `goal` distinguishes the field from the English word, so the only thing that
+# could tell them apart is a list of the API's field names — which goes stale
+# the moment the API changes, and not going stale is the property all four
+# refusals were built to have. The shape catches the names that could be
+# nothing but a field; a name that reads as ordinary prose is left to a reader.
 FIELD_SHAPE='`[a-z][a-z0-9]*(_[a-z0-9]+|[A-Z][A-Za-z0-9]*)[A-Za-z0-9_]*`'
 
 check() {
@@ -107,6 +118,15 @@ probe_field=$(printf '%s\n' 'read `requiredScope` on the resolution' 'the money 
   | grep -E "$FIELD_SHAPE" || true)
 if [ "$probe_field" != 'read `requiredScope` on the resolution' ]; then
   err "the field shape misclassifies its own probe"
+  exit 1
+fi
+# And the bound the comment above states, probed in the direction that matters:
+# a field named in one lowercase word passes, so nobody reads the refusal as
+# «no field name reaches the document» and stops looking.
+probe_bare=$(printf '%s\n' 'tagged with the `goal` name the queue also uses' \
+  | grep -E "$FIELD_SHAPE" || true)
+if [ -n "$probe_bare" ]; then
+  err "the field shape catches a one-word field name; the comment above says it cannot"
   exit 1
 fi
 

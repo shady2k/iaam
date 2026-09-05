@@ -2329,15 +2329,33 @@ fn property_description<'a>(spec: &'a serde_json::Value, schema: &str, property:
     // a property a reader meets. The flattened *field* publishes nothing; its
     // neighbours publish exactly as they always did, one level down.
     let published = if component["properties"][property].is_null() {
-        component["allOf"]
+        // Collected rather than found: two branches publishing one property
+        // name are two sentences a reader could meet, and taking whichever the
+        // generator emitted first would assert against one of them silently.
+        let branches: Vec<&serde_json::Value> = component["allOf"]
             .as_array()
-            .and_then(|branches| {
+            .map(|branches| {
                 branches
                     .iter()
                     .map(|branch| &branch["properties"][property])
-                    .find(|found| !found.is_null())
+                    .filter(|found| !found.is_null())
+                    .collect()
             })
-            .unwrap_or(&serde_json::Value::Null)
+            .unwrap_or_default();
+        assert!(
+            branches.len() < 2,
+            "{schema} publishes `{property}` in {} of its `allOf` branches, so \
+             there is no one description a reader meets",
+            branches.len()
+        );
+        // A property that is not published at all is a rename, and it wants
+        // different work from a property published without a sentence: every
+        // assertion naming it now names nothing. Saying so here keeps the two
+        // apart, which the shared `no description` panic below could not.
+        branches
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("{schema} publishes no property `{property}`"))
     } else {
         &component["properties"][property]
     };
@@ -2349,13 +2367,81 @@ fn property_description<'a>(spec: &'a serde_json::Value, schema: &str, property:
         // meets the same sentence either way, so the helper looks in both
         // places instead of obliging every caller to know which shape a field
         // happens to have.
+        //
+        // That is honest only while the union has one alternative beside null,
+        // which is the whole of what utoipa emits for this shape today. A
+        // genuine union of two would make the branch a guess, so it is refused
+        // rather than read: an obligation about one alternative is asserted on
+        // the alternative a reader meets, which is what `variant()` is for.
         .or_else(|| {
-            published["oneOf"]
+            let alternatives: Vec<&serde_json::Value> = published["oneOf"]
                 .as_array()?
                 .iter()
-                .find_map(|branch| branch["description"].as_str())
+                .filter(|branch| branch["type"] != "null")
+                .collect();
+            assert!(
+                alternatives.len() == 1,
+                "{schema}.{property} publishes {} alternatives beside null, so \
+                 no one of them is the description a reader meets; assert \
+                 against the branch itself with the sibling `variant()` helper",
+                alternatives.len()
+            );
+            alternatives[0]["description"].as_str()
         })
         .unwrap_or_else(|| panic!("{schema}.{property} publishes no description"))
+}
+
+/// A property that is not there is a rename, and it used to read as a missing
+/// doc comment.
+///
+/// The two failures want opposite work — one is «write the sentence», the other
+/// is «the field moved and every assertion about it now names nothing» — and
+/// the helper answered both with the first, so a rename presented as a doc
+/// comment somebody had forgotten to write.
+#[test]
+#[should_panic(expected = "SomeDto publishes no property `renamed`")]
+fn a_property_the_schema_does_not_publish_is_diagnosed_as_a_rename() {
+    let spec = json!({
+        "components": {"schemas": {"SomeDto": {"allOf": [
+            {"properties": {"kept": {"description": "a sentence about the field kept"}}}
+        ]}}}
+    });
+    property_description(&spec, "SomeDto", "renamed");
+}
+
+/// Where a field could be met under either of two alternatives, the helper does
+/// not pick one for the caller.
+///
+/// The `oneOf` fallback exists for the one shape the generator emits today — a
+/// reference beside null, where the sentence hangs on the reference — and
+/// taking the first branch that carries a description is honest only while
+/// there is exactly one branch to take. Nothing said so, so a second
+/// alternative would have been read as the first without a word.
+#[test]
+#[should_panic(expected = "`variant()`")]
+fn a_property_with_two_alternatives_beside_null_is_not_guessed_at() {
+    let spec = json!({
+        "components": {"schemas": {"SomeDto": {"properties": {"either": {"oneOf": [
+            {"type": "null"},
+            {"description": "what the first alternative means"},
+            {"description": "what the second alternative means"}
+        ]}}}}}
+    });
+    property_description(&spec, "SomeDto", "either");
+}
+
+/// Two flattened branches publishing one property name are two sentences a
+/// reader could meet, and neither is «the» description.
+#[test]
+#[should_panic(expected = "in 2 of its `allOf` branches")]
+fn a_property_published_by_two_flattened_branches_is_not_guessed_at() {
+    let spec = json!({
+        "components": {"schemas": {"SomeDto": {"allOf": [
+            {"properties": {"shared": {"description": "what one branch says"}}},
+            {"properties": {"shared": {"description": "what the other branch says"}}}
+        ]}}}
+    });
+    property_description(&spec, "SomeDto", "shared");
 }
 
 /// One variant of a tagged union, found by the word its `type` takes.
@@ -2386,7 +2472,12 @@ async fn a_question_says_how_the_row_is_named_to_the_owner() {
     assert_eq!(status, StatusCode::OK);
 
     let described = property_description(&spec, "ImportQuestionDto", "row");
-    for owed in ["day", "amount", "sign"] {
+    for owed in [
+        "Not what the owner is told",
+        "recognises a line by the day the",
+        "the amount it printed, with the sign it printed",
+        "eventually off by one",
+    ] {
         assert!(
             described.contains(owed),
             "ImportQuestionDto.row does not say the owner is told the {owed}: {described}"
@@ -2479,7 +2570,11 @@ async fn a_stated_far_side_never_sends_money_out_of_the_perimeter() {
         ["far_side"]["description"]
         .as_str()
         .expect("the far side publishes no description");
-    for owed in ["one leg", "perimeter"] {
+    for owed in [
+        "it posts **one leg**, on this",
+        "It still does not send money out of the **perimeter**",
+        "neither spending nor income",
+    ] {
         assert!(
             described.contains(owed),
             "the far side says nothing about «{owed}»: {described}"
@@ -2501,7 +2596,12 @@ async fn a_proposed_rule_says_what_its_condition_asks_about() {
     assert_eq!(status, StatusCode::OK);
 
     let described = property_description(&spec, "QuestionGeneralisationDto", "proposal");
-    for owed in ["one thing", "counterparty", "wider"] {
+    for owed in [
+        "**Its condition asks about one thing**",
+        "the counterparty the row named; failing that",
+        "**Say what the condition asks about**, not only that a rule is",
+        "a wider condition settles more rows next month and can settle one of",
+    ] {
         assert!(
             described.contains(owed),
             "the proposal says nothing about «{owed}»: {described}"
@@ -2545,7 +2645,12 @@ async fn a_confirmation_is_independent_only_where_two_channels_agree() {
     assert_eq!(status, StatusCode::OK);
 
     let described = property_description(&spec, "DimensionStatusDto", "status");
-    for owed in ["accepted_independent", "two", "again"] {
+    for owed in [
+        "is two channels, not two",
+        "only agreement between those two raises a measurement to",
+        "Loading the same statement again",
+        "a re-read document is never reported as a",
+    ] {
         assert!(
             described.contains(owed),
             "the measurement's status says nothing about «{owed}»: {described}"
@@ -2568,7 +2673,12 @@ async fn a_return_is_reported_over_the_whole_history_and_never_a_sub_interval() 
     assert_eq!(status, StatusCode::OK);
 
     let described = property_description(&spec, "ReturnsReportDto", "history_starts");
-    for owed in ["whole history", "interval", "start"] {
+    for owed in [
+        "It is not the start of a window",
+        "the whole history",
+        "A return over an arbitrary interval is not computed",
+        "read out as the ends of a period",
+    ] {
         assert!(
             described.contains(owed),
             "the start of the history says nothing about «{owed}»: {described}"
@@ -2599,16 +2709,110 @@ async fn a_change_that_does_not_join_is_a_discrepancy_and_not_a_correction() {
     }
 }
 
+/// A balance the journal cannot hold up against anything is not a figure the
+/// owner got wrong.
+///
+/// `not_comparable` with the reason `opening_not_asserted` and `discrepant` are
+/// opposite instructions, and the outcome publishes both words side by side
+/// with nothing saying so. A client that reads the first as a softer second
+/// tells the owner his own statement disagrees with the journal — sending him
+/// to hunt an error that does not exist, over an account whose recorded history
+/// simply starts later than the balance he read out. The rule was written down
+/// once, in a document that no longer exists; the reason string is where a
+/// client meets it.
+#[tokio::test]
+async fn an_unasserted_opening_is_never_reported_as_an_error_the_owner_made() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ClaimOutcomeDetailDto", "reason");
+    for owed in [
+        "`opening_not_asserted` is not `discrepant`",
+        "no baseline to hold the claim against",
+        "Nothing the owner stated is being contradicted",
+        "reported to him as an error he made",
+        "an opening assertion reaching back to the start of the",
+        "the import of the history before it",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the reason for `not_comparable` says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// One of the four verdicts sends the owner looking for an error, and the other
+/// three do not.
+///
+/// The word is the first thing a client reads off an outcome, and it was
+/// described nowhere at all. Ranked as severities — `matched` best,
+/// `discrepant` worst, the rest somewhere between — the three that assert
+/// nothing about his figures become bad news about them, and the detail key
+/// that would have corrected the reading is the one such a client never opens.
+#[tokio::test]
+async fn only_one_verdict_sends_the_owner_looking_for_an_error() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ClaimOutcomeDetailDto", "code");
+    for owed in [
+        "`not_comparable` is not a weaker `discrepant`",
+        "Only `discrepant` sends the owner looking for an error",
+        "reporting them alike hands him work",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the verdict says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// Two figures computed against two memberships are two answers about two
+/// different perimeters.
+///
+/// The number is published beside the contour and reads like a detail of the
+/// record rather than a coordinate of the answer. A client that sets last
+/// month's figure beside this month's without it reports a change in the
+/// owner's money when what changed was which accounts are counted as his —
+/// exactly the reading `retirement_revision`, the other coordinate, already
+/// warns against on itself.
+#[tokio::test]
+async fn two_figures_over_different_contour_versions_are_not_comparable() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "PopulationDto", "contour_version");
+    for owed in [
+        "Two figures computed against different contour versions are not comparable",
+        "the boundary moving as much as it is the",
+        "rather than reporting a change in his money",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the contour version says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
 /// A price is quotable only once its basis is read, and the row states the basis
 /// three times over.
 ///
 /// The effective basis, the basis the source recorded and the machine status of
-/// how well that basis is proven are three fields that need not agree, and only
-/// one of the three said anything about itself. A caller that reads the first
-/// and stops quotes a percentage of face as money, or quotes as settled a basis
-/// the source contradicts itself about.
+/// how well that basis is proven are three fields that need not agree. A caller
+/// that reads the first and stops quotes a percentage of face as money, or
+/// quotes as settled a basis the source contradicts itself about.
+///
+/// **One carrier, and the name says so.** The rule about all three is written
+/// on the basis in force, which is the field a caller reads first and the only
+/// one of the three that could state it without repeating itself. Of the
+/// siblings, one publishes a bare line about itself and the other publishes
+/// nothing, and neither states this rule — so the test is named for the carrier
+/// it reads rather than for the three fields the rule is about.
 #[tokio::test]
-async fn a_price_says_its_three_statements_of_the_basis_need_not_agree() {
+async fn the_basis_in_force_says_the_other_two_statements_need_not_agree() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -2672,7 +2876,8 @@ async fn an_unconfirmed_payment_and_absent_evidence_are_not_reported_alike() {
         "has not been confirmed",
         "cannot be reconciled",
         "went missing",
-        "count",
+        "carrying a count and the first and last dates",
+        "It is put to him once",
     ] {
         assert!(
             described.contains(owed),
@@ -2725,7 +2930,12 @@ async fn a_contour_says_what_its_boundary_does_to_a_movement() {
     assert_eq!(status, StatusCode::OK);
 
     let described = property_description(&spec, "ContourDto", "accounts");
-    for owed in ["portfolio", "institution", "return", "contribution"] {
+    for owed in [
+        "the set the owner considers his portfolio",
+        "his rather than an institution's",
+        "Money moved between two accounts named here changes no return",
+        "arriving from an account not named here is a **contribution**",
+    ] {
         assert!(
             described.contains(owed),
             "the composition says nothing about «{owed}»: {described}"
@@ -2773,7 +2983,11 @@ async fn a_category_answers_a_different_question_from_the_perimeter() {
     assert_eq!(status, StatusCode::OK);
 
     let described = property_description(&spec, "CategoryDto", "title");
-    for owed in ["was for", "whose money", "contour"] {
+    for owed in [
+        "whose money is in the figures",
+        "what that money was for. Neither substitutes for the other",
+        "never a statement about whether an account is his",
+    ] {
         assert!(
             described.contains(owed),
             "the category says nothing about «{owed}»: {described}"
@@ -2862,12 +3076,17 @@ async fn a_dated_resolution_keeps_its_two_refusals_apart() {
 
 /// An instrument has three currencies and the report's is not one of them.
 ///
-/// Three undescribed fields side by side read as one fact spelled three ways,
-/// and on the papers where they genuinely diverge a caller that picks whichever
-/// it met first states a holding in money the owner never held. The currency a
-/// report is drawn in belongs to the report and to no instrument.
+/// Three fields side by side read as one fact spelled three ways, and on the
+/// papers where they genuinely diverge a caller that picks whichever it met
+/// first states a holding in money the owner never held. The currency a report
+/// is drawn in belongs to the report and to no instrument.
+///
+/// **One carrier, and the name says so.** The rule naming all three is written
+/// on the first of them, where a caller reading the fields in order meets it
+/// before it can pick wrongly. The siblings publish no description at all, so a
+/// test named for three carriers would promise proof of two that do not exist.
 #[tokio::test]
-async fn an_instrument_keeps_its_three_currencies_apart() {
+async fn the_denomination_currency_says_the_other_two_are_not_it() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -2999,7 +3218,12 @@ async fn the_printed_string_is_the_accounts_identity_and_not_its_title() {
     assert_eq!(status, StatusCode::OK);
 
     let described = property_description(&spec, "CreateAccountRequest", "provider_account_id");
-    for owed in ["printed", "title", "rename"] {
+    for owed in [
+        "The string a statement printed for the account belongs here",
+        "an account carrying that string as its printed identity",
+        "put in the title instead leaves the owner with a name he did not",
+        "the rename he is entitled to make then stops the document",
+    ] {
         assert!(
             described.contains(owed),
             "CreateAccountRequest.provider_account_id says nothing about «{owed}»: {described}"
@@ -3045,7 +3269,12 @@ async fn a_custody_cell_is_named_by_the_owners_own_title_and_nothing_else() {
     let described = spec["paths"]["/v1/ingest/csv"]["post"]["description"]
         .as_str()
         .expect("the CSV ingestion route carries a description");
-    for owed in ["custody", "nothing else", "default"] {
+    for owed in [
+        "a place of custody is matched against the owner's own title for it and \
+         against nothing else",
+        "A cell left empty falls back to the account's default place of custody",
+        "a title naming two places is refused rather than chosen between",
+    ] {
         assert!(
             described.contains(owed),
             "the route says nothing about «{owed}» for a custody cell: {described}"

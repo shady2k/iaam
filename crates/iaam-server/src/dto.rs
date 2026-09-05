@@ -631,11 +631,11 @@ pub enum OperationKindDto {
         ///
         /// A row that asserts it **and** states a direction is the other case,
         /// and it does not behave the same way: it posts **one leg**, on this
-        /// account, the way the source said the money ran. It still does not
-        /// send money out of the **perimeter** — the far side is the owner's,
-        /// by the source's own words — so that leg is his money moving inside
-        /// his own accounts and is neither spending nor income, however a
-        /// report or a client words it.
+        /// account, the way the source said the money ran.
+        /// It still does not send money out of the **perimeter** — the far side
+        /// is the owner's, by the source's own words — so that leg is his money
+        /// moving inside his own accounts and is neither spending nor income,
+        /// however a report or a client words it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         far_side: Option<String>,
         /// The document the row was read out of, as the source names it.
@@ -2811,6 +2811,17 @@ impl CaveatSubjectDto {
 pub struct PopulationDto {
     /// The scope the report was computed over.
     pub contour: Uuid,
+    /// Which version of that scope's membership these figures were folded over.
+    ///
+    /// The first coordinate of the answer, beside `retirement_revision` below,
+    /// and it is here for the same reason: a version names a membership, and a
+    /// later version can name a different one.
+    ///
+    /// **Two figures computed against different contour versions are not comparable.**
+    /// The distance between them is the boundary moving as much as it is the
+    /// money moving, and neither figure says which. Quote the pair with any
+    /// figure meant to be set beside another, and where the pair differs say
+    /// the perimeter changed, rather than reporting a change in his money.
     pub contour_version: u32,
     /// How much of what the system knows about this report answered about.
     ///
@@ -7183,13 +7194,50 @@ impl ObservationBasisDto {
     }
 }
 
+/// What one control assertion came to, and the key carrying the rest of it.
+///
+/// `code` is the verdict and the other three are the detail: at most one of
+/// them is present, decided by the verdict, and it is where the answer actually
+/// is. A client that reads `code` and stops has the shape of the finding and
+/// none of what it is about.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDetailDto {
+    /// The verdict, as one of four words: `matched`, `discrepant`,
+    /// `not_comparable` or `excepted`.
+    ///
+    /// **`not_comparable` is not a weaker `discrepant`.**
+    /// Only `discrepant` sends the owner looking for an error: it says the
+    /// figures disagree and one of them is wrong. The other three assert
+    /// nothing about his figures, and reporting them alike hands him work
+    /// that does not exist. Each of the four names its own detail key below.
     pub code: String,
+    /// The two figures and the distance between them. Present exactly when
+    /// `code` is `discrepant`, which is the one verdict that is about a
+    /// disagreement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discrepancy: Option<DiscrepancyDto>,
+    /// Why no comparison could be made. Present exactly when `code` is
+    /// `not_comparable`, as one of `no_journal_coverage`,
+    /// `tax_facts_not_recorded` or `opening_not_asserted`.
+    ///
+    /// **`opening_not_asserted` is not `discrepant`, and the two are opposite
+    /// instructions.** The source stated a balance over a fold nothing anchors:
+    /// the recorded history begins with a movement and not with a stated
+    /// holding, so what was folded is movement over that interval and not a
+    /// level, and there is no baseline to hold the claim against.
+    ///
+    /// **Nothing the owner stated is being contradicted, and it is never
+    /// reported to him as an error he made.** A `discrepant` sends him to find
+    /// an error; here there is none to find, and it is not a defect he repairs
+    /// by restating the balance either — the figure he read out may be exactly
+    /// right, and the journal still has nothing to hold it against.
+    ///
+    /// What lifts it is an opening assertion reaching back to the start of the
+    /// recorded history, or the import of the history before it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The difference this system already explains, so that it is not put to
+    /// the owner as work. Present exactly when `code` is `excepted`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exception: Option<String>,
 }

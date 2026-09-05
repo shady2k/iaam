@@ -57,15 +57,41 @@ done < <(git ls-files | grep -E "$DATA_SUFFIXES" || true)
 # ADDS, because the existing tree is vetted and old plans legitimately contain
 # invented amounts in that shape.
 AMOUNT_SHAPE='[0-9]{1,3}([ ][0-9]{3})+,[0-9]{2}'
+
+# Which lines count as "added" depends on who is asking.
+#
+#   --staged   the pre-commit hook: what is about to BECOME a commit, so the
+#              comparison is against the index. This is the only moment at which
+#              a refusal costs a keystroke rather than a history rewrite.
+#   <base>     the CI gate: what this branch added on top of the base commit.
+#
+# With neither, layer 2 cannot run at all. It used to skip in silence, and the
+# pre-commit hook passed no base — so the hook reported "Personal data checked."
+# while scanning nothing but tracked file names (iaam-rq4h). The scope is now
+# printed, because a guard that will not say what it did not check is advice.
+STAGED=0
 BASE="${1:-${BASE:-}}"
-if [ -n "$BASE" ] && BASE_RESOLVED=$(git rev-parse --verify --quiet "${BASE}^{commit}"); then
+if [ "$BASE" = "--staged" ]; then
+  STAGED=1
+  BASE=""
+fi
+
+added=""
+if [ "$STAGED" -eq 1 ]; then
+  scope="staged changes"
+  added=$(git diff --cached -- '*.md' '*.rs' '*.sql' '*.toml' \
+          | grep -E '^\+' | grep -v '^+++' | grep -E "$AMOUNT_SHAPE" || true)
+elif [ -n "$BASE" ] && BASE_RESOLVED=$(git rev-parse --verify --quiet "${BASE}^{commit}"); then
+  scope="tracked files, and lines added since $BASE"
   added=$(git diff "${BASE_RESOLVED}...HEAD" -- '*.md' '*.rs' '*.sql' '*.toml' \
           | grep -E '^\+' | grep -v '^+++' | grep -E "$AMOUNT_SHAPE" || true)
-  if [ -n "$added" ]; then
-    err "an amount shaped like a statement's was added:"
-    printf '%s\n' "$added" | head -5 >&2
-    echo "        If it is invented, write it without the thousands separator." >&2
-  fi
+else
+  scope="tracked file names only — no comparison base, so no added line was read"
+fi
+if [ -n "$added" ]; then
+  err "an amount shaped like a statement's was added:"
+  printf '%s\n' "$added" | head -5 >&2
+  echo "        If it is invented, write it without the thousands separator." >&2
 fi
 
 # --- The guard tests its own boundary ----------------------------------------
@@ -92,4 +118,4 @@ if [ "$fail" -ne 0 ]; then
   echo "PRIVACY: refused." >&2
   exit 1
 fi
-echo "Personal data checked."
+echo "Personal data checked ($scope)."

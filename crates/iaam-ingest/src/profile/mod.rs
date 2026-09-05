@@ -31,9 +31,14 @@
 //!   fail about a *cell* fails here, per row, naming field, expected and actual.
 //! - [`catalogue`] is what an instance has installed, where each profile came
 //!   from, and why any of them was refused.
+//! - [`ledger`] is the one question the catalogue asks the instance's durable
+//!   state: which content does this `(id, version)` already name? A version is
+//!   a name for a content, and a name that a restart lets be reused for a
+//!   second content is not a name.
 
 pub mod catalogue;
 pub mod engine;
+pub mod ledger;
 pub mod load;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +47,7 @@ use iaam_core::event::provenance::ParserVersion;
 
 pub use catalogue::{Installed, Origin, ProfileCatalogue, Refused};
 pub use engine::{DocumentReading, ReadContext, ReadOutcome, UnresolvedAccountName, read};
+pub use ledger::{Binding, LedgerUnavailable, VersionLedger};
 pub use load::ProfileError;
 
 /// The schema version this build implements.

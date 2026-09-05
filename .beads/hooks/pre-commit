@@ -31,3 +31,17 @@ if command -v bd >/dev/null 2>&1; then
   if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
 fi
 # --- END BEADS INTEGRATION v1.1.0 ---
+
+# --- BEGIN IAAM PRIVACY GUARD (iaam-rq4h) ---
+# Managed by scripts/install-hooks.sh. Kept OUTSIDE the beads section markers on
+# purpose: beads preserves content outside them, so this survives `bd hooks
+# install` regenerating the file. Do not move it inside the markers.
+_iaam_root=$(git rev-parse --show-toplevel) || exit 1
+if [ ! -x "$_iaam_root/scripts/check-no-personal-data.sh" ]; then
+  echo "PRIVACY: scripts/check-no-personal-data.sh is missing or not executable." >&2
+  echo "        Refusing the commit: a guard that cannot run must not pass." >&2
+  exit 1
+fi
+"$_iaam_root/scripts/check-no-personal-data.sh" --staged || exit 1
+# --- END IAAM PRIVACY GUARD (iaam-rq4h) ---
+

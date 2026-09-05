@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use crate::verdict::Rejection;
 
+use super::ledger::{Binding, VersionLedger};
 use super::{SourceProfile, engine, load};
 
 /// The T-Bank operations export, bundled.
@@ -222,6 +223,71 @@ impl ProfileCatalogue {
             .sort_by(|left, right| left.profile.id().cmp(right.profile.id()));
     }
 
+    /// Bind every installed profile to the content its version names, refusing
+    /// any profile whose version already names a different one.
+    ///
+    /// **This is the half of decision 0019 §5 that a single load cannot do.**
+    /// [`Self::admit`] refuses two files claiming one id among the files of one
+    /// pass; it says nothing about the file that was loaded *last time this
+    /// instance started*. Without the ledger a profile edited between two
+    /// starts is compared against nothing, and the new content is stamped on
+    /// facts under the version the old content already stamped on others — at
+    /// which point «the rows version 3 read» is not a set and a buggy profile's
+    /// facts cannot be retracted as a group.
+    ///
+    /// **A changed content is refused; a changed version never is.** Raising
+    /// the version is the whole supported way to change a reading, and this
+    /// must not stand in its way: a new version is a new pair, and a new pair
+    /// records and installs.
+    ///
+    /// A refused profile moves from installed to [`Self::refused`] with the
+    /// reason naming both contents — the one the version stands for and the one
+    /// it was handed — because a refusal without them leaves the operator
+    /// comparing files by hand.
+    ///
+    /// A ledger that cannot be consulted refuses too. Not knowing whether the
+    /// content changed is not knowing that it did not, and installing on the
+    /// strength of an unanswered question is the silent acceptance this whole
+    /// decision exists to refuse.
+    #[must_use]
+    pub fn bound_by(mut self, ledger: &mut dyn VersionLedger) -> Self {
+        let mut bound = Vec::with_capacity(self.installed.len());
+        for installed in std::mem::take(&mut self.installed) {
+            let profile = &installed.profile;
+            let answer = ledger.bind(profile.id(), profile.version(), profile.digest());
+            let reason = match answer {
+                Ok(Binding::Recorded | Binding::Unchanged) => {
+                    bound.push(installed);
+                    continue;
+                }
+                Ok(Binding::Differs { recorded }) => format!(
+                    "version {version} of «{id}» already names the content {recorded} on this \
+                     instance, and this file's content is {offered}. A version is a name for a \
+                     content (decision 0019 §5): facts already recorded say they were read by \
+                     this version, so a second content under it would make «the rows this \
+                     version read» unanswerable. Change the reading under a new version",
+                    version = profile.version(),
+                    id = profile.id(),
+                    offered = profile.digest(),
+                ),
+                Err(unavailable) => format!(
+                    "{unavailable}, so whether version {version} of «{id}» still names the \
+                     content this file carries is unknown. A profile is installed on a recorded \
+                     answer and never on an unanswered question",
+                    version = profile.version(),
+                    id = profile.id(),
+                ),
+            };
+            self.refused.push(Refused {
+                id: Some(profile.id().to_owned()),
+                reason,
+                origin: installed.origin,
+            });
+        }
+        self.installed = bound;
+        self
+    }
+
     /// Every profile this instance reads documents with.
     #[must_use]
     pub fn installed(&self) -> &[Installed] {
@@ -302,11 +368,228 @@ impl ProfileCatalogue {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::collections::btree_map::Entry;
+
     use iaam_core::ids::AccountId;
 
     use crate::csv_source::{AccountEntry, AccountNames};
+    use crate::profile::ledger::LedgerUnavailable;
 
     use super::*;
+
+    /// A ledger that outlives the catalogues bound against it, which is the
+    /// whole of what is being tested here.
+    ///
+    /// It stands in for the instance's database and nothing else: it is built
+    /// once per test, several catalogues are bound against it in turn, and each
+    /// of those catalogues is a start of the instance. The durability itself —
+    /// that the record survives a process and not merely a value — is proven
+    /// against the real store, where the file is reopened.
+    #[derive(Debug, Default)]
+    struct RecordedVersions {
+        bound: BTreeMap<(String, u32), String>,
+        /// When set, every consultation fails, standing in for a database this
+        /// instance cannot read.
+        unavailable: bool,
+    }
+
+    impl VersionLedger for RecordedVersions {
+        fn bind(
+            &mut self,
+            id: &str,
+            version: u32,
+            digest: &str,
+        ) -> Result<Binding, LedgerUnavailable> {
+            if self.unavailable {
+                return Err(LedgerUnavailable(
+                    "the database could not be read".to_owned(),
+                ));
+            }
+            match self.bound.entry((id.to_owned(), version)) {
+                Entry::Vacant(slot) => {
+                    slot.insert(digest.to_owned());
+                    Ok(Binding::Recorded)
+                }
+                Entry::Occupied(slot) if slot.get() == digest => Ok(Binding::Unchanged),
+                Entry::Occupied(slot) => Ok(Binding::Differs {
+                    recorded: slot.get().clone(),
+                }),
+            }
+        }
+    }
+
+    /// One profile, invented end to end, with the version and one transcribed
+    /// label the caller asks for.
+    ///
+    /// The schema's own example is the body, so the fixture is a profile this
+    /// build genuinely loads; `document_label` is the field varied to change
+    /// the file's content without changing what it reads, which is exactly the
+    /// edit the binding has to catch — a changed content under a standing
+    /// version is refused whether or not the change means anything.
+    fn a_profile(version: u32, label: &str) -> Vec<u8> {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../schema/source-profile-v1.json"))
+                .expect("the schema is JSON");
+        let mut example = schema["examples"][0].clone();
+        example["version"] = serde_json::json!(version);
+        example["document_label"] = serde_json::json!(label);
+        serde_json::to_vec(&example).expect("the fixture serialises")
+    }
+
+    /// One start of the instance: a catalogue holding just this file, bound
+    /// against the ledger that outlives it.
+    fn a_start(bytes: &[u8], ledger: &mut RecordedVersions) -> ProfileCatalogue {
+        let mut catalogue = ProfileCatalogue::default();
+        catalogue.admit(
+            Origin::Local {
+                file: PathBuf::from("/profiles/example.json"),
+            },
+            load::from_bytes(bytes),
+        );
+        catalogue.bound_by(ledger)
+    }
+
+    /// A version already recorded against one content refuses a second one, and
+    /// it is the **record** that refuses: the catalogue that loaded the first
+    /// content is gone by then.
+    ///
+    /// This is the defect the binding exists for, and it is not hypothetical: a
+    /// wave changed what a bundled profile read and left the version at 1, and
+    /// nothing mechanical noticed, because the only comparison in the tree was
+    /// between two files loaded in one pass. A profile edited between two
+    /// starts was compared against nothing at all.
+    #[test]
+    fn a_second_content_under_a_recorded_version_is_refused_after_a_restart() {
+        let mut ledger = RecordedVersions::default();
+        let first = a_profile(1, "Account statement");
+        let first_digest = {
+            let catalogue = a_start(&first, &mut ledger);
+            let installed = catalogue
+                .get("example-bank-statement")
+                .expect("the first content installs");
+            installed.profile.digest().to_owned()
+            // and the catalogue is dropped here: nothing of this start
+            // survives into the next but the ledger.
+        };
+
+        let changed = a_profile(1, "Statement of account");
+        let catalogue = a_start(&changed, &mut ledger);
+
+        assert!(
+            catalogue.get("example-bank-statement").is_none(),
+            "a version that already names a content does not take a second one"
+        );
+        let refused = catalogue
+            .refused()
+            .last()
+            .expect("the refusal is published");
+        assert_eq!(refused.id.as_deref(), Some("example-bank-statement"));
+        assert!(
+            refused.reason.contains(&first_digest),
+            "the refusal names the content the version already stands for, or the operator \
+             compares files by hand: {refused:?}"
+        );
+        let changed_digest = load::from_bytes(&changed)
+            .expect("the changed file is a profile")
+            .digest()
+            .to_owned();
+        assert!(
+            refused.reason.contains(&changed_digest),
+            "the refusal names the content it was handed as well: {refused:?}"
+        );
+    }
+
+    /// A changed reading under a **new** version loads, and that is the whole
+    /// supported way to change one.
+    ///
+    /// The binding refuses a changed content, never a changed version. A guard
+    /// that stood in the way of an upgrade would be a guard nobody could ship a
+    /// corrected profile past.
+    #[test]
+    fn a_profile_at_a_new_version_loads_normally() {
+        let mut ledger = RecordedVersions::default();
+        drop(a_start(&a_profile(1, "Account statement"), &mut ledger));
+
+        let catalogue = a_start(&a_profile(2, "Statement of account"), &mut ledger);
+
+        let installed = catalogue
+            .get("example-bank-statement")
+            .expect("a new version is how a reading changes");
+        assert_eq!(installed.profile.version(), 2);
+        assert!(catalogue.refused().is_empty(), "{:?}", catalogue.refused());
+    }
+
+    /// An unchanged profile loads on every start, and the binding is silent.
+    ///
+    /// An instance that refused its own profile the second time it started
+    /// would refuse every import from then on, which is the opposite of what
+    /// the record is for.
+    #[test]
+    fn an_unchanged_profile_loads_restart_after_restart() {
+        let mut ledger = RecordedVersions::default();
+        let body = a_profile(1, "Account statement");
+        for _ in 0..3 {
+            let catalogue = a_start(&body, &mut ledger);
+            assert!(
+                catalogue.get("example-bank-statement").is_some(),
+                "the same content under the same version is the same profile"
+            );
+            assert!(catalogue.refused().is_empty(), "{:?}", catalogue.refused());
+        }
+    }
+
+    /// Binding a catalogue records the digest of every profile it loads, which
+    /// is the half of decision 0019 §5 that has to happen before anything can
+    /// be refused.
+    #[test]
+    fn binding_records_the_content_of_every_profile_loaded() {
+        let mut ledger = RecordedVersions::default();
+        let catalogue = ProfileCatalogue::bundled().bound_by(&mut ledger);
+        assert!(catalogue.refused().is_empty(), "{:?}", catalogue.refused());
+        for installed in catalogue.installed() {
+            assert_eq!(
+                ledger
+                    .bound
+                    .get(&(
+                        installed.profile.id().to_owned(),
+                        installed.profile.version()
+                    ))
+                    .map(String::as_str),
+                Some(installed.profile.digest()),
+                "a profile this instance loaded is a profile whose content it recorded"
+            );
+        }
+    }
+
+    /// A ledger this instance cannot consult refuses the profile rather than
+    /// installing it.
+    ///
+    /// Not knowing whether the content changed is not the same as knowing it
+    /// did not, and installing on the strength of an unanswered question is the
+    /// silent acceptance decision 0019 refuses. The refusal names the failure,
+    /// because an operator whose database is unreadable needs to be told that
+    /// and not that his profile is bad.
+    #[test]
+    fn a_ledger_that_cannot_be_consulted_refuses_rather_than_installs() {
+        let mut ledger = RecordedVersions {
+            unavailable: true,
+            ..RecordedVersions::default()
+        };
+
+        let catalogue = a_start(&a_profile(1, "Account statement"), &mut ledger);
+
+        assert!(catalogue.installed().is_empty());
+        let refused = catalogue
+            .refused()
+            .last()
+            .expect("the refusal is published");
+        assert_eq!(refused.id.as_deref(), Some("example-bank-statement"));
+        assert!(
+            refused.reason.contains("could not be read"),
+            "the refusal names why the ledger was silent: {refused:?}"
+        );
+    }
 
     /// Every profile this build ships loads.
     ///

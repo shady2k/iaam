@@ -49,9 +49,12 @@ pub async fn authenticate(
     };
     let hash = hash_token(&token);
 
-    if !state.limiter.allow(&hash) {
+    // The wait travels with the verdict rather than being asked for after it:
+    // the refusal is about a window that is running, and a second question
+    // about it would be answered by a different window.
+    if let Some(retry_after) = state.limiter.allow(&hash).retry_after() {
         tracing::warn!(%route, "request rate exceeded");
-        return Err(ApiFailure::too_many_requests());
+        return Err(ApiFailure::too_many_requests(retry_after));
     }
 
     let principal = state

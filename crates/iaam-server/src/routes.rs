@@ -1424,18 +1424,13 @@ pub struct MarketKeyRateParams {
     responses(
         (status = 200, description = "Prices with provenance and the completeness boundary", body = MarketPriceSeriesDto),
         (status = 422, description = "Invalid range", body = ApiError),
-        // Published here rather than only in the transport, because the market
-        // series are what a client fetches in a loop — a price per instrument
-        // per date — and the natural answer to a refusal for frequency is to
-        // send the same request again, which is the one move that keeps it
-        // refused.
-        (status = 429, description = "Too many requests. This instance counts calls per token \
-                                      over a fixed window, and the refusal stands until that \
-                                      window turns over. Lower the frequency rather than \
-                                      repeating immediately: a repeat inside the same window is \
-                                      refused again and brings the answer no closer, while one \
-                                      call over a range of dates answers what a call per date \
-                                      was asking.", body = ApiError)
+        // Only the sentence this route adds: what the refusal is and how to
+        // answer it is published on every operation that requires a token, from
+        // one text in `openapi.rs`, and this is appended to it. A market series
+        // is what a client fetches in a loop — a price per instrument per date —
+        // so it is the one place where the remedy is not only to wait.
+        (status = 429, description = "One call over a range of dates answers what a call per \
+                                      date was asking.", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1473,18 +1468,13 @@ pub async fn list_market_prices(
     responses(
         (status = 200, description = "Exchange rates with provenance and the completeness boundary", body = MarketFxSeriesDto),
         (status = 422, description = "Invalid range", body = ApiError),
-        // Published here rather than only in the transport, because the market
-        // series are what a client fetches in a loop — a price per instrument
-        // per date — and the natural answer to a refusal for frequency is to
-        // send the same request again, which is the one move that keeps it
-        // refused.
-        (status = 429, description = "Too many requests. This instance counts calls per token \
-                                      over a fixed window, and the refusal stands until that \
-                                      window turns over. Lower the frequency rather than \
-                                      repeating immediately: a repeat inside the same window is \
-                                      refused again and brings the answer no closer, while one \
-                                      call over a range of dates answers what a call per date \
-                                      was asking.", body = ApiError)
+        // Only the sentence this route adds: what the refusal is and how to
+        // answer it is published on every operation that requires a token, from
+        // one text in `openapi.rs`, and this is appended to it. A market series
+        // is what a client fetches in a loop — a price per instrument per date —
+        // so it is the one place where the remedy is not only to wait.
+        (status = 429, description = "One call over a range of dates answers what a call per \
+                                      date was asking.", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1521,18 +1511,13 @@ pub async fn list_market_fx(
     responses(
         (status = 200, description = "Key-rate intervals with provenance and the completeness boundary", body = MarketKeyRateSeriesDto),
         (status = 422, description = "Invalid range", body = ApiError),
-        // Published here rather than only in the transport, because the market
-        // series are what a client fetches in a loop — a price per instrument
-        // per date — and the natural answer to a refusal for frequency is to
-        // send the same request again, which is the one move that keeps it
-        // refused.
-        (status = 429, description = "Too many requests. This instance counts calls per token \
-                                      over a fixed window, and the refusal stands until that \
-                                      window turns over. Lower the frequency rather than \
-                                      repeating immediately: a repeat inside the same window is \
-                                      refused again and brings the answer no closer, while one \
-                                      call over a range of dates answers what a call per date \
-                                      was asking.", body = ApiError)
+        // Only the sentence this route adds: what the refusal is and how to
+        // answer it is published on every operation that requires a token, from
+        // one text in `openapi.rs`, and this is appended to it. A market series
+        // is what a client fetches in a loop — a price per instrument per date —
+        // so it is the one place where the remedy is not only to wait.
+        (status = 429, description = "One call over a range of dates answers what a call per \
+                                      date was asking.", body = ApiError)
     ),
     security(("bearer" = []))
 )]

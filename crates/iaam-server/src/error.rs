@@ -5,10 +5,14 @@
 //! with a correlation identifier and **without** a number: a result cannot be returned
 //! after a proven violation of the identity (§15.2).
 
+use std::time::Duration;
+
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, VARY, WWW_AUTHENTICATE};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_TYPE, HeaderValue, RETRY_AFTER, VARY, WWW_AUTHENTICATE,
+};
 use axum::response::{IntoResponse, Response};
 use iaam_app::error::{AppError, FieldRejection, json_pointer};
 use serde::Serialize;
@@ -204,6 +208,16 @@ pub struct ApiFailure {
     pub status: StatusCode,
     body: ApiFailureBody,
     challenge: &'static str,
+    /// Whole seconds after which the same request would be worth sending again,
+    /// for the one refusal that time alone lifts.
+    ///
+    /// Kept beside the body rather than written into it, for the reason
+    /// `challenge` is: it belongs to the response, not to the explanation, and
+    /// a caller that reads only headers must still be told. `None` on every
+    /// other failure, because no other failure here is answered by waiting —
+    /// a header that guessed one would send a caller away from a rejection its
+    /// own request has to fix.
+    retry_after: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -219,6 +233,7 @@ impl ApiFailure {
             status,
             body: ApiFailureBody::Json(Box::new(body)),
             challenge: "",
+            retry_after: None,
         }
     }
 
@@ -247,6 +262,7 @@ impl ApiFailure {
             status: StatusCode::UNAUTHORIZED,
             body: ApiFailureBody::Static(UNAUTHORIZED_BODY),
             challenge,
+            retry_after: None,
         }
     }
 
@@ -261,12 +277,33 @@ impl ApiFailure {
         )
     }
 
+    /// Too many calls with this token, with what is left of the window.
+    ///
+    /// The wait is rounded **up** to a whole second and never down to none:
+    /// `Retry-After` carries seconds, and the fraction of a second at the end of
+    /// a window would round to «now» — which is the immediate repeat the
+    /// refusal exists to stop, published in the very header meant to prevent
+    /// it. A caller waiting one second too long loses a second; one waiting a
+    /// fraction too little is refused again for its trouble.
     #[must_use]
-    pub fn too_many_requests() -> Self {
-        Self::new(
+    pub fn too_many_requests(retry_after: Duration) -> Self {
+        let seconds = retry_after
+            .as_secs()
+            .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
+            .max(1);
+        let mut failure = Self::new(
             StatusCode::TOO_MANY_REQUESTS,
-            ApiError::simple("rate_limited", "too many requests"),
-        )
+            ApiError::simple(
+                "rate_limited",
+                format!(
+                    "too many requests: wait {seconds} seconds, as Retry-After says, before \
+                     calling again. A repeat inside the same window is refused again and brings \
+                     the answer no closer."
+                ),
+            ),
+        );
+        failure.retry_after = Some(seconds);
+        failure
     }
 }
 
@@ -290,6 +327,11 @@ impl IntoResponse for ApiFailure {
             response
                 .headers_mut()
                 .insert(VARY, HeaderValue::from_static("Authorization"));
+        }
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
         }
         response
     }

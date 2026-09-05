@@ -280,6 +280,24 @@ fn unprovisioned_harness() -> Harness {
         false,
         false,
         false,
+        GENEROUS_RATE_LIMIT,
+    )
+}
+
+/// A harness that refuses after `limit` calls with one token.
+///
+/// Every other harness is given a limit no test can reach, because a test that
+/// tripped the limiter by accident would fail somewhere unrelated to what it
+/// checks. A test *about* the refusal has to reach it, and earning it a
+/// thousand calls at a time would spend a second proving arithmetic.
+fn rate_limited_harness(limit: u32) -> Harness {
+    harness_with_factory_and_provisioning(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        None,
+        true,
+        true,
+        false,
+        limit,
     )
 }
 
@@ -290,6 +308,7 @@ fn empty_owner_harness() -> Harness {
         true,
         false,
         false,
+        GENEROUS_RATE_LIMIT,
     )
 }
 
@@ -300,6 +319,7 @@ fn broker_access_harness() -> Harness {
         true,
         true,
         true,
+        GENEROUS_RATE_LIMIT,
     )
 }
 
@@ -307,8 +327,19 @@ fn harness_with_factory(
     store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
 ) -> Harness {
-    harness_with_factory_and_provisioning(store, channel_factory, true, true, false)
+    harness_with_factory_and_provisioning(
+        store,
+        channel_factory,
+        true,
+        true,
+        false,
+        GENEROUS_RATE_LIMIT,
+    )
 }
+
+/// More calls than any test makes, so that no test meets the limiter unless it
+/// asked to.
+const GENEROUS_RATE_LIMIT: u32 = 1_000;
 
 fn harness_with_factory_and_provisioning(
     mut store: SqliteStore,
@@ -316,6 +347,7 @@ fn harness_with_factory_and_provisioning(
     provisioned: bool,
     with_account: bool,
     with_broker_access: bool,
+    rate_limit: u32,
 ) -> Harness {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -423,7 +455,7 @@ fn harness_with_factory_and_provisioning(
     });
     let state = ServerState::new(
         services,
-        Arc::new(RateLimiter::new(1_000, Duration::from_secs(60))),
+        Arc::new(RateLimiter::new(rate_limit, Duration::from_secs(60))),
     );
     let (router, api) = build(state).expect("build");
 
@@ -3037,12 +3069,152 @@ async fn the_market_series_say_a_refusal_for_frequency_is_answered_by_lowering_i
         let described = spec["paths"][route]["get"]["responses"]["429"]["description"]
             .as_str()
             .unwrap_or_else(|| panic!("{route} publishes no refusal for request frequency"));
-        for owed in ["Lower the frequency", "window", "repeating immediately"] {
+        for owed in [
+            "Lower the frequency",
+            "window",
+            "repeating immediately",
+            // The sentence that is this route's own and no other's: waiting is
+            // the answer everywhere, and asking once over a range instead of
+            // once per date is the answer only here.
+            "One call over a range of dates",
+        ] {
             assert!(
                 described.contains(owed),
                 "{route}'s refusal says nothing about «{owed}»: {described}"
             );
         }
+        assert_eq!(
+            described.matches("Lower the frequency").count(),
+            1,
+            "{route} states the shared refusal twice: {described}"
+        );
+    }
+}
+
+/// Every route that can refuse for frequency says so, and the count proves it.
+///
+/// The limit is enforced in the authentication layer, so the operations that
+/// can give this refusal are exactly the operations that require a token —
+/// which is nearly the whole surface. Three of them declared it and the rest
+/// said nothing, and the skill tells a client to read this document rather than
+/// ask anyone what a refusal will look like. Comparing the two counts is what
+/// stops them drifting apart again: a route added with a token and without the
+/// refusal fails here rather than in a client's retry loop.
+#[tokio::test]
+async fn every_operation_that_needs_a_token_publishes_the_refusal_for_frequency() {
+    const METHODS: [&str; 8] = [
+        "get", "put", "post", "delete", "options", "head", "patch", "trace",
+    ];
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut needing_a_token = 0_usize;
+    let mut publishing_the_refusal = 0_usize;
+    let mut silent: Vec<String> = Vec::new();
+    for (path, item) in spec["paths"].as_object().expect("the document has paths") {
+        for method in METHODS {
+            let operation = &item[method];
+            if operation.is_null() {
+                continue;
+            }
+            let needs_a_token = operation["security"]
+                .as_array()
+                .is_some_and(|requirements| {
+                    requirements
+                        .iter()
+                        .any(|requirement| requirement.get("bearer").is_some())
+                });
+            if !needs_a_token {
+                continue;
+            }
+            needing_a_token += 1;
+            let refusal = &operation["responses"]["429"];
+            if refusal.is_null() {
+                silent.push(format!("{method} {path}"));
+                continue;
+            }
+            publishing_the_refusal += 1;
+
+            let described = refusal["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} publishes a refusal with no text"));
+            for owed in [
+                "calls per token",
+                "Retry-After",
+                "Lower the frequency",
+                "refused again",
+            ] {
+                assert!(
+                    described.contains(owed),
+                    "{method} {path}'s refusal says nothing about «{owed}»: {described}"
+                );
+            }
+            assert!(
+                refusal["headers"]["Retry-After"].is_object(),
+                "{method} {path} names the wait in prose and publishes no header for it"
+            );
+            assert_eq!(
+                refusal["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ApiError",
+                "{method} {path}'s refusal does not carry the body every other refusal carries"
+            );
+        }
+    }
+
+    assert!(
+        needing_a_token > 60,
+        "the protected surface is most of this API; only {needing_a_token} operations were found"
+    );
+    assert_eq!(
+        publishing_the_refusal, needing_a_token,
+        "operations that require a token and publish no refusal for frequency: {silent:?}"
+    );
+}
+
+/// The refusal says how long to wait, and says it where a client reads it.
+///
+/// The window start is known exactly, so the seconds remaining are known
+/// exactly; a refusal that withheld them leaves a caller to guess, and the
+/// guess it makes is «now».
+#[tokio::test]
+async fn a_refusal_for_frequency_says_how_many_seconds_are_left() {
+    let harness = rate_limited_harness(1);
+    let (status, _headers, _body) = call_raw(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the first call is within the limit");
+
+    let (status, headers, body) = call_raw(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let seconds: u64 = headers
+        .get("retry-after")
+        .expect("the refusal carries Retry-After")
+        .to_str()
+        .expect("Retry-After is text")
+        .parse()
+        .expect("Retry-After is whole seconds");
+    assert!(
+        (1..=60).contains(&seconds),
+        "the wait must be what is left of the window, and never zero: {seconds}"
+    );
+
+    let body: Value = serde_json::from_slice(&body).expect("the refusal carries a body");
+    assert_eq!(body["code"], "rate_limited");
+    let message = body["message"]
+        .as_str()
+        .expect("the refusal explains itself");
+    for owed in ["Retry-After", "refused again"] {
+        assert!(
+            message.contains(owed),
+            "the refusal says nothing about «{owed}»: {message}"
+        );
     }
 }
 

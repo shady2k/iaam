@@ -25,11 +25,12 @@ use axum::{Extension, Json, Router, middleware};
 use iaam_app::AppServices;
 use iaam_app::jobs::{MarketScheduler, MarketSyncJob};
 use thiserror::Error;
+use utoipa::Modify;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::openapi::ApiDoc;
+use crate::openapi::{ApiDoc, FrequencyRefusal};
 use crate::rate_limit::RateLimiter;
 
 /// Server state.
@@ -166,11 +167,17 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             auth::authenticate,
         ));
 
-    let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+    let (router, mut api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(routes::api_catalog))
         .routes(routes!(routes::health))
         .merge(protected)
         .split_for_parts();
+    // Applied here rather than declared in `modifiers(...)` beside the security
+    // scheme: the derive runs its modifiers over the document it generates from
+    // types, and that document has no paths in it. Every path arrives when the
+    // routers merge, on the lines above, so a modifier that walks operations
+    // has to run after this point or walk nothing.
+    FrequencyRefusal.modify(&mut api);
     let catalog = ActionCatalog::from_openapi(&api)?;
     // The discovery document is resolved against the same completed document,
     // so an entry point advertising a route that no longer exists refuses the

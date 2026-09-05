@@ -33,6 +33,7 @@ pub fn apply_migrations_through(conn: &Connection, through: u32) {
         include_str!("../../migrations/0026_document_unresolved_accounts.sql"),
         include_str!("../../migrations/0027_declined_account_names.sql"),
         include_str!("../../migrations/0028_source_profile_versions.sql"),
+        include_str!("../../migrations/0029_event_settled_by_rule.sql"),
     ];
     assert!(
         through <= migrations.len() as u32,

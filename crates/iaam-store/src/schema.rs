@@ -9,9 +9,9 @@ use rusqlite::Connection;
 use crate::StoreError;
 
 /// Schema version understood by this build.
-pub const SCHEMA_VERSION: u32 = 29;
+pub const SCHEMA_VERSION: u32 = 30;
 
-const MIGRATIONS: [(u32, &str); 29] = [
+const MIGRATIONS: [(u32, &str); 30] = [
     (1, include_str!("../migrations/0001_initial.sql")),
     (2, include_str!("../migrations/0002_sources_and_rules.sql")),
     (3, include_str!("../migrations/0003_broker_access.sql")),
@@ -97,6 +97,10 @@ const MIGRATIONS: [(u32, &str); 29] = [
     (
         29,
         include_str!("../migrations/0029_event_settled_by_rule.sql"),
+    ),
+    (
+        30,
+        include_str!("../migrations/0030_operation_history.sql"),
     ),
 ];
 

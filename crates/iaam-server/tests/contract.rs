@@ -895,7 +895,12 @@ async fn health_is_public_and_reports_versions() {
     // journal for the group one decision of his reached instead of reading a
     // whole import. An agent that does not know the field reads every fact as
     // though nothing were recorded about it, which is why the number moves.
-    assert_eq!(body["schema_version"], 15);
+    // Version 16 added a fourth thing that settlement can say: the owner
+    // answered the row himself, and the same answer minted the rule. It is
+    // neither of the two an older build knows — a standing rule filed this, or
+    // a reading ran and none did — so a build without it reads the rows he
+    // decided as rows no rule was ever recorded about.
+    assert_eq!(body["schema_version"], 16);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version

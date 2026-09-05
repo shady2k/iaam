@@ -54,9 +54,10 @@ use crate::error::{AppError, FieldRejection};
 use iaam_ingest::dedup::IdentityScope;
 
 use crate::ports::{
-    AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, ContourView,
-    ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
-    ImportSessionView, NewImportQuestion, Principal, Recorded, UnresolvedAccountView,
+    AccountDetailView, AccountScopeExclusionView, AccountTransferStatementView, AnswerRule,
+    ContourView, ImportObservationView, ImportQuestionView, ImportSessionState,
+    ImportSessionSummaryView, ImportSessionView, NewImportQuestion, Principal, Recorded,
+    UnresolvedAccountView,
 };
 use crate::scenarios::classification::{
     ClassifiedAs, classified_as, matcher_json, outcome_json, subject,
@@ -1698,7 +1699,7 @@ pub async fn answer_question(
                     None,
                 )
                 .await?;
-            services
+            let named = services
                 .store
                 .attach_import_question_rule(
                     principal.owner,
@@ -1706,7 +1707,38 @@ pub async fn answer_question(
                     question,
                     rule.id.to_string(),
                 )
-                .await?
+                .await?;
+            // And on the rows themselves, which is what the commit reads
+            // (`iaam-73xv`). The question is what the owner is shown; the
+            // observation is what the fact is written from, so a rule recorded
+            // only on the question left every row this one decision settled
+            // committing as «a reading ran and no rule of his matched» — and
+            // «show me everything this decision did» answered with every row
+            // except the ones he decided.
+            //
+            // **Every row the answer settled, not only the one he addressed.**
+            // The rows the reach settled are the same decision, and stamping
+            // half of them would split the group in two while reading as fixed.
+            //
+            // The version is the one just minted and is never read back at
+            // commit: a rule can be edited in between, and the fact records the
+            // version it was filed under.
+            let settled: Vec<u32> = targets
+                .iter()
+                .map(|target| target.row)
+                .chain(std::iter::once(named.row))
+                .collect();
+            services
+                .store
+                .attach_import_answer_rule(
+                    principal.owner,
+                    session,
+                    &settled,
+                    ClassificationRuleId(rule.id),
+                    rule.version,
+                )
+                .await?;
+            named
         }
         None => answered,
     };
@@ -5467,7 +5499,28 @@ pub enum FactBasis {
         version: u32,
     },
     /// The owner answered the question this row raised.
+    ///
+    /// The answer generalised into nothing — an agent's answer, whose standing
+    /// decisions stay the owner's, or an answer whose shape does not generalise
+    /// — so no rule was written and this row belongs to no group.
     Answered,
+    /// The owner answered the question this row raised, and that same answer
+    /// minted this rule at this version.
+    ///
+    /// Kept apart from [`Self::Answered`] because the row is not alone: it is
+    /// one of the group that single decision of his reached, which is the rows
+    /// the answer itself settled plus the rows the rule goes on to file. Kept
+    /// apart from [`Self::Rule`] because the owner decided by hand here, and no
+    /// rule filed the row without asking him.
+    ///
+    /// The rule is an identifier and the version is the one it was **minted**
+    /// at, for [`Self::Rule`]'s reasons: a rule held as text has no truthful
+    /// answer when it cannot be read back (`iaam-r0qk`), and a rule can be
+    /// edited between the answer and the commit.
+    AnsweredMintingRule {
+        rule: ClassificationRuleId,
+        version: u32,
+    },
 }
 
 impl FactBasis {
@@ -5508,6 +5561,10 @@ impl FactBasis {
                 rule: *rule,
                 version: *version,
             },
+            Self::AnsweredMintingRule { rule, version } => RuleSettlement::AnsweredMintingRule {
+                rule: *rule,
+                version: *version,
+            },
             Self::Concluded | Self::Directory | Self::SourceAsserted | Self::Answered => {
                 RuleSettlement::NoRule
             }
@@ -5523,6 +5580,7 @@ impl FactBasis {
             Self::SourceAsserted => "source_asserted",
             Self::Rule { .. } => "rule",
             Self::Answered => "answered",
+            Self::AnsweredMintingRule { .. } => "answered_minting_rule",
         }
     }
 
@@ -5543,6 +5601,10 @@ impl FactBasis {
             }
             Self::Rule { .. } => "a standing rule of yours matched the row",
             Self::Answered => "you answered the question this row raised",
+            Self::AnsweredMintingRule { .. } => {
+                "you answered the question this row raised, and that same answer became a \
+                 standing rule of yours"
+            }
         }
     }
 }
@@ -8339,11 +8401,23 @@ fn resolution_of(
             expected: "an answer this build can read".to_owned(),
             actual: error.to_string(),
         })?;
+        // Which of the two answered bases it is, read off the observation and
+        // nowhere else. The minted rule was recorded beside the answer at the
+        // moment it was minted, so the version here is the version it was filed
+        // under — not the one the rule carries now, which an edit may have
+        // moved. A row whose answer generalised into nothing, and a row
+        // answered before the recording existed, both read as
+        // [`FactBasis::Answered`]: nothing is back-filled and no reader turns
+        // that silence into a rule.
+        let basis = match observation.answer_rule {
+            Some(AnswerRule { rule, version }) => FactBasis::AnsweredMintingRule { rule, version },
+            None => FactBasis::Answered,
+        };
         return row
             .resolve_with(answer)
             .map(|operation| RowResolution::Fact {
                 operation: Box::new(operation),
-                basis: FactBasis::Answered,
+                basis,
             });
     }
     match resolver.assess(&row) {
@@ -8552,7 +8626,15 @@ impl ReachedRow {
             None => false,
             Some(QuestionSettlement::NoFact { .. }) => true,
             Some(QuestionSettlement::Fact { basis }) => match basis {
-                FactBasis::Answered | FactBasis::Directory | FactBasis::Concluded => true,
+                // Beside `Answered`, because it is the same fact about who
+                // settled the line: he answered it. That the answer also minted
+                // a rule changes what the group is, not what settles the line
+                // — `resolution_of` takes his answer before it reaches the
+                // classifier at all, so no decision made now displaces it.
+                FactBasis::Answered
+                | FactBasis::AnsweredMintingRule { .. }
+                | FactBasis::Directory
+                | FactBasis::Concluded => true,
                 FactBasis::Rule { .. } | FactBasis::SourceAsserted => false,
             },
         }
@@ -12209,6 +12291,70 @@ mod tests {
         assert_eq!(settlement.rule(), Some((rule, 1)));
     }
 
+    /// An answer that minted a rule records that rule, and it is not «no rule»
+    /// (`iaam-73xv`).
+    ///
+    /// The row he answered belongs to the group his one decision reached, and
+    /// the group is found by the rule. Recorded as `NoRule` it drops out of
+    /// «show me everything this decision did» — which then answers with every
+    /// row of the group except the ones he actually decided.
+    #[test]
+    fn an_answer_that_minted_a_rule_records_it_and_stays_apart_from_a_standing_rule() {
+        let rule = iaam_core::ids::ClassificationRuleId::new_random();
+        let minted = FactBasis::AnsweredMintingRule { rule, version: 2 };
+
+        assert_eq!(
+            minted.rule_settlement(),
+            RuleSettlement::AnsweredMintingRule { rule, version: 2 }
+        );
+        assert_ne!(minted.rule_settlement(), RuleSettlement::NoRule);
+        assert_ne!(
+            minted.rule_settlement(),
+            RuleSettlement::Rule { rule, version: 2 },
+            "he decided by hand; no rule filed this row without asking him"
+        );
+        assert_eq!(minted.code(), "answered_minting_rule");
+        assert_ne!(minted.code(), FactBasis::Answered.code());
+        assert_ne!(minted.code(), FactBasis::Rule { rule, version: 2 }.code());
+        assert!(!minted.describe().is_empty());
+    }
+
+    /// Which of the two answered bases a row settles as is read off the
+    /// observation, and off nothing else (`iaam-73xv`).
+    ///
+    /// The minted rule is recorded beside the answer at the moment it is
+    /// minted, so the commit reads it where the answer already is. A row whose
+    /// answer generalised into nothing — and a row answered before the
+    /// recording existed, which is the same absence — stays `Answered`: nothing
+    /// is back-filled and the silence is never turned into a rule.
+    #[test]
+    fn the_basis_of_an_answered_row_is_read_off_the_minted_rule_on_the_observation() {
+        let main = account(1);
+        let observed = filed_under(
+            row(main, "Shop One", Some(date!(2025 - 04 - 10))),
+            "Groceries",
+        );
+        let resolver = ruled(vec![detail(main, "Main")], Vec::new());
+        let rule = iaam_core::ids::ClassificationRuleId::new_random();
+
+        let generalised = ImportObservationView {
+            answer_rule: Some(AnswerRule { rule, version: 3 }),
+            ..answered_row(1, &observed, Answer::Paid)
+        };
+        assert_eq!(
+            read_observation(generalised, &observed, &resolver).basis,
+            Some(FactBasis::AnsweredMintingRule { rule, version: 3 }),
+            "the version is the one it was minted at, taken from the row"
+        );
+
+        let alone = answered_row(1, &observed, Answer::Paid);
+        assert_eq!(
+            read_observation(alone, &observed, &resolver).basis,
+            Some(FactBasis::Answered),
+            "an answer that generalised into nothing names no rule"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // What an answered question generalised into (iaam-ngwn)
     // -----------------------------------------------------------------------
@@ -13232,7 +13378,6 @@ mod tests {
     fn answered_row(number: u32, line: &ObservedRow, answer: Answer) -> ImportObservationView {
         ImportObservationView {
             answer: Some(serde_json::to_string(&answer).expect("an answer")),
-            answer_rule: None,
             ..stored_row(number, line)
         }
     }

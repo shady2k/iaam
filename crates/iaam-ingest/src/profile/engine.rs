@@ -35,6 +35,7 @@ use super::{
     AccountSource, AmountSource, CsvShape, CurrencySource, DateField, DateFormat, DatedCell,
     DecimalSeparator, DecimalShape, DirectionSource, DocumentShape, Encoding, FarSideSource,
     GroupSeparator, NegativeForm, RowStatus, SourceProfile, StatusSource, TimeFormat, TimeSource,
+    TranscribedColumn,
 };
 
 /// Version of the derived row key's form.
@@ -444,6 +445,9 @@ fn records(text: &str, shape: &CsvShape) -> Result<Vec<Record>, Rejection> {
 struct Columns {
     /// Heading, and its zero-based position.
     positions: Vec<(String, usize)>,
+    /// The headings this profile says the document may leave unprinted, and
+    /// this document did. Every row reads them as "the source printed none".
+    absent: Vec<String>,
     /// How many cells the header row had, which is what a row must have too.
     width: usize,
 }
@@ -451,25 +455,45 @@ struct Columns {
 impl Columns {
     /// Locate every heading the profile names, or refuse the document.
     ///
-    /// A heading the document does not have is a profile that does not read
-    /// this document, not a column that reads as empty — the difference between
-    /// a refusal an operator can act on and a month of rows with a field
-    /// silently missing.
+    /// A heading the profile **requires** and the document does not have is a
+    /// profile that does not read this document, not a column that reads as
+    /// empty — the difference between a refusal an operator can act on and a
+    /// month of rows with a field silently missing. Everything a row is made of
+    /// and everything the engine reads a decision out of is required, so what
+    /// is refused here is always a document that cannot answer a question this
+    /// reading has to ask.
     ///
-    /// A heading printed twice is refused for the neighbouring reason: choosing
-    /// either occurrence would read a column nobody chose, and the two may hold
-    /// different things.
+    /// A heading the profile says the document **may not print**
+    /// ([`SourceProfile::optional_columns`]) is recorded as absent instead, and
+    /// the field it carries says on every row what an empty cell already says.
+    /// That is not the leniency the paragraph above refuses: such a column is
+    /// transcribed and decides nothing, and its absence changes no reading of
+    /// any other cell.
+    ///
+    /// A heading printed twice is refused for the neighbouring reason, whether
+    /// it is required or not: choosing either occurrence would read a column
+    /// nobody chose, and the two may hold different things. Absent and
+    /// ambiguous are different answers, and only the first is one the profile
+    /// authorised.
     fn of(header: &Record, profile: &SourceProfile) -> Result<Self, Rejection> {
         let printed: Vec<&str> = header.cells.iter().map(|cell| cell.trim()).collect();
-        let mut positions = Vec::new();
-        for wanted in profile.columns() {
-            let found: Vec<usize> = printed
+        let locate = |wanted: &str| -> Vec<usize> {
+            printed
                 .iter()
                 .enumerate()
                 .filter(|(_, cell)| **cell == wanted)
                 .map(|(index, _)| index)
-                .collect();
-            match found.as_slice() {
+                .collect()
+        };
+        let twice = |wanted: &str, several: usize| Rejection {
+            field: "document".to_owned(),
+            expected: format!("the column «{wanted}» printed once"),
+            actual: format!("{several} columns with that heading"),
+        };
+
+        let mut positions = Vec::new();
+        for wanted in profile.required_columns() {
+            match locate(wanted).as_slice() {
                 [only] => positions.push((wanted.to_owned(), *only)),
                 [] => {
                     return Err(Rejection {
@@ -478,19 +502,39 @@ impl Columns {
                         actual: format!("a header row of: {}", printed.join(", ")),
                     });
                 }
-                several => {
-                    return Err(Rejection {
-                        field: "document".to_owned(),
-                        expected: format!("the column «{wanted}» printed once"),
-                        actual: format!("{} columns with that heading", several.len()),
-                    });
-                }
+                several => return Err(twice(wanted, several.len())),
+            }
+        }
+        let mut absent = Vec::new();
+        for wanted in profile.optional_columns() {
+            match locate(wanted).as_slice() {
+                [only] => positions.push((wanted.to_owned(), *only)),
+                [] => absent.push(wanted.to_owned()),
+                several => return Err(twice(wanted, several.len())),
             }
         }
         Ok(Self {
             positions,
+            absent,
             width: header.cells.len(),
         })
+    }
+
+    /// The cell one transcribed heading names, or the statement that the
+    /// document printed no such column.
+    ///
+    /// `Ok(None)` only where the profile said the column may be absent and it
+    /// is; every other heading goes through [`Self::cell`] unchanged, so a
+    /// record of the wrong width is still refused before any cell is read.
+    fn optional_cell<'a>(
+        &self,
+        record: &'a Record,
+        column: &str,
+    ) -> Result<Option<&'a str>, Rejection> {
+        if self.absent.iter().any(|heading| heading == column) {
+            return Ok(None);
+        }
+        self.cell(record, column).map(Some)
     }
 
     /// The cell one heading names, verbatim.
@@ -674,23 +718,17 @@ fn row(
 
     let (dates, source_time) = dates(record, columns, shape)?;
 
-    let counterparty = match &shape.counterparty {
+    // A cell that is empty or only whitespace is «the source named nobody»,
+    // which is a value and not a failure, and so is a column the document does
+    // not print. A non-empty cell is transcribed exactly, including whatever
+    // spacing the source printed: the string is what the owner's rules match
+    // on.
+    let counterparty = match transcribed(record, columns, shape.counterparty.as_ref())? {
         None => ObservedCounterparty::Unknown,
-        Some(column) => {
-            let printed = columns.cell(record, column)?;
-            // A cell that is empty or only whitespace is «the source named
-            // nobody», which is a value and not a failure. A non-empty cell is
-            // transcribed exactly, including whatever spacing the source
-            // printed: the string is what the owner's rules match on.
-            if printed.trim().is_empty() {
-                ObservedCounterparty::Unknown
-            } else {
-                ObservedCounterparty::Named(printed.to_owned())
-            }
-        }
+        Some(named) => ObservedCounterparty::Named(named),
     };
 
-    let source_operation_id = transcribed(record, columns, shape.source_operation_id.as_deref())?;
+    let source_operation_id = transcribed(record, columns, shape.source_operation_id.as_ref())?;
     let identity = RowIdentity {
         document: Some(digest.to_owned()),
         row: source_operation_id,
@@ -716,15 +754,15 @@ fn row(
         currency,
         counterparty,
         far_side,
-        source_kind: transcribed(record, columns, shape.source_kind.as_deref())?,
-        source_category: transcribed(record, columns, shape.source_category.as_deref())?,
+        source_kind: transcribed(record, columns, shape.source_kind.as_ref())?,
+        source_category: transcribed(record, columns, shape.source_category.as_ref())?,
         // The owner's own word and the network's code, transcribed exactly as
         // the two above them and interpreted no more than they are. Neither is
         // required: `transcribed` reads an empty cell as «the source printed
         // nothing», which is what a row the source assigned no code to says.
-        owner_category: transcribed(record, columns, shape.owner_category.as_deref())?,
-        source_code: transcribed(record, columns, shape.source_code.as_deref())?,
-        description: transcribed(record, columns, shape.description.as_deref())?,
+        owner_category: transcribed(record, columns, shape.owner_category.as_ref())?,
+        source_code: transcribed(record, columns, shape.source_code.as_ref())?,
+        description: transcribed(record, columns, shape.description.as_ref())?,
         dates,
         source_time,
         identity,
@@ -736,15 +774,23 @@ fn row(
 /// An empty cell is `None` rather than `Some("")`: "the source said nothing"
 /// and "the source said the empty string" are the same fact here, and only one
 /// of the two spellings can be matched by a rule.
+///
+/// Three ways of saying nothing arrive at one answer, and that is the design
+/// rather than an accident: the profile names no column, the profile names a
+/// column the document may leave unprinted and this one did, or the cell is
+/// there and empty. In all three the source printed none, and a reader
+/// downstream has one thing to handle instead of three.
 fn transcribed(
     record: &Record,
     columns: &Columns,
-    column: Option<&str>,
+    column: Option<&TranscribedColumn>,
 ) -> Result<Option<String>, Rejection> {
     let Some(column) = column else {
         return Ok(None);
     };
-    let printed = columns.cell(record, column)?;
+    let Some(printed) = columns.optional_cell(record, &column.column)? else {
+        return Ok(None);
+    };
     Ok(if printed.trim().is_empty() {
         None
     } else {
@@ -1709,6 +1755,129 @@ mod tests {
         let bare = observed(&reading.rows[1]);
         assert_eq!(bare.owner_category, None);
         assert_eq!(bare.source_code, None);
+    }
+
+    /// A transcribed column the profile says the document may not print is
+    /// read where it is there and says nothing where it is not.
+    ///
+    /// Two readings of one profile, and the point is that they are the same
+    /// profile: an older export of one institution that stopped short of a
+    /// column deciding nothing is still that institution's export, and a month
+    /// of it should not be unreadable over a field no rule of the owner's has
+    /// to consult.
+    ///
+    /// The absent column reads exactly as an empty cell already reads — «the
+    /// source printed none» — so nothing downstream learns a new value.
+    #[test]
+    fn a_column_the_document_may_not_print_says_nothing_where_it_is_absent() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "owner_category": { "column": "Your category", "presence": "optional" },
+                "source_code": { "column": "Code", "presence": "optional" }
+            }
+        }));
+
+        let printed = read_with(
+            "Posted;Sum;Your category;Code\n2026-08-05;-1.00;Invented Category;0000\n",
+            &profile,
+        );
+        let row = observed(&printed.rows[0]);
+        assert_eq!(row.owner_category.as_deref(), Some("Invented Category"));
+        assert_eq!(row.source_code.as_deref(), Some("0000"));
+
+        let unprinted = read_with("Posted;Sum\n2026-08-05;-1.00\n2026-08-06;-2.00\n", &profile);
+        assert_eq!(unprinted.rows.len(), 2);
+        for outcome in &unprinted.rows {
+            let row = observed(outcome);
+            assert_eq!(row.owner_category, None);
+            assert_eq!(row.source_code, None);
+        }
+    }
+
+    /// A column that may be absent excuses no other column.
+    ///
+    /// Account, day, sum and currency are what make a row a fact rather than a
+    /// guess, and a document short of one of them is refused as it always was.
+    /// The profile here names an optional column too, so what the test pins is
+    /// that optionality is a property of the one column that carries it and
+    /// never a leniency the document inherits.
+    #[test]
+    fn a_column_that_may_be_absent_does_not_excuse_one_that_may_not() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "account": { "from": "column", "column": "Account" },
+                "currency": { "from": "column", "column": "Ccy", "code": null },
+                "source_code": { "column": "Code", "presence": "optional" }
+            }
+        }));
+        let (declared, names) = account();
+        for missing in ["Account", "Posted", "Sum", "Ccy"] {
+            let header: Vec<&str> = ["Account", "Posted", "Sum", "Ccy"]
+                .into_iter()
+                .filter(|column| *column != missing)
+                .collect();
+            let document = format!("{}\n", header.join(";"));
+            let refusal = read(
+                document.as_bytes(),
+                &profile,
+                &ReadContext {
+                    accounts: &names,
+                    declared: Some(declared),
+                },
+            )
+            .expect_err("a document short of a column a row is made of is not this document");
+            assert_eq!(refusal.field, "document");
+            assert!(refusal.expected.contains(missing), "{refusal:?}");
+        }
+    }
+
+    /// A status column the profile declares is required, and its absence
+    /// refuses the document.
+    ///
+    /// With the column gone there is nothing to tell a movement the source
+    /// completed from one it did not, and reading every row as completed would
+    /// write a fact the source never asserted.
+    #[test]
+    fn a_declared_status_column_is_required_and_its_absence_refuses_the_document() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "status": { "column": "State", "tokens": { "Settled": "completed" } }
+            }
+        }));
+        let (declared, names) = account();
+        let refusal = read(
+            b"Posted;Sum\n2026-08-05;-1.00\n",
+            &profile,
+            &ReadContext {
+                accounts: &names,
+                declared: Some(declared),
+            },
+        )
+        .expect_err("a document printing no status column is not this document");
+        assert_eq!(refusal.field, "document");
+        assert!(refusal.expected.contains("State"), "{refusal:?}");
+    }
+
+    /// An optional column printed twice is refused for the reason any
+    /// duplicated heading is: choosing either occurrence reads a column nobody
+    /// chose. Absent and ambiguous are different answers.
+    #[test]
+    fn an_optional_column_printed_twice_is_still_an_ambiguity() {
+        let profile = profile(serde_json::json!({
+            "row": { "source_code": { "column": "Code", "presence": "optional" } }
+        }));
+        let (declared, names) = account();
+        let refusal = read(
+            b"Posted;Sum;Code;Code\n2026-08-05;-1.00;0000;0001\n",
+            &profile,
+            &ReadContext {
+                accounts: &names,
+                declared: Some(declared),
+            },
+        )
+        .expect_err("two columns with one heading are an ambiguity");
+        assert_eq!(refusal.field, "document");
+        assert!(refusal.expected.contains("Code"), "{refusal:?}");
     }
 
     /// The source's own operation word and its own category are transcribed to

@@ -5,7 +5,7 @@
 
   "description": "A source profile describes one document type printed by one institution: which column carries which cell, and which of that source's own words mean which of iaam's own words. It is data read by the import engine, never code and never an input to a calculation. Decision 0019 is the argument; this file is the vocabulary. What the engine decides, and what therefore has no key here: whether a cell is readable at all, whether a number fits the currency's minor unit, whether a date exists, whether a currency is known, what a row turned out to be, which category it falls in, which account a printed identity is, whether a row duplicates one already recorded, and what happens to a row that cannot be read. None of those is parameterised, so a profile that is valid against this schema cannot widen what the engine accepts; it can only be wrong about where a value sits, and a value read out of the wrong column is a value the engine still validates.",
 
-  "$comment": "Three invariants make the paragraph above checkable rather than promised, and a reviewer should check them before reading anything else. (1) CLOSURE. Every object in this file that describes a profile's own structure sets \"additionalProperties\": false. There is exactly one kind of exception, marked in place: a token map, where \"additionalProperties\" is the schema of the map's VALUES and \"propertyNames\" closes its keys. A widening a profile author wanted would have to be a new key, and there is no key to write. (2) LEAVES. Every leaf in a profile is one of exactly three kinds, each with its own $defs entry and no fourth: a LOCATOR (#/$defs/column, #/$defs/sheet_name, #/$defs/header_row) saying where in the document to look; a TOKEN (#/$defs/direction_token, #/$defs/far_side_token, #/$defs/row_status_token, #/$defs/date_format, #/$defs/time_format, #/$defs/negative_form, #/$defs/group_separator_dot_decimal, #/$defs/group_separator_comma_decimal, #/$defs/currency_code) drawn from a closed vocabulary of iaam's own words; and a LITERAL (#/$defs/source_literal) quoting the source's own printed text, which may appear only as a key of a token map. Nothing in a profile is a number the engine computes with, a regular expression, a format pattern, or a predicate. A leaf cannot denote engine behaviour because none of the three kinds can name any. (3) NO LENIENCY VOCABULARY. This file contains no key whose meaning is 'accept', 'tolerate', 'ignore', 'skip', 'default', 'fallback', 'on error', 'round' or 'coerce'. There is deliberately no way to say what should happen to a cell the engine cannot read, because the engine has one answer and it is not a profile's to change: the row is rejected, naming field, expected and actual, and the other rows of the document are read (specification section 10.1).",
+  "$comment": "Three invariants make the paragraph above checkable rather than promised, and a reviewer should check them before reading anything else. (1) CLOSURE. Every object in this file that describes a profile's own structure sets \"additionalProperties\": false. There is exactly one kind of exception, marked in place: a token map, where \"additionalProperties\" is the schema of the map's VALUES and \"propertyNames\" closes its keys. A widening a profile author wanted would have to be a new key, and there is no key to write. (2) LEAVES. Every leaf in a profile is one of exactly three kinds, each with its own $defs entry and no fourth: a LOCATOR (#/$defs/column, #/$defs/sheet_name, #/$defs/header_row) saying where in the document to look; a TOKEN (#/$defs/direction_token, #/$defs/far_side_token, #/$defs/row_status_token, #/$defs/date_format, #/$defs/time_format, #/$defs/negative_form, #/$defs/group_separator_dot_decimal, #/$defs/group_separator_comma_decimal, #/$defs/currency_code, #/$defs/column_presence) drawn from a closed vocabulary of iaam's own words; and a LITERAL (#/$defs/source_literal) quoting the source's own printed text, which may appear only as a key of a token map. Nothing in a profile is a number the engine computes with, a regular expression, a format pattern, or a predicate. A leaf cannot denote engine behaviour because none of the three kinds can name any. (3) NO LENIENCY VOCABULARY. This file contains no key whose meaning is 'accept', 'tolerate', 'ignore', 'skip', 'default', 'fallback', 'on error', 'round' or 'coerce'. There is deliberately no way to say what should happen to a cell the engine cannot read, because the engine has one answer and it is not a profile's to change: the row is rejected, naming field, expected and actual, and the other rows of the document are read (specification section 10.1).",
 
   "type": "object",
   "additionalProperties": false,
@@ -89,7 +89,7 @@
           "maxItems": 32,
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/source_literal" },
-          "description": "Header cells that must all be present in the document's header row. They are the source's own printed headings.\n\nEvery heading the \"row\" block names must be listed here, and a profile may list more. The engine refuses a document that does not print a heading the row shape names, so a heading named there and absent here is a document this profile recognises and then refuses at read -- the wrong answer twice: recognition promised a reading the engine will not give, where the honest answer was that no installed profile reads this document. Listing more is the discrimination this block is for: a heading no field is read out of still tells two of an institution's exports apart."
+          "description": "Header cells that must all be present in the document's header row. They are the source's own printed headings.\n\nEvery heading the \"row\" block REQUIRES must be listed here, and a profile may list more. The engine refuses a document that does not print a heading the row shape requires, so a heading required there and absent here is a document this profile recognises and then refuses at read -- the wrong answer twice: recognition promised a reading the engine will not give, where the honest answer was that no installed profile reads this document. Listing more is the discrimination this block is for: a heading no field is read out of still tells two of an institution's exports apart.\n\nA heading a transcribed block marks \"presence\": \"optional\" must NOT be listed here, and that is the same rule read from the other side. Such a column may be absent from the document and the document is still this profile's; recognising on it would make its absence defeat recognition, which is the whole of what marking it optional was for. A column that may be absent identifies nothing."
         }
       }
     },
@@ -303,7 +303,10 @@
           "additionalProperties": false,
           "required": ["column"],
           "description": "The party the source named, transcribed exactly. A cell that is empty or only whitespace is 'the source named nobody', which is a value and not a failure. There is no extraction key: a source that packs a counterparty inside a free-text purpose line is read through \"description\" instead, and the owner's own description rules are what separate it — a rule he can see, correct and re-run, rather than a cut this profile froze into every fact it wrote.",
-          "properties": { "column": { "$ref": "#/$defs/column" } }
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "presence": { "$ref": "#/$defs/column_presence" }
+          }
         },
 
         "description": {
@@ -311,7 +314,10 @@
           "additionalProperties": false,
           "required": ["column"],
           "description": "What the source printed as the description or payment purpose, transcribed exactly from one column. One column and not several: the joined string is what the owner's description rules match, so a join order would be a silent part of every rule he ever writes.",
-          "properties": { "column": { "$ref": "#/$defs/column" } }
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "presence": { "$ref": "#/$defs/column_presence" }
+          }
         },
 
         "status": {
@@ -337,7 +343,10 @@
           "additionalProperties": false,
           "required": ["column"],
           "description": "What the source called the operation, transcribed exactly. Evidence, kept beside the direction the profile read out of it rather than instead of it, so a wrong entry in the direction map is visible against the word it was made from.",
-          "properties": { "column": { "$ref": "#/$defs/column" } }
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "presence": { "$ref": "#/$defs/column_presence" }
+          }
         },
 
         "source_category": {
@@ -345,7 +354,10 @@
           "additionalProperties": false,
           "required": ["column"],
           "description": "The category the source itself assigned to the row, transcribed exactly and never rewritten. A profile names the column and stops. There is no map from a source's category to one of the owner's, and there will not be: the owner's category rules already do that, they are his, they are editable, and they can be re-run over rows already recorded — while a mapping baked into a profile is frozen into every fact at the moment of import and correctable only by retracting the import. A profile carrying such a map would also be a shipped artefact that decides what somebody's spending was.",
-          "properties": { "column": { "$ref": "#/$defs/column" } }
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "presence": { "$ref": "#/$defs/column_presence" }
+          }
         },
 
         "owner_category": {
@@ -353,7 +365,10 @@
           "additionalProperties": false,
           "required": ["column"],
           "description": "The category the OWNER HIMSELF filed the row under, at the source, transcribed exactly and never rewritten. A different fact from \"source_category\" beside it, and the difference is whose decision it is: that one is the institution's own word for what the movement was for, this one is a decision the owner took in the institution's app and the export prints back. It is transcribed for the same reason and under the same rule -- a profile names the column and stops -- and it is emphatically not a map into the owner's categories here: his decision is in his bank's vocabulary, and what it is called here is one question per distinct value, asked once and answered once, never a conclusion drawn per row.",
-          "properties": { "column": { "$ref": "#/$defs/column" } }
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "presence": { "$ref": "#/$defs/column_presence" }
+          }
         },
 
         "source_code": {
@@ -361,7 +376,10 @@
           "additionalProperties": false,
           "required": ["column"],
           "description": "The standardised code the source prints for the row, transcribed exactly and as text. It is the one word on the row that is not one institution's private vocabulary -- the code is assigned by the payment network -- so a rule written on it holds across institutions, and as the ground for a rule it covers a whole kind of spending where a description covers one merchant string. Text and never a number: it is an identifier printed with leading zeros and a number loses them. Nothing requires it, here or anywhere: a source leaves it empty on rows it assigns no code to, and a row that prints none is read with the field saying the source printed none.",
-          "properties": { "column": { "$ref": "#/$defs/column" } }
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "presence": { "$ref": "#/$defs/column_presence" }
+          }
         },
 
         "source_operation_id": {
@@ -369,7 +387,10 @@
           "additionalProperties": false,
           "required": ["column"],
           "description": "The identifier the source prints for the row, transcribed exactly. Where a source prints one, naming it is the single most valuable thing a profile does: it is the journal's first duplicate test, scoped by source, and it is what makes one statement fed twice come back as duplicates rather than as a second copy of a month.",
-          "properties": { "column": { "$ref": "#/$defs/column" } }
+          "properties": {
+            "column": { "$ref": "#/$defs/column" },
+            "presence": { "$ref": "#/$defs/column_presence" }
+          }
         }
       }
     }
@@ -389,7 +410,12 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 200,
-      "$comment": "LOCATOR. The text of a heading in the document's header row. Matched after trimming leading and trailing whitespace, and otherwise exactly. A heading the document does not have is a profile that does not load, not a column that reads as empty."
+      "$comment": "LOCATOR. The text of a heading in the document's header row. Matched after trimming leading and trailing whitespace, and otherwise exactly. A heading the document does not have refuses the document, and does not read as a column of empty cells -- unless the block naming it says \"presence\": \"optional\", which only a transcribed block may say. See #/$defs/column_presence."
+    },
+
+    "column_presence": {
+      "enum": ["required", "optional"],
+      "$comment": "TOKEN. Whether the document must print the column its block names. Omitted, it is \"required\", which is what every profile written before this word said and goes on saying: a document that does not print the column is a document this profile does not read, refused once and by name, rather than a field silently missing from every row of a month.\n\n\"optional\" says the document may print the column or may not, and it may be said ONLY in a transcribed block -- counterparty, description, source_kind, source_category, owner_category, source_code, source_operation_id. Every other block names a column the engine reads a DECISION out of: the account, the day, the sum, the currency, the direction word, the far side's word, the row's status. A decision taken from a column that was not printed is not a decision, so there is no key to write there and writing one is refused as an unknown key. The status column is the case worth naming, because it looks like the others and is not: with it absent there is nothing to tell a movement the institution completed from one it did not, and reading every row as completed would write a fact the source never asserted.\n\nWhat \"optional\" changes is only this: where the document does not print the column, the field it carries reads as \"the source printed none\" on every row -- which is precisely the reading an empty cell already has, so nothing downstream learns a new value. Where the document DOES print it, every cell is read exactly as \"required\" reads it, and a heading printed twice is still an ambiguity and still refuses the document. This is not the leniency the third review invariant refuses: leniency says what to do with a cell the engine could not read, and here there is no cell at all.\n\nA column marked \"optional\" must not appear in \"recognise.header_cells\": see the note there."
     },
 
     "sheet_name": {
@@ -536,7 +562,6 @@
           "Purpose",
           "Category",
           "Your category",
-          "Code",
           "Reference"
         ]
       },
@@ -596,7 +621,7 @@
         "source_kind": { "column": "Operation" },
         "source_category": { "column": "Category" },
         "owner_category": { "column": "Your category" },
-        "source_code": { "column": "Code" },
+        "source_code": { "column": "Code", "presence": "optional" },
         "source_operation_id": { "column": "Reference" }
       }
     }

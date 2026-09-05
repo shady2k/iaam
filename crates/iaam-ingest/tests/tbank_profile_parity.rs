@@ -137,7 +137,7 @@ fn the_export_is_recognised_by_exactly_one_installed_profile() {
     assert_eq!(installed.profile.issuer(), "T-Bank");
     assert_eq!(
         installed.profile.parser_version().0,
-        "profile/tbank-operations-csv/3"
+        "profile/tbank-operations-csv/4"
     );
 }
 

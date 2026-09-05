@@ -146,11 +146,12 @@ impl SourceProfile {
         ))
     }
 
-    /// Every column heading this profile names, once each.
+    /// Every column heading a document must print for this profile to read it,
+    /// once each.
     ///
-    /// What the engine checks the document's header row against: a heading the
-    /// document does not have is a document this profile does not read, not a
-    /// column that reads as empty.
+    /// What the engine checks the document's header row against: a heading here
+    /// that the document does not have is a document this profile does not
+    /// read, not a column that reads as empty.
     ///
     /// **Every heading here must also be one the profile recognises on**
     /// ([`Self::recognised_by`]), and the reason is that this list is a
@@ -164,8 +165,16 @@ impl SourceProfile {
     /// field whose cell is empty reads as "the source printed none"; nothing
     /// here makes a value mandatory, which is what
     /// [`RowShape::source_code`]'s "nothing may require it" says.
+    ///
+    /// **What a document is and what a row needs are two questions**, and this
+    /// list is the second one's answer. Account, day, sum and currency are what
+    /// make a row a fact rather than a guess, and every column the engine reads
+    /// a decision out of — the direction word, the far side's word, the status —
+    /// is here for the same reason. A column that is transcribed and decides
+    /// nothing may be declared absent from the document instead; those are in
+    /// [`Self::optional_columns`].
     #[must_use]
-    pub fn columns(&self) -> Vec<&str> {
+    pub fn required_columns(&self) -> Vec<&str> {
         let row = &self.row;
         let mut named: Vec<&str> = Vec::new();
         if let AccountSource::Column { column } = &row.account {
@@ -202,20 +211,38 @@ impl SourceProfile {
         if let Some(status) = &row.status {
             named.push(&status.column);
         }
-        for column in [
-            row.counterparty.as_deref(),
-            row.description.as_deref(),
-            row.source_kind.as_deref(),
-            row.source_category.as_deref(),
-            row.owner_category.as_deref(),
-            row.source_code.as_deref(),
-            row.source_operation_id.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            named.push(column);
+        for transcribed in row.transcribed() {
+            if transcribed.presence == ColumnPresence::Required {
+                named.push(&transcribed.column);
+            }
         }
+        named.sort_unstable();
+        named.dedup();
+        named
+    }
+
+    /// Every column heading this profile reads where the document prints it and
+    /// says nothing about where it does not, once each.
+    ///
+    /// A document lacking one of these is still this profile's document: the
+    /// field it carries reads as "the source printed none" on every row, which
+    /// is the reading an empty cell already has. Only a transcribed column can
+    /// be one of these — a column the engine reads a decision out of is in
+    /// [`Self::required_columns`] and stays there.
+    ///
+    /// **None of these may be a heading the profile recognises on**
+    /// ([`Self::recognised_by`]), and it is the mirror of the rule written
+    /// there: recognising on a column that may be absent makes its absence
+    /// defeat recognition, which is the whole of what declaring it optional was
+    /// for. A column that may be absent identifies nothing.
+    #[must_use]
+    pub fn optional_columns(&self) -> Vec<&str> {
+        let mut named: Vec<&str> = self
+            .row
+            .transcribed()
+            .filter(|transcribed| transcribed.presence == ColumnPresence::Optional)
+            .map(|transcribed| transcribed.column.as_str())
+            .collect();
         named.sort_unstable();
         named.dedup();
         named
@@ -293,24 +320,87 @@ pub struct RowShape {
     /// Whether the source says the row is a movement it completed. Absent, the
     /// engine reads every row as one — which is what a document that prints no
     /// such column has said.
+    ///
+    /// A profile that declares this block declares a column the document must
+    /// print, and there is no way to say otherwise: with the column gone there
+    /// is nothing to tell a movement the institution completed from one it did
+    /// not, and reading every row as completed would write a fact the source
+    /// never asserted. The two sentences look alike and are not — a profile
+    /// with no block says the source never speaks of status, and the block with
+    /// its column missing says the source speaks of it and this document did
+    /// not print what it said.
     pub status: Option<StatusSource>,
-    pub counterparty: Option<String>,
-    pub description: Option<String>,
-    pub source_kind: Option<String>,
-    pub source_category: Option<String>,
+    pub counterparty: Option<TranscribedColumn>,
+    pub description: Option<TranscribedColumn>,
+    pub source_kind: Option<TranscribedColumn>,
+    pub source_category: Option<TranscribedColumn>,
     /// The column holding the category the **owner himself** filed the row
     /// under at the source — his decision, already made and recorded there.
     ///
     /// Named for what it is rather than for one institution's heading, and kept
     /// apart from [`Self::source_category`] beside it because the two differ in
     /// whose decision they carry. Transcribed and never mapped: decision 0028.
-    pub owner_category: Option<String>,
+    pub owner_category: Option<TranscribedColumn>,
     /// The column holding the source's standardised code for the row.
     ///
     /// Empty on rows the source assigns no code to, which is why it is
     /// `Option` on the observation and why nothing may require it.
-    pub source_code: Option<String>,
-    pub source_operation_id: Option<String>,
+    pub source_code: Option<TranscribedColumn>,
+    pub source_operation_id: Option<TranscribedColumn>,
+}
+
+impl RowShape {
+    /// Every column this row shape transcribes verbatim, in field order.
+    ///
+    /// One reader for the seven, so a field cannot be forgotten by whoever adds
+    /// an eighth: this is what both column lists are computed from.
+    fn transcribed(&self) -> impl Iterator<Item = &TranscribedColumn> {
+        [
+            self.counterparty.as_ref(),
+            self.description.as_ref(),
+            self.source_kind.as_ref(),
+            self.source_category.as_ref(),
+            self.owner_category.as_ref(),
+            self.source_code.as_ref(),
+            self.source_operation_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// One column a transcribed field is read out of, and whether the document has
+/// to print it.
+///
+/// Only a transcribed column carries this question. Everything the engine reads
+/// a decision out of — the account, the day, the sum, the currency, the
+/// direction word, the far side's word, the status — is named by a block of its
+/// own and is required there, because a decision taken from a column that was
+/// not printed is not a decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscribedColumn {
+    pub column: String,
+    pub presence: ColumnPresence,
+}
+
+/// Whether a document has to print a column for this profile to read it.
+///
+/// Not leniency about a **cell**, and the distinction is the whole of why this
+/// exists. Where the document prints the column, every cell under it is read
+/// exactly as before, and an unreadable one is refused as before. Where the
+/// document does not print it, there is no cell to be lenient about, and the
+/// field says what an empty cell says: the source printed none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPresence {
+    /// The document must print the column. Its absence is a document this
+    /// profile does not read, said once, rather than a field silently missing
+    /// from every row of a month.
+    Required,
+    /// The document may print the column or may not. The profile says so
+    /// because the column decides nothing: an institution that stopped printing
+    /// it, or an export made before it existed, is the same document with one
+    /// transcription fewer.
+    Optional,
 }
 
 /// Whose statement the row is on.

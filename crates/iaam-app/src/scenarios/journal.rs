@@ -298,7 +298,8 @@ fn rule_filter(
         if let Some(version) = version {
             return Err(AppError::Invalid {
                 field: "settled_by_rule_version".to_owned(),
-                expected: "a rule named beside the version, because a version numbers one                            rule's own revisions"
+                expected: "a rule named beside the version, because a version numbers one \
+                           rule's own revisions"
                     .to_owned(),
                 actual: version.to_string(),
             });

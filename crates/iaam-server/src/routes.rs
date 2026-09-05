@@ -3897,6 +3897,13 @@ pub async fn answer_import_question(
 /// call is unaffected by this one. Correcting a movement and changing the
 /// standing decision behind it stay two acts; this performs neither.
 ///
+/// **Covered is not the same as settled.** His own answer and his own account
+/// directory are both read before any standing decision of his, so a line
+/// either of them has already settled stays exactly as it is whatever he
+/// answers here. Such a line is still listed, because dropping it would read as
+/// one the condition does not cover; it carries what settles it today, and it
+/// is not counted among what answering would settle.
+///
 /// What could not be decided either way is listed with its reason rather than
 /// left out, because an omission here would read as «nothing else is affected».
 ///

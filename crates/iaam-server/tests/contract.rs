@@ -17398,6 +17398,17 @@ async fn an_answers_standing_decision_shows_what_it_would_settle_before_it_stand
         "all three are still waiting on him: {forecast}"
     );
     assert!(
+        lines.iter().all(|line| line.get("now").is_none()),
+        "nothing settles any of them yet, which is why he is being asked: \
+         {forecast}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|line| line["settled_regardless"] == json!(false)),
+        "so all three are lines the standing decision would settle: {forecast}"
+    );
+    assert!(
         lines
             .iter()
             .all(|line| line["printed"]["title"] == "Brokerage"),
@@ -17587,6 +17598,7 @@ async fn the_contract_publishes_the_forecast_and_the_shapes_it_is_read_by() {
         "PreviewAnswerRequest",
         "ForecastedLineDto",
         "ForecastedMovementDto",
+        "QuestionSettlementDto",
         "UndecidedDto",
     ] {
         assert!(

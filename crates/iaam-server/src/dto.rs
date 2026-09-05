@@ -9661,14 +9661,22 @@ pub struct ImportQuestionDto {
 /// read beside one.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QuestionSettlementDto {
-    /// `rule`, `directory`, `source_asserted`, `one_account_two_instruments`
-    /// or `second_leg_of_one_movement`.
+    /// `rule`, `directory`, `source_asserted`, `answered`,
+    /// `one_account_two_instruments` or `second_leg_of_one_movement`.
     ///
-    /// The two other words those enumerations can say do not reach here, and
-    /// neither is a gap. `answered` is what a question with an `answered_at`
-    /// says about itself, and this field exists for the questions that have
-    /// none; `concluded` is a row whose caller submitted a finished operation,
-    /// which raises no question to settle.
+    /// Which of them can appear depends on what is being described, and the
+    /// difference is not a gap:
+    ///
+    /// - on a question, `settled_without_answer` exists for the questions with
+    ///   no `answered_at`, so `answered` never reaches it — the question says
+    ///   that about itself;
+    /// - on a line of a forecast, `answered` is one of the words, because there
+    ///   the question is what settles the line rather than why it stopped
+    ///   waiting.
+    ///
+    /// `concluded` reaches neither: a caller that submitted a finished
+    /// operation raises no question, and a forecast is never tested against
+    /// such a line.
     pub code: String,
     /// The same determination in a sentence, to be read out to the owner.
     pub explanation: String,
@@ -11993,7 +12001,7 @@ impl PlannedFactDto {
             settled_by: fact.settled_by.code().to_owned(),
             settled_by_explanation: fact.settled_by.describe().to_owned(),
             settled_by_rule: match &fact.settled_by {
-                FactBasis::Rule { rule, .. } => Some(rule.clone()),
+                FactBasis::Rule { rule, .. } => Some(rule.inner().to_string()),
                 FactBasis::Concluded
                 | FactBasis::Directory
                 | FactBasis::SourceAsserted
@@ -12610,7 +12618,7 @@ mod question_publishers {
     use super::*;
     use iaam_app::ingest::classification::Question;
     use iaam_app::ports::ImportQuestionView;
-    use iaam_core::ids::{ImportQuestionId, ImportSessionId};
+    use iaam_core::ids::{ClassificationRuleId, ImportQuestionId, ImportSessionId};
 
     fn codes(alternatives: &[AnswerAlternativeDto]) -> Vec<String> {
         alternatives
@@ -12734,7 +12742,7 @@ mod question_publishers {
             generalisation: Generalisation::Unanswered,
             settled_without_answer: Some(QuestionSettlement::Fact {
                 basis: FactBasis::Rule {
-                    rule: Uuid::new_v4().to_string(),
+                    rule: ClassificationRuleId(Uuid::new_v4()),
                     version: 1,
                 },
             }),
@@ -12811,7 +12819,28 @@ pub struct ForecastedLineDto {
     pub printed: PrintedRowDto,
     /// Whether this import is still waiting on an answer for it. `false` for a
     /// line already settled, and for one that raised no question.
+    ///
+    /// Never read on its own: `false` is those two situations and «the owner
+    /// answered it» as well, and `now` is the field that says which.
     pub awaiting_answer: bool,
+    /// What settles this line today, where anything does. Absent for a line
+    /// nothing settles, which is the state the question was asked from.
+    ///
+    /// `now` on a movement already recorded says what the record holds today;
+    /// this is the same thing for a line not yet recorded, and it is there for
+    /// the same reason: what a standing decision would do to a line is only
+    /// readable beside what is true of it now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<QuestionSettlementDto>,
+    /// Whether this line is settled whatever this standing decision does.
+    ///
+    /// `true` for a line the owner's own answer or his own account directory
+    /// already settles: both are read before any standing decision of his is,
+    /// so making one now leaves such a line exactly as it stands. It is still
+    /// listed, because a line dropped from the list would read as one the
+    /// condition does not cover — but it is not among what the sentence counts
+    /// as what answering would settle.
+    pub settled_regardless: bool,
 }
 
 /// One movement already recorded that a standing decision would cover.
@@ -12992,6 +13021,8 @@ impl AnswerRuleForecastDto {
                     row: line.row,
                     printed: PrintedRowDto::from_domain(&line.printed),
                     awaiting_answer: line.awaiting_answer,
+                    now: line.now.as_ref().map(QuestionSettlementDto::from_domain),
+                    settled_regardless: line.settled_regardless(),
                 })
                 .collect(),
             already_recorded: forecast

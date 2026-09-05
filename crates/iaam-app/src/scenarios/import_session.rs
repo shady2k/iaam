@@ -5454,7 +5454,18 @@ pub enum FactBasis {
     /// about itself.
     SourceAsserted,
     /// One of the owner's standing classification rules.
-    Rule { rule: String, version: u32 },
+    ///
+    /// The rule is the identifier and never its text (`iaam-r0qk`). Held as
+    /// text, this arm could be given a value naming a rule that cannot be read
+    /// back, and [`Self::rule_settlement`] then had to answer something about
+    /// it — and every word it could say was false. «No rule» is a reading that
+    /// found none of his rules, which is not what happened; «nothing recorded»
+    /// is the absence of the value and not a word this vocabulary can say. The
+    /// state has no truthful answer, so it is made unrepresentable instead.
+    Rule {
+        rule: ClassificationRuleId,
+        version: u32,
+    },
     /// The owner answered the question this row raised.
     Answered,
 }
@@ -5466,7 +5477,7 @@ impl FactBasis {
             Basis::Derived => Self::Directory,
             Basis::Asserted => Self::SourceAsserted,
             Basis::Rule { rule, version } => Self::Rule {
-                rule: rule.inner().to_string(),
+                rule: *rule,
                 version: *version,
             },
         }
@@ -5486,16 +5497,17 @@ impl FactBasis {
     /// written before the field existed, a correction, a broker
     /// synchronisation — and it is the absence of the whole value rather than a
     /// member of this vocabulary.
+    ///
+    /// Total, and it has no failure to fall back from (`iaam-r0qk`): a basis
+    /// that names a rule names it as an identifier, so «a rule filed this» can
+    /// never come out here as «a reading ran and no rule of his matched».
     #[must_use]
-    pub fn rule_settlement(&self) -> RuleSettlement {
+    pub const fn rule_settlement(&self) -> RuleSettlement {
         match self {
-            Self::Rule { rule, version } => {
-                rule.parse::<uuid::Uuid>()
-                    .map_or(RuleSettlement::NoRule, |rule| RuleSettlement::Rule {
-                        rule: ClassificationRuleId(rule),
-                        version: *version,
-                    })
-            }
+            Self::Rule { rule, version } => RuleSettlement::Rule {
+                rule: *rule,
+                version: *version,
+            },
             Self::Concluded | Self::Directory | Self::SourceAsserted | Self::Answered => {
                 RuleSettlement::NoRule
             }
@@ -6996,6 +7008,18 @@ impl QuestionSettlements {
             .count()
     }
 
+    /// What settles this line, where this reading settles it at all.
+    ///
+    /// Asked by line rather than by question, and it does not hold back the
+    /// line he answered: this says what settles a line today, not why a
+    /// question stopped waiting, so «he answered it» is one of the answers
+    /// rather than an omission ([`Self::settlement_of`] is the other reading
+    /// and holds it back for its own reason). `None` is a line this reading
+    /// settles no way at all — still his to answer, or unreadable.
+    fn settlement_for(&self, row: u32) -> Option<&QuestionSettlement> {
+        self.settled.get(&row)
+    }
+
     /// What settled this question, where the reading settled it and he did not.
     ///
     /// `None` for a question still waiting **and** for one he answered: this
@@ -8491,8 +8515,48 @@ pub struct ReachedRow {
     ///
     /// Read from the same reading `answer_question` reads its own reach from,
     /// so «what is still waiting» is answered once. A line that raised no
-    /// question, and a line something already settled, both answer `false`.
+    /// question, and a line something already settled, both answer `false` —
+    /// which is why it is not read alone: `false` here is three different
+    /// situations, and [`Self::now`] is the field that says which
+    /// (`iaam-r0qk`).
     pub awaiting_answer: bool,
+    /// What settles this line today, where anything does.
+    ///
+    /// [`ReachedFact::now`]'s counterpart for a line, and it exists for the
+    /// same reason: what a decision would do to something is only readable
+    /// beside what is true of it now. `None` is a line nothing settles — his to
+    /// answer, and the state the forecast's own question is asked from.
+    pub now: Option<QuestionSettlement>,
+}
+
+impl ReachedRow {
+    /// Whether this line is settled whatever this decision does
+    /// (`iaam-r0qk`).
+    ///
+    /// **Not a second model of what wins, but a reading of the one order the
+    /// commit already runs in.** Two things settle a line before any standing
+    /// decision of his is consulted, and a decision made now displaces
+    /// neither: his own answer, which `resolution_of` takes before it reaches
+    /// the classifier at all, and his account directory recognising the far
+    /// side, which `classify` answers before it looks at his decisions. A line
+    /// that settles into no fact is not settled by a decision either.
+    ///
+    /// The two that a decision made now **does** displace are the other side of
+    /// the same order: another standing decision of his, because a new one is
+    /// written above the highest version he holds and the highest wins, and the
+    /// source's own assertion about the far side, which `classify` consults
+    /// after his decisions and not before.
+    #[must_use]
+    pub const fn settled_regardless(&self) -> bool {
+        match &self.now {
+            None => false,
+            Some(QuestionSettlement::NoFact { .. }) => true,
+            Some(QuestionSettlement::Fact { basis }) => match basis {
+                FactBasis::Answered | FactBasis::Directory | FactBasis::Concluded => true,
+                FactBasis::Rule { .. } | FactBasis::SourceAsserted => false,
+            },
+        }
+    }
 }
 
 /// One movement already recorded that the condition reaches.
@@ -8694,6 +8758,10 @@ fn reach_over_session(
                             .iter()
                             .filter(|question| question.row == observation.row)
                             .any(|question| session.settlements.awaits_answer(question)),
+                        // From the same reading the line above is, so what is
+                        // still waiting and what already settles it cannot be
+                        // taken from two readings of one session.
+                        now: session.settlements.settlement_for(observation.row).cloned(),
                     });
                 }
             }
@@ -8835,10 +8903,32 @@ fn forecast_notice(
                 .to_owned();
         }
     };
-    let others = in_this_import
+    // Two counts out of one list, and the split is `iaam-r0qk`. The list is
+    // everything the condition covers, because a line left out of it reads as
+    // «not affected»; the count beside «it would settle» is what answering
+    // would actually decide, because a line his own answer or his own directory
+    // already settled is one this decision never reaches. Counted together they
+    // told him to go and look for the wrong one among lines the decision does
+    // not touch.
+    let (settled_anyway, others): (Vec<_>, Vec<_>) = in_this_import
         .iter()
         .filter(|line| line.row != asked_row)
-        .count();
+        .partition(|line| line.settled_regardless());
+    let others = others.len();
+    let already = match settled_anyway.len() {
+        0 => String::new(),
+        1 => " One other line of this import is covered by the same words and is already \
+              settled by something this would not displace — your own answer, or the other \
+              side being recognised as an account of yours — so answering here leaves it as \
+              it stands."
+            .to_owned(),
+        count => format!(
+            " {count} other lines of this import are covered by the same words and are \
+             already settled by something this would not displace — your own answer, or the \
+             other side being recognised as an account of yours — so answering here leaves \
+             them as they stand."
+        ),
+    };
     // The count of what is already recorded is not published where none of it
     // could be folded: zero would then read as «nothing of yours is affected»,
     // which is the one sentence a forecast must never compose out of a failure.
@@ -8860,7 +8950,8 @@ fn forecast_notice(
     };
     format!(
         "{kept} Before it stands, this is everything it would cover. Besides the line you were \
-         asked about it covers {others} of this import, and {recorded}. {left_out} Read them \
+         asked about it would settle {others} of this import, and {recorded}.{already} \
+         {left_out} Read them \
          before you answer: your statement says the same thing about every one of them, but only \
          you know whether they were the same thing — one that was something else is decided \
          wrongly along with the rest, and the way to keep it out is to answer that one on its own \
@@ -11656,7 +11747,17 @@ mod tests {
     /// else. A helper that set `settled` or `basis` by hand would assert
     /// against a state no reading produces.
     fn read_against(row: u32, observed: &ObservedRow, resolver: &Resolver) -> ReadRow {
-        let observation = stored_row(row, observed);
+        read_observation(stored_row(row, observed), observed, resolver)
+    }
+
+    /// The same reading, over a stored line the caller has already shaped —
+    /// one carrying his answer, say, which `stored_row` deliberately does not.
+    fn read_observation(
+        observation: ImportObservationView,
+        observed: &ObservedRow,
+        resolver: &Resolver,
+    ) -> ReadRow {
+        let row = observation.row;
         let resolution = resolution_of(&observation, resolver);
         let settled = match &resolution {
             Ok(RowResolution::NoFact(reason)) => Some(*reason),
@@ -12064,11 +12165,7 @@ mod tests {
     fn a_fact_records_the_rule_that_filed_it_and_says_so_when_none_did() {
         let rule = iaam_core::ids::ClassificationRuleId::new_random();
         assert_eq!(
-            FactBasis::Rule {
-                rule: rule.inner().to_string(),
-                version: 4,
-            }
-            .rule_settlement(),
+            FactBasis::Rule { rule, version: 4 }.rule_settlement(),
             RuleSettlement::Rule { rule, version: 4 }
         );
         for basis in [
@@ -12085,23 +12182,29 @@ mod tests {
         }
     }
 
-    /// A rule identifier this build cannot read names no rule.
+    /// A basis that names a rule never records «no rule» (`iaam-r0qk`).
     ///
-    /// The basis carries the rule as text because that is what the plan
-    /// publishes. A value that is not an identifier cannot be turned into one,
-    /// and inventing a random one would file the row under a decision nobody
-    /// made — so the fact records that no rule was named rather than a rule that
-    /// does not exist.
+    /// «No rule» is a reading that ran and found none of his rules, and a basis
+    /// naming a rule is a reading that ran and found one. Answering the first
+    /// for the second tells him a fact one of his own standing decisions filed
+    /// was decided by hand: it drops out of the group he asked to see, and a
+    /// correction on it reports no standing decision behind the row.
+    ///
+    /// The basis used to carry the rule as text, and an identifier that would
+    /// not parse was recorded as «no rule» — the one place this wave said the
+    /// second of its three states when the first was true. There is no third
+    /// answer to give instead: «nothing recorded» is the absence of the whole
+    /// value and not a word this vocabulary can say. So the state is gone
+    /// rather than handled, and this test is what says it is gone: the version
+    /// of it that named an unreadable rule no longer compiles, because there is
+    /// no unreadable rule to name.
     #[test]
-    fn a_basis_naming_an_unreadable_rule_records_no_rule() {
-        assert_eq!(
-            FactBasis::Rule {
-                rule: "not an identifier".to_owned(),
-                version: 1,
-            }
-            .rule_settlement(),
-            RuleSettlement::NoRule
-        );
+    fn a_basis_naming_a_rule_records_that_rule_and_never_no_rule() {
+        let rule = iaam_core::ids::ClassificationRuleId::new_random();
+        let settlement = FactBasis::Rule { rule, version: 1 }.rule_settlement();
+        assert_ne!(settlement, RuleSettlement::NoRule);
+        assert_eq!(settlement, RuleSettlement::Rule { rule, version: 1 });
+        assert_eq!(settlement.rule(), Some((rule, 1)));
     }
 
     // -----------------------------------------------------------------------
@@ -13117,6 +13220,33 @@ mod tests {
         }
     }
 
+    /// The same line, stored with the owner's answer already on it.
+    ///
+    /// `stored_row` deliberately carries none, and the difference is the whole
+    /// of what one half of `iaam-r0qk` is about: a line he has already answered
+    /// is settled before any standing decision of his is consulted.
+    fn answered_row(number: u32, line: &ObservedRow, answer: Answer) -> ImportObservationView {
+        ImportObservationView {
+            answer: Some(serde_json::to_string(&answer).expect("an answer")),
+            ..stored_row(number, line)
+        }
+    }
+
+    /// A line of the same shape whose far side the owner's directory
+    /// recognises as another account of his.
+    ///
+    /// It carries a direction because a directionless line naming one of his
+    /// own accounts is still a question — the far side is known and the way the
+    /// money went is not.
+    fn recognised_line(on: AccountId, named: &str, amount_minor: i64) -> ObservedRow {
+        ObservedRow {
+            counterparty: ObservedCounterparty::Named(named.to_owned()),
+            direction: ObservedDirection::Out,
+            amount_minor: -amount_minor,
+            ..directionless(row(on, named, Some(date!(2026 - 03 - 01))))
+        }
+    }
+
     fn asked_about(number: u32, line: &ObservedRow, on: AccountId) -> ImportQuestionView {
         stored_question_about(
             number,
@@ -13269,6 +13399,107 @@ mod tests {
             forecast.undecided,
             vec![Undecided::UnreadableRow { row: 4 }],
             "a line nothing can read is declared, never passed over"
+        );
+    }
+
+    /// A line something already settles is not one this decision would settle
+    /// (`iaam-r0qk`).
+    ///
+    /// Two things settle a line before any standing decision of his is
+    /// consulted: his own earlier answer, which the reading takes first, and his
+    /// account directory recognising the far side, which is read before his
+    /// decisions are. A forecast that counts those among what it would settle
+    /// tells him, of a line his own answer already decided, that answering here
+    /// decides it too — and then invites him to go and put right whichever of
+    /// them was something else. Both halves are false about such a line.
+    ///
+    /// The count and the list are kept apart for that reason: the list is
+    /// everything the condition covers, because a line left out of it reads as
+    /// «not affected», and the count is what the decision would actually
+    /// settle. Each line says which of the two it is.
+    #[test]
+    fn a_line_already_settled_is_not_counted_as_one_the_decision_would_settle() {
+        let main = account(1);
+        let savings = account(2);
+        let asked = inner_line(main, 1_000);
+        let answered = inner_line(main, 2_000);
+        let recognised = recognised_line(main, "Savings", 3_000);
+
+        let accounts = vec![detail(main, "Main"), detail(savings, "Savings")];
+        let observations = vec![
+            stored_row(1, &asked),
+            answered_row(2, &answered, Answer::Paid),
+            stored_row(3, &recognised),
+        ];
+        let questions = vec![
+            asked_about(1, &asked, main),
+            asked_about(2, &answered, main),
+        ];
+        let resolver = ruled(accounts.clone(), Vec::new());
+        let mut read = vec![
+            read_against(1, &asked, &resolver),
+            read_observation(observations[1].clone(), &answered, &resolver),
+            read_against(3, &recognised, &resolver),
+        ];
+        let settled = settlements(&mut read, &MirroredRows::default());
+
+        let forecast = forecast(
+            would_stand(&asked, Answer::Paid, true),
+            1,
+            &SessionAsRead {
+                observations: &observations,
+                questions: &questions,
+                settlements: &settled,
+            },
+            &[],
+            &held(accounts),
+        );
+
+        assert_eq!(
+            forecast
+                .in_this_import
+                .iter()
+                .map(|line| line.row)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "all three are covered by the condition, and none is dropped out \
+             of sight"
+        );
+        assert!(
+            forecast.notice.contains("no other line"),
+            "and none of them is one it would settle, which is what he is \
+             read: {}",
+            forecast.notice
+        );
+        assert!(
+            forecast.notice.contains("2 other lines"),
+            "the two it leaves as they are are declared and not dropped: {}",
+            forecast.notice
+        );
+
+        // «Still waiting» answers `false` for three different situations, so
+        // each line says which of them it is rather than leaving the reader to
+        // guess from the one word.
+        let words = forecast
+            .in_this_import
+            .iter()
+            .map(|line| {
+                (
+                    line.awaiting_answer,
+                    line.now.as_ref().map(QuestionSettlement::code),
+                    line.settled_regardless(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            vec![
+                (true, None, false),
+                (false, Some("answered"), true),
+                (false, Some("directory"), true),
+            ],
+            "the one he is being asked about is his to answer; the second he \
+             answered himself; the third his own accounts settled"
         );
     }
 

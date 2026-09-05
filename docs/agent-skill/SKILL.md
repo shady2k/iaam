@@ -195,6 +195,11 @@ has reached the journal is indistinguishable from a fact — every report will
 read it as one, and only the owner, who knows what actually happened, can
 retract it.
 
+**A question the system raises about one of his rows is never answered by
+you.** Which way the money went, and whose account was on the other side, are
+facts about the owner's affairs and not gaps for you to close. Show him the
+question and the answers it admits, and relay what he says.
+
 **Before you propose undoing, retracting or re-sending anything already
 recorded, read `correcting.md`.** It holds why append-only does not mean
 irrevocable, whose act a correction is, the one import an agent may take back

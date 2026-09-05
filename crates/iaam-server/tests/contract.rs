@@ -2284,6 +2284,203 @@ async fn the_openapi_document_says_which_fields_are_put_to_the_owner() {
     );
 }
 
+/// A description a caller reads instead of a document it may not have.
+///
+/// Read out of the published document rather than off the Rust type: what a
+/// client can learn is what the document says, and an assertion against the
+/// struct would pass just as happily with the description stripped.
+fn property_description<'a>(spec: &'a serde_json::Value, schema: &str, property: &str) -> &'a str {
+    let published = &spec["components"]["schemas"][schema]["properties"][property];
+    published["description"]
+        .as_str()
+        // An optional field whose type is a reference is published as a
+        // `oneOf` of null and the reference, and the generator hangs the doc
+        // comment on the reference rather than on the property. The reader
+        // meets the same sentence either way, so the helper looks in both
+        // places instead of obliging every caller to know which shape a field
+        // happens to have.
+        .or_else(|| {
+            published["oneOf"]
+                .as_array()?
+                .iter()
+                .find_map(|branch| branch["description"].as_str())
+        })
+        .unwrap_or_else(|| panic!("{schema}.{property} publishes no description"))
+}
+
+/// One variant of a tagged union, found by the word its `type` takes.
+///
+/// A Rust field that flattens such an enum into a request publishes no property
+/// of its own — the document carries an `allOf` of the two schemas, and the
+/// field's own doc comment reaches nobody. So an obligation about that payload
+/// is stated where a reader of the payload meets it: on the union, or on the
+/// variant it is about.
+fn variant<'a>(spec: &'a serde_json::Value, schema: &str, tag: &str) -> &'a serde_json::Value {
+    spec["components"]["schemas"][schema]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema} publishes no variants"))
+        .iter()
+        .find(|candidate| candidate["properties"]["type"]["enum"][0] == tag)
+        .unwrap_or_else(|| panic!("{schema} publishes no `{tag}` variant"))
+}
+
+/// The row number is what a machine sends back, and the day and the sum are what
+/// a person recognises the line by. A caller told only «row 14» reads a list to
+/// the owner and counts down it, and an owner counting down a list is eventually
+/// off by one — which settles the wrong row, may become a standing rule, and is
+/// never asked about again.
+#[tokio::test]
+async fn a_question_says_how_the_row_is_named_to_the_owner() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ImportQuestionDto", "row");
+    for owed in ["day", "amount", "sign"] {
+        assert!(
+            described.contains(owed),
+            "ImportQuestionDto.row does not say the owner is told the {owed}: {described}"
+        );
+    }
+}
+
+/// A held session is not an open transaction, and abandoning one costs nothing.
+///
+/// The three words alone leave both halves to be guessed. A caller reading
+/// `open` as a transaction hurries the owner through a question in order to
+/// «close it»; a caller reading `abandoned` as an undoing warns him about a
+/// journal that never moved. Neither is corrected by the word it was read from.
+#[tokio::test]
+async fn a_session_says_what_ending_it_does_to_the_journal() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ImportSessionDto", "state");
+    for owed in ["transaction", "committed", "abandoned", "retract"] {
+        assert!(
+            described.contains(owed),
+            "ImportSessionDto.state says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// The sign is carried by the kind, and a surplus digit is refused rather than
+/// rounded.
+///
+/// A caller that negates a withdrawal is submitting a sum with two signs to a
+/// vocabulary that has none, and a caller that expects a third decimal to be
+/// rounded away is expecting a convenient number to be substituted for a fact.
+/// Both are refusals of the request schema and neither was stated on it.
+#[tokio::test]
+async fn an_amount_is_positive_and_a_surplus_digit_is_refused() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = spec["components"]["schemas"]["OperationKindDto"]["description"]
+        .as_str()
+        .expect("OperationKindDto publishes no description");
+    for owed in ["positive", "sign", "scale", "rounded"] {
+        assert!(
+            described.contains(owed),
+            "OperationKindDto says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// One movement between the owner's own accounts is one row, submitted from the
+/// side the money left.
+///
+/// Two banks each print the movement, and a caller that submits both records two
+/// transfers rather than the two halves of one — both accounts move by twice the
+/// sum, and every figure of that month is wrong by it. The variant took the
+/// receiving account and said nothing about the row it must not be paired with.
+#[tokio::test]
+async fn a_transfer_is_one_row_submitted_from_the_sending_side() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = variant(&spec, "OperationKindDto", "transfer")["description"]
+        .as_str()
+        .expect("the transfer variant publishes no description");
+    for owed in ["sending side", "twice", "differ", "deposit"] {
+        assert!(
+            described.contains(owed),
+            "the transfer variant says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A far side the source called the owner's own never becomes money leaving him.
+///
+/// The field already said that a row asserting it and stating no direction posts
+/// nothing. The row that also states a direction does post, and a caller reading
+/// only that sentence has no word for what it posts — so the leg it writes is
+/// easy to read as spending, which is the one thing it is not.
+#[tokio::test]
+async fn a_stated_far_side_never_sends_money_out_of_the_perimeter() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = variant(&spec, "OperationKindDto", "unresolved_direction")["properties"]
+        ["far_side"]["description"]
+        .as_str()
+        .expect("the far side publishes no description");
+    for owed in ["one leg", "perimeter"] {
+        assert!(
+            described.contains(owed),
+            "the far side says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A proposed rule says what its condition asks about, because that is the part
+/// the owner may want to change.
+///
+/// He is the one who weighs a condition that settles more rows next month
+/// against one that settles a row wrongly, and he cannot weigh what he was not
+/// told. A caller that reads out only «a rule is available» has handed him the
+/// decision without the thing being decided.
+#[tokio::test]
+async fn a_proposed_rule_says_what_its_condition_asks_about() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "QuestionGeneralisationDto", "proposal");
+    for owed in ["one thing", "counterparty", "wider"] {
+        assert!(
+            described.contains(owed),
+            "the proposal says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An opening with no acquisition date says what the omission costs.
+///
+/// Without a date there is no ownership boundary to check a posting against, so
+/// every posting on that security is reported as unverifiable rather than
+/// checked. A caller that does not know this fills the field with the start of
+/// the journal to make the report clean, and the report then agrees with a
+/// boundary nobody asserted.
+#[tokio::test]
+async fn a_reconstructed_opening_says_what_a_missing_acquisition_date_costs() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "OpeningAssertionsDto", "acquisition_date");
+    for owed in ["material_issues", "unverifiable", "unknown"] {
+        assert!(
+            described.contains(owed),
+            "the acquisition date says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_published_code_is_the_code_the_response_carries() {
     // The vocabularies enumerate; they must enumerate what actually arrives.

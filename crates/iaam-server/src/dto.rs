@@ -386,6 +386,20 @@ pub struct OpeningAssertionsDto {
         with = "iso_date::option",
         skip_serializing_if = "Option::is_none"
     )]
+    /// The day the owner says the position was acquired.
+    ///
+    /// **What is asserted here reaches the reconciliation of postings.** The
+    /// acquisition date is what the ownership boundary is drawn with: without
+    /// one there is no date to check a posting against, so every posting on
+    /// that security is reported in `material_issues` as unverifiable instead
+    /// of being checked and passing.
+    ///
+    /// So ask the owner for the day if he remembers it. If he does not, leave
+    /// the field out and let `acquisition_date_certainty` stand at `unknown`.
+    /// Substituting the start of the journal is the one answer that must not be
+    /// given: it draws a boundary nobody asserted, the reconciliation then
+    /// checks the postings against it, and they agree — which is a clean report
+    /// about a date that was invented on this side of the wire.
     #[schema(value_type = Option<String>, format = Date)]
     pub acquisition_date: Option<Date>,
     #[serde(default)]
@@ -425,7 +439,20 @@ impl OpeningAssertionsDto {
     }
 }
 
-/// Operation type. Values are **positive**: the type determines the sign, not the client.
+/// What the row **was**, and the sign and the scale every amount below is
+/// stated in.
+///
+/// **Amounts are always positive.** The sign is carried by the kind and never
+/// by the number: a deposit and a withdrawal are two kinds, not one sum with
+/// two signs, and a negative amount is refused rather than read as the outgoing
+/// half of something. The single exception is `unresolved_direction`, which
+/// transcribes the sign the source printed — there the sign is evidence about a
+/// direction nobody has concluded yet, and making it positive would discard it.
+///
+/// **An amount's scale must not exceed the currency's minor unit.** A surplus
+/// digit after the separator is refused and not rounded away: rounding at the
+/// input substitutes a convenient number for a fact, and a fact is what the
+/// journal is asked to keep.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationKindDto {
@@ -443,6 +470,38 @@ pub enum OperationKindDto {
         amount: String,
         currency: CurrencyDto,
     },
+    /// A movement between two of the owner's own accounts: **one row, submitted
+    /// once, from the sending side**.
+    ///
+    /// The operation's own account is the one the money left and `to_account`
+    /// is the one it arrived at. The system writes both movements from this
+    /// single row — the sending account debited, the receiving account
+    /// credited, in one fact that holds both — so there is deliberately no way
+    /// to state the receiving half on its own.
+    ///
+    /// That is the shape to hold on to where two banks each print the same
+    /// movement, an outgoing row in one statement and an incoming row in the
+    /// other. A row per printed side records **two transfers** rather than the
+    /// two halves of one, and both accounts then move by twice the sum. Import
+    /// the sending side and drop the receiving row.
+    ///
+    /// Three refusals follow, each of them reached before by a caller producing
+    /// entirely plausible output:
+    ///
+    /// - **The amount is positive**, like every other amount here. A negative
+    ///   one is refused, not read as "the outgoing leg": direction is carried by
+    ///   the two accounts, so the sign has nothing left to say.
+    /// - **The two accounts must differ.** A transfer to itself moves nothing,
+    ///   and it is refused on `to_account`.
+    /// - **A transfer is not a deposit plus a withdrawal.** Those two say the
+    ///   money crossed the boundary of the owner's accounts, and a report counts
+    ///   them as money entering and money leaving; a transfer says it stayed
+    ///   inside and merely moved. Recording one as a pair overstates both what
+    ///   came in and what went out, in the same month.
+    ///
+    /// Where the caller cannot tell whether the far side is one of his accounts
+    /// at all, this is not the variant: `unresolved_direction` states what the
+    /// source stated and leaves the question to the owner.
     Transfer {
         to_account: Uuid,
         amount: String,
@@ -569,6 +628,14 @@ pub enum OperationKindDto {
         /// is exactly the row this field exists for. Such a row is recorded as
         /// a movement between the owner's own accounts with the far side
         /// unnamed, and no question is raised about it.
+        ///
+        /// A row that asserts it **and** states a direction is the other case,
+        /// and it does not behave the same way: it posts **one leg**, on this
+        /// account, the way the source said the money ran. It still does not
+        /// send money out of the **perimeter** — the far side is the owner's,
+        /// by the source's own words — so that leg is his money moving inside
+        /// his own accounts and is neither spending nor income, however a
+        /// report or a client words it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         far_side: Option<String>,
         /// The document the row was read out of, as the source names it.
@@ -8789,7 +8856,21 @@ pub struct AddImportRowsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportSessionDto {
     pub session: Uuid,
-    /// `open`, `committed` or `abandoned`.
+    /// `open`, `committed` or `abandoned` — the whole life of a session, and
+    /// what ending one costs.
+    ///
+    /// A session is opened, fed rows from one or more sources, questioned,
+    /// answered, and then either committed or abandoned. It is **not a database
+    /// transaction**: answering a question can take the owner days, nothing is
+    /// held open in the machine meanwhile, and what is durable is the session
+    /// itself — an `open` session outlives every process that has read it.
+    ///
+    /// `committed` is the one moment its rows become facts, all of them at
+    /// once. `abandoned` leaves the journal **exactly as it was**: there is
+    /// nothing to retract, because nothing was ever recorded. That is the whole
+    /// difference between changing your mind before a commit and correcting a
+    /// fact after one — the first costs nothing, and the second is a retraction
+    /// that every report the owner has already read will stop counting.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<Uuid>,
@@ -8909,7 +8990,16 @@ impl ImportSessionSummaryDto {
 pub struct ImportQuestionDto {
     pub question: Uuid,
     pub session: Uuid,
-    /// The row in the session the question is about.
+    /// The row in the session the question is about, and the number to send
+    /// back with the answer.
+    ///
+    /// **Not what the owner is told.** He recognises a line by the day the
+    /// source dated it and the amount it printed, with the sign it printed, and
+    /// those are in the session's own reading of the row. Several rows of one
+    /// month can carry the same word, name nobody and be identical in every
+    /// other respect, so an owner matching questions to rows by counting down a
+    /// list is eventually off by one — and a wrong answer settles the row, may
+    /// become a standing rule of his, and is never asked about again.
     pub row: u32,
     /// The question in words, with the owner's own account titles in it.
     pub prompt: String,
@@ -9086,6 +9176,21 @@ pub struct QuestionGeneralisationDto {
     /// The rule this answer would generalise into, ready to be posted to
     /// `POST /v1/classification-rules` as it stands. Present exactly when
     /// `state` is `available`.
+    ///
+    /// **Its condition asks about one thing**, and which one is decided in this
+    /// order: the counterparty the row named; failing that, the word the source
+    /// filed the operation under; failing both, the description. Never all
+    /// three at once. `RuleMatcherDto` joins the members that are present with
+    /// **and**, so a condition built from every field the row printed
+    /// recognises that row and almost nothing else — a rule that settles one
+    /// line while reading like a rule that settles a month.
+    ///
+    /// **Say what the condition asks about**, not only that a rule is
+    /// available. That is the part the owner may want to change before he sends
+    /// it: a wider condition settles more rows next month and can settle one of
+    /// them wrongly, and weighing the saving against that is his and nobody
+    /// else's. He can see, change and retire the rule afterwards, in his own
+    /// vocabulary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ClassificationRuleRequest>,
 }

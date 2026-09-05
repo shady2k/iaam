@@ -165,6 +165,11 @@ compute percentages, do not convert currencies, do not estimate a return
 "roughly".
 A number that is not in the API's answer is an error — even when it is correct.
 
+A fact the API answered may be quoted as it stands: a rate, or a price as of a
+date. Adding such values up, recomputing them and deriving a return from them is
+not allowed. Any derived quantity is taken from the report whole — otherwise it
+becomes your arithmetic rather than the system's answer.
+
 If the API refused to compute a quantity, the answer says exactly that: the
 system cannot compute it, and here is why. Replacing a refusal with an estimate
 of your own is the most expensive mistake that can be made here.

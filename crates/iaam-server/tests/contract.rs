@@ -2481,6 +2481,156 @@ async fn a_reconstructed_opening_says_what_a_missing_acquisition_date_costs() {
     }
 }
 
+/// A confirmation is independent only where two channels that read separately
+/// agree, and a document read twice is one channel.
+///
+/// The status word alone does not say what raised it. A caller that reads
+/// `accepted_independent` as «somebody checked it» tells the owner a figure is
+/// confirmed when the same statement was merely loaded a second time — the same
+/// reading, so the same error, reproduced and reported as corroboration.
+#[tokio::test]
+async fn a_confirmation_is_independent_only_where_two_channels_agree() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "DimensionStatusDto", "status");
+    for owed in ["accepted_independent", "two", "again"] {
+        assert!(
+            described.contains(owed),
+            "the measurement's status says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// The return is over the whole history, and the two dates on the report are
+/// not the ends of a window anybody chose.
+///
+/// `as_of` and `history_starts` read like an interval, and a caller that reads
+/// them so reports «what it earned between these dates» — and then offers the
+/// owner a different pair, which nothing here can answer. A return over an
+/// arbitrary interval is not computed at all, and the reason has to be where the
+/// dates are.
+#[tokio::test]
+async fn a_return_is_reported_over_the_whole_history_and_never_a_sub_interval() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ReturnsReportDto", "history_starts");
+    for owed in ["whole history", "interval", "start"] {
+        assert!(
+            described.contains(owed),
+            "the start of the history says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// Two stated balances that do not join are a disagreement, and the later one
+/// does not win by being later.
+///
+/// The field already says what a `matched` change claims. It said nothing about
+/// the other outcome, and a caller reading a `discrepant` change as the source
+/// setting the record straight reports a correction that nobody made — the
+/// earlier assertion is still recorded, still the owner's, and untouched by a
+/// figure that arrived after it.
+#[tokio::test]
+async fn a_change_that_does_not_join_is_a_discrepancy_and_not_a_correction() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ObservationBasisDto", "compared");
+    for owed in ["discrepant", "correction", "overwrite"] {
+        assert!(
+            described.contains(owed),
+            "the compared quantity says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A price is quotable only once its basis is read, and the row states the basis
+/// three times over.
+///
+/// The effective basis, the basis the source recorded and the machine status of
+/// how well that basis is proven are three fields that need not agree, and only
+/// one of the three said anything about itself. A caller that reads the first
+/// and stops quotes a percentage of face as money, or quotes as settled a basis
+/// the source contradicts itself about.
+#[tokio::test]
+async fn a_price_says_its_three_statements_of_the_basis_need_not_agree() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "MarketPriceDto", "quotation_basis");
+    for owed in [
+        "recorded_quotation_basis",
+        "quotation_basis_status",
+        "contradicts itself",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the quotation basis says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An interval whose start was worked out is not an interval whose start was
+/// published.
+///
+/// The source gives trading days, and a rate that changed over a weekend takes
+/// effect on a date nobody observed. The word for that is on this field or
+/// nowhere, and a caller that quotes the date as a fact of the source has
+/// invented a publication that never happened.
+#[tokio::test]
+async fn an_interval_says_whether_its_start_was_observed_or_inferred() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "MarketKeyRateDto", "boundary");
+    for owed in [
+        "inferred_across_non_trading_days",
+        "observed",
+        "trading days",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the interval's boundary says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A payment that was not confirmed and a payment that cannot be checked are
+/// two different things to tell the owner.
+///
+/// The list is a bare array of sentences, and the two read alike: one says a
+/// crediting fact is missing where the security was held and the waiting period
+/// has passed, the other says there is nothing to check it against. A caller
+/// that reports the second as the first tells him money went missing, when what
+/// is missing is the evidence — and where the journal simply begins later,
+/// nothing at all is wrong.
+#[tokio::test]
+async fn an_unconfirmed_payment_and_absent_evidence_are_not_reported_alike() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "DataQualityDto", "material_issues");
+    for owed in [
+        "has not been confirmed",
+        "cannot be reconciled",
+        "went missing",
+        "count",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the material issues say nothing about «{owed}»: {described}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_published_code_is_the_code_the_response_carries() {
     // The vocabularies enumerate; they must enumerate what actually arrives.

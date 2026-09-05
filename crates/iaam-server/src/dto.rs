@@ -2140,6 +2140,26 @@ pub struct DataQualityDto {
     pub nav_coverage: NavCoverageDto,
     pub position_coverage: PositionCoverageDto,
     pub executability: ExecutabilitySharesDto,
+    /// What is wrong with the data behind these figures, one sentence per
+    /// finding, in this system's words and naming accounts and instruments by
+    /// identifier — so an entry is conveyed to the owner and never read out as
+    /// it stands.
+    ///
+    /// **Two of them look alike and must never be reported alike.** A payment
+    /// that «has not been confirmed» is a defect: the security was held, the
+    /// waiting period has expired, and no crediting fact is in the journal.
+    /// Tell him the day, the instrument, the account and what kind of payment
+    /// it was, and ask him for the statement covering that period. A payment
+    /// that «cannot be reconciled» is missing evidence, and no conclusion
+    /// follows from it: it is not a claim that money **went missing**, and
+    /// where the journal simply begins after the payment nothing is wrong at
+    /// all. The first is something he can repair; the second is something the
+    /// system cannot check, and saying so is the whole of it.
+    ///
+    /// **Payments that cannot be reconciled for one account and instrument
+    /// arrive as one entry**, carrying a count and the first and last dates,
+    /// because one act repairs the cause of all of them. It is put to him once
+    /// and not expanded back into a list of dates.
     pub material_issues: Vec<String>,
 }
 
@@ -3952,6 +3972,16 @@ pub struct ReturnsReportDto {
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub as_of: Date,
+    /// The effective date of the earliest event these figures were folded over,
+    /// or null where the population has none.
+    ///
+    /// **It is not the start of a window, and `as_of` is not its end.** The
+    /// report's period is the whole history: everything the journal holds, up to
+    /// the report date. A return over an arbitrary interval is not computed —
+    /// it would need the contour's value at the start of that interval, and a
+    /// value is known only as of the report date — so the two dates must not be
+    /// read out as the ends of a period, and a period of his own is not a
+    /// request this report can be asked to answer.
     #[serde(
         default,
         with = "iso_date::option",
@@ -5581,6 +5611,18 @@ pub struct MarketPriceDto {
     pub kind: String,
     pub value: String,
     pub currency: String,
+    /// The basis in force for this row: whether the value is money per unit,
+    /// a percentage of the remaining face, or `unknown` — the source never
+    /// established one, and the price is then not converted into money at all.
+    ///
+    /// **Three statements about the basis, and their agreement is not a
+    /// given.** This field is the basis in force; `recorded_quotation_basis` is
+    /// what the source recorded, as it recorded it; `quotation_basis_status` is
+    /// how well that basis is proven. Where they diverge — and a
+    /// `quotation_basis_status` of `contradicts` says they do — the source
+    /// contradicts itself about its own price, and the row publishes that
+    /// rather than settling it. All three are read before the value is quoted;
+    /// none of them stands for the other two.
     #[serde(default)]
     pub quotation_basis: QuotationBasisDto,
     /// Basis exactly as recorded by the source.
@@ -5630,6 +5672,18 @@ pub struct MarketKeyRateDto {
     pub source: String,
     pub observed_at: String,
     pub quality: String,
+    /// How the interval's left boundary — the `from` date — was arrived at.
+    ///
+    /// `observed` — the rate was seen on that day.
+    /// `inferred_across_non_trading_days` — the source publishes trading days
+    /// only, and the day the rate took effect falls somewhere between the last
+    /// day it was seen at the old value and the first day it was seen at this
+    /// one.
+    ///
+    /// An inferred boundary is this instance reading a gap in the source, not a
+    /// date the source stated, so it is quoted as the start of the interval and
+    /// never as the day the rate was changed. The value itself and the
+    /// right-hand end are observed either way.
     pub boundary: String,
 }
 
@@ -6815,6 +6869,20 @@ pub struct ReconciliationParams {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DimensionStatusDto {
     pub dimension: String,
+    /// How far this measurement has been confirmed, as one of four words:
+    /// `discrepant`, `provisional`, `accepted_internal`,
+    /// `accepted_independent`.
+    ///
+    /// **What makes a confirmation independent is two channels, not two
+    /// readings.** Facts reach the journal through a document this instance
+    /// parses and through operations it fetches from the institution's own
+    /// interface, and only agreement between those two raises a measurement to
+    /// `accepted_independent`; agreement inside one source is
+    /// `accepted_internal`, because one parser reading one document distorts
+    /// both sides of that check identically. Loading the same statement again
+    /// is the same channel and confirms nothing — it reproduces whatever the
+    /// first reading got wrong — so a re-read document is never reported as a
+    /// second source.
     pub status: String,
 }
 
@@ -6969,6 +7037,13 @@ pub struct ObservationBasisDto {
     /// distance to this one; it says nothing about the level, which is still
     /// unknown. A matched change and a matched level are different findings and
     /// must not be reported alike.
+    ///
+    /// **A `discrepant` change is a discrepancy and not a correction.** The two
+    /// stated balances and the movements between them do not join, and which of
+    /// the three is wrong is exactly what the outcome does not say. A later
+    /// statement does not overwrite an earlier one: what is recorded stays
+    /// recorded, and correcting an assertion the journal holds is an explicit
+    /// act of the owner's with its own operation.
     pub compared: String,
     /// The date of the stated balance a change is measured from. Null where
     /// `compared` is `level`.

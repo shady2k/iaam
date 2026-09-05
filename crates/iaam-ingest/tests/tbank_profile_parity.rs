@@ -476,3 +476,45 @@ fn two_identical_rows_are_two_identities_without_an_ordinal() {
         );
     }
 }
+
+/// A row the source did not complete is not a fact about the owner's money.
+/// The profile read every row as completed because it declared no status
+/// column.
+///
+/// This is a document of its own rather than a line added to the converter's
+/// fixture: every row of that export carries the completed word, so the case
+/// a status block exists to refuse has no counterpart there to add.
+#[test]
+fn a_row_whose_status_word_is_not_in_the_map_is_refused_by_name() {
+    let directory = directory();
+    let catalogue = ProfileCatalogue::bundled();
+    let installed = catalogue
+        .get("tbank-operations-csv")
+        .expect("the T-Bank operations export ships");
+    let document = "\"Имя счёта\";\"Дата операции\";\"Сумма в валюте счёта\";\"Валюта счёта\";\
+                     \"Статус\";\"Категория по-умолчанию\";\"Описание\"\n\
+                     \"Main\";\"05.08.2026 10:00:00\";\"-100,00\";\"RUB\";\"НеОк\";\
+                     \"Супермаркеты\";\"Shop One\"\n";
+    let reading = engine::read(
+        document.as_bytes(),
+        &installed.profile,
+        &ReadContext {
+            accounts: &directory.names,
+            declared: None,
+        },
+    )
+    .expect("a document this profile reads even though its one row refuses");
+    assert_eq!(reading.rows.len(), 1);
+    match &reading.rows[0] {
+        ReadOutcome::Rejected { rejection, .. } => {
+            assert_eq!(rejection.field, "status");
+            assert!(
+                rejection.actual.contains("НеОк"),
+                "the refusal names the word the source printed: {rejection:?}"
+            );
+        }
+        ReadOutcome::Observed { .. } => {
+            panic!("a row with an unknown status word was accepted")
+        }
+    }
+}

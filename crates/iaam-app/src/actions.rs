@@ -3780,12 +3780,14 @@ fn movement_leg_text(leg: MovementLeg, title: &str) -> String {
 ///
 /// Two conditions, and each removes work the owner cannot do.
 ///
-/// The generalisation must be [`Generalisation::Available`]. The other three
+/// The generalisation must be [`Generalisation::Available`]. The other four
 /// states offer nothing to adopt: `Recorded` means the answer already wrote the
-/// rule, `Unanswered` means there is no decision to generalise yet, and
-/// `Impossible` means the row prints nothing a matcher could ask about — the one
-/// state of the four that no call of anybody's can change, which is why it is
-/// stated in the enum and why nothing is queued for it.
+/// rule, `Unanswered` means there is no decision to generalise yet, `Impossible`
+/// means the row prints nothing a matcher could ask about, and
+/// `DoesNotGeneralise` means the owner answered what this document did not
+/// contain, which is a fact about one row and must not be made to decide later
+/// ones. The last two are the states no call of anybody's can change, which is
+/// why they are stated in the enum and why nothing is queued for them.
 ///
 /// And the session must not be abandoned. An abandoned session's rows were never
 /// facts — [`crate::scenarios::import_session::abandon_session`] neither reads
@@ -3804,7 +3806,8 @@ fn adopt_classification_rule_eligibility(
         Generalisation::Available { matcher, outcome } => Some((matcher, *outcome)),
         Generalisation::Recorded { .. }
         | Generalisation::Unanswered
-        | Generalisation::Impossible => None,
+        | Generalisation::Impossible
+        | Generalisation::DoesNotGeneralise => None,
     }
 }
 

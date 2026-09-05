@@ -671,12 +671,24 @@ impl Question {
     /// wherever `received` is, and the case it exists for — a merchant the
     /// directory does not recognise, printed by name beside a positive amount —
     /// is `IsTransferInternal`'s, not `IsInflowIncome`'s.
+    ///
+    /// **[`AnswerShape::BetweenOwnAccounts`] is offered exactly where the two
+    /// answers that name an own account are**, and the rule is that one and not
+    /// a list of variants: a question admitting «money I moved to my own
+    /// account» is a question about a row that could be the near half of a
+    /// movement between two of them, which is the row he may know this much
+    /// about and no more. So `IsTransferInternal` and `UnresolvedDirection`
+    /// offer it and the other two do not — an outflow that is either a fee or a
+    /// payment, and an inflow that is either an earning or a receipt, are asked
+    /// about rows for which no own-account word is admissible at all, and
+    /// adding this one there would offer an answer to a question nobody put.
     #[must_use]
     pub fn alternatives(&self) -> Vec<AnswerShape> {
         match self {
             Self::IsTransferInternal { .. } => vec![
                 AnswerShape::SentToOwnAccount,
                 AnswerShape::ReceivedFromOwnAccount,
+                AnswerShape::BetweenOwnAccounts,
                 AnswerShape::Paid,
                 AnswerShape::Received,
                 AnswerShape::Refund,
@@ -690,6 +702,7 @@ impl Question {
             Self::UnresolvedDirection { .. } => vec![
                 AnswerShape::SentToOwnAccount,
                 AnswerShape::ReceivedFromOwnAccount,
+                AnswerShape::BetweenOwnAccounts,
                 AnswerShape::Paid,
                 AnswerShape::Received,
                 AnswerShape::Fee,
@@ -796,6 +809,12 @@ pub enum AnswerShape {
     Fee,
     Income,
     Refund,
+    /// «It was between accounts of mine, and I cannot say which one.»
+    ///
+    /// The eighth, and the only one that is not a claim about what the row
+    /// **was** in the sense the other seven are: it says what the document did
+    /// not contain. [`Self::generalises`] is where that difference is spent.
+    BetweenOwnAccounts,
 }
 
 impl AnswerShape {
@@ -810,20 +829,57 @@ impl AnswerShape {
             Self::Fee => "fee",
             Self::Income => "income",
             Self::Refund => "refund",
+            // The word he said, not what this system does with it. «An
+            // unplaceable movement» and «an own-account movement with the far
+            // side unnamed» are both true and both describe the record; what he
+            // told us is that the money went between accounts of his.
+            Self::BetweenOwnAccounts => "between_own_accounts",
         }
     }
 
     /// Whether the answer must name one of the owner's accounts.
+    ///
+    /// [`Self::BetweenOwnAccounts`] answers `false`, and the whole of that
+    /// answer is the `false`: it is the one own-account word for the owner who
+    /// knows the far side is his and does not know which account it is.
     #[must_use]
     pub const fn needs_account(self) -> bool {
         matches!(self, Self::SentToOwnAccount | Self::ReceivedFromOwnAccount)
+    }
+
+    /// Whether recording this answer may also become a standing rule.
+    ///
+    /// Seven of the eight say what the row **was** — a fee, a return, an
+    /// earning, money that left the perimeter, a movement to a named account of
+    /// his — and every one of those is a claim about each later row a matcher
+    /// matches. That is what a [`ClassificationRule`] is, and it is why the
+    /// classification vocabulary carries them.
+    ///
+    /// [`Self::BetweenOwnAccounts`] says something else: that **this document**
+    /// did not contain the other side. A rule made of it would file every later
+    /// row of the same shape as a movement nothing can place — including, next
+    /// month, the rows whose far half *is* in the export and which the pairing
+    /// would have settled completely. A standing decision made of «I cannot
+    /// say» converts future known cases into unknown ones, and it does it
+    /// silently, which is the property that makes it worth refusing rather than
+    /// warning about.
+    ///
+    /// **A decision and not a discovery.** Nothing in the vocabulary forbids the
+    /// rule — [`Classification::OwnAccountMovement`] is in it, because a
+    /// **source** that files every such row this way is making exactly the
+    /// standing claim a rule is for. What is refused is minting one from the
+    /// owner's «I cannot say». It is cheap to reverse if a live session shows
+    /// him answering the same thing every month.
+    #[must_use]
+    pub const fn generalises(self) -> bool {
+        !matches!(self, Self::BetweenOwnAccounts)
     }
 
     /// What choosing this alternative does to the owner's money-flow report.
     ///
     /// **Why this is a sentence per alternative and not a longer question.**
     /// The prompt asks what the row was; this says what each answer to it
-    /// decides. Put in the prompt, the seven consequences would be one string
+    /// decides. Put in the prompt, the eight consequences would be one string
     /// holding a mapping from a word to its effect — a structure sent as prose,
     /// which `docs/api/conventions.md` §5 refuses for the reason that a client
     /// composing an answer has to parse it back out. Put here, the consequence
@@ -849,6 +905,14 @@ impl AnswerShape {
     /// as a caveat; the household report is the one the owner reads a month of
     /// statements against, so it is the one named, and the sentence for
     /// `Refund` says which report it is talking about.
+    ///
+    /// **One of the eight also says what it does to his standing decisions**,
+    /// and the asymmetry is deliberate. What a question says about that before
+    /// it is answered is one sentence for the whole question —
+    /// `GeneralisationProspect` in `iaam-app` — and it is true of seven of the
+    /// eight words. [`Self::BetweenOwnAccounts`] is the one it is false of (see
+    /// [`Self::generalises`]), so the correction travels attached to the word
+    /// it corrects, which is this list's whole mechanism.
     #[must_use]
     pub const fn consequence(self) -> &'static str {
         match self {
@@ -892,15 +956,32 @@ impl AnswerShape {
                  it from what went out, in the category the money was spent in, \
                  rather than adding it to what came in or to what the capital earned."
             }
+            Self::BetweenOwnAccounts => {
+                "The money moved between accounts of yours and nothing here says which account \
+                 the other side is. The money-flow report stops counting the amount as money \
+                 that went out, and no spending category is asked for; it does not count it \
+                 under transfers between your own accounts either, because no account is named \
+                 on the far side — the amount is reported separately, as one the report could \
+                 not place. Where the statement said which way the money ran, this account's \
+                 balance moves by it; where it said nothing, nothing is posted anywhere and \
+                 only the amount is reported. This answer also keeps no standing decision, \
+                 because it says what this statement did not contain rather than what the line \
+                 was: a later statement's lines are settled as they always were."
+            }
         }
     }
 }
 
 /// The owner's answer to one question.
 ///
-/// Every variant names a direction **and** a classification, because a
-/// directionless row needs both and a single answer is the only way to give
-/// both without something provisional existing in between.
+/// Seven of the eight variants name a direction **and** a classification,
+/// because a directionless row needs both and a single answer is the only way
+/// to give both without something provisional existing in between.
+///
+/// [`Self::BetweenOwnAccounts`] is the eighth and names only the
+/// classification, for the reason recorded on it: the journal has a shape for
+/// that movement **without** a direction, so it is the one answer that does not
+/// have to supply one. See [`Self::movement`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum Answer {
@@ -931,6 +1012,35 @@ pub enum Answer {
     /// answer whose absence made the honest path record a worse fact than the
     /// converter that concluded for itself.
     Refund,
+    /// The money moved between accounts of the owner's, and he cannot say which
+    /// account the far side is.
+    ///
+    /// **The claim is his, and it is weaker than the two answers beside it.**
+    /// [`Self::SentToOwnAccount`] and [`Self::ReceivedFromOwnAccount`] name the
+    /// far account, so they record a complete movement whose other half exists;
+    /// this one records that the movement happened and that its far endpoint is
+    /// his and unnamed. Before it existed, a person who knew exactly this had
+    /// two words and both wrote a wrong fact — naming a far account invents a
+    /// half the document does not hold, and «I paid somebody» files an internal
+    /// move as spending. A source printing the same claim was already believed
+    /// (`FarSide::OwnAccount`); the owner was not, which is decision 0006's
+    /// defect one row along.
+    ///
+    /// **It carries no direction and does not need one**, which is why it is a
+    /// bare variant. Where the source printed a sign, that sign is the
+    /// direction and the fact posts one cash leg; where it printed none, the
+    /// fact is the legless one — the journal cannot debit or credit an account
+    /// on a movement whose direction nobody stated. `ObservedRow::resolve_with`
+    /// is where the two meet, and `EventKind::UnresolvedOwnAccountMovement`
+    /// carries the reason.
+    ///
+    /// **It is not an assertion that the amount stayed inside a contour.** No
+    /// contour can prove it holds every account the owner has, so an unnamed
+    /// own endpoint is classified as indeterminate and the amount is *reported*
+    /// as one no report could place. What he gets is that his spending stops
+    /// being overstated; the stronger claim — that the far side is inside the
+    /// group he drew — is a different claim and is not this one.
+    BetweenOwnAccounts,
 }
 
 impl Answer {
@@ -945,18 +1055,34 @@ impl Answer {
             Self::Fee { .. } => AnswerShape::Fee,
             Self::Income { .. } => AnswerShape::Income,
             Self::Refund => AnswerShape::Refund,
+            Self::BetweenOwnAccounts => AnswerShape::BetweenOwnAccounts,
         }
     }
 
-    /// Which way the money went.
+    /// Which way the money went, where the answer says.
+    ///
+    /// **`None` for exactly one answer, and it is not a widening of the
+    /// contract.** The seven that state a direction still state one, and the
+    /// caller that resolves a row reads this before the row's own word, so an
+    /// owner contradicting the source still wins. [`Self::BetweenOwnAccounts`]
+    /// states none because it has none to state — he was asked which of his
+    /// accounts the far side is, not which way the money ran — and the row is
+    /// then resolved with the direction the **source** printed, or with none if
+    /// it printed none. That is `ObservedRow::resolve_with`, and it is the only
+    /// place the two are put together.
+    ///
+    /// Answering `Some` here for it would have meant guessing a direction, and
+    /// answering it in the type would have meant an `Option` on every variant
+    /// that has one.
     #[must_use]
-    pub const fn movement(&self) -> Movement {
+    pub const fn movement(&self) -> Option<Movement> {
         match self {
-            Self::SentToOwnAccount { .. } | Self::Paid | Self::Fee { .. } => Movement::Out,
+            Self::SentToOwnAccount { .. } | Self::Paid | Self::Fee { .. } => Some(Movement::Out),
             Self::ReceivedFromOwnAccount { .. }
             | Self::Received
             | Self::Income { .. }
-            | Self::Refund => Movement::In,
+            | Self::Refund => Some(Movement::In),
+            Self::BetweenOwnAccounts => None,
         }
     }
 
@@ -983,6 +1109,13 @@ impl Answer {
             Self::Fee { origin } => Classification::Fee { origin: *origin },
             Self::Income { kind } => Classification::Income { kind: *kind },
             Self::Refund => Classification::Refund,
+            // The sixth outcome, which until now only a **source** could reach.
+            // The projection is lossy here as it is everywhere else in this
+            // function, and one loss is deliberate beyond the direction: what
+            // this answer generalises into is nothing at all
+            // ([`AnswerShape::generalises`]), so the value below never becomes
+            // a matcher's outcome by this route.
+            Self::BetweenOwnAccounts => Classification::OwnAccountMovement,
         }
     }
 }

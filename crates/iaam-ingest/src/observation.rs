@@ -508,14 +508,25 @@ impl ObservedRow {
 
     /// The row resolved by an answer the owner gave.
     ///
-    /// An answer always states a direction — every variant of [`Answer`] names
-    /// one — so this is the caller for which the argument above is never
-    /// `None`. That is not an accident of the current vocabulary: an answer
-    /// that stated no direction would have to be admitted by a question, and
-    /// the question that would admit it is the one the owner is being asked
-    /// precisely because nothing has settled the direction.
+    /// **The answer's direction is read first and the row's second**, and that
+    /// order is the contract: an answer states its own direction and the owner
+    /// is entitled to contradict the source, so a row printed as incoming and
+    /// answered `paid` is recorded as leaving.
+    ///
+    /// Seven of the eight answers state one, so for them the fallback is dead
+    /// code. [`Answer::BetweenOwnAccounts`] states none — it says whose the far
+    /// side is and not which way the money ran — and it is the one answer for
+    /// which the row's own word decides: a source that printed a sign gives the
+    /// movement its leg, and a source that printed nothing leaves the fact
+    /// legless, which is the pair of shapes
+    /// [`Classification::OwnAccountMovement`] resolves into above. Refusing the
+    /// pairing instead would refuse the only answer the owner of such a row can
+    /// truthfully give.
     pub fn resolve_with(&self, answer: Answer) -> Result<SubmittedOperation, Rejection> {
-        self.resolve(answer.classification(), Some(answer.movement()))
+        self.resolve(
+            answer.classification(),
+            answer.movement().or_else(|| self.movement()),
+        )
     }
 
     fn self_transfer(&self) -> Rejection {

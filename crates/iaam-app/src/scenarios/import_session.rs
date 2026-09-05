@@ -1055,9 +1055,9 @@ pub async fn add_rows(
 
 /// What became of the chance to turn one answer into a standing rule.
 ///
-/// Four states, and only three of them can be true of an answered question.
+/// Five states, and only four of them can be true of an answered question.
 ///
-/// **Why four and not an `Option<rule>`.** The rule identifier alone cannot say
+/// **Why states and not an `Option<rule>`.** The rule identifier alone cannot say
 /// why it is absent, and since the answering scope narrowed (`iaam-hnod`) it has
 /// been absent for two unrelated reasons: the row offered nothing a matcher
 /// could match on, or the answer arrived under a token that may not generalise.
@@ -1115,6 +1115,24 @@ pub enum Generalisation {
     /// under generalises into nothing, and there is no call the owner could make
     /// that would change that.
     Impossible,
+    /// The row could have grounded a rule and the **answer** is not one to
+    /// generalise (`iaam-axrf`).
+    ///
+    /// Kept apart from [`Self::Impossible`] because the two absences have
+    /// nothing in common except being absences, and `impossible` makes a claim
+    /// about the **row** — that it prints nothing a matcher could ask about —
+    /// which is false here and which a client can act on wrongly: it is the one
+    /// state that says no call of anybody's will ever produce a rule for this
+    /// line, and the row here may well ground one for a different answer given
+    /// on a later import.
+    ///
+    /// It is not [`Self::Available`] either, and that is the load-bearing half.
+    /// `available` publishes the rule for the owner to adopt and the queue
+    /// offers him the act; this state has nothing to offer, because there is
+    /// nothing here anybody should make stand. Which answers these are and why
+    /// is `AnswerShape::generalises`, and it is asked of the answer rather than
+    /// restated here.
+    DoesNotGeneralise,
 }
 
 impl Generalisation {
@@ -1126,6 +1144,7 @@ impl Generalisation {
             Self::Recorded { .. } => "recorded",
             Self::Available { .. } => "available",
             Self::Impossible => "impossible",
+            Self::DoesNotGeneralise => "does_not_generalise",
         }
     }
 }
@@ -1234,13 +1253,17 @@ pub fn generalisation_ahead(
 
 /// What one question's answer did, or could still do, to the standing rules.
 ///
-/// The order of the three tests is the decision. A written rule settles it
+/// The order of the four tests is the decision. A written rule settles it
 /// whatever the row says, because that rule exists and the row is no longer the
 /// evidence. Then a question he has not answered, which has no answer to
-/// generalise. Only then is the row consulted, and a row this build cannot read
-/// falls to `Impossible` beside a row that asks nothing — which is not a fudge:
-/// «no rule can be built from this» is true of both, and the assessment is where
-/// an unreadable row is reported as unreadable.
+/// generalise. Then the answer itself, because one of the eight is not a claim
+/// about every row like this one and is therefore never made into a rule
+/// (`AnswerShape::generalises`) — asked here rather than after the row, so that
+/// a row this build cannot read cannot turn that answer into `Impossible`.
+/// Only then is the row consulted, and a row this build cannot read falls to
+/// `Impossible` beside a row that asks nothing — which is not a fudge: «no rule
+/// can be built from this» is true of both, and the assessment is where an
+/// unreadable row is reported as unreadable.
 ///
 /// **`is_open` is the right test here and is not the one `iaam-m2oi` replaced.**
 /// This asks what the owner's *answer* generalised into, and a question he never
@@ -1266,17 +1289,24 @@ pub fn generalisation_of(
     if question.is_open() {
         return Generalisation::Unanswered;
     }
+    let answer: Option<Answer> = question
+        .answer
+        .as_deref()
+        .and_then(|stored| serde_json::from_str(stored).ok());
+    // Asked of the answer alone, and before the row is read. Whether an answer
+    // is one to generalise is a property of the word he said and of nothing
+    // else, so a row this build cannot read does not turn the truthful
+    // `does_not_generalise` into the false `impossible`.
+    if answer.is_some_and(|answer| !answer.shape().generalises()) {
+        return Generalisation::DoesNotGeneralise;
+    }
     observed_row(observations, question.row)
         .ok()
         .and_then(|observed| {
             let matcher = matcher_for(&observed)?;
-            let answer: Answer = question
-                .answer
-                .as_deref()
-                .and_then(|stored| serde_json::from_str(stored).ok())?;
             Some(Generalisation::Available {
                 matcher,
-                outcome: answer.classification(),
+                outcome: answer?.classification(),
             })
         })
         .unwrap_or(Generalisation::Impossible)
@@ -1618,7 +1648,20 @@ pub async fn answer_question(
     // caller addressed. A rule per settled row would be one decision recorded
     // many times — and `matcher_for` builds them all from the same field of the
     // same subject, so they would be the same rule written over and over.
-    let answered = match matcher_for(&observed).filter(|_| may_generalise(principal)) {
+    // Two filters and they refuse different things. `may_generalise` is about
+    // the **answerer**: an agent settles the row and the standing decision stays
+    // the owner's, and the rule it would have written is published as
+    // [`Generalisation::Available`] for him to adopt. `generalises` is about the
+    // **answer**: «it was between accounts of mine and I cannot say which» is a
+    // fact about what this document did not contain, and a rule made of it would
+    // file every later row of the same shape as unplaceable — including the ones
+    // whose far half is in the export and which the pairing would settle whole.
+    // So there is nothing here for anybody to adopt, and the question reports
+    // [`Generalisation::DoesNotGeneralise`] rather than a proposal.
+    let answered = match matcher_for(&observed)
+        .filter(|_| may_generalise(principal))
+        .filter(|_| answer.shape().generalises())
+    {
         Some(matcher) => {
             let rule = services
                 .rules
@@ -6152,7 +6195,9 @@ const fn named_account(answer: Answer) -> Option<AccountId> {
         | Answer::Received
         | Answer::Fee { .. }
         | Answer::Income { .. }
-        | Answer::Refund => None,
+        | Answer::Refund
+        // The one own-account answer that names none, which is the whole of it.
+        | Answer::BetweenOwnAccounts => None,
     }
 }
 
@@ -6404,6 +6449,15 @@ impl NoCounterpart {
     /// question the row raises is where the other half went; «name the far
     /// account» and «this left the perimeter» are answers to a question nobody
     /// asked of it.
+    ///
+    /// **And both then name the answer that is** (`iaam-axrf`). Until there was
+    /// one, this paragraph told him what his two words would do to the row and
+    /// left him to pick one of them anyway — a door pointed at and not built,
+    /// which was the one criterion the wave that wrote it could not meet. The
+    /// third answer is offered by exactly the questions this paragraph is
+    /// published on, because both gates are `AnswerShape::needs_account` over
+    /// what the question admits, so the sentence cannot name a word its own
+    /// question would refuse.
     #[must_use]
     pub const fn reported(self) -> &'static str {
         match self {
@@ -6416,7 +6470,13 @@ impl NoCounterpart {
                  an account that is not in his directory. Naming a far account in the answer \
                  records the whole movement from this row alone, and answering that the money \
                  left the perimeter files it as spending — so what this row needs settled is \
-                 where the other half went, and not which of the ordinary alternatives fits."
+                 where the other half went, and not which of the ordinary alternatives fits. There is an answer for exactly \
+                 that, published among this question's alternatives: that the money moved \
+                 between accounts of his and that he cannot say which account the other side \
+                 is. It records the movement without inventing a half the document does not \
+                 hold and without filing it as spending, and it keeps no standing decision, \
+                 because it says what this statement did not contain rather than what the line \
+                 was."
             }
             Self::SeveralAccounts => {
                 "This document holds no counterpart for it: it covers more than one account, and \
@@ -6429,7 +6489,13 @@ impl NoCounterpart {
                  the answer records the whole movement from this row alone, and answering that \
                  the money left the perimeter files it as spending — so what this row needs \
                  settled is where the other half went, and not which of the ordinary \
-                 alternatives fits."
+                 alternatives fits. There is an answer for exactly \
+                 that, published among this question's alternatives: that the money moved \
+                 between accounts of his and that he cannot say which account the other side \
+                 is. It records the movement without inventing a half the document does not \
+                 hold and without filing it as spending, and it keeps no standing decision, \
+                 because it says what this statement did not contain rather than what the line \
+                 was."
             }
         }
     }
@@ -6710,6 +6776,13 @@ fn covers_one_account(observations: &[ImportObservationView]) -> bool {
 /// word: money that left the perimeter, income, a fee or a refund is a row his
 /// answer already said what it was, and a shape it happens to share with another
 /// row does not overrule it.
+///
+/// **`BetweenOwnAccounts` is among the others and is the interesting one**: it
+/// says the far side is his and does *not* name it, so there is no account to
+/// put here. Deriving one — pairing it with whichever row of the session
+/// mirrors it — would be the matcher decision 0013 §5 declined to build, and
+/// building it in this function would build it for one row at a time and call it
+/// his answer.
 fn answered_side(
     row: u32,
     observed: &ObservedRow,
@@ -6723,7 +6796,8 @@ fn answered_side(
         | Answer::Received
         | Answer::Fee { .. }
         | Answer::Income { .. }
-        | Answer::Refund => return None,
+        | Answer::Refund
+        | Answer::BetweenOwnAccounts => return None,
     };
     Some(MirrorSide {
         row,
@@ -9723,6 +9797,48 @@ mod tests {
         }
     }
 
+    /// The paragraph points at an answer that exists (`iaam-axrf`).
+    ///
+    /// The wave that added it was right about the row and had nowhere to send
+    /// him: it says that naming a far account records a movement whose other
+    /// half this document does not hold, and that «the money left the
+    /// perimeter» files an internal move as spending, and then stops. Both
+    /// halves are asserted here — that the question carrying the paragraph
+    /// admits the third answer, and that the paragraph says so — because either
+    /// alone is the defect: an answer nothing mentions is one he never reaches,
+    /// and a sentence naming an answer the question refuses is worse than
+    /// silence.
+    #[test]
+    fn the_no_counterpart_paragraph_names_an_answer_the_question_admits() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let observed = directionless(row(main, "Shop One", Some(date!(2025 - 04 - 10))));
+        let asked = Question::UnresolvedDirection {
+            account: main,
+            stated: observed.source_kind.clone(),
+            counterparty: observed.counterparty_name().map(str::to_owned),
+        };
+        let observations = vec![stored_row(1, &observed)];
+        let questions = vec![stored_question_about(1, &asked)];
+
+        let movements = mirrored_movements_of(session, &observations, &questions);
+        let Some(&OneMovement::NoCounterpart(reason)) = movements.get(&1) else {
+            panic!("the row this paragraph is written for: {movements:?}");
+        };
+        assert!(
+            asked
+                .alternatives()
+                .contains(&AnswerShape::BetweenOwnAccounts),
+            "the paragraph is published only on a question that offers the answer it points at"
+        );
+        assert!(
+            reason.reported().contains("cannot say which"),
+            "the paragraph names the answer rather than leaving him with the two \
+             it has just told him are wrong: {}",
+            reason.reported()
+        );
+    }
+
     /// The queue weighs every row of the session, not only the questioned ones
     /// (`iaam-y5ww`).
     ///
@@ -11338,6 +11454,35 @@ mod tests {
             outcome,
             Classification::ExternalFlow,
             "the outcome is the classification the answer settled the row as"
+        );
+    }
+
+    /// The one answer that is not a claim about every row like it (iaam-axrf).
+    ///
+    /// The other seven say what a thing **was** and generalise. This one says
+    /// what the document did not contain, which is a fact about one row: a
+    /// standing decision made of it would file every later row of the same shape
+    /// as an unplaceable movement, including the ones whose other half is in the
+    /// export and which the pairing would have settled completely.
+    ///
+    /// The row here is the one that **could** ground a matcher — it prints a
+    /// counterparty — so the state is not `Impossible`, and asserting that is
+    /// the point: `Impossible` claims no rule can be built from the row under
+    /// any token, and here the row is fine and the answer is the reason.
+    #[test]
+    fn an_answer_that_says_what_the_document_did_not_contain_generalises_into_nothing() {
+        let contents = session_with(
+            row(account(1), "Savings", None),
+            Some(Answer::BetweenOwnAccounts),
+            None,
+        );
+        let described = generalisation_of(&contents.observations, &contents.questions[0]);
+        assert_eq!(described, Generalisation::DoesNotGeneralise);
+        assert_eq!(described.code(), "does_not_generalise");
+        assert_ne!(
+            described,
+            Generalisation::Impossible,
+            "the row prints a counterparty, so a rule could have been built from it"
         );
     }
 

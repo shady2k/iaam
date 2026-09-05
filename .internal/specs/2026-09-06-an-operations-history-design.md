@@ -94,10 +94,20 @@ Each step carries:
 - `events` — the identifiers this act wrote (`reversal`, `replacement`), so every
   entry is addressable and a correction of a correction can be asked for by name.
 
-`changed` is a closed vocabulary computed from the two published states, never a
-rendered before-and-after: both states are right there, and rendering the
-difference twice is two answers that come to disagree. The aspects are `kind`,
-`amount`, `account`, `dates`, `counterparty` and `confidence`.
+`changed` is a closed vocabulary, and never a rendered before-and-after: the
+states are published beside it, and rendering the difference as well is a second
+answer to the same question that comes to disagree with the first. The aspects
+are `kind`, `amount`, `account`, `dates`, `counterparty` and `confidence`.
+
+It is computed from the **facts**, not from the two published states, and the
+difference matters. The published state carries the kind as a word and the legs;
+the scalars inside the kind — what sort of income it was, what a fee was for, a
+valuation's price — are not published on their own, and a fact that posts no leg
+at all publishes no sum from its legs. Comparing only what is published would
+report an empty `changed` on a correction that changed one of those, which is
+exactly the silence this field exists to prevent. So the comparison reads the
+facts, and where a fact posts no leg the sum it states is published beside the
+legs so that what `changed` names is also visible.
 
 **A category is not among them, and that is a real limit to state rather than
 hide.** A category is not recorded on the fact; it is decided by the owner's

@@ -28,10 +28,16 @@ CREATE INDEX events_by_relation_target
 -- once per row of the group, that a rule was written from his one answer.
 --
 -- The version is a column of its own, matching `events.settled_by_rule` and
--- `events.settled_by_rule_version` (`0029`): a rule can be edited after it is
--- minted, and "the rule this answer minted" and "the rule at whatever
--- version it holds now" are two different questions. Folding both into one
--- column would answer only the second.
+-- `events.settled_by_rule_version` (`0029`), because the two are selected on
+-- separately: "which rows did this rule file" names no version, and a single
+-- column holding "rule/version" would have to be taken apart to answer it.
+--
+-- A version is the owner's decision number in sequence and never moves once
+-- the rule is written — an edit retires the rule and writes a new one under a
+-- new identifier and the next number — so what is recorded here is the pair
+-- as it stood when he answered, and it stays readable without consulting the
+-- rules at all. That is the point of recording it: a rule he retires later
+-- still names the decision that filed the row.
 --
 -- Both columns are nullable, and nothing is back-filled. NULL is the honest
 -- answer for every observation recorded before this migration and for every

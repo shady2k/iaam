@@ -18350,7 +18350,7 @@ async fn the_journal_returns_the_rows_one_rule_filed_and_each_row_names_it() {
     assert_eq!(filed["rule_settlement"]["rule"], json!(rule), "{page}");
     assert!(
         filed["rule_settlement"]["version"].is_u64(),
-        "the version is on the fact, because a rule can be edited: {page}"
+        "the version is on the fact, because the pair is what names the decision: {page}"
     );
     assert!(
         filed["rule_settlement"]["explanation"]
@@ -18424,7 +18424,7 @@ async fn the_journal_returns_the_rows_one_rule_filed_and_each_row_names_it() {
     assert_eq!(
         status,
         StatusCode::UNPROCESSABLE_ENTITY,
-        "a version numbers one rule's revisions, so it names nothing alone: {lone_version}"
+        "a version is a position in his sequence of decisions, so it names no rule alone: {lone_version}"
     );
 }
 
@@ -18593,7 +18593,7 @@ async fn a_rules_group_holds_the_rows_the_answer_that_minted_it_settled_and_says
         assert_eq!(
             settlement["version"].as_u64(),
             Some(minted),
-            "a rule can be edited, so the fact says which version filed it: {page}"
+            "the fact names the decision by the pair, not by the identifier alone: {page}"
         );
         assert!(
             settlement["explanation"]

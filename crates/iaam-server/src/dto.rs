@@ -9120,9 +9120,13 @@ pub struct JournalRuleSettlementDto {
     pub rule: Option<Uuid>,
     /// The version of that rule at the time it filed the row.
     ///
-    /// Recorded because a rule can be edited: after an edit, «the rows this rule
-    /// filed» and «the rows the version I have just replaced filed» are
-    /// different sets, and only the second is the one to review.
+    /// A version counts your decisions, not a rule's own revisions: every rule
+    /// you write takes the next number in your sequence, and editing one
+    /// retires it and writes a new rule under a new identifier and the next
+    /// number. Recorded beside the identifier because the pair is what names
+    /// the decision — a rule you retire later still names the decision that
+    /// filed this row, and `?settled_by_rule=` with `?settled_by_rule_version=`
+    /// asks for exactly it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
 }
@@ -9450,18 +9454,43 @@ pub struct OperationHistoryStepDto {
 /// One thing the owner did to an operation, as opposed to one fact the journal
 /// holds.
 ///
-/// A correction is two facts — a reversal of the target and a replacement of it
-/// — and publishing them raw would show two entries for one thing he did and
-/// leave the reader to work out that they are one act. The pairing is done once,
-/// here, and there are three words for it and no more.
+/// A correction is normally two facts — a reversal of the target and a
+/// replacement of it — and publishing them raw would show two entries for one
+/// thing he did and leave the reader to work out that they are one act. The
+/// folding is done once, here, and there are three words for it and no more.
+/// Where only one half of a correction was written, the act still gets one
+/// entry and says which half it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryActDto {
     /// The fact entered the journal. The first step of every history, and the
     /// only step of most of them.
+    ///
+    /// It is also the word for a history that begins at a fact naming a target
+    /// this journal does not hold. The walk backwards stops at such a target
+    /// rather than failing over it, because from here a target that was never
+    /// written, one belonging to another owner and one lost to a corrupt
+    /// database cannot be told apart: a step saying «there was more before
+    /// this» would claim what nothing supports, and one saying «there was not»
+    /// would be false.
+    ///
+    /// `changed` is empty on this step as on any arrival, and here that
+    /// emptiness is not the statement it is elsewhere — something did precede
+    /// the fact, and this route cannot see it. What speaks about it is
+    /// `relation` on `state`, published exactly as the fact carries it, and on
+    /// such a step it is the only thing that does.
     Arrived,
-    /// A reversal and a replacement of the same target: the fact stopped
-    /// counting and another took its place. `state` is the replacement.
+    /// A replacement of the target, and the reversal beside it where one was
+    /// written: another fact took the target's place. `state` is the
+    /// replacement.
+    ///
+    /// The replacement is what makes the act; the reversal is not required
+    /// beside it. A correction is normally the pair and `POST /v1/corrections`
+    /// takes both halves in one call, but a replacement submitted on its own is
+    /// accepted — the two halves may be sent in separate calls, and a replaced
+    /// fact stops counting because it was replaced, not because a reversal
+    /// names it. Such an act is published under this word with `reversal`
+    /// absent, which is what happened: something took the fact's place.
     Corrected,
     /// A reversal with no replacement: the fact stopped counting and nothing
     /// took its place, so there is no `state` after it.
@@ -9476,7 +9505,11 @@ pub enum HistoryActDto {
 
 /// Which aspect of the fact an act made different.
 ///
-/// A closed vocabulary, computed from the two published states.
+/// A closed vocabulary, computed from the two facts and not from the two
+/// published states beside it. A `state` carries the kind as a word and the
+/// legs; the scalars that tell two facts of one family apart are published
+/// nowhere on their own, and comparing only what is published would report an
+/// empty `changed` on a correction that changed one of them — see `kind` below.
 ///
 /// **A category is not among them, and that is a real limit rather than an
 /// omission.** A category is not recorded on the fact at all — it is decided by

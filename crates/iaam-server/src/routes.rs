@@ -5131,12 +5131,19 @@ pub struct JournalParams {
     pub settled_by_rule: Option<Uuid>,
     /// One version of that rule.
     ///
-    /// A rule can be edited, and its version counts its own revisions. «What
-    /// this rule filed» and «what version 3 of it filed» are different
-    /// questions, and after an edit the second is usually the one being asked.
+    /// A version counts the owner's decisions, not a rule's own revisions:
+    /// every rule he writes takes the next number in his sequence, and editing
+    /// one retires it and writes a new rule under a new identifier and the next
+    /// number. So a rule and its version are fixed together the moment it is
+    /// written, and a fact records the pair as it stood when the row was filed.
     ///
-    /// Supplied together with `settled_by_rule`. On its own it names nothing, so
-    /// it is refused rather than quietly ignored.
+    /// Naming both here therefore asks for exactly the decision meant, and a
+    /// version that is not the named rule's matches no fact rather than falling
+    /// back to the rule's own rows.
+    ///
+    /// Supplied together with `settled_by_rule`. On its own it is a position in
+    /// his sequence and not a name for a rule, so it is refused rather than
+    /// quietly ignored.
     #[serde(default)]
     pub settled_by_rule_version: Option<u32>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.

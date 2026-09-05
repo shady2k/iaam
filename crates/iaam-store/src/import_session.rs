@@ -108,9 +108,13 @@ pub struct StoredSessionSummary {
 /// is what it cost the last time one existed. The pair makes it
 /// unrepresentable.
 ///
-/// The version is the one that stood **when the rule was minted**, not the one
-/// the rule carries when the session commits. A rule can be edited in between,
-/// and the fact has to record the version it was filed under.
+/// The version is the one that stood **when the rule was minted**, and it is the
+/// only one that rule will ever carry: a version is the owner's decision number
+/// in sequence, and an edit retires the rule and writes a new one under a new
+/// identifier and the next number rather than raising the old one's. Recording
+/// it beside the identifier is therefore not a guard against a number that
+/// moves — it is what lets a reader say which decision of his filed the row
+/// without consulting the rules, including once that rule has been retired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredAnswerRule {
     pub rule: ClassificationRuleId,
@@ -693,10 +697,13 @@ impl SqliteStore {
     /// and it may not overwrite one already recorded. A row that no longer meets
     /// it is a `NotFound`, and the refusal takes the whole call with it.
     ///
-    /// The version is the caller's, taken at the moment the rule was minted. It
-    /// is deliberately not read back from the rule store at commit: a rule can
-    /// be edited between the answer and the commit, and the fact must record the
-    /// version it was filed under.
+    /// The version is the caller's, taken at the moment the rule was minted, and
+    /// it is deliberately not read back from the rule store at commit. Not
+    /// because it could have changed — a rule keeps the version it was written
+    /// under, since an edit retires it and writes a new rule with a new
+    /// identifier — but because the pair the answer established is the whole of
+    /// what this records. Reading it back would make the write depend on a rule
+    /// the owner may since have retired.
     pub fn attach_import_answer_rule(
         &mut self,
         owner: OwnerId,

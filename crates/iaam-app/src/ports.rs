@@ -1230,10 +1230,15 @@ pub trait Store: Send + Sync {
     /// name the rule and the rows that do not — leaving «show me everything this
     /// decision did» answering with part of it.
     ///
-    /// `version` is the version the rule was **minted** at. It is deliberately
-    /// passed in rather than read back at commit: a rule can be edited between
-    /// the answer and the commit, and the fact must record the version it was
-    /// filed under.
+    /// `version` is the version the rule was **minted** at, and it is passed in
+    /// rather than read back at commit. Not because the number could have moved
+    /// since: a rule's version is the owner's decision number in sequence, and
+    /// an edit retires the rule and writes a new one under a new identifier
+    /// rather than raising this one's, so the pair is fixed the moment the rule
+    /// is written. It is passed in because the pair is what the answer already
+    /// established, and recording it here means the rules port is not consulted
+    /// at commit for it at all — so a rule the owner retires between his answer
+    /// and the commit cannot take the commit down with it.
     ///
     /// Refused for a row nobody answered and for a row already naming a minted
     /// rule, exactly as [`Self::attach_import_question_rule`] is, and the
@@ -1387,9 +1392,13 @@ pub struct ImportObservationView {
 /// truthful answer to give about it. The pair makes it unrepresentable.
 ///
 /// The version is the one that stood when the rule was minted, which is what
-/// the fact records. It is not the version the rule carries at commit: a rule
-/// can be edited in between, and «the rows this rule filed» and «the rows the
-/// version I have just replaced filed» are different questions.
+/// the fact records — and it is the only version that rule will ever carry. A
+/// version is the owner's decision number in sequence, and an edit retires the
+/// rule and writes a new one under a new identifier and the next number, so the
+/// pair cannot drift from what the answer established. Carrying it is therefore
+/// not a guard against drift: it is what lets a reader say which decision of his
+/// filed the row without going to the rules at all, including after that rule
+/// has been retired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnswerRule {
     pub rule: ClassificationRuleId,

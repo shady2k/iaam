@@ -84,10 +84,13 @@ pub struct JournalReadQuery {
     pub settled_by_rule: Option<ClassificationRuleId>,
     /// One version of that rule, where the caller wants only its rows.
     ///
-    /// A rule can be edited, so «the rows rule R filed» and «the rows version 3
-    /// of R filed» are different questions, and after an edit the second is the
-    /// one asked. Supplied together with the rule; a version on its own names
-    /// nothing and is refused rather than ignored.
+    /// A version counts his decisions rather than one rule's revisions: every
+    /// rule he writes takes the next number in his sequence, and an edit retires
+    /// the rule and writes a new one under a new identifier and the next number.
+    /// A fact records the pair as it stood when the row was filed, so naming
+    /// both asks for exactly one decision of his. Supplied together with the
+    /// rule; a version on its own is a position in that sequence and not a name
+    /// for a rule, and is refused rather than ignored.
     pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
@@ -201,14 +204,19 @@ pub struct JournalEventView {
     pub import_session: Option<ImportSessionId>,
     /// What the owner's standing rules made of this row, when a reading said.
     ///
-    /// Three states and not two, and the third is the one he must be able to
-    /// see. A rule names itself and its version — that is the group one decision
-    /// of his reached. `no_rule` says a reading ran and none of his rules
-    /// matched, so the row was settled some other way: he answered it, his
-    /// account directory recognised the far side, the source asserted it, or the
-    /// caller submitted a finished operation. Absence says nothing was recorded
-    /// at all — every fact written before this field existed, and every route
-    /// that writes without reading a row against the rules.
+    /// Four states, and the ones past «a rule filed it» are the ones he must be
+    /// able to see. `rule` names a rule and its version: the group one standing
+    /// decision of his reached without asking him again.
+    /// `answered_minting_rule` names a rule and its version too, and says he
+    /// answered this row by hand and that same answer became the rule — the two
+    /// are different claims about **who decided**, which is why they stay two
+    /// words. `no_rule` says a reading ran and none of his rules matched, so the
+    /// row was settled some other way: his account directory recognised the far
+    /// side, the source asserted it, the caller submitted a finished operation,
+    /// or he answered it and the answer generalised into nothing. Absence is the
+    /// fourth and is none of these: nothing was recorded about rules at all —
+    /// every fact written before this field existed, and every route that writes
+    /// without reading a row against the rules.
     ///
     /// Absence is therefore never «no rule filed this». Reading it that way
     /// tells him a row one of his rules did file was decided by hand.
@@ -311,12 +319,13 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
 /// One thing the owner did to an operation, as opposed to one fact the journal
 /// holds.
 ///
-/// A correction is two facts — a reversal of the target and a replacement of
-/// it — and publishing them raw would show him two entries for one thing he
-/// did and leave him to work out that they are one act. The pairing is
-/// unambiguous, because both name the same target and `resolve` refuses a
-/// second replacement of an event, so it is done once, here, and every reader
-/// downstream is handed acts.
+/// A correction is normally two facts — a reversal of the target and a
+/// replacement of it — and publishing them raw would show him two entries for
+/// one thing he did and leave him to work out that they are one act. The
+/// folding is unambiguous, because both name the same target and `resolve`
+/// refuses a second replacement of an event, so it is done once, here, and
+/// every reader downstream is handed acts. Where only one half was written the
+/// act is still one entry, and which half it holds is on the step.
 ///
 /// Three of them, and no more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,9 +338,19 @@ pub enum HistoryAct {
     /// [`read_operation_history`] for why that ends the walk rather than
     /// failing it.
     Arrived,
-    /// A reversal and a replacement of the same target: the fact stopped
-    /// counting and another took its place. The state after the act is the
-    /// replacement.
+    /// A replacement of the target, and the reversal beside it where one was
+    /// written: another fact took the target's place. The state after the act
+    /// is the replacement.
+    ///
+    /// The replacement is what makes the act, and a reversal beside it is not
+    /// required. `candidate_for` in [`crate::scenarios::correction`] checks
+    /// only that a replacement's target exists, and
+    /// [`iaam_core::event::correction::resolve`] drops a replaced fact from the
+    /// effective set because it was replaced, not because a reversal names it —
+    /// so the two halves may be submitted in separate calls, and a replacement
+    /// alone is a correction. [`acts_of`] publishes such an act under this word
+    /// with no `reversal`, which says what happened: something took the fact's
+    /// place.
     Corrected,
     /// A reversal with no replacement: the fact stopped counting and nothing
     /// took its place, so there is no state after it.
@@ -570,9 +589,21 @@ fn replacement_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedE
 
 /// When an act of two facts reached the journal: the earlier of the two stamps.
 ///
-/// Compared as text, which is what they are: every stamp is written by this
-/// instance in the one RFC 3339 form, at UTC, so ordering them as strings
-/// orders them in time.
+/// Compared as text, which is what they are, and text order is time order for
+/// every pair whose stamps differ by a whole second or more: each is written by
+/// this instance at UTC in the one RFC 3339 form, so the fields line up
+/// character by character down to the seconds.
+///
+/// **Past the seconds it is not.** The writer omits the fractional part when
+/// the nanoseconds are zero and trims its trailing zeros otherwise, so the
+/// stamps are of variable width and `…:00.4Z` sorts before `…:00Z` on `'.'`
+/// against `'Z'`. Two stamps can therefore come back in the wrong order, but
+/// only when they fall inside one second — the prefix before the fractional
+/// part is what decides every other pair — and only the value chosen is
+/// affected, never a position: the steps of a history are ordered by the walk
+/// and not by this, and the two halves of one act are one step. Parsing both
+/// to compare them as instants would buy a sub-second distinction that nothing
+/// reads.
 fn recorded_first(reversal: Option<&RecordedEvent>, replacement: &RecordedEvent) -> String {
     reversal.map_or_else(
         || replacement.recorded_at.clone(),
@@ -911,10 +942,11 @@ fn stated_amount(event: &Event) -> Option<Money> {
 
 /// The rule narrowing, with the pair checked before either half is used.
 ///
-/// A version numbers one rule's own revisions, so a version with no rule beside
-/// it names nothing at all. Accepting it and ignoring it would answer a question
-/// nobody asked — every version's rows under a request for one — and the caller
-/// would have no way to tell that from a rule genuinely edited only once.
+/// A version is a position in the owner's sequence of decisions, not a name for
+/// a rule, so a version with no rule beside it addresses nothing a caller could
+/// have meant. Accepting it and ignoring it would answer a question nobody asked
+/// — every rule's rows under a request for one decision's — and the caller would
+/// have no way to tell that from a genuinely wide result.
 fn rule_filter(
     rule: Option<ClassificationRuleId>,
     version: Option<u32>,
@@ -923,8 +955,8 @@ fn rule_filter(
         if let Some(version) = version {
             return Err(AppError::Invalid {
                 field: "settled_by_rule_version".to_owned(),
-                expected: "a rule named beside the version, because a version numbers one \
-                           rule's own revisions"
+                expected: "a rule named beside the version, because a version is a position in \
+                           your sequence of decisions and not a name for a rule"
                     .to_owned(),
                 actual: version.to_string(),
             });
@@ -1107,9 +1139,10 @@ mod tests {
 
     #[test]
     fn a_rule_version_with_no_rule_beside_it_is_refused() {
-        // A version numbers one rule's own revisions, so «version 3» on its own
-        // names nothing. Accepting it and ignoring it would hand back every
-        // version's rows under a question that asked for one.
+        // A version is a position in the owner's sequence of decisions, so
+        // «version 3» on its own names no rule. Accepting it and ignoring it
+        // would hand back every rule's rows under a question that asked for
+        // one decision's.
         let error = rule_filter(None, Some(3)).expect_err("a version alone is refused");
         let AppError::Invalid { field, actual, .. } = error else {
             panic!("a lone version is refused as an invalid field");

@@ -533,10 +533,10 @@ pub struct JournalQuery {
     pub settled_by_rule: Option<ClassificationRuleId>,
     /// Narrower still: only the facts **that version** of the rule filed.
     ///
-    /// Meaningless without the rule beside it, because a version numbers one
-    /// rule's own revisions and nothing else. The caller that refuses the pair
-    /// is the application; a second copy of that refusal here would drift from
-    /// the first.
+    /// Meaningless without the rule beside it, because a version is a position
+    /// in the owner's sequence of decisions and not a name for a rule. The
+    /// caller that refuses the pair is the application; a second copy of that
+    /// refusal here would drift from the first.
     pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
@@ -822,6 +822,20 @@ impl SqliteStore {
     /// place. A pair written the other way round is still one act, and reading
     /// it in the order it was stored would describe the same act differently
     /// depending on how the request was assembled.
+    ///
+    /// The stamp and then the identifier break the tie between two facts of the
+    /// same half — two reversals of one target — and exist so that the order is
+    /// total and does not depend on what the query planner returned first. The
+    /// stamp is compared as text, which is time order for any two stamps a whole
+    /// second apart: each is written here at UTC in the one RFC 3339 form. Past
+    /// the seconds it is not, because that form omits the fractional part when
+    /// the nanoseconds are zero and trims its trailing zeros otherwise, so
+    /// `…:00.4Z` sorts before `…:00Z` on `'.'` against `'Z'`. Two facts written
+    /// inside one second can therefore come back in the wrong order, and the
+    /// identifier settles only the pair whose stamps are identical. Both are
+    /// arbitrary at that scale and both are stable, which is what this ordering
+    /// is for: the tie is between facts that are equally the same half of the
+    /// same act.
     fn corrections_naming(
         &self,
         owner: OwnerId,

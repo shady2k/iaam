@@ -1639,13 +1639,29 @@ pub async fn answer_question(
     // about the row, and the rule is derived from it. The derived one goes
     // second.
     //
-    // What remains possible is stated rather than hidden. A failure after this
-    // point leaves the row settled and no rule recorded — which is exactly
-    // `Generalisation::Available`, a state the action queue offers an act for,
-    // so the owner is one call from the rule rather than back at the row. A
-    // caller that sees this call fail must therefore re-read the session rather
-    // than repeat the call: the answer may already stand, and answering twice is
-    // refused.
+    // What remains possible is stated rather than hidden, and there are two
+    // windows rather than one, because the rule is now stamped on the
+    // observations as well as on the question (`iaam-73xv`).
+    //
+    // A failure between the answers and the rule leaves the row settled and no
+    // rule recorded at all — exactly `Generalisation::Available`, a state the
+    // action queue offers an act for, so the owner is one call from the rule
+    // rather than back at the row.
+    //
+    // A failure at the last of the three writes, `attach_import_answer_rule`,
+    // leaves the rule created, the question naming it and no observation
+    // stamped. `generalisation_of` reads the question, so it reports
+    // `Recorded` — true, and a state the queue offers nothing for, because
+    // there is nothing left for him to adopt. `resolution_of` reads the minted
+    // rule off the observation, so the rows commit as `NoRule` and the group
+    // that one decision reached is not assembled. What is lost is the grouping
+    // this wave added; the rule stands, the answer stands, and the row is
+    // classified exactly as he answered it, which is what happened before the
+    // grouping existed.
+    //
+    // A caller that sees this call fail must in either case re-read the session
+    // rather than repeat the call: the answer may already stand, and answering
+    // twice is refused.
     //
     // The reach makes one addition to that reasoning and no change to it. The
     // rows this answer also settles are answered **before** the row it was asked
@@ -1721,8 +1737,13 @@ pub async fn answer_question(
             // half of them would split the group in two while reading as fixed.
             //
             // The version is the one just minted and is never read back at
-            // commit: a rule can be edited in between, and the fact records the
-            // version it was filed under.
+            // commit. There is nothing to re-read: a rule keeps the version it
+            // was written under, because an edit retires it and mints a new
+            // rule with a new identifier rather than raising this one's. The
+            // pair is recorded because it is what the answer established, and
+            // recording it here is what lets the commit name the decision
+            // without asking the rules — including for a rule he retires in
+            // between.
             let settled: Vec<u32> = targets
                 .iter()
                 .map(|target| target.row)
@@ -5515,8 +5536,11 @@ pub enum FactBasis {
     ///
     /// The rule is an identifier and the version is the one it was **minted**
     /// at, for [`Self::Rule`]'s reasons: a rule held as text has no truthful
-    /// answer when it cannot be read back (`iaam-r0qk`), and a rule can be
-    /// edited between the answer and the commit.
+    /// answer when it cannot be read back (`iaam-r0qk`), and the pair names the
+    /// decision itself. The version cannot have moved since — an edit retires a
+    /// rule and writes a new one under a new identifier — so nothing here is
+    /// re-read from the rules, and a rule retired since the answer still names
+    /// the decision that filed the row.
     AnsweredMintingRule {
         rule: ClassificationRuleId,
         version: u32,
@@ -8404,8 +8428,10 @@ fn resolution_of(
         // Which of the two answered bases it is, read off the observation and
         // nowhere else. The minted rule was recorded beside the answer at the
         // moment it was minted, so the version here is the version it was filed
-        // under — not the one the rule carries now, which an edit may have
-        // moved. A row whose answer generalised into nothing, and a row
+        // under — and reading it from the observation rather than from the
+        // rules is what makes that true of a rule since retired, which the
+        // rules would no longer offer. A row whose answer generalised into
+        // nothing, and a row
         // answered before the recording existed, both read as
         // [`FactBasis::Answered`]: nothing is back-filled and no reader turns
         // that silence into a rule.

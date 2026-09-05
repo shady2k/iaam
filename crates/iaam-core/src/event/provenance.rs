@@ -82,10 +82,14 @@ pub enum RuleSettlement {
     NoRule,
     /// This rule, at this version, settled the row.
     ///
-    /// The version is recorded beside the identifier because a rule can be
-    /// edited, and «the rows rule R filed» and «the rows version 3 of R filed»
-    /// are different questions. Recording only the identifier would make the
-    /// second unanswerable, and the second is the one asked after an edit.
+    /// The version counts the owner's decisions rather than this rule's own
+    /// revisions: every rule he writes takes the next number in his sequence,
+    /// and an edit retires the rule and writes a new one under a new identifier
+    /// and the next number. It is recorded beside the identifier because the
+    /// pair is what names the decision, and it is recorded on the fact so that
+    /// «which decision filed this row» stays answerable from the journal alone
+    /// — including for a rule he has since retired, which the rules no longer
+    /// offer.
     Rule {
         rule: ClassificationRuleId,
         version: u32,

@@ -268,8 +268,12 @@ fn the_journal_narrows_to_the_rule_that_settled_the_row() {
     );
 }
 
-/// A rule can be edited, so «what rule R filed» and «what version 3 of R filed»
-/// are two questions, and the second is the one asked after an edit.
+/// A fact records the rule and the version together and the store selects on
+/// the pair, so two facts naming one rule under two numbers are what the
+/// narrowing has to tell apart. The owner's own rules never produce that
+/// shape — an edit retires a rule and writes a new one under a new identifier —
+/// so the pair is written here directly: the store fills the columns from what
+/// the fact says and derives neither.
 #[test]
 fn the_journal_narrows_to_one_version_of_a_rule() {
     let store = SqliteStore::open_in_memory().unwrap();

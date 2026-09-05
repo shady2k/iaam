@@ -198,9 +198,11 @@ fn a_chain_costs_index_lookups_and_never_scans_the_journal() {
         "looking backward must not read the journal through: {backward}"
     );
 
-    // Two corrections are five facts, and the walk that assembled them asked
-    // one question per fact plus one per step back to the head. Nothing here
-    // grows with the size of the journal.
+    // And the walk assembles the whole chain out of those two statements and
+    // nothing else: two corrections are five facts and five come back. What
+    // the walk costs is therefore some number of the lookups the plans above
+    // were just shown to be — the number is not counted here — and what it
+    // returns is bounded by the chain rather than by the journal.
     let chain = store
         .event_chain(ctx.owner, written[4].id)
         .expect("a chain");

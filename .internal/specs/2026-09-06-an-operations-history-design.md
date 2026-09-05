@@ -159,9 +159,12 @@ the question. So the minted rule is recorded where the answer already is:
 1. `import_observations` gains `answer_rule` and `answer_rule_version`
    (migration `0030`), written for every row the answer settled — the row the
    caller addressed and every row its reach reached. The version is recorded at
-   the moment the rule is minted and never read from the rules port at commit: a
-   rule can be edited between the answer and the commit, and the fact must record
-   the version it was filed under.
+   the moment the rule is minted and never read from the rules port at commit —
+   not because it could have moved, since a version is the owner's decision
+   number in sequence and an edit retires the rule and writes a new one under a
+   new identifier and the next number, but because the pair is what the answer
+   established. Recording it keeps the commit from having to ask the rules about
+   the pair at all, and therefore from depending on a rule he has since retired.
 2. `import_questions.rule` is left exactly as it is. Attaching the minted rule to
    the sibling *questions* would be the other way to carry it, and it would change
    what the assessment says about each of them — a question that reported no

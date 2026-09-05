@@ -26198,16 +26198,18 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // The profile is named on the answer, with the reader every fact out of
     // this document would record.
     assert_eq!(read["profile"]["id"], "tbank-operations-csv");
-    // Version 3: the profile reads the category the owner himself filed the row
-    // under and the standardised code, so its reading changed and a version
-    // must name a content — otherwise «the rows version 2 read» is not a set
-    // and a buggy profile's facts stop being findable and retractable.
-    assert_eq!(read["profile"]["version"], 3);
+    // Version 4: the profile reads the category the owner himself filed the row
+    // under and the standardised code, and says the document need not print
+    // either column — so a document it once refused is now one it reads. That
+    // is a different reading, and a version must name a content; otherwise «the
+    // rows version 3 read» is not a set and a buggy profile's facts stop being
+    // findable and retractable.
+    assert_eq!(read["profile"]["version"], 4);
     assert_eq!(read["profile"]["issuer"], "T-Bank");
     assert_eq!(read["profile"]["origin"], "bundled");
     assert_eq!(
         read["profile"]["parser_version"],
-        "profile/tbank-operations-csv/3"
+        "profile/tbank-operations-csv/4"
     );
     assert_eq!(read["profile"]["digest"].as_str().map(str::len), Some(64));
     assert_eq!(read["session"], id);
@@ -26542,7 +26544,7 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // retracted, which is what keeps a corrected profile from doubling a month.
     assert_eq!(
         again["profile"]["parser_version"],
-        "profile/tbank-operations-csv/3"
+        "profile/tbank-operations-csv/4"
     );
 }
 

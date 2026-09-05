@@ -302,6 +302,10 @@ impl ProfileCatalogue {
 
 #[cfg(test)]
 mod tests {
+    use iaam_core::ids::AccountId;
+
+    use crate::csv_source::{AccountEntry, AccountNames};
+
     use super::*;
 
     /// Every profile this build ships loads.
@@ -423,20 +427,25 @@ mod tests {
     }
 
     /// A document carrying every heading a bundled profile recognises on, but
-    /// missing one the profile names in its row shape, is **recognised and then
-    /// refused at read** — which is the wrong answer twice over.
+    /// missing one the profile **requires** in its row shape, is **recognised
+    /// and then refused at read** — which is the wrong answer twice over.
     ///
     /// Recognition says "this profile reads this document" and the read then
     /// says it does not. The honest answer is the one the catalogue gives a
     /// document nothing reads, so recognition must be at least as demanding as
     /// the reading it promises.
+    ///
+    /// The rule runs the other way for a column the profile says the document
+    /// may not print. Recognising on such a column would make its absence
+    /// defeat recognition, which is the whole of what optionality was for; so a
+    /// column that may be absent is exactly a column that identifies nothing.
     #[test]
     fn a_bundled_profile_recognises_on_every_column_it_requires() {
         for installed in ProfileCatalogue::bundled().installed() {
             let profile = &installed.profile;
             let recognised: Vec<&str> =
                 profile.recognised_by().iter().map(String::as_str).collect();
-            for required in profile.columns() {
+            for required in profile.required_columns() {
                 assert!(
                     recognised.contains(&required),
                     "«{required}» is a column «{id}» refuses a document for, and not one it \
@@ -445,27 +454,89 @@ mod tests {
                     id = profile.id(),
                 );
             }
+            for optional in profile.optional_columns() {
+                assert!(
+                    !recognised.contains(&optional),
+                    "«{optional}» is a column «{id}» reads where the document prints it and \
+                     recognises on as well: an export without it is then refused as \
+                     unrecognised, which is the refusal the column was made optional to avoid",
+                    id = profile.id(),
+                );
+            }
         }
     }
 
-    /// The T-Bank export prints a standardised code for a row and leaves it
-    /// empty on rows it assigns none; the profile transcribes that column.
-    /// A document that does not print the column **at all** is a different
-    /// document, and this profile says so rather than reading it and refusing
-    /// every row.
+    /// The T-Bank export prints the owner's own category and a standardised
+    /// code, and an older export prints neither column at all. It is the same
+    /// institution's statement either way, and it is read either way.
     ///
-    /// An empty cell and a missing column are not the same thing: a row that
-    /// prints no code is read, and the field says the source printed none
-    /// (`engine::transcribed`). Nothing requires the *value*. What the missing
-    /// heading settles is whether this profile reads this document at all.
+    /// Both columns are transcribed and neither decides anything: no direction,
+    /// no amount, no day, no account. A month refused over one of them would be
+    /// a month unreadable for a field no rule has to consult, so the profile
+    /// says the document may not print them and the fields say the source
+    /// printed none.
+    ///
+    /// An empty cell and a missing column reach the same reading, which is the
+    /// point: `engine::transcribed` already answers "the source printed none",
+    /// and this is that answer for a whole month.
     #[test]
-    fn a_document_without_the_code_column_is_not_this_profile_s() {
+    fn an_export_without_the_optional_columns_is_read_all_the_same() {
+        let catalogue = ProfileCatalogue::bundled();
+        // Invented end to end. The headings are the source's own printed
+        // strings; every value under them is made up.
+        let document = "Имя счёта;Номер карты;Дата операции;Сумма в валюте счёта;\
+                        Валюта счёта;Статус;Категория по-умолчанию;Описание\n\
+                        Main;*0000;05.08.2026 12:00:00;-1,00;RUB;Ок;Invented;Shop One\n";
+        let installed = catalogue
+            .recognise(document.as_bytes())
+            .expect("an export printing neither optional column is still this profile's");
+        assert_eq!(installed.profile.id(), "tbank-operations-csv");
+
+        let account = AccountId::new_random();
+        let names: AccountNames = [AccountEntry::titled("Main", account)]
+            .into_iter()
+            .collect();
+        let reading = engine::read(
+            document.as_bytes(),
+            &installed.profile,
+            &engine::ReadContext {
+                accounts: &names,
+                // The export prints its own account column.
+                declared: None,
+            },
+        )
+        .expect("a document this profile recognises is a document it reads");
+        let [outcome] = reading.rows.as_slice() else {
+            panic!("one line of data is one outcome: {:?}", reading.rows);
+        };
+        let engine::ReadOutcome::Observed { row, .. } = outcome else {
+            panic!("the row is read: {outcome:?}");
+        };
+        assert_eq!(row.account, account);
+        assert_eq!(row.amount_minor, -100);
+        assert_eq!(row.source_category.as_deref(), Some("Invented"));
+        // The two columns the document does not print say what an empty cell
+        // says, and nothing else changes.
+        assert_eq!(row.owner_category, None);
+        assert_eq!(row.source_code, None);
+    }
+
+    /// The status column is required, and an export that does not print it is
+    /// not this profile's document.
+    ///
+    /// With the column gone there is nothing to tell a movement the institution
+    /// completed from one it did not, and reading every row as completed would
+    /// write a fact the source never asserted. So this column is not among the
+    /// ones that may be absent, and its absence is the refusal an operator can
+    /// act on.
+    #[test]
+    fn an_export_without_the_status_column_is_not_this_profile_s() {
         let catalogue = ProfileCatalogue::bundled();
         let header = "Имя счёта;Номер карты;Дата операции;Сумма в валюте счёта;\
-                      Валюта счёта;Статус;Категория по-умолчанию;Ваша категория;Описание\n";
+                      Валюта счёта;Категория по-умолчанию;Ваша категория;MCC;Описание\n";
         let refusal = catalogue
             .recognise(header.as_bytes())
-            .expect_err("an export that prints no code column is not this profile's document");
+            .expect_err("an export that prints no status column is not this profile's document");
         assert_eq!(refusal.field, "document");
         assert_eq!(refusal.actual, "a document none of them recognises");
     }

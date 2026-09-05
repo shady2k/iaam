@@ -635,7 +635,14 @@ distinct value, whose answer reaches every row carrying that value.
 text, never a number, because it is an identifier printed with leading zeros.
 Nothing requires it — a source assigns none to a row that is not a purchase from
 a merchant, and a converter that demanded it would refuse rows that are
-perfectly readable.
+perfectly readable. The same holds one level up, of the column rather than the
+cell: an older export may not print the column at all, and a profile says so
+with `"presence": "optional"` on the block, which only a transcribed block may
+carry. The field then says «the source printed none» on every row, exactly as an
+empty cell does. What may **not** be said that way is any column the engine
+reads a decision out of — the account, the day, the sum, the currency, the
+direction, the far side, the status — because a decision taken from a column
+that was not printed is not a decision.
 
 A profile is a converter that cannot break the first rule by accident: the only
 way to write the field is `own_account_words`, quoting the source's own printed

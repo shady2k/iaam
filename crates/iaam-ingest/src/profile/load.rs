@@ -37,10 +37,10 @@ use crate::classification::FarSide;
 use crate::observation::ObservedDirection;
 
 use super::{
-    AccountSource, Amount, AmountSource, CsvShape, CurrencySource, DateField, DateFormat,
-    DatedCell, Dates, DecimalSeparator, DecimalShape, Delimiter, DirectionSource, DocumentShape,
-    Encoding, FarSideSource, GroupSeparator, NegativeForm, RowShape, RowStatus, SCHEMA_VERSION,
-    SourceProfile, StatusSource, TimeFormat, TimeSource,
+    AccountSource, Amount, AmountSource, ColumnPresence, CsvShape, CurrencySource, DateField,
+    DateFormat, DatedCell, Dates, DecimalSeparator, DecimalShape, Delimiter, DirectionSource,
+    DocumentShape, Encoding, FarSideSource, GroupSeparator, NegativeForm, RowShape, RowStatus,
+    SCHEMA_VERSION, SourceProfile, StatusSource, TimeFormat, TimeSource, TranscribedColumn,
 };
 
 /// Why a file is not a profile.
@@ -269,7 +269,8 @@ fn row_shape(at: &str, value: Value) -> Result<RowShape, ProfileError> {
     })
 }
 
-/// A block whose whole content is one column heading.
+/// A block naming one column heading, and saying whether the document has to
+/// print it.
 ///
 /// Seven fields share this shape — counterparty, description, the source's own
 /// operation word, its own category, the category the owner himself filed the
@@ -277,15 +278,31 @@ fn row_shape(at: &str, value: Value) -> Result<RowShape, ProfileError> {
 /// — and every one of them is transcribed verbatim into the field that field
 /// belongs in. One reader, so an eighth cannot acquire an extra key by being
 /// written separately.
-fn column_block(object: &mut Object, key: &str) -> Result<Option<String>, ProfileError> {
+///
+/// `presence` is read only here, and that is the point: it is a question only a
+/// transcribed column may be asked. A block the engine reads a decision out of
+/// is parsed by a reader of its own, none of which knows the key, so writing it
+/// there is an unknown key and is refused where every unknown key is.
+fn column_block(object: &mut Object, key: &str) -> Result<Option<TranscribedColumn>, ProfileError> {
     let Some(value) = object.take(key) else {
         return Ok(None);
     };
     let at = object.path(key);
     let mut block = Object::open(&at, value)?;
     let column = column(&block.path("column"), block.require("column")?)?;
+    let presence = match block.take("presence") {
+        None => ColumnPresence::Required,
+        Some(value) => token(
+            &block.path("presence"),
+            value,
+            &[
+                ("required", ColumnPresence::Required),
+                ("optional", ColumnPresence::Optional),
+            ],
+        )?,
+    };
     block.close()?;
-    Ok(Some(column))
+    Ok(Some(TranscribedColumn { column, presence }))
 }
 
 fn account(at: &str, value: Value) -> Result<AccountSource, ProfileError> {
@@ -1044,14 +1061,29 @@ mod tests {
             profile.parser_version().0,
             "profile/example-bank-statement/1"
         );
-        // And it recognises on every column it names, as the "recognise" block
-        // says a profile must: an example that claimed a document and then
-        // refused it at read would teach the defect it warns about.
+        // And it recognises on every column it requires, as the "recognise"
+        // block says a profile must: an example that claimed a document and
+        // then refused it at read would teach the defect it warns about.
         let recognised: Vec<&str> = profile.recognised_by().iter().map(String::as_str).collect();
-        for required in profile.columns() {
+        for required in profile.required_columns() {
             assert!(
                 recognised.contains(&required),
-                "the example names «{required}» and does not recognise on it"
+                "the example requires «{required}» and does not recognise on it"
+            );
+        }
+        // And on none of the columns it says the document may leave unprinted,
+        // which is the same rule from the other side: recognising on such a
+        // column would make its absence defeat recognition.
+        let optional = profile.optional_columns();
+        assert!(
+            !optional.is_empty(),
+            "the example shows what a profile may say, and a column that may be absent is \
+             one of the things it may say"
+        );
+        for column in optional {
+            assert!(
+                !recognised.contains(&column),
+                "the example recognises on «{column}», which it says may be absent"
             );
         }
     }
@@ -1170,6 +1202,28 @@ mod tests {
                 "row.status.tokens.Reversed",
             ),
             (
+                "a status column the document need not print",
+                {
+                    let mut profile = complete();
+                    profile["row"]["status"]["presence"] = serde_json::json!("optional");
+                    profile
+                },
+                "row.status.presence",
+            ),
+            (
+                "an account column the document need not print",
+                {
+                    let mut profile = complete();
+                    profile["row"]["account"] = serde_json::json!({
+                        "from": "column",
+                        "column": "Account",
+                        "presence": "optional"
+                    });
+                    profile
+                },
+                "row.account.presence",
+            ),
+            (
                 "a count of trailing lines to ignore",
                 {
                     let mut profile = complete();
@@ -1233,7 +1287,7 @@ mod tests {
             profile.parser_version().0,
             "profile/example-bank-statement/1"
         );
-        assert!(profile.columns().contains(&"Payee"));
+        assert!(profile.required_columns().contains(&"Payee"));
     }
 
     /// A free-text column takes the list of asserting sentences, and the list
@@ -1270,7 +1324,7 @@ mod tests {
             words.contains("Between your accounts at us"),
             "an institution prints more than one such sentence"
         );
-        assert!(loaded.columns().contains(&"Purpose"));
+        assert!(loaded.required_columns().contains(&"Purpose"));
     }
 
     /// The two far-side shapes read the same column two ways, so a profile
@@ -1296,11 +1350,46 @@ mod tests {
     #[test]
     fn a_status_block_names_a_column_the_document_must_print() {
         let loaded = load(&complete()).expect("the complete profile loads");
-        assert!(loaded.columns().contains(&"State"));
+        assert!(loaded.required_columns().contains(&"State"));
         let status = loaded.row().status.as_ref().expect("a status block");
         assert_eq!(status.column, "State");
         assert_eq!(status.tokens.get("Settled"), Some(&RowStatus::Completed));
         assert_eq!(status.tokens.get("Refused"), Some(&RowStatus::Declined));
+    }
+
+    /// A transcribed block says whether the document must print its column,
+    /// and says it with one of two words.
+    ///
+    /// Omitted, the column is required — which is what every profile written
+    /// before this key said, and what it goes on saying.
+    #[test]
+    fn a_transcribed_block_says_whether_the_document_must_print_its_column() {
+        let mut profile = complete();
+        profile["row"]["source_code"] =
+            serde_json::json!({ "column": "Code", "presence": "optional" });
+        profile["row"]["owner_category"] = serde_json::json!({ "column": "Your category" });
+        let loaded = load(&profile).expect("a presence word is part of a transcribed block");
+
+        let code = loaded.row().source_code.as_ref().expect("a code block");
+        assert_eq!(code.column, "Code");
+        assert_eq!(code.presence, ColumnPresence::Optional);
+        let owner = loaded
+            .row()
+            .owner_category
+            .as_ref()
+            .expect("an owner-category block");
+        assert_eq!(owner.presence, ColumnPresence::Required);
+
+        // A column that may be absent is not one the engine refuses a document
+        // over, and a column with no presence word is.
+        assert!(loaded.optional_columns().contains(&"Code"));
+        assert!(!loaded.required_columns().contains(&"Code"));
+        assert!(loaded.required_columns().contains(&"Your category"));
+
+        profile["row"]["source_code"] =
+            serde_json::json!({ "column": "Code", "presence": "when_printed" });
+        let error = load(&profile).expect_err("a third presence word does not load");
+        assert_eq!(error.at, "row.source_code.presence");
     }
 
     /// A key nobody defined is refused rather than ignored.

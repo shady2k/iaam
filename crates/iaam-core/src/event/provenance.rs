@@ -88,6 +88,38 @@ pub struct Provenance {
     /// those; what they carry is what the observation path meant at the time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_kind: Option<String>,
+    /// The category the **owner himself** filed the row under, at the source.
+    ///
+    /// A third word beside [`Self::source_category`] and [`Self::source_kind`],
+    /// and a different fact from both: those two are the institution's, this
+    /// one is a decision the owner took in the institution's own app which the
+    /// export prints back. It is the answer he was being asked for once per
+    /// row, and it is retained here so that a rule of his written on it goes on
+    /// matching after the fact is recorded — evidence dropped at commit makes
+    /// recomputation reconsider the row as one whose source said nothing.
+    ///
+    /// Evidence, like every field around it, and never rewritten. Nothing maps
+    /// it into one of the owner's categories here: it is his decision in his
+    /// bank's vocabulary, and what it is called here is a question of its own.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field. `None` means "not recorded",
+    /// which covers a source that printed no such column and every fact written
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_category: Option<String>,
+    /// The standardised code the source printed for the row.
+    ///
+    /// The one word among these that is not one institution's private
+    /// vocabulary: it is assigned by the payment network, so a rule written on
+    /// it holds across institutions. Retained as text and never as a number —
+    /// it is an identifier printed with leading zeros.
+    ///
+    /// `#[serde(default)]` for [`Self::owner_category`]'s reason, and `None`
+    /// also means the source assigned the row no code, which it does on rows
+    /// that are not a purchase from a merchant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_code: Option<String>,
     /// The description or counterparty the source printed on the row.
     ///
     /// Evidence about what the source said, exactly like `source_category`
@@ -183,6 +215,8 @@ impl Provenance {
             source_operation_id: None,
             source_category: None,
             source_kind: None,
+            owner_category: None,
+            source_code: None,
             description: None,
             import: None,
             declared_by: None,
@@ -206,6 +240,18 @@ impl Provenance {
     #[must_use]
     pub fn with_source_kind(mut self, kind: impl Into<String>) -> Self {
         self.source_kind = Some(kind.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner_category(mut self, category: impl Into<String>) -> Self {
+        self.owner_category = Some(category.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_code(mut self, code: impl Into<String>) -> Self {
+        self.source_code = Some(code.into());
         self
     }
 
@@ -330,6 +376,23 @@ impl Provenance {
     #[must_use]
     pub fn source_kind(&self) -> Option<&str> {
         self.source_kind.as_deref()
+    }
+
+    /// The category the owner himself filed the row under at the source, when
+    /// the source printed one.
+    ///
+    /// Read by both rule vocabularies and by neither as the other's field: a
+    /// word of his is not a word of the institution's, and the two are compared
+    /// separately or a rule fires on rows he was not describing.
+    #[must_use]
+    pub fn owner_category(&self) -> Option<&str> {
+        self.owner_category.as_deref()
+    }
+
+    /// The standardised code the source printed, when it printed one.
+    #[must_use]
+    pub fn source_code(&self) -> Option<&str> {
+        self.source_code.as_deref()
     }
 
     #[must_use]

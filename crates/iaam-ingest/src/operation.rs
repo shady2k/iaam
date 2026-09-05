@@ -332,6 +332,27 @@ pub struct SubmittedOperation {
     /// was not describing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// The category the **owner himself** filed the row under, at the source,
+    /// verbatim.
+    ///
+    /// Retained for the same reason as [`Self::source_category`] beside it and
+    /// never the same field: that one is the institution's word, this one is a
+    /// decision of his that the institution merely printed back. Kept so that a
+    /// rule of his written on it goes on matching after the fact is recorded —
+    /// a fact whose evidence was dropped on the way in looks, to recomputation,
+    /// like a row whose source said nothing.
+    ///
+    /// `#[serde(default)]` because an import session written before this field
+    /// existed said nothing about it, which is what `None` means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_category: Option<String>,
+    /// The standardised code the source printed for the row, verbatim.
+    ///
+    /// Text and never a number: it is an identifier printed with leading zeros.
+    /// `None` where the source printed none, which it does on rows it assigns
+    /// no code to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_code: Option<String>,
     /// The source's own word for what the operation **was**, verbatim.
     ///
     /// `#[serde(default)]` because a row stored by an earlier build carries no
@@ -428,6 +449,18 @@ pub fn normalize(
                 };
                 let base = match operation.source_category.as_deref() {
                     Some(category) => base.with_source_category(category),
+                    None => base,
+                };
+                // The owner's own word and the network's code, each into its
+                // own field for the reason the two above are separate: they are
+                // statements by different parties about different things, and
+                // one slot could carry only one of them.
+                let base = match operation.owner_category.as_deref() {
+                    Some(category) => base.with_owner_category(category),
+                    None => base,
+                };
+                let base = match operation.source_code.as_deref() {
+                    Some(code) => base.with_source_code(code),
                     None => base,
                 };
                 // Beside the category and never through it: the two are

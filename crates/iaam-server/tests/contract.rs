@@ -143,6 +143,8 @@ impl BrokerChannel for PopulatedChannel {
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
                 source_category: None,
+                owner_category: None,
+                source_code: None,
                 source_kind: None,
                 description: None,
             }],
@@ -10750,6 +10752,8 @@ impl BrokerChannel for TwinRowsChannel {
             idempotency_key: None,
             source_operation_id: Some(operation_id.to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             source_kind: None,
             description: None,
         };
@@ -22369,7 +22373,11 @@ async fn a_word_that_holds_two_things_is_published_with_its_contents_and_no_rule
         .as_array()
         .expect("withheld offers");
     assert_eq!(withheld.len(), 1, "{plan}");
-    assert_eq!(withheld[0]["source_category"], "Transfer", "{plan}");
+    assert_eq!(withheld[0]["filed_under"], "Transfer", "{plan}");
+    // Whose filing the word is, published beside it: the sentence a caller
+    // shows differs between the institution's word and one of the owner's, and
+    // a withheld entry carries no matcher to read the ground off.
+    assert_eq!(withheld[0]["filed_by"], "source_category", "{plan}");
     assert_eq!(withheld[0]["covers"], json!([1, 2, 3]), "{plan}");
     let contains = withheld[0]["contains"].as_array().expect("what it holds");
     assert_eq!(
@@ -25943,12 +25951,16 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // The profile is named on the answer, with the reader every fact out of
     // this document would record.
     assert_eq!(read["profile"]["id"], "tbank-operations-csv");
-    assert_eq!(read["profile"]["version"], 2);
+    // Version 3: the profile reads the category the owner himself filed the row
+    // under and the standardised code, so its reading changed and a version
+    // must name a content — otherwise «the rows version 2 read» is not a set
+    // and a buggy profile's facts stop being findable and retractable.
+    assert_eq!(read["profile"]["version"], 3);
     assert_eq!(read["profile"]["issuer"], "T-Bank");
     assert_eq!(read["profile"]["origin"], "bundled");
     assert_eq!(
         read["profile"]["parser_version"],
-        "profile/tbank-operations-csv/2"
+        "profile/tbank-operations-csv/3"
     );
     assert_eq!(read["profile"]["digest"].as_str().map(str::len), Some(64));
     assert_eq!(read["session"], id);
@@ -26283,7 +26295,7 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     // retracted, which is what keeps a corrected profile from doubling a month.
     assert_eq!(
         again["profile"]["parser_version"],
-        "profile/tbank-operations-csv/2"
+        "profile/tbank-operations-csv/3"
     );
 }
 

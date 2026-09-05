@@ -734,6 +734,31 @@ pub struct OperationDto {
     /// name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// The category the **owner himself** filed the row under, at the source,
+    /// verbatim.
+    ///
+    /// A different field from `source_category` above it, and the difference is
+    /// whose decision it is: that one is the institution's own word, this one is
+    /// a decision the owner took in the institution's app which the export
+    /// prints back. Relay it where the document prints it and never fill it in:
+    /// it is his, and a converter writing one is a converter deciding what his
+    /// money was.
+    ///
+    /// It is not a category of his **here**. Nothing maps it: what a word of his
+    /// at his bank is called in this system is a question asked once per
+    /// distinct value, and this field is only the evidence that question is put
+    /// about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_category: Option<String>,
+    /// The standardised code the source printed for the row, verbatim.
+    ///
+    /// Assigned by the payment network rather than by the institution, so it is
+    /// the one word on the row that means the same thing at another bank. Send
+    /// it as text: it is an identifier printed with leading zeros and a number
+    /// loses them. Absent where the source printed none, which it does on rows
+    /// that are not a purchase from a merchant — nothing requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_code: Option<String>,
     /// The source's own word for what the row **was**, verbatim.
     ///
     /// The operation-type cell — "transfer", "card payment" — and a different
@@ -832,6 +857,8 @@ impl OperationDto {
                 // (`iaam-p683`).
                 source_kind: self.source_kind.clone(),
                 source_category: self.source_category.clone(),
+                owner_category: self.owner_category.clone(),
+                source_code: self.source_code.clone(),
                 description: self.description.clone(),
                 dates: OperationDates {
                     trade: self.dates.trade,
@@ -877,6 +904,8 @@ impl OperationDto {
             idempotency_key: self.idempotency_key.clone(),
             source_operation_id: self.source_operation_id.clone(),
             source_category: self.source_category.clone(),
+            owner_category: self.owner_category.clone(),
+            source_code: self.source_code.clone(),
             source_kind: self.source_kind.clone(),
             description: self.description.clone(),
         })
@@ -6183,6 +6212,8 @@ mod tests {
             idempotency_key: None,
             source_operation_id: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
             source_kind: None,
             description: None,
         }
@@ -7865,6 +7896,34 @@ pub struct RuleMatcherDto {
     /// word into this field, and the two cannot be told apart afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// The category **you** filed the row under at the source, matched exactly.
+    ///
+    /// A different field from `source_category` beside it, and the difference is
+    /// whose decision it is: that one is the institution's own word for what the
+    /// movement was for, this one is a decision you took in the institution's
+    /// app which the export prints back. A rule written on one does not fire on
+    /// the other.
+    ///
+    /// It is the strongest evidence a statement carries about what a row was,
+    /// because it is already yours — and it is still only a condition. What a
+    /// word of yours at your bank is called here is a question answered once,
+    /// and this is the field a rule carrying that answer tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_category: Option<String>,
+    /// The standardised code the source printed for the row, matched exactly.
+    ///
+    /// The one condition here that is not written in a vocabulary one
+    /// institution controls: the code is assigned by the payment network, so a
+    /// rule written on it goes on holding at another bank, where a rule written
+    /// on an institution's own category holds until that institution renames
+    /// something.
+    ///
+    /// Matched as text, never as a number — it is an identifier printed with
+    /// leading zeros. A row the source printed no code for matches no condition
+    /// on it: the source assigns none to rows that are not a purchase from a
+    /// merchant, and such a row is read all the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_code: Option<String>,
 }
 
 impl RuleMatcherDto {
@@ -7875,6 +7934,8 @@ impl RuleMatcherDto {
             description_contains: matcher.description_contains.clone(),
             kind: matcher.kind.clone(),
             source_category: matcher.source_category.clone(),
+            owner_category: matcher.owner_category.clone(),
+            source_code: matcher.source_code.clone(),
         }
     }
 
@@ -7885,6 +7946,8 @@ impl RuleMatcherDto {
             description_contains: self.description_contains.clone(),
             kind: self.kind.clone(),
             source_category: self.source_category.clone(),
+            owner_category: self.owner_category.clone(),
+            source_code: self.source_code.clone(),
         }
     }
 }
@@ -10731,8 +10794,22 @@ pub struct OfferedRuleDto {
 /// the offer exists to prevent.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WithheldOfferDto {
-    /// The word the source filed these rows under, verbatim.
-    pub source_category: String,
+    /// Whose filing the word is: `source_category` where the institution filed
+    /// these rows under it, `owner_category` where **you** did, in the
+    /// institution's own app.
+    ///
+    /// **Published because `reason` would otherwise be false in one of the two
+    /// cases**, and because the two words are two vocabularies: a word of yours
+    /// is a decision you already took, and one of the institution's is its own
+    /// way of filing its own rows. It is also the field of a condition on this
+    /// ground, so it names where the word would go in a rule.
+    ///
+    /// `offered_rules[]` needs no such field: its `matcher` names the field it
+    /// asks about, so its ground is readable off the condition itself.
+    pub filed_by: String,
+    /// The word these rows were filed under, verbatim, by whoever `filed_by`
+    /// says filed them.
+    pub filed_under: String,
     /// The rows of this session, in order, that no offer covers because of it.
     /// The union of `contains[].rows`.
     pub covers: Vec<u32>,
@@ -10867,6 +10944,15 @@ pub struct PrintedRowDto {
     /// lists by row number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_category: Option<String>,
+    /// The word **you** filed the row under at the source, when the source
+    /// printed one.
+    ///
+    /// Beside `source_category` for its reason and never instead of it: both
+    /// ground a group, so an offer or a withheld entry keyed on your own word
+    /// needs the same join. It is a decision you already took, and it is the one
+    /// field here you will recognise at a glance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_category: Option<String>,
 }
 
 /// A set of this session's open rows put to a person as one thing.
@@ -11598,7 +11684,8 @@ impl ImportPlanDto {
                     .withheld_offers
                     .iter()
                     .map(|withheld| WithheldOfferDto {
-                        source_category: withheld.source_category.clone(),
+                        filed_by: withheld.filed_by.code().to_owned(),
+                        filed_under: withheld.filed_under.clone(),
                         covers: withheld.covers.clone(),
                         contains: withheld
                             .contains
@@ -11740,6 +11827,7 @@ impl PrintedRowDto {
             direction: printed.movement.map(movement_code),
             counterparty: printed.counterparty.clone(),
             source_category: printed.source_category.clone(),
+            owner_category: printed.owner_category.clone(),
         }
     }
 }

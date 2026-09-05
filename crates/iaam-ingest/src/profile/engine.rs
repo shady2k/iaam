@@ -718,6 +718,12 @@ fn row(
         far_side,
         source_kind: transcribed(record, columns, shape.source_kind.as_deref())?,
         source_category: transcribed(record, columns, shape.source_category.as_deref())?,
+        // The owner's own word and the network's code, transcribed exactly as
+        // the two above them and interpreted no more than they are. Neither is
+        // required: `transcribed` reads an empty cell as «the source printed
+        // nothing», which is what a row the source assigned no code to says.
+        owner_category: transcribed(record, columns, shape.owner_category.as_deref())?,
+        source_code: transcribed(record, columns, shape.source_code.as_deref())?,
         description: transcribed(record, columns, shape.description.as_deref())?,
         dates,
         source_time,
@@ -1668,6 +1674,41 @@ mod tests {
         let row = observed(&reading.rows[0]);
         assert_eq!(row.identity.row.as_deref(), Some("OP-7"));
         assert_eq!(row.identity.idempotency_key, None);
+    }
+
+    /// The owner's own category and the source's standardised code are
+    /// transcribed, and neither is interpreted.
+    ///
+    /// The export prints the category the owner himself filed the row under at
+    /// his institution — his decision, already made — and a standardised code
+    /// assigned by the payment network. The profile read neither, so the
+    /// instance went on to ask him, once per row, for what he had already told
+    /// his bank.
+    ///
+    /// The code is **empty on some rows**, so nothing requires it: a row that
+    /// prints none is read, and the field says the source printed none.
+    #[test]
+    fn the_profile_transcribes_the_owners_own_category_and_the_code() {
+        let profile = profile(serde_json::json!({
+            "row": {
+                "owner_category": { "column": "Your category" },
+                "source_code": { "column": "Code" }
+            }
+        }));
+        let reading = read_with(
+            "Posted;Sum;Your category;Code\n\
+             2026-08-05;-1.00;Invented Category;0000\n\
+             2026-08-06;-2.00;;\n",
+            &profile,
+        );
+        let read = observed(&reading.rows[0]);
+        assert_eq!(read.owner_category.as_deref(), Some("Invented Category"));
+        assert_eq!(read.source_code.as_deref(), Some("0000"));
+        // Nothing requires either: a row printing neither is read, and both
+        // fields say the source printed nothing.
+        let bare = observed(&reading.rows[1]);
+        assert_eq!(bare.owner_category, None);
+        assert_eq!(bare.source_code, None);
     }
 
     /// The source's own operation word and its own category are transcribed to

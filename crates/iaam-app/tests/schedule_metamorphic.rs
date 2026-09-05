@@ -178,6 +178,8 @@ async fn seed_report_position(
         idempotency_key: None,
         source_operation_id: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         source_kind: None,
         description: None,
     };

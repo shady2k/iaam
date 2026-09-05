@@ -11165,6 +11165,8 @@ mod tests {
             description: Some("card purchase 0001".to_owned()),
             source_kind: Some("card".to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             movement: None,
             far_side: FarSide::Unstated,
         }
@@ -11177,6 +11179,8 @@ mod tests {
             description_contains: None,
             kind: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
     }
 
@@ -11339,6 +11343,8 @@ mod tests {
                 description_contains: Some("card purchase".to_owned()),
                 kind: None,
                 source_category: None,
+                owner_category: None,
+                source_code: None,
             },
             Classification::ExternalFlow,
         );

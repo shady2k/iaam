@@ -33,6 +33,8 @@ fn matcher(
         description_contains: description.map(str::to_owned),
         kind: kind.map(str::to_owned),
         source_category: None,
+        owner_category: None,
+        source_code: None,
     }
 }
 
@@ -43,6 +45,8 @@ fn filed_under(category: &str) -> RuleMatcher {
         description_contains: None,
         kind: None,
         source_category: Some(category.to_owned()),
+        owner_category: None,
+        source_code: None,
     }
 }
 
@@ -62,6 +66,8 @@ fn transfer_to(name: &str, account: AccountId) -> ClassificationSubject {
         description: Some("Перевод по номеру счёта".to_owned()),
         source_kind: Some("Перевод".to_owned()),
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     }
@@ -79,6 +85,8 @@ fn a_transfer_to_an_own_account_needs_no_rule() {
         description: None,
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     };
@@ -193,6 +201,8 @@ fn the_description_matcher_ignores_letter_case() {
         description: Some("КОМИССИЯ ЗА ОБСЛУЖИВАНИЕ".to_owned()),
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     };
@@ -267,6 +277,8 @@ fn an_outflow_without_a_counterparty_asks_fee_or_withdrawal() {
         description: None,
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     };
@@ -288,6 +300,8 @@ fn an_inflow_without_a_counterparty_asks_income_or_return() {
         description: None,
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(Movement::In),
         far_side: FarSide::Unstated,
     };
@@ -648,6 +662,8 @@ fn filed_only(account: AccountId, category: &str, movement: Movement) -> Classif
         description: None,
         source_kind: None,
         source_category: Some(category.to_owned()),
+        owner_category: None,
+        source_code: None,
         movement: Some(movement),
         far_side: FarSide::Unstated,
     }
@@ -716,6 +732,8 @@ fn a_condition_on_the_category_does_not_fire_on_the_operation_word() {
     let named = ClassificationSubject {
         source_kind: Some("Bank interest".to_owned()),
         source_category: None,
+        owner_category: None,
+        source_code: None,
         ..filed_only(mine, "Bank interest", Movement::In)
     };
 
@@ -767,6 +785,8 @@ fn the_fields_of_one_condition_are_joined_with_and() {
         description_contains: None,
         kind: None,
         source_category: Some("Bank interest".to_owned()),
+        owner_category: None,
+        source_code: None,
     };
     let category_only = filed_only(mine, "Bank interest", Movement::Out);
     let with_counterparty = ClassificationSubject {
@@ -794,6 +814,8 @@ fn a_rule_reads_back_every_condition_it_was_written_with() {
             description_contains: None,
             kind: Some("credit".to_owned()),
             source_category: Some("Bank interest".to_owned()),
+            owner_category: None,
+            source_code: None,
         },
         outcome: Classification::Income { kind: None },
     };
@@ -801,6 +823,89 @@ fn a_rule_reads_back_every_condition_it_was_written_with() {
     let wording = written.describe();
     assert!(wording.contains("«credit»"), "{wording}");
     assert!(wording.contains("«Bank interest»"), "{wording}");
+}
+
+/// A rule may be written on the category the **owner himself** filed the row
+/// under at his institution, and on the source's standardised code.
+///
+/// The first is his decision, already made and recorded there; the second is
+/// the one word on the row assigned by the payment network rather than by one
+/// institution, so a rule written on it holds across institutions. Neither was
+/// readable by this vocabulary, so a profile transcribing them produced fields
+/// no classification rule could name.
+#[test]
+fn a_rule_may_ask_what_the_owner_filed_the_row_under_and_what_code_it_carries() {
+    let mine = AccountId::new_random();
+    let row = ClassificationSubject {
+        account: mine,
+        counterparty: Counterparty::Named("Shop One".to_owned()),
+        description: None,
+        source_kind: None,
+        source_category: Some("Supermarkets".to_owned()),
+        owner_category: Some("Invented Category".to_owned()),
+        source_code: Some("0000".to_owned()),
+        movement: Some(Movement::Out),
+        far_side: FarSide::Unstated,
+    };
+
+    let by_owner_category = RuleMatcher {
+        counterparty_account: None,
+        description_contains: None,
+        kind: None,
+        source_category: None,
+        owner_category: Some("Invented Category".to_owned()),
+        source_code: None,
+    };
+    let by_code = RuleMatcher {
+        counterparty_account: None,
+        description_contains: None,
+        kind: None,
+        source_category: None,
+        owner_category: None,
+        source_code: Some("0000".to_owned()),
+    };
+
+    assert!(!by_owner_category.asks_nothing());
+    assert!(!by_code.asks_nothing());
+    assert!(by_owner_category.matches(&row));
+    assert!(by_code.matches(&row));
+
+    // Exactly, and each against its own field: the owner's word is not the
+    // source's word, and neither is the code.
+    let other_owner_category = RuleMatcher {
+        owner_category: Some("Supermarkets".to_owned()),
+        ..by_owner_category.clone()
+    };
+    assert!(
+        !other_owner_category.matches(&row),
+        "the source's own category is a different field"
+    );
+
+    // A row the source printed no code for is not matched by a code condition,
+    // and it is read all the same: nothing requires the code.
+    let no_code = ClassificationSubject {
+        source_code: None,
+        ..row.clone()
+    };
+    assert!(!by_code.matches(&no_code));
+    assert!(by_owner_category.matches(&no_code));
+
+    // And both read back, or the owner reads a rule as narrower than it is.
+    let wording = rule(
+        1,
+        RuleMatcher {
+            counterparty_account: None,
+            description_contains: None,
+            kind: None,
+            source_category: None,
+            owner_category: Some("Invented Category".to_owned()),
+            source_code: Some("0000".to_owned()),
+        },
+        Classification::ExternalFlow,
+    )
+    .describe();
+    assert!(wording.contains("«Invented Category»"), "{wording}");
+    assert!(wording.contains("«0000»"), "{wording}");
 }
 
 // --- what the source says about the far side (iaam-cp94) --------------------
@@ -814,6 +919,8 @@ fn asserted_own(account: AccountId) -> ClassificationSubject {
         description: None,
         source_kind: Some("INNER".to_owned()),
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: None,
         far_side: FarSide::OwnAccount,
     }
@@ -879,6 +986,8 @@ fn a_rule_the_owner_wrote_beats_the_word_the_source_printed() {
             description_contains: None,
             kind: Some("INNER".to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
         },
         outcome: Classification::ExternalFlow,
     };
@@ -953,6 +1062,8 @@ fn one_counterparty_on_two_rows_that_ran_the_same_way_is_one_decision() {
         description: None,
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(movement),
         far_side: FarSide::Unstated,
     };
@@ -984,6 +1095,8 @@ fn one_counterparty_on_two_rows_the_source_ran_opposite_ways_is_two_decisions() 
         description: None,
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(movement),
         far_side: FarSide::Unstated,
     };
@@ -1014,6 +1127,8 @@ fn two_counterparties_are_two_decisions() {
         description: None,
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(Movement::Out),
         far_side: FarSide::Unstated,
     };
@@ -1042,6 +1157,8 @@ fn one_account_asked_about_an_outflow_and_an_inflow_is_two_decisions() {
         description: None,
         source_kind: None,
         source_category: None,
+        owner_category: None,
+        source_code: None,
         movement: Some(movement),
         far_side: FarSide::Unstated,
     };

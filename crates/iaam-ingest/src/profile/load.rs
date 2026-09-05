@@ -246,6 +246,8 @@ fn row_shape(at: &str, value: Value) -> Result<RowShape, ProfileError> {
     let description = column_block(&mut object, "description")?;
     let source_kind = column_block(&mut object, "source_kind")?;
     let source_category = column_block(&mut object, "source_category")?;
+    let owner_category = column_block(&mut object, "owner_category")?;
+    let source_code = column_block(&mut object, "source_code")?;
     let source_operation_id = column_block(&mut object, "source_operation_id")?;
     object.close()?;
     Ok(RowShape {
@@ -261,16 +263,20 @@ fn row_shape(at: &str, value: Value) -> Result<RowShape, ProfileError> {
         description,
         source_kind,
         source_category,
+        owner_category,
+        source_code,
         source_operation_id,
     })
 }
 
 /// A block whose whole content is one column heading.
 ///
-/// Five fields share this shape — counterparty, description, the source's own
-/// operation word, its own category, its own row identifier — and every one of
-/// them is transcribed verbatim into the field that field belongs in. One
-/// reader, so a sixth cannot acquire an extra key by being written separately.
+/// Seven fields share this shape — counterparty, description, the source's own
+/// operation word, its own category, the category the owner himself filed the
+/// row under there, the source's standardised code, and its own row identifier
+/// — and every one of them is transcribed verbatim into the field that field
+/// belongs in. One reader, so an eighth cannot acquire an extra key by being
+/// written separately.
 fn column_block(object: &mut Object, key: &str) -> Result<Option<String>, ProfileError> {
     let Some(value) = object.take(key) else {
         return Ok(None);

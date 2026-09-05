@@ -194,6 +194,8 @@ impl SourceProfile {
             row.description.as_deref(),
             row.source_kind.as_deref(),
             row.source_category.as_deref(),
+            row.owner_category.as_deref(),
+            row.source_code.as_deref(),
             row.source_operation_id.as_deref(),
         ]
         .into_iter()
@@ -283,6 +285,18 @@ pub struct RowShape {
     pub description: Option<String>,
     pub source_kind: Option<String>,
     pub source_category: Option<String>,
+    /// The column holding the category the **owner himself** filed the row
+    /// under at the source — his decision, already made and recorded there.
+    ///
+    /// Named for what it is rather than for one institution's heading, and kept
+    /// apart from [`Self::source_category`] beside it because the two differ in
+    /// whose decision they carry. Transcribed and never mapped: decision 0028.
+    pub owner_category: Option<String>,
+    /// The column holding the source's standardised code for the row.
+    ///
+    /// Empty on rows the source assigns no code to, which is why it is
+    /// `Option` on the observation and why nothing may require it.
+    pub source_code: Option<String>,
     pub source_operation_id: Option<String>,
 }
 

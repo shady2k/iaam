@@ -146,6 +146,27 @@ pub struct ClassificationSubject {
     /// the only thing that turns it into a classification is a rule the owner
     /// wrote — which he can read back, retire, and replan.
     pub source_category: Option<String>,
+    /// The category the **owner himself** filed the row under, at the source,
+    /// verbatim.
+    ///
+    /// A different fact from [`Self::source_category`] above it, and the
+    /// difference is whose decision it is. That one is what the institution
+    /// filed the row under; this one is what the owner filed it under, in the
+    /// institution's own app, and it is the answer he was being asked for once
+    /// per row while nothing read the column.
+    ///
+    /// **Evidence and never a conclusion**, which is the rule most at risk on
+    /// this field because the value looks like a conclusion. It is his decision
+    /// in his *bank's* vocabulary, not in his categories here, and nothing maps
+    /// it: what it is called here is one question per distinct value, asked
+    /// once, whose answer reaches every row carrying that value.
+    pub owner_category: Option<String>,
+    /// The standardised code the source printed for the row, verbatim.
+    ///
+    /// The one word on the row that is not one institution's private
+    /// vocabulary, so a rule written on it holds across institutions. Empty on
+    /// rows the source assigns no code to, and `None` is what such a row says.
+    pub source_code: Option<String>,
     /// Which way the money went, when the source said.
     ///
     /// `None` is not a default and not a missing field: it means the source
@@ -213,6 +234,40 @@ pub struct RuleMatcher {
     /// beside it, and a rule that fires wrongly is one the owner retires, which
     /// replans what it classified.
     pub source_category: Option<String>,
+    /// The category the **owner himself** filed the row under at the source,
+    /// matched exactly, against [`ClassificationSubject::owner_category`].
+    ///
+    /// **The strongest evidence a statement carries about what a row was, and
+    /// it is the owner's own.** Where [`Self::source_category`] beside it is a
+    /// word the institution files by for its own purposes — a transfer word
+    /// covering every transfer, inward and outward — this is a decision he took
+    /// himself and the export prints back. A rule written on it says «rows I
+    /// filed under this word at my bank are this», which is a claim about his
+    /// own filing and not about the bank's.
+    ///
+    /// **Still a condition and never a mapping.** Nothing concludes from the
+    /// word on its own: the profile transcribes it and stops (decision 0028),
+    /// and the only thing that turns it into a classification is a rule he
+    /// wrote — which he can read back, retire and replan. That is the whole
+    /// difference between one question per distinct value and a map frozen into
+    /// every fact at import.
+    pub owner_category: Option<String>,
+    /// The source's standardised code, matched exactly, against
+    /// [`ClassificationSubject::source_code`].
+    ///
+    /// **The one arm of this matcher that is not scoped to a vocabulary one
+    /// institution controls.** The code is assigned by the payment network, so
+    /// a rule written on it holds across institutions, where a rule written on a
+    /// source's own category holds for one bank until it renames something. It
+    /// also generalises differently: as the ground for a rule it covers a whole
+    /// kind of spending, where a description condition covers one merchant
+    /// string.
+    ///
+    /// Matched as text, exactly, and never as a number: it is an identifier
+    /// printed with leading zeros. A row the source printed no code for is
+    /// matched by no code condition — the source said nothing, and a condition
+    /// asking what it said is not answered.
+    pub source_code: Option<String>,
 }
 
 impl RuleMatcher {
@@ -226,6 +281,8 @@ impl RuleMatcher {
             && self.description_contains.is_none()
             && self.kind.is_none()
             && self.source_category.is_none()
+            && self.owner_category.is_none()
+            && self.source_code.is_none()
     }
 
     /// Whether the condition matches the row.
@@ -260,7 +317,26 @@ impl RuleMatcher {
             .source_category
             .as_deref()
             .is_none_or(|wanted| subject.source_category.as_deref() == Some(wanted));
-        by_counterparty && by_description && by_kind && by_source_category
+        // Each against its own field and each exactly, for the reason above and
+        // for one more: the owner's word and the source's word are two
+        // decisions by two parties, and a condition that read either from one
+        // slot would fire on rows he was not describing — which is the defect
+        // decision 0020 §2 took `source_kind` and `source_category` apart to
+        // end, arriving here a second time with a third and a fourth word.
+        let by_owner_category = self
+            .owner_category
+            .as_deref()
+            .is_none_or(|wanted| subject.owner_category.as_deref() == Some(wanted));
+        let by_source_code = self
+            .source_code
+            .as_deref()
+            .is_none_or(|wanted| subject.source_code.as_deref() == Some(wanted));
+        by_counterparty
+            && by_description
+            && by_kind
+            && by_source_category
+            && by_owner_category
+            && by_source_code
     }
 }
 
@@ -419,6 +495,12 @@ impl ClassificationRule {
         }
         if let Some(category) = &self.matcher.source_category {
             conditions.push(format!("source filed the row under «{category}»"));
+        }
+        if let Some(category) = &self.matcher.owner_category {
+            conditions.push(format!("you filed the row under «{category}» there"));
+        }
+        if let Some(code) = &self.matcher.source_code {
+            conditions.push(format!("source printed the code «{code}»"));
         }
         let conditions = if conditions.is_empty() {
             "no conditions, so the rule does not apply".to_owned()

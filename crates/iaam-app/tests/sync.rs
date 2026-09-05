@@ -120,6 +120,8 @@ fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> Su
         idempotency_key: None,
         source_operation_id: Some("TRADE-MARCH-1".to_owned()),
         source_category: None,
+        owner_category: None,
+        source_code: None,
         source_kind: None,
         description: None,
     }

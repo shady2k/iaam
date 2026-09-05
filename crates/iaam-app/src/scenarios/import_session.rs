@@ -2838,6 +2838,15 @@ pub struct PrintedRow {
     /// caller reading a withheld offer can see which word each open row belongs
     /// to without joining two lists by row number.
     pub source_category: Option<String>,
+    /// The word the **owner himself** filed the row under, at the source,
+    /// verbatim, when the source printed one.
+    ///
+    /// Beside [`Self::source_category`] for its reason and never instead of it:
+    /// both ground a group, so a caller reading an offer or a withheld entry
+    /// keyed on his own word needs the same join. It is a decision he already
+    /// took, so publishing it discloses nothing he did not himself write down —
+    /// and it is the one field here he will recognise at a glance.
+    pub owner_category: Option<String>,
 }
 
 /// One standing decision the session's own rows offer, stated as a condition.
@@ -2898,7 +2907,45 @@ pub struct OfferedRule {
     pub contains: RowShape,
 }
 
-/// A word the source filed rows under whose rows are not one thing, and the
+/// Whose filing a group of rows is keyed by.
+///
+/// **Two vocabularies and never one**, which is the whole reason this exists.
+/// An institution files by its own purposes; the owner files by his, in the
+/// institution's app, and the export prints both back. A group keyed by one of
+/// them is a group keyed by a decision one party made, and which party it was
+/// decides what may truthfully be said about the group and which field of a
+/// [`RuleMatcher`] a condition on it goes in.
+///
+/// Ordered so that a listing does not reorder itself between two readings, and
+/// the institution's word comes first for no better reason than that it is the
+/// one every profile has always transcribed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FiledBy {
+    /// The institution's own word for what the movement was for.
+    Source,
+    /// The owner's own word, taken in the institution's app and printed back.
+    ///
+    /// **His decision, already made.** It is the strongest evidence a statement
+    /// carries about what a row was, and it is still only evidence: it is his
+    /// decision in his *bank's* vocabulary, and what it is called here is the
+    /// question the offer puts — once for the word, never once per row.
+    Owner,
+}
+
+impl FiledBy {
+    /// The word for the wire, one place so the transport cannot spell it
+    /// differently. It is the field of a condition on this ground, which is
+    /// what makes an offer and a withheld entry joinable.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Source => "source_category",
+            Self::Owner => "owner_category",
+        }
+    }
+}
+
+/// A word rows were filed under whose rows are not one thing, and the
 /// rule that is therefore not offered on it.
 ///
 /// **This is `iaam-xchm`.** On a real export one word the institution files by
@@ -2943,8 +2990,18 @@ pub struct OfferedRule {
 /// wording is the owner's protection for the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WithheldOffer {
-    /// The word the source filed these rows under, verbatim.
-    pub source_category: String,
+    /// Whose filing the word is — the institution's or the owner's.
+    ///
+    /// **Published because the sentence beside it would otherwise be false in
+    /// one of the two cases.** An offer withheld on a word of the owner's own is
+    /// withheld on a decision he took, and telling him «your statement files
+    /// these under …» would hand his own filing back to him as the bank's.
+    /// [`OfferedRule`] needs no such field: its condition names the field it
+    /// asks about, so its ground is already readable off the matcher.
+    pub filed_by: FiledBy,
+    /// The word these rows were filed under, verbatim, by whoever
+    /// [`Self::filed_by`] says filed them.
+    pub filed_under: String,
     /// The rows of this session, in order, that no offer covers because of it.
     /// The union of [`Self::contains`]'s rows.
     pub covers: Vec<u32>,
@@ -7023,6 +7080,7 @@ fn printed_row(directory: &AccountDirectory, row: &ObservedRow) -> PrintedRow {
         movement: row.movement(),
         counterparty: row.counterparty_name().map(str::to_owned),
         source_category: row.source_category.clone(),
+        owner_category: row.owner_category.clone(),
     }
 }
 
@@ -7542,22 +7600,33 @@ fn movement_group_question(members: &[ObservedRow], directory: &AccountDirectory
 /// the list does not reorder itself between two readings of one session. Both
 /// lists are ordered that way, because a caller reads them together.
 fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offers {
-    let mut by_category: BTreeMap<String, Vec<(u32, RowShapeKey)>> = BTreeMap::new();
+    let mut by_category: BTreeMap<(FiledBy, String), Vec<(u32, RowShapeKey)>> = BTreeMap::new();
     for question in open {
         let Ok(row) = observed_row(observations, question.row) else {
             continue;
         };
-        let Some(category) = row.source_category.clone() else {
-            continue;
-        };
-        by_category
-            .entry(category)
-            .or_default()
-            .push((question.row, shape_key(&row)));
+        // Both words, and a row carrying both is counted under both. They are
+        // two conditions over two vocabularies, either of which he may prefer,
+        // and each offer covers exactly the open rows its own condition matches
+        // — so two offers overlapping is two ways to settle one set and not a
+        // claim made twice. `classify` takes the highest version among matching
+        // rules and both would be his, so adopting both costs him nothing.
+        for (filed_by, word) in [
+            (FiledBy::Source, row.source_category.clone()),
+            (FiledBy::Owner, row.owner_category.clone()),
+        ] {
+            let Some(word) = word else {
+                continue;
+            };
+            by_category
+                .entry((filed_by, word))
+                .or_default()
+                .push((question.row, shape_key(&row)));
+        }
     }
     let mut offered: Vec<OfferedRule> = Vec::new();
     let mut withheld: Vec<WithheldOffer> = Vec::new();
-    for (category, mut rows) in by_category {
+    for ((filed_by, category), mut rows) in by_category {
         rows.sort_unstable();
         let covers: Vec<u32> = rows.iter().map(|(row, _)| *row).collect();
         let mut shapes = shapes_of(&rows);
@@ -7580,41 +7649,64 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
             None
         };
         if let Some(contains) = sole {
+            // The word goes in the field that asks about the party who filed
+            // it. A condition carrying the owner's own word in the source's
+            // field would fire on rows the institution filed under it and he
+            // did not, which is the defect decision 0020 §2 took two words out
+            // of one slot to end.
+            let (source_category, owner_category) = match filed_by {
+                FiledBy::Source => (Some(category.clone()), None),
+                FiledBy::Owner => (None, Some(category.clone())),
+            };
             offered.push(OfferedRule {
-                question: offered_rule_question(&category, covers.len(), &contains),
+                question: offered_rule_question(filed_by, &category, covers.len(), &contains),
                 matcher: RuleMatcher {
                     counterparty_account: None,
                     description_contains: None,
                     kind: None,
-                    source_category: Some(category),
+                    source_category,
+                    owner_category,
+                    source_code: None,
                 },
                 covers,
                 contains,
             });
         } else {
             withheld.push(WithheldOffer {
-                reason: withheld_offer_reason(&category, &shapes),
-                source_category: category,
+                reason: withheld_offer_reason(filed_by, &category, &shapes),
+                filed_by,
+                filed_under: category,
                 covers,
                 contains: shapes,
             });
         }
     }
     offered.sort_by(|left, right| {
-        right.covers.len().cmp(&left.covers.len()).then_with(|| {
-            left.matcher
-                .source_category
-                .cmp(&right.matcher.source_category)
-        })
-    });
-    withheld.sort_by(|left, right| {
         right
             .covers
             .len()
             .cmp(&left.covers.len())
-            .then_with(|| left.source_category.cmp(&right.source_category))
+            .then_with(|| offered_ground(left).cmp(&offered_ground(right)))
+    });
+    withheld.sort_by(|left, right| {
+        right.covers.len().cmp(&left.covers.len()).then_with(|| {
+            (left.filed_by, &left.filed_under).cmp(&(right.filed_by, &right.filed_under))
+        })
     });
     Offers { offered, withheld }
+}
+
+/// The ground an offer is keyed by, read off the condition it publishes.
+///
+/// One reader, so the order two offers are listed in and the field a caller
+/// reads the word out of cannot come apart. [`OfferedRule`] keeps no ground of
+/// its own for exactly this reason: the matcher already says which word it asks
+/// about, and a second statement of it is a second answer that can disagree.
+fn offered_ground(offer: &OfferedRule) -> (FiledBy, Option<&String>) {
+    offer.matcher.owner_category.as_ref().map_or(
+        (FiledBy::Source, offer.matcher.source_category.as_ref()),
+        |word| (FiledBy::Owner, Some(word)),
+    )
 }
 
 /// What one word the source files by turned out to be worth, both ways.
@@ -7672,11 +7764,18 @@ fn shapes_of(rows: &[(u32, RowShapeKey)]) -> Vec<RowShape> {
 /// the rows themselves are published beside it, and a sentence that listed them
 /// would be a structure encoded as prose, which `docs/api/conventions.md` §5
 /// refuses and which is the defect one bead over (`iaam-pm4w`).
-fn withheld_offer_reason(category: &str, contains: &[RowShape]) -> String {
+fn withheld_offer_reason(filed_by: FiledBy, category: &str, contains: &[RowShape]) -> String {
     let shapes = contains.len();
     let covers: usize = contains.iter().map(|shape| shape.rows.len()).sum();
+    // Whose filing it was, said plainly. The word is a decision one party took,
+    // and telling him his statement filed rows he filed himself would hand his
+    // own decision back to him as the institution's.
+    let files = match filed_by {
+        FiledBy::Source => "Your statement files",
+        FiledBy::Owner => "You file",
+    };
     format!(
-        "Your statement files {covers} of the lines still waiting on you under «{category}», and \
+        "{files} {covers} of the lines still waiting on you under «{category}», and \
          they are not all the same thing: they fall into {shapes} groups by which way the money \
          went and whether the statement named anyone on the other side. One answer for the whole \
          word would be wrong for some of them and you would not be asked about those again, so \
@@ -7738,7 +7837,12 @@ fn withheld_offer_reason(category: &str, contains: &[RowShape]) -> String {
 /// rule stating it leaves every row of the group at
 /// `Question::UnresolvedDirection`. Naming it is the difference between an offer
 /// that keeps its promise and one that keeps four fifths of it in silence.
-fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> OwnerQuestion {
+fn offered_rule_question(
+    filed_by: FiledBy,
+    category: &str,
+    covers: usize,
+    contains: &RowShape,
+) -> OwnerQuestion {
     // The one thing about these rows the promise depends on. Every other
     // attribute they share is the same for all of them by construction, and this
     // one decides whether an answer finishes them or only classifies them.
@@ -7750,9 +7854,26 @@ fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> 
     } else {
         ""
     };
+    // Whose word it is, and it changes both halves. A word of the owner's own is
+    // a decision he already took, so the question is not «what did your bank
+    // mean by this» but «what you call this, what is it here» — and the
+    // sentence must not tell him his statement filed what he filed himself.
+    let (files, later) = match filed_by {
+        FiledBy::Source => (
+            "Your statement files",
+            "any later line filed under exactly «{category}», by whoever sends it, is settled the \
+             same way",
+        ),
+        FiledBy::Owner => (
+            "You file",
+            "any later line you file under exactly «{category}», at whichever institution, is \
+             settled the same way",
+        ),
+    };
+    let later = later.replace("{category}", category);
     OwnerQuestion {
         ask: format!(
-            "Your statement files {covers} of the lines still waiting on you under «{category}». \
+            "{files} {covers} of the lines still waiting on you under «{category}». \
              What is a line filed that way — money you spent, a charge the institution made, \
              money someone gave back, something your money earned, or money moving between \
              accounts of your own?"
@@ -7760,9 +7881,8 @@ fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> 
         consequence: format!(
             "One answer here settles all {covers} of them at once: they stop waiting on you and \
              are recorded as what you say they are, without being put to you one at a time. It \
-             does not stop at this statement, and it does not stop at this institution — any \
-             later line filed under exactly «{category}», by whoever sends it, is settled the \
-             same way without being put to you again. That is the risk as well as the saving: a \
+             does not stop at this statement, and it does not stop at this institution — {later} \
+             without being put to you again. That is the risk as well as the saving: a \
              word that also covers lines you would have decided differently files those wrongly, \
              and you will not be asked about them. Withdrawing the decision afterwards puts back \
              what it decided — lines still waiting in an import go back to being put to you, and \
@@ -7858,6 +7978,8 @@ fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
             description_contains: None,
             kind: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
     } else if let Some(kind) = subject.source_kind.clone() {
         RuleMatcher {
@@ -7865,6 +7987,8 @@ fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
             description_contains: None,
             kind: Some(kind),
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
     } else if let Some(category) = subject.source_category.clone() {
         RuleMatcher {
@@ -7872,6 +7996,8 @@ fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
             description_contains: None,
             kind: None,
             source_category: Some(category),
+            owner_category: None,
+            source_code: None,
         }
     } else {
         RuleMatcher {
@@ -7879,6 +8005,8 @@ fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
             description_contains: subject.description.clone(),
             kind: None,
             source_category: None,
+            owner_category: None,
+            source_code: None,
         }
     };
     // Still the last word, and deliberately not replaced by one more branch
@@ -8217,6 +8345,8 @@ mod tests {
             far_side: FarSide::Unstated,
             source_kind: Some("transfer".to_owned()),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             description: None,
             dates: OperationDates {
                 cash_posted: posted,
@@ -8776,6 +8906,8 @@ mod tests {
                 description_contains: None,
                 kind: None,
                 source_category: None,
+                owner_category: None,
+                source_code: None,
             },
             outcome: learned.classification(),
         };
@@ -8867,6 +8999,8 @@ mod tests {
                     description_contains: None,
                     kind: None,
                     source_category: None,
+                    owner_category: None,
+                    source_code: None,
                 },
                 outcome: Classification::Fee {
                     origin: FeeOrigin::AccountMaintenance,
@@ -9519,6 +9653,118 @@ mod tests {
         observed
     }
 
+    /// The same row, with the word the **owner himself** filed it under there.
+    fn owner_filed_under(mut observed: ObservedRow, category: &str) -> ObservedRow {
+        observed.owner_category = Some(category.to_owned());
+        observed
+    }
+
+    /// The word the owner himself filed rows under grounds an offer of its own,
+    /// asked once for the word rather than once for each row carrying it.
+    ///
+    /// **This is the worst question this system asks, and this is its end.** The
+    /// category is his decision, already made and recorded at his institution;
+    /// the export prints it back on every row he took it on; and until the
+    /// profile read the column he was asked, once per row, for what he had
+    /// already told his bank. One question per distinct value is the reach one
+    /// answer already has over a set — a handful of questions where there were
+    /// as many as there are rows.
+    ///
+    /// **The offer is on his word and the bank's word both**, because they are
+    /// two different conditions over two different vocabularies and either may
+    /// be the one he wants. Each offer covers exactly the open rows its own
+    /// condition matches, which is what makes the two comparable rather than
+    /// rivalrous.
+    #[test]
+    fn the_word_the_owner_filed_rows_under_is_offered_once_for_the_word() {
+        let main = account(1);
+        let observations = vec![
+            stored_row(
+                1,
+                &owner_filed_under(
+                    filed_under(row(main, "Shop One", None), "Groceries"),
+                    "Mine",
+                ),
+            ),
+            stored_row(
+                2,
+                &owner_filed_under(
+                    filed_under(row(main, "Shop Two", None), "Groceries"),
+                    "Mine",
+                ),
+            ),
+            stored_row(
+                3,
+                &owner_filed_under(
+                    filed_under(row(main, "Shop Three", None), "Groceries"),
+                    "Ours",
+                ),
+            ),
+        ];
+        let open: Vec<OpenQuestion> = (1..=3).map(open_about).collect();
+        let offered = offers(&observations, &open).offered;
+
+        // Three rows, one word of the bank's and two of his: three offers and
+        // never three questions per row.
+        let his: Vec<&OfferedRule> = offered
+            .iter()
+            .filter(|offer| offer.matcher.owner_category.is_some())
+            .collect();
+        assert_eq!(his.len(), 2, "one offer per word of his: {offered:?}");
+        assert_eq!(his[0].matcher.owner_category.as_deref(), Some("Mine"));
+        assert_eq!(his[0].covers, vec![1, 2]);
+        assert_eq!(
+            his[0].matcher.source_category, None,
+            "his word is not the bank's word and the condition says which it asks about"
+        );
+        assert_eq!(his[1].matcher.owner_category.as_deref(), Some("Ours"));
+        assert_eq!(his[1].covers, vec![3]);
+
+        // And the bank's own word still grounds its own offer beside them.
+        let theirs: Vec<&OfferedRule> = offered
+            .iter()
+            .filter(|offer| offer.matcher.source_category.is_some())
+            .collect();
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].covers, vec![1, 2, 3]);
+
+        // The question is put in his register and quotes his own word, because
+        // it is his: asking him what his bank called it would be asking him
+        // about a word he did not choose.
+        assert!(his[0].question.ask.contains("«Mine»"), "{:?}", his[0]);
+    }
+
+    /// A word of his whose rows are not one thing is withheld, and the withheld
+    /// entry says whose word it was.
+    ///
+    /// Without that, a caller shows him «your statement files these under
+    /// «Mine»» — which is false twice over: the statement did not file them, he
+    /// did, and the sentence would hand his own decision back to him as the
+    /// bank's.
+    #[test]
+    fn a_word_of_his_whose_rows_disagree_is_withheld_and_named_as_his() {
+        let main = account(1);
+        let mut arrived = row(main, "Someone", None);
+        arrived.direction = ObservedDirection::In;
+        arrived.amount_minor = 1_000;
+        let observations = vec![
+            stored_row(1, &owner_filed_under(row(main, "Shop One", None), "Mine")),
+            stored_row(2, &owner_filed_under(arrived, "Mine")),
+        ];
+        let offers = offers(&observations, &[open_about(1), open_about(2)]);
+        assert!(offers.offered.is_empty(), "{:?}", offers.offered);
+        assert_eq!(offers.withheld.len(), 1);
+        let withheld = &offers.withheld[0];
+        assert_eq!(withheld.filed_under, "Mine");
+        assert_eq!(withheld.filed_by, FiledBy::Owner);
+        assert_eq!(withheld.covers, vec![1, 2]);
+        assert!(
+            withheld.reason.contains("You file"),
+            "the sentence says it was his own filing: {}",
+            withheld.reason
+        );
+    }
+
     /// A statement's own categories are offered once each, whatever the parties.
     ///
     /// The complaint this answers: a first import asks about every row, two
@@ -9623,7 +9869,12 @@ mod tests {
     /// and another rather than that the decision is his.
     #[test]
     fn an_offer_is_worded_for_a_person_and_says_what_his_answer_changes() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::Out), true),
+        );
         for internal in [
             "source_category",
             "matcher",
@@ -9666,7 +9917,12 @@ mod tests {
     /// actually deciding.
     #[test]
     fn an_offer_says_the_decision_is_not_held_to_the_institution_that_sent_the_lines() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::Out), true),
+        );
         assert!(
             !question.consequence.contains("the same institution"),
             "which is what it used to promise and is not what the rule does: {}",
@@ -9688,7 +9944,12 @@ mod tests {
     /// skip the warning that matters.
     #[test]
     fn an_offer_on_lines_that_state_a_direction_carries_no_caveat_about_direction() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::Out), true));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::Out), true),
+        );
         assert!(
             !question.consequence.contains("which way the money went"),
             "these lines say which way, so nothing about direction is open: {}",
@@ -9705,7 +9966,8 @@ mod tests {
     /// outcomes the offer names decide a direction themselves.
     #[test]
     fn an_offer_on_lines_that_state_no_direction_says_which_answer_does_not_finish_them() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(None, false));
+        let question =
+            offered_rule_question(FiledBy::Source, "Groceries", 3, &shape_of(None, false));
         assert!(
             question.consequence.contains("which way the money went"),
             "the lines do not say, and that decides whether the offer keeps its \
@@ -9730,7 +9992,12 @@ mod tests {
     /// read alone invites him to expect the rows to move whatever he says.
     #[test]
     fn an_offer_says_a_wrong_answer_settles_none_of_the_lines_rather_than_some() {
-        let question = offered_rule_question("Groceries", 3, &shape_of(Some(Movement::In), false));
+        let question = offered_rule_question(
+            FiledBy::Source,
+            "Groceries",
+            3,
+            &shape_of(Some(Movement::In), false),
+        );
         assert!(
             question.consequence.contains("settles none of them"),
             "all or none, never some: {}",
@@ -9769,7 +10036,8 @@ mod tests {
             offers.offered
         );
         let withheld = &offers.withheld[0];
-        assert_eq!(withheld.source_category, "Transfer");
+        assert_eq!(withheld.filed_under, "Transfer");
+        assert_eq!(withheld.filed_by, FiledBy::Source);
         assert_eq!(withheld.covers, vec![1, 2, 3]);
         assert_eq!(withheld.contains.len(), 2, "{:?}", withheld.contains);
         assert_eq!(
@@ -9882,6 +10150,7 @@ mod tests {
     #[test]
     fn an_offer_withheld_says_why_without_a_word_of_ours() {
         let reason = withheld_offer_reason(
+            FiledBy::Source,
             "Transfer",
             &[
                 RowShape {
@@ -9933,7 +10202,10 @@ mod tests {
         };
         let observations = vec![stored_row(
             1,
-            &filed_under(row(main, "Shop One", Some(day)), "Transfer"),
+            &owner_filed_under(
+                filed_under(row(main, "Shop One", Some(day)), "Transfer"),
+                "Mine",
+            ),
         )];
         let questions = vec![stored_question_about(1, &asked)];
         let open = open_questions(
@@ -9953,6 +10225,11 @@ mod tests {
         assert_eq!(printed.movement, Some(Movement::Out));
         assert_eq!(printed.counterparty.as_deref(), Some("Shop One"));
         assert_eq!(printed.source_category.as_deref(), Some("Transfer"));
+        // Both words, because both ground a group: a caller reading an offer or
+        // a withheld entry keyed on the owner's own word can see which open row
+        // carries it without joining two lists by row number, exactly as it can
+        // for the institution's.
+        assert_eq!(printed.owner_category.as_deref(), Some("Mine"));
     }
 
     /// A row the source stated no direction for says so, and does not guess.
@@ -10259,6 +10536,8 @@ mod tests {
                 description_contains: None,
                 kind: None,
                 source_category: Some(category.to_owned()),
+                owner_category: None,
+                source_code: None,
             },
             outcome: Classification::ExternalFlow,
         }
@@ -11067,6 +11346,8 @@ mod tests {
                     description_contains: None,
                     kind: None,
                     source_category: None,
+                    owner_category: None,
+                    source_code: None,
                 },
                 outcome: Classification::ExternalFlow,
             }
@@ -11600,6 +11881,8 @@ mod recorded_identities {
             idempotency_key: idempotency_key.map(str::to_owned),
             source_operation_id: source_operation_id.map(str::to_owned),
             source_category: None,
+            owner_category: None,
+            source_code: None,
             source_kind: None,
             description: None,
         };

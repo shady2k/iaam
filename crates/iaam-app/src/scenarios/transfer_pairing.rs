@@ -434,6 +434,12 @@ fn transfer_for(
         idempotency_key: Some(format!("pairing/{}/{}", outgoing.inner(), incoming.inner())),
         source_operation_id: None,
         source_category: None,
+        // Neither the owner's own word at either bank nor either bank's code:
+        // for the reason the description is dropped just below, and one of its
+        // own — the two legs may carry two different words of his, and choosing
+        // one would file the transfer under a decision he made about one side.
+        owner_category: None,
+        source_code: None,
         source_kind: None,
         // The two banks described this movement in two vocabularies; neither is
         // the transfer's own description, and picking one would state that the
@@ -473,6 +479,8 @@ mod tests {
                 idempotency_key: None,
                 source_operation_id: None,
                 source_category: None,
+                owner_category: None,
+                source_code: None,
                 source_kind: None,
                 description: None,
             },

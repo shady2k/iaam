@@ -164,12 +164,14 @@ pub fn matcher_json(matcher: &RuleMatcher) -> Value {
         "description_contains": matcher.description_contains,
         "kind": matcher.kind,
         "source_category": matcher.source_category,
+        "owner_category": matcher.owner_category,
+        "source_code": matcher.source_code,
     })
 }
 
 /// The condition, in the form a request body carries it.
 ///
-/// The same four fields as [`matcher_json`] and deliberately not the same
+/// The same six fields as [`matcher_json`] and deliberately not the same
 /// shape: what a rule is **stored** as states every key, so a reader of the
 /// store sees what the rule does not ask about; what a rule is **sent** as is
 /// the shape `RuleMatcherDto` publishes, which omits an absent field, and that
@@ -195,6 +197,8 @@ pub fn matcher_request_json(matcher: &RuleMatcher) -> Value {
         ),
         ("kind", matcher.kind.as_ref()),
         ("source_category", matcher.source_category.as_ref()),
+        ("owner_category", matcher.owner_category.as_ref()),
+        ("source_code", matcher.source_code.as_ref()),
     ] {
         if let Some(value) = value {
             object.insert(field.to_owned(), Value::String(value.clone()));
@@ -430,6 +434,12 @@ fn matcher_and_outcome(
             // what those rules meant: the condition could not be written, so no
             // rule that predates the field is silently widened by reading it.
             source_category: optional_string(&matcher, "source_category", "matcher")?,
+            // Absent from every rule stored before the profile could read the
+            // columns, and `None` is what those rules meant, exactly as above:
+            // a condition that could not be written is not read into a rule
+            // that never asked it.
+            owner_category: optional_string(&matcher, "owner_category", "matcher")?,
+            source_code: optional_string(&matcher, "source_code", "matcher")?,
         },
         parse_outcome(outcome)?,
     ))
@@ -662,6 +672,14 @@ fn subject(event: &Event) -> Option<ClassificationSubject> {
         // counterparty and no operation word.
         source_kind: event.provenance.source_kind().map(str::to_owned),
         source_category: source_category_evidence(event),
+        // Straight off provenance, and with no version boundary of the kind
+        // `source_category_evidence` needs: neither field ever held another
+        // word, so there is no fact in the journal whose value has to be read
+        // as something else. `None` is a fact recorded before the profile read
+        // the columns, or a source that printed nothing — and both mean the
+        // journal holds no such evidence about this row.
+        owner_category: event.provenance.owner_category().map(str::to_owned),
+        source_code: event.provenance.source_code().map(str::to_owned),
         movement,
         far_side,
     })
@@ -785,6 +803,8 @@ mod tests {
                 description_contains: Some("shop one".to_owned()),
                 kind: None,
                 source_category: None,
+                owner_category: None,
+                source_code: None,
             })
             .matcher
             .matches(&subject),
@@ -814,6 +834,8 @@ mod tests {
                 description_contains: None,
                 kind: Some("Transfers".to_owned()),
                 source_category: None,
+                owner_category: None,
+                source_code: None,
             })
             .matcher
             .matches(&subject),
@@ -884,6 +906,8 @@ mod tests {
                 description_contains: None,
                 kind: None,
                 source_category: Some("Bank interest".to_owned()),
+                owner_category: None,
+                source_code: None,
             })
             .matcher
             .matches(&subject),
@@ -913,6 +937,8 @@ mod tests {
                 description_contains: None,
                 kind: None,
                 source_category: Some("INNER".to_owned()),
+                owner_category: None,
+                source_code: None,
             })
             .matcher
             .matches(&subject),
@@ -932,6 +958,8 @@ mod tests {
             description_contains: None,
             kind: None,
             source_category: Some("Bank interest".to_owned()),
+            owner_category: None,
+            source_code: None,
         };
         let stored = serde_json::to_string(&matcher_json(&matcher)).expect("matcher json");
         let outcome = serde_json::to_string(&outcome_json(Classification::Income {

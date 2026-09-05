@@ -16,8 +16,11 @@
 
 use iaam_core::dates::EventDates;
 use iaam_core::event::leg::Leg;
+use iaam_core::event::provenance::RuleSettlement;
 use iaam_core::event::{Confidence, Relation};
-use iaam_core::ids::{AccountId, EventId, ImportId, ImportSessionId, OwnerId, SourceId};
+use iaam_core::ids::{
+    AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
+};
 use time::{Date, Time};
 
 use crate::error::AppError;
@@ -61,6 +64,25 @@ pub struct JournalReadQuery {
     /// `POST /v1/import-sessions` handed it to him and every row returned here
     /// carries it back.
     pub import_session: Option<ImportSessionId>,
+    /// The standing classification rule that filed the rows.
+    ///
+    /// The handle the owner's own review needs. He makes one decision, a rule is
+    /// written from it, and the rule then files a group of rows automatically;
+    /// when one of them turns out wrong, finding it means seeing the group — and
+    /// the group is defined by the rule. Every other filter here narrows by
+    /// where a row came from or when it happened, and none of them can assemble
+    /// that group.
+    ///
+    /// It composes with the rest rather than replacing them: «what this rule did
+    /// in March, on that account» is one query.
+    pub settled_by_rule: Option<ClassificationRuleId>,
+    /// One version of that rule, where the caller wants only its rows.
+    ///
+    /// A rule can be edited, so «the rows rule R filed» and «the rows version 3
+    /// of R filed» are different questions, and after an edit the second is the
+    /// one asked. Supplied together with the rule; a version on its own names
+    /// nothing and is refused rather than ignored.
+    pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -154,6 +176,20 @@ pub struct JournalEventView {
     /// `None` covers both a fact that came through no session and one committed
     /// before the field existed, and a reader must not resolve it either way.
     pub import_session: Option<ImportSessionId>,
+    /// What the owner's standing rules made of this row, when a reading said.
+    ///
+    /// Three states and not two, and the third is the one he must be able to
+    /// see. A rule names itself and its version — that is the group one decision
+    /// of his reached. `no_rule` says a reading ran and none of his rules
+    /// matched, so the row was settled some other way: he answered it, his
+    /// account directory recognised the far side, the source asserted it, or the
+    /// caller submitted a finished operation. Absence says nothing was recorded
+    /// at all — every fact written before this field existed, and every route
+    /// that writes without reading a row against the rules.
+    ///
+    /// Absence is therefore never «no rule filed this». Reading it that way
+    /// tells him a row one of his rules did file was decided by hand.
+    pub rule_settlement: Option<RuleSettlement>,
 }
 
 /// Read one page of the owner's journal.
@@ -175,6 +211,8 @@ pub async fn read_journal(
         .as_ref()
         .map(|declared| declared_source(owner, declared))
         .transpose()?;
+    let (settled_by_rule, settled_by_rule_version) =
+        rule_filter(query.settled_by_rule, query.settled_by_rule_version)?;
 
     // One row beyond the page: the difference between "there is more" and "that
     // was everything" cannot be inferred from a full page, and a caller that
@@ -188,6 +226,8 @@ pub async fn read_journal(
                 account: query.account,
                 source,
                 import_session: query.import_session,
+                settled_by_rule,
+                settled_by_rule_version,
                 from: range.0,
                 to: range.1,
                 after,
@@ -240,7 +280,32 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         source_kind: event.provenance.source_kind().map(str::to_owned),
         description: event.provenance.description().map(str::to_owned),
         import_session: event.provenance.import_session(),
+        rule_settlement: event.provenance.rule_settlement().copied(),
     }
+}
+
+/// The rule narrowing, with the pair checked before either half is used.
+///
+/// A version numbers one rule's own revisions, so a version with no rule beside
+/// it names nothing at all. Accepting it and ignoring it would answer a question
+/// nobody asked — every version's rows under a request for one — and the caller
+/// would have no way to tell that from a rule genuinely edited only once.
+fn rule_filter(
+    rule: Option<ClassificationRuleId>,
+    version: Option<u32>,
+) -> Result<(Option<ClassificationRuleId>, Option<u32>), AppError> {
+    if rule.is_none() {
+        if let Some(version) = version {
+            return Err(AppError::Invalid {
+                field: "settled_by_rule_version".to_owned(),
+                expected: "a rule named beside the version, because a version numbers one \
+                           rule's own revisions"
+                    .to_owned(),
+                actual: version.to_string(),
+            });
+        }
+    }
+    Ok((rule, version))
 }
 
 fn page_size(limit: Option<u32>) -> Result<u32, AppError> {
@@ -381,6 +446,36 @@ mod tests {
             };
             assert_eq!(field, "after");
         }
+    }
+
+    #[test]
+    fn a_rule_narrows_the_journal_and_a_version_narrows_it_further() {
+        let rule = ClassificationRuleId::new_random();
+        assert_eq!(
+            rule_filter(None, None).expect("no rule named"),
+            (None, None)
+        );
+        assert_eq!(
+            rule_filter(Some(rule), None).expect("the rule alone"),
+            (Some(rule), None)
+        );
+        assert_eq!(
+            rule_filter(Some(rule), Some(3)).expect("one version of it"),
+            (Some(rule), Some(3))
+        );
+    }
+
+    #[test]
+    fn a_rule_version_with_no_rule_beside_it_is_refused() {
+        // A version numbers one rule's own revisions, so «version 3» on its own
+        // names nothing. Accepting it and ignoring it would hand back every
+        // version's rows under a question that asked for one.
+        let error = rule_filter(None, Some(3)).expect_err("a version alone is refused");
+        let AppError::Invalid { field, actual, .. } = error else {
+            panic!("a lone version is refused as an invalid field");
+        };
+        assert_eq!(field, "settled_by_rule_version");
+        assert_eq!(actual, "3");
     }
 
     #[test]

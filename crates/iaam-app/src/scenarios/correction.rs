@@ -19,9 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::correction::{CorrectionError, resolve};
 use iaam_core::event::kind::EventKind;
-use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, EventId, ImportId, PrincipalId, SourceId};
+use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, ImportId, PrincipalId, SourceId};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{SubmittedOperation, Verdict, normalize};
@@ -63,6 +63,16 @@ pub enum CorrectionRequest {
         target: EventId,
         operation: Box<SubmittedOperation>,
     },
+}
+
+impl CorrectionRequest {
+    /// The event this correction is about. Both shapes name one.
+    #[must_use]
+    pub const fn target(&self) -> EventId {
+        match self {
+            Self::Reversal { target } | Self::Replacement { target, .. } => *target,
+        }
+    }
 }
 
 /// Which import a correction retracts.
@@ -117,6 +127,58 @@ impl ImportTarget {
     }
 }
 
+/// What one correction did, and the standing decision behind the row it touched.
+///
+/// The verdict alone was the whole answer, and it left the owner's own question
+/// unanswered. He corrects one row of a group a rule filed; the rule is not part
+/// of the correction and is still in force, so the next row of the same shape is
+/// filed the same way. Two acts, and nothing linked them.
+///
+/// It rides the correction's own answer rather than waiting to be asked for. The
+/// moment he has just said a fact was wrong is the moment the standing decision
+/// behind it is worth naming, and a caller that must make a second call to learn
+/// it will not make one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionOutcome {
+    pub verdict: Verdict,
+    /// The rule that filed the corrected row, where the fact records one.
+    ///
+    /// `None` in both of the other two states, and they are different states.
+    /// A fact saying a reading ran and no rule matched has no standing decision
+    /// behind it, so there is nothing to name. A fact recording nothing about
+    /// rules at all — every fact written before that recording existed, and
+    /// every path that writes without reading a row against the rules — is not
+    /// evidence that no rule filed it, and nothing here turns the silence into
+    /// the claim that he decided the row by hand.
+    pub standing_rule: Option<StandingRule>,
+}
+
+/// A rule that filed a corrected row and that the correction left in force.
+///
+/// It is a statement, never an offer: retiring a rule or rewriting it is the
+/// owner's own act under his own credential, and nothing in a correction
+/// performs it or asks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandingRule {
+    /// The rule that filed the row. The identifier is what the act of retiring
+    /// it takes, so it is what a caller needs in order to offer him that act.
+    pub rule: ClassificationRuleId,
+    /// The version of the rule the fact was filed under.
+    pub version: u32,
+    /// Rows this rule filed that still count once this correction is written.
+    ///
+    /// The cost of the two acts this notice does not perform, as a number.
+    /// Retiring the rule or rewriting it changes what happens to rows read from
+    /// now on and nothing else: these stay exactly as they are, and each one he
+    /// disagrees with is a correction of its own.
+    ///
+    /// Counted over every recorded version of the rule, because retiring is by
+    /// rule. Rows this same request corrects are excluded — he has just dealt
+    /// with them — and so are rows already reversed or replaced, which stopped
+    /// counting before he asked.
+    pub still_filed: usize,
+}
+
 /// Outcome of correcting one whole declared import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImportCorrectionOutcome {
@@ -146,7 +208,7 @@ pub async fn correct_events(
     principal: &Principal,
     acknowledge_retraction: bool,
     corrections: &[CorrectionRequest],
-) -> Result<Vec<Verdict>, AppError> {
+) -> Result<Vec<CorrectionOutcome>, AppError> {
     may_correct(principal)?;
     acknowledged(acknowledge_retraction)?;
     if corrections.is_empty() {
@@ -168,17 +230,95 @@ pub async fn correct_events(
         }
     }
 
+    // Read off the journal as it stands, before the candidates join it: the
+    // question is what the owner's rules have already decided, and a reversal
+    // this request is about to write is not part of that.
+    let standing = standing_rules(&events, corrections)?;
+
     let candidates = checked_against_resolve(events, candidates)?;
     let recorded =
         crate::scenarios::ingest::append_checked(services, candidates, IdentityScope::Source)
             .await?;
     Ok(recorded
         .into_iter()
-        .map(|outcome| match outcome {
-            Recorded::Inserted { id } => Verdict::Provisional { event: id },
-            Recorded::Duplicate { existing } => Verdict::Duplicate { existing },
+        .zip(standing)
+        .map(|(outcome, standing_rule)| CorrectionOutcome {
+            verdict: match outcome {
+                Recorded::Inserted { id } => Verdict::Provisional { event: id },
+                Recorded::Duplicate { existing } => Verdict::Duplicate { existing },
+            },
+            standing_rule,
         })
         .collect())
+}
+
+/// The standing rule behind each corrected row, in the order they were asked for.
+///
+/// The journal is resolved a second time here, and only when it buys something:
+/// a request none of whose targets records a rule has nothing to count, and
+/// folding a whole journal to answer «nothing» is the cost every correction
+/// would pay for the notice a few of them carry.
+///
+/// A target the journal does not hold cannot reach this — `candidate_for` has
+/// already refused the request — and if one somehow did, it says nothing rather
+/// than failing the correction: a notice is not worth refusing a write over.
+fn standing_rules(
+    journal: &[Event],
+    corrections: &[CorrectionRequest],
+) -> Result<Vec<Option<StandingRule>>, AppError> {
+    let by_id: BTreeMap<EventId, &Event> = journal.iter().map(|event| (event.id, event)).collect();
+    let targets: Vec<Option<&Event>> = corrections
+        .iter()
+        .map(|correction| by_id.get(&correction.target()).copied())
+        .collect();
+    if !targets.iter().flatten().any(|target| {
+        matches!(
+            target.provenance.rule_settlement(),
+            Some(RuleSettlement::Rule { .. })
+        )
+    }) {
+        return Ok(vec![None; corrections.len()]);
+    }
+
+    let effective = resolve(journal).map_err(AppError::Correction)?;
+    let corrected: BTreeSet<EventId> = corrections.iter().map(CorrectionRequest::target).collect();
+    Ok(targets
+        .into_iter()
+        .map(|target| target.and_then(|target| standing_rule_for(target, &effective, &corrected)))
+        .collect())
+}
+
+/// The rule behind one corrected row, and what it still files.
+///
+/// The three states a fact can be in reach the answer as themselves. A rule
+/// names itself. A reading that matched none of his rules leaves nothing to
+/// name. And a fact that records nothing is not the second one: reading the
+/// silence as «no rule filed this» would tell him he had decided by hand a row
+/// one of his rules may well have decided for him.
+fn standing_rule_for(
+    target: &Event,
+    effective: &[&Event],
+    corrected: &BTreeSet<EventId>,
+) -> Option<StandingRule> {
+    let (rule, version) = match target.provenance.rule_settlement() {
+        Some(RuleSettlement::Rule { rule, version }) => (*rule, *version),
+        Some(RuleSettlement::NoRule) | None => return None,
+    };
+    let still_filed = effective
+        .iter()
+        .filter(|event| !corrected.contains(&event.id))
+        .filter(|event| {
+            event
+                .provenance
+                .settling_rule()
+                .is_some_and(|(filed_by, _)| filed_by == rule)
+        })
+        .count();
+    Some(StandingRule {
+        rule,
+        version,
+        still_filed,
+    })
 }
 
 /// Retract every effective event one declared import left in the journal.
@@ -732,7 +872,7 @@ mod tests {
     use iaam_core::event::Confidence;
     use iaam_core::event::kind::EventKind;
     use iaam_core::event::leg::Leg;
-    use iaam_core::ids::{AccountId, OwnerId};
+    use iaam_core::ids::{AccountId, ClassificationRuleId, OwnerId};
     use iaam_core::money::{CurrencyCode, Money, PostedMinor};
     use time::macros::date;
 
@@ -880,6 +1020,120 @@ mod tests {
         assert_eq!(
             event.provenance.source(),
             SourceId::declared(owner(), account(), CORRECTION_CHANNEL)
+        );
+    }
+
+    /// A row one of the owner's standing rules filed, at that version of it.
+    fn filed_by_rule(id: u128, rule: ClassificationRuleId, version: u32) -> Event {
+        let mut event = deposit(id, SourceId::new_random());
+        event.provenance = event
+            .provenance
+            .clone()
+            .with_rule_settlement(RuleSettlement::Rule { rule, version });
+        event
+    }
+
+    /// The owner's own case: a rule filed a group and one row of it is wrong.
+    ///
+    /// Correcting that row does nothing to the rule, so the answer names the
+    /// rule and how much of his journal it still decides — which is what
+    /// retiring or rewriting it would leave exactly as it is.
+    #[test]
+    fn a_corrected_row_a_rule_filed_names_the_rule_and_what_it_still_files() {
+        let rule = ClassificationRuleId(uuid::Uuid::from_u128(11));
+        let corrected = filed_by_rule(1, rule, 3);
+        let sibling = filed_by_rule(2, rule, 3);
+        let unrelated = deposit(3, SourceId::new_random());
+        let journal = vec![corrected.clone(), sibling, unrelated];
+        let effective = resolve(&journal).expect("a journal that resolves");
+
+        let standing = standing_rule_for(&corrected, &effective, &BTreeSet::from([corrected.id]))
+            .expect("the rule that filed the row is still standing");
+
+        assert_eq!(standing.rule, rule);
+        assert_eq!(standing.version, 3, "the version that filed this row");
+        assert_eq!(
+            standing.still_filed, 1,
+            "the sibling, and not the row being corrected nor the row no rule filed"
+        );
+    }
+
+    /// A reading ran and none of his rules matched: he settled the row himself,
+    /// his directory recognised the far side, or the caller stated it outright.
+    ///
+    /// There is no standing decision behind the row, so there is nothing to say
+    /// about one, and the answer says nothing.
+    #[test]
+    fn a_corrected_row_no_rule_settled_says_nothing_about_a_rule() {
+        let mut corrected = deposit(1, SourceId::new_random());
+        corrected.provenance = corrected
+            .provenance
+            .clone()
+            .with_rule_settlement(RuleSettlement::NoRule);
+        let journal = vec![corrected.clone()];
+        let effective = resolve(&journal).expect("a journal that resolves");
+
+        assert!(
+            standing_rule_for(&corrected, &effective, &BTreeSet::from([corrected.id])).is_none(),
+            "no rule stands behind this row, so the correction names none"
+        );
+    }
+
+    /// The state every fact written before the recording existed is in.
+    ///
+    /// Absence is «nothing was recorded», never «no rule of mine filed this».
+    /// A rule may well have filed the row; nobody wrote down that it did. An
+    /// answer that turned the silence into the sentence for `no_rule` would tell
+    /// him he had decided by hand a row one of his rules decided for him.
+    #[test]
+    fn a_corrected_row_from_before_the_recording_existed_says_nothing_about_a_rule() {
+        let corrected = deposit(1, SourceId::new_random());
+        assert!(
+            corrected.provenance.rule_settlement().is_none(),
+            "the state under test is the fact that records nothing at all"
+        );
+        let journal = vec![corrected.clone()];
+        let effective = resolve(&journal).expect("a journal that resolves");
+
+        assert!(
+            standing_rule_for(&corrected, &effective, &BTreeSet::from([corrected.id])).is_none(),
+            "nothing was recorded, so nothing is claimed either way"
+        );
+    }
+
+    /// What the rule still files is what it files **after** this request lands.
+    ///
+    /// A row this batch is also correcting is one he has just dealt with, and a
+    /// row somebody already retracted stopped counting before he asked. Counting
+    /// either would overstate what retiring the rule would leave behind, which
+    /// is the one number this notice exists to give him.
+    #[test]
+    fn what_a_rule_still_files_excludes_this_request_and_what_is_already_retracted() {
+        let rule = ClassificationRuleId(uuid::Uuid::from_u128(11));
+        let corrected = filed_by_rule(1, rule, 3);
+        let also_corrected = filed_by_rule(2, rule, 3);
+        let already_reversed = filed_by_rule(3, rule, 3);
+        let reversal = reversal_for(&already_reversed);
+        let untouched = filed_by_rule(4, rule, 3);
+        let journal = vec![
+            corrected.clone(),
+            also_corrected.clone(),
+            already_reversed,
+            reversal,
+            untouched,
+        ];
+        let effective = resolve(&journal).expect("a journal that resolves");
+
+        let standing = standing_rule_for(
+            &corrected,
+            &effective,
+            &BTreeSet::from([corrected.id, also_corrected.id]),
+        )
+        .expect("the rule is still standing");
+
+        assert_eq!(
+            standing.still_filed, 1,
+            "only the row this request leaves alone and nothing has retracted"
         );
     }
 

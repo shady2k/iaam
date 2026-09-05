@@ -587,7 +587,22 @@ fn invalid_income_kind(actual: &str) -> AppError {
     .into()
 }
 
-fn subject(event: &Event) -> Option<ClassificationSubject> {
+/// One recorded fact, as a standing rule is tested against it.
+///
+/// `None` for a fact no rule classifies — a trade, a valuation, a corporate
+/// action — and that absence is a decision rather than a gap: those are facts
+/// and not the owner's classifications, so no rule of his is ever tested
+/// against them.
+///
+/// **Visible to the crate since `iaam-uibl`, and to exactly one other caller.**
+/// The import session's forecast has to answer «which recorded movements would
+/// this condition reach» before the condition stands, and that question is only
+/// worth answering if it is answered by the same reader the recomputation
+/// replays history with. A second reading of a fact into a subject there would
+/// let a forecast promise a reach the classifier does not perform — the
+/// `source_category` boundary below is exactly the kind of rule the two copies
+/// would disagree about first.
+pub(crate) fn subject(event: &Event) -> Option<ClassificationSubject> {
     let (counterparty, movement, far_side) = match event.kind {
         EventKind::CashIn { .. } | EventKind::Income { .. } | EventKind::Refund { .. } => {
             (Counterparty::Unknown, Some(Movement::In), FarSide::Unstated)

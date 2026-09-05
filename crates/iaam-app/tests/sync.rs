@@ -1305,7 +1305,7 @@ async fn an_event_claiming_an_older_schema_version_is_refused_on_write() {
             field,
             expected,
             actual,
-        } if field == "event[0].schema_version" && expected == "14" && actual == "7"
+        } if field == "event[0].schema_version" && expected == "15" && actual == "7"
     ));
     assert!(load_all(&services, owner).await.is_empty());
 }

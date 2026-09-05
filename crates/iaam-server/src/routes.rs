@@ -54,8 +54,8 @@ use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposa
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
-    AccountId, CategoryId, CategoryRuleId, CustodyId, EventId, ImportId, ImportQuestionId,
-    ImportSessionId, InstrumentId, SourceId,
+    AccountId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId, EventId, ImportId,
+    ImportQuestionId, ImportSessionId, InstrumentId, SourceId,
 };
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
@@ -85,21 +85,22 @@ use crate::dto::{
     CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
     CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
-    CreateAccountRequest, CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest,
-    CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DeclaredAccountDto,
-    DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto,
-    InputAlternativeDto, InstrumentDto, IssuedTokenDto, JournalEventReadDto, JournalPageDto,
-    MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
-    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    NegativeBalanceExpectationDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
-    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
-    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
-    RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
-    RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
-    ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest, RequestPlanDto,
-    RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
+    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
+    CustodyRepairRequest, DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams,
+    FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
+    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
+    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
+    OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto, ProposedAnswerDto,
+    QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams,
+    ReconciliationResponseDto, ReconciliationStatusDto, RecordAccountNameDispositionRequest,
+    RecordAccountScopeRequest, RecordAccountTransferPartnersBatchRequest,
+    RecordAccountTransferPartnersRequest, ReplaceAccountAliasesRequest,
+    ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -108,6 +109,9 @@ use crate::dto::{
     ImportRowDto, ImportSessionContentsDto, ImportSessionDto, ImportSessionSummaryDto,
     OpenImportSessionRequest, RecordedEventDto, StateImportControlFiguresRequest,
 };
+// What one answer's standing decision would settle before it stands
+// (`iaam-uibl`), in a block of its own for the reason the block above gives.
+use crate::dto::{AnswerRuleForecastDto, PreviewAnswerRequest};
 // Types added by wave K, in a block of their own for the reason the block above
 // states: this file is edited by several changes at once, and merging one name
 // into a wrapped list reflows lines nothing else touched.
@@ -667,7 +671,7 @@ pub async fn repair_custody(
     path = "/v1/corrections",
     request_body = SubmitCorrectionsRequest,
     responses(
-        (status = 200, description = "Verdict for each correction", body = Vec<VerdictDto>),
+        (status = 200, description = "Verdict for each correction, with the standing rule behind the row it corrected", body = Vec<CorrectionVerdictDto>),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 409, description = "A correction key is held by an unrelated event", body = ApiError),
         (status = 422, description = "The correction would not resolve, or the acknowledgement is missing", body = ApiError),
@@ -680,7 +684,7 @@ pub async fn submit_corrections(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     ApiBytes(body): ApiBytes,
-) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
+) -> Result<Json<Vec<CorrectionVerdictDto>>, ApiFailure> {
     require(&principal, OperationKey::SubmitCorrections)?;
     let request: SubmitCorrectionsRequest = serde_json::from_slice(&body)
         .map_err(|error| invalid_field("body", "correction JSON object", error.to_string()))?;
@@ -700,7 +704,7 @@ pub async fn submit_corrections(
         corrections.push(domain);
     }
 
-    let verdicts = correct_events(
+    let outcomes = correct_events(
         &state.services,
         &principal,
         request.acknowledge_retraction,
@@ -708,10 +712,10 @@ pub async fn submit_corrections(
     )
     .await?;
     Ok(Json(
-        verdicts
+        outcomes
             .iter()
             .enumerate()
-            .map(|(index, verdict)| VerdictDto::from_domain(index + 1, verdict))
+            .map(|(index, outcome)| CorrectionVerdictDto::from_domain(index + 1, outcome))
             .collect(),
     ))
 }
@@ -3874,6 +3878,81 @@ pub async fn answer_import_question(
     Ok(Json(ImportQuestionDto::from_answered(&answered)))
 }
 
+/// What the standing decision one answer would keep would settle, before it
+/// stands.
+///
+/// The owner asked it in his own words: what if every one of the operations is
+/// right except one? He answers a line, a standing decision appears, and it
+/// files a group of lines he never sees one by one. What that decision reaches
+/// was published nowhere until after it stood.
+///
+/// This answers it before. The condition is the one the answering call would
+/// write, and beside it come the lines of this import it would cover and the
+/// movements already recorded that it would cover — each of the second naming
+/// the fact a correction is addressed to, so the one that was something else can
+/// be found before the decision stands rather than a month after.
+///
+/// **It writes nothing.** No standing decision is made, nothing already recorded
+/// is changed, the question stays exactly as open as it was, and the answering
+/// call is unaffected by this one. Correcting a movement and changing the
+/// standing decision behind it stay two acts; this performs neither.
+///
+/// **Covered is not the same as settled.** His own answer and his own account
+/// directory are both read before any standing decision of his, so a line
+/// either of them has already settled stays exactly as it is whatever he
+/// answers here. Such a line is still listed, because dropping it would read as
+/// one the condition does not cover; it carries what settles it today, and it
+/// is not counted among what answering would settle.
+///
+/// What could not be decided either way is listed with its reason rather than
+/// left out, because an omission here would read as «nothing else is affected».
+///
+/// The body is the answering call's body without `settles`: what that word
+/// reaches is a fact about the answer, not about the standing decision.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/questions/{question}/answer/preview",
+    params(
+        ("session" = Uuid, Path, description = "Import session identifier"),
+        ("question" = Uuid, Path, description = "Question identifier")
+    ),
+    request_body = PreviewAnswerRequest,
+    responses(
+        (status = 200, description = "What the answer's standing decision would settle", body = AnswerRuleForecastDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such session or question", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "The answer is not one this question admits, or it carries a field its own word does not take", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn preview_import_answer(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath((session, question)): ApiPath<(Uuid, Uuid)>,
+    ApiJson(request): ApiJson<PreviewAnswerRequest>,
+) -> Result<Json<AnswerRuleForecastDto>, ApiFailure> {
+    // The authority the **answering** call demands, and no operation key: this
+    // is the call it describes, asked in advance, so an answerer that could not
+    // answer must not be handed the forecast either. Nothing is written, so
+    // there is nothing to make idempotent (decision 0025).
+    require(&principal, OperationKey::AnswerImportQuestion)?;
+    let answer = request.to_domain().map_err(|rejection| {
+        invalid_field(rejection.field, &rejection.expected, rejection.actual)
+    })?;
+    let forecast = iaam_app::scenarios::import_session::preview_answer_rule(
+        &state.services,
+        &principal,
+        ImportSessionId(session),
+        ImportQuestionId(question),
+        answer,
+    )
+    .await?;
+    Ok(Json(AnswerRuleForecastDto::from_domain(&forecast)))
+}
+
 /// What committing this session would do, before it does it (iaam-k1xa).
 ///
 /// Computed by the code that commits, not beside it. That is the whole property:
@@ -5032,6 +5111,32 @@ pub struct JournalParams {
     /// `POST /v1/import-sessions` returned and every row here carries back.
     #[serde(default)]
     pub import_session: Option<Uuid>,
+    /// The standing classification rule that filed the rows.
+    ///
+    /// One decision of yours becomes a rule, and the rule then files rows
+    /// automatically — rows you never see one by one. This returns that group,
+    /// so a row that turns out wrong can be found among the others the same
+    /// decision reached instead of by reading a whole import.
+    ///
+    /// It narrows alongside the other filters rather than replacing them: an
+    /// account, a date interval and a rule together ask what that rule did on
+    /// that account in that month.
+    ///
+    /// Rows the rule did not file are outside every value of it, including rows
+    /// nothing recorded a settlement for at all. Each row returned by this route
+    /// carries `rule_settlement`, which says which of those it is.
+    #[serde(default)]
+    pub settled_by_rule: Option<Uuid>,
+    /// One version of that rule.
+    ///
+    /// A rule can be edited, and its version counts its own revisions. «What
+    /// this rule filed» and «what version 3 of it filed» are different
+    /// questions, and after an edit the second is usually the one being asked.
+    ///
+    /// Supplied together with `settled_by_rule`. On its own it names nothing, so
+    /// it is refused rather than quietly ignored.
+    #[serde(default)]
+    pub settled_by_rule_version: Option<u32>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date)]
@@ -5100,6 +5205,8 @@ pub async fn list_journal_events(
             account: params.account.map(AccountId),
             source,
             import_session: params.import_session.map(ImportSessionId),
+            settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
+            settled_by_rule_version: params.settled_by_rule_version,
             from,
             to,
             after: params.after,
@@ -5455,7 +5562,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// the reason [`require_admin`] states: the queue and the caveat register are
 /// about the owner's money and these are about the shape of the instance, so
 /// there is no second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 25] = [
     (
         "resolve_instrument",
         "A read that takes a body: it answers which instrument a namespace, a value and a date name, and records nothing. A target is a call that changes something — see list_source_profiles.",
@@ -5463,6 +5570,10 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
     (
         "preview_category_rule_route",
         "A read that takes a body: it says what a rule would match and writes no rule.",
+    ),
+    (
+        "preview_import_answer",
+        "A read that takes a body: it says what the standing decision an answer would keep would settle, and it keeps none, answers nothing and corrects nothing. It publishes the floor of the call it describes — answer_import_question — because an answerer that could not answer has no use for its forecast; that is the answering route's own key, read once, not a second authority stated here.",
     ),
     (
         "returns_report_with_rates",

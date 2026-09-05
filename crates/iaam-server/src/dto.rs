@@ -28,7 +28,9 @@ use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyI
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
 };
-use iaam_app::scenarios::correction::{CorrectionRequest, ImportCorrectionOutcome};
+use iaam_app::scenarios::correction::{
+    CorrectionOutcome, CorrectionRequest, ImportCorrectionOutcome, StandingRule,
+};
 use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::{
     AnswerableQuestion, ControlReconciliation, FactBasis, HeldRow, ImportPlan, NoFactReason,
@@ -50,6 +52,9 @@ use iaam_app::scenarios::import_session::PlannedOrigin;
 // to a wrapped list reflows every line of it.
 use iaam_app::actions::{OwnerQuestion, ReportStanding};
 use iaam_app::scenarios::import_session::{AnswerReach, AnsweredQuestions, stored_alternatives};
+// What one answer's standing decision would settle before it stands
+// (`iaam-uibl`), in a block of its own for the reason the blocks above give.
+use iaam_app::scenarios::import_session::{AnswerRuleForecast, Undecided};
 // Wave Y's own names, in a block of their own for the reason the blocks above
 // give: this file is edited by several changes at once, and a name added to a
 // wrapped list reflows every line of it.
@@ -1230,6 +1235,112 @@ impl CorrectionDto {
             },
         })
     }
+}
+
+/// Verdict for one correction, and the standing decision behind the row it
+/// touched.
+///
+/// The verdict is flattened rather than nested, so a caller reading this route
+/// reads the same object every other write route answers with, plus one field.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CorrectionVerdictDto {
+    #[serde(flatten)]
+    pub verdict: VerdictDto,
+    /// The standing rule that filed the row you corrected, where the recorded
+    /// fact names one.
+    ///
+    /// **Absent says nothing about rules, and never «no rule filed this».** It
+    /// covers a row whose reading matched none of your rules — there is no
+    /// standing decision behind such a row to name — and equally a row whose
+    /// fact records nothing about rules at all: everything recorded before that
+    /// recording existed, and everything written without reading a row against
+    /// your rules, a correction included. A rule may well have filed such a row
+    /// and nobody wrote down that it did, so nothing here claims either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standing_rule: Option<StandingRuleDto>,
+}
+
+/// A rule that filed the corrected row and that the correction left standing.
+///
+/// It is a statement and not an offer. Correcting a row and retiring the rule
+/// behind it are two acts: the first says one fact was wrong, the second changes
+/// what happens to every row of that shape from now on. This names the second
+/// and performs no part of it — nothing here retires a rule, edits one, or asks
+/// permission to.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct StandingRuleDto {
+    /// The rule that filed the row.
+    ///
+    /// The identifier is published because it is what the act this notice does
+    /// not perform takes: `DELETE /v1/classification-rules/{id}` retires a rule,
+    /// and `POST /v1/classification-rules` with `replaces` set to this value
+    /// rewrites one. Both are the owner's own acts, under his own credential.
+    pub rule: Uuid,
+    /// The version of the rule the row was filed under.
+    pub version: u32,
+    /// Other rows this rule filed that still count once this correction is
+    /// written.
+    ///
+    /// Rows the same request corrects are not among them, nor are rows already
+    /// retracted: the number is what retiring or rewriting the rule would leave
+    /// behind, and a row that has already stopped counting is not left behind.
+    pub still_filed: usize,
+    /// What the correction did, and what it left alone.
+    pub explanation: String,
+    /// What retiring the rule or rewriting it would cost. Neither has happened.
+    pub changing_it: String,
+}
+
+impl CorrectionVerdictDto {
+    #[must_use]
+    pub fn from_domain(row: usize, outcome: &CorrectionOutcome) -> Self {
+        Self {
+            verdict: VerdictDto::from_domain(row, &outcome.verdict),
+            standing_rule: outcome.standing_rule.map(StandingRuleDto::from_domain),
+        }
+    }
+}
+
+impl StandingRuleDto {
+    #[must_use]
+    pub fn from_domain(standing: StandingRule) -> Self {
+        Self {
+            rule: standing.rule.inner(),
+            version: standing.version,
+            still_filed: standing.still_filed,
+            explanation: CORRECTION_LEAVES_THE_RULE_STANDING.to_owned(),
+            changing_it: changing_a_standing_rule_costs(standing.still_filed),
+        }
+    }
+}
+
+/// The one sentence for the one thing a correction does to a standing rule,
+/// published from one place so that two readers of it cannot be told two
+/// different things.
+const CORRECTION_LEAVES_THE_RULE_STANDING: &str = "You corrected one row. The standing rule that filed it is untouched and \
+     still in force, so the next row it matches will be filed the same way.";
+
+/// What the two acts this notice does not perform would cost, as a sentence.
+///
+/// Composed here rather than left to the caller: the number alone does not say
+/// which way it cuts, and a caller inventing the sentence for it is a second
+/// author of what the owner is read out.
+fn changing_a_standing_rule_costs(still_filed: usize) -> String {
+    let left_behind = match still_filed {
+        0 => "no other row it has already filed still counts.".to_owned(),
+        1 => "the one other row it has already filed stays exactly as it is, and \
+              correcting that one is an act of its own."
+            .to_owned(),
+        many => format!(
+            "the {many} other rows it has already filed stay exactly as they are, \
+             and each one you disagree with is an act of its own."
+        ),
+    };
+    format!(
+        "Retiring this rule, or rewriting it, is a separate step you take yourself, \
+         and nothing here has taken it. It would change only how rows are read from \
+         now on: {left_behind}"
+    )
 }
 
 impl ImportCorrectionDto {
@@ -8934,6 +9045,75 @@ pub struct JournalEventReadDto {
     /// session exists».
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import_session: Option<Uuid>,
+    /// Which of your standing classification rules filed this row.
+    ///
+    /// The one thing about a recorded fact that nothing else here answers.
+    /// Every other field says what the source printed or which submission
+    /// brought the row in; this says why it was filed the way it was, and it is
+    /// what `?settled_by_rule=` on this route selects by.
+    ///
+    /// **Absent means nothing was recorded about it, and never «no rule filed
+    /// this».** A row settled without a rule carries the object with
+    /// `settled_by` reading `no_rule`, which is a statement; absence covers
+    /// every fact recorded before this field existed and every route that writes
+    /// without reading the row against your rules — a correction, a broker
+    /// synchronisation. Reading absence as «you decided this one yourself» says
+    /// something the journal never did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_settlement: Option<JournalRuleSettlementDto>,
+}
+
+/// What a fact records about the rule that filed it.
+///
+/// One object rather than fields spread across the row, because it is one
+/// statement: the word, the sentence for it, and the rule it names are true
+/// together or not at all.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JournalRuleSettlementDto {
+    /// `rule` where one of your standing rules filed the row, `no_rule` where
+    /// the row was read against them and none matched — you answered it
+    /// yourself, your account directory recognised the other side, the source
+    /// asserted it, or the operation arrived already decided.
+    pub settled_by: String,
+    /// The same determination in words.
+    pub explanation: String,
+    /// The rule that filed the row, where one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Uuid>,
+    /// The version of that rule at the time it filed the row.
+    ///
+    /// Recorded because a rule can be edited: after an edit, «the rows this rule
+    /// filed» and «the rows the version I have just replaced filed» are
+    /// different sets, and only the second is the one to review.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
+impl JournalRuleSettlementDto {
+    #[must_use]
+    pub fn from_domain(settlement: &iaam_core::event::provenance::RuleSettlement) -> Self {
+        Self {
+            settled_by: settlement.code().to_owned(),
+            explanation: settlement_explanation(settlement).to_owned(),
+            rule: settlement.rule().map(|(rule, _)| rule.inner()),
+            version: settlement.rule().map(|(_, version)| version),
+        }
+    }
+}
+
+/// One static sentence per word, published from one function, so two readers of
+/// the same value cannot be told two different things about it.
+const fn settlement_explanation(
+    settlement: &iaam_core::event::provenance::RuleSettlement,
+) -> &'static str {
+    match settlement {
+        iaam_core::event::provenance::RuleSettlement::NoRule => {
+            "no standing rule of yours filed this row; it was settled some other way"
+        }
+        iaam_core::event::provenance::RuleSettlement::Rule { .. } => {
+            "a standing rule of yours matched the row and filed it"
+        }
+    }
 }
 
 /// The semantic dates a journal event carries. Absent means unknown, which is
@@ -9126,6 +9306,10 @@ impl JournalEventReadDto {
             source_kind: view.source_kind.clone(),
             description: view.description.clone(),
             import_session: view.import_session.map(|session| session.inner()),
+            rule_settlement: view
+                .rule_settlement
+                .as_ref()
+                .map(JournalRuleSettlementDto::from_domain),
         }
     }
 }
@@ -9477,14 +9661,22 @@ pub struct ImportQuestionDto {
 /// read beside one.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QuestionSettlementDto {
-    /// `rule`, `directory`, `source_asserted`, `one_account_two_instruments`
-    /// or `second_leg_of_one_movement`.
+    /// `rule`, `directory`, `source_asserted`, `answered`,
+    /// `one_account_two_instruments` or `second_leg_of_one_movement`.
     ///
-    /// The two other words those enumerations can say do not reach here, and
-    /// neither is a gap. `answered` is what a question with an `answered_at`
-    /// says about itself, and this field exists for the questions that have
-    /// none; `concluded` is a row whose caller submitted a finished operation,
-    /// which raises no question to settle.
+    /// Which of them can appear depends on what is being described, and the
+    /// difference is not a gap:
+    ///
+    /// - on a question, `settled_without_answer` exists for the questions with
+    ///   no `answered_at`, so `answered` never reaches it — the question says
+    ///   that about itself;
+    /// - on a line of a forecast, `answered` is one of the words, because there
+    ///   the question is what settles the line rather than why it stopped
+    ///   waiting.
+    ///
+    /// `concluded` reaches neither: a caller that submitted a finished
+    /// operation raises no question, and a forecast is never tested against
+    /// such a line.
     pub code: String,
     /// The same determination in a sentence, to be read out to the owner.
     pub explanation: String,
@@ -11809,7 +12001,7 @@ impl PlannedFactDto {
             settled_by: fact.settled_by.code().to_owned(),
             settled_by_explanation: fact.settled_by.describe().to_owned(),
             settled_by_rule: match &fact.settled_by {
-                FactBasis::Rule { rule, .. } => Some(rule.clone()),
+                FactBasis::Rule { rule, .. } => Some(rule.inner().to_string()),
                 FactBasis::Concluded
                 | FactBasis::Directory
                 | FactBasis::SourceAsserted
@@ -12426,7 +12618,7 @@ mod question_publishers {
     use super::*;
     use iaam_app::ingest::classification::Question;
     use iaam_app::ports::ImportQuestionView;
-    use iaam_core::ids::{ImportQuestionId, ImportSessionId};
+    use iaam_core::ids::{ClassificationRuleId, ImportQuestionId, ImportSessionId};
 
     fn codes(alternatives: &[AnswerAlternativeDto]) -> Vec<String> {
         alternatives
@@ -12550,7 +12742,7 @@ mod question_publishers {
             generalisation: Generalisation::Unanswered,
             settled_without_answer: Some(QuestionSettlement::Fact {
                 basis: FactBasis::Rule {
-                    rule: Uuid::new_v4().to_string(),
+                    rule: ClassificationRuleId(Uuid::new_v4()),
                     version: 1,
                 },
             }),
@@ -12571,5 +12763,287 @@ mod question_publishers {
             published.answered_at.is_none(),
             "settled is not answered: he never spoke about this row"
         );
+    }
+}
+
+/// The answer a forecast is asked about.
+///
+/// The same four fields `AnswerImportQuestionRequest` takes, minus `settles`,
+/// and read by that type's own conversion rather than by a second one: what a
+/// forecast describes is the standing decision an answer keeps, and `settles`
+/// says how many lines the **answer** disposes of, which is a different fact
+/// this call would have to either ignore or restate. A field silently ignored
+/// is worse than a field that is not there.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PreviewAnswerRequest {
+    /// One of the words the question published in its alternatives.
+    pub answer: String,
+    /// The owner's account on the other side, for `sent_to_own_account` and
+    /// `received_from_own_account` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    /// Where a fee came from, for the `fee` answer only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<FeeOriginDto>,
+    /// Which earning this was, for the `income` answer only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub income_kind: Option<IncomeKindDto>,
+}
+
+impl PreviewAnswerRequest {
+    /// Conversion to the owner's decision, through the answering call's own
+    /// reader.
+    ///
+    /// One reader, so a word this forecast accepts and the answering call
+    /// refuses — or the other way round — is not representable.
+    pub fn to_domain(&self) -> Result<Answer, Rejection> {
+        AnswerImportQuestionRequest {
+            answer: self.answer.clone(),
+            settles: None,
+            account: self.account,
+            origin: self.origin,
+            income_kind: self.income_kind,
+        }
+        .to_domain()
+    }
+}
+
+/// One line of this import a standing decision would cover.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ForecastedLineDto {
+    /// The line's position among what this import took, in submission order,
+    /// stable across a re-reading. **Not the document's line number**, which is
+    /// `locator` on the reading's own response.
+    pub row: u32,
+    /// What the source printed on it, in the shape an open question publishes.
+    pub printed: PrintedRowDto,
+    /// Whether this import is still waiting on an answer for it. `false` for a
+    /// line already settled, and for one that raised no question.
+    ///
+    /// Never read on its own: `false` is those two situations and «the owner
+    /// answered it» as well, and `now` is the field that says which.
+    pub awaiting_answer: bool,
+    /// What settles this line today, where anything does. Absent for a line
+    /// nothing settles, which is the state the question was asked from.
+    ///
+    /// `now` on a movement already recorded says what the record holds today;
+    /// this is the same thing for a line not yet recorded, and it is there for
+    /// the same reason: what a standing decision would do to a line is only
+    /// readable beside what is true of it now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<QuestionSettlementDto>,
+    /// Whether this line is settled whatever this standing decision does.
+    ///
+    /// `true` for a line the owner's own answer or his own account directory
+    /// already settles: both are read before any standing decision of his is,
+    /// so making one now leaves such a line exactly as it stands. It is still
+    /// listed, because a line dropped from the list would read as one the
+    /// condition does not cover — but it is not among what the sentence counts
+    /// as what answering would settle.
+    pub settled_regardless: bool,
+}
+
+/// One movement already recorded that a standing decision would cover.
+///
+/// It says the condition reaches the movement and what is recorded about it
+/// today. It deliberately does **not** say what the movement would become:
+/// which of the owner's standing decisions wins over a recorded fact is settled
+/// by the version the store assigns when the decision is actually made, and a
+/// second model of that here would drift into a plan he acted on.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ForecastedMovementDto {
+    /// The fact, as `POST /v1/corrections` addresses it.
+    pub event: Uuid,
+    /// The account it is recorded on.
+    pub account: Uuid,
+    /// What the owner calls that account. Absent for an account his directory
+    /// does not hold; never the identifier printed where a name belongs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The day it is effective on. Absent for a fact that carries none.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub date: Option<Date>,
+    /// The amount as a decimal string, with the sign the journal holds.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    /// What is recorded about it today, in the words a standing decision is
+    /// written in. Absent for a fact no standing decision classifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<ClassifiedAsDto>,
+}
+
+/// Something the forecast could not decide either way, and why.
+///
+/// **Published rather than omitted.** A forecast that dropped these would read
+/// as «nothing else is affected», silently, in the response the owner is about
+/// to answer from.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct UndecidedDto {
+    /// `unreadable_row` — a line of this import whose stored text this build
+    /// cannot read at all; or `fact_without_the_word` — a movement recorded
+    /// before the source's word for what an operation **was** and its word for
+    /// what the operation was **for** were kept in separate fields, against a
+    /// condition asking about one of them. The word is absent from the field
+    /// the condition asks about and may be sitting in the other, so neither
+    /// answer would be true; or `recorded_movements_would_not_fold` — nothing
+    /// already recorded could be judged at all, because the whole of it could
+    /// not be folded into what is currently in force. That last word carries no
+    /// identifier, because it is about all of them at once, and where it appears
+    /// `already_recorded` is empty for that reason and not because nothing is
+    /// covered.
+    pub state: String,
+    /// The line of this import, for `unreadable_row`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<u32>,
+    /// The recorded fact, for `fact_without_the_word`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Uuid>,
+    /// The account that fact is on, for `fact_without_the_word`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<Uuid>,
+    /// What the owner calls that account, where his directory holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The day that fact is effective on.
+    #[serde(
+        default,
+        with = "iso_date::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub date: Option<Date>,
+    /// Why it could not be judged, in one sentence to read out to him.
+    pub explanation: String,
+}
+
+impl UndecidedDto {
+    #[must_use]
+    pub fn from_domain(undecided: &Undecided) -> Self {
+        let (row, event, account, date, title) = match undecided {
+            Undecided::UnreadableRow { row } => (Some(*row), None, None, None, None),
+            Undecided::RecordedMovementsWouldNotFold => (None, None, None, None, None),
+            Undecided::FactWithoutTheWord {
+                event,
+                account,
+                title,
+                date,
+            } => (
+                None,
+                Some(event.0),
+                Some(account.inner()),
+                *date,
+                title.clone(),
+            ),
+        };
+        Self {
+            state: undecided.code().to_owned(),
+            row,
+            event,
+            account,
+            title,
+            date,
+            explanation: undecided.why().to_owned(),
+        }
+    }
+}
+
+/// What the standing decision one answer would keep would settle, before it
+/// stands.
+///
+/// Nothing here has been written: no standing decision was made, nothing already
+/// recorded was changed, and the question is as open as it was. It is the
+/// counterpart of `POST /v1/category-rules/preview` for the other kind of
+/// standing decision, and it keeps the same promise.
+///
+/// Correcting one movement and changing the standing decision behind it stay
+/// two acts, and this call performs neither. What it removes is the discovery a
+/// month later.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnswerRuleForecastDto {
+    /// `written` — answering under this token writes the standing decision;
+    /// `for_his_adoption` — answering writes nothing and publishes it, because
+    /// only the owner may make one, and one call of his own makes it stand;
+    /// `not_from_this_answer` — this answer is never kept as a standing
+    /// decision, whoever gives it; `not_from_this_row` — this line prints
+    /// nothing a later line could be matched against, so no token produces one.
+    ///
+    /// The last two both publish empty lists, and the word is what says which
+    /// of the two reasons it is. They are different facts: the first is about
+    /// the answer and a different answer to the same line may well keep one.
+    pub state: String,
+    /// The standing decision itself, in the exact body
+    /// `POST /v1/classification-rules` takes. Present exactly when `state` is
+    /// `written` or `for_his_adoption`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<ClassificationRuleRequest>,
+    /// The lines of this import it would cover, in submission order, including
+    /// the line asked about. Empty where `state` says no standing decision comes
+    /// of this answer.
+    pub in_this_import: Vec<ForecastedLineDto>,
+    /// The movements already recorded that it would cover, in the order they
+    /// are held.
+    pub already_recorded: Vec<ForecastedMovementDto>,
+    /// What could not be decided either way, each saying why. Always present,
+    /// empty included: an absent list and an empty one would say the same thing
+    /// about two different situations.
+    pub undecided: Vec<UndecidedDto>,
+    /// The whole of the above in one statement, to read out to him.
+    ///
+    /// It is `state`'s sentence as well as the counts': a client showing him a
+    /// forecast shows him this rather than the word, and the two cannot come to
+    /// disagree because one function composes the sentence off the word. Where
+    /// the two lists are empty it says which of the reasons that is.
+    pub notice: String,
+}
+
+impl AnswerRuleForecastDto {
+    #[must_use]
+    pub fn from_domain(forecast: &AnswerRuleForecast) -> Self {
+        Self {
+            state: forecast.stands.code().to_owned(),
+            proposal: forecast
+                .stands
+                .proposed()
+                .map(|proposed| ClassificationRuleRequest {
+                    matcher: RuleMatcherDto::from_domain(&proposed.matcher),
+                    outcome: ClassifiedAsDto::from_domain(classified_as(proposed.outcome)),
+                    replaces: None,
+                }),
+            in_this_import: forecast
+                .in_this_import
+                .iter()
+                .map(|line| ForecastedLineDto {
+                    row: line.row,
+                    printed: PrintedRowDto::from_domain(&line.printed),
+                    awaiting_answer: line.awaiting_answer,
+                    now: line.now.as_ref().map(QuestionSettlementDto::from_domain),
+                    settled_regardless: line.settled_regardless(),
+                })
+                .collect(),
+            already_recorded: forecast
+                .already_recorded
+                .iter()
+                .map(|movement| ForecastedMovementDto {
+                    event: movement.event.0,
+                    account: movement.account.inner(),
+                    title: movement.title.clone(),
+                    date: movement.date,
+                    amount: minor_amount(movement.amount_minor, movement.currency),
+                    currency: CurrencyDto::from_domain(movement.currency),
+                    now: movement.now.clone().map(ClassifiedAsDto::from_domain),
+                })
+                .collect(),
+            undecided: forecast
+                .undecided
+                .iter()
+                .map(UndecidedDto::from_domain)
+                .collect(),
+            notice: forecast.notice.clone(),
+        }
     }
 }

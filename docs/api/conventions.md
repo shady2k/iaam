@@ -213,7 +213,7 @@ things. Read it as the lookup table for §1.
 | `POST /v1/ingest/operations` | `[VerdictDto]` | bare array | one verdict per submitted row, in the caller's own order |
 | `POST /v1/ingest/journal-events` | `[VerdictDto]` | bare array | one verdict per submitted row |
 | `POST /v1/ingest/csv` | `[VerdictDto]` | bare array | one verdict per parsed row |
-| `POST /v1/corrections` | `[VerdictDto]` | bare array | one verdict per submitted correction |
+| `POST /v1/corrections` | `[CorrectionVerdictDto]` | bare array | one verdict per submitted correction, each carrying `standing_rule` where the corrected row was filed by a standing rule of the owner's — the rule survives the correction untouched, and the answer that says a fact was wrong is where that is worth naming |
 | `POST /v1/reconciliation/balance` | `OwnerBalanceOutcomeDto` | object, `statuses` | `control_assertions` — whether each claim reached the journal or was already held there, which no status row can say |
 | `POST /v1/import-sessions/{session}/rows` | `[ImportRowDto]` | bare array | one outcome per fed row; nothing was recorded |
 | `POST /v1/documents` | `DocumentDto` | object, `rows` | the document hash, source, parser version and period |
@@ -362,6 +362,8 @@ Every published type that prints an identifier of a thing the owner named.
 | `PopulationAccountDto` | `account` | `title` |
 | `ImportQuestionDto` | in `prompt`, and `accounts[].id` | the titles, in the sentence; `title` and `institution` on each candidate |
 | `PrintedRowDto` | `account` | `title`, `institution`, both optional — see below |
+| `ForecastedMovementDto` | `account` | `title`, optional for `PrintedRowDto`'s reason |
+| `UndecidedDto` | `account` | `title`, optional for `PrintedRowDto`'s reason |
 | `ContourDto` | `contour` | `title` |
 | `CategoryDto`, `CategoryGroupDto` | `id` | `title` |
 | `InstrumentDto` | `id` | `symbol`, `title` |
@@ -373,6 +375,7 @@ And the types that print a bare identifier on purpose.
 | Published type | Identifier | Why no name |
 |---|---|---|
 | `ActionSubjectDto::Event` | `id` | nothing the owner said names an event; the identifier is the whole of its identity and the item's `reason` states what it was |
+| `ForecastedMovementDto`, `UndecidedDto` | `event` | nothing the owner said names a recorded movement, for the reason above. It is published because it is what `POST /v1/corrections` takes, and the day, the amount and the account's title beside it are what he reads the movement by |
 | `AccountBalanceDto`, `NegativeCashDto`, `AssetAccountDto`, `CashClassTotalDto`, `NotDecomposedAccountDto`, `AccountResidualDto`, `EarningSourceAmountDto`, `CaveatSubjectDto` | `account` | the answer these sit in carries `population`, whose `covered` and `outside` name every account it mentions and every account it left out. The join table is in the same response, computed by the same fold, and one report row cannot disagree with it |
 | `HeldSessionDto` | `session` | nothing the owner said names an import session. He names an *import* by its label, and a session may declare no source at all; the identifier is the whole of the session's identity, and it addresses `GET /v1/import-sessions/{session}` and its assessment, where everything about it is published |
 | `ReconciliationStatusDto`, `TaintDto` | `account` | the caller named the account in the request; the response answers about that one and no other |

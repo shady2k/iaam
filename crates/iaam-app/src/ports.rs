@@ -629,6 +629,14 @@ pub struct JournalQuery {
     /// importing put in — which the declared source cannot, since a source
     /// covers every import that ever came through the same channel.
     pub import_session: Option<iaam_core::ids::ImportSessionId>,
+    /// Only facts one of the owner's standing classification rules filed. The
+    /// rule is stamped on the event's provenance where a reading settled the row
+    /// by one, so this narrows to the group a single decision of his reached —
+    /// which no other handle here can assemble.
+    pub settled_by_rule: Option<iaam_core::ids::ClassificationRuleId>,
+    /// Only the facts that version of the rule filed. Supplied with the rule;
+    /// the refusal for a version named on its own is the scenario's.
+    pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.

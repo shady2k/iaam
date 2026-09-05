@@ -386,6 +386,20 @@ pub struct OpeningAssertionsDto {
         with = "iso_date::option",
         skip_serializing_if = "Option::is_none"
     )]
+    /// The day the owner says the position was acquired.
+    ///
+    /// **What is asserted here reaches the reconciliation of postings.** The
+    /// acquisition date is what the ownership boundary is drawn with: without
+    /// one there is no date to check a posting against, so every posting on
+    /// that security is reported in `material_issues` as unverifiable instead
+    /// of being checked and passing.
+    ///
+    /// So ask the owner for the day if he remembers it. If he does not, leave
+    /// the field out and let `acquisition_date_certainty` stand at `unknown`.
+    /// Substituting the start of the journal is the one answer that must not be
+    /// given: it draws a boundary nobody asserted, the reconciliation then
+    /// checks the postings against it, and they agree — which is a clean report
+    /// about a date that was invented on this side of the wire.
     #[schema(value_type = Option<String>, format = Date)]
     pub acquisition_date: Option<Date>,
     #[serde(default)]
@@ -425,7 +439,20 @@ impl OpeningAssertionsDto {
     }
 }
 
-/// Operation type. Values are **positive**: the type determines the sign, not the client.
+/// What the row **was**, and the sign and the scale every amount below is
+/// stated in.
+///
+/// **Amounts are always positive.** The sign is carried by the kind and never
+/// by the number: a deposit and a withdrawal are two kinds, not one sum with
+/// two signs, and a negative amount is refused rather than read as the outgoing
+/// half of something. The single exception is `unresolved_direction`, which
+/// transcribes the sign the source printed — there the sign is evidence about a
+/// direction nobody has concluded yet, and making it positive would discard it.
+///
+/// **An amount's scale must not exceed the currency's minor unit.** A surplus
+/// digit after the separator is refused and not rounded away: rounding at the
+/// input substitutes a convenient number for a fact, and a fact is what the
+/// journal is asked to keep.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationKindDto {
@@ -443,6 +470,38 @@ pub enum OperationKindDto {
         amount: String,
         currency: CurrencyDto,
     },
+    /// A movement between two of the owner's own accounts: **one row, submitted
+    /// once, from the sending side**.
+    ///
+    /// The operation's own account is the one the money left and `to_account`
+    /// is the one it arrived at. The system writes both movements from this
+    /// single row — the sending account debited, the receiving account
+    /// credited, in one fact that holds both — so there is deliberately no way
+    /// to state the receiving half on its own.
+    ///
+    /// That is the shape to hold on to where two banks each print the same
+    /// movement, an outgoing row in one statement and an incoming row in the
+    /// other. A row per printed side records **two transfers** rather than the
+    /// two halves of one, and both accounts then move by twice the sum. Import
+    /// the sending side and drop the receiving row.
+    ///
+    /// Three refusals follow, each of them reached before by a caller producing
+    /// entirely plausible output:
+    ///
+    /// - **The amount is positive**, like every other amount here. A negative
+    ///   one is refused, not read as "the outgoing leg": direction is carried by
+    ///   the two accounts, so the sign has nothing left to say.
+    /// - **The two accounts must differ.** A transfer to itself moves nothing,
+    ///   and it is refused on `to_account`.
+    /// - **A transfer is not a deposit plus a withdrawal.** Those two say the
+    ///   money crossed the boundary of the owner's accounts, and a report counts
+    ///   them as money entering and money leaving; a transfer says it stayed
+    ///   inside and merely moved. Recording one as a pair overstates both what
+    ///   came in and what went out, in the same month.
+    ///
+    /// Where the caller cannot tell whether the far side is one of his accounts
+    /// at all, this is not the variant: `unresolved_direction` states what the
+    /// source stated and leaves the question to the owner.
     Transfer {
         to_account: Uuid,
         amount: String,
@@ -569,6 +628,14 @@ pub enum OperationKindDto {
         /// is exactly the row this field exists for. Such a row is recorded as
         /// a movement between the owner's own accounts with the far side
         /// unnamed, and no question is raised about it.
+        ///
+        /// A row that asserts it **and** states a direction is the other case,
+        /// and it does not behave the same way: it posts **one leg**, on this
+        /// account, the way the source said the money ran.
+        /// It still does not send money out of the **perimeter** — the far side
+        /// is the owner's, by the source's own words — so that leg is his money
+        /// moving inside his own accounts and is neither spending nor income,
+        /// however a report or a client words it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         far_side: Option<String>,
         /// The document the row was read out of, as the source names it.
@@ -602,6 +669,15 @@ pub struct OperationDto {
     /// other than the one the batch declared is still the whole batch's problem,
     /// and is refused as it always was: that row contradicts a statement the
     /// caller made over all of them.
+    ///
+    /// **Three vocabularies are read, and only two of them are a caller's to
+    /// send.** iaam's own identifier, then the identity the account's source
+    /// prints for it, then the owner's title for it. Send the first where you
+    /// have it, send the second where the file you are reading prints it, and
+    /// do not send the title. It resolves only so that documents written before
+    /// the other two existed keep parsing: a title is a string the owner may
+    /// change tomorrow, and two of his accounts may carry one title, which is
+    /// refused rather than guessed at.
     pub account: String,
     #[serde(flatten)]
     pub kind: OperationKindDto,
@@ -1051,6 +1127,14 @@ pub struct SubmitCorrectionsRequest {
     pub acknowledge_retraction: bool,
     /// Applied together or not at all: a correction batch is one deliberate act,
     /// unlike an import, whose rows are judged one by one.
+    ///
+    /// **Diagnose before proposing.** The journal can be read back per row, so
+    /// name the events a correction affects from what that reading found.
+    /// Every target named here should already be known, not inferred: a
+    /// correction proposed from a report's aggregate — "the total is off by
+    /// this much, so retract something that size" — is a guess about which
+    /// rows are wrong, and this field has no way to tell a diagnosed target
+    /// from a guessed one.
     pub corrections: Vec<CorrectionDto>,
 }
 
@@ -1069,6 +1153,15 @@ pub struct CorrectImportRequest {
     /// what is retracted is every row of that account and channel that named
     /// no import — which is what rows recorded before imports could be named
     /// look like, and is the only way to reach them.
+    ///
+    /// **The bound is checked, not trusted.** This import is retracted only
+    /// while its rows are still in force and nothing has been built on it: no
+    /// row of it has been reversed or replaced by anyone, and no balance the
+    /// owner named has been reconciled against the interval those rows fall
+    /// in. Anything wider than that is his to undo, and a refusal names
+    /// exactly which condition failed. Retracting the same import twice is
+    /// refused too — the second attempt reporting the rows as already
+    /// reversed is also the answer to whether the first attempt landed.
     pub source: DeclaredSourceDto,
 }
 
@@ -2061,6 +2154,15 @@ pub struct BondPositionAttributesDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct NavCoverageDto {
     pub accepted_independent: String,
+    /// Share of NAV where an assertion the owner made himself is what the
+    /// journal was reconciled against.
+    ///
+    /// A balance he names is not a second, independent source confirming a
+    /// figure — it is the thing being checked. Agreement between the journal
+    /// and what he stated gives this share rather than `accepted_independent`,
+    /// and it must never be reported as independently confirmed: he usually
+    /// remembers the balance from the same application the statement came
+    /// from, so the two agreeing proves less than a second source would.
     pub accepted_internal: String,
     pub provisional: String,
     pub discrepant: String,
@@ -2073,6 +2175,26 @@ pub struct DataQualityDto {
     pub nav_coverage: NavCoverageDto,
     pub position_coverage: PositionCoverageDto,
     pub executability: ExecutabilitySharesDto,
+    /// What is wrong with the data behind these figures, one sentence per
+    /// finding, in this system's words and naming accounts and instruments by
+    /// identifier — so an entry is conveyed to the owner and never read out as
+    /// it stands.
+    ///
+    /// **Two of them look alike and must never be reported alike.** A payment
+    /// that «has not been confirmed» is a defect: the security was held, the
+    /// waiting period has expired, and no crediting fact is in the journal.
+    /// Tell him the day, the instrument, the account and what kind of payment
+    /// it was, and ask him for the statement covering that period. A payment
+    /// that «cannot be reconciled» is missing evidence, and no conclusion
+    /// follows from it: it is not a claim that money **went missing**, and
+    /// where the journal simply begins after the payment nothing is wrong at
+    /// all. The first is something he can repair; the second is something the
+    /// system cannot check, and saying so is the whole of it.
+    ///
+    /// **Payments that cannot be reconciled for one account and instrument
+    /// arrive as one entry**, carrying a count and the first and last dates,
+    /// because one act repairs the cause of all of them. It is put to him once
+    /// and not expanded back into a list of dates.
     pub material_issues: Vec<String>,
 }
 
@@ -2532,6 +2654,18 @@ pub struct CaveatDto {
     /// One call does not always empty a caveat — a caveat is one line per
     /// account, currency or instrument, and closing it may take more than one
     /// fact. `see` remains the check.
+    ///
+    /// **These are this caveat's remedies and no other's.** One account
+    /// routinely stands under two caveats at once — a retired account whose
+    /// figures are not all zero usually carries `running_cash_sum` beside
+    /// `retired_account_not_empty` — and the calls listed here close the line
+    /// they are listed on. Reaching for the neighbouring line's remedy does not
+    /// fail loudly, because the two are not the same kind of fact: an
+    /// owner-balance assertion is checked against the fold rather than added to
+    /// it, so recording one where the opening of the account was what was
+    /// missing relabels the figure instead of removing it, and both lines stay
+    /// standing. Take the calls from the caveat whose `kind` and `subject` name
+    /// the gap you mean to close.
     pub closed_by: Vec<ClosingOperationDto>,
 }
 
@@ -2677,6 +2811,17 @@ impl CaveatSubjectDto {
 pub struct PopulationDto {
     /// The scope the report was computed over.
     pub contour: Uuid,
+    /// Which version of that scope's membership these figures were folded over.
+    ///
+    /// The first coordinate of the answer, beside `retirement_revision` below,
+    /// and it is here for the same reason: a version names a membership, and a
+    /// later version can name a different one.
+    ///
+    /// **Two figures computed against different contour versions are not comparable.**
+    /// The distance between them is the boundary moving as much as it is the
+    /// money moving, and neither figure says which. Quote the pair with any
+    /// figure meant to be set beside another, and where the pair differs say
+    /// the perimeter changed, rather than reporting a change in his money.
     pub contour_version: u32,
     /// How much of what the system knows about this report answered about.
     ///
@@ -3885,6 +4030,16 @@ pub struct ReturnsReportDto {
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub as_of: Date,
+    /// The effective date of the earliest event these figures were folded over,
+    /// or null where the population has none.
+    ///
+    /// **It is not the start of a window, and `as_of` is not its end.** The
+    /// report's period is the whole history: everything the journal holds, up to
+    /// the report date. A return over an arbitrary interval is not computed —
+    /// it would need the contour's value at the start of that interval, and a
+    /// value is known only as of the report date — so the two dates must not be
+    /// read out as the ends of a period, and a period of his own is not a
+    /// request this report can be asked to answer.
     #[serde(
         default,
         with = "iso_date::option",
@@ -4304,6 +4459,20 @@ pub struct ActionDto {
     /// where the two do not line up field for field, and `blocked_by` says why.
     #[serde(default)]
     pub goals: Vec<String>,
+    /// Whether this item wants something, in one word.
+    ///
+    /// **`settled` wants nothing, and it is not work.** The owner decided
+    /// something, and the item says what his decision left standing — the
+    /// records it keeps out of every report, and why. The only call it
+    /// publishes is the withdrawal of that decision, which is his to send. Show
+    /// it when he asks what has been decided; do not raise it as work, do not
+    /// collect a field for it, and do not go looking for what it is holding up,
+    /// because nothing is.
+    ///
+    /// It is not the word for «no call in this API touches this». An item that
+    /// publishes no way out at all is a different statement, and reading a
+    /// decision of his as one of those turns something he settled into a gap
+    /// somebody keeps trying to close.
     pub state: String,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4899,6 +5068,29 @@ pub struct AccountRetirementDto {
 /// which is the retroactivity the revision exists to make visible.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecordAccountRetirementRequest {
+    /// The statement being recorded, or taken back: `retired` or `in_use`.
+    ///
+    /// **What an accepted `retired` changes is bounded, and the bound is the
+    /// point of the operation.** From `effective_on` the asset snapshot stops
+    /// publishing the account's row and its membership of its cash class — but
+    /// only where every one of that row's figures is zero — and
+    /// `population.retirement_revision` advances. That is the whole of it.
+    ///
+    /// **No figure moves.** No classification changes, ever. A snapshot taken
+    /// while the product was still open is untouched. The balances answer keeps
+    /// the account's row, because that answer is what the journal holds per
+    /// account and is what a statement is reconciled against. Nothing hides a
+    /// retired account from the account list or from the outstanding-work
+    /// queue, and where a retired row's figures are not all zero the row stands
+    /// with `retired_account_not_empty` beside it — a retirement never hides
+    /// money.
+    ///
+    /// So which of the owner's products still exist is read off any report's
+    /// `population`, keeping the entries with no `retirement`, and it is read
+    /// out to him by their `title` and `institution` rather than by the
+    /// identifiers beside them. It is never read off the contour's
+    /// composition, which answers whose money is in the figures and not whether
+    /// the product is still there.
     pub state: AccountRetirementStateDto,
     /// Required for `retired` and refused for `in_use`.
     #[serde(
@@ -5006,6 +5198,13 @@ pub struct CreateAccountRequest {
     /// account carrying none is found by this and a rename can stop a statement
     /// resolving. A client putting this question to the owner says that much —
     /// the queue's own wording for it is in `MissingInputDto.prompt`.
+    ///
+    /// **It is his to give and never a client's to guess.** Where a document
+    /// names an account this instance holds none for, the answer is to ask him,
+    /// or to send the string the source printed as `provider_account_id` below.
+    /// Inventing a plausible name does not make the refused records import: it
+    /// makes a second account he never asked for, which he then has to find and
+    /// retire.
     pub title: String,
     /// The institution the account is held at, as the owner names it.
     ///
@@ -5025,6 +5224,15 @@ pub struct CreateAccountRequest {
     /// rather than the printed number, and to change `provider` whenever it
     /// changes that derivation — a re-derivation must present as a new source
     /// rather than as new accounts.
+    ///
+    /// **The string a statement printed for the account belongs here, and not
+    /// in the title.** A document names each account in its institution's own
+    /// words, and a name this instance holds no account for refuses every
+    /// record on it; an account carrying that string as its printed identity
+    /// resolves those records the next time the same document is read. The same
+    /// string put in the title instead leaves the owner with a name he did not
+    /// choose, and the rename he is entitled to make then stops the document
+    /// resolving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_account_id: Option<String>,
     /// What kind of cash the account holds, where the owner has said.
@@ -5441,6 +5649,17 @@ pub struct ContourDto {
     pub version: u32,
     /// The accounts this version covers. Empty is a real answer: a version can
     /// be recorded with no members, and it covers nothing.
+    ///
+    /// **This is the set the owner considers his portfolio, and the boundary is
+    /// his rather than an institution's.** Accounts at one bank sit on one side
+    /// of it only because he put them there, and two of his products at the
+    /// same bank may fall on opposite sides.
+    ///
+    /// Two consequences hold over every figure computed against this version.
+    /// Money moved between two accounts named here changes no return — it is
+    /// one of his pockets into another, not money he put in or took out. Money
+    /// arriving from an account not named here is a **contribution**, and money
+    /// leaving to one is a withdrawal.
     pub accounts: Vec<Uuid>,
 }
 
@@ -5514,6 +5733,18 @@ pub struct MarketPriceDto {
     pub kind: String,
     pub value: String,
     pub currency: String,
+    /// The basis in force for this row: whether the value is money per unit,
+    /// a percentage of the remaining face, or `unknown` — the source never
+    /// established one, and the price is then not converted into money at all.
+    ///
+    /// **Three statements about the basis, and their agreement is not a
+    /// given.** This field is the basis in force; `recorded_quotation_basis` is
+    /// what the source recorded, as it recorded it; `quotation_basis_status` is
+    /// how well that basis is proven. Where they diverge — and a
+    /// `quotation_basis_status` of `contradicts` says they do — the source
+    /// contradicts itself about its own price, and the row publishes that
+    /// rather than settling it. All three are read before the value is quoted;
+    /// none of them stands for the other two.
     #[serde(default)]
     pub quotation_basis: QuotationBasisDto,
     /// Basis exactly as recorded by the source.
@@ -5563,6 +5794,18 @@ pub struct MarketKeyRateDto {
     pub source: String,
     pub observed_at: String,
     pub quality: String,
+    /// How the interval's left boundary — the `from` date — was arrived at.
+    ///
+    /// `observed` — the rate was seen on that day.
+    /// `inferred_across_non_trading_days` — the source publishes trading days
+    /// only, and the day the rate took effect falls somewhere between the last
+    /// day it was seen at the old value and the first day it was seen at this
+    /// one.
+    ///
+    /// An inferred boundary is this instance reading a gap in the source, not a
+    /// date the source stated, so it is quoted as the start of the interval and
+    /// never as the day the rate was changed. The value itself and the
+    /// right-hand end are observed either way.
     pub boundary: String,
 }
 
@@ -6748,6 +6991,20 @@ pub struct ReconciliationParams {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DimensionStatusDto {
     pub dimension: String,
+    /// How far this measurement has been confirmed, as one of four words:
+    /// `discrepant`, `provisional`, `accepted_internal`,
+    /// `accepted_independent`.
+    ///
+    /// **What makes a confirmation independent is two channels, not two
+    /// readings.** Facts reach the journal through a document this instance
+    /// parses and through operations it fetches from the institution's own
+    /// interface, and only agreement between those two raises a measurement to
+    /// `accepted_independent`; agreement inside one source is
+    /// `accepted_internal`, because one parser reading one document distorts
+    /// both sides of that check identically. Loading the same statement again
+    /// is the same channel and confirms nothing — it reproduces whatever the
+    /// first reading got wrong — so a re-read document is never reported as a
+    /// second source.
     pub status: String,
 }
 
@@ -6902,6 +7159,13 @@ pub struct ObservationBasisDto {
     /// distance to this one; it says nothing about the level, which is still
     /// unknown. A matched change and a matched level are different findings and
     /// must not be reported alike.
+    ///
+    /// **A `discrepant` change is a discrepancy and not a correction.** The two
+    /// stated balances and the movements between them do not join, and which of
+    /// the three is wrong is exactly what the outcome does not say. A later
+    /// statement does not overwrite an earlier one: what is recorded stays
+    /// recorded, and correcting an assertion the journal holds is an explicit
+    /// act of the owner's with its own operation.
     pub compared: String,
     /// The date of the stated balance a change is measured from. Null where
     /// `compared` is `level`.
@@ -6930,13 +7194,50 @@ impl ObservationBasisDto {
     }
 }
 
+/// What one control assertion came to, and the key carrying the rest of it.
+///
+/// `code` is the verdict and the other three are the detail: at most one of
+/// them is present, decided by the verdict, and it is where the answer actually
+/// is. A client that reads `code` and stops has the shape of the finding and
+/// none of what it is about.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ClaimOutcomeDetailDto {
+    /// The verdict, as one of four words: `matched`, `discrepant`,
+    /// `not_comparable` or `excepted`.
+    ///
+    /// **`not_comparable` is not a weaker `discrepant`.**
+    /// Only `discrepant` sends the owner looking for an error: it says the
+    /// figures disagree and one of them is wrong. The other three assert
+    /// nothing about his figures, and reporting them alike hands him work
+    /// that does not exist. Each of the four names its own detail key below.
     pub code: String,
+    /// The two figures and the distance between them. Present exactly when
+    /// `code` is `discrepant`, which is the one verdict that is about a
+    /// disagreement.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discrepancy: Option<DiscrepancyDto>,
+    /// Why no comparison could be made. Present exactly when `code` is
+    /// `not_comparable`, as one of `no_journal_coverage`,
+    /// `tax_facts_not_recorded` or `opening_not_asserted`.
+    ///
+    /// **`opening_not_asserted` is not `discrepant`, and the two are opposite
+    /// instructions.** The source stated a balance over a fold nothing anchors:
+    /// the recorded history begins with a movement and not with a stated
+    /// holding, so what was folded is movement over that interval and not a
+    /// level, and there is no baseline to hold the claim against.
+    ///
+    /// **Nothing the owner stated is being contradicted, and it is never
+    /// reported to him as an error he made.** A `discrepant` sends him to find
+    /// an error; here there is none to find, and it is not a defect he repairs
+    /// by restating the balance either — the figure he read out may be exactly
+    /// right, and the journal still has nothing to hold it against.
+    ///
+    /// What lifts it is an opening assertion reaching back to the start of the
+    /// recorded history, or the import of the history before it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The difference this system already explains, so that it is not put to
+    /// the owner as work. Present exactly when `code` is `excepted`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exception: Option<String>,
 }
@@ -7196,6 +7497,16 @@ pub struct ReconciliationResponseDto {
 pub struct CategoryDto {
     pub id: Uuid,
     pub group: Uuid,
+    /// The owner's own word for what the money was for. His register rather
+    /// than a vocabulary of ours, and the string a figure is read out to him
+    /// under — never the identifier beside it.
+    ///
+    /// **A category and a contour answer different questions over the same
+    /// journal.** A contour says whose money is in the figures; a category says
+    /// what that money was for. Neither substitutes for the other: a category
+    /// is never a statement about whether an account is his, and a contour's
+    /// membership is never a statement about what a row was spent on.
+    /// Confusing the two is the mistake the pair exists to keep apart.
     pub title: String,
     pub retired_at: Option<String>,
 }
@@ -7294,6 +7605,23 @@ pub struct CategoryRuleRequest {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleImpactDto {
     pub rows: u64,
+    /// The movements the proposed rule causes, month by month.
+    ///
+    /// **Everything a category rule can move is in this list.** Changing only a
+    /// category assignment cannot change the return: not what was contributed,
+    /// not what was withdrawn, not the contour's value, not `xirr_pre_tax`.
+    /// Those are computed from the kind of each event, the accounts it touched
+    /// and the contour's membership, and no category, category group or income
+    /// flag enters any of them. So this list is the whole of what the owner is
+    /// agreeing to, and it is put to him as money moving from one of his
+    /// explanations to another.
+    ///
+    /// Say it to him in those words, because the neighbouring sentence is
+    /// false. Changing an event's kind, the accounts it touches, or the
+    /// contour's membership does change all of them — a row moved from a
+    /// payment out to a transfer is a different fact, not a different
+    /// explanation of the same one. No rule performs that change, and it is not
+    /// asked for here: it goes back through the channel the fact arrived by.
     pub months: Vec<MonthlyImpactDto>,
 }
 
@@ -7797,6 +8125,18 @@ pub struct InstrumentDto {
     pub kind: Option<String>,
     pub symbol: String,
     pub title: String,
+    /// The currency the paper is denominated in — the first of three, and not
+    /// interchangeable with the other two.
+    ///
+    /// **This, `settlement_currency` and `quote_currency` answer three
+    /// different questions**, and on a replacement bond they diverge: the paper
+    /// is denominated in one currency, settled in another and quoted in a
+    /// third. There is no «the instrument's currency», and a caller that treats
+    /// any one of them as such states a holding in money the owner never held.
+    ///
+    /// The report currency is not among them. It is a property of the report,
+    /// chosen when the report is asked for, and no field of an instrument
+    /// answers it.
     pub denomination_currency: String,
     pub settlement_currency: String,
     pub quote_currency: String,
@@ -7923,6 +8263,20 @@ pub struct ResolveInstrumentRequest {
     pub value: String,
     /// Document date. Required: ISIN changes, and there is no «current»
     /// answer (§4.7).
+    ///
+    /// **Two refusals follow from that, and they must not be confused.** A code
+    /// that is *unknown* means there is no such security in the catalogue at
+    /// all: the instrument has to be created, that is the owner's work, and an
+    /// agent is forbidden to write to the catalogue — a restriction of rights,
+    /// not an absence of the capability. A code that is known, but
+    /// *not on this date*, means the code exists and its interval of validity
+    /// does not cover the date sent here; check the document's date first,
+    /// because the date is by far the likelier error.
+    ///
+    /// The second case is almost always corrupted data rather than a gap in the
+    /// catalogue: a code introduced by a corporate action, printed in a document
+    /// dated before that action, means the document or its date was assembled
+    /// wrongly.
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub on: Date,
@@ -8789,7 +9143,21 @@ pub struct AddImportRowsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportSessionDto {
     pub session: Uuid,
-    /// `open`, `committed` or `abandoned`.
+    /// `open`, `committed` or `abandoned` — the whole life of a session, and
+    /// what ending one costs.
+    ///
+    /// A session is opened, fed rows from one or more sources, questioned,
+    /// answered, and then either committed or abandoned. It is **not a database
+    /// transaction**: answering a question can take the owner days, nothing is
+    /// held open in the machine meanwhile, and what is durable is the session
+    /// itself — an `open` session outlives every process that has read it.
+    ///
+    /// `committed` is the one moment its rows become facts, all of them at
+    /// once. `abandoned` leaves the journal **exactly as it was**: there is
+    /// nothing to retract, because nothing was ever recorded. That is the whole
+    /// difference between changing your mind before a commit and correcting a
+    /// fact after one — the first costs nothing, and the second is a retraction
+    /// that every report the owner has already read will stop counting.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<Uuid>,
@@ -8909,7 +9277,16 @@ impl ImportSessionSummaryDto {
 pub struct ImportQuestionDto {
     pub question: Uuid,
     pub session: Uuid,
-    /// The row in the session the question is about.
+    /// The row in the session the question is about, and the number to send
+    /// back with the answer.
+    ///
+    /// **Not what the owner is told.** He recognises a line by the day the
+    /// source dated it and the amount it printed, with the sign it printed, and
+    /// those are in the session's own reading of the row. Several rows of one
+    /// month can carry the same word, name nobody and be identical in every
+    /// other respect, so an owner matching questions to rows by counting down a
+    /// list is eventually off by one — and a wrong answer settles the row, may
+    /// become a standing rule of his, and is never asked about again.
     pub row: u32,
     /// The question in words, with the owner's own account titles in it.
     pub prompt: String,
@@ -9086,6 +9463,21 @@ pub struct QuestionGeneralisationDto {
     /// The rule this answer would generalise into, ready to be posted to
     /// `POST /v1/classification-rules` as it stands. Present exactly when
     /// `state` is `available`.
+    ///
+    /// **Its condition asks about one thing**, and which one is decided in this
+    /// order: the counterparty the row named; failing that, the word the source
+    /// filed the operation under; failing both, the description. Never all
+    /// three at once. `RuleMatcherDto` joins the members that are present with
+    /// **and**, so a condition built from every field the row printed
+    /// recognises that row and almost nothing else — a rule that settles one
+    /// line while reading like a rule that settles a month.
+    ///
+    /// **Say what the condition asks about**, not only that a rule is
+    /// available. That is the part the owner may want to change before he sends
+    /// it: a wider condition settles more rows next month and can settle one of
+    /// them wrongly, and weighing the saving against that is his and nobody
+    /// else's. He can see, change and retire the rule afterwards, in his own
+    /// vocabulary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ClassificationRuleRequest>,
 }

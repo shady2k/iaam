@@ -1,6 +1,14 @@
 # 0037. The skill keeps the process, and the reference moves beside it
 
-Date: 2026-09-05 · Status: proposed · Bead: `iaam-arad`
+Date: 2026-09-05 · Status: superseded · Bead: `iaam-arad`
+
+**Superseded the same week, by `iaam-1pfo`.** The four companion files named
+below no longer exist: what they held is either a copy of what a payload already
+carried, or a rule that now lives on the published description of the field or
+the response it is about, and `docs/agent-skill/SKILL.md` is the whole skill
+again — under 200 lines, because the reference it used to carry is served by the
+running instance. The record below is kept for the reasoning that produced the
+split, and the file map in it is history rather than a route to anything.
 
 ## Context
 

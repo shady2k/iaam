@@ -280,6 +280,24 @@ fn unprovisioned_harness() -> Harness {
         false,
         false,
         false,
+        GENEROUS_RATE_LIMIT,
+    )
+}
+
+/// A harness that refuses after `limit` calls with one token.
+///
+/// Every other harness is given a limit no test can reach, because a test that
+/// tripped the limiter by accident would fail somewhere unrelated to what it
+/// checks. A test *about* the refusal has to reach it, and earning it a
+/// thousand calls at a time would spend a second proving arithmetic.
+fn rate_limited_harness(limit: u32) -> Harness {
+    harness_with_factory_and_provisioning(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        None,
+        true,
+        true,
+        false,
+        limit,
     )
 }
 
@@ -290,6 +308,7 @@ fn empty_owner_harness() -> Harness {
         true,
         false,
         false,
+        GENEROUS_RATE_LIMIT,
     )
 }
 
@@ -300,6 +319,7 @@ fn broker_access_harness() -> Harness {
         true,
         true,
         true,
+        GENEROUS_RATE_LIMIT,
     )
 }
 
@@ -307,8 +327,19 @@ fn harness_with_factory(
     store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
 ) -> Harness {
-    harness_with_factory_and_provisioning(store, channel_factory, true, true, false)
+    harness_with_factory_and_provisioning(
+        store,
+        channel_factory,
+        true,
+        true,
+        false,
+        GENEROUS_RATE_LIMIT,
+    )
 }
+
+/// More calls than any test makes, so that no test meets the limiter unless it
+/// asked to.
+const GENEROUS_RATE_LIMIT: u32 = 1_000;
 
 fn harness_with_factory_and_provisioning(
     mut store: SqliteStore,
@@ -316,6 +347,7 @@ fn harness_with_factory_and_provisioning(
     provisioned: bool,
     with_account: bool,
     with_broker_access: bool,
+    rate_limit: u32,
 ) -> Harness {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -423,7 +455,7 @@ fn harness_with_factory_and_provisioning(
     });
     let state = ServerState::new(
         services,
-        Arc::new(RateLimiter::new(1_000, Duration::from_secs(60))),
+        Arc::new(RateLimiter::new(rate_limit, Duration::from_secs(60))),
     );
     let (router, api) = build(state).expect("build");
 
@@ -2282,6 +2314,1137 @@ async fn the_openapi_document_says_which_fields_are_put_to_the_owner() {
         "`preset` must say it is the request already filled in and not a \
          question: {preset}"
     );
+}
+
+/// A description a caller reads instead of a document it may not have.
+///
+/// Read out of the published document rather than off the Rust type: what a
+/// client can learn is what the document says, and an assertion against the
+/// struct would pass just as happily with the description stripped.
+fn property_description<'a>(spec: &'a serde_json::Value, schema: &str, property: &str) -> &'a str {
+    let component = &spec["components"]["schemas"][schema];
+    // A struct that flattens an enum into itself is published as an `allOf` of
+    // the union and an object carrying the struct's own fields, so the schema
+    // has no `properties` of its own while every one of those fields is still
+    // a property a reader meets. The flattened *field* publishes nothing; its
+    // neighbours publish exactly as they always did, one level down.
+    let published = if component["properties"][property].is_null() {
+        // Collected rather than found: two branches publishing one property
+        // name are two sentences a reader could meet, and taking whichever the
+        // generator emitted first would assert against one of them silently.
+        let branches: Vec<&serde_json::Value> = component["allOf"]
+            .as_array()
+            .map(|branches| {
+                branches
+                    .iter()
+                    .map(|branch| &branch["properties"][property])
+                    .filter(|found| !found.is_null())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            branches.len() < 2,
+            "{schema} publishes `{property}` in {} of its `allOf` branches, so \
+             there is no one description a reader meets",
+            branches.len()
+        );
+        // A property that is not published at all is a rename, and it wants
+        // different work from a property published without a sentence: every
+        // assertion naming it now names nothing. Saying so here keeps the two
+        // apart, which the shared `no description` panic below could not.
+        branches
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("{schema} publishes no property `{property}`"))
+    } else {
+        &component["properties"][property]
+    };
+    published["description"]
+        .as_str()
+        // An optional field whose type is a reference is published as a
+        // `oneOf` of null and the reference, and the generator hangs the doc
+        // comment on the reference rather than on the property. The reader
+        // meets the same sentence either way, so the helper looks in both
+        // places instead of obliging every caller to know which shape a field
+        // happens to have.
+        //
+        // That is honest only while the union has one alternative beside null,
+        // which is the whole of what utoipa emits for this shape today. A
+        // genuine union of two would make the branch a guess, so it is refused
+        // rather than read: an obligation about one alternative is asserted on
+        // the alternative a reader meets, which is what `variant()` is for.
+        .or_else(|| {
+            let alternatives: Vec<&serde_json::Value> = published["oneOf"]
+                .as_array()?
+                .iter()
+                .filter(|branch| branch["type"] != "null")
+                .collect();
+            assert!(
+                alternatives.len() == 1,
+                "{schema}.{property} publishes {} alternatives beside null, so \
+                 no one of them is the description a reader meets; assert \
+                 against the branch itself with the sibling `variant()` helper",
+                alternatives.len()
+            );
+            alternatives[0]["description"].as_str()
+        })
+        .unwrap_or_else(|| panic!("{schema}.{property} publishes no description"))
+}
+
+/// A property that is not there is a rename, and it used to read as a missing
+/// doc comment.
+///
+/// The two failures want opposite work — one is «write the sentence», the other
+/// is «the field moved and every assertion about it now names nothing» — and
+/// the helper answered both with the first, so a rename presented as a doc
+/// comment somebody had forgotten to write.
+#[test]
+#[should_panic(expected = "SomeDto publishes no property `renamed`")]
+fn a_property_the_schema_does_not_publish_is_diagnosed_as_a_rename() {
+    let spec = json!({
+        "components": {"schemas": {"SomeDto": {"allOf": [
+            {"properties": {"kept": {"description": "a sentence about the field kept"}}}
+        ]}}}
+    });
+    property_description(&spec, "SomeDto", "renamed");
+}
+
+/// Where a field could be met under either of two alternatives, the helper does
+/// not pick one for the caller.
+///
+/// The `oneOf` fallback exists for the one shape the generator emits today — a
+/// reference beside null, where the sentence hangs on the reference — and
+/// taking the first branch that carries a description is honest only while
+/// there is exactly one branch to take. Nothing said so, so a second
+/// alternative would have been read as the first without a word.
+#[test]
+#[should_panic(expected = "`variant()`")]
+fn a_property_with_two_alternatives_beside_null_is_not_guessed_at() {
+    let spec = json!({
+        "components": {"schemas": {"SomeDto": {"properties": {"either": {"oneOf": [
+            {"type": "null"},
+            {"description": "what the first alternative means"},
+            {"description": "what the second alternative means"}
+        ]}}}}}
+    });
+    property_description(&spec, "SomeDto", "either");
+}
+
+/// Two flattened branches publishing one property name are two sentences a
+/// reader could meet, and neither is «the» description.
+#[test]
+#[should_panic(expected = "in 2 of its `allOf` branches")]
+fn a_property_published_by_two_flattened_branches_is_not_guessed_at() {
+    let spec = json!({
+        "components": {"schemas": {"SomeDto": {"allOf": [
+            {"properties": {"shared": {"description": "what one branch says"}}},
+            {"properties": {"shared": {"description": "what the other branch says"}}}
+        ]}}}
+    });
+    property_description(&spec, "SomeDto", "shared");
+}
+
+/// One variant of a tagged union, found by the word its `type` takes.
+///
+/// A Rust field that flattens such an enum into a request publishes no property
+/// of its own — the document carries an `allOf` of the two schemas, and the
+/// field's own doc comment reaches nobody. So an obligation about that payload
+/// is stated where a reader of the payload meets it: on the union, or on the
+/// variant it is about.
+fn variant<'a>(spec: &'a serde_json::Value, schema: &str, tag: &str) -> &'a serde_json::Value {
+    spec["components"]["schemas"][schema]["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{schema} publishes no variants"))
+        .iter()
+        .find(|candidate| candidate["properties"]["type"]["enum"][0] == tag)
+        .unwrap_or_else(|| panic!("{schema} publishes no `{tag}` variant"))
+}
+
+/// The row number is what a machine sends back, and the day and the sum are what
+/// a person recognises the line by. A caller told only «row 14» reads a list to
+/// the owner and counts down it, and an owner counting down a list is eventually
+/// off by one — which settles the wrong row, may become a standing rule, and is
+/// never asked about again.
+#[tokio::test]
+async fn a_question_says_how_the_row_is_named_to_the_owner() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ImportQuestionDto", "row");
+    for owed in [
+        "Not what the owner is told",
+        "recognises a line by the day the",
+        "the amount it printed, with the sign it printed",
+        "eventually off by one",
+    ] {
+        assert!(
+            described.contains(owed),
+            "ImportQuestionDto.row does not say the owner is told the {owed}: {described}"
+        );
+    }
+}
+
+/// A held session is not an open transaction, and abandoning one costs nothing.
+///
+/// The three words alone leave both halves to be guessed. A caller reading
+/// `open` as a transaction hurries the owner through a question in order to
+/// «close it»; a caller reading `abandoned` as an undoing warns him about a
+/// journal that never moved. Neither is corrected by the word it was read from.
+#[tokio::test]
+async fn a_session_says_what_ending_it_does_to_the_journal() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ImportSessionDto", "state");
+    for owed in ["transaction", "committed", "abandoned", "retract"] {
+        assert!(
+            described.contains(owed),
+            "ImportSessionDto.state says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// The sign is carried by the kind, and a surplus digit is refused rather than
+/// rounded.
+///
+/// A caller that negates a withdrawal is submitting a sum with two signs to a
+/// vocabulary that has none, and a caller that expects a third decimal to be
+/// rounded away is expecting a convenient number to be substituted for a fact.
+/// Both are refusals of the request schema and neither was stated on it.
+#[tokio::test]
+async fn an_amount_is_positive_and_a_surplus_digit_is_refused() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = spec["components"]["schemas"]["OperationKindDto"]["description"]
+        .as_str()
+        .expect("OperationKindDto publishes no description");
+    for owed in ["positive", "sign", "scale", "rounded"] {
+        assert!(
+            described.contains(owed),
+            "OperationKindDto says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// One movement between the owner's own accounts is one row, submitted from the
+/// side the money left.
+///
+/// Two banks each print the movement, and a caller that submits both records two
+/// transfers rather than the two halves of one — both accounts move by twice the
+/// sum, and every figure of that month is wrong by it. The variant took the
+/// receiving account and said nothing about the row it must not be paired with.
+#[tokio::test]
+async fn a_transfer_is_one_row_submitted_from_the_sending_side() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = variant(&spec, "OperationKindDto", "transfer")["description"]
+        .as_str()
+        .expect("the transfer variant publishes no description");
+    for owed in ["sending side", "twice", "differ", "deposit"] {
+        assert!(
+            described.contains(owed),
+            "the transfer variant says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A far side the source called the owner's own never becomes money leaving him.
+///
+/// The field already said that a row asserting it and stating no direction posts
+/// nothing. The row that also states a direction does post, and a caller reading
+/// only that sentence has no word for what it posts — so the leg it writes is
+/// easy to read as spending, which is the one thing it is not.
+#[tokio::test]
+async fn a_stated_far_side_never_sends_money_out_of_the_perimeter() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = variant(&spec, "OperationKindDto", "unresolved_direction")["properties"]
+        ["far_side"]["description"]
+        .as_str()
+        .expect("the far side publishes no description");
+    for owed in [
+        "it posts **one leg**, on this",
+        "It still does not send money out of the **perimeter**",
+        "neither spending nor income",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the far side says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A proposed rule says what its condition asks about, because that is the part
+/// the owner may want to change.
+///
+/// He is the one who weighs a condition that settles more rows next month
+/// against one that settles a row wrongly, and he cannot weigh what he was not
+/// told. A caller that reads out only «a rule is available» has handed him the
+/// decision without the thing being decided.
+#[tokio::test]
+async fn a_proposed_rule_says_what_its_condition_asks_about() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "QuestionGeneralisationDto", "proposal");
+    for owed in [
+        "**Its condition asks about one thing**",
+        "the counterparty the row named; failing that",
+        "**Say what the condition asks about**, not only that a rule is",
+        "a wider condition settles more rows next month and can settle one of",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the proposal says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An opening with no acquisition date says what the omission costs.
+///
+/// Without a date there is no ownership boundary to check a posting against, so
+/// every posting on that security is reported as unverifiable rather than
+/// checked. A caller that does not know this fills the field with the start of
+/// the journal to make the report clean, and the report then agrees with a
+/// boundary nobody asserted.
+#[tokio::test]
+async fn a_reconstructed_opening_says_what_a_missing_acquisition_date_costs() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "OpeningAssertionsDto", "acquisition_date");
+    for owed in ["material_issues", "unverifiable", "unknown"] {
+        assert!(
+            described.contains(owed),
+            "the acquisition date says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A confirmation is independent only where two channels that read separately
+/// agree, and a document read twice is one channel.
+///
+/// The status word alone does not say what raised it. A caller that reads
+/// `accepted_independent` as «somebody checked it» tells the owner a figure is
+/// confirmed when the same statement was merely loaded a second time — the same
+/// reading, so the same error, reproduced and reported as corroboration.
+#[tokio::test]
+async fn a_confirmation_is_independent_only_where_two_channels_agree() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "DimensionStatusDto", "status");
+    for owed in [
+        "is two channels, not two",
+        "only agreement between those two raises a measurement to",
+        "Loading the same statement again",
+        "a re-read document is never reported as a",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the measurement's status says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// The return is over the whole history, and the two dates on the report are
+/// not the ends of a window anybody chose.
+///
+/// `as_of` and `history_starts` read like an interval, and a caller that reads
+/// them so reports «what it earned between these dates» — and then offers the
+/// owner a different pair, which nothing here can answer. A return over an
+/// arbitrary interval is not computed at all, and the reason has to be where the
+/// dates are.
+#[tokio::test]
+async fn a_return_is_reported_over_the_whole_history_and_never_a_sub_interval() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ReturnsReportDto", "history_starts");
+    for owed in [
+        "It is not the start of a window",
+        "the whole history",
+        "A return over an arbitrary interval is not computed",
+        "read out as the ends of a period",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the start of the history says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// Two stated balances that do not join are a disagreement, and the later one
+/// does not win by being later.
+///
+/// The field already says what a `matched` change claims. It said nothing about
+/// the other outcome, and a caller reading a `discrepant` change as the source
+/// setting the record straight reports a correction that nobody made — the
+/// earlier assertion is still recorded, still the owner's, and untouched by a
+/// figure that arrived after it.
+#[tokio::test]
+async fn a_change_that_does_not_join_is_a_discrepancy_and_not_a_correction() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ObservationBasisDto", "compared");
+    for owed in ["discrepant", "correction", "overwrite"] {
+        assert!(
+            described.contains(owed),
+            "the compared quantity says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A balance the journal cannot hold up against anything is not a figure the
+/// owner got wrong.
+///
+/// `not_comparable` with the reason `opening_not_asserted` and `discrepant` are
+/// opposite instructions, and the outcome publishes both words side by side
+/// with nothing saying so. A client that reads the first as a softer second
+/// tells the owner his own statement disagrees with the journal — sending him
+/// to hunt an error that does not exist, over an account whose recorded history
+/// simply starts later than the balance he read out. The rule was written down
+/// once, in a document that no longer exists; the reason string is where a
+/// client meets it.
+#[tokio::test]
+async fn an_unasserted_opening_is_never_reported_as_an_error_the_owner_made() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ClaimOutcomeDetailDto", "reason");
+    for owed in [
+        "`opening_not_asserted` is not `discrepant`",
+        "no baseline to hold the claim against",
+        "Nothing the owner stated is being contradicted",
+        "reported to him as an error he made",
+        "an opening assertion reaching back to the start of the",
+        "the import of the history before it",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the reason for `not_comparable` says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// One of the four verdicts sends the owner looking for an error, and the other
+/// three do not.
+///
+/// The word is the first thing a client reads off an outcome, and it was
+/// described nowhere at all. Ranked as severities — `matched` best,
+/// `discrepant` worst, the rest somewhere between — the three that assert
+/// nothing about his figures become bad news about them, and the detail key
+/// that would have corrected the reading is the one such a client never opens.
+#[tokio::test]
+async fn only_one_verdict_sends_the_owner_looking_for_an_error() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ClaimOutcomeDetailDto", "code");
+    for owed in [
+        "`not_comparable` is not a weaker `discrepant`",
+        "Only `discrepant` sends the owner looking for an error",
+        "reporting them alike hands him work",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the verdict says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// Two figures computed against two memberships are two answers about two
+/// different perimeters.
+///
+/// The number is published beside the contour and reads like a detail of the
+/// record rather than a coordinate of the answer. A client that sets last
+/// month's figure beside this month's without it reports a change in the
+/// owner's money when what changed was which accounts are counted as his —
+/// exactly the reading `retirement_revision`, the other coordinate, already
+/// warns against on itself.
+#[tokio::test]
+async fn two_figures_over_different_contour_versions_are_not_comparable() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "PopulationDto", "contour_version");
+    for owed in [
+        "Two figures computed against different contour versions are not comparable",
+        "the boundary moving as much as it is the",
+        "rather than reporting a change in his money",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the contour version says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A price is quotable only once its basis is read, and the row states the basis
+/// three times over.
+///
+/// The effective basis, the basis the source recorded and the machine status of
+/// how well that basis is proven are three fields that need not agree. A caller
+/// that reads the first and stops quotes a percentage of face as money, or
+/// quotes as settled a basis the source contradicts itself about.
+///
+/// **One carrier, and the name says so.** The rule about all three is written
+/// on the basis in force, which is the field a caller reads first and the only
+/// one of the three that could state it without repeating itself. Of the
+/// siblings, one publishes a bare line about itself and the other publishes
+/// nothing, and neither states this rule — so the test is named for the carrier
+/// it reads rather than for the three fields the rule is about.
+#[tokio::test]
+async fn the_basis_in_force_says_the_other_two_statements_need_not_agree() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "MarketPriceDto", "quotation_basis");
+    for owed in [
+        "recorded_quotation_basis",
+        "quotation_basis_status",
+        "contradicts itself",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the quotation basis says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An interval whose start was worked out is not an interval whose start was
+/// published.
+///
+/// The source gives trading days, and a rate that changed over a weekend takes
+/// effect on a date nobody observed. The word for that is on this field or
+/// nowhere, and a caller that quotes the date as a fact of the source has
+/// invented a publication that never happened.
+#[tokio::test]
+async fn an_interval_says_whether_its_start_was_observed_or_inferred() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "MarketKeyRateDto", "boundary");
+    for owed in [
+        "inferred_across_non_trading_days",
+        "observed",
+        "trading days",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the interval's boundary says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A payment that was not confirmed and a payment that cannot be checked are
+/// two different things to tell the owner.
+///
+/// The list is a bare array of sentences, and the two read alike: one says a
+/// crediting fact is missing where the security was held and the waiting period
+/// has passed, the other says there is nothing to check it against. A caller
+/// that reports the second as the first tells him money went missing, when what
+/// is missing is the evidence — and where the journal simply begins later,
+/// nothing at all is wrong.
+#[tokio::test]
+async fn an_unconfirmed_payment_and_absent_evidence_are_not_reported_alike() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "DataQualityDto", "material_issues");
+    for owed in [
+        "has not been confirmed",
+        "cannot be reconciled",
+        "went missing",
+        "carrying a count and the first and last dates",
+        "It is put to him once",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the material issues say nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A retired product leaves the perimeter and its money does not leave the
+/// journal.
+///
+/// The word alone says the owner called the product finished. What a caller
+/// must know before it repeats that to him is the bound: no figure moves, no
+/// classification changes, a snapshot already taken is untouched, and the
+/// balances answer keeps the row. A caller that reads a retirement as a removal
+/// tells him a figure went away when only a boundary moved.
+#[tokio::test]
+async fn a_retirement_says_what_it_leaves_untouched() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "RecordAccountRetirementRequest", "state");
+    for owed in [
+        "No figure moves",
+        "classification",
+        "still open is untouched",
+        "balances",
+        "queue",
+        "population",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the retirement says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A boundary the owner draws, not one an institution draws for him.
+///
+/// A list of identifiers says which accounts a version covers and nothing about
+/// what covering them means. The two consequences a caller has to know before
+/// it explains any figure are that money moved between two accounts on this
+/// list changes no return — it is one pocket to another — and that money
+/// arriving from an account not on it is a contribution.
+#[tokio::test]
+async fn a_contour_says_what_its_boundary_does_to_a_movement() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ContourDto", "accounts");
+    for owed in [
+        "the set the owner considers his portfolio",
+        "his rather than an institution's",
+        "Money moved between two accounts named here changes no return",
+        "arriving from an account not named here is a **contribution**",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the composition says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A remedy belongs to the caveat that names it, and to no other caveat on the
+/// same account.
+///
+/// One account routinely stands under two caveats at once, and the calls that
+/// close one of them do not close the other. Swapping them fails silently: an
+/// owner-balance assertion is checked against the fold rather than added to it,
+/// so it relabels the figure it was meant to remove and both lines stay
+/// standing.
+#[tokio::test]
+async fn a_caveats_remedies_are_not_the_remedies_of_its_neighbour() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CaveatDto", "closed_by");
+    for owed in [
+        "two caveats at once",
+        "checked against the fold",
+        "this caveat",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the remedies say nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// What the money was for is not the same question as whose the money is.
+///
+/// A title alone reads as a label a client may put anywhere. Set beside the
+/// contour, it is one of a pair of answers over one journal, and a caller that
+/// substitutes either for the other tells the owner that a row was reclassified
+/// when an account changed hands, or the reverse.
+#[tokio::test]
+async fn a_category_answers_a_different_question_from_the_perimeter() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CategoryDto", "title");
+    for owed in [
+        "whose money is in the figures",
+        "what that money was for. Neither substitutes for the other",
+        "never a statement about whether an account is his",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the category says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A rule moves rows between explanations and moves no figure of the return.
+///
+/// The impact answer is what a caller shows the owner before he agrees to a
+/// rule, and a list of monthly movements looks like a list of things about to
+/// change. It has to say what is **not** in it — the return and every figure it
+/// is built from — and it has to say what does move them, so that a caller
+/// meaning to change a fact does not reach for a rule to do it.
+#[tokio::test]
+async fn an_impact_says_which_figures_a_rule_cannot_move() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CategoryRuleImpactDto", "months");
+    for owed in [
+        "xirr_pre_tax",
+        "contributed",
+        "withdrawn",
+        "different fact",
+        "channel the fact arrived by",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the impact says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// Three vocabularies are read and only two are for a caller to send.
+///
+/// The tiering is published, so a caller can see that a title resolves; what it
+/// cannot see is that sending one is the wrong move. A title is a string the
+/// owner may change tomorrow and two of his accounts may carry one of them, so
+/// a converter that reaches for it writes rows that stop parsing the day he
+/// renames something.
+#[tokio::test]
+async fn an_account_says_which_of_its_names_to_send() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "OperationDto", "account");
+    for owed in ["do not send the title", "keep parsing", "change tomorrow"] {
+        assert!(
+            described.contains(owed),
+            "the account field says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A code nobody holds and a code that is wrong for this date are two answers,
+/// and only one of them is about the catalogue.
+///
+/// Both arrive as a refusal to resolve, and a caller that reads them alike asks
+/// the owner to create a security that already exists — or, worse, treats a
+/// document assembled with the wrong date as a gap in a catalogue shared with
+/// every other owner.
+#[tokio::test]
+async fn a_dated_resolution_keeps_its_two_refusals_apart() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ResolveInstrumentRequest", "on");
+    for owed in [
+        "unknown",
+        "not on this date",
+        "the owner's work",
+        "forbidden",
+        "document's date",
+        "corrupted",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the resolution date says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An instrument has three currencies and the report's is not one of them.
+///
+/// Three fields side by side read as one fact spelled three ways, and on the
+/// papers where they genuinely diverge a caller that picks whichever it met
+/// first states a holding in money the owner never held. The currency a report
+/// is drawn in belongs to the report and to no instrument.
+///
+/// **One carrier, and the name says so.** The rule naming all three is written
+/// on the first of them, where a caller reading the fields in order meets it
+/// before it can pick wrongly. The siblings publish no description at all, so a
+/// test named for three carriers would promise proof of two that do not exist.
+#[tokio::test]
+async fn the_denomination_currency_says_the_other_two_are_not_it() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "InstrumentDto", "denomination_currency");
+    for owed in [
+        "settlement_currency",
+        "quote_currency",
+        "diverge",
+        "property of the report",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the denomination currency says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// Retracting an import is checked against a bound, not taken on trust that the
+/// caller still has the standing it once had.
+///
+/// A caller that reads only the label and the account can ask to take back an
+/// import that something has since been built on — a row reversed by someone
+/// else, or a balance reconciled against the interval it covers — and a
+/// retraction that succeeded anyway would silently undo work that was never
+/// the caller's to undo.
+#[tokio::test]
+async fn retracting_an_import_is_checked_against_a_bound_not_trusted() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CorrectImportRequest", "source");
+    for owed in [
+        "still in force",
+        "nothing has been built on it",
+        "reversed or replaced",
+        "reconciled",
+        "refusal names",
+        "twice",
+    ] {
+        assert!(
+            described.contains(owed),
+            "CorrectImportRequest.source says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A correction batch is diagnosed from the journal read back per row, and a
+/// correction proposed from a report's aggregate is a guess about which rows
+/// are wrong.
+///
+/// The field already says the batch is applied together or not at all; it said
+/// nothing about where the rows named in it are supposed to come from, and a
+/// caller that fills a correction from a report total rather than from the
+/// journal is guessing which facts to retract.
+#[tokio::test]
+async fn corrections_are_diagnosed_from_the_journal_not_guessed_from_a_total() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "SubmitCorrectionsRequest", "corrections");
+    for owed in ["journal", "read back", "aggregate", "guess"] {
+        assert!(
+            described.contains(owed),
+            "SubmitCorrectionsRequest.corrections says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An owner's own assertion of a balance is what the journal is reconciled
+/// against, not a second, independent source confirming it.
+///
+/// `accepted_internal` reads like a confirmation, and a caller that reports it
+/// as one tells the owner two sources agree when the second "source" was his
+/// own recollection of the same figure the statement gave him.
+#[tokio::test]
+async fn an_owners_balance_is_not_an_independent_confirmation() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "NavCoverageDto", "accepted_internal");
+    for owed in [
+        "reconciled against",
+        "not a second",
+        "independently confirmed",
+    ] {
+        assert!(
+            described.contains(owed),
+            "NavCoverageDto.accepted_internal says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An item the owner settled wants nothing, and a client that reads it as work
+/// goes looking for what it holds up.
+///
+/// The word arrived with no description at all. What `settled` means — his
+/// decision recorded, the records it keeps out of every report, and the single
+/// call that withdraws it — lived in a comment in the server's own source,
+/// where no client reads anything.
+#[tokio::test]
+async fn a_settled_item_says_it_wants_nothing() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ActionDto", "state");
+    for owed in ["settled", "not work", "withdrawal", "no call in this API"] {
+        assert!(
+            described.contains(owed),
+            "ActionDto.state says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// The string a statement printed for an account is its printed identity, and
+/// putting it in the title is what makes the next reading refuse the same rows.
+///
+/// The field advised a derived value and said nothing about where the printed
+/// string belongs, so a client holding a wall of refused records had no
+/// published reason to prefer this field over the one a person reads.
+#[tokio::test]
+async fn the_printed_string_is_the_accounts_identity_and_not_its_title() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CreateAccountRequest", "provider_account_id");
+    for owed in [
+        "The string a statement printed for the account belongs here",
+        "an account carrying that string as its printed identity",
+        "put in the title instead leaves the owner with a name he did not",
+        "the rename he is entitled to make then stops the document",
+    ] {
+        assert!(
+            described.contains(owed),
+            "CreateAccountRequest.provider_account_id says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A title is the owner's to give, and a guessed one does not make a refused
+/// record import — it makes a second account he never asked for.
+///
+/// The description explained what a title is and is not. It did not say what
+/// happens when a client invents one, which is the move a wall of refusals
+/// invites.
+#[tokio::test]
+async fn a_title_is_asked_for_and_never_guessed() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CreateAccountRequest", "title");
+    for owed in ["guess", "second account", "never asked for"] {
+        assert!(
+            described.contains(owed),
+            "CreateAccountRequest.title says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A place of custody is named by the owner's own title, and a document's
+/// account cell is not.
+///
+/// The route already publishes how an account cell is read — three
+/// vocabularies, in one order — and said nothing about the custody cell beside
+/// it. A caller that reads the two as one question sends the identity a source
+/// prints for a depository, which names nothing here, and reads back a refusal
+/// that sounds like the place does not exist.
+#[tokio::test]
+async fn a_custody_cell_is_named_by_the_owners_own_title_and_nothing_else() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = spec["paths"]["/v1/ingest/csv"]["post"]["description"]
+        .as_str()
+        .expect("the CSV ingestion route carries a description");
+    for owed in [
+        "a place of custody is matched against the owner's own title for it and \
+         against nothing else",
+        "A cell left empty falls back to the account's default place of custody",
+        "a title naming two places is refused rather than chosen between",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the route says nothing about «{owed}» for a custody cell: {described}"
+        );
+    }
+}
+
+/// A refusal for request frequency is answered by lowering the frequency.
+///
+/// An agent quoting a price per date meets this refusal in a loop, and the
+/// natural move — send it again — is the one that keeps it refused, because the
+/// window only turns over while nothing is calling. Nothing published said so,
+/// and a transport-level refusal has no schema of its own to say it on.
+#[tokio::test]
+async fn the_market_series_say_a_refusal_for_frequency_is_answered_by_lowering_it() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for route in ["/v1/market/prices", "/v1/market/fx", "/v1/market/key-rate"] {
+        let described = spec["paths"][route]["get"]["responses"]["429"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{route} publishes no refusal for request frequency"));
+        for owed in [
+            "Lower the frequency",
+            "window",
+            "repeating immediately",
+            // The sentence that is this route's own and no other's: waiting is
+            // the answer everywhere, and asking once over a range instead of
+            // once per date is the answer only here.
+            "One call over a range of dates",
+        ] {
+            assert!(
+                described.contains(owed),
+                "{route}'s refusal says nothing about «{owed}»: {described}"
+            );
+        }
+        assert_eq!(
+            described.matches("Lower the frequency").count(),
+            1,
+            "{route} states the shared refusal twice: {described}"
+        );
+    }
+}
+
+/// Every route that can refuse for frequency says so, and the count proves it.
+///
+/// The limit is enforced in the authentication layer, so the operations that
+/// can give this refusal are exactly the operations that require a token —
+/// which is nearly the whole surface. Three of them declared it and the rest
+/// said nothing, and the skill tells a client to read this document rather than
+/// ask anyone what a refusal will look like. Comparing the two counts is what
+/// stops them drifting apart again: a route added with a token and without the
+/// refusal fails here rather than in a client's retry loop.
+#[tokio::test]
+async fn every_operation_that_needs_a_token_publishes_the_refusal_for_frequency() {
+    const METHODS: [&str; 8] = [
+        "get", "put", "post", "delete", "options", "head", "patch", "trace",
+    ];
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut needing_a_token = 0_usize;
+    let mut publishing_the_refusal = 0_usize;
+    let mut silent: Vec<String> = Vec::new();
+    for (path, item) in spec["paths"].as_object().expect("the document has paths") {
+        for method in METHODS {
+            let operation = &item[method];
+            if operation.is_null() {
+                continue;
+            }
+            let needs_a_token = operation["security"]
+                .as_array()
+                .is_some_and(|requirements| {
+                    requirements
+                        .iter()
+                        .any(|requirement| requirement.get("bearer").is_some())
+                });
+            if !needs_a_token {
+                continue;
+            }
+            needing_a_token += 1;
+            let refusal = &operation["responses"]["429"];
+            if refusal.is_null() {
+                silent.push(format!("{method} {path}"));
+                continue;
+            }
+            publishing_the_refusal += 1;
+
+            let described = refusal["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {path} publishes a refusal with no text"));
+            for owed in [
+                "calls per token",
+                "Retry-After",
+                "Lower the frequency",
+                "refused again",
+            ] {
+                assert!(
+                    described.contains(owed),
+                    "{method} {path}'s refusal says nothing about «{owed}»: {described}"
+                );
+            }
+            assert!(
+                refusal["headers"]["Retry-After"].is_object(),
+                "{method} {path} names the wait in prose and publishes no header for it"
+            );
+            assert_eq!(
+                refusal["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ApiError",
+                "{method} {path}'s refusal does not carry the body every other refusal carries"
+            );
+        }
+    }
+
+    assert!(
+        needing_a_token > 60,
+        "the protected surface is most of this API; only {needing_a_token} operations were found"
+    );
+    assert_eq!(
+        publishing_the_refusal, needing_a_token,
+        "operations that require a token and publish no refusal for frequency: {silent:?}"
+    );
+}
+
+/// The refusal says how long to wait, and says it where a client reads it.
+///
+/// The window start is known exactly, so the seconds remaining are known
+/// exactly; a refusal that withheld them leaves a caller to guess, and the
+/// guess it makes is «now».
+#[tokio::test]
+async fn a_refusal_for_frequency_says_how_many_seconds_are_left() {
+    let harness = rate_limited_harness(1);
+    let (status, _headers, _body) = call_raw(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the first call is within the limit");
+
+    let (status, headers, body) = call_raw(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let seconds: u64 = headers
+        .get("retry-after")
+        .expect("the refusal carries Retry-After")
+        .to_str()
+        .expect("Retry-After is text")
+        .parse()
+        .expect("Retry-After is whole seconds");
+    assert!(
+        (1..=60).contains(&seconds),
+        "the wait must be what is left of the window, and never zero: {seconds}"
+    );
+
+    let body: Value = serde_json::from_slice(&body).expect("the refusal carries a body");
+    assert_eq!(body["code"], "rate_limited");
+    let message = body["message"]
+        .as_str()
+        .expect("the refusal explains itself");
+    for owed in ["Retry-After", "refused again"] {
+        assert!(
+            message.contains(owed),
+            "the refusal says nothing about «{owed}»: {message}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::destination::Destination;
 use crate::request::{HttpMethod, HttpRequest};
+use crate::resilience::parse_retry_after;
 use crate::response::{HttpError, HttpResponse};
 use crate::trust::{ConfiguredClient, client_for};
 
@@ -87,12 +88,25 @@ impl HttpClient {
         }
         let response = builder.send().await.map_err(classify_transport_error)?;
         let status = response.status().as_u16();
+        // Read before `bytes()` consumes the response: only the delay-seconds
+        // form is understood, so a value in another form (an HTTP-date) or
+        // an absent header both become `None`, and the retry policy falls
+        // back to its computed backoff.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
         let body = response
             .bytes()
             .await
             .map_err(classify_transport_error)?
             .to_vec();
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            retry_after,
+        })
     }
 }
 

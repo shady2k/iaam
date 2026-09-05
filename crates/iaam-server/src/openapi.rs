@@ -7,7 +7,11 @@
 
 use utoipa::Modify;
 use utoipa::OpenApi;
+use utoipa::openapi::path::Operation;
+use utoipa::openapi::response::{Response, ResponseBuilder};
+use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::{ContentBuilder, HeaderBuilder, Ref, RefOr};
 
 use crate::dto::{
     AccountBalanceDto, AccountCandidateDto, AccountDto, AccountNameDispositionDto,
@@ -79,6 +83,33 @@ use crate::vocabulary::{
     VerdictCodeDto,
 };
 
+/// The name the bearer scheme is declared and required under.
+///
+/// One constant for both, because the refusal for frequency is published on
+/// exactly the operations that require this scheme: if the declaration and the
+/// requirement were spelled separately, a rename would leave the refusal
+/// published on nothing while every route still asked for a token.
+const BEARER_SCHEME: &str = "bearer";
+
+/// The status a refusal for request frequency is given.
+const TOO_MANY_REQUESTS: &str = "429";
+
+/// What a client is told when it is refused for calling too often.
+///
+/// Written once, here, and attached below to every operation that can give it.
+/// It says what the count is over, where to read the wait, and what not to do —
+/// and it names neither the window's length nor the number of calls allowed,
+/// because both are configuration of one deployment and a published document
+/// that quoted them would be wrong at the next restart that changed either.
+const FREQUENCY_REFUSAL: &str = "Too many requests. This instance counts calls per token over a fixed window, and \
+     `Retry-After` on the response says how many seconds of that window are left. Wait that long \
+     before calling again. Lower the frequency rather than repeating immediately: a repeat inside \
+     the same window is refused again and brings the answer no closer.";
+
+/// What the `Retry-After` header on that refusal carries.
+const RETRY_AFTER_HEADER: &str = "Whole seconds left of the window this token is counted over. Rounded up, and never zero, so \
+     waiting exactly this long is enough and no answer is lost by waiting it.";
+
 /// Authentication scheme. Declared separately: `utoipa` generates it
 /// from types, but the `Bearer` requirement cannot be expressed by a type.
 pub struct BearerSecurity;
@@ -87,7 +118,7 @@ impl Modify for BearerSecurity {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
-                "bearer",
+                BEARER_SCHEME,
                 SecurityScheme::Http(
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
@@ -100,6 +131,119 @@ impl Modify for BearerSecurity {
             );
         }
     }
+}
+
+/// The refusal for request frequency, on every operation that can give it.
+///
+/// The limit is enforced in the authentication layer, and every operation that
+/// requires a token passes through it — so every one of them can answer this
+/// way, and none of them can be written to avoid it. Declared per route, it was
+/// declared on three operations out of seventy-two, which is worse than nowhere:
+/// the skill tells a client to read this document instead of asking anyone what
+/// a refusal will look like, so a client built from what is published would meet
+/// an undeclared refusal on the other sixty-nine and answer it by sending the
+/// same request again — the one move that keeps it refused.
+///
+/// So the operations are found by the security requirement they carry, never by
+/// a list of paths kept here. A route added tomorrow is covered by asking for a
+/// token, which it must do anyway, rather than by somebody remembering to come
+/// back to this file.
+///
+/// A route with something of its own to say about frequency declares a `429`
+/// carrying **only** that sentence; it is appended to the shared paragraph
+/// below, so the two are one text with an extra clause and not two texts that
+/// can drift.
+pub struct FrequencyRefusal;
+
+impl Modify for FrequencyRefusal {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        for item in openapi.paths.paths.values_mut() {
+            // The eight methods are separate fields rather than a map in this
+            // version of the model, so they are gathered by hand. Listing all
+            // eight, including the ones no route uses, is deliberate: a list
+            // trimmed to what exists today is a list to be wrong about later.
+            let operations = [
+                item.get.as_mut(),
+                item.put.as_mut(),
+                item.post.as_mut(),
+                item.delete.as_mut(),
+                item.options.as_mut(),
+                item.head.as_mut(),
+                item.patch.as_mut(),
+                item.trace.as_mut(),
+            ];
+            for operation in operations.into_iter().flatten() {
+                if !requires_bearer(operation) {
+                    continue;
+                }
+                let particular = operation
+                    .responses
+                    .responses
+                    .remove(TOO_MANY_REQUESTS)
+                    .and_then(own_description);
+                operation.responses.responses.insert(
+                    TOO_MANY_REQUESTS.to_owned(),
+                    RefOr::T(frequency_refusal(particular.as_deref())),
+                );
+            }
+        }
+    }
+}
+
+/// Whether this operation asks for a bearer token, and so passes the limiter.
+fn requires_bearer(operation: &Operation) -> bool {
+    operation.security.iter().flatten().any(|requirement| {
+        // The requirement keeps its scheme names private and publishes them
+        // only by serialising, which is also the form the document is read in.
+        // Comparing against a requirement built here would instead ask whether
+        // the scopes match, and a route that one day asks for a scope would
+        // quietly stop being covered.
+        serde_json::to_value(requirement)
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_object()
+                    .map(|schemes| schemes.contains_key(BEARER_SCHEME))
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// The sentence a route declared for itself, where it declared one.
+fn own_description(declared: RefOr<Response>) -> Option<String> {
+    match declared {
+        RefOr::T(response) => Some(response.description),
+        // A reference to a shared response component holds no text of its own
+        // to carry over.
+        RefOr::Ref(_) => None,
+    }
+}
+
+/// The published refusal, with whatever one route adds to it.
+fn frequency_refusal(particular: Option<&str>) -> Response {
+    let description = match particular {
+        Some(particular) => format!("{FREQUENCY_REFUSAL} {particular}"),
+        None => FREQUENCY_REFUSAL.to_owned(),
+    };
+    ResponseBuilder::new()
+        .description(description)
+        // Published as a header and not only as prose: a client reads the wait
+        // from the response, and a wait described in a sentence has to be
+        // guessed at from the sentence.
+        .header(
+            "Retry-After",
+            HeaderBuilder::new()
+                .schema(Object::with_type(Type::Integer))
+                .description(Some(RETRY_AFTER_HEADER))
+                .build(),
+        )
+        .content(
+            "application/json",
+            ContentBuilder::new()
+                .schema(Some(Ref::from_schema_name("ApiError")))
+                .build(),
+        )
+        .build()
 }
 
 #[derive(OpenApi)]

@@ -1,5 +1,7 @@
 //! Transport response and refusals.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Endpoint response: status and body as received.
@@ -11,6 +13,11 @@ use thiserror::Error;
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The `Retry-After` the source named, already parsed as delay-seconds
+    /// (see `resilience::parse_retry_after`). `None` when the header was
+    /// absent or in a form that function does not parse, such as an
+    /// HTTP-date.
+    pub retry_after: Option<Duration>,
 }
 
 impl HttpResponse {
@@ -48,6 +55,7 @@ mod tests {
         let response = HttpResponse {
             status: 200,
             body: "response".as_bytes().to_vec(),
+            retry_after: None,
         };
 
         assert_eq!(response.text_utf8(), Some("response"));
@@ -58,6 +66,7 @@ mod tests {
         let response = HttpResponse {
             status: 200,
             body: vec![0xff, 0xfe],
+            retry_after: None,
         };
 
         assert_eq!(response.text_utf8(), None);

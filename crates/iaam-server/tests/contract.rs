@@ -26283,3 +26283,139 @@ async fn an_agent_token_reads_an_institution_s_export_into_a_session() {
         "{read}"
     );
 }
+
+/// The queue and the assessment say the same thing about what an answer keeps.
+///
+/// **The defect.** Two published sentences described one act with opposite
+/// persistence and neither was conditional: the queue's item stated flatly that
+/// the answer is written as a rule and a row matching it settles by itself next
+/// time, and the assessment's decision group stated flatly that no standing
+/// decision is kept. Neither was stale — each was right about a different case —
+/// so a caller that read both had to pick one, which is how an owner came to be
+/// told a rule would not exist that would exist.
+///
+/// Both are now read off one derivation, and the derivation takes the asking
+/// authority: the owner may generalise and an agent may not (`iaam-hnod`), so
+/// the same session answers differently to the two tokens and says so on both
+/// surfaces at once.
+///
+/// Everything here is invented: the account is the harness's own `Main`, and the
+/// rows were made up for this test.
+#[tokio::test]
+async fn the_queue_and_the_assessment_agree_on_what_an_answer_keeps() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "kept" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    // Two rows the source says the same thing about, so they raise one decision
+    // and the assessment publishes the group whose sentence is the other half of
+    // this test. Both print `INNER`, so a rule can be built from either.
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row(account, "kept-one"),
+                    unresolved_row(account, "kept-two"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let owner_reason = classification_item_reason(&harness, &harness.owner_token).await;
+    let owner_consequence = decision_group_consequence(&harness, &harness.owner_token, &id).await;
+
+    // The owner's token may generalise, so both surfaces owe the same answer.
+    assert!(
+        owner_reason.contains("settles by itself next time"),
+        "the queue does not say the rule will stand: {owner_reason}"
+    );
+    assert!(
+        !owner_consequence.contains("no standing decision is kept"),
+        "the group still denies what the queue promises: {owner_consequence}"
+    );
+    assert!(
+        owner_consequence.contains("without asking you again"),
+        "the group does not say the rule will stand: {owner_consequence}"
+    );
+
+    // The agent's token may not, and neither surface promises him a rule.
+    let agent_reason = classification_item_reason(&harness, &harness.agent_token).await;
+    let agent_consequence = decision_group_consequence(&harness, &harness.agent_token, &id).await;
+    assert!(
+        !agent_reason.contains("settles by itself next time"),
+        "the queue promises an agent a rule it will not write: {agent_reason}"
+    );
+    assert!(
+        agent_reason.contains("writes no rule"),
+        "the queue does not say why no rule stands: {agent_reason}"
+    );
+    assert!(
+        !agent_consequence.contains("without asking you again"),
+        "the group promises an agent a rule it will not write: {agent_consequence}"
+    );
+    assert!(
+        agent_consequence.contains("keeps no standing decision"),
+        "the group does not say why no rule stands: {agent_consequence}"
+    );
+
+    // One group, and it is still the group's own fact how many lines one answer
+    // settles — that half of the sentence is what the persistence clause was
+    // welded to, and it stays.
+    for consequence in [&owner_consequence, &agent_consequence] {
+        assert!(
+            consequence.contains("all 2 of these lines together"),
+            "the group stopped saying how far one answer reaches: {consequence}"
+        );
+    }
+}
+
+/// The reason the queue publishes on the item for a held classification question.
+async fn classification_item_reason(harness: &Harness, token: &str) -> String {
+    let (status, actions) = call(&harness.router, get("/v1/actions", Some(token))).await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .find(|item| item["kind"] == "answer_classification_question")
+        .and_then(|item| item["reason"].as_str())
+        .expect("an item for a held classification question")
+        .to_owned()
+}
+
+/// What the assessment tells a person turns on answering one decision group.
+async fn decision_group_consequence(harness: &Harness, token: &str, session: &str) -> String {
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}/assessment"),
+            Some(token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    plan["interpretation"]["groups"]
+        .as_array()
+        .expect("row groups")
+        .iter()
+        .find(|group| group["basis"] == "one_decision")
+        .and_then(|group| group["question"]["consequence"].as_str())
+        .expect("a decision group with a sentence")
+        .to_owned()
+}

@@ -30,7 +30,8 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_ingest::classification::{
     Answer, AnswerShape, Basis, Classification, ClassificationResult, ClassificationRule,
-    ClassificationSubject, Movement, Question, QuestionSubject, RuleMatcher, classify,
+    ClassificationSubject, Counterparty, Movement, Question, QuestionSubject, RuleMatcher,
+    classify,
 };
 use iaam_ingest::csv_source::{AccountEntry, AccountNames, UnresolvedAccount};
 use iaam_ingest::mirror::{MirrorSide, mirrored};
@@ -1126,6 +1127,108 @@ impl Generalisation {
             Self::Available { .. } => "available",
             Self::Impossible => "impossible",
         }
+    }
+}
+
+/// What answering will decide beyond this session, before it is answered.
+///
+/// [`Generalisation`] is the same question asked afterwards, and it cannot
+/// answer this one: an unanswered question is [`Generalisation::Unanswered`] by
+/// construction. Two things are known before the answer and they are the whole
+/// of it — whether the row can ground a matcher at all, and whether the caller
+/// may generalise (`iaam-hnod`).
+///
+/// **One derivation, because two sentences.** The queue's item and the
+/// assessment's group proposal both have to say this. They said opposite things
+/// — the queue that the answer is written as a rule, the group that no standing
+/// decision is kept — while each was right about one case and neither was
+/// conditional, so a reader had no way to tell which case he was in. A caller
+/// that read both had to choose, and choosing wrong is how an owner came to be
+/// told a rule would not exist that would exist.
+///
+/// **The sentences differ and the value does not.** A surface reporting *about*
+/// the owner and a surface speaking *to* him are two registers, and one string
+/// serving both would be wrong in one of them; so the two spellings live here,
+/// side by side, off one value. Nothing downstream re-derives which of the three
+/// it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneralisationProspect {
+    /// The answer is written as a rule, and a row matching it settles by itself
+    /// next time.
+    WillStand,
+    /// The answer settles this row and writes no rule, because the answerer may
+    /// not generalise. The rule is the owner's to make stand.
+    NeedsHisAdoption,
+    /// No rule can be built from this row under any token: a matcher that asks
+    /// nothing matches nothing.
+    NoneFromThisRow,
+}
+
+impl GeneralisationProspect {
+    /// The sentence for a surface reporting about the owner.
+    #[must_use]
+    pub const fn reported(self) -> &'static str {
+        match self {
+            Self::WillStand => {
+                "The answer is written as a rule, so a row matching it settles by itself next time."
+            }
+            Self::NeedsHisAdoption => {
+                "The answer settles this row and writes no rule: the rule it would have been is \
+                 published with the answer, and making it stand is the owner's own act."
+            }
+            Self::NoneFromThisRow => {
+                "The answer settles this row and nothing else: this row carries nothing a rule \
+                 could match on, so no later row settles by itself because of it."
+            }
+        }
+    }
+
+    /// The same fact in the second person, for a sentence the owner is read.
+    ///
+    /// **Not the sentence above with the pronouns changed.** Decision 0027's
+    /// register holds here and is enforced mechanically — «rule» is this
+    /// system's word for what he calls a standing decision, and the guard on
+    /// [`decision_group_question`] refuses it along with every other word that
+    /// exists only because of how this is built.
+    #[must_use]
+    pub const fn addressed(self) -> &'static str {
+        match self {
+            Self::WillStand => {
+                "Your answer is also kept as a standing decision, so a line matching it in a \
+                 later statement is settled without asking you again."
+            }
+            Self::NeedsHisAdoption => {
+                "Your answer keeps no standing decision, because only you may make one: the \
+                 standing decision it would have been is published beside the answer, and one \
+                 call of your own makes it stand."
+            }
+            Self::NoneFromThisRow => {
+                "Your answer keeps no standing decision, because these lines carry nothing a \
+                 later line could be matched against: no line of a later statement is settled \
+                 by it."
+            }
+        }
+    }
+}
+
+/// What answering one question will decide beyond this session.
+///
+/// The two facts it reads are the two that exist before an answer does. The
+/// subject is `None` where this build cannot read the row, and a row it can read
+/// still grounds no rule when it prints nothing a matcher could ask about — both
+/// are «no rule can be built from this», which is the same pair
+/// [`generalisation_of`] folds into [`Generalisation::Impossible`]. Groundedness
+/// is asked of [`matcher_from`] and not restated here, because a second spelling
+/// of that field policy is a second answer to what a rule can be built from.
+#[must_use]
+pub fn generalisation_ahead(
+    subject: Option<&ClassificationSubject>,
+    may_generalise: bool,
+) -> GeneralisationProspect {
+    match subject.and_then(matcher_from) {
+        None => GeneralisationProspect::NoneFromThisRow,
+        Some(_) if may_generalise => GeneralisationProspect::WillStand,
+        Some(_) => GeneralisationProspect::NeedsHisAdoption,
     }
 }
 
@@ -3795,7 +3898,12 @@ pub async fn plan_session(
     // questions one decision. The directory is the same one every row of this
     // plan was resolved against, because a group names its account the way the
     // owner reads it.
-    let groups = row_groups(&contents.observations, &open_questions, &resolver.directory);
+    let groups = row_groups(
+        &contents.observations,
+        &open_questions,
+        &resolver.directory,
+        may_generalise(principal),
+    );
 
     let mut facts = Vec::new();
     let mut duplicates = Vec::new();
@@ -6538,10 +6646,16 @@ fn answer_accounts(directory: &AccountDirectory, open: &[OpenQuestion]) -> Vec<A
 /// none of whose rows this build can read is published not at all, because a
 /// group is a claim about what its members have in common and there is nothing to
 /// make the claim out of.
+///
+/// **`may_generalise` is a parameter and not a read** (`iaam-sh6m`). A decision
+/// group's sentence has to say what answering it keeps, and that depends on who
+/// is answering; the caller holds the principal and hands the one bit down,
+/// rather than this fold acquiring an authority of its own.
 fn row_groups(
     observations: &[ImportObservationView],
     open: &[OpenQuestion],
     directory: &AccountDirectory,
+    may_generalise: bool,
 ) -> Vec<RowGroup> {
     let mut sets: Vec<(GroupBasis, Vec<u32>)> = Vec::new();
     let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
@@ -6595,7 +6709,30 @@ fn row_groups(
         let amounts = common.currency.and_then(|_| amount_span(&members));
         let question = match basis {
             GroupBasis::OneDecision => {
-                decision_group_question(rows.len(), &common, days.as_ref(), amounts.as_ref())
+                // The group's prospect is the weakest of its members'. One
+                // answer covers every one of them, so a single member no rule
+                // could be built from is a member the answer settles and
+                // nothing more — and a sentence promising a standing rule to
+                // the set would be false of that one. Where they all ground a
+                // rule they ground the same kind of one, because what makes
+                // them a group is the question their rows raise.
+                let subjects: Vec<ClassificationSubject> =
+                    members.iter().map(|member| member.subject(None)).collect();
+                let ground = if subjects
+                    .iter()
+                    .all(|subject| matcher_from(subject).is_some())
+                {
+                    subjects.first()
+                } else {
+                    None
+                };
+                decision_group_question(
+                    rows.len(),
+                    &common,
+                    days.as_ref(),
+                    amounts.as_ref(),
+                    generalisation_ahead(ground, may_generalise),
+                )
             }
             GroupBasis::OneMovement => movement_group_question(&members, directory),
         };
@@ -6810,11 +6947,21 @@ fn group_mark(
 /// bead about a question published without them; a group that carried its own
 /// copy would be a fifth publisher of one stored list, which is the thing that
 /// bead's one reader exists to prevent.
+///
+/// **The persistence half is not written here either** (`iaam-sh6m`). How many
+/// of this session's lines one answer settles is the group's own fact and is
+/// stated below. Whether the answer also becomes a standing rule is not: it
+/// depends on the row and on who is answering, this sentence used to assert one
+/// of the three cases flatly — «no standing decision is kept» — and the queue
+/// asserted a different one about the same act. It is now
+/// [`GeneralisationProspect`], derived once and spoken here in the second
+/// person.
 fn decision_group_question(
     count: usize,
     common: &SharedRow,
     days: Option<&DaySpan>,
     amounts: Option<&AmountSpan>,
+    prospect: GeneralisationProspect,
 ) -> OwnerQuestion {
     let mark = group_mark(count, common, days, amounts);
     let ask = match (common.movement, common.counterparty.as_deref()) {
@@ -6845,14 +6992,14 @@ fn decision_group_question(
         ask,
         consequence: format!(
             "One answer here decides all {count} of these lines together instead of one at a \
-             time, and decides nothing outside them: no line of a later statement is settled by \
-             it and no standing decision is kept. Your statement says the same thing about every \
-             one of them, but only you know whether they were the same thing — answered as a \
-             group, a line that was something else is decided wrongly along with the rest, and \
-             the way to keep it out is to answer that one on its own first. Which figure of your \
-             money-flow report each line moves depends on the word you choose, and every one of \
-             these lines is published with the words that answer it and what each of them \
-             decides. Nothing is written until you commit this import."
+             time. {kept} Your statement says the same thing about every one of them, but only \
+             you know whether they were the same thing — answered as a group, a line that was \
+             something else is decided wrongly along with the rest, and the way to keep it out \
+             is to answer that one on its own first. Which figure of your money-flow report each \
+             line moves depends on the word you choose, and every one of these lines is \
+             published with the words that answer it and what each of them decides. Nothing is \
+             written until you commit this import.",
+            kept = prospect.addressed(),
         ),
     }
 }
@@ -7236,21 +7383,37 @@ fn offered_rule_question(category: &str, covers: usize, contains: &RowShape) -> 
 /// classifier could **not** settle, so the field it proposes is one that had no
 /// standing rule on it.
 fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
-    let matcher = if let Some(counterparty) = row.counterparty_name() {
+    // Through the subject, because the subject is the shape the whole field
+    // policy below is written about and it is what `generalisation_ahead` holds.
+    // `ObservedRow::subject(None)` is the reading a rule is tested under — the
+    // counterparty stays the name the source printed — which is the same reading
+    // `subject_of` publishes and the same one this function has always taken.
+    matcher_from(&row.subject(None))
+}
+
+/// The same policy, asked of the row as the classifier sees it.
+///
+/// Split out so that «can a rule be built from this row at all» has one answer.
+/// [`generalisation_ahead`] needs exactly that question and holds a
+/// [`ClassificationSubject`] rather than an [`ObservedRow`]; a predicate of its
+/// own beside this would be a second statement of which fields ground a rule,
+/// and the two would drift the first time a fifth field is admitted.
+fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
+    let matcher = if let Counterparty::Named(counterparty) = &subject.counterparty {
         RuleMatcher {
-            counterparty_account: Some(counterparty.to_owned()),
+            counterparty_account: Some(counterparty.clone()),
             description_contains: None,
             kind: None,
             source_category: None,
         }
-    } else if let Some(kind) = row.source_kind.clone() {
+    } else if let Some(kind) = subject.source_kind.clone() {
         RuleMatcher {
             counterparty_account: None,
             description_contains: None,
             kind: Some(kind),
             source_category: None,
         }
-    } else if let Some(category) = row.source_category.clone() {
+    } else if let Some(category) = subject.source_category.clone() {
         RuleMatcher {
             counterparty_account: None,
             description_contains: None,
@@ -7260,7 +7423,7 @@ fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
     } else {
         RuleMatcher {
             counterparty_account: None,
-            description_contains: row.description.clone(),
+            description_contains: subject.description.clone(),
             kind: None,
             source_category: None,
         }
@@ -7408,7 +7571,15 @@ fn require_submit(principal: &Principal) -> Result<(), AppError> {
 /// It reads [`crate::ports::Scope::may_administer`] and not a gate of its own:
 /// this **is** the administer decision, arriving by another door, and a second
 /// predicate beside it would be a second place for the two to drift apart.
-fn may_generalise(principal: &Principal) -> bool {
+///
+/// **Public since `iaam-sh6m`,** because the queue must say what a caller's
+/// answer will keep and the authority is the caller's fact to supply: the route
+/// asks this one question of the principal it already holds and hands the answer
+/// to `frontier` as a `bool`. Exporting the predicate rather than letting a
+/// second surface read `may_administer` itself is what keeps the gate stated
+/// once.
+#[must_use]
+pub fn may_generalise(principal: &Principal) -> bool {
     principal.scope.may_administer()
 }
 
@@ -10213,6 +10384,44 @@ mod tests {
         assert_eq!(proposed.kind, None);
     }
 
+    /// What an answer will keep, before anyone has answered (`iaam-sh6m`).
+    ///
+    /// The three cases the queue and the assessment used each to assert one of,
+    /// flatly, in two sentences that contradicted each other. The last is the
+    /// one no authority changes, and the one a test of the enum alone would miss:
+    /// a row this build reads perfectly well and that still grounds nothing.
+    #[test]
+    fn what_an_answer_will_keep_is_read_off_the_row_and_the_authority() {
+        let grounded = row(account(1), "Shop One", None).subject(None);
+        assert_eq!(
+            generalisation_ahead(Some(&grounded), true),
+            GeneralisationProspect::WillStand
+        );
+        assert_eq!(
+            generalisation_ahead(Some(&grounded), false),
+            GeneralisationProspect::NeedsHisAdoption,
+            "the row would ground one; the answerer may not write it"
+        );
+
+        // Read, and still nothing to build a standing decision from — so no
+        // token makes this one stand.
+        let bare = unmatchable(account(1)).subject(None);
+        for authority in [true, false] {
+            assert_eq!(
+                generalisation_ahead(Some(&bare), authority),
+                GeneralisationProspect::NoneFromThisRow,
+                "a row that asks nothing grounds nothing under any token"
+            );
+        }
+
+        // And the row this build cannot read at all, which is the absence
+        // `subject_of` publishes.
+        assert_eq!(
+            generalisation_ahead(None, true),
+            GeneralisationProspect::NoneFromThisRow
+        );
+    }
+
     /// The one row that still generalises into nothing, unchanged by the field
     /// policy above: a matcher that asks nothing matches nothing.
     #[test]
@@ -10412,6 +10621,7 @@ mod tests {
             &one_party_three_times(main),
             &three_alike(),
             &held(vec![detail(main, "Main")]),
+            true,
         );
         assert_eq!(groups.len(), 1, "one decision is one group: {groups:?}");
         let group = &groups[0];
@@ -10473,7 +10683,7 @@ mod tests {
         let directory = held(vec![detail(main, "Main")]);
 
         let agreeing = vec![stored_row(1, &one), stored_row(2, &two)];
-        let groups = row_groups(&agreeing, &open, &directory);
+        let groups = row_groups(&agreeing, &open, &directory, true);
         assert_eq!(
             groups[0].common.description.as_deref(),
             Some(printed),
@@ -10487,7 +10697,7 @@ mod tests {
 
         two.description = Some("Something else the statement printed".to_owned());
         let differing = vec![stored_row(1, &one), stored_row(2, &two)];
-        let groups = row_groups(&differing, &open, &directory);
+        let groups = row_groups(&differing, &open, &directory, true);
         assert_eq!(
             groups[0].common.description, None,
             "a text one member does not carry is that member's and not the group's"
@@ -10505,14 +10715,15 @@ mod tests {
         let observations = vec![stored_row(1, &row(main, "Shop One", None))];
         let directory = held(vec![detail(main, "Main")]);
         assert!(
-            row_groups(&observations, &[open_about(1)], &directory).is_empty(),
+            row_groups(&observations, &[open_about(1)], &directory, true).is_empty(),
             "a question nothing else is alike to is published as itself"
         );
         assert!(
             row_groups(
                 &observations,
                 &[open_paired(1, Uuid::from_bytes([7; 16]), 2)],
-                &directory
+                &directory,
+                true
             )
             .is_empty(),
             "and a movement whose other leg an answer already settled is one \
@@ -10550,6 +10761,7 @@ mod tests {
             &observations,
             &open,
             &held(vec![detail(main, "Main"), detail(savings, "Savings")]),
+            true,
         );
         assert_eq!(groups.len(), 2, "{groups:?}");
         let decision = groups
@@ -10601,6 +10813,7 @@ mod tests {
             &one_party_three_times(main),
             &three_alike(),
             &held(vec![detail(main, "Main")]),
+            true,
         );
         let question = &groups[0].question;
         for internal in [
@@ -10651,7 +10864,12 @@ mod tests {
         two.currency = CurrencyCode::Usd;
         let observations = vec![stored_row(1, &one), stored_row(2, &two)];
         let open = vec![open_alike(1, vec![2]), open_alike(2, vec![1])];
-        let groups = row_groups(&observations, &open, &held(vec![detail(main, "Main")]));
+        let groups = row_groups(
+            &observations,
+            &open,
+            &held(vec![detail(main, "Main")]),
+            true,
+        );
         assert_eq!(groups[0].common.currency, None);
         assert_eq!(
             groups[0].amounts, None,
@@ -10676,7 +10894,7 @@ mod tests {
         known.institution = Some("Institution One".to_owned());
         let observations = one_party_three_times(main);
         let open = three_alike();
-        let groups = row_groups(&observations, &open, &held(vec![known]));
+        let groups = row_groups(&observations, &open, &held(vec![known]), true);
         let named = groups[0]
             .common
             .account
@@ -10686,7 +10904,7 @@ mod tests {
         assert_eq!(named.title, "Main");
         assert_eq!(named.institution.as_deref(), Some("Institution One"));
 
-        let stranger = row_groups(&observations, &open, &held(Vec::new()));
+        let stranger = row_groups(&observations, &open, &held(Vec::new()), true);
         assert_eq!(
             stranger[0].common.account, None,
             "an identifier this instance cannot put a title on is not something \
@@ -10733,7 +10951,13 @@ mod tests {
             "the word is still worth one condition"
         );
         assert!(
-            row_groups(&observations, &open, &held(vec![detail(main, "Main")])).is_empty(),
+            row_groups(
+                &observations,
+                &open,
+                &held(vec![detail(main, "Main")]),
+                true
+            )
+            .is_empty(),
             "and it is not a group: no one answer settles two parties"
         );
     }
@@ -10752,7 +10976,12 @@ mod tests {
         let mut open = three_alike();
         open.push(open_alike(4, vec![5]));
         open.push(open_alike(5, vec![4]));
-        let groups = row_groups(&observations, &open, &held(vec![detail(main, "Main")]));
+        let groups = row_groups(
+            &observations,
+            &open,
+            &held(vec![detail(main, "Main")]),
+            true,
+        );
         assert_eq!(groups.len(), 2, "{groups:?}");
         assert_eq!(groups[0].rows, vec![1, 2, 3]);
         assert_eq!(groups[1].rows, vec![4, 5]);
@@ -10769,7 +10998,15 @@ mod tests {
         let main = account(1);
         let observations = vec![stored_row(1, &row(main, "Shop One", None))];
         let open = vec![open_alike(1, vec![2]), open_alike(2, vec![1])];
-        assert!(row_groups(&observations, &open, &held(vec![detail(main, "Main")])).is_empty());
+        assert!(
+            row_groups(
+                &observations,
+                &open,
+                &held(vec![detail(main, "Main")]),
+                true
+            )
+            .is_empty()
+        );
     }
 }
 

@@ -7,7 +7,7 @@ use crate::ports::{
     ImportSessionState, ImportSessionSummaryView, Scope, Store, required_scope,
 };
 use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
-use crate::scenarios::import_session::{self, Generalisation};
+use crate::scenarios::import_session::{self, Generalisation, generalisation_ahead};
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::source_row::RowName;
@@ -2203,8 +2203,18 @@ pub struct ClassificationQuestion {
 /// from and a request that fails takes the recovery with it. The one content
 /// failure still left propagating is a stored import question this build cannot
 /// parse, and [`ClassificationQuestion`] says why it is where it is.
+///
+/// **`may_generalise` is the caller's authority, and it arrives as a `bool`**
+/// (`iaam-sh6m`). One item — the one for a held classification question — has to
+/// say what *this* caller's answer will keep, and that is not the same sentence
+/// for the owner and for an agent relaying his answers. The scope stops at the
+/// route, which holds a `Principal` and asks
+/// [`crate::scenarios::import_session::may_generalise`] of it; nothing in this
+/// module reads a token. The queue's business is to say what may be called, and
+/// who is asking is the caller's fact to supply.
 pub async fn frontier(
     owner: OwnerId,
+    may_generalise: bool,
     store: &dyn Store,
     rules: &dyn ClassificationRuleStore,
 ) -> Result<Vec<Action>, AppError> {
@@ -2277,6 +2287,7 @@ pub async fn frontier(
         retired: retirements.as_assessment(),
         sessions: &sessions,
         questions: &questions,
+        may_generalise,
         rules: &rules,
         wanted_accounts: &wanted_accounts,
     })
@@ -3251,6 +3262,17 @@ struct OwnerState<'a> {
     /// nothing says so, and once here.
     sessions: &'a [ImportSessionSummaryView],
     questions: &'a [ClassificationQuestion],
+    /// Whether the caller reading this queue may turn an answer into a standing
+    /// rule (`iaam-hnod`).
+    ///
+    /// **Supplied, never read here** (`iaam-sh6m`). The queue's business is to
+    /// say what may be called, and who is asking is the caller's own fact: the
+    /// route holds the principal and asks
+    /// [`crate::scenarios::import_session::may_generalise`] of it once. A token
+    /// read inside this module would be a second place deciding the same gate,
+    /// and the item for a classification question has to state what *this*
+    /// caller's answer will keep.
+    may_generalise: bool,
     /// The owner's standing classification rules, as the classifier reads them.
     ///
     /// Read for one purpose: to find out whether a proposal the queue would
@@ -3286,6 +3308,7 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
         retired,
         sessions,
         questions,
+        may_generalise,
         rules,
         wanted_accounts,
     } = *state;
@@ -3358,6 +3381,7 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
             question,
             names.get(question.asked.account())?,
             accounts,
+            may_generalise,
         ));
     }
     // After them, for the same reason and in the same order: an answered
@@ -3510,7 +3534,17 @@ fn answer_classification_question_action(
     question: &ClassificationQuestion,
     account: &AccountView,
     accounts: &[AccountView],
+    may_generalise: bool,
 ) -> Action {
+    // What the answer keeps beyond this session, and the one thing about this
+    // item that is not the same for every caller (`iaam-sh6m`). It used to be a
+    // clause of the sentence below, stating flatly that a rule is written — true
+    // of the owner answering about a row a matcher can be built from, and false
+    // of the other two cases, which the reader had no way to distinguish. The
+    // assessment's group proposal stated the opposite just as flatly. Both now
+    // read the same derivation, and it is stated in the scenario that owns
+    // `Generalisation` rather than a second time here.
+    let kept = generalisation_ahead(question.subject.as_ref(), may_generalise).reported();
     let mut preset = BTreeMap::new();
     // Both are path segments of the answering route, and both are known: the
     // question is the subject of this item and the session is on its row.
@@ -3541,8 +3575,7 @@ fn answer_classification_question_action(
         format!(
             "Account {} ({}) has row {} of import session {} held unclassified. {} Nothing else \
              is refused while it stands, but the row is in no journal and in no report, and the \
-             session holding it will not commit until it is answered. The answer is written as a \
-             rule, so a row matching it settles by itself next time.",
+             session holding it will not commit until it is answered. {kept}",
             account.id.inner(),
             account.title,
             question.view.row,
@@ -6175,6 +6208,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -6694,7 +6728,9 @@ mod tests {
     async fn an_empty_owner_isoffered_the_first_account_action() {
         let owner = OwnerId::new_random();
         let store = store();
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
 
         assert_eq!(actions.len(), 1);
         let action = &actions[0];
@@ -6747,6 +6783,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: wanted,
         })
@@ -7597,7 +7634,7 @@ mod tests {
             .await
             .expect("record");
 
-        let before: Vec<String> = frontier(owner, &store, &store)
+        let before: Vec<String> = frontier(owner, true, &store, &store)
             .await
             .expect("frontier")
             .iter()
@@ -7611,7 +7648,7 @@ mod tests {
             .await
             .expect("account");
 
-        let after: Vec<String> = frontier(owner, &store, &store)
+        let after: Vec<String> = frontier(owner, true, &store, &store)
             .await
             .expect("frontier")
             .iter()
@@ -7655,7 +7692,9 @@ mod tests {
             .await
             .expect("record");
 
-        let required = frontier(owner, &store, &store).await.expect("frontier");
+        let required = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let before = named_by_document(&required);
         assert!(matches!(
             before.category(),
@@ -7674,7 +7713,9 @@ mod tests {
             .await
             .expect("declined");
 
-        let settled = frontier(owner, &store, &store).await.expect("frontier");
+        let settled = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let after = named_by_document(&settled);
         assert_eq!(
             after.id(),
@@ -7693,7 +7734,9 @@ mod tests {
             .await
             .expect("withdrawn");
 
-        let asked_again = frontier(owner, &store, &store).await.expect("frontier");
+        let asked_again = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(matches!(
             named_by_document(&asked_again).category(),
             ActionCategory::RequiredForGoal(_)
@@ -7733,7 +7776,7 @@ mod tests {
             .expect("second reading");
 
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -7756,7 +7799,7 @@ mod tests {
         assert!(!accounts.is_empty());
         assert!(account_completion(&accounts));
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -7774,7 +7817,9 @@ mod tests {
             .await
             .expect("account");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::CreateFirstContour)
@@ -7837,7 +7882,7 @@ mod tests {
         assert!(!contours.is_empty());
         assert!(contour_completion(&contours));
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -7877,7 +7922,9 @@ mod tests {
                 .expect("contour");
         }
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(
             actions.iter().any(|action| action
                 .target()
@@ -7976,7 +8023,9 @@ mod tests {
             .await
             .expect("contour");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
@@ -8040,7 +8089,9 @@ mod tests {
             .await
             .expect("contour");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let action = actions
             .iter()
             .find(|action| action.kind() == ActionKind::AccountScopeUndecided)
@@ -8118,7 +8169,7 @@ mod tests {
             .await
             .expect("contour");
         assert!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -8132,7 +8183,9 @@ mod tests {
             .await
             .expect("account");
 
-        let reopened = frontier(owner, &store, &store).await.expect("frontier");
+        let reopened = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert_eq!(
             reopened
                 .iter()
@@ -8178,7 +8231,9 @@ mod tests {
             .await
             .expect("exclusion");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(
             actions
                 .iter()
@@ -8193,7 +8248,7 @@ mod tests {
             .await
             .expect("cleared");
         assert_eq!(
-            frontier(owner, &store, &store)
+            frontier(owner, true, &store, &store)
                 .await
                 .expect("frontier")
                 .iter()
@@ -8305,6 +8360,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8379,6 +8435,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8651,6 +8708,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8695,8 +8753,12 @@ mod tests {
             .await
             .expect("account");
 
-        let first = frontier(owner, &store, &store).await.expect("frontier");
-        let second = frontier(owner, &store, &store).await.expect("frontier");
+        let first = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
+        let second = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert_eq!(first, second);
         assert!(
             first
@@ -8728,6 +8790,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8885,6 +8948,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -8917,6 +8981,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -8948,6 +9013,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -9120,6 +9186,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -9152,6 +9219,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -9172,6 +9240,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: &[],
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -10535,6 +10604,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10577,6 +10647,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10613,6 +10684,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10657,6 +10729,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10687,6 +10760,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10740,6 +10814,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(&question),
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10772,6 +10847,7 @@ mod tests {
                 retired: RetirementAssessment::Assessed(&[]),
                 sessions: &[],
                 questions: std::slice::from_ref(&question),
+                may_generalise: true,
                 rules: &[],
                 wanted_accounts: &[],
             })
@@ -10806,6 +10882,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: &[first.clone(), second.clone()],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -10858,7 +10935,9 @@ mod tests {
             .await
             .expect("question recorded");
 
-        let actions = frontier(owner, &store, &store).await.expect("frontier");
+        let actions = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         let item = only_question_item(&actions);
         assert_eq!(
             item.id(),
@@ -10879,7 +10958,9 @@ mod tests {
             .await
             .expect("answered");
 
-        let after = frontier(owner, &store, &store).await.expect("frontier");
+        let after = frontier(owner, true, &store, &store)
+            .await
+            .expect("frontier");
         assert!(
             after
                 .iter()
@@ -10966,6 +11047,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions: &[],
             questions: std::slice::from_ref(question),
+            may_generalise: true,
             rules,
             wanted_accounts: &[],
         })
@@ -11191,6 +11273,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(retired),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -11253,6 +11336,7 @@ mod tests {
             retired: RetirementAssessment::Assessed(&[]),
             sessions,
             questions,
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -11352,6 +11436,7 @@ mod tests {
             retired: RetirementAssessment::NotAssessed("event A references non-existent B"),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })
@@ -11523,6 +11608,7 @@ mod tests {
             ]),
             sessions: &[],
             questions: &[],
+            may_generalise: true,
             rules: &[],
             wanted_accounts: &[],
         })

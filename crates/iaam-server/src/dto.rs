@@ -9339,6 +9339,199 @@ fn format_source_time(time: time::Time) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// An operation's history (iaam-rzh0)
+// ---------------------------------------------------------------------------
+
+/// One operation's life: what it was when it arrived, and every act since.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OperationHistoryDto {
+    /// The acts, **oldest first**, because a history is read forwards: he wants
+    /// to see what the operation was before he sees what it became.
+    ///
+    /// The whole of it, always. There is no pagination here and no page size to
+    /// pass, on purpose: the length of this list is the number of times the
+    /// owner changed his mind about one row, and a page boundary falling in the
+    /// middle of a history would hide the very thing the history exists to show.
+    pub steps: Vec<OperationHistoryStepDto>,
+    /// The fact that counts now.
+    ///
+    /// Absent where the operation ends in a retraction, because nothing stands
+    /// after one. It is the identifier of the last step's `state`, published
+    /// beside the steps so that a caller about to act on the operation —
+    /// correcting it once more — need not work out which step that is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<Uuid>,
+}
+
+/// One act the owner took, with the state it left behind.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct OperationHistoryStepDto {
+    /// Which of the three things happened.
+    pub act: HistoryActDto,
+    /// When the act was **recorded by this instance**, RFC 3339.
+    ///
+    /// Not when the operation happened, and never an effective date. A
+    /// correction written in March to a fact effective in January is a March act
+    /// about a January fact, and a reader that confused the two would date the
+    /// owner's change of mind to the day of the operation he changed his mind
+    /// about. The effective date is on `state`, where it belongs.
+    ///
+    /// One act can be two facts, each carrying its own stamp; the earlier of the
+    /// two is published, because that is when the act reached the journal and a
+    /// caller is free to send the two halves in either order.
+    pub at: String,
+    /// The fact as it stands after this act.
+    ///
+    /// Absent after a retraction, because nothing stands after one. It is the
+    /// same view `GET /v1/journal/events` returns, so the two routes can never
+    /// describe one fact differently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<JournalEventReadDto>,
+    /// Which aspects of the fact this act made different from the previous
+    /// state.
+    ///
+    /// Empty on an arrival, which changed nothing because there was nothing
+    /// before it, and after a retraction, which left no state to compare.
+    ///
+    /// It **names** where the difference is and is deliberately not a rendered
+    /// before-and-after: both states are published here in full, so rendering
+    /// the difference as well would be a second answer to the same question, and
+    /// the two would come to disagree in front of the reader.
+    pub changed: Vec<HistoryChangedAspectDto>,
+    /// The reversal this act wrote, where it wrote one.
+    ///
+    /// Published so that every entry of the history is addressable by name: a
+    /// correction of a correction can then be asked about on its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reversal: Option<Uuid>,
+    /// The replacement this act wrote, where it wrote one.
+    ///
+    /// Absent on an arrival and on a retraction, and that absence is the whole
+    /// difference between a retraction and a correction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<Uuid>,
+}
+
+/// One thing the owner did to an operation, as opposed to one fact the journal
+/// holds.
+///
+/// A correction is two facts — a reversal of the target and a replacement of it
+/// — and publishing them raw would show two entries for one thing he did and
+/// leave the reader to work out that they are one act. The pairing is done once,
+/// here, and there are three words for it and no more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryActDto {
+    /// The fact entered the journal. The first step of every history, and the
+    /// only step of most of them.
+    Arrived,
+    /// A reversal and a replacement of the same target: the fact stopped
+    /// counting and another took its place. `state` is the replacement.
+    Corrected,
+    /// A reversal with no replacement: the fact stopped counting and nothing
+    /// took its place, so there is no `state` after it.
+    ///
+    /// A whole import taken back writes exactly the reversal one corrected row
+    /// does, and this is the same word for both: what you are looking at is one
+    /// operation, and «this was taken back» is the same fact about it either
+    /// way. Which act it belonged to is read off the state before the
+    /// retraction, which names the import the fact arrived in.
+    Retracted,
+}
+
+/// Which aspect of the fact an act made different.
+///
+/// A closed vocabulary, computed from the two published states.
+///
+/// **A category is not among them, and that is a real limit rather than an
+/// omission.** A category is not recorded on the fact at all — it is decided by
+/// the owner's category rules when a report is computed — so «I filed this under
+/// the wrong category» is not a correction of an operation, and this history
+/// will not show it. An empty `changed` that quietly meant «we do not record
+/// that» would report that nothing had happened.
+///
+/// Provenance is not among them either, for the opposite reason: a replacement
+/// is a new fact and necessarily carries its own source and its own idempotency
+/// key, so calling those changed would mark every correction as having changed
+/// them and would say nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryChangedAspectDto {
+    /// The event family — `cash_in`, `trade`, `income` and so on.
+    Kind,
+    /// What moved: the money and the quantity the legs carry, and the instrument
+    /// they name.
+    Amount,
+    /// Where it moved: the account the fact is filed under, and the account and
+    /// custody each leg posts to.
+    Account,
+    /// When it happened: the date the journal orders the fact by, the time of
+    /// day the source stated, and the semantic dates the fact carries.
+    Dates,
+    /// Who the far side was, as the source printed it on the row.
+    Counterparty,
+    /// How sure the fact is.
+    Confidence,
+}
+
+impl OperationHistoryDto {
+    #[must_use]
+    pub fn from_domain(history: &iaam_app::scenarios::journal::OperationHistory) -> Self {
+        Self {
+            steps: history
+                .steps
+                .iter()
+                .map(OperationHistoryStepDto::from_domain)
+                .collect(),
+            current: history.current.map(|event| event.inner()),
+        }
+    }
+}
+
+impl OperationHistoryStepDto {
+    #[must_use]
+    pub fn from_domain(step: &iaam_app::scenarios::journal::HistoryStep) -> Self {
+        Self {
+            act: HistoryActDto::from_domain(step.act),
+            at: step.at.clone(),
+            state: step.state.as_ref().map(JournalEventReadDto::from_domain),
+            changed: step
+                .changed
+                .iter()
+                .copied()
+                .map(HistoryChangedAspectDto::from_domain)
+                .collect(),
+            reversal: step.reversal.map(|event| event.inner()),
+            replacement: step.replacement.map(|event| event.inner()),
+        }
+    }
+}
+
+impl HistoryActDto {
+    const fn from_domain(act: iaam_app::scenarios::journal::HistoryAct) -> Self {
+        match act {
+            iaam_app::scenarios::journal::HistoryAct::Arrived => Self::Arrived,
+            iaam_app::scenarios::journal::HistoryAct::Corrected => Self::Corrected,
+            iaam_app::scenarios::journal::HistoryAct::Retracted => Self::Retracted,
+        }
+    }
+}
+
+impl HistoryChangedAspectDto {
+    const fn from_domain(aspect: iaam_app::scenarios::journal::ChangedAspect) -> Self {
+        use iaam_app::scenarios::journal::ChangedAspect;
+        match aspect {
+            ChangedAspect::Kind => Self::Kind,
+            ChangedAspect::Amount => Self::Amount,
+            ChangedAspect::Account => Self::Account,
+            ChangedAspect::Dates => Self::Dates,
+            ChangedAspect::Counterparty => Self::Counterparty,
+            ChangedAspect::Confidence => Self::Confidence,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Import sessions (iaam-3kru, iaam-6qsa)
 // ---------------------------------------------------------------------------
 

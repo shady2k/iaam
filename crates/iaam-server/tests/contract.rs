@@ -28259,3 +28259,313 @@ async fn decision_group_consequence(harness: &Harness, token: &str, session: &st
         .expect("a decision group with a sentence")
         .to_owned()
 }
+
+/// The whole owner's case, from the question to the history (`iaam-rzh0`).
+///
+/// A session holds two alike rows raising the same classification question. He
+/// answers once, with a reach over the session, and the answer mints a rule that
+/// settles both rows. The session commits. Then one of the two turns out wrong
+/// and he corrects it, and the correction names the standing rule his own answer
+/// minted. Finally he asks that row what happened to it, and gets its life back:
+/// it arrived, filed by that rule; it was corrected, on such a date, and these
+/// aspects changed; and this is what it is now.
+///
+/// Every account, amount, date and key here is invented (CLAUDE.md).
+#[tokio::test]
+async fn an_operation_reads_back_as_the_acts_the_owner_took_on_it() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    // 1. A session with two alike rows, which are the same decision asked twice.
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [
+                    unresolved_row(account, "rzh0-one"),
+                    unresolved_row_dated(account, "rzh0-two", "2025-03-19", "2500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    // 2. One answer, reaching every like row of the session, and it mints a rule.
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({
+                "answer": "sent_to_own_account",
+                "account": savings,
+                "settles": "every_like_row_in_this_session",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    let rule = answered["generalisation"]["rule"]
+        .as_str()
+        .expect("the rule his answer wrote")
+        .to_owned();
+
+    // 3. The session commits, and both rows reach the journal under that rule.
+    let committed = commit_session(&harness, &session).await;
+    assert_eq!(
+        committed["rows"].as_array().map(Vec::len),
+        Some(2),
+        "{committed}"
+    );
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?idempotency_key=rzh0-one",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let arrived = page["rows"][0]["event"].as_str().expect("event").to_owned();
+    assert_eq!(
+        page["rows"][0]["rule_settlement"]["settled_by"], "answered_minting_rule",
+        "the row was filed by the rule his own answer minted: {page}"
+    );
+
+    // 4. One row of the group is wrong. He takes it back and re-states it, and
+    //    the correction names the rule that filed it as still standing.
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": arrived }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(
+        retracted[0]["standing_rule"]["rule"],
+        json!(rule),
+        "the correction names the rule his answer minted: {retracted}"
+    );
+    assert_eq!(
+        retracted[0]["standing_rule"]["still_filed"], 1,
+        "the sibling row it settled, which this correction leaves alone: {retracted}"
+    );
+
+    let (status, restated) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{
+                    "relation": "replacement",
+                    "target": arrived,
+                    "operation": {
+                        "account": account,
+                        "type": "withdrawal",
+                        "amount": "3100.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-03-18" },
+                        "idempotency_key": "rzh0-one-corrected",
+                    },
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{restated}");
+    let replacement = restated[0]["event_id"]
+        .as_str()
+        .expect("the fact that took its place")
+        .to_owned();
+
+    // 5. He asks that row what happened to it.
+    let (status, history) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events/{arrived}/history"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let steps = history["steps"].as_array().expect("steps");
+    assert_eq!(
+        steps.iter().map(|step| &step["act"]).collect::<Vec<_>>(),
+        vec![&json!("arrived"), &json!("corrected")],
+        "it arrived and then he corrected it, oldest first: {history}"
+    );
+
+    // It arrived, filed by that rule.
+    assert_eq!(steps[0]["state"]["event"], json!(arrived), "{history}");
+    assert_eq!(
+        steps[0]["state"]["rule_settlement"]["rule"],
+        json!(rule),
+        "the state he is shown says which rule filed it: {history}"
+    );
+    assert_eq!(
+        steps[0]["changed"],
+        json!([]),
+        "an arrival changed nothing, because there was nothing before it: {history}"
+    );
+
+    // Then it was corrected, on such a date, and these aspects changed.
+    let at = steps[1]["at"].as_str().expect("a recorded moment");
+    assert!(
+        at.contains('T') && at.len() >= 20,
+        "every act says when this instance recorded it: {at}"
+    );
+    assert!(
+        !at.starts_with("2025-03-18"),
+        "the recorded moment is never the effective date of the operation: {at}"
+    );
+    let changed: BTreeSet<&str> = steps[1]["changed"]
+        .as_array()
+        .expect("aspects")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        changed.contains("amount"),
+        "he re-stated the sum, so the sum is among the aspects: {history}"
+    );
+    assert!(
+        changed.is_subset(&BTreeSet::from([
+            "kind",
+            "amount",
+            "account",
+            "dates",
+            "counterparty",
+            "confidence",
+        ])),
+        "the vocabulary is closed, and a category is not in it: {history}"
+    );
+    assert!(
+        steps[1]["reversal"].is_string() && steps[1]["replacement"] == json!(replacement),
+        "one act, and both facts it wrote are addressable by name: {history}"
+    );
+
+    // And this is what it is now.
+    assert_eq!(steps[1]["state"]["event"], json!(replacement), "{history}");
+    assert_eq!(
+        history["current"],
+        json!(replacement),
+        "the fact that counts now, published beside the steps: {history}"
+    );
+
+    // Every identifier of the operation answers with the same history: which
+    // handle he happens to hold must not decide which question he may ask.
+    let (status, entered) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events/{replacement}/history"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{entered}");
+    assert_eq!(entered, history, "{entered}");
+}
+
+/// An event identifier is a UUID, and a UUID that addresses no event of his is a
+/// missing resource; one that is not a UUID at all is a request that could not
+/// be read. The two are different failures and the caller acts on them
+/// differently, so they are different codes.
+#[tokio::test]
+async fn a_history_of_nothing_is_not_found_and_an_unreadable_identifier_is_refused() {
+    let harness = harness();
+
+    let stranger = Uuid::new_v4();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events/{stranger}/history"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "not_found", "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events/not-an-identifier/history",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+}
+
+/// The route and everything it publishes reach the generated document, because
+/// a schema nobody registered is a contract the caller cannot read.
+#[tokio::test]
+async fn the_history_route_and_its_schemas_are_published() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let route = &spec["paths"]["/v1/journal/events/{event}/history"]["get"];
+    assert!(route.is_object(), "the route is missing from the document");
+    for code in ["200", "404", "422"] {
+        assert!(
+            route["responses"][code].is_object(),
+            "response {code} is missing: {route}"
+        );
+    }
+    let schemas = &spec["components"]["schemas"];
+    for schema in [
+        "OperationHistoryDto",
+        "OperationHistoryStepDto",
+        "HistoryActDto",
+        "HistoryChangedAspectDto",
+    ] {
+        assert!(
+            schemas[schema].is_object(),
+            "schema {schema} is missing from the document"
+        );
+    }
+
+    // Nothing on a step is flattened: a flattened field renders as `allOf` and
+    // publishes no description at all, so every field is named here and carries
+    // its own sentence.
+    let step = &schemas["OperationHistoryStepDto"];
+    assert_eq!(step["allOf"], Value::Null, "{step}");
+    for field in ["act", "at", "state", "changed", "reversal", "replacement"] {
+        assert!(
+            step["properties"][field].is_object(),
+            "a step publishes {field} under its own name: {step}"
+        );
+    }
+    for described in ["at", "changed"] {
+        assert!(
+            step["properties"][described]["description"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{described} is read by a caller and must say what it is: {step}"
+        );
+    }
+}

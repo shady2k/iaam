@@ -20100,6 +20100,193 @@ async fn the_session_list_says_what_each_session_holds() {
     assert_eq!(contents["unanswered"], listed["unanswered"], "{contents}");
 }
 
+/// A document covering two of the owner's own accounts, printing one movement
+/// between them.
+///
+/// A departure on one account and the arrival on the other: same day, same
+/// magnitude, opposite signs, neither of them saying who the far side is. Every
+/// value is invented for this file, and the session declares no account because
+/// the case is a single document that covers two of them.
+///
+/// Returns the session and the account the arrival is on, which is the far side
+/// an answer that accepts the pair has to name.
+async fn a_session_with_one_mirrored_movement(harness: &Harness) -> (String, Uuid) {
+    let main = another_account(harness, "Main").await;
+    let savings = another_account(harness, "Savings").await;
+
+    let (status, session) = call(
+        &harness.router,
+        post("/v1/import-sessions", &harness.owner_token, &json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    unresolved_row_dated(main, "mirrored-departure", "2025-04-10", "-2500.00"),
+                    unresolved_row_dated(savings, "mirrored-arrival", "2025-04-10", "2500.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    for row in rows.as_array().expect("rows") {
+        assert_eq!(
+            row["state"], "needs_classification",
+            "the fixture needs both legs waiting on the owner: {rows}"
+        );
+    }
+    (id, savings)
+}
+
+/// One movement a document printed twice is one decision (iaam-lkvb).
+///
+/// Two items grade it as two pieces of work and leave open the act that records
+/// the movement twice: an agent working the queue answers both legs separately,
+/// and the journal then holds one movement twice or one leg as an orphan. The
+/// assessment has paired the two rows and raised one question about the pair
+/// since decision 0031; the queue never consulted the pairing at all.
+#[tokio::test]
+async fn a_movement_printed_on_both_of_its_accounts_is_one_item() {
+    let harness = harness();
+    let (session, _) = a_session_with_one_mirrored_movement(&harness).await;
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "the two legs of one movement are published as {} items: {items:#?}",
+        items.len()
+    );
+    let item = &items[0];
+    assert_eq!(item["kind"], "answer_classification_question", "{item}");
+    assert_eq!(
+        item["target"]["request"]["preset"]["session"],
+        json!(session),
+        "{item}"
+    );
+
+    // Both rows are named the way a row is named to the owner: the day the
+    // source dated it and the amount it printed. A row number alone tells
+    // nobody which line this is — several lines of one month can be identical
+    // in every other respect.
+    let reason = item["reason"].as_str().expect("a reason");
+    for (amount, title) in [("-2500.00", "Main"), ("2500.00", "Savings")] {
+        assert!(
+            reason.contains(&format!("{amount} RUB on «{title}», dated 2025-04-10")),
+            "each leg is named by the day its source dated it and the amount it \
+             printed: {reason}"
+        );
+    }
+    // And by the number the answering call takes, so the reader can act on
+    // either — the number beside the printed line, never instead of it.
+    assert!(reason.contains("row 2"), "{reason}");
+
+    // And the identity does not move under a caller that reads the queue twice.
+    let again = open_question_items(&harness).await;
+    assert_eq!(again.len(), 1, "{again:#?}");
+    assert_eq!(again[0]["id"], item["id"], "{again:#?}");
+}
+
+/// A pair is a hypothesis, and refusing it stays sayable (iaam-lkvb).
+///
+/// Two unrelated payments of one amount on one day have exactly this shape, so
+/// an item that could not be refused would be worse than two items. The refusal
+/// is any answer that does not name the other row's account, and the vocabulary
+/// already publishes those words.
+#[tokio::test]
+async fn one_item_for_a_pair_can_still_be_answered_they_are_two_different_things() {
+    let harness = harness();
+    let _ = a_session_with_one_mirrored_movement(&harness).await;
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let answer = items[0]["target"]["request"]["missing"]
+        .as_array()
+        .expect("missing fields")
+        .iter()
+        .find(|missing| missing["pointer"] == "/answer")
+        .expect("the answer field")
+        .clone();
+    let shapes: Vec<&str> = answer["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .iter()
+        .map(|alternative| alternative["value"].as_str().expect("a value"))
+        .collect();
+    assert!(
+        shapes.contains(&"paid") && shapes.contains(&"received"),
+        "«no, these are two different things» must remain sayable: {shapes:?}"
+    );
+
+    // And saying it leaves two rows with two questions, which is the state the
+    // pair was only ever a hypothesis about.
+    let session = items[0]["target"]["request"]["preset"]["session"]
+        .as_str()
+        .expect("the session is preset");
+    let question = items[0]["target"]["request"]["preset"]["question"]
+        .as_str()
+        .expect("the question is preset");
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let left = open_question_items(&harness).await;
+    assert_eq!(
+        left.len(),
+        1,
+        "the other row is still a row with a question of its own: {left:#?}"
+    );
+}
+
+/// Answering the pair settles both legs, and the queue lists neither again.
+#[tokio::test]
+async fn answering_one_item_for_a_pair_settles_both_of_its_legs() {
+    let harness = harness();
+    let (_, savings) = a_session_with_one_mirrored_movement(&harness).await;
+
+    let items = open_question_items(&harness).await;
+    assert_eq!(items.len(), 1, "{items:#?}");
+    let session = items[0]["target"]["request"]["preset"]["session"]
+        .as_str()
+        .expect("the session is preset")
+        .to_owned();
+    let question = items[0]["target"]["request"]["preset"]["question"]
+        .as_str()
+        .expect("the question is preset")
+        .to_owned();
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    assert!(
+        open_question_items(&harness).await.is_empty(),
+        "one answer settles the movement, so neither leg is still asked about"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The assessment, and the revision commit checks (iaam-k1xa)
 // ---------------------------------------------------------------------------

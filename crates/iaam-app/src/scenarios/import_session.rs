@@ -6160,6 +6160,278 @@ pub struct MirroredPair {
     pub row: u32,
 }
 
+/// One movement a document printed on both of its accounts, with both of its
+/// rows named (`iaam-lkvb`).
+///
+/// **[`MirroredPair`] read from outside one question, and that is the whole
+/// difference.** A caller walking a session's open questions one at a time holds
+/// the row it is on and asks what the other one is; a caller that publishes
+/// **one** piece of work for the two holds neither yet and has to name both — so
+/// it needs the two legs together, not the relation from one side.
+///
+/// Named by what each source line printed, because that is how a row is named to
+/// the owner. A row number is enough for a call and is not enough for a person:
+/// several lines of one month can be identical in everything the number does not
+/// say, and «row 4» tells nobody which line of the statement in front of him
+/// this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirroredMovement {
+    /// The identifier both rows carry, and no other row of the session does.
+    ///
+    /// [`pair_identity`]'s, so it is the same identifier the assessment
+    /// publishes on the two questions and is a function of the session and the
+    /// two rows alone — a caller that deduplicates by it sees nothing move
+    /// between two readings of an unchanged session.
+    pub id: Uuid,
+    /// The row on the account the money left.
+    ///
+    /// The one of the two a caller acts on, wherever it must pick one: a
+    /// transfer is recorded from its sending side everywhere else in this
+    /// system, and `mirrored_rows` keeps the departure's fact for the same
+    /// reason.
+    pub departure: MovementLeg,
+    /// The row on the account the money reached.
+    pub arrival: MovementLeg,
+}
+
+impl MirroredMovement {
+    /// This row's own leg.
+    ///
+    /// Beside [`Self::far_of`] rather than left to the caller to pick by
+    /// comparing row numbers: a caller that publishes the two together names
+    /// both, and the two lookups are one question — which of the two is this —
+    /// answered once here.
+    #[must_use]
+    pub const fn leg_of(&self, row: u32) -> Option<MovementLeg> {
+        if self.departure.row == row {
+            Some(self.departure)
+        } else if self.arrival.row == row {
+            Some(self.arrival)
+        } else {
+            None
+        }
+    }
+
+    /// The leg that is not this row's.
+    ///
+    /// `None` for a row this movement does not hold, which is the same answer
+    /// [`MirroredRows::pair_of`] gives such a row.
+    #[must_use]
+    pub const fn far_of(&self, row: u32) -> Option<MovementLeg> {
+        if self.departure.row == row {
+            Some(self.arrival)
+        } else if self.arrival.row == row {
+            Some(self.departure)
+        } else {
+            None
+        }
+    }
+}
+
+/// One leg of such a movement, as the source printed the row.
+///
+/// Nothing here is normalised, for [`PrintedRow`]'s reason: every field says
+/// what the document said, so that the owner can match it against the line in
+/// front of him.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MovementLeg {
+    /// The row's position in its session, which is what the answering call
+    /// takes.
+    pub row: u32,
+    /// The account whose statement printed it.
+    pub account: AccountId,
+    /// The day the source dated the row.
+    ///
+    /// Not an `Option`, unlike [`PrintedRow::date`]: a row the source left
+    /// undated is not a side of anything — [`mirrored`] pairs on an exact day —
+    /// so a leg with no day cannot exist.
+    pub date: time::Date,
+    /// The amount **with the sign the source printed**, for
+    /// [`PrintedRow::amount_minor`]'s reason.
+    pub amount_minor: i64,
+    pub currency: CurrencyCode,
+}
+
+/// What one row of a session is to a movement its document printed twice.
+///
+/// Two states and not one, because a caller publishing work about the row owes a
+/// different sentence for each: two rows that are one question, and a row that
+/// is no longer a question at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneMovement {
+    /// This row and one other are the two legs, and both are still the owner's
+    /// to answer. One answer settles both, so they are one decision and belong
+    /// in one piece of work.
+    Waiting(MirroredMovement),
+    /// The other leg's answer already records the movement, so this row has
+    /// nothing of its own left to record.
+    ///
+    /// [`NoFactReason::SecondLegOfOneMovement`] as a caller that has not read
+    /// the whole session can see it, and the row it names is the row that
+    /// records the movement — which is what makes it a statement rather than a
+    /// disappearance.
+    Recorded { by: u32 },
+}
+
+/// What a session's questions are to the movements its document printed twice
+/// (`iaam-lkvb`).
+///
+/// **The queue's reader for the pairing, and not a second derivation of it.**
+/// The action queue publishes an item per open question and never consulted the
+/// pairing at all, so one movement a document printed twice reached the owner as
+/// two independent items — and an agent working them answered both legs
+/// separately, which records the movement twice or leaves one leg an orphan. The
+/// fix could have been a pairing written beside the queue; two derivations of
+/// one fact on two surfaces is the defect one level up, so this goes through
+/// [`mirrored`], [`unanswered_side`] and [`pair_identity`] — the three the
+/// assessment's own pass is built from — and splits the result the three ways
+/// [`mirrored_rows`] splits it.
+///
+/// **It sees less than [`mirrored_rows`] and says so.** That pass runs over rows
+/// already read against the owner's directory and his standing rules, so a leg
+/// his directory recognised is a named side of it. This has the session's
+/// observations and its stored questions and nothing else — which is exactly
+/// what [`crate::actions`] holds, and it holds them without loading a session —
+/// so the sides it can build are the two a question states on its own: a row
+/// still waiting on him, which names no far side, and a row he answered as a
+/// movement to or from one of his own accounts, which names the far side in the
+/// answer itself.
+///
+/// The cost of the difference is one way only. A pair this finds is a pair the
+/// deep pass finds, because both ask [`mirrored`] the same question about the
+/// same two rows; a pair only the deep pass finds leaves the queue publishing
+/// the two rows as it always has, which is where this started rather than
+/// something it breaks.
+#[must_use]
+pub fn mirrored_movements_of(
+    session: ImportSessionId,
+    observations: &[ImportObservationView],
+    questions: &[ImportQuestionView],
+) -> BTreeMap<u32, OneMovement> {
+    let rows: BTreeMap<u32, ObservedRow> = questions
+        .iter()
+        .filter_map(|question| {
+            observed_row(observations, question.row)
+                .ok()
+                .map(|row| (question.row, row))
+        })
+        .collect();
+    let mut open: BTreeSet<u32> = BTreeSet::new();
+    let mut sides: Vec<MirrorSide> = Vec::new();
+    for question in questions {
+        let Some(observed) = rows.get(&question.row) else {
+            continue;
+        };
+        if question.is_open() {
+            open.insert(question.row);
+            sides.extend(unanswered_side(question.row, observed));
+        } else {
+            sides.extend(answered_side(question.row, observed, question));
+        }
+    }
+    let mut movements = BTreeMap::new();
+    for mirror in mirrored(&sides) {
+        // The three outcomes [`mirrored_rows`] decides, decided the same way and
+        // on the same question: how many of the two sides are already answered.
+        // A pair with one side answered is one movement already recorded, and
+        // the other side has nothing of its own to add.
+        match (
+            open.contains(&mirror.outgoing),
+            open.contains(&mirror.incoming),
+        ) {
+            (true, true) => {
+                let (Some(departure), Some(arrival)) = (
+                    rows.get(&mirror.outgoing)
+                        .and_then(|observed| movement_leg(mirror.outgoing, observed)),
+                    rows.get(&mirror.incoming)
+                        .and_then(|observed| movement_leg(mirror.incoming, observed)),
+                ) else {
+                    continue;
+                };
+                let movement = OneMovement::Waiting(MirroredMovement {
+                    id: pair_identity(session, mirror.outgoing, mirror.incoming),
+                    departure,
+                    arrival,
+                });
+                movements.insert(mirror.outgoing, movement);
+                movements.insert(mirror.incoming, movement);
+            }
+            (true, false) => {
+                movements.insert(
+                    mirror.outgoing,
+                    OneMovement::Recorded {
+                        by: mirror.incoming,
+                    },
+                );
+            }
+            (false, true) => {
+                movements.insert(
+                    mirror.incoming,
+                    OneMovement::Recorded {
+                        by: mirror.outgoing,
+                    },
+                );
+            }
+            // Both answered. Each states the movement in the owner's own words
+            // and the deep pass decides which of the two records it; nothing
+            // here is published about either, because neither is work.
+            (false, false) => {}
+        }
+    }
+    movements
+}
+
+/// A row the owner has answered as a movement between two of his own accounts,
+/// as the mirror test reads it.
+///
+/// **The far side comes from his answer, which is the only named far side a
+/// caller without the session's reading has.** [`mirror_side`]'s first branch
+/// reads it off the `CashTransfer` such an answer resolves into, and the two
+/// cannot disagree: the transfer's far account *is* the account the answer
+/// named — `Answer::SentToOwnAccount`'s and `ReceivedFromOwnAccount`'s whole
+/// content.
+///
+/// Every other answer yields no side, which is [`mirror_side`]'s rule word for
+/// word: money that left the perimeter, income, a fee or a refund is a row his
+/// answer already said what it was, and a shape it happens to share with another
+/// row does not overrule it.
+fn answered_side(
+    row: u32,
+    observed: &ObservedRow,
+    question: &ImportQuestionView,
+) -> Option<MirrorSide> {
+    let answer: Answer = serde_json::from_str(question.answer.as_deref()?).ok()?;
+    let (direction, far_side) = match answer {
+        Answer::SentToOwnAccount { to } => (Movement::Out, to),
+        Answer::ReceivedFromOwnAccount { from } => (Movement::In, from),
+        Answer::Paid
+        | Answer::Received
+        | Answer::Fee { .. }
+        | Answer::Income { .. }
+        | Answer::Refund => return None,
+    };
+    Some(MirrorSide {
+        row,
+        account: observed.account,
+        direction,
+        amount_minor: observed.amount_minor.checked_abs().filter(|it| *it > 0)?,
+        currency: observed.currency,
+        date: observed.dates.effective_date()?,
+        far_side: Some(far_side),
+    })
+}
+
+/// One leg named by what its line printed.
+fn movement_leg(row: u32, observed: &ObservedRow) -> Option<MovementLeg> {
+    Some(MovementLeg {
+        row,
+        account: observed.account,
+        date: observed.dates.effective_date()?,
+        amount_minor: observed.amount_minor,
+        currency: observed.currency,
+    })
+}
+
 impl MirroredRows {
     /// The pair this row's question belongs to, if it belongs to one.
     fn pair_of(&self, row: u32) -> Option<MirroredPair> {
@@ -6449,26 +6721,46 @@ fn mirror_side(read: &ReadRow, questioned: bool) -> Option<MirrorSide> {
             let Intake::Observed { row, .. } = read.intake.as_ref()? else {
                 return None;
             };
-            let direction = match row.movement() {
-                Some(movement) => movement,
-                None => match row.amount_minor.signum() {
-                    1 => Movement::In,
-                    -1 => Movement::Out,
-                    _ => return None,
-                },
-            };
-            Some(MirrorSide {
-                row: read.row,
-                account,
-                direction,
-                amount_minor: row.amount_minor.checked_abs().filter(|it| *it > 0)?,
-                currency: row.currency,
-                date,
-                far_side: None,
-            })
+            // The account and the day above are `ReadRow`'s readings of this
+            // same intake — `Intake::account` is `row.account` and
+            // `ReadRow::stated_day` is `row.dates.effective_date()` — so nothing
+            // is lost by letting the shared function read them off the row.
+            unanswered_side(read.row, row)
         }
         None => None,
     }
+}
+
+/// One row still waiting on the owner, as the mirror test reads it.
+///
+/// **Shared with [`mirrored_movements_of`] rather than spelled twice**
+/// (`iaam-lkvb`). The action queue pairs the same rows from the observations
+/// alone, and the one thing that must not differ between the two readings is
+/// what a row still waiting on him *is* — the sign read as a direction included.
+///
+/// The direction comes from the source's own direction word, and from the **sign
+/// it printed** where it used no word, which is the one place in this system
+/// that reads the sign as evidence. See [`mirror_side`] for why it is allowed
+/// to: a sign read wrongly can only fail to pair two rows or offer a pair the
+/// owner then refuses.
+fn unanswered_side(row: u32, observed: &ObservedRow) -> Option<MirrorSide> {
+    let direction = match observed.movement() {
+        Some(movement) => movement,
+        None => match observed.amount_minor.signum() {
+            1 => Movement::In,
+            -1 => Movement::Out,
+            _ => return None,
+        },
+    };
+    Some(MirrorSide {
+        row,
+        account: observed.account,
+        direction,
+        amount_minor: observed.amount_minor.checked_abs().filter(|it| *it > 0)?,
+        currency: observed.currency,
+        date: observed.dates.effective_date()?,
+        far_side: None,
+    })
 }
 
 /// The questions still waiting, each carrying what may be said to it and which
@@ -8842,6 +9134,101 @@ mod tests {
             open_questions(&no_accounts(), &observations, &questions, &settled).len(),
             1,
             "and the arrival still has to be answered on its own"
+        );
+    }
+
+    /// The same pair, read by a caller that has not loaded the session.
+    ///
+    /// This is what the action queue holds: the session's observations and its
+    /// stored questions, and no reading of the owner's directory or his rules.
+    /// The two legs must come out as one decision there too, or the queue
+    /// publishes the two rows as two items and an agent answers both — which is
+    /// the movement recorded twice that decision 0031 exists to prevent.
+    #[test]
+    fn the_two_legs_are_one_decision_to_a_caller_holding_only_the_questions() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
+        let questions = vec![
+            stored_question_about(1, &Question::IsOutflowAFee { account: main }),
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+
+        let movements = mirrored_movements_of(session, &observations, &questions);
+        let OneMovement::Waiting(pair) = movements[&1] else {
+            panic!("the departure is one leg of a movement still waiting: {movements:?}")
+        };
+        assert_eq!(movements[&2], OneMovement::Waiting(pair));
+        assert_eq!(
+            pair.id,
+            pair_identity(session, 1, 2),
+            "and under the identifier the assessment publishes, so the two \
+             surfaces name one decision"
+        );
+        assert_eq!((pair.departure.row, pair.arrival.row), (1, 2));
+        assert_eq!(
+            (pair.departure.amount_minor, pair.arrival.amount_minor),
+            (departure.amount_minor, arrival.amount_minor),
+            "each leg carries the amount its own line printed, sign included"
+        );
+    }
+
+    /// One leg answered leaves the other with nothing of its own to record.
+    ///
+    /// The far side comes out of the answer rather than out of a reading: it is
+    /// the account he named, and it is what makes the queue stop asking about
+    /// the second row instead of asking him to record the movement again.
+    #[test]
+    fn an_answered_leg_leaves_the_other_recording_nothing_of_its_own() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
+        let mut answered = stored_question_about(1, &Question::IsOutflowAFee { account: main });
+        answered.answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        answered.answer = Some(
+            serde_json::to_string(&Answer::SentToOwnAccount { to: savings }).expect("an answer"),
+        );
+        let questions = vec![
+            answered,
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+
+        let movements = mirrored_movements_of(session, &observations, &questions);
+        assert_eq!(movements.get(&2), Some(&OneMovement::Recorded { by: 1 }));
+        assert!(
+            !movements.contains_key(&1),
+            "the row he answered records the movement and is not published as \
+             half of anything: {movements:?}"
+        );
+    }
+
+    /// «No, these are two different things» leaves two rows and two questions.
+    ///
+    /// The refusal `iaam_ingest::mirror` insists on, at this surface: an answer
+    /// naming no account of his own says the row was something else, and a shape
+    /// two rows happen to share does not overrule it.
+    #[test]
+    fn an_answer_naming_no_own_account_pairs_nothing_for_the_queue() {
+        let session = ImportSessionId::new_random();
+        let main = account(1);
+        let savings = account(2);
+        let (departure, arrival) = two_legs(main, savings);
+        let observations = vec![stored_row(1, &departure), stored_row(2, &arrival)];
+        let mut answered = stored_question_about(1, &Question::IsOutflowAFee { account: main });
+        answered.answered_at = Some("2026-03-02T00:00:00Z".to_owned());
+        answered.answer = Some(serde_json::to_string(&Answer::Paid).expect("an answer"));
+        let questions = vec![
+            answered,
+            stored_question_about(2, &Question::IsInflowIncome { account: savings }),
+        ];
+
+        assert!(
+            mirrored_movements_of(session, &observations, &questions).is_empty(),
+            "the arrival is still a row with a question of its own"
         );
     }
 

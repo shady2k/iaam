@@ -4448,6 +4448,20 @@ pub struct ActionDto {
     /// where the two do not line up field for field, and `blocked_by` says why.
     #[serde(default)]
     pub goals: Vec<String>,
+    /// Whether this item wants something, in one word.
+    ///
+    /// **`settled` wants nothing, and it is not work.** The owner decided
+    /// something, and the item says what his decision left standing — the
+    /// records it keeps out of every report, and why. The only call it
+    /// publishes is the withdrawal of that decision, which is his to send. Show
+    /// it when he asks what has been decided; do not raise it as work, do not
+    /// collect a field for it, and do not go looking for what it is holding up,
+    /// because nothing is.
+    ///
+    /// It is not the word for «no call in this API touches this». An item that
+    /// publishes no way out at all is a different statement, and reading a
+    /// decision of his as one of those turns something he settled into a gap
+    /// somebody keeps trying to close.
     pub state: String,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5173,6 +5187,13 @@ pub struct CreateAccountRequest {
     /// account carrying none is found by this and a rename can stop a statement
     /// resolving. A client putting this question to the owner says that much —
     /// the queue's own wording for it is in `MissingInputDto.prompt`.
+    ///
+    /// **It is his to give and never a client's to guess.** Where a document
+    /// names an account this instance holds none for, the answer is to ask him,
+    /// or to send the string the source printed as `provider_account_id` below.
+    /// Inventing a plausible name does not make the refused records import: it
+    /// makes a second account he never asked for, which he then has to find and
+    /// retire.
     pub title: String,
     /// The institution the account is held at, as the owner names it.
     ///
@@ -5192,6 +5213,15 @@ pub struct CreateAccountRequest {
     /// rather than the printed number, and to change `provider` whenever it
     /// changes that derivation — a re-derivation must present as a new source
     /// rather than as new accounts.
+    ///
+    /// **The string a statement printed for the account belongs here, and not
+    /// in the title.** A document names each account in its institution's own
+    /// words, and a name this instance holds no account for refuses every
+    /// record on it; an account carrying that string as its printed identity
+    /// resolves those records the next time the same document is read. The same
+    /// string put in the title instead leaves the owner with a name he did not
+    /// choose, and the rename he is entitled to make then stops the document
+    /// resolving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_account_id: Option<String>,
     /// What kind of cash the account holds, where the owner has said.

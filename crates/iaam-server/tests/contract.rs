@@ -2932,6 +2932,120 @@ async fn an_owners_balance_is_not_an_independent_confirmation() {
     }
 }
 
+/// An item the owner settled wants nothing, and a client that reads it as work
+/// goes looking for what it holds up.
+///
+/// The word arrived with no description at all. What `settled` means — his
+/// decision recorded, the records it keeps out of every report, and the single
+/// call that withdraws it — lived in a comment in the server's own source,
+/// where no client reads anything.
+#[tokio::test]
+async fn a_settled_item_says_it_wants_nothing() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ActionDto", "state");
+    for owed in ["settled", "not work", "withdrawal", "no call in this API"] {
+        assert!(
+            described.contains(owed),
+            "ActionDto.state says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// The string a statement printed for an account is its printed identity, and
+/// putting it in the title is what makes the next reading refuse the same rows.
+///
+/// The field advised a derived value and said nothing about where the printed
+/// string belongs, so a client holding a wall of refused records had no
+/// published reason to prefer this field over the one a person reads.
+#[tokio::test]
+async fn the_printed_string_is_the_accounts_identity_and_not_its_title() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CreateAccountRequest", "provider_account_id");
+    for owed in ["printed", "title", "rename"] {
+        assert!(
+            described.contains(owed),
+            "CreateAccountRequest.provider_account_id says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A title is the owner's to give, and a guessed one does not make a refused
+/// record import — it makes a second account he never asked for.
+///
+/// The description explained what a title is and is not. It did not say what
+/// happens when a client invents one, which is the move a wall of refusals
+/// invites.
+#[tokio::test]
+async fn a_title_is_asked_for_and_never_guessed() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CreateAccountRequest", "title");
+    for owed in ["guess", "second account", "never asked for"] {
+        assert!(
+            described.contains(owed),
+            "CreateAccountRequest.title says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A place of custody is named by the owner's own title, and a document's
+/// account cell is not.
+///
+/// The route already publishes how an account cell is read — three
+/// vocabularies, in one order — and said nothing about the custody cell beside
+/// it. A caller that reads the two as one question sends the identity a source
+/// prints for a depository, which names nothing here, and reads back a refusal
+/// that sounds like the place does not exist.
+#[tokio::test]
+async fn a_custody_cell_is_named_by_the_owners_own_title_and_nothing_else() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = spec["paths"]["/v1/ingest/csv"]["post"]["description"]
+        .as_str()
+        .expect("the CSV ingestion route carries a description");
+    for owed in ["custody", "nothing else", "default"] {
+        assert!(
+            described.contains(owed),
+            "the route says nothing about «{owed}» for a custody cell: {described}"
+        );
+    }
+}
+
+/// A refusal for request frequency is answered by lowering the frequency.
+///
+/// An agent quoting a price per date meets this refusal in a loop, and the
+/// natural move — send it again — is the one that keeps it refused, because the
+/// window only turns over while nothing is calling. Nothing published said so,
+/// and a transport-level refusal has no schema of its own to say it on.
+#[tokio::test]
+async fn the_market_series_say_a_refusal_for_frequency_is_answered_by_lowering_it() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for route in ["/v1/market/prices", "/v1/market/fx", "/v1/market/key-rate"] {
+        let described = spec["paths"][route]["get"]["responses"]["429"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{route} publishes no refusal for request frequency"));
+        for owed in ["Lower the frequency", "window", "repeating immediately"] {
+            assert!(
+                described.contains(owed),
+                "{route}'s refusal says nothing about «{owed}»: {described}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_published_code_is_the_code_the_response_carries() {
     // The vocabularies enumerate; they must enumerate what actually arrives.

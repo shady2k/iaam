@@ -1423,7 +1423,19 @@ pub struct MarketKeyRateParams {
     params(MarketPricesParams),
     responses(
         (status = 200, description = "Prices with provenance and the completeness boundary", body = MarketPriceSeriesDto),
-        (status = 422, description = "Invalid range", body = ApiError)
+        (status = 422, description = "Invalid range", body = ApiError),
+        // Published here rather than only in the transport, because the market
+        // series are what a client fetches in a loop — a price per instrument
+        // per date — and the natural answer to a refusal for frequency is to
+        // send the same request again, which is the one move that keeps it
+        // refused.
+        (status = 429, description = "Too many requests. This instance counts calls per token \
+                                      over a fixed window, and the refusal stands until that \
+                                      window turns over. Lower the frequency rather than \
+                                      repeating immediately: a repeat inside the same window is \
+                                      refused again and brings the answer no closer, while one \
+                                      call over a range of dates answers what a call per date \
+                                      was asking.", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1460,7 +1472,19 @@ pub async fn list_market_prices(
     params(MarketFxParams),
     responses(
         (status = 200, description = "Exchange rates with provenance and the completeness boundary", body = MarketFxSeriesDto),
-        (status = 422, description = "Invalid range", body = ApiError)
+        (status = 422, description = "Invalid range", body = ApiError),
+        // Published here rather than only in the transport, because the market
+        // series are what a client fetches in a loop — a price per instrument
+        // per date — and the natural answer to a refusal for frequency is to
+        // send the same request again, which is the one move that keeps it
+        // refused.
+        (status = 429, description = "Too many requests. This instance counts calls per token \
+                                      over a fixed window, and the refusal stands until that \
+                                      window turns over. Lower the frequency rather than \
+                                      repeating immediately: a repeat inside the same window is \
+                                      refused again and brings the answer no closer, while one \
+                                      call over a range of dates answers what a call per date \
+                                      was asking.", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1496,7 +1520,19 @@ pub async fn list_market_fx(
     params(MarketKeyRateParams),
     responses(
         (status = 200, description = "Key-rate intervals with provenance and the completeness boundary", body = MarketKeyRateSeriesDto),
-        (status = 422, description = "Invalid range", body = ApiError)
+        (status = 422, description = "Invalid range", body = ApiError),
+        // Published here rather than only in the transport, because the market
+        // series are what a client fetches in a loop — a price per instrument
+        // per date — and the natural answer to a refusal for frequency is to
+        // send the same request again, which is the one move that keeps it
+        // refused.
+        (status = 429, description = "Too many requests. This instance counts calls per token \
+                                      over a fixed window, and the refusal stands until that \
+                                      window turns over. Lower the frequency rather than \
+                                      repeating immediately: a repeat inside the same window is \
+                                      refused again and brings the answer no closer, while one \
+                                      call over a range of dates answers what a call per date \
+                                      was asking.", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -4396,6 +4432,13 @@ pub struct IngestCsvParams {
                    source prints for it, then the owner's title — which \
                    resolves for documents written before the other two \
                    existed, and is refused when two accounts share it. \
+                   The `custody` cell is **not** read that way: a place of \
+                   custody is matched against the owner's own title for it and \
+                   against nothing else, because no source prints an identity \
+                   for a depository and there is no second vocabulary to \
+                   prefer. A cell left empty falls back to the account's \
+                   default place of custody, and a title naming two places is \
+                   refused rather than chosen between. \
                    It is **not** a bank export endpoint — an institution's own \
                    file rejects every row here. Rows arrive under the `csv` \
                    channel of the account each row names, so \

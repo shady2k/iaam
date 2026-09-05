@@ -10,8 +10,8 @@
 # CANNOT make the claim. A running instance answers what it serves through
 # `/.well-known/api-catalog` and the contract behind it; the document explains
 # meaning. So this guard refuses a versioned route path, an HTTP method spelled
-# as an instruction, and an HTTP status code, anywhere in the skill — the entry
-# file and every companion file it names alike.
+# as an instruction, an HTTP status code, and the name of a payload field,
+# anywhere in the skill.
 #
 # Like the privacy guard, it checks SHAPES. It needs no list of routes, so it
 # cannot itself go stale when the API changes — which is the whole point.
@@ -30,10 +30,10 @@ if [ ! -f "$DOC" ]; then
   exit 1
 fi
 
-# `SKILL.md` is loaded whole and names companion files a caller opens when the
-# work reaches them. A guard over the entry file alone would stop covering most
-# of the skill the moment the first of those was written, so every markdown file
-# in the directory is held to the same three refusals.
+# The skill is one file today (`iaam-jy0m`), and the walk over the directory is
+# what keeps it one: a second file added beside it is held to the same four
+# refusals from the moment it exists, rather than becoming the place the
+# narration moves back into.
 DOCS=()
 while IFS= read -r f; do DOCS+=("$f"); done < <(find "$DIR" -type f -name '*.md' | sort)
 if [ "${#DOCS[@]}" -eq 0 ]; then
@@ -54,6 +54,13 @@ METHOD_SHAPE='\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b'
 # Status codes, listed rather than matched as "three digits": the file
 # legitimately contains RFC numbers and percentages.
 STATUS_SHAPE='\b(200|201|202|204|301|302|304|400|401|403|404|405|409|410|415|422|429|500|501|502|503|504)\b'
+# A payload field name. A document that names `requiredScope` or `blocked_by` is
+# narrating the payload, which is the disease the first three refusals treat one
+# level down: the contract publishes those descriptions, they move with the code,
+# and a copy here is a claim that rots. Matched as a shape — a backticked
+# identifier in snake_case or lowerCamelCase — so it needs no list of fields and
+# cannot go stale when the API changes.
+FIELD_SHAPE='`[a-z][a-z0-9]*(_[a-z0-9]+|[A-Z][A-Za-z0-9]*)[A-Za-z0-9_]*`'
 
 check() {
   local shape=$1 what=$2 remedy=$3 doc hits
@@ -73,6 +80,8 @@ check "$METHOD_SHAPE" "an HTTP method" \
   "Name the operation by what it does, not by how it is called."
 check "$STATUS_SHAPE" "an HTTP status code" \
   "The contract declares the responses; a copy here is a claim that rots."
+check "$FIELD_SHAPE" "a payload field name" \
+  "Say what the value MEANS to him. The contract carries the field's own description."
 
 # --- The guard tests its own boundary ----------------------------------------
 # A guard nobody has seen fail is the advice it replaces.
@@ -92,6 +101,12 @@ probe_method=$(printf '%s\n' 'читается через GET' 'the contract dec
   | grep -E "$METHOD_SHAPE" || true)
 if [ "$probe_method" != 'читается через GET' ]; then
   err "the method shape misclassifies its own probe"
+  exit 1
+fi
+probe_field=$(printf '%s\n' 'read `requiredScope` on the resolution' 'the money and the perimeter' \
+  | grep -E "$FIELD_SHAPE" || true)
+if [ "$probe_field" != 'read `requiredScope` on the resolution' ]; then
+  err "the field shape misclassifies its own probe"
   exit 1
 fi
 

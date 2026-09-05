@@ -2290,7 +2290,25 @@ async fn the_openapi_document_says_which_fields_are_put_to_the_owner() {
 /// client can learn is what the document says, and an assertion against the
 /// struct would pass just as happily with the description stripped.
 fn property_description<'a>(spec: &'a serde_json::Value, schema: &str, property: &str) -> &'a str {
-    let published = &spec["components"]["schemas"][schema]["properties"][property];
+    let component = &spec["components"]["schemas"][schema];
+    // A struct that flattens an enum into itself is published as an `allOf` of
+    // the union and an object carrying the struct's own fields, so the schema
+    // has no `properties` of its own while every one of those fields is still
+    // a property a reader meets. The flattened *field* publishes nothing; its
+    // neighbours publish exactly as they always did, one level down.
+    let published = if component["properties"][property].is_null() {
+        component["allOf"]
+            .as_array()
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .map(|branch| &branch["properties"][property])
+                    .find(|found| !found.is_null())
+            })
+            .unwrap_or(&serde_json::Value::Null)
+    } else {
+        &component["properties"][property]
+    };
     published["description"]
         .as_str()
         // An optional field whose type is a reference is published as a
@@ -2627,6 +2645,211 @@ async fn an_unconfirmed_payment_and_absent_evidence_are_not_reported_alike() {
         assert!(
             described.contains(owed),
             "the material issues say nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A retired product leaves the perimeter and its money does not leave the
+/// journal.
+///
+/// The word alone says the owner called the product finished. What a caller
+/// must know before it repeats that to him is the bound: no figure moves, no
+/// classification changes, a snapshot already taken is untouched, and the
+/// balances answer keeps the row. A caller that reads a retirement as a removal
+/// tells him a figure went away when only a boundary moved.
+#[tokio::test]
+async fn a_retirement_says_what_it_leaves_untouched() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "RecordAccountRetirementRequest", "state");
+    for owed in [
+        "No figure moves",
+        "classification",
+        "still open is untouched",
+        "balances",
+        "queue",
+        "population",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the retirement says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A boundary the owner draws, not one an institution draws for him.
+///
+/// A list of identifiers says which accounts a version covers and nothing about
+/// what covering them means. The two consequences a caller has to know before
+/// it explains any figure are that money moved between two accounts on this
+/// list changes no return — it is one pocket to another — and that money
+/// arriving from an account not on it is a contribution.
+#[tokio::test]
+async fn a_contour_says_what_its_boundary_does_to_a_movement() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ContourDto", "accounts");
+    for owed in ["portfolio", "institution", "return", "contribution"] {
+        assert!(
+            described.contains(owed),
+            "the composition says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A remedy belongs to the caveat that names it, and to no other caveat on the
+/// same account.
+///
+/// One account routinely stands under two caveats at once, and the calls that
+/// close one of them do not close the other. Swapping them fails silently: an
+/// owner-balance assertion is checked against the fold rather than added to it,
+/// so it relabels the figure it was meant to remove and both lines stay
+/// standing.
+#[tokio::test]
+async fn a_caveats_remedies_are_not_the_remedies_of_its_neighbour() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CaveatDto", "closed_by");
+    for owed in [
+        "two caveats at once",
+        "checked against the fold",
+        "this caveat",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the remedies say nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// What the money was for is not the same question as whose the money is.
+///
+/// A title alone reads as a label a client may put anywhere. Set beside the
+/// contour, it is one of a pair of answers over one journal, and a caller that
+/// substitutes either for the other tells the owner that a row was reclassified
+/// when an account changed hands, or the reverse.
+#[tokio::test]
+async fn a_category_answers_a_different_question_from_the_perimeter() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CategoryDto", "title");
+    for owed in ["was for", "whose money", "contour"] {
+        assert!(
+            described.contains(owed),
+            "the category says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A rule moves rows between explanations and moves no figure of the return.
+///
+/// The impact answer is what a caller shows the owner before he agrees to a
+/// rule, and a list of monthly movements looks like a list of things about to
+/// change. It has to say what is **not** in it — the return and every figure it
+/// is built from — and it has to say what does move them, so that a caller
+/// meaning to change a fact does not reach for a rule to do it.
+#[tokio::test]
+async fn an_impact_says_which_figures_a_rule_cannot_move() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "CategoryRuleImpactDto", "months");
+    for owed in [
+        "xirr_pre_tax",
+        "contributed",
+        "withdrawn",
+        "different fact",
+        "channel the fact arrived by",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the impact says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// Three vocabularies are read and only two are for a caller to send.
+///
+/// The tiering is published, so a caller can see that a title resolves; what it
+/// cannot see is that sending one is the wrong move. A title is a string the
+/// owner may change tomorrow and two of his accounts may carry one of them, so
+/// a converter that reaches for it writes rows that stop parsing the day he
+/// renames something.
+#[tokio::test]
+async fn an_account_says_which_of_its_names_to_send() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "OperationDto", "account");
+    for owed in ["do not send the title", "keep parsing", "change tomorrow"] {
+        assert!(
+            described.contains(owed),
+            "the account field says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// A code nobody holds and a code that is wrong for this date are two answers,
+/// and only one of them is about the catalogue.
+///
+/// Both arrive as a refusal to resolve, and a caller that reads them alike asks
+/// the owner to create a security that already exists — or, worse, treats a
+/// document assembled with the wrong date as a gap in a catalogue shared with
+/// every other owner.
+#[tokio::test]
+async fn a_dated_resolution_keeps_its_two_refusals_apart() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "ResolveInstrumentRequest", "on");
+    for owed in [
+        "unknown",
+        "not on this date",
+        "the owner's work",
+        "forbidden",
+        "document's date",
+        "corrupted",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the resolution date says nothing about «{owed}»: {described}"
+        );
+    }
+}
+
+/// An instrument has three currencies and the report's is not one of them.
+///
+/// Three undescribed fields side by side read as one fact spelled three ways,
+/// and on the papers where they genuinely diverge a caller that picks whichever
+/// it met first states a holding in money the owner never held. The currency a
+/// report is drawn in belongs to the report and to no instrument.
+#[tokio::test]
+async fn an_instrument_keeps_its_three_currencies_apart() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let described = property_description(&spec, "InstrumentDto", "denomination_currency");
+    for owed in [
+        "settlement_currency",
+        "quote_currency",
+        "diverge",
+        "property of the report",
+    ] {
+        assert!(
+            described.contains(owed),
+            "the denomination currency says nothing about «{owed}»: {described}"
         );
     }
 }

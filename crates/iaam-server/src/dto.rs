@@ -669,6 +669,15 @@ pub struct OperationDto {
     /// other than the one the batch declared is still the whole batch's problem,
     /// and is refused as it always was: that row contradicts a statement the
     /// caller made over all of them.
+    ///
+    /// **Three vocabularies are read, and only two of them are a caller's to
+    /// send.** iaam's own identifier, then the identity the account's source
+    /// prints for it, then the owner's title for it. Send the first where you
+    /// have it, send the second where the file you are reading prints it, and
+    /// do not send the title. It resolves only so that documents written before
+    /// the other two existed keep parsing: a title is a string the owner may
+    /// change tomorrow, and two of his accounts may carry one title, which is
+    /// refused rather than guessed at.
     pub account: String,
     #[serde(flatten)]
     pub kind: OperationKindDto,
@@ -2619,6 +2628,18 @@ pub struct CaveatDto {
     /// One call does not always empty a caveat — a caveat is one line per
     /// account, currency or instrument, and closing it may take more than one
     /// fact. `see` remains the check.
+    ///
+    /// **These are this caveat's remedies and no other's.** One account
+    /// routinely stands under two caveats at once — a retired account whose
+    /// figures are not all zero usually carries `running_cash_sum` beside
+    /// `retired_account_not_empty` — and the calls listed here close the line
+    /// they are listed on. Reaching for the neighbouring line's remedy does not
+    /// fail loudly, because the two are not the same kind of fact: an
+    /// owner-balance assertion is checked against the fold rather than added to
+    /// it, so recording one where the opening of the account was what was
+    /// missing relabels the figure instead of removing it, and both lines stay
+    /// standing. Take the calls from the caveat whose `kind` and `subject` name
+    /// the gap you mean to close.
     pub closed_by: Vec<ClosingOperationDto>,
 }
 
@@ -4996,6 +5017,29 @@ pub struct AccountRetirementDto {
 /// which is the retroactivity the revision exists to make visible.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RecordAccountRetirementRequest {
+    /// The statement being recorded, or taken back: `retired` or `in_use`.
+    ///
+    /// **What an accepted `retired` changes is bounded, and the bound is the
+    /// point of the operation.** From `effective_on` the asset snapshot stops
+    /// publishing the account's row and its membership of its cash class — but
+    /// only where every one of that row's figures is zero — and
+    /// `population.retirement_revision` advances. That is the whole of it.
+    ///
+    /// **No figure moves.** No classification changes, ever. A snapshot taken
+    /// while the product was still open is untouched. The balances answer keeps
+    /// the account's row, because that answer is what the journal holds per
+    /// account and is what a statement is reconciled against. Nothing hides a
+    /// retired account from the account list or from the outstanding-work
+    /// queue, and where a retired row's figures are not all zero the row stands
+    /// with `retired_account_not_empty` beside it — a retirement never hides
+    /// money.
+    ///
+    /// So which of the owner's products still exist is read off any report's
+    /// `population`, keeping the entries with no `retirement`, and it is read
+    /// out to him by their `title` and `institution` rather than by the
+    /// identifiers beside them. It is never read off the contour's
+    /// composition, which answers whose money is in the figures and not whether
+    /// the product is still there.
     pub state: AccountRetirementStateDto,
     /// Required for `retired` and refused for `in_use`.
     #[serde(
@@ -5538,6 +5582,17 @@ pub struct ContourDto {
     pub version: u32,
     /// The accounts this version covers. Empty is a real answer: a version can
     /// be recorded with no members, and it covers nothing.
+    ///
+    /// **This is the set the owner considers his portfolio, and the boundary is
+    /// his rather than an institution's.** Accounts at one bank sit on one side
+    /// of it only because he put them there, and two of his products at the
+    /// same bank may fall on opposite sides.
+    ///
+    /// Two consequences hold over every figure computed against this version.
+    /// Money moved between two accounts named here changes no return — it is
+    /// one of his pockets into another, not money he put in or took out. Money
+    /// arriving from an account not named here is a **contribution**, and money
+    /// leaving to one is a withdrawal.
     pub accounts: Vec<Uuid>,
 }
 
@@ -7338,6 +7393,16 @@ pub struct ReconciliationResponseDto {
 pub struct CategoryDto {
     pub id: Uuid,
     pub group: Uuid,
+    /// The owner's own word for what the money was for. His register rather
+    /// than a vocabulary of ours, and the string a figure is read out to him
+    /// under — never the identifier beside it.
+    ///
+    /// **A category and a contour answer different questions over the same
+    /// journal.** A contour says whose money is in the figures; a category says
+    /// what that money was for. Neither substitutes for the other: a category
+    /// is never a statement about whether an account is his, and a contour's
+    /// membership is never a statement about what a row was spent on.
+    /// Confusing the two is the mistake the pair exists to keep apart.
     pub title: String,
     pub retired_at: Option<String>,
 }
@@ -7436,6 +7501,23 @@ pub struct CategoryRuleRequest {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleImpactDto {
     pub rows: u64,
+    /// The movements the proposed rule causes, month by month.
+    ///
+    /// **Everything a category rule can move is in this list.** Changing only a
+    /// category assignment cannot change the return: not what was contributed,
+    /// not what was withdrawn, not the contour's value, not `xirr_pre_tax`.
+    /// Those are computed from the kind of each event, the accounts it touched
+    /// and the contour's membership, and no category, category group or income
+    /// flag enters any of them. So this list is the whole of what the owner is
+    /// agreeing to, and it is put to him as money moving from one of his
+    /// explanations to another.
+    ///
+    /// Say it to him in those words, because the neighbouring sentence is
+    /// false. Changing an event's kind, the accounts it touches, or the
+    /// contour's membership does change all of them — a row moved from a
+    /// payment out to a transfer is a different fact, not a different
+    /// explanation of the same one. No rule performs that change, and it is not
+    /// asked for here: it goes back through the channel the fact arrived by.
     pub months: Vec<MonthlyImpactDto>,
 }
 
@@ -7939,6 +8021,18 @@ pub struct InstrumentDto {
     pub kind: Option<String>,
     pub symbol: String,
     pub title: String,
+    /// The currency the paper is denominated in — the first of three, and not
+    /// interchangeable with the other two.
+    ///
+    /// **This, `settlement_currency` and `quote_currency` answer three
+    /// different questions**, and on a replacement bond they diverge: the paper
+    /// is denominated in one currency, settled in another and quoted in a
+    /// third. There is no «the instrument's currency», and a caller that treats
+    /// any one of them as such states a holding in money the owner never held.
+    ///
+    /// The report currency is not among them. It is a property of the report,
+    /// chosen when the report is asked for, and no field of an instrument
+    /// answers it.
     pub denomination_currency: String,
     pub settlement_currency: String,
     pub quote_currency: String,
@@ -8065,6 +8159,20 @@ pub struct ResolveInstrumentRequest {
     pub value: String,
     /// Document date. Required: ISIN changes, and there is no «current»
     /// answer (§4.7).
+    ///
+    /// **Two refusals follow from that, and they must not be confused.** A code
+    /// that is *unknown* means there is no such security in the catalogue at
+    /// all: the instrument has to be created, that is the owner's work, and an
+    /// agent is forbidden to write to the catalogue — a restriction of rights,
+    /// not an absence of the capability. A code that is known, but
+    /// *not on this date*, means the code exists and its interval of validity
+    /// does not cover the date sent here; check the document's date first,
+    /// because the date is by far the likelier error.
+    ///
+    /// The second case is almost always corrupted data rather than a gap in the
+    /// catalogue: a code introduced by a corporate action, printed in a document
+    /// dated before that action, means the document or its date was assembled
+    /// wrongly.
     #[serde(with = "iso_date")]
     #[schema(value_type = String, format = Date)]
     pub on: Date,

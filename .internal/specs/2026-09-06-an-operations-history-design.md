@@ -61,8 +61,10 @@ Three acts and no more:
 `retracted` covers a whole import taken back (`POST /v1/corrections/imports`)
 exactly as it covers one row, and the history does not distinguish them: what the
 owner is looking at is his operation, and "this was taken back" is the same fact
-about it either way. Which act it belonged to is answerable from the import the
-reversal names.
+about it either way. The reversal itself names no import — it is written on the
+correction channel, and that channel declares none — so what says which import
+the row belonged to is the state before the retraction, which the history
+publishes in full.
 
 ### 3.2 Entering anywhere in the chain
 

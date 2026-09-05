@@ -19826,6 +19826,7 @@ async fn an_open_classification_question_is_an_item_in_the_action_queue() {
         vec![
             "sent_to_own_account",
             "received_from_own_account",
+            "between_own_accounts",
             "paid",
             "received",
             "fee",
@@ -25482,6 +25483,164 @@ async fn a_far_side_word_the_contract_does_not_know_is_refused_rather_than_dropp
     assert_eq!(status, StatusCode::OK, "{refusal}");
     assert_eq!(refusal[0]["verdict"], "rejected", "{refusal}");
     assert_eq!(refusal[0]["field"], "far_side", "{refusal}");
+}
+
+/// The eighth answer, end to end (iaam-axrf).
+///
+/// The source said nothing about the far side, so the row is a question — and
+/// until now the owner who knew the answer had only two words, each of which
+/// writes a wrong fact: naming a far account records a movement whose other
+/// half does not exist, and «I paid somebody» files an internal move as
+/// spending. This is the word for what he actually knows.
+#[tokio::test]
+async fn the_owner_can_say_it_was_between_his_own_accounts_without_naming_which() {
+    let harness = harness();
+    let before = journal_rows(&harness).await;
+
+    let (session, question) = ask_one_question(&harness, &harness.owner_token, "unnamed-own").await;
+
+    // It is offered on the question, with the sentence saying what it decides.
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    let alternatives = contents["questions"][0]["alternatives"]
+        .as_array()
+        .expect("alternatives")
+        .clone();
+    let offered = alternatives
+        .iter()
+        .find(|alternative| alternative["answer"] == "between_own_accounts")
+        .unwrap_or_else(|| panic!("the eighth answer is published: {contents}"));
+    assert_eq!(
+        offered["needs_account"],
+        json!(false),
+        "the whole of this answer is that he cannot name the account: {offered}"
+    );
+    assert!(
+        offered["consequence"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "an alternative that says nothing about itself is the defect: {offered}"
+    );
+
+    // Answered under the owner's own token — the one principal who may
+    // generalise — and still no rule stands.
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "between_own_accounts" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(
+        answered["generalisation"]["state"], "does_not_generalise",
+        "the absence is published as its own reason and not as «no rule could \
+         be built from this row»: {answered}"
+    );
+    assert!(answered["generalisation"]["rule"].is_null(), "{answered}");
+    assert!(
+        answered["generalisation"]["proposal"].is_null(),
+        "there is nothing for him to adopt: {answered}"
+    );
+    assert_eq!(
+        classification_rule_count(&harness).await,
+        0,
+        "a standing decision made of «I cannot say» would file next month's \
+         rows as unplaceable, including the ones a pairing would settle whole"
+    );
+
+    // And the row commits as the fact that posts nothing.
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(journal_rows(&harness).await, before + 1, "{committed}");
+    let recorded = journal_events(&harness).await;
+    let row = recorded
+        .iter()
+        .find(|row| row["idempotency_key"] == "unnamed-own")
+        .unwrap_or_else(|| panic!("the fact is in the journal: {recorded:?}"));
+    assert_eq!(row["kind"], "unresolved_own_account_movement", "{row}");
+    assert!(
+        row["legs"].as_array().expect("legs").is_empty(),
+        "nothing may be posted on a direction nobody stated: {row}"
+    );
+}
+
+/// The same answer on a row whose direction the source did print.
+#[tokio::test]
+async fn the_eighth_answer_posts_a_leg_where_the_statement_stated_a_direction() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "march" },
+                "operations": [{
+                    "account": account,
+                    "type": "unresolved_direction",
+                    "amount": "-2500.00",
+                    "currency": "RUB",
+                    "direction": "out",
+                    "dates": { "cash_posted": "2025-03-18" },
+                    "counterparty": "Northline Savings",
+                    "idempotency_key": "directed-own",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"].as_str().expect("session");
+    let question = verdicts[0]["question_id"].as_str().expect("question");
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "between_own_accounts" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    let recorded = journal_events(&harness).await;
+    let row = recorded
+        .iter()
+        .find(|row| row["idempotency_key"] == "directed-own")
+        .unwrap_or_else(|| panic!("the fact is in the journal: {recorded:?}"));
+    assert_eq!(row["kind"], "own_account_movement", "{row}");
+    assert_eq!(row["legs"].as_array().expect("legs").len(), 1, "{row}");
 }
 
 #[tokio::test]

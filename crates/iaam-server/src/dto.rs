@@ -1366,7 +1366,7 @@ pub struct VerdictDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AnswerAlternativeDto {
     /// The word to send back: `sent_to_own_account`, `received_from_own_account`,
-    /// `paid`, `received`, `fee`, `income`, `refund`.
+    /// `between_own_accounts`, `paid`, `received`, `fee`, `income`, `refund`.
     pub answer: String,
     /// Whether the answer must also name one of the owner's accounts.
     pub needs_account: bool,
@@ -1380,14 +1380,14 @@ pub struct AnswerAlternativeDto {
     /// `received_from_own_account` moves the amount out of transfers between
     /// the owner's own accounts and into what came in from outside.
     ///
-    /// A sentence per word rather than a longer prompt. Seven consequences in
+    /// A sentence per word rather than a longer prompt. Eight consequences in
     /// one sentence would be a mapping from a word to its effect encoded as
     /// prose, which §5 refuses for the reason that the client would have to
     /// take it apart again to show the owner one alternative; here the caller
     /// that reads the word reads its effect in the same object.
     ///
     /// Always present. An alternative whose consequence were sometimes absent
-    /// would read as one that decides nothing, and every one of the seven
+    /// would read as one that decides nothing, and every one of the eight
     /// decides something.
     pub consequence: String,
 }
@@ -9536,6 +9536,13 @@ pub struct AlsoSettledDto {
 /// - `impossible` — no rule can be built from this row under any token. A
 ///   matcher that asks nothing matches nothing, and an "everything" rule would
 ///   silently reclassify the portfolio. There is no call that changes this;
+/// - `does_not_generalise` — the row could have grounded a rule and the answer
+///   is not one to keep. `between_own_accounts` says the statement did not hold
+///   the other side of this line, which is a fact about this line: kept as a
+///   standing decision it would file every later line of the same shape as
+///   unplaceable, including the ones whose other half the next statement does
+///   hold. Nothing is published to adopt, because there is nothing here that
+///   should stand;
 /// - `unanswered` — he has not answered it, so there is no answer to generalise.
 ///   Not the same as «it is still waiting on him»: a standing rule of his may
 ///   have settled the row already, which `settled_without_answer` says and this
@@ -9548,7 +9555,8 @@ pub struct AlsoSettledDto {
 /// expensive one; here he copies one object per question and sends it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QuestionGeneralisationDto {
-    /// `recorded`, `available`, `impossible` or `unanswered`.
+    /// `recorded`, `available`, `impossible`, `does_not_generalise` or
+    /// `unanswered`.
     pub state: String,
     /// The rule the answer created. Present exactly when `state` is `recorded`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9592,7 +9600,9 @@ impl QuestionGeneralisationDto {
                     replaces: None,
                 }),
             ),
-            Generalisation::Impossible | Generalisation::Unanswered => (None, None),
+            Generalisation::Impossible
+            | Generalisation::Unanswered
+            | Generalisation::DoesNotGeneralise => (None, None),
         };
         Self {
             state: generalisation.code().to_owned(),
@@ -9756,15 +9766,20 @@ pub struct AnswerImportQuestionRequest {
     /// The owner's account on the other side, for `sent_to_own_account` and
     /// `received_from_own_account` only. Required by those two, refused by every
     /// other answer.
+    ///
+    /// `between_own_accounts` is the third own-account word and takes none, on
+    /// purpose: it is the answer for the row whose far side the owner knows to
+    /// be his and cannot name. Sending an account beside it is refused rather
+    /// than read as one of the two above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<Uuid>,
     /// Where a fee came from, for the `fee` answer only. Refused on the other
-    /// six; optional on `fee` itself, where absence means the origin was not
+    /// seven; optional on `fee` itself, where absence means the origin was not
     /// stated and the fee is recorded as `other` rather than as a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<FeeOriginDto>,
     /// Which earning this was, for the `income` answer only. Refused on the
-    /// other six.
+    /// other seven.
     ///
     /// Optional on `income` itself, where absence means the owner named no kind
     /// and the journal records none (§4.9). **Naming one is the only way an
@@ -9833,11 +9848,12 @@ impl AnswerImportQuestionRequest {
                 kind: self.income_kind.map(IncomeKindDto::to_domain),
             },
             "refund" => Answer::Refund,
+            "between_own_accounts" => Answer::BetweenOwnAccounts,
             other => {
                 return Err(Rejection {
                     field: "answer".into(),
-                    expected: "sent_to_own_account, received_from_own_account, paid, \
-                               received, fee, income or refund"
+                    expected: "sent_to_own_account, received_from_own_account, \
+                               between_own_accounts, paid, received, fee, income or refund"
                         .into(),
                     actual: other.to_owned(),
                 });

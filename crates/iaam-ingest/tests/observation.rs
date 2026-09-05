@@ -296,17 +296,17 @@ fn an_internal_transfer_states_no_direction_of_its_own() {
 
 #[test]
 fn the_two_own_account_answers_differ_by_direction_and_not_by_far_side() {
-    // Why `Answer` is left alone. The direction is already structural — two
-    // variants, and `movement()` is total over them. What both collapse into is
-    // the *rule* vocabulary, and a rule must carry no direction: it will fire on
-    // rows the owner has never seen, and a replayed direction is the same guess
-    // in new clothing.
+    // Why the pair is two variants. The direction is structural between them,
+    // and `movement()` answers for both. What both collapse into is the *rule*
+    // vocabulary, and a rule must carry no direction: it will fire on rows the
+    // owner has never seen, and a replayed direction is the same guess in new
+    // clothing.
     let far = AccountId::new_random();
     let sent = Answer::SentToOwnAccount { to: far };
     let received = Answer::ReceivedFromOwnAccount { from: far };
 
-    assert_eq!(sent.movement(), Movement::Out);
-    assert_eq!(received.movement(), Movement::In);
+    assert_eq!(sent.movement(), Some(Movement::Out));
+    assert_eq!(received.movement(), Some(Movement::In));
     assert_eq!(
         sent.classification(),
         received.classification(),
@@ -456,9 +456,11 @@ fn a_question_admits_only_the_answers_it_published() {
 }
 
 #[test]
-fn every_answer_names_a_direction_and_a_classification() {
+fn every_answer_that_names_a_direction_names_one_its_classification_admits() {
     // A directionless row needs both, and one answer is the only way to give
-    // both without something provisional existing in between.
+    // both without something provisional existing in between. Seven of the
+    // eight do; the eighth is asserted below, where the reason it does not is
+    // the point.
     let to = AccountId::new_random();
     for answer in [
         Answer::SentToOwnAccount { to },
@@ -475,7 +477,9 @@ fn every_answer_names_a_direction_and_a_classification() {
         Answer::Refund,
     ] {
         let classification = answer.classification();
-        let movement = answer.movement();
+        let movement = answer
+            .movement()
+            .unwrap_or_else(|| panic!("{answer:?} names a direction"));
         match (classification, movement) {
             (Classification::Fee { .. }, Movement::Out)
             | (Classification::Income { .. } | Classification::Refund, Movement::In)
@@ -1092,4 +1096,193 @@ fn a_row_stored_before_the_assertion_existed_reads_as_stating_nothing() {
         .remove("far_side");
     let restored: ObservedRow = serde_json::from_value(value).expect("an older row still parses");
     assert_eq!(restored.far_side, FarSide::Unstated);
+}
+
+// ---------------------------------------------------------------------------
+// The eighth answer: between my own accounts, and I cannot say which (iaam-axrf)
+// ---------------------------------------------------------------------------
+
+/// The row the same answer is recorded from, with whatever the source said
+/// about the direction.
+fn recorded_from(row: &ObservedRow, answer: Answer) -> (String, FlowEndpoints) {
+    let operation = row
+        .resolve_with(answer)
+        .expect("the answer names a direction its classification admits");
+    let event = normalize(
+        &operation,
+        &NormalizationContext {
+            owner: OwnerId::new_random(),
+            source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
+        },
+    )
+    .expect("a dated cash row normalises")
+    .event;
+    (
+        event.kind.discriminant().to_owned(),
+        event.kind.flow_endpoints(),
+    )
+}
+
+/// Wherever he may name an own account, he may say he cannot name it.
+///
+/// The gate is [`AnswerShape::needs_account`] and not a list of question
+/// variants: a question that admits «money I moved to my own account» is one
+/// whose row could be the near half of a movement between two, and that is
+/// exactly the row he may know this much about and no more.
+#[test]
+fn every_question_that_admits_an_own_account_answer_admits_the_unnamed_one() {
+    let account = AccountId::new_random();
+    for question in [
+        Question::IsTransferInternal {
+            account,
+            counterparty: "Shop One".to_owned(),
+        },
+        Question::IsOutflowAFee { account },
+        Question::IsInflowIncome { account },
+        Question::UnresolvedDirection {
+            account,
+            stated: Some("INNER".to_owned()),
+            counterparty: None,
+        },
+    ] {
+        let alternatives = question.alternatives();
+        assert_eq!(
+            alternatives.contains(&AnswerShape::BetweenOwnAccounts),
+            alternatives.iter().any(|shape| shape.needs_account()),
+            "{question:?} offers one of the two own-account answers and not the other"
+        );
+    }
+    assert!(
+        !AnswerShape::BetweenOwnAccounts.needs_account(),
+        "the whole of this answer is that he cannot name the account"
+    );
+}
+
+/// The direction the source printed is the one recorded, and it posts a leg.
+#[test]
+fn the_eighth_answer_posts_a_leg_where_the_source_stated_a_direction() {
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::Out,
+        counterparty: ObservedCounterparty::Named("Shop One".to_owned()),
+        ..inner_row(account)
+    };
+    let question = Question::IsTransferInternal {
+        account,
+        counterparty: "Shop One".to_owned(),
+    };
+    assert!(question.admits(&Answer::BetweenOwnAccounts));
+
+    let operation = row
+        .resolve_with(Answer::BetweenOwnAccounts)
+        .expect("a row whose direction the source printed resolves");
+    assert!(
+        matches!(
+            operation.kind,
+            OperationKind::OwnAccountMovement {
+                movement: Some(Movement::Out),
+                amount_minor: 250_000,
+                ..
+            }
+        ),
+        "{:?}",
+        operation.kind
+    );
+    assert_eq!(
+        recorded_from(&row, Answer::BetweenOwnAccounts),
+        (
+            "own_account_movement".to_owned(),
+            FlowEndpoints::OwnAccountUnnamed
+        )
+    );
+}
+
+/// And where nothing stated one, the fact carries no leg at all.
+#[test]
+fn the_eighth_answer_posts_no_leg_where_no_direction_was_stated() {
+    let account = AccountId::new_random();
+    let row = inner_row(account);
+    assert_eq!(row.movement(), None, "the row this answer exists for");
+
+    let operation = row
+        .resolve_with(Answer::BetweenOwnAccounts)
+        .expect("the one answer that survives an absent direction");
+    assert!(
+        matches!(
+            operation.kind,
+            OperationKind::OwnAccountMovement {
+                movement: None,
+                amount_minor: 250_000,
+                ..
+            }
+        ),
+        "{:?}",
+        operation.kind
+    );
+    assert_eq!(
+        recorded_from(&row, Answer::BetweenOwnAccounts),
+        (
+            "unresolved_own_account_movement".to_owned(),
+            FlowEndpoints::OwnAccountUnnamed
+        )
+    );
+}
+
+/// The amount is not absorbed into «between my own accounts», and the answer
+/// does not pretend otherwise.
+///
+/// A contour cannot prove it holds every account the owner has, so an unnamed
+/// own endpoint stays unplaced. What the answer buys him is that the amount
+/// stops being spending, and this pins both halves of that against the two
+/// answers he had before.
+#[test]
+fn saying_he_cannot_name_the_account_is_neither_spending_nor_a_transfer() {
+    let account = AccountId::new_random();
+    let far = AccountId::new_random();
+    let row = inner_row(account);
+
+    let unnamed = recorded_from(&row, Answer::BetweenOwnAccounts);
+    assert_ne!(
+        unnamed.1,
+        FlowEndpoints::OutboundToOutside,
+        "it is not the outflow «I paid somebody» would have recorded"
+    );
+    assert_ne!(
+        unnamed.1,
+        FlowEndpoints::BetweenAccounts {
+            from: account,
+            to: far,
+        },
+        "and it is not the complete transfer naming a far account would have recorded"
+    );
+    assert_eq!(unnamed.1, FlowEndpoints::OwnAccountUnnamed);
+}
+
+/// It says what the document did not contain, so it becomes no standing rule.
+///
+/// The other seven say what a thing **was** and generalise. A rule made of «I
+/// cannot say» would file next month's rows of the same shape as unplaceable —
+/// including the ones whose other half is in the export and which pairing would
+/// have settled completely.
+#[test]
+fn the_eighth_answer_is_the_one_that_writes_no_standing_rule() {
+    let to = AccountId::new_random();
+    for answer in [
+        Answer::SentToOwnAccount { to },
+        Answer::ReceivedFromOwnAccount { from: to },
+        Answer::Paid,
+        Answer::Received,
+        Answer::Fee {
+            origin: FeeOrigin::Brokerage,
+        },
+        Answer::Income { kind: None },
+        Answer::Refund,
+    ] {
+        assert!(
+            answer.shape().generalises(),
+            "{answer:?} says what the row was, which is a claim about every row like it"
+        );
+    }
+    assert!(!AnswerShape::BetweenOwnAccounts.generalises());
 }

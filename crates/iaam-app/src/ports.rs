@@ -22,6 +22,13 @@ use iaam_ingest::SubmittedOperation;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::profile::UnresolvedAccountName;
 use iaam_store::documents::BrokerCode;
+// Not retyped on this side, unlike [`Recorded`] beside it, and for the reason
+// [`Store::list_import_control_figures`] gives for carrying a core type: a view
+// exists where the store's shape and the port's differ, and here nothing does.
+// The store mints `recorded_at` from its own clock, so a port copy of the pair
+// would be the same two fields written twice — and the retyping is where the
+// two could come to disagree about which moment the stamp names.
+pub use iaam_store::events::RecordedEvent;
 // The grouping label deliberately does not live in `iaam-core`: the core is
 // where rules live, and nothing may branch on it.
 pub use iaam_core::report::balances::NegativeBalanceExpectation;
@@ -765,6 +772,25 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         query: JournalQuery,
     ) -> Result<Vec<Event>, AppError>;
+
+    /// Every fact of one operation's correction chain, oldest first.
+    ///
+    /// Separate from [`Store::list_journal_events`], which answers "show me the
+    /// rows matching this": a chain is not a filter on the journal, because
+    /// nothing a row carries says what became of it. It is assembled by
+    /// following the corrections in both directions, and **any** identifier in
+    /// it answers with the same chain — the original, the replacement standing
+    /// now, or a reversal written along the way.
+    ///
+    /// Empty where the owner has no such event. That is the same answer for an
+    /// identifier of nothing and for an identifier of somebody else's fact, and
+    /// deliberately so: an answer that told those apart would confirm that a
+    /// stranger's event exists.
+    async fn event_chain(
+        &self,
+        owner: OwnerId,
+        event: iaam_core::ids::EventId,
+    ) -> Result<Vec<RecordedEvent>, AppError>;
 
     /// The owner is included in every reference-data and scope query.
     /// A scope identifier is a UUID, but a UUID does not confer

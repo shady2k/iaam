@@ -18,8 +18,8 @@ use crate::ports::{
     ControlAssertionView, CustodyView, Declared, DeclinedAccountNameView, DocumentToKeep,
     ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
     ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
-    JournalQuery, NewImportQuestion, Principal, Recorded, Scope, SoleOwner, Store, TokenAdmin,
-    TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
+    JournalQuery, NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store,
+    TokenAdmin, TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -438,6 +438,15 @@ impl Store for SqliteAdapter {
                 .map_err(store_error)
         })
         .await
+    }
+
+    async fn event_chain(
+        &self,
+        owner: OwnerId,
+        event: iaam_core::ids::EventId,
+    ) -> Result<Vec<RecordedEvent>, AppError> {
+        self.blocking(move |store| store.event_chain(owner, event).map_err(store_error))
+            .await
     }
 
     async fn load_contour(

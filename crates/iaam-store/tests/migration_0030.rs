@@ -31,7 +31,7 @@ fn database_at_version_twenty_nine() -> Connection {
              relation_kind, relation_target, source, source_operation_id,
              idempotency_key, raw_hash, payload, recorded_at
          ) VALUES (?1, 1, ?2, ?3, 'cash_in', '2026-02-02', 2,
-                   'replaces', ?4, ?5, NULL, NULL, ?6, '{}', '2026-02-02T00:00:00Z')",
+                   'replacement', ?4, ?5, NULL, NULL, ?6, '{}', '2026-02-02T00:00:00Z')",
         params![REPLACEMENT, OWNER, ACCOUNT, HEAD, SOURCE, "2".repeat(64)],
     )
     .expect("a correction naming the head as its relation target");

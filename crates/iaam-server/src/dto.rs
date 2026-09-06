@@ -8999,6 +8999,9 @@ pub struct JournalEventReadDto {
     /// carries the money, so that no number has two places here to be read from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<AmountDto>,
+    /// A trade's basis-only fee, which is not repeated as a leg or a total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis_fee: Option<AmountDto>,
     pub relation: JournalRelationDto,
     pub confidence: JournalConfidenceDto,
     /// The client key supplied at ingest, if one was.
@@ -9125,8 +9128,7 @@ pub struct JournalRuleSettlementDto {
     /// retires it and writes a new rule under a new identifier and the next
     /// number. Recorded beside the identifier because the pair is what names
     /// the decision — a rule you retire later still names the decision that
-    /// filed this row, and `?settled_by_rule=` with `?settled_by_rule_version=`
-    /// asks for exactly it.
+    /// filed this row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
 }
@@ -9343,6 +9345,7 @@ impl JournalEventReadDto {
             dates: JournalEventDatesDto::from_domain(view.dates),
             legs: view.legs.iter().map(JournalLegDto::from_domain).collect(),
             amount: view.amount.map(AmountDto::from_money),
+            basis_fee: view.basis_fee.map(AmountDto::from_money),
             relation: JournalRelationDto::from_domain(view.relation),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
@@ -9374,6 +9377,11 @@ fn format_source_time(time: time::Time) -> String {
 // ---------------------------------------------------------------------------
 
 /// One operation's life: what it was when it arrived, and every act since.
+///
+/// This is a correction history, not a transfer pairing view. If the requested
+/// event is a leg that was paired with another event, the counterpart is not included
+/// here, and its absence does not mean there is no counterpart. Joining paired legs
+/// requires a separate contract and is not performed by this route.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OperationHistoryDto {
     /// The acts, **oldest first**, because a history is read forwards: he wants
@@ -9550,8 +9558,9 @@ pub enum HistoryChangedAspectDto {
     /// When it happened: the date the journal orders the fact by, the time of
     /// day the source stated, and the semantic dates the fact carries.
     Dates,
-    /// Who the far side was, as the source printed it on the row.
-    Counterparty,
+    /// The source description field, which may carry a description or the
+    /// counterparty text printed on the row.
+    SourceDescription,
     /// How sure the fact is — and, on a reconstructed opening or a valuation,
     /// what the fact itself asserts about how sure it is.
     Confidence,
@@ -9608,7 +9617,7 @@ impl HistoryChangedAspectDto {
             ChangedAspect::Amount => Self::Amount,
             ChangedAspect::Account => Self::Account,
             ChangedAspect::Dates => Self::Dates,
-            ChangedAspect::Counterparty => Self::Counterparty,
+            ChangedAspect::SourceDescription => Self::SourceDescription,
             ChangedAspect::Confidence => Self::Confidence,
         }
     }

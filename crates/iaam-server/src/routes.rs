@@ -5129,23 +5129,6 @@ pub struct JournalParams {
     /// carries `rule_settlement`, which says which of those it is.
     #[serde(default)]
     pub settled_by_rule: Option<Uuid>,
-    /// One version of that rule.
-    ///
-    /// A version counts the owner's decisions, not a rule's own revisions:
-    /// every rule he writes takes the next number in his sequence, and editing
-    /// one retires it and writes a new rule under a new identifier and the next
-    /// number. So a rule and its version are fixed together the moment it is
-    /// written, and a fact records the pair as it stood when the row was filed.
-    ///
-    /// Naming both here therefore asks for exactly the decision meant, and a
-    /// version that is not the named rule's matches no fact rather than falling
-    /// back to the rule's own rows.
-    ///
-    /// Supplied together with `settled_by_rule`. On its own it is a position in
-    /// his sequence and not a name for a rule, so it is refused rather than
-    /// quietly ignored.
-    #[serde(default)]
-    pub settled_by_rule_version: Option<u32>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date)]
@@ -5215,7 +5198,6 @@ pub async fn list_journal_events(
             source,
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
-            settled_by_rule_version: params.settled_by_rule_version,
             from,
             to,
             after: params.after,
@@ -5256,6 +5238,11 @@ pub async fn list_journal_events(
 /// hide the very thing the history exists to show. There is no `limit` and no
 /// `after` here, and a caller written against the listing must not expect one.
 ///
+/// This is a correction-chain view, not a transfer-pairing view. If the requested
+/// event is a leg that was paired with another event, the counterpart is not
+/// included here; its absence does not mean there is no counterpart. Joining the
+/// paired legs requires a separate contract and is not performed by this route.
+///
 /// What this does not show is a category. A category is not recorded on the fact
 /// — it is decided by the owner's category rules when a report is computed — so
 /// «I filed this under the wrong category» is not a correction of an operation
@@ -5265,7 +5252,7 @@ pub async fn list_journal_events(
     path = "/v1/journal/events/{event}/history",
     params(("event" = Uuid, Path, description = "Any event identifier of the operation: the original, the fact standing now, or a reversal written along the way")),
     responses(
-        (status = 200, description = "The operation's acts, oldest first, and the fact that counts now", body = OperationHistoryDto),
+        (status = 200, description = "The operation's correction history, oldest first, and the fact that counts now. This is not a transfer pairing view: if the event is a paired leg, its counterpart is not included, and its absence does not mean there is no counterpart", body = OperationHistoryDto),
         (status = 404, description = "An identifier that addresses no event of yours. An event of another owner reads the same way, deliberately: telling the two apart would confirm that a stranger's event exists", body = ApiError),
         (status = 422, description = "An identifier that could not be read", body = ApiError)
     ),

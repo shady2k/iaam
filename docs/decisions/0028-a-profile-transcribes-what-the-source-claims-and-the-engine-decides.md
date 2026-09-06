@@ -189,53 +189,41 @@ is not made here for §2's reason: the response's shape is `dto.rs`'s.
 
 ### 4. Three more columns, and what each is worth
 
-**A merchant classification code — a named field, and it is designed but not
-built.** It is the strongest classification evidence in such a document and the
-only one that is not an institution's private vocabulary: the code is assigned by
-the payment network, so a rule written on it holds across institutions, where a
-rule written on a source's own category holds for one bank until it renames
-something. It is worth a **named** field rather than an entry in a general map of
-transcribed columns, because a general map's key is one profile author's spelling
-and a rule matching on it would be scoped to that author's choice — which is
-exactly the property that makes this code worth having. It is transcribed as
-text and never as a number: it is an identifier printed with leading zeros, and a
-number loses them.
+**Amendment — 2026-09-06.** This section was written before the observation
+channel and its rule matchers carried all three columns described below. The
+implementation changed in decisions 0020 and 0026 and in the follow-up work
+that added the remaining observation fields. This amendment records the
+current code and why the earlier section no longer does; it does not silently
+rewrite the decision's history.
 
-It is not built in this change, and the reason is mechanical rather than a
-judgement about its value. A field on `ObservedRow` is a field in every struct
-literal of `ObservedRow`, and those live in `crates/iaam-app/src/actions.rs` and
-`crates/iaam-app/src/scenarios/import_session.rs`; and for a rule to read it —
-which `iaam-3nqt` and `RuleMatcher::source_category` say is the whole test of
-whether a transcribed field does anything — `RuleMatcherDto` in
-`crates/iaam-server/src/dto.rs` must carry it too. All three are held by other
-work in this wave. Decision 0019 already deferred a neighbouring field, the far
-account's own identifier, on the ground that it is "a change to the observation
-channel's published shape" and belongs with the parity work; this is the same
-ground and the same answer.
+**The source's standardised code — built and matchable as `source_code`.** The
+profile may transcribe the code as text, preserving identifiers such as one
+with leading zeroes. The observation, operation, provenance, journal view and
+classification subject carry it as `source_code`, and `RuleMatcher` may match
+it exactly. It remains evidence from the source, not a classification verdict,
+and a profile may leave it absent because some rows have no code.
 
-**A second, owner-set category column — nothing, for now.** The institution's app
-lets the owner file a row under a category of his own beside the one it assigns
-by default, and the export carries both. iaam has exactly one field for "what the
-source filed this row under", `source_category`, and a profile names a column for
-it — so a profile may name **either** column, and an owner who files rows in his
-institution's app can point it at his own. That is a locator choice, which is
-what a profile is for, it is visible in the file, and it costs one version bump.
-What he cannot have is both at once, and having both is a sibling field on the
-observation channel: §4's first paragraph, same reason, same wave. The evidence
-in the meantime comes from whichever column he chose plus his own rules, which
-are re-runnable over rows already recorded and a category frozen at import is
-not.
+**The source's category and the owner's category — both built, as two fields.**
+`source_category` is the source's word for what the row was for. The
+`owner_category` beside it is the word the owner filed it under in the
+source's own application. Both are transcribed verbatim, retained through the
+observation and journal paths, and kept separate from `source_kind`, the
+source's word for what the operation was. The owner's category and
+classification rules can read the fields they own, each with its own question
+and outcome; neither field is mapped by the profile.
 
-**The source's own "counts in analytics" flag — nothing, and not later.** The
-institution states per row whether *it* treats the movement as a real expense.
-That is a decision about the institution's own reporting perimeter, and iaam has
-a perimeter of its own that is the owner's (decision 0014). Transcribing the flag
-would hand him a rule vocabulary whose meaning is "the bank did not count this in
-the bank's report", and a rule written on it silently imports another product's
-reporting boundary into his — the one thing a perimeter must not be. On
-own-account movements it says "no", which is the case that makes it look useful,
-and there the far side already says the same thing in words and says it as an
-assertion about the far side rather than as a conclusion about a report.
+The implementation therefore no longer permits a profile to choose only one
+category column, and it no longer defers the owner-set category as an
+unbuilt sibling field. The earlier reasoning about editable owner rules still
+stands: a profile records source evidence, while the owner's rules decide what
+that evidence means for his reports.
+
+**The source's own analytics flag — still deliberately not transcribed.** The
+institution's flag says whether it counts the movement inside its reporting
+perimeter. Transcribing it would import that perimeter into the owner's, so it
+would remain a source claim with no honest meaning in the owner's reports.
+The far side and the owner's own rules already provide evidence for iaam's
+decisions; this flag is not part of the observation channel.
 
 ### 5. What a movement between the owner's own accounts becomes, on both legs
 
@@ -330,10 +318,6 @@ deferred.
   files. It is `iaam-rdya`'s remaining half.
 - **A third document-row outcome beside `held` and `unreadable`.** §3. A declined
   row is read and refused, not unreadable, and the response word is wrong.
-- **The merchant classification code.** §4. It is a change to the observation
-  channel's published shape and belongs with the parity work, exactly as decision
-  0019 says of the far account's identifier.
-- **A second column of the owner's own categories.** §4.
 - **Whether an own-account movement should be offered to the transfer matcher.**
   §5. It is the difference between two indeterminate quantities and one internal
   transfer, and it is not a profile question at all.

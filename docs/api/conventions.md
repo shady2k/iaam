@@ -38,6 +38,16 @@ page at a time, and the position to resume from is a property of the page, not
 of any row in it. It is also the one field that cannot be reconstructed from the
 rows: an absent `next` means "this was the last page", which no row states.
 
+Journal rows do not publish a computed total. `legs` carries posted movements,
+`amount` carries the one self-stated sum of a legless fact, and `basis_fee`
+carries a trade's basis-only fee because it is a stated figure that is not a
+leg. The latter is not a second total: it is present only where the trade
+states that fee.
+
+History `changed` calls this aspect `source_description`: it compares the
+source description field, whose value may be the source's description or its
+printed counterparty text.
+
 The same reasoning already appears in the code, at the type that first needed it:
 `BalancesReportDto` is an object rather than an array of account rows because
 `negative_cash` is one fact about the whole answer, and `MarketPriceSeriesDto`
@@ -200,7 +210,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/import-sessions` | `[ImportSessionSummaryDto]` | bare array | whole list, newest first; each entry carries `row_count` and `unanswered` beside the header, so «which import is still waiting on me» is one request rather than one per session |
 | `GET /v1/actions` | `ActionsResponseDto` | object, `items` | `reports` — where each of the four reports stands, which is stated for an unobstructed one by the absence of items and so can be carried by none of them (§1.4a) |
 | `GET /v1/journal/events` | `JournalPageDto` | object, `rows` | `next` — the position to resume the page from |
-| `GET /v1/journal/events/{event}/history` | `OperationHistoryDto` | object, `steps` | `current` — the fact that counts now, which no step can state on its own, since a step knows only what it left behind and not whether a later act displaced it; and which is absent for an operation ending in a retraction, a fact about the whole history that no step carries either |
+| `GET /v1/journal/events/{event}/history` | `OperationHistoryDto` | object, `steps` | `current` — the fact that counts now, which no step can state on its own, since a step knows only what it left behind and not whether a later act displaced it; and which is absent for an operation ending in a retraction, a fact about the whole history that no step carries either. This is a correction history, not a transfer pairing view: if the event is a paired leg, the counterpart is not included, and its absence does not mean there is no counterpart |
 | `GET /v1/market/prices` | `MarketPriceSeriesDto` | object, `rows` | `complete_through` — how far the series is known |
 | `GET /v1/market/fx` | `MarketFxSeriesDto` | object, `rows` | `complete_through` |
 | `GET /v1/market/key-rate` | `MarketKeyRateSeriesDto` | object, `rows` | `complete_through` |

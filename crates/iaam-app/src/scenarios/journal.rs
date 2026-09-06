@@ -82,16 +82,6 @@ pub struct JournalReadQuery {
     /// It composes with the rest rather than replacing them: «what this rule did
     /// in March, on that account» is one query.
     pub settled_by_rule: Option<ClassificationRuleId>,
-    /// One version of that rule, where the caller wants only its rows.
-    ///
-    /// A version counts his decisions rather than one rule's revisions: every
-    /// rule he writes takes the next number in his sequence, and an edit retires
-    /// the rule and writes a new one under a new identifier and the next number.
-    /// A fact records the pair as it stood when the row was filed, so naming
-    /// both asks for exactly one decision of his. Supplied together with the
-    /// rule; a version on its own is a position in that sequence and not a name
-    /// for a rule, and is refused rather than ignored.
-    pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -153,6 +143,11 @@ pub struct JournalEventView {
     /// it is `None` wherever a leg already carries the money, so that no number
     /// has two places to be read from.
     pub amount: Option<Money>,
+    /// The basis-only fee a trade states, where one was recorded.
+    ///
+    /// This is separate from `amount`: a trade already publishes its cash and
+    /// security legs, while this fee is an audit figure that is not a leg.
+    pub basis_fee: Option<Money>,
     /// Whether this event reverses or replaces another. A reader who cannot see
     /// that an event was reversed reads a retracted fact as a live one.
     pub relation: Relation,
@@ -242,8 +237,6 @@ pub async fn read_journal(
         .as_ref()
         .map(|declared| declared_source(owner, declared))
         .transpose()?;
-    let (settled_by_rule, settled_by_rule_version) =
-        rule_filter(query.settled_by_rule, query.settled_by_rule_version)?;
 
     // One row beyond the page: the difference between "there is more" and "that
     // was everything" cannot be inferred from a full page, and a caller that
@@ -257,8 +250,7 @@ pub async fn read_journal(
                 account: query.account,
                 source,
                 import_session: query.import_session,
-                settled_by_rule,
-                settled_by_rule_version,
+                settled_by_rule: query.settled_by_rule,
                 from: range.0,
                 to: range.1,
                 after,
@@ -302,6 +294,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         dates: event.dates,
         legs: event.legs.clone(),
         amount: stated_amount(event),
+        basis_fee: stated_basis_fee(event),
         relation: event.relation,
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
@@ -412,8 +405,9 @@ pub enum ChangedAspect {
     /// When it happened: the date the journal orders the fact by, the time of
     /// day the source stated, and the semantic dates the fact carries.
     Dates,
-    /// Who the far side was, as the source printed it on the row.
-    Counterparty,
+    /// The source description field, which may carry a description or the
+    /// counterparty text printed on the row.
+    SourceDescription,
     /// How sure the fact is — and, on a reconstructed opening or a valuation,
     /// what the fact itself asserts about how sure it is.
     Confidence,
@@ -521,7 +515,6 @@ pub async fn read_operation_history(
 /// One pass forward from the head, pairing at each step the reversal and the
 /// replacement that name the fact standing there.
 fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> OperationHistory {
-    let mut standing = &head.event;
     let mut steps = vec![HistoryStep {
         act: HistoryAct::Arrived,
         at: head.recorded_at.clone(),
@@ -531,36 +524,58 @@ fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> Operation
         replacement: None,
     }];
     let mut current = Some(head.event.id);
+    let mut consumed = Vec::new();
 
-    // Every act consumes at least one fact of the chain, so the chain's length
-    // bounds the number of acts. The bound is what stops a database the core
-    // could not have written from being walked forever.
-    for _ in 0..chain.len() {
-        let Some(target) = current else { break };
-        let reversal = reversal_of(chain, target);
-        let Some(replacement) = replacement_of(chain, target) else {
-            let Some(reversal) = reversal else { break };
-            steps.push(HistoryStep {
-                act: HistoryAct::Retracted,
-                at: reversal.recorded_at.clone(),
-                state: None,
-                changed: Vec::new(),
-                reversal: Some(reversal.event.id),
-                replacement: None,
-            });
-            current = None;
-            break;
-        };
-        steps.push(HistoryStep {
-            act: HistoryAct::Corrected,
-            at: recorded_first(reversal, replacement),
-            changed: changed_aspects(standing, &replacement.event),
-            state: Some(journal_event_view(&replacement.event)),
-            reversal: reversal.map(|reversal| reversal.event.id),
-            replacement: Some(replacement.event.id),
-        });
-        current = Some(replacement.event.id);
-        standing = &replacement.event;
+    for recorded in chain.iter().skip(1) {
+        if consumed.contains(&recorded.event.id) {
+            continue;
+        }
+        match recorded.event.relation {
+            Relation::Reversal { target } => {
+                let reversal = recorded;
+                let Some(replacement) = replacement_of(chain, target)
+                    .filter(|replacement| !consumed.contains(&replacement.event.id))
+                else {
+                    steps.push(HistoryStep {
+                        act: HistoryAct::Retracted,
+                        at: reversal.recorded_at.clone(),
+                        state: None,
+                        changed: Vec::new(),
+                        reversal: Some(reversal.event.id),
+                        replacement: None,
+                    });
+                    if current == Some(target) {
+                        current = None;
+                    }
+                    continue;
+                };
+                consumed.push(replacement.event.id);
+                steps.push(HistoryStep {
+                    act: HistoryAct::Corrected,
+                    at: recorded_first(Some(reversal), replacement),
+                    changed: state_for_target(chain, target).map_or_else(Vec::new, |before| {
+                        changed_aspects(before, &replacement.event)
+                    }),
+                    state: Some(journal_event_view(&replacement.event)),
+                    reversal: Some(reversal.event.id),
+                    replacement: Some(replacement.event.id),
+                });
+                current = Some(replacement.event.id);
+            }
+            Relation::Replacement { target } => {
+                steps.push(HistoryStep {
+                    act: HistoryAct::Corrected,
+                    at: recorded.recorded_at.clone(),
+                    changed: state_for_target(chain, target)
+                        .map_or_else(Vec::new, |before| changed_aspects(before, &recorded.event)),
+                    state: Some(journal_event_view(&recorded.event)),
+                    reversal: reversal_of(chain, target).map(|reversal| reversal.event.id),
+                    replacement: Some(recorded.event.id),
+                });
+                current = Some(recorded.event.id);
+            }
+            Relation::None => {}
+        }
     }
 
     OperationHistory { steps, current }
@@ -568,9 +583,8 @@ fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> Operation
 
 /// The fact that reverses the named one, where the chain holds it.
 ///
-/// The first such fact, not every one of them: a second reversal of one target
-/// is a second fact but not a second retraction, and a database that holds one
-/// must not turn into two acts about the same target.
+/// This supplies the reversal beside a replacement-only correction. The fold
+/// itself handles every reversal so that a second one cannot disappear.
 fn reversal_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEvent> {
     chain.iter().find(
         |recorded| matches!(recorded.event.relation, Relation::Reversal { target: named } if named == target),
@@ -579,14 +593,27 @@ fn reversal_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEven
 
 /// The fact that replaces the named one, where the chain holds it.
 ///
-/// The first, for the reason [`reversal_of`] takes the first: `resolve` refuses
-/// to admit a second replacement of one event, so a chain holding two is a
-/// database nothing here can have written, and following both would publish two
-/// futures for one fact.
+/// The first is the one this fold can publish. `resolve` refuses to admit a
+/// second replacement of one event, so a chain holding two is database state
+/// nothing here could have written.
 fn replacement_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEvent> {
     chain.iter().find(
         |recorded| matches!(recorded.event.relation, Relation::Replacement { target: named } if named == target),
     )
+}
+
+/// The state a replacement supersedes, if its target was a state-bearing fact.
+///
+/// Reversals never count as states. A replacement of one therefore starts a
+/// new state after a retraction and has no before-state to compare with.
+fn state_for_target(chain: &[RecordedEvent], target: EventId) -> Option<&Event> {
+    chain
+        .iter()
+        .find(|recorded| recorded.event.id == target)
+        .and_then(|recorded| match recorded.event.relation {
+            Relation::Reversal { .. } => None,
+            Relation::None | Relation::Replacement { .. } => Some(&recorded.event),
+        })
 }
 
 /// When an act of two facts reached the journal: the earlier of the two stamps.
@@ -655,7 +682,7 @@ fn changed_aspects(before: &Event, after: &Event) -> Vec<ChangedAspect> {
         changed.push(ChangedAspect::Dates);
     }
     if before.provenance.description() != after.provenance.description() {
-        changed.push(ChangedAspect::Counterparty);
+        changed.push(ChangedAspect::SourceDescription);
     }
     if before.confidence != after.confidence || was.confidence != now.confidence {
         changed.push(ChangedAspect::Confidence);
@@ -942,29 +969,16 @@ fn stated_amount(event: &Event) -> Option<Money> {
     }
 }
 
-/// The rule narrowing, with the pair checked before either half is used.
+/// The basis-only fee a trade states, where one was recorded.
 ///
-/// A version is a position in the owner's sequence of decisions, not a name for
-/// a rule, so a version with no rule beside it addresses nothing a caller could
-/// have meant. Accepting it and ignoring it would answer a question nobody asked
-/// — every rule's rows under a request for one decision's — and the caller would
-/// have no way to tell that from a genuinely wide result.
-fn rule_filter(
-    rule: Option<ClassificationRuleId>,
-    version: Option<u32>,
-) -> Result<(Option<ClassificationRuleId>, Option<u32>), AppError> {
-    if rule.is_none() {
-        if let Some(version) = version {
-            return Err(AppError::Invalid {
-                field: "settled_by_rule_version".to_owned(),
-                expected: "a rule named beside the version, because a version is a position in \
-                           your sequence of decisions and not a name for a rule"
-                    .to_owned(),
-                actual: version.to_string(),
-            });
-        }
+/// It is not a leg and therefore cannot be recovered from `legs`; publishing
+/// it separately keeps a basis-fee-only correction visible without inventing a
+/// total for the trade.
+fn stated_basis_fee(event: &Event) -> Option<Money> {
+    match event.kind {
+        EventKind::Trade { basis_fee, .. } => basis_fee,
+        _ => None,
     }
-    Ok((rule, version))
 }
 
 fn page_size(limit: Option<u32>) -> Result<u32, AppError> {
@@ -1040,7 +1054,7 @@ mod tests {
     use std::sync::Arc;
 
     use iaam_core::dates::{CashPostedDate, EffectiveOrder};
-    use iaam_core::event::kind::EventKind;
+    use iaam_core::event::kind::{EventKind, TradeSide};
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
     use iaam_core::money::{CurrencyCode, PostedMinor};
     use iaam_core::reconciliation::evidence::IdentityScope;
@@ -1120,37 +1134,6 @@ mod tests {
             };
             assert_eq!(field, "after");
         }
-    }
-
-    #[test]
-    fn a_rule_narrows_the_journal_and_a_version_narrows_it_further() {
-        let rule = ClassificationRuleId::new_random();
-        assert_eq!(
-            rule_filter(None, None).expect("no rule named"),
-            (None, None)
-        );
-        assert_eq!(
-            rule_filter(Some(rule), None).expect("the rule alone"),
-            (Some(rule), None)
-        );
-        assert_eq!(
-            rule_filter(Some(rule), Some(3)).expect("one version of it"),
-            (Some(rule), Some(3))
-        );
-    }
-
-    #[test]
-    fn a_rule_version_with_no_rule_beside_it_is_refused() {
-        // A version is a position in the owner's sequence of decisions, so
-        // «version 3» on its own names no rule. Accepting it and ignoring it
-        // would hand back every rule's rows under a question that asked for
-        // one decision's.
-        let error = rule_filter(None, Some(3)).expect_err("a version alone is refused");
-        let AppError::Invalid { field, actual, .. } = error else {
-            panic!("a lone version is refused as an invalid field");
-        };
-        assert_eq!(field, "settled_by_rule_version");
-        assert_eq!(actual, "3");
     }
 
     #[test]
@@ -1273,6 +1256,29 @@ mod tests {
 
         fn deposit(&self, hash: u8, minor: i64, account: AccountId) -> iaam_core::event::Event {
             self.recorded(hash, minor, account, None)
+        }
+
+        fn trade(
+            &self,
+            hash: u8,
+            basis_fee_minor: i64,
+            relation: Relation,
+        ) -> iaam_core::event::Event {
+            let mut event = self.deposit(hash, -10_000, self.main);
+            let gross = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
+            let basis_fee = Money::new(PostedMinor::new(basis_fee_minor), CurrencyCode::Rub);
+            event.kind = EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument: InstrumentId::new_random(),
+                quantity: Quantity::zero(),
+                gross,
+                fee: None,
+                basis_fee: Some(basis_fee),
+                basis_fee_exact: None,
+                accrued_interest: None,
+            };
+            event.relation = relation;
+            event
         }
 
         /// A movement between two accounts of his that the source asserted and
@@ -1470,6 +1476,127 @@ mod tests {
         assert_eq!(
             history.current, None,
             "no fact of this operation counts now"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_reversal_of_one_fact_is_visible_in_history() {
+        let ctx = Ctx::new();
+        let original = ctx.deposit(1, 4_500, ctx.main);
+        let first_reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.deposit(2, 4_500, ctx.main)
+        };
+        let second_reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.deposit(3, 4_500, ctx.main)
+        };
+        ctx.write(&[
+            original.clone(),
+            first_reversal.clone(),
+            second_reversal.clone(),
+        ])
+        .await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            vec![
+                HistoryAct::Arrived,
+                HistoryAct::Retracted,
+                HistoryAct::Retracted
+            ]
+        );
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .filter_map(|step| step.reversal)
+                .collect::<Vec<_>>(),
+            vec![first_reversal.id, second_reversal.id]
+        );
+        assert_eq!(history.current, None);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_of_a_reversal_is_visible_after_the_retraction() {
+        let ctx = Ctx::new();
+        let original = ctx.deposit(1, 4_500, ctx.main);
+        let reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.deposit(2, 4_500, ctx.main)
+        };
+        let replacement = iaam_core::event::Event {
+            relation: Relation::Replacement {
+                target: reversal.id,
+            },
+            ..ctx.deposit(3, 5_200, ctx.savings)
+        };
+        ctx.write(&[original.clone(), reversal.clone(), replacement.clone()])
+            .await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            vec![
+                HistoryAct::Arrived,
+                HistoryAct::Retracted,
+                HistoryAct::Corrected
+            ]
+        );
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .filter_map(|step| step.state.as_ref().map(|state| state.event))
+                .collect::<Vec<_>>(),
+            vec![original.id, replacement.id]
+        );
+        assert_eq!(history.current, Some(replacement.id));
+    }
+
+    #[tokio::test]
+    async fn a_trade_correction_that_only_changes_basis_fee_publishes_both_fees() {
+        let ctx = Ctx::new();
+        let original = ctx.trade(1, 100, Relation::None);
+        let replacement = ctx.trade(
+            2,
+            200,
+            Relation::Replacement {
+                target: original.id,
+            },
+        );
+        ctx.write(&[original.clone(), replacement.clone()]).await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(history.steps[1].changed, vec![ChangedAspect::Amount]);
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .filter_map(|step| step.state.as_ref().map(|state| state.basis_fee))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Money::new(PostedMinor::new(100), CurrencyCode::Rub)),
+                Some(Money::new(PostedMinor::new(200), CurrencyCode::Rub)),
+            ]
         );
     }
 
@@ -1697,6 +1824,19 @@ mod tests {
             changed_aspects(&coupon, &dividend),
             vec![ChangedAspect::Kind],
             "the sum did not move, and the sort of the income did"
+        );
+    }
+
+    #[test]
+    fn a_source_description_change_is_named_as_source_description() {
+        let ctx = Ctx::new();
+        let before = ctx.deposit(1, 4_500, ctx.main);
+        let mut after = before.clone();
+        after.provenance = after.provenance.clone().with_description("Other Shop");
+
+        assert_eq!(
+            changed_aspects(&before, &after),
+            vec![ChangedAspect::SourceDescription]
         );
     }
 

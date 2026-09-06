@@ -268,42 +268,6 @@ fn the_journal_narrows_to_the_rule_that_settled_the_row() {
     );
 }
 
-/// A fact records the rule and the version together and the store selects on
-/// the pair, so two facts naming one rule under two numbers are what the
-/// narrowing has to tell apart. The owner's own rules never produce that
-/// shape — an edit retires a rule and writes a new one under a new identifier —
-/// so the pair is written here directly: the store fills the columns from what
-/// the fact says and derives neither.
-#[test]
-fn the_journal_narrows_to_one_version_of_a_rule() {
-    let store = SqliteStore::open_in_memory().unwrap();
-    let ctx = Ctx::new();
-    let rule = ClassificationRuleId::new_random();
-
-    let older = ctx.settled_by(1, RuleSettlement::Rule { rule, version: 2 });
-    let newer = ctx.settled_by(2, RuleSettlement::Rule { rule, version: 3 });
-    for event in [&older, &newer] {
-        store.append_event(event, IdentityScope::Source).unwrap();
-    }
-
-    let narrowed = store
-        .list_journal_events(
-            ctx.owner,
-            &JournalQuery {
-                settled_by_rule: Some(rule),
-                settled_by_rule_version: Some(3),
-                limit: 10,
-                ..JournalQuery::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        narrowed.iter().map(|event| event.id).collect::<Vec<_>>(),
-        vec![newer.id],
-        "one version of one rule"
-    );
-}
-
 /// The column cannot tell «no rule» from «nothing recorded», and the payload can.
 ///
 /// Both are NULL in the column, which is honest — the column exists to select a

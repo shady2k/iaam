@@ -641,9 +641,6 @@ pub struct JournalQuery {
     /// by one, so this narrows to the group a single decision of his reached —
     /// which no other handle here can assemble.
     pub settled_by_rule: Option<ClassificationRuleId>,
-    /// Only the facts that version of the rule filed. Supplied with the rule;
-    /// the refusal for a version named on its own is the scenario's.
-    pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.

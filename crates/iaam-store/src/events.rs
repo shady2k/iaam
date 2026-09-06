@@ -413,10 +413,12 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
             // Lifted out of the payload for the same reason and written from
             // the event for the same one: a caller that could pass a rule other
             // than the one the fact carries is a caller that can make the
-            // column disagree with the provenance. Both columns stay NULL where
-            // the fact names no rule — including where it says a reading found
-            // none, which the payload records and the column deliberately does
-            // not.
+            // column disagree with the provenance. The version column is kept
+            // as recorded provenance for compatibility with the schema, but it
+            // is not a second journal filter: a rule identifier has one version.
+            // Both columns stay NULL where the fact names no rule — including
+            // where it says a reading found none, which the payload records and
+            // the columns deliberately do not.
             event
                 .provenance
                 .settling_rule()
@@ -531,13 +533,6 @@ pub struct JournalQuery {
     /// name no rule, and this selects by a named one. What tells those two
     /// apart is the fact's own provenance, not this handle.
     pub settled_by_rule: Option<ClassificationRuleId>,
-    /// Narrower still: only the facts **that version** of the rule filed.
-    ///
-    /// Meaningless without the rule beside it, because a version is a position
-    /// in the owner's sequence of decisions and not a name for a rule. The
-    /// caller that refuses the pair is the application; a second copy of that
-    /// refusal here would drift from the first.
-    pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -623,13 +618,6 @@ fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rus
             &mut sql,
             " AND settled_by_rule = ?",
             Box::new(rule.inner().to_string()),
-        );
-    }
-    if let Some(version) = query.settled_by_rule_version {
-        bind(
-            &mut sql,
-            " AND settled_by_rule_version = ?",
-            Box::new(version),
         );
     }
     if let Some(from) = query.from {

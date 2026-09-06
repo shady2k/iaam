@@ -7,7 +7,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, SourceId};
+use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, PrincipalId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -242,7 +242,8 @@ pub async fn record_owner_balance(
     // source cost and for why the account is the whole of the key.
     let source = SourceId::declared(principal.owner, balance.account, OWNER_STATED_CHANNEL);
     let parser_version = ParserVersion(OWNER_STATED_PARSER_VERSION.to_owned());
-    let provenance = Provenance::new(source, balance.raw_hash, parser_version);
+    let provenance = Provenance::new(source, balance.raw_hash, parser_version)
+        .with_declared_by(PrincipalId(principal.token_id));
     let mut claims = Vec::new();
     if let Some((currency, amount)) = balance.cash {
         claims.push(ControlClaim::CashBalance {

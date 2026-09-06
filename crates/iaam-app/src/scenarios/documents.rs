@@ -6,7 +6,7 @@
 use iaam_core::dates::{EffectiveOrder, EventDates};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, EventId, OwnerId, PrincipalId, SourceId};
 use iaam_ingest::Verdict;
 use iaam_ingest::csv_source::{Directory, ParsedRow};
 use iaam_ingest::dedup::IdentityScope;
@@ -108,6 +108,7 @@ pub async fn upload_report(
             services,
             AssertionOrigin {
                 owner: principal.owner,
+                declared_by: PrincipalId(principal.token_id),
                 account,
                 source,
                 parser_version: parser_version.clone(),
@@ -300,6 +301,7 @@ async fn submit_rows(
 /// silently ends up under the wrong owner because both fields have the same type.
 struct AssertionOrigin {
     owner: OwnerId,
+    declared_by: PrincipalId,
     account: AccountId,
     source: SourceId,
     parser_version: ParserVersion,
@@ -313,6 +315,7 @@ async fn append_control_assertions(
 ) -> Result<(), AppError> {
     let AssertionOrigin {
         owner,
+        declared_by,
         account,
         source,
         parser_version,
@@ -325,7 +328,8 @@ async fn append_control_assertions(
         });
     };
     let document_hash = raw_hash.as_str();
-    let provenance = Provenance::new(source, raw_hash.clone(), parser_version);
+    let provenance =
+        Provenance::new(source, raw_hash.clone(), parser_version).with_declared_by(declared_by);
     let events: Vec<Event> = report
         .sections
         .claims()

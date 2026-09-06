@@ -24,8 +24,8 @@ use iaam_app::ingest::observation::Intake;
 use iaam_app::ingest::{Rejection, SubmittedJournalEvent, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     AccountAliasView, AccountCreated, AccountDeclarations, AccountDetailView, AccountIdentityView,
-    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView, Declared,
-    DeclinedAccountNameView, Principal, Scope, required_scope,
+    AccountScopeExclusionView, AccountTransferStatementView, AccountView, ContourView,
+    DecisionQuery, Declared, DeclinedAccountNameView, Principal, Scope, required_scope,
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
@@ -89,14 +89,14 @@ use crate::dto::{
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams,
-    FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
-    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
-    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
-    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
-    OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
-    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
-    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto,
+    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
+    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
+    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
+    PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
     RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
     ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest, RequestPlanDto,
@@ -945,6 +945,15 @@ pub async fn reconciliation_balance(
         period.to,
     )
     .await?;
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::RecordOwnerBalance,
+        request.account.to_string(),
+        serde_json::json!({"account": request.account, "from": period.from, "to": period.to}),
+        "restated by another owner balance for the same account and period",
+    )
+    .await?;
     Ok(Json(OwnerBalanceOutcomeDto {
         control_assertions: recorded.iter().map(RecordedEventDto::from_domain).collect(),
         statuses: statuses.iter().map(reconciliation_status_dto).collect(),
@@ -1011,6 +1020,15 @@ pub async fn create_classification_rule(
         request.replaces,
     )
     .await?;
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::CreateClassificationRule,
+        change.rule.id.to_string(),
+        serde_json::json!({"rule": change.rule.id}),
+        "retire the classification rule; its recomputation plan names the affected facts",
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(ClassificationRuleChangeDto::from_domain(change)?),
@@ -1041,6 +1059,15 @@ pub async fn delete_classification_rule(
 ) -> Result<Json<RecomputePlanDto>, ApiFailure> {
     require(&principal, OperationKey::CreateClassificationRule)?;
     let plan = retire_rule(&state.services, &principal, id).await?;
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::CreateClassificationRule,
+        id.to_string(),
+        serde_json::json!({"rule": id}),
+        "restore the classification rule with the same identifier",
+    )
+    .await?;
     Ok(Json(RecomputePlanDto::from_domain(plan)))
 }
 /// Active and retired owner category groups.
@@ -1247,6 +1274,15 @@ pub async fn create_category_rule_route(
             },
             replaces: request.replaces.map(CategoryRuleId),
         },
+    )
+    .await?;
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::CreateCategoryRule,
+        rule.id.inner().to_string(),
+        serde_json::json!({"rule": rule.id.inner()}),
+        "retire the category rule; its history remains available",
     )
     .await?;
     Ok((StatusCode::CREATED, Json(CategoryRuleDto::from_port(rule))))
@@ -1753,6 +1789,15 @@ pub async fn create_account(
     let account = match created {
         AccountCreated::Created(account) | AccountCreated::Existing(account) => account,
     };
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::CreateAccount,
+        account.id.inner().to_string(),
+        serde_json::json!({"account": account.id.inner()}),
+        "retire the account; an account carrying no facts is inert",
+    )
+    .await?;
     Ok((status, Json(account_dto(account))))
 }
 
@@ -2231,6 +2276,15 @@ pub async fn record_account_scope(
         }
     }
 
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::RecordAccountScope,
+        account.inner().to_string(),
+        serde_json::json!({"account": account.inner(), "disposition": format!("{:?}", request.disposition)}),
+        "restated with PUT or withdrawn by the undecided disposition",
+    )
+    .await?;
     Ok(Json(account_scope_dto(&state, &principal, &named).await?))
 }
 
@@ -2359,6 +2413,15 @@ pub async fn record_account_name_disposition(
         }
     };
 
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::RecordAccountNameDisposition,
+        printed.clone(),
+        serde_json::json!({"printed": printed.clone(), "disposition": format!("{:?}", request.disposition)}),
+        "set disposition to undecided for the same printed name",
+    )
+    .await?;
     Ok(Json(PrintedAccountNameDto {
         printed,
         disposition: request.disposition,
@@ -2454,6 +2517,15 @@ pub async fn record_account_retirement(
             withdraw_account_retirement(&state.services, &principal, named.id).await?
         }
     };
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::RecordAccountRetirement,
+        named.id.inner().to_string(),
+        serde_json::json!({"account": named.id.inner(), "state": format!("{:?}", request.state)}),
+        "withdraw under the same account key",
+    )
+    .await?;
     Ok(Json(account_retirement_dto(&named, &outcome)))
 }
 
@@ -2548,6 +2620,15 @@ pub async fn record_account_transfer_partners(
         .record_account_transfer_statement(principal.owner, statement)
         .await?;
 
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::RecordAccountTransferPartners,
+        account.inner().to_string(),
+        serde_json::json!({"account": account.inner()}),
+        "replace the complete transfer-partner enumeration",
+    )
+    .await?;
     Ok(Json(
         account_transfer_partners_dto(&state, &principal, account).await?,
     ))
@@ -2632,6 +2713,17 @@ pub async fn record_account_transfer_partners_batch(
         .record_account_transfer_statements(principal.owner, statements)
         .await?;
 
+    for account in &accounts {
+        record_decision(
+            &state,
+            &principal,
+            OperationKey::RecordAccountTransferPartners,
+            account.inner().to_string(),
+            serde_json::json!({"account": account.inner()}),
+            "replace the complete transfer-partner enumeration",
+        )
+        .await?;
+    }
     let mut recorded = Vec::with_capacity(accounts.len());
     for account in accounts {
         recorded.push(account_transfer_partners_dto(&state, &principal, account).await?);
@@ -2711,6 +2803,15 @@ pub async fn clear_account_transfer_partners(
         .store
         .clear_account_transfer_statement(principal.owner, account)
         .await?;
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::RecordAccountTransferPartners,
+        account.inner().to_string(),
+        serde_json::json!({"account": account.inner(), "disposition": "undecided"}),
+        "record the complete transfer-partner enumeration again",
+    )
+    .await?;
     Ok(Json(
         account_transfer_partners_dto(&state, &principal, account).await?,
     ))
@@ -3076,6 +3177,15 @@ pub async fn create_contour_version(
         )
         .await?;
 
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::CreateContour,
+        contour.0.to_string(),
+        serde_json::json!({"contour": contour.0, "version": version.0}),
+        "add a later version to replace the contour's composition",
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(ContourVersionDto {
@@ -3170,6 +3280,15 @@ pub async fn add_contour_version(
         )
         .await?;
 
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::AddContourVersion,
+        format!("{}:{}", current.id.0, version.0),
+        serde_json::json!({"contour": current.id.0, "version": version.0}),
+        "add another version to replace this composition",
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(ContourVersionDto {
@@ -4099,11 +4218,11 @@ pub async fn commit_import_session(
 ///
 /// A bank statement prints its own arithmetic — opening balance, closing
 /// balance, and how much crossed the account each way — and until now a session
-/// could not take it. The figures went in afterwards, through the owner-only
-/// reconciliation route, against a journal that already held whatever the import
-/// got wrong. So the one moment a mismatch was cheap was the one moment nothing
-/// compared anything, while the source had printed the answer on the same page
-/// as the rows.
+/// could not take it. The figures went in afterwards, through the
+/// reconciliation route, against a journal that already held whatever the
+/// import got wrong. So the one moment a mismatch was cheap was the one moment
+/// nothing compared anything, while the source had printed the answer on the
+/// same page as the rows.
 ///
 /// Stating them makes the assessment compare: `control_reconciliation` puts both
 /// numbers beside each other per account and currency, and a disagreement takes
@@ -5250,6 +5369,61 @@ pub async fn list_journal_events(
     }))
 }
 
+/// The owner's decision record: who acted, what was settled, and what undoes it.
+///
+/// This view is deliberately not a scope-filtered queue. It is the owner's
+/// after-the-fact audit, and an agent cannot use it to turn a call's acceptance
+/// into permission to read the owner's history.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct DecisionParams {
+    /// Inclusive lower bound on the recording date, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub from: Option<String>,
+    /// Inclusive upper bound on the recording date, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub to: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/decisions",
+    params(DecisionParams),
+    responses(
+        (status = 200, description = "The owner's recorded decisions", body = Vec<DecisionDto>),
+        (status = 403, description = "Owner scope required", body = ApiError),
+        (status = 422, description = "A date parameter could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_decisions(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<DecisionParams>,
+) -> Result<Json<Vec<DecisionDto>>, ApiFailure> {
+    if principal.scope != Scope::Owner {
+        return Err(ApiFailure::forbidden(principal.scope.code()));
+    }
+    let from = params
+        .from
+        .as_deref()
+        .map(|value| parse_query_date("from", value))
+        .transpose()?;
+    let to = params
+        .to
+        .as_deref()
+        .map(|value| parse_query_date("to", value))
+        .transpose()?;
+    let records = state
+        .services
+        .store
+        .list_decisions(principal.owner, DecisionQuery { from, to })
+        .await?;
+    Ok(Json(records.iter().map(DecisionDto::from_domain).collect()))
+}
+
 /// One operation's life: what it was when it arrived, and every act since.
 ///
 /// The sibling of `GET /v1/journal/events`, and a different question rather than
@@ -5592,6 +5766,29 @@ fn require(principal: &Principal, operation: OperationKey) -> Result<(), ApiFail
     } else {
         Err(ApiFailure::forbidden(principal.scope.code()))
     }
+}
+
+async fn record_decision(
+    state: &ServerState,
+    principal: &Principal,
+    operation: OperationKey,
+    subject: String,
+    decision: serde_json::Value,
+    undo: &str,
+) -> Result<(), ApiFailure> {
+    state
+        .services
+        .store
+        .record_decision(
+            principal.owner,
+            iaam_core::ids::PrincipalId(principal.token_id),
+            operation.as_str().to_owned(),
+            subject,
+            decision,
+            undo.to_owned(),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Refuse a call to an owner-only route that no [`OperationKey`] names.

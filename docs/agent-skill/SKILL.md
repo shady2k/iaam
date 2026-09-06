@@ -139,13 +139,11 @@ of your own is the most expensive mistake that can be made here.
 
 The agent is not part of the system and has no access to its storage. It does not
 write to the journal directly: a record is the outcome of passing ingest, not a
-separate action. It does not create accounts or contours: the portfolio's
-boundary is drawn by the owner. It does not rule on what is already recorded —
-retracting a fact the owner holds is his act, and his credential is what the
-system will accept for it. The one exception is narrow: an agent may take back an
-import it declared, while nothing has been built on it. And it does not **read**
-the owner's statements: what it knows about their contents is what the API
-answered.
+separate action. It may carry the owner's answer through any operation the API
+accepts. The API's acceptance of that call is not permission to invent its
+contents: the agent still never answers in the owner's place. It does not
+**read** the owner's statements: what it knows about their contents is what the
+API answered.
 
 From this follows the thing that is easiest to violate out of the best
 intentions: a missing value is asked of the owner, not filled in. A guess that

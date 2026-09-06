@@ -21,7 +21,8 @@ use iaam_app::ingest::operation::{OperationDates, OperationKind, SubmittedOperat
 use iaam_app::ingest::{Rejection, Verdict};
 use iaam_app::ports::{
     BrokerAccessView, BrokerEnvironment, CashAssetClass, CategoryRuleView, CategoryView,
-    ClassificationRuleView, IssuedToken, NegativeBalanceExpectation, Scope, TokenView,
+    ClassificationRuleView, DecisionRecord, IssuedToken, NegativeBalanceExpectation, Scope,
+    TokenView,
 };
 use iaam_app::ports::{ImportSessionSummaryView, ImportSessionView, Recorded};
 use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
@@ -4624,6 +4625,42 @@ pub struct ActionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<ActionSubjectDto>,
     pub target: ActionTargetDto,
+}
+
+/// One journal or standing decision in the owner's bounded review.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DecisionDto {
+    pub operation: String,
+    pub actor: Option<DecisionActorDto>,
+    pub subject: String,
+    pub decision: serde_json::Value,
+    pub undo: String,
+    #[serde(rename = "recordedAt")]
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DecisionActorDto {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+impl DecisionDto {
+    #[must_use]
+    pub fn from_domain(record: &DecisionRecord) -> Self {
+        Self {
+            operation: record.operation.clone(),
+            actor: record.declared_by.map(|id| DecisionActorDto {
+                id: id.inner(),
+                scope: record.actor_scope.map(|scope| scope.code().to_owned()),
+            }),
+            subject: record.subject.clone(),
+            decision: record.decision.clone(),
+            undo: record.undo.clone(),
+            recorded_at: record.recorded_at.clone(),
+        }
+    }
 }
 
 /// The typed subject of an action.
@@ -11265,9 +11302,9 @@ pub struct MirroredPairDto {
 /// in the outcome would be that map written a step later.
 ///
 /// `matcher` is the body `POST /v1/classification-rules` takes, minus the
-/// outcome he chooses. Sending it is his call and not an agent's: it decides
-/// rows nobody has looked at, which is the same act that route is owner-only
-/// for.
+/// outcome the caller chooses. Sending it is a reversible call available to an
+/// agent; the question remains separate because this object is a proposal, not
+/// an implicit write of a standing decision.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OfferedRuleDto {
     /// The condition, in the shape the rule route takes.

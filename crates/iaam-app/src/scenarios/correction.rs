@@ -357,11 +357,10 @@ fn standing_rule_for(
 /// **Who may call it.** The owner, for any import. An agent, for an import it
 /// declared itself and nothing has been built on — see
 /// [`undoes_only_its_own_declaration`] for the four conditions and for why they
-/// are decided here rather than at the transport. That is narrower than
-/// [`correct_events`] beside it, which stays owner-only, and the difference is
-/// the doctrine rather than an inconsistency: taking back your own declaration
-/// returns the journal to the state before you acted, and naming an event of the
-/// owner's to reverse is a judgement about his history.
+/// are decided here rather than at the transport. Unlike [`correct_events`],
+/// this route has an extra journal-bound precondition because an arbitrary
+/// import target can include facts the agent did not submit. The distinction is
+/// evidence about the target, not a second scope grade.
 pub async fn correct_import(
     services: &AppServices,
     principal: &Principal,
@@ -421,7 +420,11 @@ pub async fn correct_import(
         });
     }
 
-    let candidates: Vec<Event> = targets.iter().map(reversal_for).collect();
+    let declared_by = PrincipalId(principal.token_id);
+    let candidates: Vec<Event> = targets
+        .iter()
+        .map(|target| reversal_for(target, declared_by))
+        .collect();
     let candidates = checked_against_resolve(events, candidates)?;
     let recorded =
         crate::scenarios::ingest::append_checked(services, candidates, IdentityScope::Source)
@@ -448,34 +451,25 @@ pub async fn correct_import(
     })
 }
 
-/// Only the owner corrects the journal event by event.
+/// A correction is two append-only facts: a reversal and, where requested, its
+/// replacement. Another correction can put the journal back, so an agent token
+/// may submit this operation. The route still requires the owner's answer in
+/// its request; admitting the call does not let the agent invent one.
 ///
-/// A reversal rewrites what every downstream report says, and naming an
-/// arbitrary event to reverse is a judgement about the owner's history: which
-/// of the facts he holds should stop counting. Nothing about the caller's own
-/// conduct bounds it, so nothing narrower than the owner's scope will do.
+/// Import-wide retraction has a narrower, evidence-based rule in
+/// [`correct_import`]. That rule is not a second scope grade: it proves that
+/// the agent declared every covered row and that no later decision depends on
+/// those rows.
 ///
-/// This is also why corrections do not ride the ingest transport, and that half
-/// is unchanged by `iaam-rond`: [`crate::ports::Scope::may_submit`] admits an
-/// agent, and a relation field on an ingest row would make every ingest handler
-/// a retraction surface guarded by a per-row check that one input could forget.
-/// A separate route with its own gate is the right shape; only the gate on
-/// [`correct_import`] moved.
-///
-/// The reason that comment used to give — "the agent is an external client that
-/// does not decide the portfolio's shape" — was already false when it was
-/// written. Committing an import is open to the agent and rewrites every
-/// downstream report, so the agent does decide the portfolio's shape by adding
-/// to it; the gate closed only the safer direction, and left an agent that
-/// finds by control total that it wrote nonsense with nothing to do but wake the
-/// owner to undo the agent's own mistake.
+/// The scope test is therefore about whether the append-only correction has a
+/// named undo, not about whether a report changes as a consequence.
 fn may_correct(principal: &Principal) -> Result<(), AppError> {
-    if principal.scope.may_administer() {
+    if principal.scope.may_submit() {
         Ok(())
     } else {
         Err(AppError::Invalid {
             field: "scope".to_owned(),
-            expected: "owner permission to correct the journal".to_owned(),
+            expected: "permission to submit corrections".to_owned(),
             actual: principal.scope.code().to_owned(),
         })
     }
@@ -783,7 +777,7 @@ fn candidate_for(
                     actual: target.inner().to_string(),
                 });
             }
-            Ok(reversal_for(original))
+            Ok(reversal_for(original, PrincipalId(principal.token_id)))
         }
         CorrectionRequest::Replacement { target, operation } => {
             // Looked up here rather than left to `resolve`, so a replacement of
@@ -813,10 +807,12 @@ fn candidate_for(
                 expected: rejection.expected,
                 actual: rejection.actual,
             })?;
-            Ok(Event {
-                relation: Relation::Replacement { target: *target },
-                ..normalized.event
-            })
+            let mut event = normalized.event;
+            event.provenance = event
+                .provenance
+                .with_declared_by(PrincipalId(principal.token_id));
+            event.relation = Relation::Replacement { target: *target };
+            Ok(event)
         }
     }
 }
@@ -835,7 +831,7 @@ fn unknown_target(index: usize, target: EventId) -> AppError {
 /// before it is written, and a reversal that carried no legs would be a
 /// malformed event in an append-only journal. They never post: `resolve` drops
 /// every reversal from the effective set.
-fn reversal_for(original: &Event) -> Event {
+fn reversal_for(original: &Event, declared_by: PrincipalId) -> Event {
     let idempotency_key = format!("correction/reversal/{}", original.id.inner());
     let raw_hash = hash_of(&idempotency_key);
     // Sequence zero, like custody repair: the store assigns the real one within
@@ -861,7 +857,8 @@ fn reversal_for(original: &Event) -> Event {
             SourceId::declared(original.owner, original.account, CORRECTION_CHANNEL),
             raw_hash,
             ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
-        ),
+        )
+        .with_declared_by(declared_by),
         relation: Relation::Reversal {
             target: original.id,
         },
@@ -950,7 +947,8 @@ mod tests {
     #[test]
     fn a_reversal_keeps_the_facts_of_its_target_and_names_this_build() {
         let original = deposit(1, SourceId::new_random());
-        let reversal = reversal_for(&original);
+        let declared_by = PrincipalId(uuid::Uuid::from_u128(4));
+        let reversal = reversal_for(&original, declared_by);
 
         assert_eq!(
             reversal.relation,
@@ -967,6 +965,7 @@ mod tests {
             reversal.provenance.parser_version(),
             &ParserVersion(CORRECTION_PARSER_VERSION.to_owned())
         );
+        assert_eq!(reversal.provenance.declared_by(), Some(declared_by));
         assert_eq!(
             reversal.provenance.source(),
             SourceId::declared(owner(), account(), CORRECTION_CHANNEL),
@@ -1030,12 +1029,18 @@ mod tests {
         );
         assert_eq!(
             event.provenance.parser_version(),
-            reversal_for(&original).provenance.parser_version(),
+            reversal_for(&original, PrincipalId(uuid::Uuid::from_u128(4)))
+                .provenance
+                .parser_version(),
             "one channel, one writer: the two halves must not disagree"
         );
         assert_eq!(
             event.provenance.source(),
             SourceId::declared(owner(), account(), CORRECTION_CHANNEL)
+        );
+        assert_eq!(
+            event.provenance.declared_by(),
+            Some(PrincipalId(principal.token_id))
         );
     }
 
@@ -1150,7 +1155,7 @@ mod tests {
         let corrected = filed_by_rule(1, rule, 3);
         let also_corrected = filed_by_rule(2, rule, 3);
         let already_reversed = filed_by_rule(3, rule, 3);
-        let reversal = reversal_for(&already_reversed);
+        let reversal = reversal_for(&already_reversed, PrincipalId(uuid::Uuid::from_u128(4)));
         let untouched = filed_by_rule(4, rule, 3);
         let journal = vec![
             corrected.clone(),
@@ -1178,8 +1183,8 @@ mod tests {
     fn reversing_the_same_event_twice_produces_the_same_key() {
         let original = deposit(1, SourceId::new_random());
         assert_eq!(
-            reversal_for(&original).idempotency_key,
-            reversal_for(&original).idempotency_key,
+            reversal_for(&original, PrincipalId(uuid::Uuid::from_u128(4))).idempotency_key,
+            reversal_for(&original, PrincipalId(uuid::Uuid::from_u128(4))).idempotency_key,
             "a repeat correction must deduplicate rather than write a second fact"
         );
     }
@@ -1216,7 +1221,7 @@ mod tests {
             target: EventId(uuid::Uuid::from_u128(99)),
         };
         let sound = deposit(2, SourceId::new_random());
-        let candidate = reversal_for(&sound);
+        let candidate = reversal_for(&sound, PrincipalId(uuid::Uuid::from_u128(4)));
 
         let error = checked_against_resolve(vec![broken, sound], vec![candidate])
             .expect_err("the journal does not resolve");
@@ -1251,7 +1256,7 @@ mod tests {
     #[test]
     fn a_correction_key_held_by_an_unrelated_event_is_a_conflict() {
         let original = deposit(1, SourceId::new_random());
-        let candidate = reversal_for(&original);
+        let candidate = reversal_for(&original, PrincipalId(uuid::Uuid::from_u128(4)));
         let mut squatter = deposit(2, SourceId::new_random());
         squatter.idempotency_key = candidate.idempotency_key.clone();
 
@@ -1326,23 +1331,30 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owner_corrects_the_journal() {
+    fn an_agent_may_submit_a_correction_and_a_read_only_token_may_not() {
         use crate::ports::Scope;
 
-        for scope in [Scope::Agent, Scope::ReadOnly] {
-            let principal = Principal {
+        assert!(
+            may_correct(&Principal {
                 token_id: uuid::Uuid::from_u128(3),
                 owner: owner(),
-                scope,
-            };
-            let AppError::Invalid { field, actual, .. } =
-                may_correct(&principal).expect_err("only the owner may correct")
-            else {
-                panic!("expected an invalid request");
-            };
-            assert_eq!(field, "scope");
-            assert_eq!(actual, scope.code());
-        }
+                scope: Scope::Agent,
+            })
+            .is_ok()
+        );
+
+        let principal = Principal {
+            token_id: uuid::Uuid::from_u128(3),
+            owner: owner(),
+            scope: Scope::ReadOnly,
+        };
+        let AppError::Invalid { field, actual, .. } =
+            may_correct(&principal).expect_err("a read-only token may not correct")
+        else {
+            panic!("expected an invalid request");
+        };
+        assert_eq!(field, "scope");
+        assert_eq!(actual, Scope::ReadOnly.code());
 
         assert!(
             may_correct(&Principal {

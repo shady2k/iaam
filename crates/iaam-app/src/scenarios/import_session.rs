@@ -27,7 +27,7 @@ use iaam_core::event::{
 };
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId,
-    SourceId,
+    PrincipalId, SourceId,
 };
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
@@ -1891,8 +1891,8 @@ pub struct AnsweredQuestions {
 /// control section is opening balance, closing balance and turnover each way,
 /// and the journal has had the vocabulary for exactly those since §10.3. It has
 /// only ever been able to receive them *after* the rows were written, through
-/// the owner-only reconciliation route, against a journal that already held
-/// whatever the import got wrong.
+/// the reconciliation route, against a journal that already held whatever the
+/// import got wrong.
 ///
 /// Four things are refused here rather than at commit, because each is a mistake
 /// in the transcription and the transcriber is the only one who can fix it:
@@ -2108,11 +2108,13 @@ pub async fn commit_session(
     // intermediate state that misleads: for as long as it stands alone, the
     // figures look confirmable against a journal that is short the very rows
     // this attempt dropped.
-    let assertions = control_assertions(principal.owner, &planned.plan);
+    let declared_by = PrincipalId(principal.token_id);
+    let assertions = control_assertions(principal.owner, declared_by, &planned.plan);
     let stated = assertions.len();
     let mut writing = assertions;
     writing.extend(coverage_gaps(
         principal.owner,
+        declared_by,
         &planned.plan,
         &planned.declined,
     ));
@@ -5160,7 +5162,11 @@ fn control_assertion_key(
 ///
 /// [`ControlClaim::CashBalance`]: iaam_core::reconciliation::claim::ControlClaim::CashBalance
 /// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
-fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event::Event> {
+fn control_assertions(
+    owner: OwnerId,
+    declared_by: PrincipalId,
+    plan: &ImportPlan,
+) -> Vec<iaam_core::event::Event> {
     let mut events = Vec::new();
     for section in plan
         .control_reconciliation
@@ -5198,7 +5204,8 @@ fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event
             section_hash(section),
             ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
         )
-        .with_import_session(plan.session.id);
+        .with_import_session(plan.session.id)
+        .with_declared_by(declared_by);
         for claim in claims {
             events.push(iaam_core::event::Event {
                 id: EventId::new_random(),
@@ -5404,6 +5411,7 @@ fn coverage_gap_key(account: AccountId, period: AssertionPeriod, rows: &[Refused
 /// statement.
 fn coverage_gaps(
     owner: OwnerId,
+    declared_by: PrincipalId,
     plan: &ImportPlan,
     declined: &[DeclinedRow],
 ) -> Vec<iaam_core::event::Event> {
@@ -5432,7 +5440,8 @@ fn coverage_gaps(
             RawHash::parse(&digest_hex(&key))
                 .expect("a SHA-256 digest is 64 hexadecimal characters"),
             ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
-        );
+        )
+        .with_declared_by(declared_by);
         if let Some(event) = coverage_gap::gap_event(
             coverage_gap::GapTarget {
                 owner,
@@ -8658,22 +8667,17 @@ fn require_submit(principal: &Principal) -> Result<(), AppError> {
 /// from months the caller has not imported, and including rows it will never
 /// see, because a matched row is never asked about.
 ///
-/// The second act is the same one `POST /v1/classification-rules` performs, and
-/// that route is owner-only. Admitting the agent here and refusing it there
-/// would leave the harder gate protecting nothing: the agent would simply make
-/// the decision through the route whose name does not mention rules. So the
-/// answer is refused a rule rather than the whole call — the row still settles,
-/// and the import still finishes without waking the owner twice.
-///
-/// The cost is real and is the point: an agent relaying the owner's answers is
-/// asked about the same counterparty again next month, because nobody recorded
-/// that the answer generalises. Turning it into a rule is one call the owner
-/// makes with his own token, and it is a decision he can then read back, edit
-/// and retire.
+/// The rule is a separate reversible operation, so an agent may write it
+/// through `POST /v1/classification-rules`. This answer route deliberately
+/// keeps the acts separate for an agent: the row settles, while the response
+/// carries the possible rule for a separate call. An owner answer may perform
+/// both acts as a convenience.
 ///
 /// It reads [`crate::ports::Scope::may_administer`] and not a gate of its own:
-/// this **is** the administer decision, arriving by another door, and a second
-/// predicate beside it would be a second place for the two to drift apart.
+/// this is the administer decision for the answer route's convenience path,
+/// arriving by another door, and a second predicate beside it would be a second
+/// place for the two to drift apart.
+///
 ///
 /// **Public since `iaam-sh6m`,** because the queue must say what a caller's
 /// answer will keep and the authority is the caller's fact to supply: the route

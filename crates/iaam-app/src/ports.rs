@@ -7,7 +7,7 @@ use iaam_core::event::Event;
 use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{
     AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId,
-    ImportId, ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, SourceId,
+    ImportId, ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, PrincipalId, SourceId,
 };
 use iaam_core::operation::OperationKey;
 use iaam_core::projection::Snapshot;
@@ -629,6 +629,27 @@ pub struct JournalQuery {
     pub limit: u32,
 }
 
+/// One decision the owner can review, including its actor and undo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionRecord {
+    pub operation: String,
+    /// `None` means the record predates attribution; never «by nobody».
+    pub declared_by: Option<PrincipalId>,
+    /// Read from the token record, not inferred from the token identifier.
+    pub actor_scope: Option<Scope>,
+    pub subject: String,
+    pub decision: serde_json::Value,
+    pub undo: String,
+    pub recorded_at: String,
+}
+
+/// Inclusive calendar bounds for a decision review.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionQuery {
+    pub from: Option<Date>,
+    pub to: Option<Date>,
+}
+
 /// A document to keep: the bytes the facts were parsed from.
 ///
 /// The type belongs to the port rather than the store, for the reason
@@ -748,6 +769,26 @@ pub trait Store: Send + Sync {
         query: JournalQuery,
     ) -> Result<Vec<Event>, AppError>;
 
+    /// All journal facts and standing decisions attributable to the owner,
+    /// bounded by the moment this instance recorded them.
+    async fn list_decisions(
+        &self,
+        owner: OwnerId,
+        query: DecisionQuery,
+    ) -> Result<Vec<DecisionRecord>, AppError>;
+
+    /// Record the actor of a standing decision. The typed record remains the
+    /// source of truth; this row is the cross-family review index.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_decision(
+        &self,
+        owner: OwnerId,
+        declared_by: PrincipalId,
+        operation: String,
+        subject: String,
+        decision: serde_json::Value,
+        undo: String,
+    ) -> Result<(), AppError>;
     /// Every fact of one operation's correction chain, oldest first.
     ///
     /// Separate from [`Store::list_journal_events`], which answers "show me the

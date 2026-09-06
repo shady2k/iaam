@@ -38,6 +38,12 @@ page at a time, and the position to resume from is a property of the page, not
 of any row in it. It is also the one field that cannot be reconstructed from the
 rows: an absent `next` means "this was the last page", which no row states.
 
+Journal rows do not publish a computed total. `legs` carries posted movements,
+`amount` carries the one self-stated sum of a legless fact, and `basis_fee`
+carries a trade's basis-only fee because it is a stated figure that is not a
+leg. The latter is not a second total: it is present only where the trade
+states that fee.
+
 The same reasoning already appears in the code, at the type that first needed it:
 `BalancesReportDto` is an object rather than an array of account rows because
 `negative_cash` is one fact about the whole answer, and `MarketPriceSeriesDto`

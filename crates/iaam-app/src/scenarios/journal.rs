@@ -143,6 +143,11 @@ pub struct JournalEventView {
     /// it is `None` wherever a leg already carries the money, so that no number
     /// has two places to be read from.
     pub amount: Option<Money>,
+    /// The basis-only fee a trade states, where one was recorded.
+    ///
+    /// This is separate from `amount`: a trade already publishes its cash and
+    /// security legs, while this fee is an audit figure that is not a leg.
+    pub basis_fee: Option<Money>,
     /// Whether this event reverses or replaces another. A reader who cannot see
     /// that an event was reversed reads a retracted fact as a live one.
     pub relation: Relation,
@@ -289,6 +294,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         dates: event.dates,
         legs: event.legs.clone(),
         amount: stated_amount(event),
+        basis_fee: stated_basis_fee(event),
         relation: event.relation,
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
@@ -962,6 +968,18 @@ fn stated_amount(event: &Event) -> Option<Money> {
     }
 }
 
+/// The basis-only fee a trade states, where one was recorded.
+///
+/// It is not a leg and therefore cannot be recovered from `legs`; publishing
+/// it separately keeps a basis-fee-only correction visible without inventing a
+/// total for the trade.
+fn stated_basis_fee(event: &Event) -> Option<Money> {
+    match event.kind {
+        EventKind::Trade { basis_fee, .. } => basis_fee,
+        _ => None,
+    }
+}
+
 fn page_size(limit: Option<u32>) -> Result<u32, AppError> {
     let Some(limit) = limit else {
         return Ok(DEFAULT_PAGE_SIZE);
@@ -1035,7 +1053,7 @@ mod tests {
     use std::sync::Arc;
 
     use iaam_core::dates::{CashPostedDate, EffectiveOrder};
-    use iaam_core::event::kind::EventKind;
+    use iaam_core::event::kind::{EventKind, TradeSide};
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
     use iaam_core::money::{CurrencyCode, PostedMinor};
     use iaam_core::reconciliation::evidence::IdentityScope;
@@ -1237,6 +1255,29 @@ mod tests {
 
         fn deposit(&self, hash: u8, minor: i64, account: AccountId) -> iaam_core::event::Event {
             self.recorded(hash, minor, account, None)
+        }
+
+        fn trade(
+            &self,
+            hash: u8,
+            basis_fee_minor: i64,
+            relation: Relation,
+        ) -> iaam_core::event::Event {
+            let mut event = self.deposit(hash, -10_000, self.main);
+            let gross = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
+            let basis_fee = Money::new(PostedMinor::new(basis_fee_minor), CurrencyCode::Rub);
+            event.kind = EventKind::Trade {
+                side: TradeSide::Buy,
+                instrument: InstrumentId::new_random(),
+                quantity: Quantity::zero(),
+                gross,
+                fee: None,
+                basis_fee: Some(basis_fee),
+                basis_fee_exact: None,
+                accrued_interest: None,
+            };
+            event.relation = relation;
+            event
         }
 
         /// A movement between two accounts of his that the source asserted and
@@ -1527,6 +1568,35 @@ mod tests {
             vec![original.id, replacement.id]
         );
         assert_eq!(history.current, Some(replacement.id));
+    }
+
+    #[tokio::test]
+    async fn a_trade_correction_that_only_changes_basis_fee_publishes_both_fees() {
+        let ctx = Ctx::new();
+        let original = ctx.trade(1, 100, Relation::None);
+        let replacement = ctx.trade(
+            2,
+            200,
+            Relation::Replacement {
+                target: original.id,
+            },
+        );
+        ctx.write(&[original.clone(), replacement.clone()]).await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(history.steps[1].changed, vec![ChangedAspect::Amount]);
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .filter_map(|step| step.state.as_ref().map(|state| state.basis_fee))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Money::new(PostedMinor::new(100), CurrencyCode::Rub)),
+                Some(Money::new(PostedMinor::new(200), CurrencyCode::Rub)),
+            ]
+        );
     }
 
     /// Most of his journal is this: a fact that arrived and was never touched.

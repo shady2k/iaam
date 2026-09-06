@@ -8999,6 +8999,9 @@ pub struct JournalEventReadDto {
     /// carries the money, so that no number has two places here to be read from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<AmountDto>,
+    /// A trade's basis-only fee, which is not repeated as a leg or a total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis_fee: Option<AmountDto>,
     pub relation: JournalRelationDto,
     pub confidence: JournalConfidenceDto,
     /// The client key supplied at ingest, if one was.
@@ -9341,6 +9344,7 @@ impl JournalEventReadDto {
             dates: JournalEventDatesDto::from_domain(view.dates),
             legs: view.legs.iter().map(JournalLegDto::from_domain).collect(),
             amount: view.amount.map(AmountDto::from_money),
+            basis_fee: view.basis_fee.map(AmountDto::from_money),
             relation: JournalRelationDto::from_domain(view.relation),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),

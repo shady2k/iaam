@@ -9552,8 +9552,9 @@ pub enum HistoryChangedAspectDto {
     /// When it happened: the date the journal orders the fact by, the time of
     /// day the source stated, and the semantic dates the fact carries.
     Dates,
-    /// Who the far side was, as the source printed it on the row.
-    Counterparty,
+    /// The source description field, which may carry a description or the
+    /// counterparty text printed on the row.
+    SourceDescription,
     /// How sure the fact is — and, on a reconstructed opening or a valuation,
     /// what the fact itself asserts about how sure it is.
     Confidence,
@@ -9610,7 +9611,7 @@ impl HistoryChangedAspectDto {
             ChangedAspect::Amount => Self::Amount,
             ChangedAspect::Account => Self::Account,
             ChangedAspect::Dates => Self::Dates,
-            ChangedAspect::Counterparty => Self::Counterparty,
+            ChangedAspect::SourceDescription => Self::SourceDescription,
             ChangedAspect::Confidence => Self::Confidence,
         }
     }

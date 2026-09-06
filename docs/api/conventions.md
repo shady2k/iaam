@@ -44,6 +44,10 @@ carries a trade's basis-only fee because it is a stated figure that is not a
 leg. The latter is not a second total: it is present only where the trade
 states that fee.
 
+History `changed` calls this aspect `source_description`: it compares the
+source description field, whose value may be the source's description or its
+printed counterparty text.
+
 The same reasoning already appears in the code, at the type that first needed it:
 `BalancesReportDto` is an object rather than an array of account rows because
 `negative_cash` is one fact about the whole answer, and `MarketPriceSeriesDto`

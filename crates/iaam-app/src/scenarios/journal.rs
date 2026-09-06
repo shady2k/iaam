@@ -405,8 +405,9 @@ pub enum ChangedAspect {
     /// When it happened: the date the journal orders the fact by, the time of
     /// day the source stated, and the semantic dates the fact carries.
     Dates,
-    /// Who the far side was, as the source printed it on the row.
-    Counterparty,
+    /// The source description field, which may carry a description or the
+    /// counterparty text printed on the row.
+    SourceDescription,
     /// How sure the fact is — and, on a reconstructed opening or a valuation,
     /// what the fact itself asserts about how sure it is.
     Confidence,
@@ -681,7 +682,7 @@ fn changed_aspects(before: &Event, after: &Event) -> Vec<ChangedAspect> {
         changed.push(ChangedAspect::Dates);
     }
     if before.provenance.description() != after.provenance.description() {
-        changed.push(ChangedAspect::Counterparty);
+        changed.push(ChangedAspect::SourceDescription);
     }
     if before.confidence != after.confidence || was.confidence != now.confidence {
         changed.push(ChangedAspect::Confidence);
@@ -1823,6 +1824,19 @@ mod tests {
             changed_aspects(&coupon, &dividend),
             vec![ChangedAspect::Kind],
             "the sum did not move, and the sort of the income did"
+        );
+    }
+
+    #[test]
+    fn a_source_description_change_is_named_as_source_description() {
+        let ctx = Ctx::new();
+        let before = ctx.deposit(1, 4_500, ctx.main);
+        let mut after = before.clone();
+        after.provenance = after.provenance.clone().with_description("Other Shop");
+
+        assert_eq!(
+            changed_aspects(&before, &after),
+            vec![ChangedAspect::SourceDescription]
         );
     }
 

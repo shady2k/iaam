@@ -537,6 +537,11 @@ pub async fn create_instrument(
 }
 
 /// Upload a report with per-row outcomes.
+///
+/// Use this when the source is a broker's XLSX/XLS report and the server's
+/// reviewed report reader should record it as it reads. It is not the route for
+/// an institution's own export; hand that document to
+/// `POST /v1/import-sessions/{session}/document` instead.
 #[utoipa::path(
     post,
     path = "/v1/documents",
@@ -1286,6 +1291,11 @@ pub async fn preview_category_rule_route(
 }
 
 /// Synchronise one broker channel over an interval.
+///
+/// Use this when the instance has a configured broker channel for the account:
+/// the server fetches the broker's report and records its reviewed reading.
+/// It is not a route for handing over an institution's own export; use
+/// `POST /v1/import-sessions/{session}/document` for that document instead.
 #[utoipa::path(
     post,
     path = "/v1/brokers/{broker}/sync",
@@ -3295,6 +3305,13 @@ fn contour_version_dto(contour: &ContourView, created: bool) -> ContourVersionDt
 }
 
 /// Operation ingestion.
+///
+/// Use this conclusive route when the caller already holds rows in iaam's own
+/// operation vocabulary. Accepted rows are written immediately. It does not
+/// read an institution's export; use
+/// `POST /v1/import-sessions/{session}/document` for that, or the session's
+/// rows route when the caller already has iaam-shaped rows but wants to review
+/// them before committing.
 #[utoipa::path(
     post,
     path = "/v1/ingest/operations",
@@ -3430,6 +3447,11 @@ fn intake_verdict_dto(row: usize, outcome: &IntakeOutcome) -> VerdictDto {
 
 /// Open an import session.
 ///
+///
+/// This is the review-before-write channel for rows already in iaam's own
+/// shape. Open a session, add those rows, answer any questions, and commit it;
+/// when the caller has an institution's export instead, the primary route is
+/// `POST /v1/import-sessions/{session}/document`.
 /// The declared account may be named by its iaam identifier or by the identifier
 /// its source prints for it — its `provider_account_id`, or one of its aliases,
 /// a card among them. An identifier two accounts answer to is refused rather
@@ -3583,6 +3605,11 @@ pub async fn get_import_session(
 /// caller concluded. That is what a session is for: both legs of one transfer
 /// can sit in it before either is recorded.
 ///
+/// Use this observation fallback only when the primary document route cannot
+/// read the export, or when the caller already has rows in iaam's shape. When
+/// transcribing an unreadable export, preserve the source's sign, direction
+/// word, and named party; do not turn the observation into a conclusion.
+///
 /// The sibling of `POST /v1/import-sessions/{session}/document`, and the choice
 /// between them is which vocabulary the caller holds the rows in: an
 /// institution's own file goes to that one, where a reviewed profile says which
@@ -3647,6 +3674,12 @@ pub async fn add_import_rows(
 }
 
 /// Read an institution's own export into this session, through a source profile.
+///
+/// This is the primary document route: use it whenever the caller has the
+/// institution's readable export. The server, not the caller, applies the
+/// reviewed profile; if no installed profile recognises it, use the observation
+/// fallback through the session's rows route rather than treating the refusal
+/// as proof that the institution cannot be imported.
 ///
 /// **The body is the document's bytes and the output is a session, not facts.**
 /// That is the whole difference from `POST /v1/documents`: a broker report is a
@@ -4312,6 +4345,11 @@ fn session_contents_dto(
 }
 
 /// Journal fact ingestion: corporate actions and offers.
+///
+/// Use this only when the caller holds corporate-action or offer facts already
+/// expressed in the journal-event shape. It is an owner route for facts that
+/// are not a statement's ordinary operations, not a reader for an institution's
+/// export, and not the observation fallback for an unresolved statement row.
 ///
 /// **Every fact is retractable, once the caller says under what.** The source
 /// was `SourceId::new_random()`, minted per request, and the pair of

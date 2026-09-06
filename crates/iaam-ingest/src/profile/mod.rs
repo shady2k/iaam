@@ -45,8 +45,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use iaam_core::event::provenance::ParserVersion;
 
-pub use catalogue::{Installed, Origin, ProfileCatalogue, Refused};
-pub use engine::{DocumentReading, ReadContext, ReadOutcome, UnresolvedAccountName, read};
+pub use catalogue::{CatalogueRejection, Installed, Origin, ProfileCatalogue, Refused};
+pub use engine::{
+    DocumentReading, ReadContext, ReadOutcome, Recognition, UnresolvedAccountName, read,
+};
 pub use ledger::{Binding, LedgerUnavailable, VersionLedger};
 pub use load::ProfileError;
 

@@ -93,6 +93,19 @@ pub struct Refused {
     pub reason: String,
 }
 
+/// Why no single installed profile could be selected for a document.
+///
+/// The variant is kept alongside the transport-shaped [`Rejection`] so callers
+/// can branch on the cause without joining crates by comparing its English
+/// fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogueRejection {
+    /// No installed profile recognises the document.
+    NoneRecognised { rejection: Rejection },
+    /// More than one installed profile recognises the document.
+    MultipleRecognised { rejection: Rejection },
+}
+
 /// The format catalogue of one deployment.
 ///
 /// A property of the deployment and not of the journal, which is why nothing
@@ -314,55 +327,103 @@ impl ProfileCatalogue {
     /// registry refuses a workbook two parsers recognise: two matches mean the
     /// criterion is too weak, and choosing either records facts read by the
     /// wrong profile.
-    pub fn recognise(&self, bytes: &[u8]) -> Result<&Installed, Rejection> {
-        let matched: Vec<&Installed> = self
-            .installed
-            .iter()
-            .filter(|installed| engine::recognises(bytes, &installed.profile))
-            .collect();
+    pub fn recognise(&self, bytes: &[u8]) -> Result<&Installed, CatalogueRejection> {
+        let mut matched = Vec::new();
+        let mut failures = Vec::new();
+        for installed in &self.installed {
+            let recognition = engine::recognises(bytes, &installed.profile);
+            if recognition.is_match() {
+                matched.push(installed);
+            } else {
+                failures.push((installed, recognition));
+            }
+        }
         match matched.as_slice() {
             [only] => Ok(only),
-            [] => Err(Rejection {
-                field: "document".to_owned(),
-                expected: format!(
-                    "a document one of this instance's source profiles recognises: {}",
-                    self.catalogue_line()
-                ),
-                actual: "a document none of them recognises".to_owned(),
-            }),
-            several => Err(Rejection {
-                field: "document".to_owned(),
-                expected: "a document exactly one source profile recognises: name the \
-                           profile to read it with"
-                    .to_owned(),
-                actual: format!(
-                    "recognised by {}",
-                    several
-                        .iter()
-                        .map(|installed| installed.profile.id().to_owned())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+            [] => {
+                let (expected, actual) = if failures.is_empty() {
+                    (
+                        "a document recognised by an installed source profile; this instance \
+                         has no source profile installed"
+                            .to_owned(),
+                        "a document no installed source profile recognised".to_owned(),
+                    )
+                } else {
+                    (
+                        format!(
+                            "a document one of this instance's source profiles recognises; \
+                             profiles looked for: {}",
+                            recognition_line(&failures)
+                        ),
+                        "a document no installed source profile recognised".to_owned(),
+                    )
+                };
+                Err(CatalogueRejection::NoneRecognised {
+                    rejection: Rejection {
+                        field: "document".to_owned(),
+                        expected,
+                        actual,
+                    },
+                })
+            }
+            several => Err(CatalogueRejection::MultipleRecognised {
+                rejection: Rejection {
+                    field: "document".to_owned(),
+                    expected: "a document exactly one source profile recognises: name the \
+                               profile to read it with"
+                        .to_owned(),
+                    actual: format!(
+                        "recognised by {}",
+                        several
+                            .iter()
+                            .map(|installed| installed.profile.id().to_owned())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                },
             }),
         }
     }
+}
 
-    /// The installed profiles in one sentence, for a refusal somebody reads.
-    fn catalogue_line(&self) -> String {
-        if self.installed.is_empty() {
-            return "this instance has no source profile installed".to_owned();
+fn recognition_line(failures: &[(&Installed, engine::Recognition)]) -> String {
+    failures
+        .iter()
+        .map(|(installed, recognition)| {
+            format!(
+                "{} ({}; {})",
+                installed.profile.id(),
+                installed.profile.issuer(),
+                recognition_description(recognition)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn recognition_description(recognition: &engine::Recognition) -> String {
+    match recognition {
+        engine::Recognition::Recognised => "recognised".to_owned(),
+        engine::Recognition::WrongEncoding { encoding } => {
+            format!("looked for text in {}", encoding_name(*encoding))
         }
-        self.installed
-            .iter()
-            .map(|installed| {
-                format!(
-                    "{} ({})",
-                    installed.profile.id(),
-                    installed.profile.issuer()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        engine::Recognition::MissingHeaderRow { row } => {
+            format!("looked for headings on line {row}")
+        }
+        engine::Recognition::MissingColumns { columns } => {
+            format!("looked for header cells {}", columns.join(", "))
+        }
+        engine::Recognition::MalformedDocument => {
+            "looked for a well-formed delimited document".to_owned()
+        }
+    }
+}
+
+fn encoding_name(encoding: super::Encoding) -> &'static str {
+    match encoding {
+        super::Encoding::Utf8 => "utf-8",
+        super::Encoding::Utf8Bom => "utf-8-bom",
+        super::Encoding::Windows1251 => "windows-1251",
     }
 }
 
@@ -699,14 +760,24 @@ mod tests {
     #[test]
     fn a_document_nothing_recognises_is_refused_by_name() {
         let catalogue = ProfileCatalogue::bundled();
-        let refusal = catalogue
+        let refusal = match catalogue
             .recognise(b"date,type,account,amount,currency\n")
-            .expect_err("iaam's own CSV is not an institution's export");
+            .expect_err("iaam's own CSV is not an institution's export")
+        {
+            CatalogueRejection::NoneRecognised { rejection } => rejection,
+            other => panic!("expected a no-profile refusal, got {other:?}"),
+        };
         assert_eq!(refusal.field, "document");
         assert!(
             refusal.expected.contains("tbank-operations-csv"),
             "{refusal:?}"
         );
+        assert!(
+            refusal.expected.contains("header cells"),
+            "the refusal names the document-side mismatch: {refusal:?}"
+        );
+        assert!(!refusal.expected.contains("date"));
+        assert!(!refusal.actual.contains("date"));
     }
 
     /// A document carrying every heading a bundled profile recognises on, but
@@ -817,10 +888,17 @@ mod tests {
         let catalogue = ProfileCatalogue::bundled();
         let header = "Имя счёта;Номер карты;Дата операции;Сумма в валюте счёта;\
                       Валюта счёта;Категория по-умолчанию;Ваша категория;MCC;Описание\n";
-        let refusal = catalogue
+        let refusal = match catalogue
             .recognise(header.as_bytes())
-            .expect_err("an export that prints no status column is not this profile's document");
+            .expect_err("an export that prints no status column is not this profile's document")
+        {
+            CatalogueRejection::NoneRecognised { rejection } => rejection,
+            other => panic!("expected a no-profile refusal, got {other:?}"),
+        };
         assert_eq!(refusal.field, "document");
-        assert_eq!(refusal.actual, "a document none of them recognises");
+        assert!(
+            refusal.expected.contains("header cells"),
+            "the refusal names the missing status column: {refusal:?}"
+        );
     }
 }

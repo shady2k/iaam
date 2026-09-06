@@ -19,8 +19,11 @@ not allowed to assume**.
 
 ## 1. The channels, and who runs each
 
-Every route that puts a fact in the journal, and where the knowledge of the
-source's format sits for each.
+This table is the maintainer's map: who runs each channel, what crosses its
+boundary, and where its format knowledge lives. The caller-facing distinction —
+what a channel presupposes and when to choose it — is published by each
+operation's description in `/v1/openapi.json`. This section does not duplicate
+those descriptions.
 
 | Channel | Run by | Handed | Format knowledge lives |
 |---|---|---|---|
@@ -32,55 +35,19 @@ source's format sits for each.
 | `POST /v1/ingest/journal-events` | owner | corporate actions and offers | — |
 | `POST /v1/import-sessions/{session}/document` | agent or owner | an institution's own export, as it prints it | `crates/iaam-ingest/schema/source-profile-v1.json` and one profile per document type — `crates/iaam-ingest/profiles/`, in tree and in the image, or beside the deployment under `IAAM_SOURCE_PROFILES` |
 
-The last row is the one this document used to say was not a route. Decision 0019
-settles what a source profile is and what it may say, decision 0022 settles who
-may hand such a document over, and the channel that carries it is now built.
-`GET /v1/source-profiles` publishes what this instance reads with, and what it
-refused and why. §9 below is what the row means.
+The last row is the source-document channel. Decision 0019 settles what a
+source profile is and what it may say, decision 0022 settles who may hand such
+a document over, and `GET /v1/source-profiles` publishes what this instance
+reads with and what it refused. The profile schema, bundled profiles, and local
+directory are implementation details for the maintainer; the operation
+description is the contract a caller reads.
 
-It is also the only **document** row an agent can run while holding no value of
-the owner's at all — the broker channel is the other such row, and it exists only
-for the accounts that have one. It hands over bytes it has not read, and
-everything the document turns out to say is reached afterwards: by the engine, by
-the owner's directory, by his rules and by his answers. §4 is why that is allowed
-and what it forbids in exchange.
+It is also the only document row an agent can run while holding no value of the
+owner's at all; §4 is why that is allowed and what it forbids in exchange.
 
-Two of those rows are read wrongly often enough to be worth naming.
-
-**`POST /v1/ingest/csv` does not accept a bank's export.** Its columns are
-iaam's — `date`, `type`, `account`, `currency` and the optional rest. Its
-`account` and `counterparty_account` cells are resolved through the same tiering
-`POST /v1/ingest/operations` resolves a row's account with — iaam's own
-identifier, then the identifier the account's source prints for it, then the
-owner's title (decision 0010). It used to resolve the title and nothing else,
-which made one flow answer «which account is this» in two vocabularies. It is a
-hand-writable format, not a bridge from anybody's institution. Sending a bank
-export to it does not half-work; it rejects every row. The path is what invites
-the mistake: `csv` is the file extension of every statement any institution
-emits, and the name says nothing about whose columns are expected.
-
-Its rows **are** retractable, since iaam-0f8f. They used to arrive under a
-source minted for one request, which `POST /v1/corrections/imports` could never
-reach; they now arrive under the `csv` channel of the account each row names,
-so the retraction is the ordinary one — that account, channel `csv`, and the
-`label` query parameter the submission gave, if it gave one. A row that named
-no `idempotency_key` is identified by the document's digest and its own line
-number, so re-sending one document writes nothing the second time.
-
-**Corporate actions and offers are declared the same way.** The journal-fact
-channel had no declaration at all: it minted a source per request, so what it
-recorded was reachable one event at a time and never as the batch it arrived in,
-and a resubmission of the same facts was a second source rather than the same
-rows. It now takes the declaration the conclusive route takes — account, channel,
-label — and refuses a batch whose facts do not all name the declared account, so
-a batch spanning two accounts is two calls. Omitting the declaration still
-records the facts under a source minted for the request; that is what every
-caller written before had, and it is not a default worth choosing.
-
-**A session is not a second vocabulary.** `AddImportRowsRequest` carries the
-same `OperationDto` the conclusive route takes. The difference between the two
-channels is *when* the fact is written, not *what* a row may say. So anything
-this document settles about the shape of a row settles it for both.
+A session is not a second vocabulary. Anything this document settles about the
+shape of a row settles it for both the conclusive route and the observation
+session.
 
 ## 2. The channel with no parser is the bank export, and privacy is not why
 

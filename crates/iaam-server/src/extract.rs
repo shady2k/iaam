@@ -391,7 +391,10 @@ mod tests {
 
     #[test]
     fn an_unknown_field_is_named() {
-        assert_eq!(unknown_field("unknown field `bogus`, expected `account`"), Some("bogus"));
+        assert_eq!(
+            unknown_field("unknown field `bogus`, expected `account`"),
+            Some("bogus")
+        );
         assert_eq!(unknown_field("invalid digit found in string"), None);
     }
 

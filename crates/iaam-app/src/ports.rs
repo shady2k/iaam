@@ -163,9 +163,9 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         OperationKey::CreateClassificationRule => Scope::Agent,
         // Transfer partners and account scope are PUT-style statements:
         // restating them replaces the current answer.
-        OperationKey::RecordAccountTransferPartners
-        | OperationKey::RecordAccountTransferPartnersBatch
-        | OperationKey::RecordAccountScope => Scope::Agent,
+        OperationKey::RecordAccountTransferPartners | OperationKey::RecordAccountScope => {
+            Scope::Agent
+        }
         // Account retirement is withdrawn under the same account key.
         OperationKey::RecordAccountRetirement => Scope::Agent,
         // A name disposition is undone by stating `undecided`, the settled
@@ -2161,7 +2161,6 @@ mod tests {
             OperationKey::CreateCategoryRule,
             OperationKey::CreateClassificationRule,
             OperationKey::RecordAccountTransferPartners,
-            OperationKey::RecordAccountTransferPartnersBatch,
             OperationKey::RecordAccountScope,
             OperationKey::RecordAccountRetirement,
             OperationKey::RecordAccountNameDisposition,
@@ -2187,13 +2186,12 @@ mod tests {
             OperationKey::CreateCategoryRule,
             OperationKey::CreateClassificationRule,
             OperationKey::RecordAccountTransferPartners,
-            OperationKey::RecordAccountTransferPartnersBatch,
             OperationKey::RecordAccountScope,
             OperationKey::RecordAccountRetirement,
             OperationKey::RecordAccountNameDisposition,
             OperationKey::SubmitCorrections,
         ];
-        assert_eq!(newly_admitted.len(), 12);
+        assert_eq!(newly_admitted.len(), 11);
         assert!(
             newly_admitted
                 .iter()

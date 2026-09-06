@@ -7148,8 +7148,8 @@ mod tests {
     }
 }
 /// Report upload parameters. The route body is the workbook's binary bytes.
-#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct DocumentParams {
     #[serde(default)]
@@ -7174,8 +7174,8 @@ pub struct DocumentDto {
 }
 
 /// Reconciliation range parameters.
-#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct ReconciliationParams {
     pub account: Uuid,
@@ -12994,8 +12994,8 @@ impl SourceDocumentDto {
 }
 
 /// Reading a document into a session. The route body is the document's bytes.
-#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct SourceDocumentParams {
     /// The profile to read with. Omitted, the instance asks which of its

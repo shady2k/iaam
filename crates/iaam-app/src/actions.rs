@@ -4263,21 +4263,11 @@ fn actions_from_views(
             actions.push(account_scope_action(account, accounts, contours));
         }
     }
-    let transfer_accounts: Vec<&AccountView> = accounts
-        .iter()
-        .filter(|account| {
-            transfer_relationships_eligibility(account.id, accounts, contours, exclusions)
-                && transfer_relationships_gap(account.id, transfers)
-        })
-        .collect();
-    let transfer_batch = (transfer_accounts.len() > 1)
-        .then(|| transfer_relationships_batch_request(&transfer_accounts));
-    for account in transfer_accounts {
-        actions.push(transfer_relationships_action(
-            account,
-            accounts,
-            transfer_batch.as_ref(),
-        ));
+    for account in accounts.iter().filter(|account| {
+        transfer_relationships_eligibility(account.id, accounts, contours, exclusions)
+            && transfer_relationships_gap(account.id, transfers)
+    }) {
+        actions.push(transfer_relationships_action(account, accounts));
     }
     actions
 }
@@ -4448,40 +4438,11 @@ fn transfer_relationships_completion(
 /// happen to match would be a fabricated fact about the owner's money, in
 /// exactly the way an inferred contour would be. So every other account is
 /// offered, with the institution that holds it, and the statement is his.
-fn transfer_relationships_batch_request(accounts: &[&AccountView]) -> RequestPlan {
-    let statements = accounts
-        .iter()
-        .map(|account| serde_json::json!({"account": account.id.inner()}))
-        .collect();
-    let missing = accounts
-        .iter()
-        .enumerate()
-        .map(|(index, account)| {
-            let candidates = accounts
-                .iter()
-                .filter(|candidate| candidate.id != account.id)
-                .map(|candidate| (*candidate).clone())
-                .collect();
-            let mut missing = MissingInput::asked_from(OwnerPrompt::TransferPartners, candidates);
-            missing.pointer = format!("/statements/{index}/partners");
-            missing
-        })
-        .collect();
-    RequestPlan {
-        preset: BTreeMap::from([("statements".to_owned(), serde_json::Value::Array(statements))]),
-        missing,
-    }
-}
-
-fn transfer_relationships_action(
-    account: &AccountView,
-    accounts: &[AccountView],
-    batch: Option<&RequestPlan>,
-) -> Action {
+fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]) -> Action {
     let mut preset = BTreeMap::new();
     preset.insert("account".to_owned(), account.id.inner().to_string().into());
 
-    let individual = ResolutionOption {
+    let resolutions = vec![ResolutionOption {
         operation: OperationKey::RecordAccountTransferPartners,
         request: RequestPlan {
             preset,
@@ -4499,14 +4460,7 @@ fn transfer_relationships_action(
                 ),
             )],
         },
-    };
-    let mut resolutions = vec![individual];
-    if let Some(batch) = batch {
-        resolutions.push(ResolutionOption {
-            operation: OperationKey::RecordAccountTransferPartnersBatch,
-            request: batch.clone(),
-        });
-    }
+    }];
 
     Action::new(
         ActionFacts {
@@ -8739,7 +8693,7 @@ mod tests {
         // The candidates are proposed and the choice is not made: every *other*
         // account is offered, and the account itself is not among them.
         let resolutions = asked[0].target().resolutions();
-        assert_eq!(resolutions.len(), 2);
+        assert_eq!(resolutions.len(), 1);
         let (operation, request) = resolutions
             .iter()
             .find(|(operation, _)| *operation == OperationKey::RecordAccountTransferPartners)
@@ -8761,23 +8715,7 @@ mod tests {
             "an account is not the other side of itself: {candidates:#?}"
         );
         assert_eq!(candidates.len(), 1);
-
-        let (batch_operation, batch_request) = resolutions
-            .iter()
-            .find(|(operation, _)| *operation == OperationKey::RecordAccountTransferPartnersBatch)
-            .expect("the batch route is offered beside the per-account route");
-        assert_eq!(*batch_operation, OperationKey::RecordAccountTransferPartnersBatch);
-        assert_eq!(
-            batch_request
-                .preset
-                .get("statements")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len),
-            Some(2)
-        );
-        assert_eq!(batch_request.missing.len(), 2);
-        assert_eq!(batch_request.missing[0].pointer, "/statements/0/partners");
-        assert_eq!(batch_request.missing[1].pointer, "/statements/1/partners");
+    }
 
     /// With one account there is no other side, so the question is not asked.
     #[test]
@@ -9420,11 +9358,14 @@ mod tests {
             BalancePoint::Opening,
             Dimension::Cash
         ));
-        assert!(
-            assertion_queue(&account, period, &[reconstructed])
-                .iter()
-                .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
-        );
+        // The opening question is gone and the closing one takes its place, which
+        // is the ordering `the_opening_point_is_asked_for_before_the_closing_one`
+        // exists for. Asserting that no assertion item survives would assert the
+        // wrong thing: a reconstructed opening answers the first question, and
+        // the second was always waiting behind it.
+        let after = assertion_queue(&account, period, &[reconstructed]);
+        let remaining = the_only_assertion_action(&after);
+        assert_eq!(assertion_preset(remaining).preset["at"], "closing");
     }
 
     #[test]

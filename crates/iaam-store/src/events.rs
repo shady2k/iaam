@@ -312,9 +312,12 @@ impl SqliteStore {
             let (period, point, dimension, reconstructed_opening) = match event.kind {
                 EventKind::ControlAssertion { period, claim } => {
                     let point = match &claim {
-                        iaam_core::reconciliation::claim::ControlClaim::CashBalance { at, .. }
-                        | iaam_core::reconciliation::claim::ControlClaim::PositionQuantity {
+                        iaam_core::reconciliation::claim::ControlClaim::CashBalance {
                             at, ..
+                        }
+                        | iaam_core::reconciliation::claim::ControlClaim::PositionQuantity {
+                            at,
+                            ..
                         } => Some(*at),
                         _ => None,
                     };

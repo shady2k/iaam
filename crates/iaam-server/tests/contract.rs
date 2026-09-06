@@ -9714,10 +9714,7 @@ async fn actions_endpoint_rejects_unknown_query_parameters() {
     let harness = empty_owner_harness();
     let (status, body) = call(
         &harness.router,
-        get(
-            "/v1/actions?bogus=1",
-            Some(&harness.owner_token),
-        ),
+        get("/v1/actions?bogus=1", Some(&harness.owner_token)),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");

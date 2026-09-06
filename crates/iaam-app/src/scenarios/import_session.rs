@@ -1210,6 +1210,17 @@ pub enum GeneralisationProspect {
     NoneFromThisRow,
 }
 
+/// The session-wide meaning of the fields a standing rule would match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneralisationGround {
+    /// The row has no field a standing rule could match.
+    NoMatcher,
+    /// Every row carrying the selected field has one movement meaning.
+    SingleShape,
+    /// The selected field carries different movement meanings in this session.
+    MixedShapes,
+}
+
 impl GeneralisationProspect {
     /// The sentence for a surface reporting about the owner.
     #[must_use]
@@ -1256,26 +1267,25 @@ impl GeneralisationProspect {
         }
     }
 }
-
 /// What answering one question will decide beyond this session.
 ///
-/// The two facts it reads are the two that exist before an answer does. The
-/// subject is `None` where this build cannot read the row, and a row it can read
-/// still grounds no rule when it prints nothing a matcher could ask about — both
-/// are «no rule can be built from this», which is the same pair
-/// [`generalisation_of`] folds into [`Generalisation::Impossible`]. Groundedness
-/// is asked of [`matcher_from`] and not restated here, because a second spelling
-/// of that field policy is a second answer to what a rule can be built from.
+/// The row's subject says whether a matcher can be built. The caller supplies
+/// the session-wide ground verdict, because this function cannot read the
+/// session and must not restate that policy. A mixed ground remains a useful
+/// proposal, but it is not safe to write automatically.
 #[must_use]
 pub fn generalisation_ahead(
     subject: Option<&ClassificationSubject>,
     may_generalise: bool,
+    ground: GeneralisationGround,
 ) -> GeneralisationProspect {
-    match subject.and_then(matcher_from) {
-        None => GeneralisationProspect::NoneFromThisRow,
-        Some(_) if may_generalise => GeneralisationProspect::WillStand,
-        Some(_) => GeneralisationProspect::NeedsHisAdoption,
+    if subject.is_none() || matches!(ground, GeneralisationGround::NoMatcher) {
+        return GeneralisationProspect::NoneFromThisRow;
     }
+    if matches!(ground, GeneralisationGround::MixedShapes) || !may_generalise {
+        return GeneralisationProspect::NeedsHisAdoption;
+    }
+    GeneralisationProspect::WillStand
 }
 
 /// What one question's answer did, or could still do, to the standing rules.
@@ -1691,17 +1701,21 @@ pub async fn answer_question(
     // caller addressed. A rule per settled row would be one decision recorded
     // many times — and `matcher_for` builds them all from the same field of the
     // same subject, so they would be the same rule written over and over.
-    // Two filters and they refuse different things. `may_generalise` is about
-    // the **answerer**: an agent settles the row and the standing decision stays
+    // Three filters refuse different things. `may_generalise` is about the
+    // **answerer**: an agent settles the row and the standing decision stays
     // the owner's, and the rule it would have written is published as
     // [`Generalisation::Available`] for him to adopt. `generalises` is about the
     // **answer**: «it was between accounts of mine and I cannot say which» is a
     // fact about what this document did not contain, and a rule made of it would
     // file every later row of the same shape as unplaceable — including the ones
     // whose far half is in the export and which the pairing would settle whole.
-    // So there is nothing here for anybody to adopt, and the question reports
-    // [`Generalisation::DoesNotGeneralise`] rather than a proposal.
+    // The shared `one_shape` verdict is about the **ground**: a repeated token
+    // carrying opposing meanings in this session is shown to the owner as a
+    // proposal, never written automatically. Only the first two cases report
+    // [`Generalisation::DoesNotGeneralise`]; the mixed-ground case remains
+    // available for an informed owner adoption.
     let answered = match matcher_for(&observed)
+        .filter(|matcher| matcher_ground_is_single_shape(matcher, &contents.observations))
         .filter(|_| may_generalise(principal))
         .filter(|_| answer.shape().generalises())
     {
@@ -3544,6 +3558,39 @@ pub struct ResemblingRow {
     pub resembles: EventId,
 }
 
+/// How one row is accounted for by the commit.
+///
+/// This is deliberately a row-shaped ledger rather than a count. A standing
+/// rule can record a source outflow as an internal transfer, which removes it
+/// from the outflow report without removing it from the journal; naming the
+/// fact kind and its basis is what makes that diversion visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowReconciliation {
+    pub row: u32,
+    pub outcome: ReconciliationOutcome,
+}
+
+/// The stated outcome for one row in a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconciliationOutcome {
+    /// The row becomes a new journal fact. `records_as` names its journal event
+    /// kind, using the same discriminant the journal publishes.
+    Recorded {
+        records_as: &'static str,
+        settled_by: FactBasis,
+    },
+    /// The row is already represented by a keyed journal fact.
+    Duplicate {
+        records_as: &'static str,
+        settled_by: FactBasis,
+    },
+    /// The row is retained because it is unreadable or unanswered.
+    Retained { reason: RetentionReason },
+    /// The row correctly produces no fact, including when its partner records
+    /// the movement.
+    SettledWithoutFact { reason: NoFactReason },
+}
+
 /// What the journal gains, and what it does not.
 ///
 /// Every list here is a list of rows, and beside two of them is what those rows
@@ -3561,6 +3608,13 @@ pub struct ResemblingRow {
 pub struct CommitDelta {
     /// Facts that would be appended.
     pub facts: Vec<PlannedFact>,
+    /// One explicit outcome for every row the session holds, in row order.
+    ///
+    /// Unlike the specialised lists below, this is the complete accounting
+    /// journal. A caller can inspect one row and see whether it became a fact,
+    /// was already recorded, was retained, or was deliberately settled without
+    /// a fact.
+    pub reconciliation: Vec<RowReconciliation>,
     /// Rows the owner's journal already holds under a key of theirs. They
     /// commit to a `duplicate` verdict and add nothing — which is correct, and
     /// is also exactly what «every verdict was positive and half the rows are
@@ -4112,6 +4166,7 @@ pub async fn plan_session(
     // over the rows would describe a different import from the one that runs.
     let mut declined: Vec<DeclinedRow> = Vec::new();
     let mut settled_without_fact: Vec<SettledRow> = Vec::new();
+    let mut reconciliation = Vec::with_capacity(read_rows.len());
     for read in &read_rows {
         let Some(candidate) = &read.candidate else {
             // Settled, and settled is not retained: nothing is owed, nothing is
@@ -4123,6 +4178,10 @@ pub async fn plan_session(
                     row: read.row,
                     reason,
                 });
+                reconciliation.push(RowReconciliation {
+                    row: read.row,
+                    outcome: ReconciliationOutcome::SettledWithoutFact { reason },
+                });
             }
             continue;
         };
@@ -4130,8 +4189,22 @@ pub async fn plan_session(
             Ok(event) => {
                 let fact = planned_fact(read, event);
                 if recorded.holds(event) {
+                    reconciliation.push(RowReconciliation {
+                        row: read.row,
+                        outcome: ReconciliationOutcome::Duplicate {
+                            records_as: reconciliation_records_as(event),
+                            settled_by: fact.settled_by.clone(),
+                        },
+                    });
                     duplicates.push(fact);
                 } else {
+                    reconciliation.push(RowReconciliation {
+                        row: read.row,
+                        outcome: ReconciliationOutcome::Recorded {
+                            records_as: reconciliation_records_as(event),
+                            settled_by: fact.settled_by.clone(),
+                        },
+                    });
                     // Level five is asked only of a row the two key levels
                     // above said nothing about — `dedup::assess`'s own order,
                     // so a row already known to be recorded is never also
@@ -4172,10 +4245,24 @@ pub async fn plan_session(
                 };
                 retained.push(RetainedRow {
                     row: read.row,
-                    reason,
+                    reason: reason.clone(),
+                });
+                reconciliation.push(RowReconciliation {
+                    row: read.row,
+                    outcome: ReconciliationOutcome::Retained { reason },
                 });
             }
         }
+    }
+
+    if let Some(unaccounted) = read_rows
+        .iter()
+        .find(|read| !reconciliation.iter().any(|entry| entry.row == read.row))
+    {
+        return Err(AppError::Store(format!(
+            "row {} of the session has no reconciliation outcome",
+            unaccounted.row
+        )));
     }
 
     let resolved: Vec<PlannedFact> = facts.iter().chain(duplicates.iter()).cloned().collect();
@@ -4201,6 +4288,7 @@ pub async fn plan_session(
         fact_totals: batch_totals(&facts)?,
         duplicate_totals: batch_totals(&duplicates)?,
         facts,
+        reconciliation,
         duplicates,
         resembles_recorded: resembling,
         retained_unrecorded: retained,
@@ -4649,6 +4737,14 @@ fn scope_assessment(
         }
     }
     assessment
+}
+
+/// The reconciliation vocabulary uses the journal's own event-kind spelling.
+///
+/// This is deliberately not a classification vocabulary: a cash transfer is
+/// `cash_transfer` everywhere the journal exposes its kind, including here.
+const fn reconciliation_records_as(event: &iaam_core::event::Event) -> &'static str {
+    event.kind.discriminant()
 }
 
 fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact {
@@ -7576,20 +7672,18 @@ fn row_groups(
                 // them a group is the question their rows raise.
                 let subjects: Vec<ClassificationSubject> =
                     members.iter().map(|member| member.subject(None)).collect();
-                let ground = if subjects
+                let ground = subjects
                     .iter()
                     .all(|subject| matcher_from(subject).is_some())
-                {
-                    subjects.first()
-                } else {
-                    None
-                };
+                    .then(|| subjects.first())
+                    .flatten();
+                let ground_verdict = generalisation_ground(ground, observations);
                 decision_group_question(
                     rows.len(),
                     &common,
                     days.as_ref(),
                     amounts.as_ref(),
-                    generalisation_ahead(ground, may_generalise),
+                    generalisation_ahead(ground, may_generalise, ground_verdict),
                 )
             }
             GroupBasis::OneMovement => movement_group_question(&members, directory),
@@ -7985,25 +8079,10 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
     for ((filed_by, category), mut rows) in by_category {
         rows.sort_unstable();
         let covers: Vec<u32> = rows.iter().map(|(row, _)| *row).collect();
-        let mut shapes = shapes_of(&rows);
-        // Most-covering first inside the group too, and by the shape itself
-        // where two are equal: a caller showing a mixed word shows the largest
-        // share first, and the order does not move between two readings.
-        shapes.sort_by(|left, right| {
-            right
-                .rows
-                .len()
-                .cmp(&left.rows.len())
-                .then_with(|| shape_key_of(left).cmp(&shape_key_of(right)))
-        });
         // One shape or many, and the branch is the whole bead. `OfferedRule`
         // holds one `RowShape` and cannot hold two, so a group that is not one
         // thing is not representable as an offer at all.
-        let sole = if shapes.len() == 1 {
-            shapes.pop()
-        } else {
-            None
-        };
+        let sole = one_shape(&rows);
         if let Some(contains) = sole {
             // The word goes in the field that asks about the party who filed
             // it. A condition carrying the owner's own word in the source's
@@ -8028,6 +8107,17 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
                 contains,
             });
         } else {
+            let mut shapes = shapes_of(&rows);
+            // Most-covering first inside the group too, and by the shape itself
+            // where two are equal: a caller showing a mixed word shows the largest
+            // share first, and the order does not move between two readings.
+            shapes.sort_by(|left, right| {
+                right
+                    .rows
+                    .len()
+                    .cmp(&left.rows.len())
+                    .then_with(|| shape_key_of(left).cmp(&shape_key_of(right)))
+            });
             withheld.push(WithheldOffer {
                 reason: withheld_offer_reason(filed_by, &category, &shapes),
                 filed_by,
@@ -8105,6 +8195,15 @@ fn shapes_of(rows: &[(u32, RowShapeKey)]) -> Vec<RowShape> {
             rows,
         })
         .collect()
+}
+
+/// The one-shape verdict shared by offers and answer-derived matchers.
+///
+/// A condition may stand only when every row carrying its ground has one
+/// movement shape. The row numbers are incidental; the shared fold is not.
+fn one_shape(rows: &[(u32, RowShapeKey)]) -> Option<RowShape> {
+    let mut shapes = shapes_of(rows);
+    (shapes.len() == 1).then(|| shapes.pop()).flatten()
 }
 
 /// Why no rule is offered on a word, in one sentence for the owner.
@@ -8305,12 +8404,11 @@ fn offered_rule_question(
 /// A matcher on one field settles more rows than a matcher on several, and one
 /// of them can be settled wrongly: a source word like the one a bank prints on
 /// every transfer would carry a classification onto rows that do not deserve it.
-/// Two things bound that. The proposal is only ever *offered* — it is published
-/// as the body of `POST /v1/classification-rules` for the owner to read, narrow
-/// and send, and a rule he adopts is one he can retire, which replans the
-/// history it classified. And the rows this is computed for are rows the
-/// classifier could **not** settle, so the field it proposes is one that had no
-/// standing rule on it.
+/// Offers use [`one_shape`] to withhold a condition whose rows have mixed
+/// meanings. Answer-derived matchers use that same verdict across the whole
+/// session; when it is mixed, the answer publishes the exact condition for the
+/// owner to read and adopt rather than writing it silently. A rule he adopts is
+/// one he can retire, which replans the history it classified.
 fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
     // Through the subject, because the subject is the shape the whole field
     // policy below is written about and it is what `generalisation_ahead` holds.
@@ -8320,8 +8418,62 @@ fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
     matcher_from(&row.subject(None))
 }
 
-/// The same policy, asked of the row as the classifier sees it.
+/// Whether the rule's selected ground has one meaning in this session.
 ///
+/// The selected field is the same priority `matcher_for` uses. Rows carrying
+/// that exact value are folded through [`one_shape`], so an answer cannot make
+/// a standing condition from a repeated word that means both inward and
+/// outward movement here.
+fn matcher_ground_is_single_shape(
+    matcher: &RuleMatcher,
+    observations: &[ImportObservationView],
+) -> bool {
+    let rows: Vec<(u32, RowShapeKey)> = observations
+        .iter()
+        .filter_map(|observation| {
+            let Intake::Observed { row, .. } = parse_intake(&observation.payload).ok()? else {
+                return None;
+            };
+            let same_ground = if let Some(counterparty) = &matcher.counterparty_account {
+                row.counterparty_name() == Some(counterparty.as_str())
+            } else if let Some(kind) = &matcher.kind {
+                row.source_kind.as_deref() == Some(kind.as_str())
+            } else if let Some(category) = &matcher.source_category {
+                row.source_category.as_deref() == Some(category.as_str())
+            } else if let Some(category) = &matcher.owner_category {
+                row.owner_category.as_deref() == Some(category.as_str())
+            } else if let Some(code) = &matcher.source_code {
+                row.source_code.as_deref() == Some(code.as_str())
+            } else if let Some(description) = &matcher.description_contains {
+                row.description
+                    .as_deref()
+                    .is_some_and(|value| value.contains(description))
+            } else {
+                false
+            };
+            same_ground.then_some((observation.row, shape_key(&row)))
+        })
+        .collect();
+    one_shape(&rows).is_some()
+}
+
+/// Classify the selected rule ground once for the whole session.
+pub(crate) fn generalisation_ground(
+    subject: Option<&ClassificationSubject>,
+    observations: &[ImportObservationView],
+) -> GeneralisationGround {
+    let Some(subject) = subject else {
+        return GeneralisationGround::NoMatcher;
+    };
+    let Some(matcher) = matcher_from(subject) else {
+        return GeneralisationGround::NoMatcher;
+    };
+    if matcher_ground_is_single_shape(&matcher, observations) {
+        GeneralisationGround::SingleShape
+    } else {
+        GeneralisationGround::MixedShapes
+    }
+}
 /// Split out so that «can a rule be built from this row at all» has one answer.
 /// [`generalisation_ahead`] needs exactly that question and holds a
 /// [`ClassificationSubject`] rather than an [`ObservedRow`]; a predicate of its
@@ -8819,6 +8971,27 @@ fn would_stand(observed: &ObservedRow, answer: Answer, may_generalise: bool) -> 
     }
 }
 
+/// The forecasted standing decision, with the session's mixed-ground guard.
+///
+/// A mixed ground remains a useful proposal, but it is not safe to write
+/// automatically: the owner must see the exact matcher before adopting it.
+fn would_stand_in_session(
+    observed: &ObservedRow,
+    answer: Answer,
+    may_generalise: bool,
+    observations: &[ImportObservationView],
+) -> WouldStand {
+    let stands = would_stand(observed, answer, may_generalise);
+    match stands {
+        WouldStand::Written(proposed)
+            if !matcher_ground_is_single_shape(&proposed.matcher, observations) =>
+        {
+            WouldStand::ForHisAdoption(proposed)
+        }
+        other => other,
+    }
+}
+
 /// One session as a forecast reads it: its lines, the questions they raised,
 /// and what the reading has already settled.
 ///
@@ -9213,7 +9386,12 @@ pub async fn preview_answer_rule(
         .into());
     }
     let observed = observed_row(&contents.observations, stored.row)?;
-    let stands = would_stand(&observed, answer, may_generalise(principal));
+    let stands = would_stand_in_session(
+        &observed,
+        answer,
+        may_generalise(principal),
+        &contents.observations,
+    );
     // Nothing is read that nothing would be said about. A forecast with no
     // standing decision in it has an empty reach whatever the journal holds, and
     // the state says why it is empty — so the three reads below are skipped
@@ -10020,6 +10198,173 @@ mod tests {
                 panic!("nothing here resolves the far side to this row's own account: {reason:?}")
             }
         }
+    }
+    /// A standing rule supplies the classification, but never the direction.
+    ///
+    /// The rule matches a row whose source said money arrived. The resulting
+    /// event must therefore credit the row's account, even though the answer
+    /// that minted the rule may have been about money leaving.
+    #[test]
+    fn a_matching_rule_keeps_the_direction_stated_by_the_row() {
+        let main = account(1);
+        let savings = account(2);
+        let rule = ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: Some("Somebody".to_owned()),
+                description_contains: None,
+                kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+            },
+            outcome: Classification::InternalTransfer { to: savings },
+        };
+        let resolver = ruled(
+            vec![detail(main, "Main"), detail(savings, "Savings")],
+            vec![rule],
+        );
+        let observed = incoming(row(main, "Somebody", Some(date!(2026 - 06 - 01))));
+        let Assessment::Settled {
+            classification,
+            movement,
+            ..
+        } = resolver.assess(&observed)
+        else {
+            panic!("the standing rule should classify the row");
+        };
+        assert_eq!(movement, Some(Movement::In));
+        let operation = observed
+            .resolve(classification, movement)
+            .expect("the row direction and rule classification are compatible");
+        let event = normalize(
+            &operation,
+            &NormalizationContext {
+                owner: OwnerId(uuid::Uuid::from_bytes([9; 16])),
+                source: SourceId(uuid::Uuid::from_bytes([9; 16])),
+                parser_version: ParserVersion("ingest/manual/1".to_owned()),
+            },
+        )
+        .expect("the classified operation normalises")
+        .event;
+        let main_cash = event
+            .legs
+            .iter()
+            .find(|leg| leg.account == main)
+            .and_then(|leg| leg.cash_effect())
+            .expect("the row account has a cash leg");
+        assert_eq!(
+            main_cash.amount().raw(),
+            1_000,
+            "the inbound direction from the row must be recorded as an inflow"
+        );
+    }
+
+    /// The shape the field report described: a rule that says "money left the
+    /// perimeter", matching a row on which the source said money arrived.
+    ///
+    /// This is the one outcome that states no direction of its own, so it is
+    /// the only one under which a rule could plausibly have supplied one. It
+    /// does not: the row is asked first, and the fact credits the account.
+    /// Without this case the two tests beside it disprove a defect that was
+    /// never reported, since a fee and an internal transfer are not what a
+    /// standing rule for a payment carries.
+    #[test]
+    fn an_external_flow_rule_does_not_turn_an_inbound_row_into_an_outflow() {
+        let main = account(1);
+        let rule = ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: Some("Somebody".to_owned()),
+                description_contains: None,
+                kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+            },
+            outcome: Classification::ExternalFlow,
+        };
+        let resolver = ruled(vec![detail(main, "Main")], vec![rule]);
+        let observed = incoming(row(main, "Somebody", Some(date!(2026 - 06 - 01))));
+        let Assessment::Settled {
+            classification,
+            movement,
+            ..
+        } = resolver.assess(&observed)
+        else {
+            panic!("the standing rule should classify the row");
+        };
+        assert_eq!(classification, Classification::ExternalFlow);
+        assert_eq!(
+            movement,
+            Some(Movement::In),
+            "an outcome that implies no direction leaves the row's own word standing"
+        );
+        let operation = observed
+            .resolve(classification, movement)
+            .expect("an inbound external flow is money arriving");
+        let event = normalize(
+            &operation,
+            &NormalizationContext {
+                owner: OwnerId(uuid::Uuid::from_bytes([9; 16])),
+                source: SourceId(uuid::Uuid::from_bytes([9; 16])),
+                parser_version: ParserVersion("ingest/manual/1".to_owned()),
+            },
+        )
+        .expect("the classified operation normalises")
+        .event;
+        let main_cash = event
+            .legs
+            .iter()
+            .find(|leg| leg.account == main)
+            .and_then(|leg| leg.cash_effect())
+            .expect("the row account has a cash leg");
+        assert!(
+            main_cash.amount().raw() > 0,
+            "the row said the money arrived, so the fact must not post an outflow: {main_cash:?}"
+        );
+    }
+
+    /// A rule outcome whose implied direction conflicts with the row is not
+    /// allowed to become an oppositely signed fact.
+    #[test]
+    fn a_rule_cannot_turn_an_inbound_row_into_an_outbound_fee() {
+        let main = account(1);
+        let rule = ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: Some("Somebody".to_owned()),
+                description_contains: None,
+                kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+            },
+            outcome: Classification::Fee {
+                origin: FeeOrigin::Other,
+            },
+        };
+        let resolver = ruled(vec![detail(main, "Main")], vec![rule]);
+        let observed = incoming(row(main, "Somebody", Some(date!(2026 - 06 - 01))));
+        let Assessment::Settled {
+            classification,
+            movement,
+            ..
+        } = resolver.assess(&observed)
+        else {
+            panic!("the standing rule should classify the row");
+        };
+        assert_eq!(movement, Some(Movement::In));
+        let rejection = observed
+            .resolve(classification, movement)
+            .expect_err("an inbound fee is not a valid fact");
+        assert!(
+            rejection.expected.contains("fee leaves"),
+            "the rejection must explain the direction conflict: {rejection:?}"
+        );
     }
 
     #[test]
@@ -12727,37 +13072,21 @@ mod tests {
     /// unique to its row — and it is still a rule, where the alternative would
     /// be to tell the owner that no rule can be built from the row at all.
     #[test]
-    fn a_row_carrying_only_a_description_generalises_on_it() {
-        let mut described = row(account(1), "Savings", None);
-        described.counterparty = ObservedCounterparty::Unknown;
-        described.source_kind = None;
-        described.description = Some("standing order".to_owned());
-        let proposed = matcher_for(&described).expect("a matcher");
-        assert_eq!(
-            proposed.description_contains.as_deref(),
-            Some("standing order")
-        );
-        assert_eq!(proposed.counterparty_account, None);
-        assert_eq!(proposed.kind, None);
-    }
-
-    /// What an answer will keep, before anyone has answered (`iaam-sh6m`).
-    ///
-    /// The three cases the queue and the assessment used each to assert one of,
-    /// flatly, in two sentences that contradicted each other. The last is the
-    /// one no authority changes, and the one a test of the enum alone would miss:
-    /// a row this build reads perfectly well and that still grounds nothing.
-    #[test]
     fn what_an_answer_will_keep_is_read_off_the_row_and_the_authority() {
         let grounded = row(account(1), "Shop One", None).subject(None);
         assert_eq!(
-            generalisation_ahead(Some(&grounded), true),
+            generalisation_ahead(Some(&grounded), true, GeneralisationGround::SingleShape,),
             GeneralisationProspect::WillStand
         );
         assert_eq!(
-            generalisation_ahead(Some(&grounded), false),
+            generalisation_ahead(Some(&grounded), false, GeneralisationGround::SingleShape,),
             GeneralisationProspect::NeedsHisAdoption,
             "the row would ground one; the answerer may not write it"
+        );
+        assert_eq!(
+            generalisation_ahead(Some(&grounded), true, GeneralisationGround::MixedShapes,),
+            GeneralisationProspect::NeedsHisAdoption,
+            "a mixed ground must be adopted rather than written automatically"
         );
 
         // Read, and still nothing to build a standing decision from — so no
@@ -12765,7 +13094,7 @@ mod tests {
         let bare = unmatchable(account(1)).subject(None);
         for authority in [true, false] {
             assert_eq!(
-                generalisation_ahead(Some(&bare), authority),
+                generalisation_ahead(Some(&bare), authority, GeneralisationGround::NoMatcher,),
                 GeneralisationProspect::NoneFromThisRow,
                 "a row that asks nothing grounds nothing under any token"
             );
@@ -12774,7 +13103,7 @@ mod tests {
         // And the row this build cannot read at all, which is the absence
         // `subject_of` publishes.
         assert_eq!(
-            generalisation_ahead(None, true),
+            generalisation_ahead(None, true, GeneralisationGround::NoMatcher),
             GeneralisationProspect::NoneFromThisRow
         );
     }

@@ -2131,6 +2131,31 @@ async fn the_openapi_document_enumerates_and_explains_every_verdict() {
 }
 
 #[tokio::test]
+async fn import_reconciliation_codes_are_typed_and_explained() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (field, vocabulary) in [
+        ("outcome", "ReconciliationOutcomeDto"),
+        ("reason", "ReconciliationReasonDto"),
+    ] {
+        assert!(
+            refers_to(
+                &spec["components"]["schemas"]["RowReconciliationDto"]["properties"][field],
+                vocabulary
+            ),
+            "RowReconciliationDto.{field} must point at {vocabulary}: {}",
+            spec["components"]["schemas"]["RowReconciliationDto"]["properties"][field]
+        );
+        assert!(
+            !published_vocabulary(&spec, vocabulary).is_empty(),
+            "{vocabulary} must enumerate its codes"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_verdict_vocabulary_admits_which_codes_nothing_emits() {
     // Three of the eleven are published and constructed by no path, and all three
     // are the reconciliation ones. That is not a coincidence: a verdict is the
@@ -19104,6 +19129,74 @@ async fn a_rule_on_the_sources_own_category_settles_a_row_naming_no_operation_wo
     );
 }
 
+/// A standing rule can turn a source outflow into an internal transfer fact.
+///
+/// The row is not absent from the journal, but it is absent from the money-flow
+/// report that an owner checking the source would read. The assessment must make
+/// that diversion explicit by naming both the fact kind and the rule that
+/// settled it, rather than presenting a complete-looking list of rows.
+#[tokio::test]
+async fn reconciliation_names_a_row_diverted_by_a_standing_transfer_rule() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, rule) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": { "source_category": "Service" },
+                "outcome": { "kind": "internal_transfer", "to": savings },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{rule}");
+
+    let (session, _) = one_row_session(
+        &harness,
+        "diverted",
+        json!({
+            "account": account,
+            "type": "unresolved_direction",
+            "amount": "125.00",
+            "currency": "RUB",
+            "direction": "out",
+            "dates": { "cash_posted": "2025-03-31" },
+            "source_kind": "PAYMENT",
+            "source_category": "Service",
+            "idempotency_key": "diverted-row",
+        }),
+    )
+    .await;
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let reconciliation = plan["commit_delta"]["reconciliation"]
+        .as_array()
+        .expect("row reconciliation");
+    assert_eq!(reconciliation.len(), 1, "{plan}");
+    assert_eq!(reconciliation[0]["row"], 1, "{plan}");
+    assert_eq!(reconciliation[0]["outcome"], "recorded", "{plan}");
+    assert_eq!(
+        reconciliation[0]["records_as"], "cash_transfer",
+        "the event kind that removes the row from outflows must be visible: {plan}"
+    );
+    assert_eq!(
+        reconciliation[0]["settled_by"], "rule",
+        "the standing rule that diverted the row must be visible: {plan}"
+    );
+}
+
 /// A category condition does not fire on the operation word, or the reverse.
 ///
 /// The two words are separate fields end to end (decision 0020 §2), and a
@@ -23674,6 +23767,98 @@ async fn a_word_that_holds_two_things_is_published_with_its_contents_and_no_rule
             "row {row} is still asked about: {plan}"
         );
     }
+}
+
+/// A repeated counterparty phrase is not necessarily the far side.
+///
+/// Both rows below carry the same service phrase, but one money movement leaves
+/// and the other arrives. Answering one must not mint a rule that silently
+/// matches the other meaning in the same session.
+#[tokio::test]
+async fn answering_one_of_mixed_counterparty_rows_mints_no_rule() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "service-phrase" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let filed = |key: &str, direction: &str| {
+        json!({
+            "account": account,
+            "type": "unresolved_direction",
+            "amount": "100.00",
+            "currency": "RUB",
+            "direction": direction,
+            "counterparty": "Service phrase",
+            "dates": { "cash_posted": "2025-03-18" },
+            "source_kind": "PAYMENT",
+            "source_category": "Service",
+            "idempotency_key": key,
+        })
+    };
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    filed("mixed-counterparty-out", "out"),
+                    filed("mixed-counterparty-in", "in"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    let promised = classification_item_reason(&harness, &harness.owner_token).await;
+    assert!(
+        promised.contains("writes no rule"),
+        "the mixed ground must not promise a standing rule before the answer: {promised}"
+    );
+    assert!(
+        !promised.contains("settles by itself next time"),
+        "the mixed ground must not promise automatic generalisation: {promised}"
+    );
+
+    let question = rows[0]["question_id"]
+        .as_str()
+        .expect("the outward row has a question")
+        .to_owned();
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert!(
+        answered["generalisation"]["rule"].is_null(),
+        "the answer must not mint a standing rule from a mixed ground: {answered}"
+    );
+
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert!(
+        rules.as_array().expect("rules").is_empty(),
+        "no rule may stand on the mixed service phrase: {rules}"
+    );
 }
 
 /// A commit against a reading the session no longer answers to is refused.

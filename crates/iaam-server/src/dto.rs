@@ -34,7 +34,8 @@ use iaam_app::scenarios::correction::{
 use iaam_app::scenarios::import_session::AccountDirectory;
 use iaam_app::scenarios::import_session::{
     AnswerableQuestion, ControlReconciliation, FactBasis, HeldRow, ImportPlan, NoFactReason,
-    PlannedFact, Readiness, ResemblingRow, RetainedRow, RetentionReason, SettledRow,
+    PlannedFact, Readiness, ReconciliationOutcome, ResemblingRow, RetainedRow, RetentionReason,
+    RowReconciliation, SettledRow,
 };
 // The question's own generalisation, in a block of its own rather than merged
 // into the list above: this file is edited by several changes at once, and one
@@ -110,7 +111,7 @@ use uuid::Uuid;
 
 use crate::vocabulary::{
     DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, ProvidedByDto,
-    VerdictCodeDto, described_vocabulary,
+    ReconciliationOutcomeDto, ReconciliationReasonDto, VerdictCodeDto, described_vocabulary,
 };
 
 // Custom date format: the standard serialisation of `time::Date` is not
@@ -11717,10 +11718,104 @@ pub struct PlannedFactDto {
     pub idempotency_key: Option<String>,
 }
 
+/// The outcome the commit records for one held row.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RowReconciliationDto {
+    pub row: u32,
+    /// The outcome's meaning for this row.
+    pub outcome: ReconciliationOutcomeDto,
+    /// The journal event kind recorded by the row, for recorded and duplicate
+    /// rows. A cash transfer is exposed here as `cash_transfer`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records_as: Option<String>,
+    /// What settled a recorded or duplicate row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_by: Option<String>,
+    /// The reason the row has no fact of its own, when one is stated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ReconciliationReasonDto>,
+    /// The human-readable explanation of `reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+impl RowReconciliationDto {
+    #[must_use]
+    pub fn from_domain(reconciliation: &RowReconciliation) -> Self {
+        let (outcome, records_as, settled_by, reason, explanation) = match &reconciliation.outcome {
+            ReconciliationOutcome::Recorded {
+                records_as,
+                settled_by,
+            } => (
+                ReconciliationOutcomeDto::Recorded,
+                Some((*records_as).to_owned()),
+                Some(settled_by.code().to_owned()),
+                None,
+                None,
+            ),
+            ReconciliationOutcome::Duplicate {
+                records_as,
+                settled_by,
+            } => (
+                ReconciliationOutcomeDto::Duplicate,
+                Some((*records_as).to_owned()),
+                Some(settled_by.code().to_owned()),
+                None,
+                None,
+            ),
+            ReconciliationOutcome::Retained { reason } => match reason {
+                RetentionReason::Unreadable { .. } => (
+                    ReconciliationOutcomeDto::Retained,
+                    None,
+                    None,
+                    Some(ReconciliationReasonDto::Unreadable),
+                    Some("the row could not be read into a journal fact".to_owned()),
+                ),
+                RetentionReason::Unanswered { .. } => (
+                    ReconciliationOutcomeDto::Retained,
+                    None,
+                    None,
+                    Some(ReconciliationReasonDto::Unanswered),
+                    Some("the row is waiting for the owner's answer".to_owned()),
+                ),
+            },
+            ReconciliationOutcome::SettledWithoutFact { reason } => {
+                let (reason, explanation) = match reason {
+                    NoFactReason::OneAccountTwoInstruments { .. } => (
+                        ReconciliationReasonDto::OneAccountTwoInstruments,
+                        reason.describe(),
+                    ),
+                    NoFactReason::SecondLegOfOneMovement { .. } => (
+                        ReconciliationReasonDto::SecondLegOfOneMovement,
+                        reason.describe(),
+                    ),
+                };
+                (
+                    ReconciliationOutcomeDto::SettledWithoutFact,
+                    None,
+                    None,
+                    Some(reason),
+                    Some(explanation.to_owned()),
+                )
+            }
+        };
+        Self {
+            row: reconciliation.row,
+            outcome,
+            records_as,
+            settled_by,
+            reason,
+            explanation,
+        }
+    }
+}
+
 /// What the journal gains, and what it does not.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitDeltaDto {
     pub facts: Vec<PlannedFactDto>,
+    /// One explicit outcome for every row held by the import session.
+    pub reconciliation: Vec<RowReconciliationDto>,
     /// Rows the journal already holds under a key of theirs. They commit to
     /// `duplicate` and add nothing.
     ///
@@ -12242,6 +12337,12 @@ impl ImportPlanDto {
                     .facts
                     .iter()
                     .map(PlannedFactDto::from_domain)
+                    .collect(),
+                reconciliation: plan
+                    .commit_delta
+                    .reconciliation
+                    .iter()
+                    .map(RowReconciliationDto::from_domain)
                     .collect(),
                 duplicates: plan
                     .commit_delta

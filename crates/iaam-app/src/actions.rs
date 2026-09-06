@@ -8,7 +8,7 @@ use crate::ports::{
 };
 use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
 use crate::scenarios::import_session::{
-    self, Generalisation, MovementLeg, OneMovement, generalisation_ahead,
+    self, Generalisation, GeneralisationGround, MovementLeg, OneMovement,
 };
 use crate::scenarios::reports::MoneyFlowReport;
 use iaam_core::event::correction::resolve;
@@ -2174,6 +2174,12 @@ pub struct ClassificationQuestion {
     /// second answer to what one answer generalised into, published on two
     /// surfaces that would eventually disagree.
     pub generalisation: Generalisation,
+    /// The whole-session verdict for the fields a standing rule would match.
+    ///
+    /// Computed before the question enters the queue. Passing it alongside the
+    /// row subject lets the action use `generalisation_ahead` without inventing
+    /// a row-only answer that misses mixed meanings elsewhere in the import.
+    pub ground: GeneralisationGround,
     /// The row the question is about, as the classifier asks about it.
     ///
     /// Carried beside the generalisation rather than folded into it, because the
@@ -2265,18 +2271,19 @@ pub async fn frontier(
             continue;
         }
         let observations = store.list_import_observations(owner, session.id).await?;
-        // Over the whole session and before the loop, because a pair is
-        // invisible to a reading of either of its rows on its own — which is
-        // exactly why the queue used to publish one movement as two items. The
-        // scenario derives it; nothing here re-derives it.
+        // Pairing is derived across the whole session before each question is
+        // turned into an action, just like the ground verdict below.
         let pairs = import_session::mirrored_movements_of(session.id, &observations, &held);
         for view in held {
             let asked = serde_json::from_str(&view.question).map_err(|error| {
                 AppError::Store(format!("stored import question could not be read: {error}"))
             })?;
+            let subject = import_session::subject_of(&observations, &view);
+            let ground = import_session::generalisation_ground(subject.as_ref(), &observations);
             questions.push(ClassificationQuestion {
                 generalisation: import_session::generalisation_of(&observations, &view),
-                subject: import_session::subject_of(&observations, &view),
+                ground,
+                subject,
                 pair: pairs.get(&view.row).copied(),
                 view,
                 session_state: session.state,
@@ -3609,18 +3616,16 @@ fn answer_classification_question_action(
     accounts: &[AccountView],
     may_generalise: bool,
 ) -> Action {
-    // What the answer keeps beyond this session, and the one thing about this
-    // item that is not the same for every caller (`iaam-sh6m`). It used to be a
-    // clause of the sentence below, stating flatly that a rule is written — true
-    // of the owner answering about a row a matcher can be built from, and false
-    // of the other two cases, which the reader had no way to distinguish. The
-    // assessment's group proposal stated the opposite just as flatly. Both now
-    // read the same derivation, and it is stated in the scenario that owns
-    // `Generalisation` rather than a second time here.
-    let kept = generalisation_ahead(question.subject.as_ref(), may_generalise).reported();
+    // The ground was derived from the whole session before this action was
+    // built. Relaying it preserves the mixed-ground guard.
+    let kept = import_session::generalisation_ahead(
+        question.subject.as_ref(),
+        may_generalise,
+        question.ground,
+    )
+    .reported();
     // What the two rows are to each other, where they are anything. Empty for
-    // the ordinary row, which is one row and one decision and needs no clause
-    // saying so.
+    // the ordinary row and explicit for a paired decision.
     let pairing = one_movement_text(question, account, far);
     let mut preset = BTreeMap::new();
     // Both are path segments of the answering route, and both are known: the
@@ -10744,6 +10749,7 @@ mod tests {
             // about is not consulted while that is true.
             generalisation: Generalisation::Unanswered,
             subject: None,
+            ground: GeneralisationGround::NoMatcher,
             // One row of this session and half of nothing. The pairing is
             // exercised where it is derived and through the queue's own
             // published items, not by asserting a relation into a fixture.

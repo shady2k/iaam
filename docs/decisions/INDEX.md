@@ -42,3 +42,4 @@
 | [0037](0037-the-skill-keeps-the-process-and-the-reference-moves-beside-it.md) | The skill keeps the process, and the reference moves beside it | 2026-09-05 | superseded | `iaam-arad` |
 | [0038](0038-a-question-stops-being-open-where-the-reading-says-so.md) | A question stops being open where the reading says so, not where the store does | 2026-09-05 | proposed | `iaam-m2oi` |
 | [0039](0039-the-queue-says-which-reports-it-leaves-unobstructed.md) | The queue says which reports it leaves unobstructed, and names what stands in the way of the rest | 2026-09-05 | proposed | `iaam-i3nx` |
+| [0040](0040-the-agents-authority-is-bounded-by-what-cannot-be-undone.md) | The agent's authority is bounded by what cannot be undone | 2026-09-06 | proposed | `iaam-lzwb`, `iaam-45gc` |

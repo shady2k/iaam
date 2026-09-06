@@ -120,15 +120,13 @@ impl Scope {
 /// not state it.** `ActionCatalog::from_openapi` resolves a key's method, path
 /// and request schema from the completed OpenAPI document because the document
 /// carries them. It carries no authority: every route declares the same
-/// `security(("bearer" = []))`, and the prose beside the 403 already disagrees
-/// with the handlers — `create_account` says «Insufficient permissions» and
-/// `record_owner_balance` says «Owner only», and both call `require_admin`.
-/// OpenAPI 3.1 does permit role names in a non-OAuth security requirement, but
-/// `utoipa::openapi::security::SecurityRequirement` keeps its map private, so a
-/// role written into the document could not be read back out of it in the
-/// typed form the catalogue resolves everything else in. A fact written into
-/// the contract that nothing reads back is a second hand-maintained statement,
-/// which is the thing being removed here. See ADR-0021.
+/// `security(("bearer" = []))`, and the prose beside a 403 is not a typed
+/// authority field. OpenAPI 3.1 permits role names in a non-OAuth security
+/// requirement, but `utoipa::openapi::security::SecurityRequirement` keeps its
+/// map private, so a role written into the document could not be read back out
+/// in the typed form the catalogue resolves everything else in. A fact written
+/// into the contract that nothing reads back is a second hand-maintained
+/// statement, which is the thing being removed here. See ADR-0021.
 ///
 /// **A floor, not a promise.** `docs/api/conventions.md` §4.7 is explicit that
 /// the transport keeps only the scope that cannot be right under any journal,
@@ -145,59 +143,39 @@ impl Scope {
 #[must_use]
 pub const fn required_scope(operation: OperationKey) -> Scope {
     match operation {
-        // «It states a standing decision that will apply to things nobody has
-        // looked at» — conventions §4.2, second bullet. An account, a contour
-        // version, a category rule, a classification rule, a statement about
-        // an account's transfer partners, a scope exclusion and a retirement
-        // are all decisions the owner will have to live with, applied to rows
-        // no one has seen yet.
-        OperationKey::CreateAccount
-        | OperationKey::CreateContour
-        | OperationKey::AddContourVersion
-        | OperationKey::CreateCategoryRule
-        | OperationKey::CreateClassificationRule
-        | OperationKey::RecordAccountTransferPartners
-        | OperationKey::RecordAccountScope
-        | OperationKey::RecordAccountRetirement => Scope::Owner,
-        // The same bullet, and the standing part of it is what decides the
-        // floor: a name declared not to be his account is a statement about
-        // every future statement that prints it, not about the records already
-        // refused. Next month's export prints the same counterparty, and this is
-        // the sentence that says it is still nobody's account of his. It is also
-        // the only thing keeping those records refused deliberately rather than
-        // provisionally, which is not a distinction an agent may draw for him.
-        //
-        // The withdrawal of that statement travels under the same key and so
-        // keeps the same floor, and that is the whole of why a settled item is
-        // owner-scoped: an agent may not take back a judgement it could not have
-        // made. It is a property of this call, read off this call. It is not a
-        // claim that the item is waiting on him — `ActionState::Settled` is the
-        // word for what such an item wants, and it wants nothing (`iaam-c143`).
-        OperationKey::RecordAccountNameDisposition => Scope::Owner,
-        // A control balance is the owner's own statement of what an account
-        // held, and reconciliation is computed against it: conventions §4.3,
-        // «Record a control balance».
-        OperationKey::RecordOwnerBalance => Scope::Owner,
-        // «It rules on what is already in the journal» — §4.2, third bullet.
-        OperationKey::SubmitCorrections => Scope::Owner,
-        // «It disposes of something the caller itself submitted, and nothing
-        // else changes» — §4.2, first bullet. Recording a row, opening and
-        // feeding a session, settling one row, ending a session either way,
-        // and synchronising a channel are all mechanics.
-        //
-        // Reading an institution's export into a session is the same bullet and
-        // not a wider one, which is decision 0022's line: the caller conveys a
-        // document and interprets none of it. The profile that reads it is the
-        // deployment's, not the request's — no route installs one — and what
-        // each row turns out to be is settled afterwards, by the owner's
-        // directory, by a standing rule of his, or by his answer. Nothing
-        // reaches the journal until a commit, which has this same floor.
-        //
-        // Feeding a session row by row is the same act said in this API's own
-        // vocabulary rather than the source's, so it keeps the same floor: the
-        // rows are held out of the journal either way, and the two ways in
-        // cannot differ in authority without making which shape a caller sent
-        // decide what it is allowed to say.
+        // CreateAccount is withdrawn by retiring an account; if it carries no
+        // facts afterwards, it is inert.
+        OperationKey::CreateAccount => Scope::Agent,
+        // CreateContour and AddContourVersion are undone by their versioned
+        // contour history: the next version replaces the current composition.
+        OperationKey::CreateContour | OperationKey::AddContourVersion => Scope::Agent,
+        // RecordOwnerBalance is restated under the same account and period.
+        // It is unlike the other ten: it is the owner's assertion about the
+        // world outside this system, and reconciliation is computed against it.
+        // Nothing here can detect that it is wrong, because it is the thing
+        // everything else is checked by. The test still admits it because the
+        // record itself has an undo.
+        OperationKey::RecordOwnerBalance => Scope::Agent,
+        // A category rule is retired, preserving the history it reached.
+        OperationKey::CreateCategoryRule => Scope::Agent,
+        // A classification rule is retired, and retirement reports what it
+        // reached.
+        OperationKey::CreateClassificationRule => Scope::Agent,
+        // Transfer partners and account scope are PUT-style statements:
+        // restating them replaces the current answer.
+        OperationKey::RecordAccountTransferPartners | OperationKey::RecordAccountScope => {
+            Scope::Agent
+        }
+        // Account retirement is withdrawn under the same account key.
+        OperationKey::RecordAccountRetirement => Scope::Agent,
+        // A name disposition is undone by stating `undecided`, the settled
+        // item's own target.
+        OperationKey::RecordAccountNameDisposition => Scope::Agent,
+        // A correction is itself two facts in the append-only journal, so the
+        // correction can be undone by another correction.
+        OperationKey::SubmitCorrections => Scope::Agent,
+        // These caller-submitted mechanics are undone by withdrawing or
+        // abandoning the caller's own submission.
         OperationKey::SubmitOperations
         | OperationKey::OpenImportSession
         | OperationKey::SyncBroker
@@ -2110,14 +2088,27 @@ mod tests {
 
     /// The split the queue publishes, named operation by operation.
     ///
-    /// Not a restatement of the match: this is the table
-    /// `docs/api/conventions.md` §4.3 states in prose, written out so that
-    /// moving a call across the line is a deliberate edit here as well as
-    /// there. `iaam-woeh` is what it is for — `ingest_operations` admitting an
-    /// agent while `submit_corrections` and `record_account_retirement` do not
-    /// is the whole of the finding.
+    /// Every operation that changes state is reversible under ADR 0040. The
+    /// agent reaches each one; credentials remain outside this vocabulary and
+    /// remain owner-only.
     #[test]
     fn the_floor_of_each_operation_is_the_one_conventions_states() {
+        for operation in OperationKey::ALL {
+            assert_eq!(
+                required_scope(operation),
+                Scope::Agent,
+                "{} has an undo and is admitted to the agent",
+                operation.as_str()
+            );
+        }
+    }
+
+    /// Each operation ADR 0040 newly admits is reachable by an agent token.
+    ///
+    /// Keep the eleven named calls explicit: this test is the acceptance
+    /// proof for the authority change, not only a count over the vocabulary.
+    #[test]
+    fn an_agent_token_reaches_each_newly_admitted_operation() {
         for operation in [
             OperationKey::CreateAccount,
             OperationKey::CreateContour,
@@ -2131,40 +2122,40 @@ mod tests {
             OperationKey::RecordAccountNameDisposition,
             OperationKey::SubmitCorrections,
         ] {
-            assert_eq!(
-                required_scope(operation),
-                Scope::Owner,
-                "{} states a standing decision or rules on the journal",
-                operation.as_str()
-            );
-        }
-        for operation in [
-            OperationKey::SubmitOperations,
-            OperationKey::OpenImportSession,
-            OperationKey::SyncBroker,
-            OperationKey::ReadImportDocument,
-            OperationKey::AddImportRows,
-            OperationKey::AnswerImportQuestion,
-            OperationKey::CommitImportSession,
-            OperationKey::AbandonImportSession,
-        ] {
-            assert_eq!(
-                required_scope(operation),
-                Scope::Agent,
-                "{} disposes of what the caller itself submitted",
+            assert!(
+                Scope::Agent.admits(required_scope(operation)),
+                "{} must be reachable by an agent token",
                 operation.as_str()
             );
         }
     }
 
-    /// The two lists above are the whole vocabulary, not the part somebody
-    /// remembered.
-    ///
-    /// They are written out by hand on purpose — moving a call across the line
-    /// should be a deliberate edit — and a hand-written list drifts from the
-    /// enum exactly where the next mistake is. So the count is pinned: a
-    /// nineteenth key added to `ALL` and to neither list would otherwise pass
-    /// the table test by not appearing in it.
+    /// The vocabulary is exhaustive, so the test above cannot silently omit a
+    /// newly admitted operation.
+    #[test]
+    fn the_newly_admitted_operation_list_covers_the_authority_change() {
+        let newly_admitted = [
+            OperationKey::CreateAccount,
+            OperationKey::CreateContour,
+            OperationKey::AddContourVersion,
+            OperationKey::RecordOwnerBalance,
+            OperationKey::CreateCategoryRule,
+            OperationKey::CreateClassificationRule,
+            OperationKey::RecordAccountTransferPartners,
+            OperationKey::RecordAccountScope,
+            OperationKey::RecordAccountRetirement,
+            OperationKey::RecordAccountNameDisposition,
+            OperationKey::SubmitCorrections,
+        ];
+        assert_eq!(newly_admitted.len(), 11);
+        assert!(
+            newly_admitted
+                .iter()
+                .all(|operation| required_scope(*operation) == Scope::Agent)
+        );
+    }
+
+    /// The table above covers every operation.
     #[test]
     fn the_table_above_covers_every_operation() {
         let owner = OperationKey::ALL
@@ -2175,9 +2166,8 @@ mod tests {
             .iter()
             .filter(|operation| required_scope(**operation) == Scope::Agent)
             .count();
-        assert_eq!(owner, 11, "the owner-only half of §4.3");
-        assert_eq!(agent, 8, "the half an agent reaches, §4.3");
-        assert_eq!(owner + agent, OperationKey::ALL.len());
+        assert_eq!(owner, 0, "credentials, not operations, remain owner-only");
+        assert_eq!(agent, OperationKey::ALL.len());
     }
 
     /// The port must be object-safe: the composition root holds

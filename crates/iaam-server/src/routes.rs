@@ -862,7 +862,7 @@ pub async fn reconciliation(
     request_body = OwnerBalanceRequest,
     responses(
         (status = 200, description = "What the claim wrote, and the updated statuses", body = OwnerBalanceOutcomeDto),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid balance", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -989,7 +989,7 @@ pub async fn list_classification_rules(
     request_body = ClassificationRuleRequest,
     responses(
         (status = 201, description = "Rule added, with the history it would correct", body = ClassificationRuleChangeDto),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid rule", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1028,7 +1028,7 @@ pub async fn create_classification_rule(
     params(("id" = Uuid, Path, description = "Rule identifier")),
     responses(
         (status = 200, description = "Rule retired, with the history its absence would correct", body = RecomputePlanDto),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 404, description = "Rule not found", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
     ),
@@ -1039,7 +1039,7 @@ pub async fn delete_classification_rule(
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<RecomputePlanDto>, ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::CreateClassificationRule)?;
     let plan = retire_rule(&state.services, &principal, id).await?;
     Ok(Json(RecomputePlanDto::from_domain(plan)))
 }
@@ -1220,7 +1220,7 @@ pub async fn list_category_rules_route(
     request_body = CategoryRuleRequest,
     responses(
         (status = 201, description = "Category rule added", body = CategoryRuleDto),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid category rule", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1791,8 +1791,8 @@ pub async fn replace_account_aliases(
     ApiJson(request): ApiJson<ReplaceAccountAliasesRequest>,
 ) -> Result<Json<AccountDto>, ApiFailure> {
     // Which printed identifier reaches which account decides which account a row
-    // lands on: the owner's judgement, by the rule that keeps account creation
-    // out of the agent's hands.
+    // lands on. This declaration route remains instance administration; the
+    // account-creation operation itself is reversible and agent-reachable.
     require_admin(&principal)?;
     let account = AccountId(id);
     owned_account(&state, &principal, account).await?;
@@ -2173,8 +2173,8 @@ pub async fn record_account_scope(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(request): ApiJson<RecordAccountScopeRequest>,
 ) -> Result<Json<AccountScopeDto>, ApiFailure> {
-    // Drawing the perimeter is the owner's judgement, in either direction: the
-    // same rule that keeps contour composition out of the agent's hands.
+    // A scope statement is a reversible PUT: the agent may restate it or
+    // withdraw it, and the owner can review the actor recorded with the call.
     require(&principal, OperationKey::RecordAccountScope)?;
     let account = AccountId(id);
     let named = owned_account(&state, &principal, account).await?;
@@ -2398,9 +2398,8 @@ pub async fn get_account_retirement(
 /// destroying both of those answers. This route removes the row and changes no
 /// figure: nothing here is ever read by contour classification.
 ///
-/// The owner's, not the agent's. It states a standing decision that changes
-/// what every later asset snapshot prints, which is the line
-/// `docs/api/conventions.md` §4.2 draws.
+/// Reversible under the same account key: an agent may record or withdraw it,
+/// and the owner can review the actor recorded with the statement.
 #[utoipa::path(
     post,
     path = "/v1/accounts/{id}/retirement",
@@ -2535,9 +2534,8 @@ pub async fn record_account_transfer_partners(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(request): ApiJson<RecordAccountTransferPartnersRequest>,
 ) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
-    // Saying which two accounts are the two sides of one movement is the
-    // owner's judgement, by the same rule that keeps the contour composition
-    // out of the agent's hands.
+    // Transfer partners are a reversible statement: replacing the list is its
+    // undo, so the same operation is available to an agent token.
     require(&principal, OperationKey::RecordAccountTransferPartners)?;
     let account = AccountId(id);
     let statement =
@@ -2593,7 +2591,7 @@ pub async fn record_account_transfer_partners_batch(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<RecordAccountTransferPartnersBatchRequest>,
 ) -> Result<Json<AccountTransferPartnersBatchDto>, ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::RecordAccountTransferPartners)?;
 
     let mut accounts: Vec<AccountId> = Vec::with_capacity(request.statements.len());
     let mut statements = Vec::with_capacity(request.statements.len());
@@ -2705,7 +2703,7 @@ pub async fn clear_account_transfer_partners(
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<AccountTransferPartnersDto>, ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::RecordAccountTransferPartners)?;
     let account = AccountId(id);
     owned_account(&state, &principal, account).await?;
     state
@@ -3838,22 +3836,21 @@ pub async fn list_source_profiles(
 
 /// Answer one of the session's questions.
 ///
-/// The answer is written onto the row, and — for an owner token only — as a
+/// The answer is written onto the row. An owner answer may also mint the
 /// durable classification rule beside it, so the next import of a matching row
-/// settles without asking. Nothing is recorded in the journal: the answer
-/// settles what the row is, and commit is what records it.
+/// settles without asking. The rule itself is reversible and the separate
+/// `POST /v1/classification-rules` operation is available to an agent as well.
+/// Nothing is recorded in the journal: the answer settles what the row is, and
+/// commit is what records it.
 ///
-/// **The split is `iaam-hnod`.** Settling one row is import mechanics and
-/// belongs to whoever is running the import. Generalising that settlement into a
-/// standing rule decides rows nobody has looked at yet, which is the same act
-/// `POST /v1/classification-rules` performs under an owner-only gate — so an
-/// agent that could do it here would be making the decision through a route
-/// whose name does not mention rules. Under an agent token the row settles and
-/// no rule is written — but the response says so in a word and hands back the
-/// rule that would have been written, so the owner makes the settlement stand by
-/// posting `generalisation.proposal` under his own token, unedited (`iaam-ngwn`).
-/// Without that, the one party who knew a generalisation was possible is the one
-/// that could not perform it.
+/// **The split is `iaam-hnod`.** Settling one row is import mechanics, while
+/// the standing rule is a second act. Under an agent token the row settles and
+/// no rule is written by this answer route — the response says so and hands
+/// back the rule that could be written by a separate call. Under an owner token
+/// the route may perform both acts as a convenience.
+///
+/// The separate-call proposal is posted under the agent's own token, unedited
+/// (`iaam-ngwn`). The rule's reversible contract is why that call is admitted.
 ///
 /// The two answers that name one of the owner's accounts take an identifier, and
 /// the question published only that an account was needed — so answering one
@@ -4118,10 +4115,10 @@ pub async fn commit_import_session(
 /// a correction.
 ///
 /// **This is not the owner stating his balance.** That is
-/// `POST /v1/reconciliation/balance`, which is owner-only and writes under the
-/// owner-stated parser version, capped at `accepted_internal` by §10.4. What is
-/// stated here is what a document says, by whoever fed the document in — an
-/// agent may do it, exactly as an agent may feed in the rows — and it is written
+/// `POST /v1/reconciliation/balance`, which records the owner's assertion under
+/// the owner-stated parser version, capped at `accepted_internal` by §10.4.
+/// What is stated here is what a document says, by whoever fed the document in —
+/// an agent may do it, exactly as an agent may feed in the rows — and it is written
 /// under its own parser version and its own key namespace, so neither claim can
 /// supersede or deduplicate the other.
 #[utoipa::path(
@@ -5584,10 +5581,7 @@ fn declared_label<'a>(field: &str, label: Option<&'a str>) -> Result<Option<&'a 
 /// **The gate reads the same statement the queue publishes.** Every route named
 /// by an [`OperationKey`] is guarded through here, so the authority a call
 /// demands is written once — in [`required_scope`] — and the handler enforces
-/// *from* that writing rather than restating it. `iaam-woeh` is what the
-/// restatement cost: the queue graded an item owner-only while one of the three
-/// calls it offered admitted an agent, and nothing could notice, because the
-/// two facts were two sentences in two crates.
+/// that statement rather than restating it.
 ///
 /// The refusal is the one [`require_admin`] gives and the one the `may_submit`
 /// tests gave before it: 403 naming the scope the caller holds. Nothing about
@@ -5707,7 +5701,7 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 25] = [
     ),
     (
         "delete_classification_rule",
-        "Owner-only administration: retiring a standing decision of his, which no computed state asks for.",
+        "It uses the CreateClassificationRule floor: retiring a rule is the undo for the reversible rule decision.",
     ),
     (
         "create_category_group_route",
@@ -5731,11 +5725,11 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 25] = [
     ),
     (
         "record_account_transfer_partners_batch",
-        "The batch spelling of record_account_transfer_partners, which is the key. resolve_transfer_relationships is per account and its target is the per-account route; a second key for the same statement would let two items disagree about which call makes it.",
+        "The batch spelling of record_account_transfer_partners, which is the key, and it uses that key's reversible floor.",
     ),
     (
         "clear_account_transfer_partners",
-        "It withdraws the statement record_account_transfer_partners makes, and no computed state is about a statement that should be taken back.",
+        "It withdraws the statement record_account_transfer_partners makes, so it uses that key's reversible floor.",
     ),
     (
         "revoke_broker_access",

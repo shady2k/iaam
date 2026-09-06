@@ -1955,12 +1955,11 @@ impl Action {
     /// demands is a property of the call, so the queue cannot hold an opinion
     /// about it separate from the calls it publishes:
     /// [`crate::ports::required_scope`] is the one statement, and
-    /// `iaam_server::routes` gates the route by the same one. Before this it
-    /// was typed in per item, and `retired_account_not_empty` proved what that
-    /// costs — the item was graded owner-only while one of the three calls it
-    /// offered admits an agent token, so an agent filtering on this field was
-    /// told nothing was available to it when the ordinary remedy was
-    /// (`iaam-woeh`).
+    /// `iaam_server::routes` gates the route by the same one.
+    /// The historical defect was that an item's summary could disagree with
+    /// the floors of the resolutions it published. The summary is now derived
+    /// from those resolutions, so a caller filtering by scope sees every
+    /// reachable item.
     ///
     /// **The narrowest and not the widest, and the choice is what a client can
     /// do with the field.** A client filtering the queue by the token it holds
@@ -3047,16 +3046,13 @@ fn unexplained_residual_action(account: &AccountView, amount: Money) -> Action {
     )
 }
 
-/// The owner's remedy for outflow rows no category rule matched.
+/// The available remedy for outflow rows no category rule matched.
 ///
-/// `NeedsOwnerInput` rather than `Blocked`, because `Blocked` means "no operation
-/// in this API is available for this item" and category-rule creation is in this
-/// same API. The earlier wording — no *report* operation can provide a rule — was
-/// true and irrelevant: the action catalogue resolves a target against the whole
-/// completed contract, not a report-local namespace, and owner-only is what the
-/// floor of `create_category_rule` says, not what `Blocked` says. `first_contour_action` is the
-/// precedent: the agent may not draw the boundary, and the action still names the
-/// owner-only operation and the inputs only he can supply.
+/// `NeedsOwnerInput` rather than `Blocked`, because `Blocked` means "no
+/// operation in this API is available for this item" and category-rule
+/// creation is in this same API. The target resolves against the whole
+/// completed contract, not a report-local namespace, and the operation's
+/// required scope is read from [`crate::ports::required_scope`].
 ///
 /// `Recommended`, not `RequiredForGoal`. The distinction the control-assertion
 /// actions were promoted on is whether the absence makes the reported number mean
@@ -3078,8 +3074,8 @@ fn unexplained_residual_action(account: &AccountView, amount: Money) -> Action {
 ///   account, a currency, a row count and a net amount, none of which are fields
 ///   of the rule request. Proposing one would need the diagnostic to retain row
 ///   keys or source descriptions, which it deliberately does not.
-/// - The **category** is the owner's judgement by the same rule that forbids
-///   inventing one anywhere else.
+/// - The **category** is supplied by the caller. The aggregate cannot choose
+///   one without inventing the owner's answer.
 fn undecomposed_outflows_action(
     account: &AccountView,
     currency: CurrencyCode,
@@ -3859,23 +3855,15 @@ fn adopt_classification_rule_completion(
     })
 }
 
-/// The rule an answer would have written, offered to the one who may write it.
-///
-/// **This is `iaam-4hcy`.** `Generalisation::Available` was honest and
-/// unreachable: a client could read that a rule was possible and that none was
-/// written, and no queued act turned it into one. A state the system reports
-/// truthfully with no act that resolves it is a dead end dressed as information,
-/// and the owner — the only principal who may generalise — was the one reading
+/// The rule an answer would have written, offered to the caller who may write
 /// it.
 ///
-/// **`create_classification_rule`, and no new route.** The proposal is already
-/// published in the exact body `POST /v1/classification-rules` takes; the route
-/// exists, it is owner-only, and it is the same act. What was missing was its
-/// name in [`OperationKey`], so the queue could address it. A route of its own —
-/// «adopt the rule of question N» — would have been a second way to write a
-/// classification rule, and it would have had to decide whether the rule it
-/// created belongs to the question, which is the one thing
-/// [`Generalisation::Available`] says it must not.
+/// **This is `iaam-4hcy`.** `Generalisation::Available` is useful only when a
+/// client can read a possible rule and has an operation that turns it into
+/// one. The proposal is published in the exact body
+/// `POST /v1/classification-rules` takes; that route is available to an agent
+/// because the rule can later be retired. No new route adopts the rule
+/// implicitly, so the caller decides whether to make the separate write.
 ///
 /// **`Recommended`, not required for any goal.** The row this was learned from
 /// is already settled and already in the journal; nothing the owner can run
@@ -5601,9 +5589,9 @@ fn account_named_by_document_gap(
 /// contour, with nothing anywhere saying so.
 ///
 /// `NeedsOwnerInput`, not `Ready`, even when every field is preset. Drawing the
-/// reporting perimeter is the owner's judgement — the same rule that keeps
-/// `first_contour_action` out of the agent's hands — and a fully formed request
-/// does not change who may send it.
+/// reporting perimeter remains a question for the owner; the complete request
+/// does not change the operation's input shape. The named operation's floor is
+/// still derived from [`crate::ports::required_scope`].
 ///
 /// The target publishes both halves of the answer, because there are two and
 /// the sentence says so. Membership is one — put the account in a contour — and
@@ -6922,7 +6910,7 @@ mod tests {
         assert_eq!(action.kind(), ActionKind::CreateFirstAccount);
         assert_eq!(action.category(), ActionCategory::Blocking);
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
-        assert_eq!(action.required_scope(), Some(Scope::Owner));
+        assert_eq!(action.required_scope(), Some(Scope::Agent));
         let ActionTarget::Operation { operation, request } = action.target() else {
             panic!("first account needs an operation target");
         };
@@ -7699,10 +7687,8 @@ mod tests {
         );
         assert_eq!(
             action.required_scope(),
-            Some(Scope::Owner),
-            "the withdrawal is still his, and an agent may not take back a \
-             judgement it could not have made — which is a floor on that call \
-             and not a claim that the item is waiting on him"
+            Some(Scope::Agent),
+            "the withdrawal is reversible under the same account key"
         );
     }
 
@@ -8140,7 +8126,7 @@ mod tests {
             ActionCategory::required_for(ActionKind::AccountScopeUndecided)
         );
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
-        assert_eq!(action.required_scope(), Some(Scope::Owner));
+        assert_eq!(action.required_scope(), Some(Scope::Agent));
         // The act is «add it to one of the contours that exist», not «create a
         // contour»: naming the creating operation here is what let an agent
         // answer this item with a second perimeter.
@@ -9716,7 +9702,7 @@ mod tests {
         // The system still cannot say which side is wrong. One operation settles
         // either side once the owner has, and it is in this same API.
         assert_eq!(action.state(), ActionState::NeedsOwnerInput);
-        assert_eq!(action.required_scope(), Some(Scope::Owner));
+        assert_eq!(action.required_scope(), Some(Scope::Agent));
         let ActionTarget::Operation { operation, request } = action.target() else {
             panic!("a discrepancy names the correction that settles it");
         };
@@ -9789,7 +9775,7 @@ mod tests {
         assert_eq!(undecomposed.category(), ActionCategory::Recommended);
         assert!(undecomposed.reason().contains(&account.inner().to_string()));
         assert_eq!(undecomposed.state(), ActionState::NeedsOwnerInput);
-        assert_eq!(undecomposed.required_scope(), Some(Scope::Owner));
+        assert_eq!(undecomposed.required_scope(), Some(Scope::Agent));
         let ActionTarget::Operation { operation, request } = undecomposed.target() else {
             panic!("a rule-remediable outflow names the operation that remedies it");
         };
@@ -10569,16 +10555,15 @@ mod tests {
                     "{} is not blocked and must name the operation that answers it",
                     action.id()
                 );
-                // Some scope, and the scope the named route actually checks:
-                // `create_category_rule` and `submit_corrections` are owner-only,
-                // `sync_broker` admits an agent token, and an item that named the
-                // wrong one would tell a caller it may not send a request the
-                // server would accept.
-                let expected = match action.kind() {
-                    ActionKind::IndependentConfirmationMissing => Scope::Agent,
-                    _ => Scope::Owner,
-                };
-                assert_eq!(action.required_scope(), Some(expected), "{}", action.id());
+                // The item's scope is the floor of the operation it names.
+                // Every state-changing operation in this vocabulary is reversible
+                // under ADR 0040 and therefore admits an agent token.
+                assert_eq!(
+                    action.required_scope(),
+                    Some(Scope::Agent),
+                    "{}",
+                    action.id()
+                );
             }
         }
 
@@ -11277,8 +11262,8 @@ mod tests {
         );
         assert_eq!(
             item.required_scope(),
-            Some(Scope::Owner),
-            "generalising is the administer decision arriving by another door"
+            Some(Scope::Agent),
+            "generalisation is reversible under the operation it publishes"
         );
         assert_eq!(
             item.subject().and_then(ActionSubject::account),
@@ -11607,8 +11592,8 @@ mod tests {
             .collect();
         assert_eq!(
             floors,
-            vec![Scope::Agent, Scope::Owner, Scope::Owner],
-            "the three ways out do not want one authority"
+            vec![Scope::Agent, Scope::Agent, Scope::Agent],
+            "all three remedies are reversible",
         );
     }
 
@@ -11656,7 +11641,7 @@ mod tests {
             None,
             "the subject is the journal, and no account is what refused"
         );
-        assert_eq!(item.required_scope(), Some(Scope::Owner));
+        assert_eq!(item.required_scope(), Some(Scope::Agent));
         assert_eq!(
             item.target().resolutions(),
             vec![(

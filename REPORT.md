@@ -96,7 +96,10 @@ was added and no reload or signalling mechanism was invented.
 
 ## Verification
 
-`make check` passed after the implementation. The observed gate output included:
+`make check` was first run before the final type annotation and stopped in
+workspace clippy with `error[E0282]: type annotations needed` in
+`crates/iaam-ingest/src/profile/engine.rs`. After that fix, the prescribed
+command was rerun and passed. The observed successful gate output included:
 
 - `Architecture guards passed.`
 - `Personal data checked (tracked files, and lines added since origin/main).`
@@ -106,9 +109,11 @@ was added and no reload or signalling mechanism was invented.
 - workspace doc tests completed successfully with zero doc tests in each listed
   crate.
 
-Additional commands run beyond the prescribed `make check`: `pwd`; the mandated
-read-only `bd show iaam-ag7b iaam-wzon iaam-8hdk iaam-ftpz`; `git diff` for review;
-and the three bead commits plus the final recognition-diagnostics formatting
-commit. No bead was closed, no Beads state was changed, and nothing was pushed.
+Additional commands run beyond the prescribed `make check`: `pwd`; the
+mandated read-only `bd show iaam-ag7b iaam-wzon iaam-8hdk iaam-ftpz`; `git diff`
+for review; the repository search for the report ignore rule; `git add` and
+four bead/report commits (including the initial failed `git add REPORT.md`,
+which reported that the globally ignored report needed `-f`). No bead was
+closed, no Beads state was changed, and nothing was pushed.
 
 No new bead-worthy follow-up was found.

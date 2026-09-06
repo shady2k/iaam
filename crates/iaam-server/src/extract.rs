@@ -293,6 +293,14 @@ fn unreadable<E: Display>(subject: Subject, error: &serde_path_to_error::Error<E
     let path = error.path().to_string();
     let path = (path != ".").then_some(path);
 
+    if let Some(name) = unknown_field(inner) {
+        return invalid_request(
+            Some(name.to_owned()),
+            None,
+            format!("{} {name} is not recognized", subject.noun()),
+        );
+    }
+
     if let Some(name) = missing_field(inner) {
         let field = match &path {
             Some(prefix) => format!("{prefix}.{name}"),
@@ -310,6 +318,16 @@ fn unreadable<E: Display>(subject: Subject, error: &serde_path_to_error::Error<E
         None => format!("{} could not be read", subject.whole()),
     };
     invalid_request(path, expected_type(inner), message)
+}
+
+/// `serde` writes an unknown field as ``unknown field `bogus`, expected …``.
+/// The name is the caller's key, not its value, so it is safe and actionable to
+/// publish it as the refused field.
+fn unknown_field(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("unknown field `")
+        .and_then(|rest| rest.split('`').next())
+        .filter(|name| !name.is_empty())
 }
 
 /// `serde` writes a missing field as ``missing field `contour` `` and has done
@@ -370,6 +388,12 @@ fn is_json_content_type(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_field_is_named() {
+        assert_eq!(unknown_field("unknown field `bogus`, expected `account`"), Some("bogus"));
+        assert_eq!(unknown_field("invalid digit found in string"), None);
+    }
 
     #[test]
     fn a_missing_field_is_named() {

@@ -51,6 +51,12 @@ pub enum OperationKey {
     CreateClassificationRule,
     /// Record the owner's statement about one account's transfer partners.
     RecordAccountTransferPartners,
+    /// Record several owners' transfer-partner statements atomically.
+    ///
+    /// This is the batch spelling of [`Self::RecordAccountTransferPartners`].
+    /// It has its own key because the transport publishes its own operation
+    /// identifier, while both calls carry the same reversible decision.
+    RecordAccountTransferPartnersBatch,
     /// Rule an account outside the reporting perimeter, with a reason.
     ///
     /// The half of the scope decision that a contour cannot express: membership
@@ -233,7 +239,7 @@ impl OperationKey {
     /// The declared length is the only thing holding a twentieth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -241,6 +247,7 @@ impl OperationKey {
         Self::CreateCategoryRule,
         Self::CreateClassificationRule,
         Self::RecordAccountTransferPartners,
+        Self::RecordAccountTransferPartnersBatch,
         Self::RecordAccountScope,
         Self::RecordAccountRetirement,
         Self::RecordAccountNameDisposition,
@@ -266,6 +273,7 @@ impl OperationKey {
             Self::CreateCategoryRule => "create_category_rule",
             Self::CreateClassificationRule => "create_classification_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",
+            Self::RecordAccountTransferPartnersBatch => "record_account_transfer_partners_batch",
             Self::RecordAccountScope => "record_account_scope",
             Self::RecordAccountRetirement => "record_account_retirement",
             Self::RecordAccountNameDisposition => "record_account_name_disposition",

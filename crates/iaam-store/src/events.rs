@@ -63,6 +63,7 @@ pub struct ControlAssertionRecord {
     pub period: AssertionPeriod,
     pub point: Option<BalancePoint>,
     pub dimension: Dimension,
+    pub reconstructed_opening: bool,
 }
 
 impl SqliteStore {
@@ -291,14 +292,15 @@ impl SqliteStore {
         let mut statement = self.conn.prepare(
             "SELECT id, payload
              FROM events
-             WHERE owner = ?1 AND account = ?2 AND kind = ?3
+             WHERE owner = ?1 AND account = ?2 AND kind IN (?3, ?4)
              ORDER BY effective_date, sequence, id",
         )?;
         let rows = statement.query_map(
             params![
                 owner.inner().to_string(),
                 account.inner().to_string(),
-                CONTROL_ASSERTION_KIND
+                CONTROL_ASSERTION_KIND,
+                "opening_cash"
             ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?;
@@ -307,21 +309,32 @@ impl SqliteStore {
             let (id, payload) = row?;
             let event: Event = serde_json::from_str(&payload)
                 .map_err(|source| StoreError::EventDecode { id, source })?;
-            let EventKind::ControlAssertion { period, claim } = event.kind else {
-                continue;
-            };
-            let point = match &claim {
-                iaam_core::reconciliation::claim::ControlClaim::CashBalance { at, .. }
-                | iaam_core::reconciliation::claim::ControlClaim::PositionQuantity { at, .. } => {
-                    Some(*at)
+            let (period, point, dimension, reconstructed_opening) = match event.kind {
+                EventKind::ControlAssertion { period, claim } => {
+                    let point = match &claim {
+                        iaam_core::reconciliation::claim::ControlClaim::CashBalance { at, .. }
+                        | iaam_core::reconciliation::claim::ControlClaim::PositionQuantity {
+                            at, ..
+                        } => Some(*at),
+                        _ => None,
+                    };
+                    (period, point, claim.dimension(), false)
                 }
-                _ => None,
+                EventKind::OpeningCash { .. } => (
+                    AssertionPeriod::between(event.order.date(), event.order.date())
+                        .expect("an opening event has a one-day assertion period"),
+                    Some(BalancePoint::Opening),
+                    Dimension::Cash,
+                    true,
+                ),
+                _ => continue,
             };
             assertions.push(ControlAssertionRecord {
                 account: event.account,
                 period,
                 point,
-                dimension: claim.dimension(),
+                dimension,
+                reconstructed_opening,
             });
         }
         Ok(assertions)

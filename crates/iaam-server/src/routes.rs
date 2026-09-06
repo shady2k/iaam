@@ -181,10 +181,15 @@ pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
     )),
     security(("bearer" = []))
 )]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionsParams {}
+
 pub async fn list_actions(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiQuery(_params): ApiQuery<ActionsParams>,
 ) -> Result<Json<ActionsResponseDto>, ApiFailure> {
     // The caller's authority, asked once of the principal this route already
     // holds and handed down (`iaam-sh6m`). The queue says what an answer to a
@@ -1410,6 +1415,7 @@ pub async fn sync_market(
 }
 
 /// Price series parameters.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct MarketPricesParams {
@@ -1439,6 +1445,7 @@ pub struct MarketPricesParams {
 }
 
 /// Exchange-rate series parameters.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct MarketFxParams {
@@ -1459,6 +1466,7 @@ pub struct MarketFxParams {
 }
 
 /// Key-rate series parameters.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct MarketKeyRateParams {
@@ -4597,6 +4605,7 @@ const CSV_CHANNEL: &str = "csv";
 /// its own account, and one file spanning two accounts writes two sources and,
 /// under a label, two imports. That is the same granularity every other channel
 /// has; it just takes two retraction calls to undo instead of one.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct IngestCsvParams {
@@ -4745,6 +4754,7 @@ pub async fn ingest_csv(
 }
 
 /// Money flow report parameters.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct MoneyFlowParams {
@@ -4812,6 +4822,7 @@ pub async fn flow_report(
 }
 
 /// Account balances at a date.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct BalancesParams {
@@ -4873,6 +4884,7 @@ pub async fn balances_report(
 }
 
 /// What the owner holds at a date.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct AssetSnapshotParams {
@@ -4939,6 +4951,7 @@ pub async fn asset_snapshot_report(
 }
 
 /// Returns report parameters.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ReturnsParams {
@@ -5242,6 +5255,7 @@ fn matcher_text(value: &serde_json::Value, field: &str) -> Result<String, ApiFai
         })
 }
 /// Journal read parameters. Every filter is optional and they combine.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct JournalParams {
@@ -5374,6 +5388,7 @@ pub async fn list_journal_events(
 /// This view is deliberately not a scope-filtered queue. It is the owner's
 /// after-the-fact audit, and an agent cannot use it to turn a call's acceptance
 /// into permission to read the owner's history.
+#[serde(deny_unknown_fields)]
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct DecisionParams {

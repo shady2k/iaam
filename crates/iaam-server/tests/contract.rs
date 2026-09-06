@@ -9709,6 +9709,23 @@ async fn actions_endpoint_is_authenticated_and_reports_the_empty_frontier() {
     );
 }
 
+#[tokio::test]
+async fn actions_endpoint_rejects_unknown_query_parameters() {
+    let harness = empty_owner_harness();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            "/v1/actions?bogus=1",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+    assert_eq!(body["field"], "bogus", "{body}");
+    assert_eq!(body["expected"], Value::Null, "{body}");
+}
+
 /// The queue says which of the four reports nothing outstanding stands in the
 /// way of, and names the items standing in the way of the rest.
 ///

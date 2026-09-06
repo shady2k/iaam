@@ -3516,9 +3516,12 @@ fn control_assertion_completion(
 ) -> bool {
     assertions.iter().any(|assertion| {
         assertion.account == account
-            && assertion.period == period
-            && assertion.point == Some(point)
             && assertion.dimension == dimension
+            && if assertion.reconstructed_opening {
+                point == BalancePoint::Opening
+            } else {
+                assertion.period == period && assertion.point == Some(point)
+            }
     })
 }
 
@@ -4260,11 +4263,21 @@ fn actions_from_views(
             actions.push(account_scope_action(account, accounts, contours));
         }
     }
-    for account in accounts.iter().filter(|account| {
-        transfer_relationships_eligibility(account.id, accounts, contours, exclusions)
-            && transfer_relationships_gap(account.id, transfers)
-    }) {
-        actions.push(transfer_relationships_action(account, accounts));
+    let transfer_accounts: Vec<&AccountView> = accounts
+        .iter()
+        .filter(|account| {
+            transfer_relationships_eligibility(account.id, accounts, contours, exclusions)
+                && transfer_relationships_gap(account.id, transfers)
+        })
+        .collect();
+    let transfer_batch = (transfer_accounts.len() > 1)
+        .then(|| transfer_relationships_batch_request(&transfer_accounts));
+    for account in transfer_accounts {
+        actions.push(transfer_relationships_action(
+            account,
+            accounts,
+            transfer_batch.as_ref(),
+        ));
     }
     actions
 }
@@ -4435,9 +4448,65 @@ fn transfer_relationships_completion(
 /// happen to match would be a fabricated fact about the owner's money, in
 /// exactly the way an inferred contour would be. So every other account is
 /// offered, with the institution that holds it, and the statement is his.
-fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]) -> Action {
+fn transfer_relationships_batch_request(accounts: &[&AccountView]) -> RequestPlan {
+    let statements = accounts
+        .iter()
+        .map(|account| serde_json::json!({"account": account.id.inner()}))
+        .collect();
+    let missing = accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| {
+            let candidates = accounts
+                .iter()
+                .filter(|candidate| candidate.id != account.id)
+                .map(|candidate| (*candidate).clone())
+                .collect();
+            let mut missing = MissingInput::asked_from(OwnerPrompt::TransferPartners, candidates);
+            missing.pointer = format!("/statements/{index}/partners");
+            missing
+        })
+        .collect();
+    RequestPlan {
+        preset: BTreeMap::from([("statements".to_owned(), serde_json::Value::Array(statements))]),
+        missing,
+    }
+}
+
+fn transfer_relationships_action(
+    account: &AccountView,
+    accounts: &[AccountView],
+    batch: Option<&RequestPlan>,
+) -> Action {
     let mut preset = BTreeMap::new();
     preset.insert("account".to_owned(), account.id.inner().to_string().into());
+
+    let individual = ResolutionOption {
+        operation: OperationKey::RecordAccountTransferPartners,
+        request: RequestPlan {
+            preset,
+            // The owner's other accounts, and only those: this statement is
+            // about two accounts of his own, and a counterparty who is not
+            // him is the classification rules' question.
+            missing: vec![MissingInput::asked_from(
+                OwnerPrompt::TransferPartners,
+                account_candidates(
+                    &accounts
+                        .iter()
+                        .filter(|candidate| candidate.id != account.id)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+            )],
+        },
+    };
+    let mut resolutions = vec![individual];
+    if let Some(batch) = batch {
+        resolutions.push(ResolutionOption {
+            operation: OperationKey::RecordAccountTransferPartnersBatch,
+            request: batch.clone(),
+        });
+    }
 
     Action::new(
         ActionFacts {
@@ -4460,25 +4529,7 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
             account.id.inner(),
             account.title
         ),
-        ActionTarget::Operation {
-            operation: OperationKey::RecordAccountTransferPartners,
-            request: RequestPlan {
-                preset,
-                // The owner's other accounts, and only those: this statement is
-                // about two accounts of his own, and a counterparty who is not
-                // him is the classification rules' question.
-                missing: vec![MissingInput::asked_from(
-                    OwnerPrompt::TransferPartners,
-                    account_candidates(
-                        &accounts
-                            .iter()
-                            .filter(|candidate| candidate.id != account.id)
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    ),
-                )],
-            },
-        },
+        ActionTarget::from_options(resolutions),
     )
     .expect("transfer relationships action has an operation target")
 }
@@ -8687,9 +8738,12 @@ mod tests {
 
         // The candidates are proposed and the choice is not made: every *other*
         // account is offered, and the account itself is not among them.
-        let ActionTarget::Operation { operation, request } = asked[0].target() else {
-            panic!("the statement has an operation to make it");
-        };
+        let resolutions = asked[0].target().resolutions();
+        assert_eq!(resolutions.len(), 2);
+        let (operation, request) = resolutions
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::RecordAccountTransferPartners)
+            .expect("the per-account route remains available");
         assert_eq!(*operation, OperationKey::RecordAccountTransferPartners);
         assert_eq!(request.missing.len(), 1);
         assert_eq!(request.missing[0].pointer, "/partners");
@@ -8707,7 +8761,23 @@ mod tests {
             "an account is not the other side of itself: {candidates:#?}"
         );
         assert_eq!(candidates.len(), 1);
-    }
+
+        let (batch_operation, batch_request) = resolutions
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::RecordAccountTransferPartnersBatch)
+            .expect("the batch route is offered beside the per-account route");
+        assert_eq!(*batch_operation, OperationKey::RecordAccountTransferPartnersBatch);
+        assert_eq!(
+            batch_request
+                .preset
+                .get("statements")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(batch_request.missing.len(), 2);
+        assert_eq!(batch_request.missing[0].pointer, "/statements/0/partners");
+        assert_eq!(batch_request.missing[1].pointer, "/statements/1/partners");
 
     /// With one account there is no other side, so the question is not asked.
     #[test]
@@ -9232,6 +9302,7 @@ mod tests {
             period,
             point: Some(point),
             dimension: Dimension::Cash,
+            reconstructed_opening: false,
         }
     }
 
@@ -9328,6 +9399,29 @@ mod tests {
         }
         assert!(
             assertion_queue(&account, period, &both)
+                .iter()
+                .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
+        );
+        let reconstructed = ControlAssertionView {
+            account: account.id,
+            period: AssertionPeriod::between(
+                time::macros::date!(2026 - 02 - 01),
+                time::macros::date!(2026 - 02 - 01),
+            )
+            .expect("opening event period"),
+            point: Some(BalancePoint::Opening),
+            dimension: Dimension::Cash,
+            reconstructed_opening: true,
+        };
+        assert!(control_assertion_completion(
+            &[reconstructed],
+            account.id,
+            period,
+            BalancePoint::Opening,
+            Dimension::Cash
+        ));
+        assert!(
+            assertion_queue(&account, period, &[reconstructed])
                 .iter()
                 .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
         );

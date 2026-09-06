@@ -9376,6 +9376,11 @@ fn format_source_time(time: time::Time) -> String {
 // ---------------------------------------------------------------------------
 
 /// One operation's life: what it was when it arrived, and every act since.
+///
+/// This is a correction history, not a transfer pairing view. If the requested
+/// event is a leg that was paired with another event, the counterpart is not included
+/// here, and its absence does not mean there is no counterpart. Joining paired legs
+/// requires a separate contract and is not performed by this route.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OperationHistoryDto {
     /// The acts, **oldest first**, because a history is read forwards: he wants

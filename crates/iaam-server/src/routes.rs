@@ -5238,6 +5238,11 @@ pub async fn list_journal_events(
 /// hide the very thing the history exists to show. There is no `limit` and no
 /// `after` here, and a caller written against the listing must not expect one.
 ///
+/// This is a correction-chain view, not a transfer-pairing view. If the requested
+/// event is a leg that was paired with another event, the counterpart is not
+/// included here; its absence does not mean there is no counterpart. Joining the
+/// paired legs requires a separate contract and is not performed by this route.
+///
 /// What this does not show is a category. A category is not recorded on the fact
 /// — it is decided by the owner's category rules when a report is computed — so
 /// «I filed this under the wrong category» is not a correction of an operation
@@ -5247,7 +5252,7 @@ pub async fn list_journal_events(
     path = "/v1/journal/events/{event}/history",
     params(("event" = Uuid, Path, description = "Any event identifier of the operation: the original, the fact standing now, or a reversal written along the way")),
     responses(
-        (status = 200, description = "The operation's acts, oldest first, and the fact that counts now", body = OperationHistoryDto),
+        (status = 200, description = "The operation's correction history, oldest first, and the fact that counts now. This is not a transfer pairing view: if the event is a paired leg, its counterpart is not included, and its absence does not mean there is no counterpart", body = OperationHistoryDto),
         (status = 404, description = "An identifier that addresses no event of yours. An event of another owner reads the same way, deliberately: telling the two apart would confirm that a stranger's event exists", body = ApiError),
         (status = 422, description = "An identifier that could not be read", body = ApiError)
     ),

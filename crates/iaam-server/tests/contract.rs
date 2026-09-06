@@ -28729,3 +28729,42 @@ async fn the_history_route_and_its_schemas_are_published() {
         );
     }
 }
+/// The history route answers the correction-chain question, not the transfer-pairing question.
+/// A paired leg's missing counterpart must not be read as evidence that no counterpart exists.
+#[tokio::test]
+async fn history_contract_explains_that_transfer_counterparts_are_not_included() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let route = &spec["paths"]["/v1/journal/events/{event}/history"]["get"];
+    let response_description = route["responses"]["200"]["description"]
+        .as_str()
+        .expect("history response description");
+    for phrase in [
+        "correction history",
+        "transfer pairing",
+        "counterpart is not included",
+        "absence does not mean there is no counterpart",
+    ] {
+        assert!(
+            response_description.contains(phrase),
+            "history response omits {phrase:?}: {response_description}"
+        );
+    }
+
+    let history_description = spec["components"]["schemas"]["OperationHistoryDto"]["description"]
+        .as_str()
+        .expect("history schema description");
+    for phrase in [
+        "correction history",
+        "transfer pairing",
+        "counterpart is not included",
+        "absence does not mean there is no counterpart",
+    ] {
+        assert!(
+            history_description.contains(phrase),
+            "history schema omits {phrase:?}: {history_description}"
+        );
+    }
+}

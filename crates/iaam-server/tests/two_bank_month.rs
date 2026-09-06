@@ -964,7 +964,14 @@ async fn an_opening_balance_is_asked_for_per_account() {
     let asked: Vec<Uuid> = items
         .iter()
         .filter(|item| item["kind"] == "provide_control_assertion")
-        .filter(|item| item["target"]["request"]["preset"]["at"] == "opening")
+        .filter(|item| {
+            item["target"]["options"].as_array().is_some_and(|options| {
+                options.iter().any(|option| {
+                    option["operationId"] == "record_owner_balance"
+                        && option["request"]["preset"]["at"] == "opening"
+                })
+            })
+        })
         .filter_map(|item| item["subject"]["id"].as_str())
         .filter_map(|id| Uuid::parse_str(id).ok())
         .collect();
@@ -983,9 +990,15 @@ async fn an_opening_balance_is_asked_for_per_account() {
     // each», and it was three only while two accounts were invisible.
     assert_eq!(asked.len(), 5, "{items:#?}");
     assert!(
-        !items
-            .iter()
-            .any(|item| item["target"]["request"]["preset"]["at"] == "closing"),
+        !items.iter().any(|item| {
+            item["kind"] == "provide_control_assertion"
+                && item["target"]["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| {
+                        option["operationId"] == "record_owner_balance"
+                            && option["request"]["preset"]["at"] == "closing"
+                    })
+                })
+        }),
         "the closing balance must not be asked for before the opening one: {items:#?}"
     );
 }

@@ -221,20 +221,16 @@ impl CaveatKind {
     ///   answers "what call acts on this line", and for a decision he is
     ///   entitled to keep for good the answer is still not `&[]` — which would
     ///   say no call reaches it.
-    /// - `RunningCashSum` — the opening control assertion, which is exactly
-    ///   what turns the figure from a movement into a balance. The queue's
-    ///   `provide_control_assertion` names the same operation. It is **not**
-    ///   also listed under `RetiredAccountNotEmpty` below, and the reason is the
-    ///   one thing an assertion cannot do: `record_owner_balance` writes a
-    ///   `ControlAssertion`, which has no legs, so
-    ///   [`crate::reconciliation::OpeningAnchors`] reads it and the figure is
-    ///   respelled a balance while the number itself does not move. On the
-    ///   deposit whose principal was never imported that is worse than the
-    ///   movement it replaced: the row stops saying «this is a sum from an
-    ///   unknown start» and starts asserting a balance of minus the principal.
-    ///   The two caveats appear together on exactly that account, so a reader
-    ///   who took the neighbour's remedy for this one's would reach for the
-    ///   call that hardens the wrong figure.
+    /// - `RunningCashSum` — a §10.7 reconstructed opening, recorded through
+    ///   `submit_operations`, is what makes the number right: its `opening_cash`
+    ///   event has a leg, so the starting state is incorporated into the fold.
+    ///   `record_owner_balance` is deliberately not named here. It writes a
+    ///   legless `ControlAssertion`, which
+    ///   [`crate::reconciliation::OpeningAnchors`] reads only as evidence that
+    ///   reconciliation may compare a source claim against the fold. It does
+    ///   not change the number or close the caveat. On a deposit whose principal
+    ///   was never imported, offering that assertion would respell the movement
+    ///   as a balance while leaving it at minus the principal.
     /// - `UndecomposedMovements` — a category rule. It is the only operation
     ///   addressed to this state and it does not reach all of it: category
     ///   assignment is never consulted for a transfer that left the contour, so
@@ -294,7 +290,7 @@ impl CaveatKind {
             Self::AccountInAnotherScope | Self::AccountRuledOutside => {
                 &[OperationKey::AddContourVersion]
             }
-            Self::RunningCashSum => &[OperationKey::RecordOwnerBalance],
+            Self::RunningCashSum => &[OperationKey::SubmitOperations],
             Self::RetiredAccountNotEmpty => &[
                 OperationKey::SubmitOperations,
                 OperationKey::SubmitCorrections,
@@ -671,27 +667,20 @@ mod tests {
         );
     }
 
-    /// The remedy for the caveat next door is not a remedy for this one.
-    ///
-    /// Both caveats land on the same account in the case that motivated the
-    /// register — a deposit whose principal was never imported is both an
-    /// unanchored sum and a retirement that did not take effect — and
-    /// `record_owner_balance` writes a control assertion, which has no legs. It
-    /// respells the figure and moves no number, so offering it here would send
-    /// the owner to assert a balance of minus the principal. `RunningCashSum`
-    /// keeps it, because respelling the figure is exactly its own question.
+    /// A running sum is closed by adding the reconstructed opening that moves
+    /// the number, not by recording the legless assertion that only compares it.
     #[test]
-    fn an_owner_balance_closes_the_unanchored_sum_and_not_the_standing_row() {
+    fn a_running_sum_names_the_reconstructed_opening_not_the_assertion() {
         assert!(
             CaveatKind::RunningCashSum
                 .closed_by()
-                .contains(&OperationKey::RecordOwnerBalance)
+                .contains(&OperationKey::SubmitOperations)
         );
         assert!(
-            !CaveatKind::RetiredAccountNotEmpty
+            !CaveatKind::RunningCashSum
                 .closed_by()
                 .contains(&OperationKey::RecordOwnerBalance),
-            "an assertion with no legs cannot empty an account"
+            "a legless assertion does not close the running sum"
         );
     }
 }

@@ -46,6 +46,7 @@ use crate::money::{CalcMoney, CurrencyCode, Money, MoneyError, PerUnitAmount, Qu
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 use crate::projection::balances::PositionKey;
+use crate::reconciliation::OpeningIncorporation;
 use crate::returns::KnowledgeCoordinate;
 use crate::rules::quotation::{QuotationRule, QuotationV1};
 use crate::rules::valuation::SourcePriorityVersion;
@@ -54,7 +55,7 @@ use crate::valuation::{
     decide_price,
 };
 
-use super::balances::{AccountBalanceRow, AccountCash, BalancesReport, CashFigure, CashOpening};
+use super::balances::{AccountBalanceRow, AccountCash, BalancesReport, CashFigure};
 use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence};
 use super::population::ReportPopulation;
 
@@ -221,7 +222,7 @@ impl AssetSnapshot {
         let mut caveats = self.population.caveats();
         for row in &self.accounts {
             for cash in &row.cash {
-                if cash.opening == CashOpening::Unasserted {
+                if cash.opening == OpeningIncorporation::Unincorporated {
                     caveats.push(Caveat::new(
                         CaveatKind::RunningCashSum,
                         CaveatSubject::AccountCurrency {
@@ -716,14 +717,14 @@ mod tests {
     fn asserted(money: Money) -> AccountCash {
         AccountCash {
             money,
-            opening: CashOpening::Asserted,
+            opening: OpeningIncorporation::Incorporated,
         }
     }
 
     fn unasserted(money: Money) -> AccountCash {
         AccountCash {
             money,
-            opening: CashOpening::Unasserted,
+            opening: OpeningIncorporation::Unincorporated,
         }
     }
 

@@ -3,14 +3,17 @@ use std::sync::Arc;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{AccountView, Clock, Principal, Scope};
+use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance};
 use iaam_app::scenarios::reports::{
-    AccountStanding, HeldScope, KnownAccountCoverage, MoneyFlowQuery, account_balances, money_flow,
+    AccountStanding, CashFigure, HeldScope, KnownAccountCoverage, MoneyFlowQuery,
+    OpeningIncorporation, account_balances, money_flow,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::event::provenance::ParserVersion;
+use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
@@ -240,6 +243,66 @@ async fn a_reversed_interval_is_rejected_by_the_period_field() {
 }
 
 #[tokio::test]
+async fn an_opening_assertion_without_principal_is_not_published_as_a_balance() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = account(&services, owner, "Savings").await;
+    let contour = contour(&services, owner, &[account]).await;
+
+    append_operation(
+        &services,
+        owner,
+        cash_operation(
+            account,
+            OperationKind::Deposit {
+                amount_minor: 300_000,
+                currency: CurrencyCode::Rub,
+            },
+            date!(2026 - 08 - 05),
+        ),
+    )
+    .await;
+
+    record_owner_balance(
+        &services,
+        &principal(owner),
+        OwnerBalance {
+            account,
+            period: AssertionPeriod::between(date!(2026 - 08 - 01), date!(2026 - 08 - 31))
+                .unwrap_or_else(|| panic!("valid August period")),
+            at: BalancePoint::Opening,
+            cash: Some((
+                CurrencyCode::Rub,
+                iaam_core::money::PostedMinor::new(300_000),
+            )),
+            positions: Vec::new(),
+            raw_hash: RawHash::parse(&"a".repeat(64)).unwrap_or_else(|| panic!("valid raw hash")),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("record opening assertion: {error:?}"));
+
+    let report = account_balances(
+        &services,
+        &principal(owner),
+        contour,
+        None,
+        date!(2026 - 08 - 31),
+        &HeldScope::None,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("balances: {error}"))
+    .report;
+    let cash = report.accounts[0].cash[0];
+
+    assert_eq!(cash.opening, OpeningIncorporation::Unincorporated);
+    assert_eq!(
+        CashFigure::for_account(cash),
+        CashFigure::Movement(cash.money)
+    );
+}
+
+#[tokio::test]
 async fn an_account_with_no_movements_still_appears_without_combining_balances() {
     let services = services();
     let owner = OwnerId::new_random();
@@ -323,7 +386,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
     // figure is a running sum rather than a balance.
     assert_eq!(
         card_row.cash[0].opening,
-        iaam_app::scenarios::reports::CashOpening::Unasserted
+        iaam_app::scenarios::reports::OpeningIncorporation::Unincorporated
     );
     assert!(report.negative_cash.is_empty());
     assert_eq!(card_row.positions.len(), 1);

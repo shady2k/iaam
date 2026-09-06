@@ -111,7 +111,7 @@ use uuid::Uuid;
 
 use crate::vocabulary::{
     DataQualityStatusDto, NegativeCashClassificationDto, NotComputableCodeDto, ProvidedByDto,
-    VerdictCodeDto, described_vocabulary,
+    ReconciliationOutcomeDto, ReconciliationReasonDto, VerdictCodeDto, described_vocabulary,
 };
 
 // Custom date format: the standard serialisation of `time::Date` is not
@@ -11722,8 +11722,8 @@ pub struct PlannedFactDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RowReconciliationDto {
     pub row: u32,
-    /// `recorded`, `duplicate`, `retained` or `settled_without_fact`.
-    pub outcome: String,
+    /// The outcome's meaning for this row.
+    pub outcome: ReconciliationOutcomeDto,
     /// The classification kind recorded by the row, for recorded and duplicate
     /// rows. A complete cash-transfer fact is exposed here as `internal_transfer`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11731,9 +11731,9 @@ pub struct RowReconciliationDto {
     /// What settled a recorded or duplicate row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_by: Option<String>,
-    /// The typed reason, for retained and settled-without-fact rows.
+    /// The reason the row has no fact of its own, when one is stated.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<ReconciliationReasonDto>,
     /// The human-readable explanation of `reason`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
@@ -11742,53 +11742,71 @@ pub struct RowReconciliationDto {
 impl RowReconciliationDto {
     #[must_use]
     pub fn from_domain(reconciliation: &RowReconciliation) -> Self {
-        let mut dto = Self {
-            row: reconciliation.row,
-            outcome: String::new(),
-            records_as: None,
-            settled_by: None,
-            reason: None,
-            explanation: None,
-        };
-        match &reconciliation.outcome {
+        let (outcome, records_as, settled_by, reason, explanation) = match &reconciliation.outcome {
             ReconciliationOutcome::Recorded {
                 records_as,
                 settled_by,
-            } => {
-                dto.outcome = "recorded".to_owned();
-                dto.records_as = Some((*records_as).to_owned());
-                dto.settled_by = Some(settled_by.code().to_owned());
-            }
+            } => (
+                ReconciliationOutcomeDto::Recorded,
+                Some((*records_as).to_owned()),
+                Some(settled_by.code().to_owned()),
+                None,
+                None,
+            ),
             ReconciliationOutcome::Duplicate {
                 records_as,
                 settled_by,
-            } => {
-                dto.outcome = "duplicate".to_owned();
-                dto.records_as = Some((*records_as).to_owned());
-                dto.settled_by = Some(settled_by.code().to_owned());
-            }
-            ReconciliationOutcome::Retained { reason } => {
-                dto.outcome = "retained".to_owned();
-                match reason {
-                    RetentionReason::Unreadable { .. } => {
-                        dto.reason = Some("unreadable".to_owned());
-                        dto.explanation =
-                            Some("the row could not be read into a journal fact".to_owned());
-                    }
-                    RetentionReason::Unanswered { .. } => {
-                        dto.reason = Some("unanswered".to_owned());
-                        dto.explanation =
-                            Some("the row is waiting for the owner's answer".to_owned());
-                    }
-                }
-            }
+            } => (
+                ReconciliationOutcomeDto::Duplicate,
+                Some((*records_as).to_owned()),
+                Some(settled_by.code().to_owned()),
+                None,
+                None,
+            ),
+            ReconciliationOutcome::Retained { reason } => match reason {
+                RetentionReason::Unreadable { .. } => (
+                    ReconciliationOutcomeDto::Retained,
+                    None,
+                    None,
+                    Some(ReconciliationReasonDto::Unreadable),
+                    Some("the row could not be read into a journal fact".to_owned()),
+                ),
+                RetentionReason::Unanswered { .. } => (
+                    ReconciliationOutcomeDto::Retained,
+                    None,
+                    None,
+                    Some(ReconciliationReasonDto::Unanswered),
+                    Some("the row is waiting for the owner's answer".to_owned()),
+                ),
+            },
             ReconciliationOutcome::SettledWithoutFact { reason } => {
-                dto.outcome = "settled_without_fact".to_owned();
-                dto.reason = Some(reason.code().to_owned());
-                dto.explanation = Some(reason.describe().to_owned());
+                let (reason, explanation) = match reason {
+                    NoFactReason::OneAccountTwoInstruments { .. } => (
+                        ReconciliationReasonDto::OneAccountTwoInstruments,
+                        reason.describe(),
+                    ),
+                    NoFactReason::SecondLegOfOneMovement { .. } => (
+                        ReconciliationReasonDto::SecondLegOfOneMovement,
+                        reason.describe(),
+                    ),
+                };
+                (
+                    ReconciliationOutcomeDto::SettledWithoutFact,
+                    None,
+                    None,
+                    Some(reason),
+                    Some(explanation.to_owned()),
+                )
             }
+        };
+        Self {
+            row: reconciliation.row,
+            outcome,
+            records_as,
+            settled_by,
+            reason,
+            explanation,
         }
-        dto
     }
 }
 

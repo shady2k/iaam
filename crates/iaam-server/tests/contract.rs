@@ -2131,6 +2131,31 @@ async fn the_openapi_document_enumerates_and_explains_every_verdict() {
 }
 
 #[tokio::test]
+async fn import_reconciliation_codes_are_typed_and_explained() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (field, vocabulary) in [
+        ("outcome", "ReconciliationOutcomeDto"),
+        ("reason", "ReconciliationReasonDto"),
+    ] {
+        assert!(
+            refers_to(
+                &spec["components"]["schemas"]["RowReconciliationDto"]["properties"][field],
+                vocabulary
+            ),
+            "RowReconciliationDto.{field} must point at {vocabulary}: {}",
+            spec["components"]["schemas"]["RowReconciliationDto"]["properties"][field]
+        );
+        assert!(
+            !published_vocabulary(&spec, vocabulary).is_empty(),
+            "{vocabulary} must enumerate its codes"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_verdict_vocabulary_admits_which_codes_nothing_emits() {
     // Three of the eleven are published and constructed by no path, and all three
     // are the reconciliation ones. That is not a coincidence: a verdict is the

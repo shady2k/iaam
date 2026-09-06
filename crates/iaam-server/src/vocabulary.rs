@@ -33,6 +33,124 @@ use iaam_app::ingest::Verdict;
 use iaam_core::perimeter::NegativeCashClassification;
 use iaam_core::returns::{DataQualityStatus, NotComputable};
 
+use iaam_app::scenarios::import_session::{NoFactReason, ReconciliationOutcome, RetentionReason};
+
+/// How the commit accounted for a row from the import session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconciliationOutcomeDto {
+    /// A new journal fact will be written for the row.
+    #[serde(rename = "recorded")]
+    Recorded,
+    /// The journal already contains the row's fact, so this commit writes nothing.
+    #[serde(rename = "duplicate")]
+    Duplicate,
+    /// The row remains in the session because it could not be committed.
+    #[serde(rename = "retained")]
+    Retained,
+    /// The row deliberately produces no journal fact for a stated reason.
+    #[serde(rename = "settled_without_fact")]
+    SettledWithoutFact,
+}
+
+/// Why a reconciled row has no fact of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReconciliationReasonDto {
+    /// The row could not be read into a journal fact.
+    #[serde(rename = "unreadable")]
+    Unreadable,
+    /// The row is waiting for the owner's answer.
+    #[serde(rename = "unanswered")]
+    Unanswered,
+    /// The source named two payment instruments over one account.
+    #[serde(rename = "one_account_two_instruments")]
+    OneAccountTwoInstruments,
+    /// Another row in the session already records the movement.
+    #[serde(rename = "second_leg_of_one_movement")]
+    SecondLegOfOneMovement,
+}
+
+impl PartialSchema for ReconciliationOutcomeDto {
+    fn schema() -> RefOr<Schema> {
+        described_vocabulary(
+            "How the commit accounted for each row in the import session.",
+            &[
+                ("recorded", "a new journal fact will be written for the row"),
+                (
+                    "duplicate",
+                    "the journal already contains the row's fact, so this commit writes nothing",
+                ),
+                (
+                    "retained",
+                    "the row remains in the session because it could not be committed",
+                ),
+                (
+                    "settled_without_fact",
+                    "the row deliberately produces no journal fact for a stated reason",
+                ),
+            ],
+        )
+    }
+}
+
+impl ToSchema for ReconciliationOutcomeDto {}
+
+impl PartialSchema for ReconciliationReasonDto {
+    fn schema() -> RefOr<Schema> {
+        described_vocabulary(
+            "Why a reconciled row has no fact of its own.",
+            &[
+                (
+                    "unreadable",
+                    "the row could not be read into a journal fact",
+                ),
+                ("unanswered", "the row is waiting for the owner's answer"),
+                (
+                    "one_account_two_instruments",
+                    "the source named two payment instruments over one account",
+                ),
+                (
+                    "second_leg_of_one_movement",
+                    "another row in the session already records the movement",
+                ),
+            ],
+        )
+    }
+}
+
+impl ToSchema for ReconciliationReasonDto {}
+
+impl ReconciliationOutcomeDto {
+    /// Converts the domain outcome to its wire vocabulary.
+    #[must_use]
+    pub const fn from_domain(outcome: &ReconciliationOutcome) -> Self {
+        match outcome {
+            ReconciliationOutcome::Recorded { .. } => Self::Recorded,
+            ReconciliationOutcome::Duplicate { .. } => Self::Duplicate,
+            ReconciliationOutcome::Retained { .. } => Self::Retained,
+            ReconciliationOutcome::SettledWithoutFact { .. } => Self::SettledWithoutFact,
+        }
+    }
+}
+
+impl ReconciliationReasonDto {
+    /// Converts a retained-row reason to its wire vocabulary.
+    #[must_use]
+    pub const fn from_retention(reason: &RetentionReason) -> Self {
+        match reason {
+            RetentionReason::Unreadable { .. } => Self::Unreadable,
+            RetentionReason::Unanswered { .. } => Self::Unanswered,
+        }
+    }
+
+    /// Converts a no-fact reason to its wire vocabulary.
+    #[must_use]
+    pub const fn from_no_fact(reason: NoFactReason) -> Self {
+        match reason {
+            NoFactReason::OneAccountTwoInstruments { .. } => Self::OneAccountTwoInstruments,
+            NoFactReason::SecondLegOfOneMovement { .. } => Self::SecondLegOfOneMovement,
+        }
+    }
+}
 /// A schema that both enumerates a vocabulary and explains it.
 ///
 /// `oneOf` over single-valued `enum`s rather than one `enum` with every code:

@@ -218,12 +218,14 @@ pub fn recognises(bytes: &[u8], profile: &SourceProfile) -> Recognition {
     };
     let header = match header(&records, shape) {
         Ok(header) => header,
-        Err(_) => return Recognition::MissingHeaderRow {
-            row: shape.header_row,
-        },
+        Err(_) => {
+            return Recognition::MissingHeaderRow {
+                row: shape.header_row,
+            };
+        }
     };
     let printed: Vec<&str> = header.cells.iter().map(|cell| cell.trim()).collect();
-    let columns = profile
+    let columns: Vec<String> = profile
         .recognised_by()
         .iter()
         .filter(|wanted| !printed.contains(&wanted.as_str()))

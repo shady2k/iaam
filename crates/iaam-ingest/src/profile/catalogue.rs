@@ -373,9 +373,7 @@ impl ProfileCatalogue {
     }
 }
 
-fn recognition_line(
-    failures: &[(&Installed, engine::Recognition)],
-) -> String {
+fn recognition_line(failures: &[(&Installed, engine::Recognition)]) -> String {
     if failures.is_empty() {
         return "none".to_owned();
     }

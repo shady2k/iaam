@@ -355,11 +355,25 @@ pub async fn reread_into_session(
 ///
 /// The engine speaks [`Rejection`] because that is what a row refusal is, and a
 /// document refusal has the same three parts for the same reason: the field,
-/// what was admissible, and what arrived.
+/// what was admissible, and what arrived. The HTTP contract belongs here rather
+/// than in `iaam-ingest`, so this boundary can name the route that remains open
+/// without making the recogniser depend on server vocabulary.
 fn rejected(rejection: Rejection) -> AppError {
+    let expected = if rejection.field == "document"
+        && rejection.actual == "a document none of them recognises"
+    {
+        format!(
+            "{}. The primary document route remains the right choice whenever \
+             an installed profile can read the export; otherwise transcribe its \
+             observations through POST /v1/import-sessions/{{session}}/rows",
+            rejection.expected
+        )
+    } else {
+        rejection.expected
+    };
     AppError::Invalid {
         field: rejection.field,
-        expected: rejection.expected,
+        expected,
         actual: rejection.actual,
     }
 }

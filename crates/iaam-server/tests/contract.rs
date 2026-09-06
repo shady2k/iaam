@@ -28153,6 +28153,12 @@ async fn a_document_no_profile_recognises_is_refused_by_name() {
             .is_some_and(|expected| expected.contains("tbank-operations-csv")),
         "the refusal lists what this instance reads: {refusal}"
     );
+    assert!(
+        refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("POST /v1/import-sessions/{session}/rows")),
+        "the refusal names the observation fallback: {refusal}"
+    );
 }
 
 /// The document channel is an operation the contract publishes, and it resolves

@@ -4532,6 +4532,13 @@ pub struct ReportStandingDto {
     /// that nothing outstanding stands in the way of this one — never that this
     /// one is ready.
     ///
+    /// **Non-empty means only that the named items stand in the way of this
+    /// report's next step; it is not a refusal and does not say the report cannot
+    /// answer.** The report still answers when called, and its own confidence
+    /// register says whether that answer is complete, silent about something, or
+    /// partial. A caller reading only this queue must not turn a non-empty list
+    /// into "unavailable", and must reach the report itself to read that register.
+    ///
     /// An item that blocks the queue outright stands in the way of all four and
     /// appears in all four lists, even though its own `goals` is empty. The two
     /// fields answer different questions: `goals` says which reports an item's
@@ -7142,6 +7149,7 @@ mod tests {
 }
 /// Report upload parameters. The route body is the workbook's binary bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct DocumentParams {
     #[serde(default)]
@@ -7167,6 +7175,7 @@ pub struct DocumentDto {
 
 /// Reconciliation range parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct ReconciliationParams {
     pub account: Uuid,
@@ -12986,6 +12995,7 @@ impl SourceDocumentDto {
 
 /// Reading a document into a session. The route body is the document's bytes.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct SourceDocumentParams {
     /// The profile to read with. Omitted, the instance asks which of its

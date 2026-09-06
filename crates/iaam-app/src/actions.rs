@@ -3516,9 +3516,12 @@ fn control_assertion_completion(
 ) -> bool {
     assertions.iter().any(|assertion| {
         assertion.account == account
-            && assertion.period == period
-            && assertion.point == Some(point)
             && assertion.dimension == dimension
+            && if assertion.reconstructed_opening {
+                point == BalancePoint::Opening
+            } else {
+                assertion.period == period && assertion.point == Some(point)
+            }
     })
 }
 
@@ -4439,6 +4442,26 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
     let mut preset = BTreeMap::new();
     preset.insert("account".to_owned(), account.id.inner().to_string().into());
 
+    let resolutions = vec![ResolutionOption {
+        operation: OperationKey::RecordAccountTransferPartners,
+        request: RequestPlan {
+            preset,
+            // The owner's other accounts, and only those: this statement is
+            // about two accounts of his own, and a counterparty who is not
+            // him is the classification rules' question.
+            missing: vec![MissingInput::asked_from(
+                OwnerPrompt::TransferPartners,
+                account_candidates(
+                    &accounts
+                        .iter()
+                        .filter(|candidate| candidate.id != account.id)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+            )],
+        },
+    }];
+
     Action::new(
         ActionFacts {
             id: format!(
@@ -4460,25 +4483,7 @@ fn transfer_relationships_action(account: &AccountView, accounts: &[AccountView]
             account.id.inner(),
             account.title
         ),
-        ActionTarget::Operation {
-            operation: OperationKey::RecordAccountTransferPartners,
-            request: RequestPlan {
-                preset,
-                // The owner's other accounts, and only those: this statement is
-                // about two accounts of his own, and a counterparty who is not
-                // him is the classification rules' question.
-                missing: vec![MissingInput::asked_from(
-                    OwnerPrompt::TransferPartners,
-                    account_candidates(
-                        &accounts
-                            .iter()
-                            .filter(|candidate| candidate.id != account.id)
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    ),
-                )],
-            },
-        },
+        ActionTarget::from_options(resolutions),
     )
     .expect("transfer relationships action has an operation target")
 }
@@ -8687,9 +8692,12 @@ mod tests {
 
         // The candidates are proposed and the choice is not made: every *other*
         // account is offered, and the account itself is not among them.
-        let ActionTarget::Operation { operation, request } = asked[0].target() else {
-            panic!("the statement has an operation to make it");
-        };
+        let resolutions = asked[0].target().resolutions();
+        assert_eq!(resolutions.len(), 1);
+        let (operation, request) = resolutions
+            .iter()
+            .find(|(operation, _)| *operation == OperationKey::RecordAccountTransferPartners)
+            .expect("the per-account route remains available");
         assert_eq!(*operation, OperationKey::RecordAccountTransferPartners);
         assert_eq!(request.missing.len(), 1);
         assert_eq!(request.missing[0].pointer, "/partners");
@@ -9232,6 +9240,7 @@ mod tests {
             period,
             point: Some(point),
             dimension: Dimension::Cash,
+            reconstructed_opening: false,
         }
     }
 
@@ -9331,6 +9340,32 @@ mod tests {
                 .iter()
                 .all(|action| action.kind() != ActionKind::ProvideControlAssertion)
         );
+        let reconstructed = ControlAssertionView {
+            account: account.id,
+            period: AssertionPeriod::between(
+                time::macros::date!(2026 - 02 - 01),
+                time::macros::date!(2026 - 02 - 01),
+            )
+            .expect("opening event period"),
+            point: Some(BalancePoint::Opening),
+            dimension: Dimension::Cash,
+            reconstructed_opening: true,
+        };
+        assert!(control_assertion_completion(
+            &[reconstructed],
+            account.id,
+            period,
+            BalancePoint::Opening,
+            Dimension::Cash
+        ));
+        // The opening question is gone and the closing one takes its place, which
+        // is the ordering `the_opening_point_is_asked_for_before_the_closing_one`
+        // exists for. Asserting that no assertion item survives would assert the
+        // wrong thing: a reconstructed opening answers the first question, and
+        // the second was always waiting behind it.
+        let after = assertion_queue(&account, period, &[reconstructed]);
+        let remaining = the_only_assertion_action(&after);
+        assert_eq!(assertion_preset(remaining).preset["at"], "closing");
     }
 
     #[test]

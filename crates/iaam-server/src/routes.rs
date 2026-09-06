@@ -171,6 +171,16 @@ pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 /// account and a range, one synchronisation's own verdicts, one report's own
 /// diagnostics — and "nothing stands in the way of this report" read off a slice
 /// of the queue would be a reassurance nothing in that slice could support.
+/// The queue takes no query parameters, and says so rather than ignoring them.
+///
+/// An empty type rather than no extractor at all: a route with no parameter type
+/// accepts every key silently, and a caller that believed it had filtered the
+/// queue proceeded on a list it had not filtered (`iaam-0vvm`). Naming the empty
+/// set is what makes an unknown key a refusal.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionsParams {}
+
 #[utoipa::path(
     get,
     path = "/v1/actions",
@@ -185,6 +195,7 @@ pub async fn list_actions(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
     Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiQuery(_params): ApiQuery<ActionsParams>,
 ) -> Result<Json<ActionsResponseDto>, ApiFailure> {
     // The caller's authority, asked once of the principal this route already
     // holds and handed down (`iaam-sh6m`). The queue says what an answer to a
@@ -1411,6 +1422,7 @@ pub async fn sync_market(
 
 /// Price series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct MarketPricesParams {
     /// Instrument identifier.
@@ -1440,6 +1452,7 @@ pub struct MarketPricesParams {
 
 /// Exchange-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct MarketFxParams {
     /// Base currency of the pair: the currency being priced.
@@ -1460,6 +1473,7 @@ pub struct MarketFxParams {
 
 /// Key-rate series parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct MarketKeyRateParams {
     /// Inclusive start of the interval, YYYY-MM-DD.
@@ -4598,6 +4612,7 @@ const CSV_CHANNEL: &str = "csv";
 /// under a label, two imports. That is the same granularity every other channel
 /// has; it just takes two retraction calls to undo instead of one.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct IngestCsvParams {
     /// What names this import within the account and the `csv` channel — a
@@ -4746,6 +4761,7 @@ pub async fn ingest_csv(
 
 /// Money flow report parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct MoneyFlowParams {
     /// Scope identifier.
@@ -4813,6 +4829,7 @@ pub async fn flow_report(
 
 /// Account balances at a date.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct BalancesParams {
     /// Scope identifier.
@@ -4874,6 +4891,7 @@ pub async fn balances_report(
 
 /// What the owner holds at a date.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct AssetSnapshotParams {
     /// Scope identifier.
@@ -4940,6 +4958,7 @@ pub async fn asset_snapshot_report(
 
 /// Returns report parameters.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct ReturnsParams {
     /// Scope identifier.
@@ -5243,6 +5262,7 @@ fn matcher_text(value: &serde_json::Value, field: &str) -> Result<String, ApiFai
 }
 /// Journal read parameters. Every filter is optional and they combine.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct JournalParams {
     /// The client key supplied at ingest. It addresses at most one event, so a
@@ -5375,6 +5395,7 @@ pub async fn list_journal_events(
 /// after-the-fact audit, and an agent cannot use it to turn a call's acceptance
 /// into permission to read the owner's history.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
 pub struct DecisionParams {
     /// Inclusive lower bound on the recording date, YYYY-MM-DD.

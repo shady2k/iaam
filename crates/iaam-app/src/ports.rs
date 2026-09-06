@@ -476,13 +476,16 @@ pub struct AccountActivityView {
     pub last_effective_date: Option<Date>,
 }
 
-/// One control assertion's matching dimensions, projected without its payload.
+/// One completed resolution relevant to a control assertion action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlAssertionView {
     pub account: AccountId,
     pub period: AssertionPeriod,
     pub point: Option<BalancePoint>,
     pub dimension: Dimension,
+    /// `true` for a reconstructed `opening_cash` resolution, which closes an
+    /// opening assertion action regardless of the event's own date.
+    pub reconstructed_opening: bool,
 }
 
 /// Instrument as seen by the transport.
@@ -2146,7 +2149,7 @@ mod tests {
 
     /// Each operation ADR 0040 newly admits is reachable by an agent token.
     ///
-    /// Keep the eleven named calls explicit: this test is the acceptance
+    /// Keep the twelve named calls explicit: this test is the acceptance
     /// proof for the authority change, not only a count over the vocabulary.
     #[test]
     fn an_agent_token_reaches_each_newly_admitted_operation() {

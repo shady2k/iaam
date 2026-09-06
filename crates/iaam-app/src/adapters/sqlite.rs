@@ -738,6 +738,7 @@ impl Store for SqliteAdapter {
                     period: record.period,
                     point: record.point,
                     dimension: record.dimension,
+                    reconstructed_opening: record.reconstructed_opening,
                 })
                 .collect())
         })

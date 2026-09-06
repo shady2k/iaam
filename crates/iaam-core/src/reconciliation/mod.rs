@@ -20,7 +20,7 @@ use time::Date;
 use crate::event::correction::resolve;
 use crate::event::{Event, kind::EventKind};
 use crate::ids::AccountId;
-pub use anchor::{OpeningAnchor, OpeningAnchors};
+pub use anchor::{OpeningAnchor, OpeningAnchors, OpeningIncorporation};
 use check::{ClaimOutcome, ObservationBasis, check_claim, observation_basis};
 use claim::{AssertionPeriod, BalancePoint, ControlClaim};
 pub use evidence::{Evidence, Ground, IdentityScope, SourceChannel};

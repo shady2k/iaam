@@ -6,13 +6,13 @@
 //! is the movement over the imported interval and not a balance at all.
 //!
 //! **This rule lives here because two readers apply it and they must not
-//! disagree.** The balances answer spends it on the spelling of a figure —
+//! disagree.** Reconciliation spends [`OpeningAnchor`] on whether a source's
+//! balance assertion can be compared at all. The balances answer spends
+//! [`OpeningIncorporation`] on whether to spell the figure
 //! `CashFigure::Balance` or `CashFigure::Movement`, published as
-//! `movement_since_unknown_start` — and reconciliation spends it on whether a
-//! source's balance assertion can be compared at all. Until `iaam-d7hn` the two
-//! read the same silence differently: the report refused to call the figure a
-//! balance while reconciliation called it zero and told the owner his own
-//! anchor was wrong. One rule, one place, is the only fix that stays fixed.
+//! `movement_since_unknown_start`. Until `iaam-d7hn` the two readers derived
+//! different answers over the same silence. One index, with each fact computed
+//! here once, is the only fix that stays fixed.
 //!
 //! **The question is whether anything states what the account held before the
 //! first movement folded in.** Two things do, and both count:
@@ -21,7 +21,7 @@
 //!   movement — a source said so, and reconciliation then checks it;
 //! - the first movement itself being a §10.7 reconstructed opening
 //!   ([`EventKind::OpeningCash`], [`EventKind::OpeningPosition`]) — the owner
-//!   said so, and it is recorded as a fact with provenance and legs.
+//!   said so, and its leg is incorporated into the number.
 //!
 //! An ordinary transaction as the earliest record states nothing, and that is
 //! the whole of the case this module exists for: a journal that simply begins
@@ -69,6 +69,21 @@ impl OpeningAnchor {
             Self::Unasserted => "unasserted",
         }
     }
+}
+
+/// Whether the opening state is part of the number being published.
+///
+/// A control assertion is evidence for reconciliation but has no legs, so it
+/// does not change the fold. A reconstructed opening has a leg and is therefore
+/// incorporated into the fold. This is deliberately separate from
+/// [`OpeningAnchor`], whose answer is whether reconciliation may compare an
+/// assertion against the fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningIncorporation {
+    /// A reconstructed opening contributes its leg to the fold.
+    Incorporated,
+    /// The fold has no reconstructed opening supplying its start.
+    Unincorporated,
 }
 
 /// The anchor state of every account, currency and holding in one journal.
@@ -137,6 +152,44 @@ impl OpeningAnchors {
                 (*owner == account && *code == currency).then_some(*from)
             }),
             self.reconstructed_cash.get(&(account, currency)).copied(),
+            *first,
+        )
+    }
+
+    /// Whether a reconstructed opening contributes the cash fold's start.
+    ///
+    /// A control assertion is intentionally absent from this answer: it is
+    /// evidence for reconciliation, not a leg in the number being published.
+    #[must_use]
+    pub fn cash_incorporation(
+        &self,
+        account: AccountId,
+        currency: CurrencyCode,
+    ) -> OpeningIncorporation {
+        let Some(first) = self.first_cash.get(&(account, currency)) else {
+            return OpeningIncorporation::Unincorporated;
+        };
+        incorporation(
+            self.reconstructed_cash.get(&(account, currency)).copied(),
+            *first,
+        )
+    }
+
+    /// Whether a reconstructed opening contributes a position fold's start.
+    #[must_use]
+    pub fn position_incorporation(
+        &self,
+        account: AccountId,
+        instrument: InstrumentId,
+        custody: CustodyId,
+    ) -> OpeningIncorporation {
+        let Some(first) = self.first_security.get(&(account, instrument, custody)) else {
+            return OpeningIncorporation::Unincorporated;
+        };
+        incorporation(
+            self.reconstructed_position
+                .get(&(account, instrument, custody))
+                .copied(),
             *first,
         )
     }
@@ -256,6 +309,15 @@ fn anchored(
     }
 }
 
+/// Whether the reconstructed opening reaches back to the first movement.
+fn incorporation(reconstructed_at: Option<Date>, first_movement: Date) -> OpeningIncorporation {
+    if reconstructed_at.is_some_and(|at| at <= first_movement) {
+        OpeningIncorporation::Incorporated
+    } else {
+        OpeningIncorporation::Unincorporated
+    }
+}
+
 fn earliest<K: Ord>(into: &mut BTreeMap<K, Date>, key: K, date: Date) {
     into.entry(key)
         .and_modify(|known| {
@@ -273,6 +335,7 @@ mod tests {
     use crate::event::test_support::event_with;
     use crate::money::{Money, PostedMinor};
     use crate::reconciliation::claim::AssertionPeriod;
+    use crate::report::balances::{AccountCash, CashFigure};
     use time::macros::date;
 
     fn rub(minor: i64) -> Money {
@@ -316,11 +379,13 @@ mod tests {
     #[test]
     fn an_opening_assertion_anchors_only_what_it_reaches_back_over() {
         // An opening assertion states the balance before the first event of its
-        // own interval. It therefore anchors the accumulation exactly when that
-        // interval starts no later than the first movement; one that opens after
-        // the movement leaves everything before it unasserted, and the figure is
-        // still a running sum. This is the whole of `iaam-c6f0`: a proven
-        // balance in the middle of a history does not explain what precedes it.
+        // own interval. It therefore anchors reconciliation exactly when that
+        // interval starts no later than the first movement; it does not supply
+        // the cash fold's starting leg, so the figure remains a running sum
+        // until a reconstructed opening does. One that opens after the movement
+        // leaves everything before it unasserted. This is the whole of
+        // `iaam-c6f0`: a proven balance in the middle of a history does not
+        // explain what precedes it.
         let account = AccountId::new_random();
         let first = date!(2026 - 08 - 05);
         let movement = inflow(account, first);
@@ -436,5 +501,26 @@ mod tests {
             OpeningAnchor::Asserted.code(),
             OpeningAnchor::Unasserted.code()
         );
+    }
+    #[test]
+    fn an_opening_assertion_without_a_reconstructed_opening_is_not_incorporated() {
+        let account = AccountId::new_random();
+        let first = date!(2026 - 08 - 05);
+        let index = anchors(&[inflow(account, first), opening_from(account, first)]);
+        assert_eq!(
+            index.cash(account, CurrencyCode::Rub),
+            OpeningAnchor::Asserted,
+            "the assertion remains available for reconciliation"
+        );
+
+        assert_eq!(
+            index.cash_incorporation(account, CurrencyCode::Rub),
+            OpeningIncorporation::Unincorporated
+        );
+        let figure = CashFigure::for_account(AccountCash {
+            money: rub(100_000),
+            opening: index.cash_incorporation(account, CurrencyCode::Rub),
+        });
+        assert_eq!(figure, CashFigure::Movement(rub(100_000)));
     }
 }

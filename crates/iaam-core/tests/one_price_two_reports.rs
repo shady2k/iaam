@@ -29,11 +29,9 @@ use iaam_core::numeric::decimal::Dec;
 use iaam_core::perimeter::{PerimeterAssessment, PerimeterPolicy};
 use iaam_core::projection::state::LedgerState;
 use iaam_core::projection::{ProjectionContext, project};
-use iaam_core::reconciliation::ReconciliationLedger;
+use iaam_core::reconciliation::{OpeningIncorporation, ReconciliationLedger};
 use iaam_core::report::assets::{SnapshotPrices, asset_snapshot};
-use iaam_core::report::balances::{
-    AccountBalanceRow, AccountCash, BalancesReport, CashOpening, PeriodReports,
-};
+use iaam_core::report::balances::{AccountBalanceRow, AccountCash, BalancesReport, PeriodReports};
 use iaam_core::report::population::{AccountStanding, PopulationAccount, ReportPopulation};
 use iaam_core::returns::{KnowledgeCoordinate, ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
@@ -197,7 +195,7 @@ fn balances_from(state: &LedgerState, fixture: &Fixture) -> BalancesReport {
         .filter(|(account, _)| *account == fixture.account)
         .map(|(_, money)| AccountCash {
             money,
-            opening: CashOpening::Asserted,
+            opening: OpeningIncorporation::Incorporated,
         })
         .collect();
     let positions = state

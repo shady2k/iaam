@@ -118,11 +118,10 @@ pub enum OperationKey {
     ///
     /// Not [`Self::RecordOwnerBalance`], and the difference is what a caveat
     /// naming the wrong one costs. A control assertion has no legs: it is
-    /// checked against the fold and never summed into it, so it changes how a
-    /// cash figure is *spelled* — `crate::reconciliation::OpeningAnchors` reads
-    /// it and the figure becomes a balance — and moves no number. A
-    /// reconstructed opening is an event with legs, and it is what makes the
-    /// movements on an account sum to what the account actually held.
+    /// checked against the fold and never summed into it, so it is evidence for
+    /// reconciliation only and moves no number. A reconstructed opening is an
+    /// event with legs, and it is what makes the movements on an account sum to
+    /// what the account actually held.
     ///
     /// Not [`Self::SubmitCorrections`] either: a correction is addressed to an
     /// event the owner names, and the state this key answers is one where the

@@ -9,41 +9,13 @@ use crate::ids::AccountId;
 use crate::money::{CurrencyCode, Money, Quantity};
 use crate::perimeter::NegativeCashSpan;
 use crate::projection::balances::PositionKey;
-use crate::reconciliation::ReconciliationStatus;
+use crate::reconciliation::{OpeningIncorporation, ReconciliationStatus};
 
 use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence};
 use super::population::ReportPopulation;
 use crate::goal::ReportGoal;
 
-/// Whether anything asserts the state a cash figure was accumulated from.
-///
-/// The projection sums cash legs from zero. Zero is a starting point only when
-/// something says the account held nothing before its first event; otherwise the
-/// figure is the movement over the imported interval, not a balance.
-///
-/// This is carried by **every** cash figure, not only by figures that look
-/// wrong. In the reported case one account showed an impossible negative and
-/// the rest showed plausible positives — and from an unasserted start the
-/// plausible ones were exactly as unfounded as the impossible one. They were
-/// merely the ones that passed a plausibility check the reader happened to
-/// have. A marker that appeared only on anomalies would confirm that mistake.
-///
-/// The distinction is per account-and-currency, because that is what an opening
-/// assertion is about and what a cash figure is about.
-///
-/// This is evidence, not the published shape. What a caller reads is
-/// [`CashFigure`], which spends this distinction on the spelling of the figure
-/// instead of stating it beside one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CashOpening {
-    /// An opening assertion covers the state before this account's first cash
-    /// movement in this currency.
-    Asserted,
-    /// Nothing does: the figure accumulated from an unasserted start.
-    Unasserted,
-}
-
-/// One cash figure together with what is known about where it started.
+/// One cash figure together with whether its opening state is incorporated.
 ///
 /// The two travel as one value rather than in parallel collections: a caller
 /// that carried them separately could render the amount and drop the marker,
@@ -51,14 +23,14 @@ pub enum CashOpening {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountCash {
     pub money: Money,
-    pub opening: CashOpening,
+    pub opening: OpeningIncorporation,
 }
 
 /// A cash figure together with what it is a figure *of*.
 ///
-/// [`CashOpening`] states the same distinction **beside** the number, and that
-/// turned out not to be enough. A reader of `{amount, opening}` reaches the
-/// amount without reading the flag, and the reported defect is exactly that: an
+/// [`OpeningIncorporation`] states whether a reconstructed opening contributes
+/// to the number. That is not enough by itself: a reader of `{amount, opening}`
+/// reaches the amount without reading the flag, and the reported defect is exactly that: an
 /// agent ran a first import, read the cash figures — one of them an impossible
 /// negative on a savings-class account — and reported them as holdings. Here
 /// there is no field spelled `amount` to reach for. The figure is called a
@@ -69,9 +41,9 @@ pub struct AccountCash {
 /// and deliberately the same shape, so that a client needs one reader for both.
 ///
 /// **Three cases and not two.** A figure summed across accounts can be a
-/// mixture, because an opening assertion is per account and currency and the
-/// owner may have made some of them. The sum of a mixture is neither of its
-/// parts: a balance is a stock and a movement from an unasserted start is a
+/// mixture, because a reconstructed opening is per account and currency and
+/// the owner may have made some of them. The sum of a mixture is neither of its
+/// parts: a balance is a stock and a movement from an unincorporated start is a
 /// flow, and adding a stock to a flow yields a number that denotes nothing.
 /// (That is also why the whole may mix cash with position values and may not
 /// mix these two — the first is a difference in how well a value is known, the
@@ -80,16 +52,15 @@ pub struct AccountCash {
 /// them means something performs the addition himself, and by then he has
 /// decided it.
 ///
-/// A single account and currency is never [`Self::Mixed`]: one opening
-/// assertion either covers it or does not.
+/// A single account and currency is never [`Self::Mixed`]: one reconstructed
+/// opening either contributes to it or does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CashFigure {
-    /// Every leg summed into this figure starts from an asserted opening, so
-    /// the figure is a balance.
+    /// A reconstructed opening leg supplies the fold's starting state, so the
+    /// figure is a balance.
     Balance(Money),
-    /// Nothing asserts the state summed from: the movement over the recorded
-    /// interval, which is not a balance and cannot be made into one by looking
-    /// plausible.
+    /// No reconstructed opening supplies the fold's start: this is movement
+    /// over the recorded interval, not a balance.
     Movement(Money),
     /// Part of what was summed is a balance and part is movement. Both parts
     /// are in the same currency by construction: the fold that builds this
@@ -102,8 +73,8 @@ impl CashFigure {
     #[must_use]
     pub const fn for_account(cash: AccountCash) -> Self {
         match cash.opening {
-            CashOpening::Asserted => Self::Balance(cash.money),
-            CashOpening::Unasserted => Self::Movement(cash.money),
+            OpeningIncorporation::Incorporated => Self::Balance(cash.money),
+            OpeningIncorporation::Unincorporated => Self::Movement(cash.money),
         }
     }
 
@@ -356,7 +327,7 @@ impl BalancesReport {
         let mut caveats = self.population.caveats();
         for row in &self.accounts {
             for cash in &row.cash {
-                if cash.opening == CashOpening::Unasserted {
+                if cash.opening == OpeningIncorporation::Unincorporated {
                     caveats.push(Caveat::new(
                         CaveatKind::RunningCashSum,
                         CaveatSubject::AccountCurrency {
@@ -408,7 +379,7 @@ mod tests {
         }
     }
 
-    fn row(opening: CashOpening) -> AccountBalanceRow {
+    fn row(opening: OpeningIncorporation) -> AccountBalanceRow {
         AccountBalanceRow {
             account: account(10),
             cash: vec![AccountCash {
@@ -421,7 +392,7 @@ mod tests {
         }
     }
 
-    fn report(standings: &[AccountStanding], opening: CashOpening) -> BalancesReport {
+    fn report(standings: &[AccountStanding], opening: OpeningIncorporation) -> BalancesReport {
         BalancesReport {
             accounts: vec![row(opening)],
             negative_cash: Vec::new(),
@@ -444,7 +415,10 @@ mod tests {
             ],
         ];
         for standings in partial_populations {
-            for opening in [CashOpening::Asserted, CashOpening::Unasserted] {
+            for opening in [
+                OpeningIncorporation::Incorporated,
+                OpeningIncorporation::Unincorporated,
+            ] {
                 let report = report(&standings, opening);
                 assert_ne!(
                     report.population.known_account_coverage(),
@@ -458,7 +432,10 @@ mod tests {
             }
         }
 
-        let whole = report(&[AccountStanding::Covered], CashOpening::Unasserted);
+        let whole = report(
+            &[AccountStanding::Covered],
+            OpeningIncorporation::Unincorporated,
+        );
         assert_eq!(
             whole.population.known_account_coverage(),
             KnownAccountCoverage::Whole
@@ -472,27 +449,30 @@ mod tests {
     /// The only shape that may read as complete, so that the assertion above is
     /// not passing because nothing ever does.
     #[test]
-    fn a_whole_population_of_asserted_balances_is_complete() {
-        let report = report(&[AccountStanding::Covered], CashOpening::Asserted);
+    fn a_whole_population_of_incorporated_balances_is_complete() {
+        let report = report(
+            &[AccountStanding::Covered],
+            OpeningIncorporation::Incorporated,
+        );
         let confidence = report.confidence();
         assert!(confidence.complete());
         assert!(confidence.caveats().is_empty());
         assert_eq!(confidence.goal(), ReportGoal::AssetSnapshot);
     }
 
-    /// One account and currency is a balance or it is movement, and never both:
-    /// a single opening assertion either covers it or does not. The figure it
-    /// publishes says which, and there is no third field to read it out of.
+    /// One account and currency is a balance only where a reconstructed opening
+    /// contributes its starting state. A control assertion alone is evidence
+    /// for reconciliation and does not change this figure.
     #[test]
-    fn an_account_figure_is_a_balance_only_where_an_assertion_anchors_it() {
+    fn an_account_figure_is_a_balance_only_where_an_opening_is_incorporated() {
         let money = Money::new(PostedMinor::new(1_000), CurrencyCode::Rub);
         let anchored = CashFigure::for_account(AccountCash {
             money,
-            opening: CashOpening::Asserted,
+            opening: OpeningIncorporation::Incorporated,
         });
         let adrift = CashFigure::for_account(AccountCash {
             money,
-            opening: CashOpening::Unasserted,
+            opening: OpeningIncorporation::Unincorporated,
         });
 
         assert_eq!(anchored, CashFigure::Balance(money));
@@ -509,7 +489,10 @@ mod tests {
     /// reader is sent to the wrong row of a multi-currency account.
     #[test]
     fn a_running_sum_caveat_names_the_account_and_currency_and_the_field() {
-        let report = report(&[AccountStanding::Covered], CashOpening::Unasserted);
+        let report = report(
+            &[AccountStanding::Covered],
+            OpeningIncorporation::Unincorporated,
+        );
         let confidence = report.confidence();
         let caveat = confidence.caveats().first().expect("one caveat");
         assert_eq!(caveat.kind(), CaveatKind::RunningCashSum);
@@ -527,7 +510,10 @@ mod tests {
     /// field that says so.
     #[test]
     fn a_refused_period_is_a_caveat_naming_the_account() {
-        let mut report = report(&[AccountStanding::Covered], CashOpening::Asserted);
+        let mut report = report(
+            &[AccountStanding::Covered],
+            OpeningIncorporation::Incorporated,
+        );
         report.accounts[0].period_reports = PeriodReports::Refused(Vec::new());
         let confidence = report.confidence();
         let caveat = confidence.caveats().first().expect("one caveat");
@@ -548,7 +534,10 @@ mod tests {
             (Some(NegativeBalanceExpectation::Unexpected), true),
         ];
         for (expectation, contradicts) in cases {
-            let mut report = report(&[AccountStanding::Covered], CashOpening::Asserted);
+            let mut report = report(
+                &[AccountStanding::Covered],
+                OpeningIncorporation::Incorporated,
+            );
             let entry = NegativeCash {
                 account: account(10),
                 money: Money::new(PostedMinor::new(-500), CurrencyCode::Rub),
@@ -590,7 +579,10 @@ mod tests {
     /// fire on almost every report.
     #[test]
     fn a_negative_balance_alone_does_not_make_the_answer_incomplete() {
-        let mut report = report(&[AccountStanding::Covered], CashOpening::Asserted);
+        let mut report = report(
+            &[AccountStanding::Covered],
+            OpeningIncorporation::Incorporated,
+        );
         report.negative_cash = vec![NegativeCash {
             account: account(10),
             money: Money::new(PostedMinor::new(-500), CurrencyCode::Rub),

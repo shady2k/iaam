@@ -162,16 +162,19 @@ impl ActionKind {
         Self::PossibleDuplicateUndecided,
     ];
 
-    /// The reports this kind's outstanding work stands between the owner and.
+    /// The reports this kind's outstanding work normally stands between the
+    /// owner and a complete report.
     ///
-    /// The single table, and the reason it lives on the kind rather than at each
-    /// producer: [`ActionCategory::required_for`] is the only way to build the
-    /// required category, so a kind cannot be graded required for one set of
-    /// goals in one branch and another set in the next.
+    /// The set is the default for kinds whose required reports do not depend on
+    /// a point or another payload. Most producers use [`ActionCategory::required_for`]
+    /// to apply it. `ProvideControlAssertion` is the deliberate exception:
+    /// [`provide_control_assertion_action`] derives its category from the point
+    /// and the resolutions it publishes, because its opening resolution also
+    /// reaches the asset snapshot while its closing resolution does not.
     ///
     /// Empty for the five kinds the queue never grades required — a blocking
-    /// item, two recommendations, two statements of fact — and empty is refused by
-    /// [`Action::new`], so an attempt to promote one of them without deciding
+    /// item, two recommendations, two statements of fact — and empty is refused
+    /// by [`Action::new`], so an attempt to promote one of them without deciding
     /// what it blocks fails at construction rather than publishing a required
     /// item that names nothing.
     ///
@@ -201,13 +204,13 @@ impl ActionKind {
     ///   exist, with nothing on the figure saying so. Abandoning satisfies the
     ///   goal too, and does not contradict this grading: it is the owner saying
     ///   the rows were never facts, after which no report is short of anything.
-    /// - `ProvideControlAssertion` — the closing assertion is the claim side of
-    ///   reconciliation, and the opening one is what makes the snapshot's cash a
-    ///   balance: `reports::account_balances` decides `CashOpening::Asserted`
-    ///   or `Unasserted` per account and currency from exactly these events,
-    ///   and only the first spells the figure `CashFigure::Balance`.
-    ///   **Not returns and not flow**: a control assertion has no legs, so it
-    ///   moves no number in either; it only grades confidence there.
+    /// - `ProvideControlAssertion` — a control assertion is the claim side of
+    ///   reconciliation and is required only for that goal. It has no legs, so
+    ///   it moves no number in any report; an opening assertion cannot turn a
+    ///   movement into a balance. The opening action therefore also offers the
+    ///   reconstructed-opening operation, whose leg is what makes the snapshot
+    ///   figure a balance. **Not returns and not flow**: neither resolution
+    ///   changes those reports.
     /// - `CoverageGapUnrepaired`, `IndependentConfirmationMissing`,
     ///   `DiscrepancyUnresolved` — all three are about whether a period is
     ///   confirmed, and nothing else. `EventKind::ImportCoverageGap` says so in
@@ -257,7 +260,7 @@ impl ActionKind {
             | Self::AnswerClassificationQuestion
             | Self::ImportSessionUnfinished
             | Self::PossibleDuplicateUndecided => ReportGoals::ALL,
-            Self::ProvideControlAssertion => ReportGoals::of(&[AssetSnapshot, Reconciliation]),
+            Self::ProvideControlAssertion => ReportGoals::of(&[Reconciliation]),
             Self::RetiredAccountNotEmpty | Self::RetirementNotAssessed => {
                 ReportGoals::of(&[AssetSnapshot])
             }
@@ -414,6 +417,17 @@ impl ActionCategory {
     #[must_use]
     pub const fn required_for(kind: ActionKind) -> Self {
         Self::RequiredForGoal(kind.goals())
+    }
+
+    /// Build required work from a goal set selected by the action's context.
+    ///
+    /// This is used where one [`ActionKind`] has different report consequences
+    /// at different points. The category carries the selected set into
+    /// [`report_standings`], so the queue does not ask a caller to reconstruct
+    /// it from the target.
+    #[must_use]
+    pub const fn required_for_goals(goals: ReportGoals) -> Self {
+        Self::RequiredForGoal(goals)
     }
 
     /// Urgency, most urgent first. The queue's order, and nothing else.
@@ -4728,11 +4742,11 @@ fn start_account_import_action(account: &AccountView) -> Action {
 /// The request for one control assertion, at the point it is wanted for.
 ///
 /// Parameterised by the point rather than split into a second `ActionKind`: the
-/// kind names the work — obtain a control assertion from a document and record
-/// it — and that work is the same at either end of the interval. The same
-/// operation, the same preset fields, the same missing `/cash`, the same
-/// category and scope; a second kind would duplicate all of it and oblige every
-/// consumer that switches on the kind to learn a second name for one job.
+/// control assertion is the reconciliation work at either end of the interval.
+/// An opening action additionally publishes the reconstructed-opening call,
+/// because that is the separate operation that supplies a leg to the balances
+/// fold. Both roles are visible in the target instead of being conflated in
+/// `record_owner_balance`.
 ///
 /// The point is not lost by that choice: it already sits in the action's id,
 /// between the interval and the dimension, so an opening request and a closing
@@ -4744,11 +4758,26 @@ fn provide_control_assertion_action(
     point: BalancePoint,
 ) -> Action {
     let dimension = Dimension::Cash;
+    let required_goals = match point {
+        BalancePoint::Opening => {
+            ReportGoals::of(&[ReportGoal::AssetSnapshot, ReportGoal::Reconciliation])
+        }
+        BalancePoint::Closing => ReportGoals::of(&[ReportGoal::Reconciliation]),
+    };
     let mut preset = BTreeMap::new();
     preset.insert("account".to_owned(), account.id.inner().to_string().into());
     preset.insert("from".to_owned(), period.from.to_string().into());
     preset.insert("to".to_owned(), period.to.to_string().into());
     preset.insert("at".to_owned(), point.code().into());
+    let assertion = ResolutionOption {
+        operation: OperationKey::RecordOwnerBalance,
+        request: RequestPlan {
+            // `/cash` is the one chosen input, so the request cannot be empty:
+            // the scenario rejects a balance carrying neither cash nor positions.
+            preset,
+            missing: vec![MissingInput::asked(OwnerPrompt::OwnerBalanceCash)],
+        },
+    };
     Action::new(
         ActionFacts {
             id: format!(
@@ -4761,34 +4790,20 @@ fn provide_control_assertion_action(
                 dimension.code()
             ),
             kind: ActionKind::ProvideControlAssertion,
-            // Required for a goal, at either point, not `Recommended`.
-            //
-            // Without the opening assertion the cash figure is a movement over
-            // the imported interval and not a balance at all, so the assertion
-            // is not work that "improves quality but is not required" — it is
-            // what makes the number mean anything. Without the closing one the
-            // interval has nothing to reconcile against and its dimensions stay
-            // provisional; `IndependentConfirmationMissing` already grades the
-            // absence of confirmation as required, and grading the assertion
-            // that produces it as optional would contradict that. So neither
-            // point is recommended-only, and the queue stops telling the owner
-            // that the one thing which would make his numbers trustworthy is
-            // his to skip.
-            //
-            // Which goals, at either point, is `ActionKind::goals`: the snapshot
-            // and the reconciliation. Both requests are the same operation with
-            // the same fields, so a per-point set would be a second table saying
-            // the same thing.
-            category: ActionCategory::required_for(ActionKind::ProvideControlAssertion),
+            // Required for reconciliation at either point, and additionally
+            // for the asset snapshot when the opening resolution supplies its
+            // reconstructed starting leg.
+            category: ActionCategory::required_for_goals(required_goals),
             state: ActionState::NeedsOwnerInput,
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         match point {
             BalancePoint::Opening => format!(
-                "Account {} ({}) has business facts from {} through {}; record its opening cash \
-                 balance. Until it is recorded, the cash figure for this account is a sum \
-                 accumulated from an unasserted start, and a closing balance compared against it \
-                 reports the missing opening balance as a discrepancy.",
+                "Account {} ({}) has business facts from {} through {}; the amount it held \
+                 at the beginning is missing. If it stays missing, the closing amount will be \
+                 compared with an unrecorded opening and the difference will remain a \
+                 discrepancy. Record how much cash the account held then. A separate statement \
+                 can still be used as reconciliation evidence; it does not change the amount.",
                 account.id.inner(),
                 account.title,
                 period.from,
@@ -4804,14 +4819,34 @@ fn provide_control_assertion_action(
                 period.to
             ),
         },
-        ActionTarget::Operation {
-            operation: OperationKey::RecordOwnerBalance,
-            request: RequestPlan {
-                // `/cash` is the one chosen input, so the request cannot be empty:
-                // the scenario rejects a balance carrying neither cash nor positions.
-                preset,
-                missing: vec![MissingInput::asked(OwnerPrompt::OwnerBalanceCash)],
-            },
+        match point {
+            BalancePoint::Opening => {
+                let mut opening_preset = BTreeMap::new();
+                opening_preset.insert(
+                    "operations".to_owned(),
+                    serde_json::json!([{
+                        "account": account.id.inner().to_string(),
+                        "type": "opening_cash",
+                    }]),
+                );
+                let opening = ResolutionOption {
+                    operation: OperationKey::SubmitOperations,
+                    request: RequestPlan {
+                        preset: opening_preset,
+                        missing: vec![
+                            MissingInput::asked(OwnerPrompt::OpeningAmount),
+                            MissingInput::asked(OwnerPrompt::OpeningCurrency),
+                            MissingInput::asked(OwnerPrompt::OpeningDate),
+                            MissingInput::plain(
+                                "/operations/0/idempotency_key",
+                                NobodyIsAsked::Caller,
+                            ),
+                        ],
+                    },
+                };
+                ActionTarget::from_options(vec![opening, assertion])
+            }
+            BalancePoint::Closing => ActionTarget::from_options(vec![assertion]),
         },
     )
     .expect("control assertion action has an operation target")
@@ -6696,12 +6731,11 @@ mod tests {
                 | ActionKind::PossibleDuplicateUndecided => {
                     &[AssetSnapshot, MoneyFlow, Returns, Reconciliation]
                 }
-                // The closing assertion is reconciliation's claim side; the
-                // opening one is what makes the snapshot's cash a balance rather
-                // than movement, which `account_balances` decides per account
-                // and currency. It has no legs, so it moves no number in flow or
-                // returns.
-                ActionKind::ProvideControlAssertion => &[AssetSnapshot, Reconciliation],
+                // A control assertion is reconciliation's claim side. It has no
+                // legs, and therefore moves no number; only the reconstructed
+                // opening offered by the opening action supplies the balances
+                // fold's starting leg.
+                ActionKind::ProvideControlAssertion => &[Reconciliation],
                 // A retirement is read in one place — the asset snapshot's row
                 // suppression. `contour::classify` never sees it, so flow and
                 // returns are unchanged by it, and `reconciliation::report`
@@ -9231,10 +9265,24 @@ mod tests {
     }
 
     fn assertion_preset(action: &Action) -> &RequestPlan {
-        let ActionTarget::Operation { operation, request } = action.target() else {
-            panic!("control assertion needs an operation target");
-        };
-        assert_eq!(*operation, OperationKey::RecordOwnerBalance);
+        let (operation, request) = action
+            .target()
+            .resolutions()
+            .into_iter()
+            .find(|(operation, _)| *operation == OperationKey::RecordOwnerBalance)
+            .expect("control assertion needs an assertion resolution");
+        assert_eq!(operation, OperationKey::RecordOwnerBalance);
+        request
+    }
+
+    fn opening_preset(action: &Action) -> &RequestPlan {
+        let (operation, request) = action
+            .target()
+            .resolutions()
+            .into_iter()
+            .find(|(operation, _)| *operation == OperationKey::SubmitOperations)
+            .expect("opening assertion needs a reconstructed-opening resolution");
+        assert_eq!(operation, OperationKey::SubmitOperations);
         request
     }
 
@@ -9248,12 +9296,39 @@ mod tests {
         .expect("period");
 
         let actions = assertion_queue(&account, period, &[]);
-        let request = assertion_preset(the_only_assertion_action(&actions));
+        let action = the_only_assertion_action(&actions);
+        assert_eq!(
+            action.category().goals().iter().collect::<Vec<_>>(),
+            vec![ReportGoal::AssetSnapshot, ReportGoal::Reconciliation]
+        );
+        let request = assertion_preset(action);
         assert_eq!(request.preset["account"], account.id.inner().to_string());
         assert_eq!(request.preset["from"], period.from.to_string());
         assert_eq!(request.preset["to"], period.to.to_string());
         assert_eq!(request.missing.len(), 1);
         assert_eq!(request.missing[0].pointer, "/cash");
+
+        let opening = opening_preset(action);
+        assert_eq!(
+            opening.preset["operations"],
+            serde_json::json!([{
+                "account": account.id.inner().to_string(),
+                "type": "opening_cash",
+            }])
+        );
+        assert_eq!(
+            opening
+                .missing
+                .iter()
+                .map(|missing| missing.pointer.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/operations/0/amount",
+                "/operations/0/currency",
+                "/operations/0/dates/cash_posted",
+                "/operations/0/idempotency_key",
+            ]
+        );
 
         let both = [
             recorded_cash_assertion(account.id, period, BalancePoint::Opening),
@@ -9303,6 +9378,10 @@ mod tests {
             )],
         );
         let closing = the_only_assertion_action(&after_opening);
+        assert_eq!(
+            closing.category().goals().iter().collect::<Vec<_>>(),
+            vec![ReportGoal::Reconciliation]
+        );
         assert_eq!(assertion_preset(closing).preset["at"], "closing");
 
         // Two questions about the same account and interval, one kind, two

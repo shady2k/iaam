@@ -20,7 +20,7 @@ use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::claim::AssertionPeriod;
-use iaam_core::reconciliation::{OpeningAnchor, OpeningAnchors, ReconciliationLedger};
+use iaam_core::reconciliation::{OpeningAnchors, ReconciliationLedger};
 use iaam_core::report::assets;
 use iaam_core::returns::{
     KnowledgeCoordinate, ReturnsReport, ReturnsRequest, returns_report_with_bond_inputs,
@@ -47,6 +47,7 @@ use crate::ports::{
 };
 
 pub use iaam_core::goal::ReportGoal;
+pub use iaam_core::reconciliation::OpeningIncorporation;
 /// The report vocabulary, in the core.
 ///
 /// These types were defined here, beside the scenario that fills them, and
@@ -59,8 +60,7 @@ pub use iaam_core::report::assets::{
     AssetAccount, AssetSnapshot, CashClassTotal, CashSide, HoldingValue, PositionsSide,
 };
 pub use iaam_core::report::balances::{
-    AccountBalanceRow, AccountCash, BalancesReport, CashFigure, CashOpening, NegativeCash,
-    PeriodReports,
+    AccountBalanceRow, AccountCash, BalancesReport, CashFigure, NegativeCash, PeriodReports,
 };
 pub use iaam_core::report::confidence::{
     Caveat, CaveatKind, CaveatSubject, ReportConfidence, money_flow_confidence, returns_confidence,
@@ -965,7 +965,7 @@ async fn balances_with_prices(
             .filter(|(owner_account, _)| *owner_account == account)
             .map(|(_, money)| AccountCash {
                 money,
-                opening: cash_opening(anchors.cash(account, money.currency())),
+                opening: anchors.cash_incorporation(account, money.currency()),
             })
             .collect();
         let reconciliation =
@@ -1055,20 +1055,6 @@ fn period_reports(perimeter: &PerimeterAssessment, account: AccountId) -> Period
             .copied()
             .collect(),
     )
-}
-
-/// The balances answer's word for what the core rule decided.
-///
-/// A translation and nothing else: the rule lives in
-/// [`OpeningAnchors`](iaam_core::reconciliation::OpeningAnchors), which
-/// reconciliation reads too, and this maps its answer onto the vocabulary this
-/// report publishes. Two spellings of one distinction are tolerable; two rules
-/// were not.
-const fn cash_opening(anchor: OpeningAnchor) -> CashOpening {
-    match anchor {
-        OpeningAnchor::Asserted => CashOpening::Asserted,
-        OpeningAnchor::Unasserted => CashOpening::Unasserted,
-    }
 }
 
 struct ReportInputs<'a> {

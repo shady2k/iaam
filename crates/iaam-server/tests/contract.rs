@@ -8019,15 +8019,14 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
 
 /// The reported defect: an instance with one month imported and no opening
 /// assertion showed a negative cash balance on an account that cannot be
-/// overdrawn. The number was a running sum from an unknown start presented as a
-/// balance, and nothing on the answer said so.
+/// overdrawn. The first imported movement is a running sum from an unknown
+/// start, and a later control assertion must not relabel it as a balance.
 ///
-/// It said so afterwards, in an `opening` field beside the amount, and that was
-/// still not enough — the amount could be read without the field, and was. So
-/// the figure now names itself: there is no `amount` to read, `movement` is
-/// spelled `movement`, and only an anchored figure is spelled `balance`.
+/// A control assertion is evidence for reconciliation, not a leg in the cash
+/// fold. The number stays a movement until a reconstructed opening contributes
+/// its opening leg.
 #[tokio::test]
-async fn a_cash_figure_says_whether_its_start_was_asserted() {
+async fn an_opening_assertion_does_not_publish_a_cash_balance() {
     let harness = harness();
     let contour = json!({
         "title": "August starts",
@@ -8070,8 +8069,8 @@ async fn a_cash_figure_says_whether_its_start_was_asserted() {
     assert!(cash.get("amount").is_none(), "{body}");
     assert!(cash.get("balance").is_none(), "{body}");
 
-    // The remedy the queue asks for: an assertion about the state before the
-    // interval's first event, recorded through the ordinary operation.
+    // Recording the owner's opening assertion supplies reconciliation evidence
+    // but no leg, so the balances figure remains a movement.
     let opening = json!({
         "account": harness.account.inner(),
         "from": "2026-08-01",
@@ -8089,9 +8088,9 @@ async fn a_cash_figure_says_whether_its_start_was_asserted() {
     let (status, body) = call(&harness.router, get(&balances, Some(&harness.owner_token))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let cash = &body["accounts"][0]["cash"][0];
-    assert_eq!(cash["kind"], "balance", "{body}");
-    assert_eq!(cash["balance"], "3000.00", "{body}");
-    assert!(cash.get("movement").is_none(), "{body}");
+    assert_eq!(cash["kind"], "movement_since_unknown_start", "{body}");
+    assert_eq!(cash["movement"], "3000.00", "{body}");
+    assert!(cash.get("balance").is_none(), "{body}");
 }
 
 /// An assertion that opens after the first movement leaves everything before it
@@ -8640,7 +8639,24 @@ async fn a_balance_point_taken_from_an_action_is_accepted_verbatim() {
             .find(|item| item["kind"] == "provide_control_assertion")
             .unwrap_or_else(|| panic!("no assertion request for the {expected} point: {body}"))
             .clone();
-        let preset = &action["target"]["request"]["preset"];
+        let preset = if expected == "opening" {
+            let options = action["target"]["options"]
+                .as_array()
+                .expect("opening action options");
+            let assertion = options
+                .iter()
+                .find(|option| option["operationId"] == "record_owner_balance")
+                .unwrap_or_else(|| panic!("no assertion resolution: {action}"));
+            assert!(
+                options
+                    .iter()
+                    .any(|option| option["operationId"] == "ingest_operations"),
+                "opening action must offer the reconstructed opening: {action}"
+            );
+            &assertion["request"]["preset"]
+        } else {
+            &action["target"]["request"]["preset"]
+        };
         assert_eq!(preset["at"], expected, "{action}");
 
         let recorded = json!({
@@ -8708,14 +8724,27 @@ async fn the_action_queue_asks_for_the_opening_balance_before_the_closing_one() 
     let outstanding = assertion_requests(&body);
     assert_eq!(outstanding.len(), 1, "{body}");
     let opening = &outstanding[0];
-    assert_eq!(opening["target"]["request"]["preset"]["at"], "opening");
-    assert_eq!(opening["target"]["operationId"], "record_owner_balance");
     let opening_id = opening["id"].as_str().expect("action id").to_owned();
+    let opening_options = opening["target"]["options"]
+        .as_array()
+        .expect("opening action options");
+    let opening_assertion = opening_options
+        .iter()
+        .find(|option| option["operationId"] == "record_owner_balance")
+        .expect("opening assertion resolution");
+    let opening_preset = &opening_assertion["request"]["preset"];
+    assert_eq!(opening_preset["at"], "opening");
+    assert!(
+        opening_options
+            .iter()
+            .any(|option| option["operationId"] == "ingest_operations"),
+        "the opening action must offer a reconstructed opening: {opening}"
+    );
 
     let recorded = json!({
-        "account": harness.account.inner(),
-        "from": opening["target"]["request"]["preset"]["from"],
-        "to": opening["target"]["request"]["preset"]["to"],
+        "account": opening_preset["account"],
+        "from": opening_preset["from"],
+        "to": opening_preset["to"],
         "at": "opening",
         "cash": { "currency": "RUB", "amount": "0.00" },
     });
@@ -15409,10 +15438,9 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
 
     // --- running_cash_sum ---------------------------------------------------
     //
-    // The opening control assertion, which is what turns the figure from a
-    // movement into a balance. It moves no number and is not asked to: this
-    // caveat is about how the figure may be read, and that is exactly what the
-    // assertion changes.
+    // A reconstructed opening supplies the leg that turns the running sum into
+    // a balance. A control assertion is reconciliation evidence and does not
+    // close this caveat.
     {
         let harness = harness();
         let brokerage = harness.account.inner().to_string();
@@ -15446,14 +15474,17 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
         let (status, recorded) = call(
             &harness.router,
             post(
-                "/v1/reconciliation/balance",
+                "/v1/ingest/operations",
                 &harness.owner_token,
                 &json!({
-                    "account": harness.account.inner(),
-                    "from": "2026-01-01",
-                    "to": "2026-01-31",
-                    "at": "opening",
-                    "cash": { "currency": "RUB", "amount": "0.00" },
+                    "operations": [{
+                        "account": harness.account.inner(),
+                        "type": "opening_cash",
+                        "amount": "0.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-01" },
+                        "idempotency_key": "remedy-running-sum-opening"
+                    }]
                 }),
             ),
         )
@@ -16032,16 +16063,14 @@ async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does(
         "{outside}"
     );
 
-    // The opening assertion is what turns the figure into a balance, and it is
-    // the operation the queue names for the same state.
+    // A running sum is closed by the reconstructed opening operation, which
+    // contributes a leg to the fold. The legless owner assertion only supplies
+    // reconciliation evidence and is not listed here.
     let running = find("running_cash_sum");
-    assert_eq!(
-        running["closed_by"][0]["operationId"],
-        "record_owner_balance"
-    );
+    assert_eq!(running["closed_by"][0]["operationId"], "ingest_operations");
     assert_eq!(running["closed_by"][0]["method"], "POST");
     assert_eq!(
-        running["closed_by"][0]["path"], "/v1/reconciliation/balance",
+        running["closed_by"][0]["path"], "/v1/ingest/operations",
         "{running}"
     );
     // The register points at the call; the queue fills it in. A caveat that
@@ -25060,15 +25089,12 @@ async fn the_asset_snapshot_groups_cash_by_the_class_the_owner_declared() {
     assert_eq!(snapshot["confidence"]["goal"], "asset_snapshot");
 }
 
-/// Two accounts in one class and one currency, one anchored by an opening
-/// assertion and one not. Their sum is neither a balance nor a movement — a
-/// stock added to a flow — so the class publishes both parts and no sum.
+/// Two accounts in one class and one currency, one anchored by a reconstructed
+/// opening and one not. Their sum is neither a balance nor a movement — a stock
+/// added to a flow — so the class publishes both parts and no sum.
 ///
-/// The shape this replaced said `unasserted` for the whole class and printed
-/// one number, which understated the anchored account and made the class total
-/// unusable at the same time. Nothing in this answer states the combined
-/// figure: a reader who wants it adds two labelled parts and knows what he
-/// added.
+/// A legless owner assertion would not change this result: it is reconciliation
+/// evidence, not a cash leg.
 #[tokio::test]
 async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
     let harness = harness();
@@ -25129,22 +25155,49 @@ async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{verdicts}");
+    // Before the reconstructed opening, both accounts are flows and the class
+    // total is their ordinary movement sum.
+    let (status, before) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    let before_total = &before["cash"]["classes"][0]["totals"][0];
+    assert_eq!(
+        before_total["kind"], "movement_since_unknown_start",
+        "{before}"
+    );
+    assert_eq!(before_total["movement"], "1000.00", "{before}");
+    assert!(before_total.get("balance").is_none(), "{before}");
+    assert_eq!(
+        before["cash"]["totals"][0]["kind"], "movement_since_unknown_start",
+        "{before}"
+    );
+    assert_eq!(
+        before["cash"]["totals"][0]["movement"], "1000.00",
+        "{before}"
+    );
 
-    // Only the first account is anchored. The second is left as it arrived,
-    // which is how every account looks after a first import.
+    // A reconstructed opening is a real cash leg and keeps the mixed-shape
+    // contract exercised: the first account is a balance, the second a flow.
+    let opening = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": created[0],
+            "type": "opening_cash",
+            "amount": "0.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-01-01" },
+            "idempotency_key": "mixed-opening",
+        }]
+    });
     let (status, recorded) = call(
         &harness.router,
-        post(
-            "/v1/reconciliation/balance",
-            &harness.owner_token,
-            &json!({
-                "account": created[0],
-                "from": "2026-01-01",
-                "to": "2026-01-31",
-                "at": "opening",
-                "cash": { "currency": "RUB", "amount": "0.00" },
-            }),
-        ),
+        post("/v1/ingest/operations", &harness.owner_token, &opening),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{recorded}");
@@ -25176,8 +25229,8 @@ async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
     assert_eq!(snapshot["cash"]["totals"][0]["kind"], "mixed", "{snapshot}");
     assert_eq!(snapshot["total"], json!([]), "{snapshot}");
 
-    // Which account is unanchored is said once, in the register, and is not
-    // copied onto the class row where it could fall out of step.
+    // Only the second account is unanchored. It is said once, in the register,
+    // and is not copied onto the class row where it could fall out of step.
     let caveat = snapshot["confidence"]["caveats"]
         .as_array()
         .expect("caveats")
@@ -25217,6 +25270,14 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
                 "operations": [
                     {
                         "account": harness.account.inner(),
+                        "type": "opening_cash",
+                        "amount": "0.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-01" },
+                        "idempotency_key": "halves-opening"
+                    },
+                    {
+                        "account": harness.account.inner(),
                         "type": "deposit",
                         "amount": "500.00",
                         "currency": "RUB",
@@ -25250,27 +25311,6 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{verdicts}");
-
-    // The opening the whole depends on. Without it the cash half is movement
-    // from an unknown start, and then no whole exists to state at all — which
-    // is the subject of another test; this one is about the order the three
-    // figures are read in when there *is* a whole.
-    let (status, recorded) = call(
-        &harness.router,
-        post(
-            "/v1/reconciliation/balance",
-            &harness.owner_token,
-            &json!({
-                "account": harness.account.inner(),
-                "from": "2026-01-01",
-                "to": "2026-01-31",
-                "at": "opening",
-                "cash": { "currency": "RUB", "amount": "0.00" },
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{recorded}");
 
     let (status, _headers, bytes) = call_raw(
         &harness.router,

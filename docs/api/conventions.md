@@ -600,14 +600,13 @@ proposal: the rule he created is his own act, and it is read back from
 The proposal is also an item in the action queue, kind
 `adopt_classification_rule`, one per answered question that has one. A state the
 system reports truthfully with no act that resolves it is a dead end dressed as
-information, and `available` was one: the owner is the only principal who may
-generalise, the queue is where he is told what only he can do, and nothing in it
-mentioned the rule waiting for him. The item is `recommended` — the row it came
-from is settled and no report is short of anything — it names `owner` as the
-required scope, and its target is `POST /v1/classification-rules` with the
-proposal preset as the body and no missing field. What is missing is his
-decision, which is why the item's state is `needs_owner_input` rather than
-`ready`.
+information, and `available` was one: the queue must show the owner the decision
+still to be made and the exact call that carries it. The item is `recommended`
+— the row it came from is settled and no report is short of anything — and its
+target is `POST /v1/classification-rules` with the proposal preset as the body
+and no missing field. The operation's `agent` floor is the scope of the call;
+the item's state remains `needs_owner_input` because the owner decides whether
+the proposal should stand, rather than the queue silently invoking it.
 
 Because the question goes on saying `available`, the item's completion is read
 from his rules instead: it disappears once a standing rule of his classifies a

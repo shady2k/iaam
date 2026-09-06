@@ -78,21 +78,24 @@ pub enum ActionKind {
     /// it reads as an answer.
     RetirementNotAssessed,
     /// A row the source described without a settled direction or counterparty
-    /// is held in an import session, and the owner has not said what it was.
+    /// is held in an import session, and the owner has not yet answered the
+    /// question it carries.
     ///
     /// Declared here, between the import and the diagnostics, because
     /// [`frontier`] emits its items last and one of its tests requires the
     /// frontier's order to be non-decreasing in this enum's order.
     AnswerClassificationQuestion,
+    ///
     /// A question the owner answered wrote no standing rule, and one was
-    /// possible. He is the only one who can make it stand.
+    /// possible. The caller can send the separate classification-rule
+    /// operation if the owner decides to make it stand.
     ///
     /// Declared straight after the question it comes out of, because
     /// [`actions_from_state`] emits it there and the frontier's order must be
     /// non-decreasing in this enum's order.
     AdoptClassificationRule,
-    /// An import session holds rows and has not ended. The rows are in no
-    /// journal, and only the owner can say whether they should be.
+    /// An import session holds rows and has not ended. The caller can commit
+    /// or abandon the session; the rows are in no journal until then.
     ///
     /// Declared after the two items about a session's questions and before the
     /// diagnostics, because [`actions_from_state`] emits it there and the
@@ -464,11 +467,11 @@ pub enum ActionState {
     /// Nothing is wanted. The item states a fact, and the fact still stands.
     ///
     /// **The item does not disappear, which is why this is a state and not a
-    /// deletion.** What settles an item is a decision of the owner's, and the
-    /// decision leaves something standing — records refused, a figure in no
-    /// report — that this queue is the only surface saying anything about.
-    /// Dropping the item would hide the consequence of his own decision from
-    /// him, which is the silent drop this module refuses everywhere else.
+    /// deletion.** What settles an item is a recorded decision, and the decision
+    /// leaves something standing — records refused, a figure in no report —
+    /// that this queue is the only surface saying anything about.
+    /// Dropping the item would hide the consequence of the decision from the
+    /// owner, which is the silent drop this module refuses everywhere else.
     ///
     /// **Not [`Self::Blocked`], and the difference is that there is a way back.**
     /// `Blocked` says no call in this API touches the item. A settled item
@@ -477,10 +480,10 @@ pub enum ActionState {
     /// publish a resolution — and [`Action::required_scope`] answers for it.
     ///
     /// **Not [`Self::Ready`] either, and for a reason that is not about
-    /// urgency.** The withdrawal is the owner's: an agent may not take back a
-    /// judgement it could not have made. That floor is a property of the call
-    /// and is read off the call; what this state says is that no one is being
-    /// waited on.
+    /// urgency.** The withdrawal uses the floor of its published operation,
+    /// and an agent token can send it when that operation is reversible. That
+    /// floor is a property of the call and is read off the call; what this state
+    /// says is that no one is being waited on.
     ///
     /// **What a caller does with it.** Show it when he asks what has been
     /// decided. Never raise it as work, and never go looking for what it is
@@ -2805,10 +2808,10 @@ fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCateg
 /// it cannot raise a dimension past the level this item reports.
 ///
 /// The promoted half reads `agent`, for the reason `start_account_import_action`
-/// gives: the floor `sync_broker` keeps is [`Scope::Agent`], and an item marked
-/// owner-only would tell an agent it may not send a request the server would
-/// accept. The item states no scope of its own — it is read off the route it
-/// names, through [`crate::ports::required_scope`].
+/// gives: the floor `sync_broker` keeps is [`Scope::Agent`], and the item must
+/// not publish a narrower floor than the route it names. The item states no
+/// scope of its own — it is read off the route it names, through
+/// [`crate::ports::required_scope`].
 fn independent_confirmation_action(
     account: &AccountView,
     period: AssertionPeriod,
@@ -3875,10 +3878,9 @@ fn adopt_classification_rule_completion(
 /// derived from the row and the answer, and `replaces` is absent because a
 /// proposal supersedes nothing. What is missing is not a value; it is his
 /// decision, and [`ActionState::Ready`] means «may be invoked without asking the
-/// owner», which this must never be. It reads `owner`, because generalising is
-/// the administer decision arriving by another door — the same gate
-/// `may_generalise` reads when it declines to write the rule in the first place,
-/// and the floor `create_classification_rule` keeps for the same reason.
+/// owner», which this must never be. The queue keeps the owner's decision
+/// visible; the operation's `agent` floor says only that a caller may carry out
+/// that decision once he has made it.
 fn adopt_classification_rule_action(
     question: &ClassificationQuestion,
     account: &AccountView,
@@ -4898,16 +4900,11 @@ fn retired_account_completion(retired: &RetiredProduct) -> bool {
 /// a document too.
 ///
 /// **Three ways out, and three floors — this is the item `iaam-woeh` was filed
-/// on.** `ingest_operations` keeps [`Scope::Agent`]; `submit_corrections` and
-/// `record_account_retirement` keep [`Scope::Owner`]. Each resolution publishes
-/// its own floor, so a client choosing among the three is told which of them its
-/// token reaches. The item's own `required_scope` is now the narrowest of the
-/// three — `agent` — and that is a change from what it used to say. It used to
-/// say `owner`, on the argument that an agent could not close the item alone;
-/// that argument was about the *figure*, not about the *call*, and the figure is
-/// already published as `/operations/0/amount` marked [`ProvidedBy::Owner`]. An
-/// agent reading the old grading dropped the item entirely and never reached the
-/// route it could in fact call.
+/// on.** `ingest_operations`, `submit_corrections` and
+/// `record_account_retirement` all keep [`Scope::Agent`] because ADR 0040 names
+/// an undo for each. Each resolution publishes its own floor, and the item's
+/// `required_scope` is the same agent floor. The missing opening figure remains
+/// [`ProvidedBy::Owner`]: that is a field requirement, not an authority grade.
 fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Action {
     // The reconstructed opening. Preset is exactly what the policy knows: the
     // account this row is on, and that the row is an opening. The figure, the
@@ -5494,10 +5491,10 @@ fn declining_option(printed: &str) -> ResolutionOption {
 /// and told him what it had done to find out. The queue said this needed him,
 /// and it did not.
 ///
-/// The one act the item still offers is the withdrawal of his own statement, and
-/// an agent may not withdraw a judgement it could not have made. That is a floor
-/// on the call, read off the call by [`Action::required_scope`]; it was never a
-/// reason to publish the item as waiting on him.
+/// The one act the item still offers is the withdrawal of the statement, and
+/// its operation floor says an agent may carry it out when that act is
+/// reversible. That floor is read off the call by [`Action::required_scope`];
+/// it was never a reason to publish the item as waiting on him.
 ///
 /// **The way back is the withdrawal and not `create_account`.** Offering both
 /// would publish, on an item that says the matter is settled, the very act he
@@ -11148,9 +11145,12 @@ mod tests {
     //
     // The defect these cover: `Generalisation::Available` said a rule was
     // possible and none was written, and no item in the queue turned it into
-    // one. The owner is the only principal who may, and the queue is where he is
-    // told what only he can do.
+    // one. The answer call may leave the rule for a separate operation; the
+    // queue tells the owner about that decision, and the operation records
+    // whoever carries it out.
 
+    // The queue remains owner-facing because the state records a decision to
+    // review, not because the operation is owner-only.
     /// The row a proposal was learned from, as a rule is tested against it.
     fn shop_row(account: AccountId) -> ClassificationSubject {
         ClassificationSubject {
@@ -11568,13 +11568,11 @@ mod tests {
     /// The item publishes the narrowest of its three floors, and each
     /// resolution publishes its own (`iaam-woeh`).
     ///
-    /// This is the item the finding was filed on. `ingest_operations` keeps
-    /// [`Scope::Agent`] and the other two keep [`Scope::Owner`], so a single
-    /// grading had to lie in one direction or the other; it said `owner`, and
-    /// an agent filtering the queue by its own scope dropped the item and never
-    /// reached the call it could in fact make.
+    /// This is the item the finding was filed on. ADR 0040 makes all three
+    /// remedies reversible, so each publishes [`Scope::Agent`] and the item
+    /// remains visible to an agent filtering by its own scope.
     #[test]
-    fn the_retirement_item_admits_an_agent_to_the_one_call_that_admits_one() {
+    fn the_retirement_item_publishes_agent_floor_for_reversible_calls() {
         let term = named("Term");
         let actions = queue_for_retirement(&term, &[ceased(term.id, false)]);
         let items = retired_items(&actions);

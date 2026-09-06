@@ -2,6 +2,9 @@
 
 Date: 2026-09-05 · Status: proposed · Bead: `iaam-c143`, `iaam-09tn`
 
+The authority treatment of reversible operations is superseded by ADR 0040; the
+item state and relay decisions below remain.
+
 ## Context
 
 Two findings from one relay of a first import, and they are the same finding

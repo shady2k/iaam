@@ -5,9 +5,20 @@ use serde_json::Value;
 
 /// One reversible standing decision recorded by this instance.
 ///
-/// The decision table is a read index for the typed records. The actor remains
-/// on those records; this row lets the owner read all decision families as one
-/// bounded list.
+/// The decision table is an append-only review index, not a second mutable
+/// source of truth. It is not the “second place recording where a fact came
+/// from” warned about by [`iaam_core::event::provenance::Provenance::declared_by`]:
+/// standing decisions are not journal facts and their typed records have no
+/// common provenance-bearing row on which to store the actor. This table is
+/// therefore the one place that joins their actor, operation and immutable
+/// decision snapshot for the owner's bounded review. The route writes the typed
+/// decision before this index row; if the index insert fails, the route returns
+/// the error and the typed decision remains authoritative, while the review
+/// deliberately omits an actor rather than inventing one.
+///
+/// `undo` is a snapshot of the undo promised by the operation when this
+/// decision was recorded. It is kept per history row so a later contract change
+/// does not rewrite what the owner was told would reverse an earlier act.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredDecision {
     pub operation: String,

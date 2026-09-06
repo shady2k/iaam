@@ -5170,7 +5170,7 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
 }
 
 #[tokio::test]
-async fn only_the_owner_can_manage_classification_rules() {
+async fn a_read_only_token_cannot_manage_classification_rules() {
     let harness = harness();
     let rule = json!({
         "matcher": { "kind": "income" },
@@ -10060,7 +10060,7 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
         "path": "/v1/accounts",
         "requestSchema": "#/components/schemas/CreateAccountRequest",
         "requiredScope": "agent",
-        "request": {"missing": [{"pointer": "/title", "provided_by": "agent"}]}
+        "request": {"missing": [{"pointer": "/title", "provided_by": "caller"}]}
     });
     let parsed: iaam_server::dto::ActionTargetDto =
         serde_json::from_value(target.clone()).expect("tagged target");
@@ -15792,12 +15792,9 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
     assert_eq!(item["category"], "required_for_goal", "{item}");
     assert_eq!(item["goals"], json!(["asset_snapshot"]), "{item}");
     assert_eq!(item["state"], "needs_owner_input", "{item}");
-    // `agent`, and this is `iaam-woeh`. The item's own scope is the narrowest
-    // of the floors its three resolutions keep, and the ordinary remedy — the
-    // reconstructed opening — is a call an agent token may make. It read
-    // `owner` while one field had to speak for three calls, and an agent that
-    // filtered the queue by its own scope dropped the item and never reached
-    // the call it could make.
+    // `agent`, because all three resolutions now name reversible operations.
+    // The item summary and each per-resolution floor therefore tell an agent
+    // filter exactly what the queue can carry out.
     assert_eq!(item["required_scope"], "agent", "{item}");
 
     // Three ways out, addressed, in the register's order. The two lists are one
@@ -26218,11 +26215,11 @@ async fn an_answer_that_could_not_generalise_publishes_the_rule_it_would_have_ma
 /// The proposal is also a queued act, and not only a field on a session
 /// (iaam-4hcy).
 ///
-/// The defect: `available` was honest and unreachable. A client could read that
-/// a rule was possible and that none had been written, and the action queue —
-/// the one surface that tells the owner what only he can do — said nothing about
-/// it. He had to know the field existed, know which session held it, and go and
-/// read it.
+/// The defect: `available` was honest and hard to act on. A client could read
+/// that a rule was possible and that none had been written, while the action
+/// queue — the one surface that tells the owner about the decision and the
+/// exact reversible call — said nothing. He had to know the field existed,
+/// know which session held it, and go and reconstruct the request.
 ///
 /// The item points at the route that already writes classification rules, with
 /// the proposal preset as the body. Posting the preset unedited is what this
@@ -26970,8 +26967,8 @@ async fn the_owner_can_say_it_was_between_his_own_accounts_without_naming_which(
         "an alternative that says nothing about itself is the defect: {offered}"
     );
 
-    // Answered under the owner's own token — the one principal who may
-    // generalise — and still no rule stands.
+    // Answered under the owner's own token — the answer route's one principal
+    // whose answer may generalise — and still no rule stands.
     let (status, answered) = call(
         &harness.router,
         post(
@@ -28553,10 +28550,11 @@ async fn an_agent_token_reads_an_institution_s_export_into_a_session() {
 /// so a caller that read both had to pick one, which is how an owner came to be
 /// told a rule would not exist that would exist.
 ///
-/// Both are now read off one derivation, and the derivation takes the asking
-/// authority: the owner may generalise and an agent may not (`iaam-hnod`), so
-/// the same session answers differently to the two tokens and says so on both
-/// surfaces at once.
+/// Both are now read off one derivation, and the derivation keeps the answer
+/// route's deliberate split: an owner answer may generalise as a convenience,
+/// while an agent answer returns a proposal for the separate reversible
+/// operation. The same session answers differently to the two tokens and says
+/// so on both surfaces at once.
 ///
 /// Everything here is invented: the account is the harness's own `Main`, and the
 /// rows were made up for this test.

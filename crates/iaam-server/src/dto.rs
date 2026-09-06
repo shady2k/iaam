@@ -2819,11 +2819,10 @@ pub struct CaveatDto {
 /// queue holds an account and an interval and can preset fields from them, and
 /// a caveat kind holds nothing but its own identity.
 ///
-/// `requiredScope` is shared for the same reason it exists on a resolution: a
-/// register that names an owner-only remedy to an agent has told it to make a
-/// call the server will refuse, and the register offers the same sets of calls
-/// the queue does — `retired_account_not_empty` is one caveat and one item,
-/// naming the same three operations.
+/// `requiredScope` is shared for the same reason it exists on a resolution:
+/// it tells a caller the floor the transport checks before reading the request.
+/// The caveat and the queue name the same operation sets, so the client can
+/// apply one scope filter to both without inventing a second authority rule.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ClosingOperationDto {
     #[serde(rename = "operationId")]
@@ -4728,15 +4727,11 @@ pub enum ActionTargetDto {
         request_schema: Option<String>,
         /// The narrowest token scope that reaches this call: `owner` or `agent`.
         ///
-        /// **Per resolution, because the authority is a property of the call.** An
-        /// item's own `required_scope` is a summary — the narrowest scope reaching
-        /// *any* of its resolutions — and an item offering three ways out can want
-        /// three different authorities. `retired_account_not_empty` is the case
-        /// that made this a field: it offers a reconstructed opening, which an
-        /// agent token may submit, and a correction and a retirement withdrawal,
-        /// which only the owner may. Graded once for the whole item it read
-        /// `owner`, and an agent that filtered on it was told that none of the
-        /// three was available to it while the ordinary remedy was.
+        /// **Per resolution, because the authority is a property of the call.**
+        /// An item's own `required_scope` is a summary derived from its
+        /// resolutions. A scope-filtering caller can therefore see every item
+        /// that has at least one reachable remedy, while the selected
+        /// resolution still carries its own floor.
         ///
         /// **A floor, not a promise the call will succeed.** It is the scope the
         /// transport checks before it reads anything else; a route may still refuse
@@ -4775,15 +4770,11 @@ pub struct ResolutionOptionDto {
     pub request_schema: Option<String>,
     /// The narrowest token scope that reaches this call: `owner` or `agent`.
     ///
-    /// **Per resolution, because the authority is a property of the call.** An
-    /// item's own `required_scope` is a summary — the narrowest scope reaching
-    /// *any* of its resolutions — and an item offering three ways out can want
-    /// three different authorities. `retired_account_not_empty` is the case
-    /// that made this a field: it offers a reconstructed opening, which an
-    /// agent token may submit, and a correction and a retirement withdrawal,
-    /// which only the owner may. Graded once for the whole item it read
-    /// `owner`, and an agent that filtered on it was told that none of the
-    /// three was available to it while the ordinary remedy was.
+    /// **Per resolution, because the authority is a property of the call.**
+    /// An item's own `required_scope` is a summary derived from its
+    /// resolutions. A scope-filtering caller can therefore see every item
+    /// that has at least one reachable remedy, while the selected
+    /// resolution still carries its own floor.
     ///
     /// **A floor, not a promise the call will succeed.** It is the scope the
     /// transport checks before it reads anything else; a route may still refuse
@@ -10053,20 +10044,18 @@ pub struct AlsoSettledDto {
 ///
 /// **This replaces the bare `rule` identifier**, which could be absent for two
 /// unrelated reasons and said which only by not being there: the row offered
-/// nothing a matcher could match on, or the answer arrived under an agent
-/// token, which settles the row and generalises nothing (`iaam-hnod`). A client
-/// could tell them apart, because it knows what token it holds. The owner
-/// reading the session back could not, and he is the one who can act on the
-/// difference.
+/// nothing a matcher could match on, or the answer route deliberately left the
+/// rule for the separate operation. A client can tell those states apart from
+/// `generalisation`, and the owner reading the session back can see the exact
+/// proposal without reconstructing it.
 ///
 /// So the identifier moved inside an object that names its own state. Four
 /// words, and the reader never has to reason about an absence:
 ///
 /// - `recorded` — the answer created a rule, and `rule` names it;
-/// - `available` — a rule was possible and none was written, because the
-///   answerer may not generalise. `proposal` is that rule, in the exact body
-///   `POST /v1/classification-rules` takes: the owner makes the settlement stand
-///   by posting it under his own token, unedited;
+/// - `available` — a rule was possible and none was written by the answer route.
+///   `proposal` is that rule, in the exact body `POST /v1/classification-rules`
+///   takes; the separate operation is reversible and carries the actor;
 /// - `impossible` — no rule can be built from this row under any token. A
 ///   matcher that asks nothing matches nothing, and an "everything" rule would
 ///   silently reclassify the portfolio. There is no call that changes this;
@@ -10283,8 +10272,9 @@ pub struct AnswerImportQuestionRequest {
     /// the same direction for. Those rows are published as `alike` on the
     /// session's assessment, so what the word reaches is readable before it is
     /// sent. It claims nothing about a statement nobody has imported yet, and it
-    /// does not turn an agent's answer into a standing rule — that is
-    /// `POST /v1/classification-rules`, it is the owner's, and it stays so.
+    /// does not turn an agent's answer into a standing rule through this
+    /// answer route — the separate `POST /v1/classification-rules` operation is
+    /// reversible and carries the actor after the owner decides.
     ///
     /// Absent means `this_row`, which is what this call has always done, so a
     /// client that says nothing settles exactly the row it addressed.
@@ -11291,8 +11281,8 @@ pub struct MirroredPairDto {
 /// A first import has no rules of the owner's, so every row naming a party
 /// becomes a question and the answer is the same for most of them. The one field in the document that says what a row was *for* — the word
 /// the institution filed it under — is transcribed by the profile and read by
-/// nothing on a first import, because a standing rule comes only from answering
-/// a question and there are hundreds of those.
+/// nothing on a first import, because a standing rule is supplied by the answer
+/// or by the separate classification-rule operation.
 ///
 /// **It offers a condition and never an outcome.** What the rows have in common
 /// is a fact about the document; what they *are* is the owner's. A map from an
@@ -13421,8 +13411,9 @@ impl UndecidedDto {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AnswerRuleForecastDto {
     /// `written` — answering under this token writes the standing decision;
-    /// `for_his_adoption` — answering writes nothing and publishes it, because
-    /// only the owner may make one, and one call of his own makes it stand;
+    /// `for_his_adoption` — answering writes nothing through this route and
+    /// publishes the proposal, which the separate reversible operation carries
+    /// after the owner decides;
     /// `not_from_this_answer` — this answer is never kept as a standing
     /// decision, whoever gives it; `not_from_this_row` — this line prints
     /// nothing a later line could be matched against, so no token produces one.

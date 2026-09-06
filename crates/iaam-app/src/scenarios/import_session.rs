@@ -10021,6 +10021,107 @@ mod tests {
             }
         }
     }
+    /// A standing rule supplies the classification, but never the direction.
+    ///
+    /// The rule matches a row whose source said money arrived. The resulting
+    /// event must therefore credit the row's account, even though the answer
+    /// that minted the rule may have been about money leaving.
+    #[test]
+    fn a_matching_rule_keeps_the_direction_stated_by_the_row() {
+        let main = account(1);
+        let savings = account(2);
+        let rule = ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: Some("Somebody".to_owned()),
+                description_contains: None,
+                kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+            },
+            outcome: Classification::InternalTransfer { to: savings },
+        };
+        let resolver = ruled(
+            vec![detail(main, "Main"), detail(savings, "Savings")],
+            vec![rule],
+        );
+        let observed = incoming(row(main, "Somebody", Some(date!(2026 - 06 - 01))));
+        let Assessment::Settled {
+            classification,
+            movement,
+            ..
+        } = resolver.assess(&observed)
+        else {
+            panic!("the standing rule should classify the row");
+        };
+        assert_eq!(movement, Some(Movement::In));
+        let operation = observed
+            .resolve(classification, movement)
+            .expect("the row direction and rule classification are compatible");
+        let event = normalize(
+            &operation,
+            &NormalizationContext {
+                owner: OwnerId(uuid::Uuid::from_bytes([9; 16])),
+                source: SourceId(uuid::Uuid::from_bytes([9; 16])),
+                parser_version: ParserVersion("ingest/manual/1".to_owned()),
+            },
+        )
+        .expect("the classified operation normalises")
+        .event;
+        let main_cash = event
+            .legs
+            .iter()
+            .find(|leg| leg.account == main)
+            .and_then(|leg| leg.cash_effect())
+            .expect("the row account has a cash leg");
+        assert_eq!(
+            main_cash.amount().raw(),
+            1_000,
+            "the inbound direction from the row must be recorded as an inflow"
+        );
+    }
+
+    /// A rule outcome whose implied direction conflicts with the row is not
+    /// allowed to become an oppositely signed fact.
+    #[test]
+    fn a_rule_cannot_turn_an_inbound_row_into_an_outbound_fee() {
+        let main = account(1);
+        let rule = ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: Some("Somebody".to_owned()),
+                description_contains: None,
+                kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+            },
+            outcome: Classification::Fee {
+                origin: FeeOrigin::Other,
+            },
+        };
+        let resolver = ruled(vec![detail(main, "Main")], vec![rule]);
+        let observed = incoming(row(main, "Somebody", Some(date!(2026 - 06 - 01))));
+        let Assessment::Settled {
+            classification,
+            movement,
+            ..
+        } = resolver.assess(&observed)
+        else {
+            panic!("the standing rule should classify the row");
+        };
+        assert_eq!(movement, Some(Movement::In));
+        let rejection = observed
+            .resolve(classification, movement)
+            .expect_err("an inbound fee is not a valid fact");
+        assert!(
+            rejection.expected.contains("fee leaves"),
+            "the rejection must explain the direction conflict: {rejection:?}"
+        );
+    }
 
     #[test]
     fn a_row_whose_source_stated_a_direction_settles_without_a_question() {

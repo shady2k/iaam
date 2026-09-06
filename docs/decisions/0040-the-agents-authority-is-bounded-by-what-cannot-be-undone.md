@@ -97,8 +97,17 @@ and every report computed in between is wrong. The rollback is one call; the
 noticing is the whole cost. So this decision is not «widen the gate» on its own —
 it is inseparable from making the agent's decisions **reviewable as a set**: the
 owner asks what his agent decided over a period and reads it as one list, with
-what would undo each beside it. The provenance is already recorded on the facts;
-what is missing is the read.
+what would undo each beside it.
+
+**And the price of that is not evenly spread.** A journal fact already carries
+its actor: `Provenance::declared_by` holds the principal and every write path
+stamps it, which is why the correction path can already tell an agent that it may
+retract only what it declared. The eleven operations admitted above carry
+**nothing** — a classification rule is an id, a version, a matcher and an
+outcome, and accounts, contours, category rules, transfer partners, scope,
+retirement and name dispositions are the same. So the half of §5 that is a read
+away is the half this decision does not change, and the standing decisions it
+does admit need the actor recorded before they can be reviewed at all.
 
 The two land together. Admitting the eleven without §5 trades a cost the owner
 can see for one he cannot.

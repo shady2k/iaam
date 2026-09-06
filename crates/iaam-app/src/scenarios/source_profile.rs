@@ -171,7 +171,7 @@ pub async fn read_into_session(
                 expected: "a source profile this instance has installed".into(),
                 actual: id.to_owned(),
             })?;
-            if !engine::recognises(bytes, &installed.profile) {
+            if !engine::recognises(bytes, &installed.profile).is_match() {
                 return Err(AppError::Invalid {
                     field: "profile".into(),
                     expected: format!(

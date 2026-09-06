@@ -315,18 +315,25 @@ impl ProfileCatalogue {
     /// criterion is too weak, and choosing either records facts read by the
     /// wrong profile.
     pub fn recognise(&self, bytes: &[u8]) -> Result<&Installed, Rejection> {
-        let matched: Vec<&Installed> = self
-            .installed
-            .iter()
-            .filter(|installed| engine::recognises(bytes, &installed.profile))
-            .collect();
+        let mut matched = Vec::new();
+        let mut failures = Vec::new();
+        for installed in &self.installed {
+            let recognition = engine::recognises(bytes, &installed.profile);
+            if recognition.is_match() {
+                matched.push(installed);
+            } else {
+                failures.push((installed, recognition));
+            }
+        }
         match matched.as_slice() {
             [only] => Ok(only),
             [] => Err(Rejection {
                 field: "document".to_owned(),
                 expected: format!(
-                    "a document one of this instance's source profiles recognises: {}",
-                    self.catalogue_line()
+                    "a document one of this instance's source profiles recognises: {}. \
+                     Profiles looked for: {}",
+                    self.catalogue_line(),
+                    recognition_line(&failures)
                 ),
                 actual: "a document none of them recognises".to_owned(),
             }),
@@ -363,6 +370,51 @@ impl ProfileCatalogue {
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+fn recognition_line(
+    failures: &[(&Installed, engine::Recognition)],
+) -> String {
+    if failures.is_empty() {
+        return "none".to_owned();
+    }
+    failures
+        .iter()
+        .map(|(installed, recognition)| {
+            format!(
+                "{} ({})",
+                installed.profile.id(),
+                recognition_description(recognition)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn recognition_description(recognition: &engine::Recognition) -> String {
+    match recognition {
+        engine::Recognition::Recognised => "recognised".to_owned(),
+        engine::Recognition::WrongEncoding { encoding } => {
+            format!("looked for text in {}", encoding_name(*encoding))
+        }
+        engine::Recognition::MissingHeaderRow { row } => {
+            format!("looked for headings on line {row}")
+        }
+        engine::Recognition::MissingColumns { columns } => {
+            format!("looked for header cells {}", columns.join(", "))
+        }
+        engine::Recognition::MalformedDocument => {
+            "looked for a well-formed delimited document".to_owned()
+        }
+    }
+}
+
+fn encoding_name(encoding: super::Encoding) -> &'static str {
+    match encoding {
+        super::Encoding::Utf8 => "utf-8",
+        super::Encoding::Utf8Bom => "utf-8-bom",
+        super::Encoding::Windows1251 => "windows-1251",
     }
 }
 
@@ -707,6 +759,12 @@ mod tests {
             refusal.expected.contains("tbank-operations-csv"),
             "{refusal:?}"
         );
+        assert!(
+            refusal.expected.contains("header cells"),
+            "the refusal names the document-side mismatch: {refusal:?}"
+        );
+        assert!(!refusal.expected.contains("date"));
+        assert!(!refusal.actual.contains("date"));
     }
 
     /// A document carrying every heading a bundled profile recognises on, but

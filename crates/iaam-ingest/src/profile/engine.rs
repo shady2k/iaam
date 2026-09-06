@@ -136,6 +136,31 @@ pub struct ReadContext<'a> {
     pub declared: Option<AccountId>,
 }
 
+/// Why a document did not match this profile's recognition rule.
+///
+/// Recognition deliberately keeps only the profile-side shape: it never carries
+/// a cell value or any other content from the document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recognition {
+    /// Every header cell this profile names was present.
+    Recognised,
+    /// The bytes could not be read using the profile's declared encoding.
+    WrongEncoding { encoding: Encoding },
+    /// The profile's configured header record was absent.
+    MissingHeaderRow { row: u32 },
+    /// The header was readable, but these profile-named cells were absent.
+    MissingColumns { columns: Vec<String> },
+    /// The document could not be parsed as the profile's delimited format.
+    MalformedDocument,
+}
+
+impl Recognition {
+    #[must_use]
+    pub const fn is_match(&self) -> bool {
+        matches!(self, Self::Recognised)
+    }
+}
+
 /// The document's own header row, as this profile would read it.
 ///
 /// Published because recognition needs it and recognition is the catalogue's:
@@ -170,23 +195,45 @@ fn header<'a>(records: &'a [Record], shape: &CsvShape) -> Result<&'a Record, Rej
             },
         })
 }
-
-/// Whether this profile recognises the document.
+/// Whether, and why, this profile recognises the document.
 ///
 /// Every header cell the profile names must be present in the document's header
-/// row, compared after trimming and otherwise exactly. A document no profile
-/// recognises is refused, and so is one two profiles recognise — see
-/// [`super::catalogue::ProfileCatalogue::recognise`].
+/// row, compared after trimming and otherwise exactly. The returned reason is
+/// limited to the profile's declared encoding, header row, and header cells; it
+/// never repeats anything the document printed.
 #[must_use]
-pub fn recognises(bytes: &[u8], profile: &SourceProfile) -> bool {
-    let Ok(header) = header_of(bytes, profile) else {
-        return false;
+pub fn recognises(bytes: &[u8], profile: &SourceProfile) -> Recognition {
+    let DocumentShape::Csv(shape) = profile.document();
+    let text = match decode(bytes, shape.encoding) {
+        Ok(text) => text,
+        Err(_) => {
+            return Recognition::WrongEncoding {
+                encoding: shape.encoding,
+            };
+        }
     };
-    let printed: Vec<&str> = header.iter().map(|cell| cell.trim()).collect();
-    profile
+    let records = match records(&text, shape) {
+        Ok(records) => records,
+        Err(_) => return Recognition::MalformedDocument,
+    };
+    let header = match header(&records, shape) {
+        Ok(header) => header,
+        Err(_) => return Recognition::MissingHeaderRow {
+            row: shape.header_row,
+        },
+    };
+    let printed: Vec<&str> = header.cells.iter().map(|cell| cell.trim()).collect();
+    let columns = profile
         .recognised_by()
         .iter()
-        .all(|wanted| printed.contains(&wanted.as_str()))
+        .filter(|wanted| !printed.contains(&wanted.as_str()))
+        .cloned()
+        .collect();
+    if columns.is_empty() {
+        Recognition::Recognised
+    } else {
+        Recognition::MissingColumns { columns }
+    }
 }
 
 /// Read the document.
@@ -2103,6 +2150,43 @@ mod tests {
         assert_eq!(refusal.field, "document");
     }
 
+    /// Recognition reports an encoding mismatch without exposing document
+    /// content.
+    #[test]
+    fn recognition_reports_wrong_encoding() {
+        let outcome = recognises(b"\xff", &profile(serde_json::json!({})));
+        assert_eq!(
+            outcome,
+            Recognition::WrongEncoding {
+                encoding: Encoding::Utf8
+            }
+        );
+    }
+
+    /// Recognition reports that the profile's configured header row is absent.
+    #[test]
+    fn recognition_reports_missing_header_row() {
+        let profile = profile(serde_json::json!({
+            "document": { "header_row": 2 }
+        }));
+        assert_eq!(
+            recognises(b"Posted;Sum\n", &profile),
+            Recognition::MissingHeaderRow { row: 2 }
+        );
+    }
+
+    /// Recognition reports the profile-named header cells that were absent.
+    #[test]
+    fn recognition_reports_missing_header_cells() {
+        let profile = profile(serde_json::json!({}));
+        assert_eq!(
+            recognises(b"Posted;Total\n", &profile),
+            Recognition::MissingColumns {
+                columns: vec!["Sum".to_owned()]
+            }
+        );
+    }
+
     /// `utf-8-bom` removes a leading mark, and `utf-8` does not — so a document
     /// with a mark read as plain utf-8 fails to be recognised rather than
     /// reading a heading nobody printed.
@@ -2112,8 +2196,8 @@ mod tests {
         document.extend_from_slice(b"Posted;Sum\n2026-08-05;-1.00\n");
         let strict = profile(serde_json::json!({}));
         let tolerant = profile(serde_json::json!({ "document": { "encoding": "utf-8-bom" } }));
-        assert!(!recognises(&document, &strict));
-        assert!(recognises(&document, &tolerant));
+        assert!(!recognises(&document, &strict).is_match());
+        assert!(recognises(&document, &tolerant).is_match());
 
         let (declared, names) = account();
         let reading = read(
@@ -2129,7 +2213,7 @@ mod tests {
         // And a document without a mark is still read by the same profile: the
         // mark is invisible, and an author cannot see whether his institution
         // emits one.
-        assert!(recognises(b"Posted;Sum\n2026-08-05;-1.00\n", &tolerant));
+        assert!(recognises(b"Posted;Sum\n2026-08-05;-1.00\n", &tolerant).is_match());
     }
 
     /// A profile recognises a document only when every header cell it names is
@@ -2141,10 +2225,10 @@ mod tests {
             "recognise": { "header_cells": ["Posted", "Sum"] }
         }));
         let document = "Statement of account\n\nPosted;Sum\n2026-08-05;-1.00\n";
-        assert!(recognises(document.as_bytes(), &profile));
+        assert!(recognises(document.as_bytes(), &profile).is_match());
         let reading = read_with(document, &profile);
         assert_eq!(reading.rows.len(), 1);
         assert_eq!(reading.rows[0].locator(), 4);
-        assert!(!recognises(b"Posted;Total\n", &profile));
+        assert!(!recognises(b"Posted;Total\n", &profile).is_match());
     }
 }

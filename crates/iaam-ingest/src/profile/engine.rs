@@ -150,7 +150,8 @@ pub enum Recognition {
     MissingHeaderRow { row: u32 },
     /// The header was readable, but these profile-named cells were absent.
     MissingColumns { columns: Vec<String> },
-    /// The document could not be parsed as the profile's delimited format.
+    /// The document was empty or could not be parsed as the profile's delimited
+    /// format.
     MalformedDocument,
 }
 
@@ -168,11 +169,22 @@ impl Recognition {
 /// profile's* format, encoding, delimiter and header row, carries every header
 /// cell the profile names. Asking any other way would mean one profile's answer
 /// depending on another's idea of where the headings are.
-pub fn header_of(bytes: &[u8], profile: &SourceProfile) -> Result<Vec<String>, Rejection> {
+pub fn header_of(bytes: &[u8], profile: &SourceProfile) -> Result<Vec<String>, Recognition> {
     let DocumentShape::Csv(shape) = profile.document();
-    let text = decode(bytes, shape.encoding)?;
-    let records = records(&text, shape)?;
-    Ok(header(&records, shape)?.cells.clone())
+    let text = decode(bytes, shape.encoding).map_err(|_| Recognition::WrongEncoding {
+        encoding: shape.encoding,
+    })?;
+    let records = records(&text, shape).map_err(|_| Recognition::MalformedDocument)?;
+    let header = match header(&records, shape) {
+        Ok(header) => header,
+        Err(_) if records.is_empty() => return Err(Recognition::MalformedDocument),
+        Err(_) => {
+            return Err(Recognition::MissingHeaderRow {
+                row: shape.header_row,
+            });
+        }
+    };
+    Ok(header.cells.clone())
 }
 
 /// The record that carries the headings, by the line the profile names.
@@ -203,28 +215,11 @@ fn header<'a>(records: &'a [Record], shape: &CsvShape) -> Result<&'a Record, Rej
 /// never repeats anything the document printed.
 #[must_use]
 pub fn recognises(bytes: &[u8], profile: &SourceProfile) -> Recognition {
-    let DocumentShape::Csv(shape) = profile.document();
-    let text = match decode(bytes, shape.encoding) {
-        Ok(text) => text,
-        Err(_) => {
-            return Recognition::WrongEncoding {
-                encoding: shape.encoding,
-            };
-        }
-    };
-    let records = match records(&text, shape) {
-        Ok(records) => records,
-        Err(_) => return Recognition::MalformedDocument,
-    };
-    let header = match header(&records, shape) {
+    let header = match header_of(bytes, profile) {
         Ok(header) => header,
-        Err(_) => {
-            return Recognition::MissingHeaderRow {
-                row: shape.header_row,
-            };
-        }
+        Err(reason) => return reason,
     };
-    let printed: Vec<&str> = header.cells.iter().map(|cell| cell.trim()).collect();
+    let printed: Vec<&str> = header.iter().map(|cell| cell.trim()).collect();
     let columns: Vec<String> = profile
         .recognised_by()
         .iter()
@@ -2187,6 +2182,14 @@ mod tests {
                 columns: vec!["Sum".to_owned()]
             }
         );
+    }
+
+    /// Recognition reports an empty document as malformed without exposing
+    /// document content.
+    #[test]
+    fn recognition_reports_malformed_document() {
+        let outcome = recognises(b"", &profile(serde_json::json!({})));
+        assert_eq!(outcome, Recognition::MalformedDocument);
     }
 
     /// `utf-8-bom` removes a leading mark, and `utf-8` does not — so a document

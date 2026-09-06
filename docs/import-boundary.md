@@ -42,6 +42,13 @@ reads with and what it refused. The profile schema, bundled profiles, and local
 directory are implementation details for the maintainer; the operation
 description is the contract a caller reads.
 
+It is also the only document row an agent can run while holding no value of the
+owner's at all; §4 is why that is allowed and what it forbids in exchange.
+
+A session is not a second vocabulary. Anything this document settles about the
+shape of a row settles it for both the conclusive route and the observation
+session.
+
 ## 2. The channel with no parser is the bank export, and privacy is not why
 
 The repository holds two broker report parsers and a CSV parser. Format

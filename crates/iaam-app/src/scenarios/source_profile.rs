@@ -33,7 +33,8 @@ use iaam_core::ids::{AccountId, ImportSessionId, SourceId};
 use iaam_ingest::Rejection;
 use iaam_ingest::observation::Intake;
 use iaam_ingest::profile::{
-    Installed, ProfileCatalogue, ReadContext, ReadOutcome, UnresolvedAccountName, engine,
+    CatalogueRejection, Installed, ProfileCatalogue, ReadContext, ReadOutcome,
+    UnresolvedAccountName, engine,
 };
 
 use crate::AppServices;
@@ -164,7 +165,7 @@ pub async fn read_into_session(
 ) -> Result<DocumentImport, AppError> {
     let catalogue = catalogue(services);
     let installed = match profile {
-        None => catalogue.recognise(bytes).map_err(rejected)?,
+        None => catalogue.recognise(bytes).map_err(rejected_catalogue)?,
         Some(id) => {
             let installed = catalogue.get(id).ok_or_else(|| AppError::Invalid {
                 field: "profile".into(),
@@ -351,29 +352,37 @@ pub async fn reread_into_session(
     read_into_session(services, principal, session, &body, profile, account).await
 }
 
+/// Add the route that remains open only to the typed no-profile refusal.
+///
+/// The variant comes from the catalogue, so this boundary never joins crates
+/// by comparing the transport's English `expected` or `actual` fields.
+fn rejected_catalogue(rejection: CatalogueRejection) -> AppError {
+    match rejection {
+        CatalogueRejection::NoneRecognised { rejection } => AppError::Invalid {
+            field: rejection.field,
+            expected: format!(
+                "{}. The primary document route remains the right choice whenever \
+                 an installed profile can read the export; otherwise transcribe its \
+                 observations through POST /v1/import-sessions/{{session}}/rows",
+                rejection.expected
+            ),
+            actual: rejection.actual,
+        },
+        CatalogueRejection::MultipleRecognised { rejection } => rejected(rejection),
+    }
+}
+
 /// A refusal about the document, in the shape the transport publishes.
 ///
 /// The engine speaks [`Rejection`] because that is what a row refusal is, and a
 /// document refusal has the same three parts for the same reason: the field,
 /// what was admissible, and what arrived. The HTTP contract belongs here rather
-/// than in `iaam-ingest`, so this boundary can name the route that remains open
-/// without making the recogniser depend on server vocabulary.
+/// than in `iaam-ingest`, so this boundary can name no route in the generic
+/// row/document conversion.
 fn rejected(rejection: Rejection) -> AppError {
-    let expected = if rejection.field == "document"
-        && rejection.actual == "a document none of them recognises"
-    {
-        format!(
-            "{}. The primary document route remains the right choice whenever \
-             an installed profile can read the export; otherwise transcribe its \
-             observations through POST /v1/import-sessions/{{session}}/rows",
-            rejection.expected
-        )
-    } else {
-        rejection.expected
-    };
     AppError::Invalid {
         field: rejection.field,
-        expected,
+        expected: rejection.expected,
         actual: rejection.actual,
     }
 }

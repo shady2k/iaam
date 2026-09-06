@@ -9128,6 +9128,7 @@ pub struct JournalRuleSettlementDto {
     /// retires it and writes a new rule under a new identifier and the next
     /// number. Recorded beside the identifier because the pair is what names
     /// the decision — a rule you retire later still names the decision that
+    /// filed this row.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u32>,
 }

@@ -1,6 +1,6 @@
 # 0029. One answer per decision, and a question published with the answers it admits
 
-Date: 2026-09-04 · Status: proposed · Beads: `iaam-qn6d`, `iaam-q5og`, `iaam-ulib`
+Date: 2026-09-04 · Status: partially superseded by ADR 0040 · Beads: `iaam-qn6d`, `iaam-q5og`, `iaam-ulib`
 
 The authority treatment of classification-rule adoption is superseded by ADR
 0040; the answer-route split and the question publication decisions below remain.
@@ -40,10 +40,10 @@ question, and an agent's answer writes none, so the only route from «no rules»
 ### The question that is asked once per row
 
 `answer_question` resolves the stored question's row and settles that row. The
-generalisation behind the answer route is gated by `may_generalise`, which is
-`scope.may_administer()` — an owner answer may perform both acts as a
-convenience. An agent working a session still makes one answer call per row;
-the proposal it receives can then be sent through the separate operation.
+generalisation behind it is gated by `may_generalise`, which is
+`scope.may_administer()` — the owner. An agent working a session must therefore
+make one call per row, answering a question it has already answered, with nothing
+available to it for saying «and every other row like this one».
 
 Three consequences, and none of them is about speed. The owner is read a question
 he has already answered, which is the state `iaam-8ano` and the whole visibility
@@ -167,16 +167,16 @@ one answer and another.
 call has always done. `EveryLikeRowInThisSession` records the same answer against
 every question still open **in this session** that is the same decision.
 
-**`may_generalise` remains the answer-route split, not a second authority
-grade.** The two acts are different in what they claim and in what can be seen
-before they take effect. A standing rule classifies rows nobody has looked at,
-in months not yet imported, including rows that will never be shown to anyone
-because a matched row is never asked about. The answer route may perform that
-act for an owner as a convenience; the separate operation is the reversible
-agent-reachable call. Settling rows inside one session touches only rows the
-caller has already submitted, which the owner reads in that session's assessment
-before the commit writes anything, and which he can abandon whole. Nothing in
-the answer route's reach makes a claim about next month.
+**`may_generalise` is untouched, and this is not a way round it.** The two acts
+are different in what they claim and in what can be seen before they take effect.
+A standing rule classifies rows nobody has looked at, in months not yet imported,
+including rows that will never be shown to anyone because a matched row is never
+asked about — it is the owner's, it stays his, and `POST /v1/classification-rules`
+is still where it is written. Settling rows inside one session touches only rows
+the caller has already submitted, which the owner reads in that session's
+assessment before the commit writes anything, and which he can abandon whole,
+leaving the journal exactly as it was. Nothing survives the session; the reach
+makes no claim about next month.
 
 **«The same decision» is `QuestionSubject`, which is the question paired with the
 direction the source stated for the row.** The question alone is not the identity,
@@ -293,9 +293,8 @@ something already hashed. Adding them would be hashing one fact twice.
 - **An agent settling fifty rows leaves fifty `adopt_classification_rule`
   items**, one per question, all proposing the same rule. That is the state
   before this decision as well — fifty answers already made fifty items — but the
-  operation makes each proposal reachable in one call, so it is now easy to
-  produce. Whether the queue folds items proposing an identical rule into one
-  is not decided here.
+  reach makes it reachable in one call, so it is now easy to produce. Whether the
+  queue folds items proposing an identical rule into one is not decided here.
 - **Whether an offer should also be raised on the counterparty a session repeats
   most** is left open. The category is the one that turns hundreds into a
   handful; a counterparty offer would be a second list with the same shape and a

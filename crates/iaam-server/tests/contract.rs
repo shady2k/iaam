@@ -5178,10 +5178,6 @@ async fn a_read_only_token_cannot_manage_classification_rules() {
     });
     for (method, body) in [
         (
-            "GET",
-            get("/v1/classification-rules", Some(&harness.readonly_token)),
-        ),
-        (
             "POST",
             post("/v1/classification-rules", &harness.readonly_token, &rule),
         ),
@@ -5197,6 +5193,20 @@ async fn a_read_only_token_cannot_manage_classification_rules() {
         assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {response}");
         assert_eq!(response["code"], "forbidden", "{method}: {response}");
     }
+
+    // Reading them is not managing them, which is what this test is named for.
+    // The list used to be refused here too, and that grading is what put the
+    // agent in the state `iaam-xiy5` describes: it could install a standing rule
+    // and could not see the rules it was adding to, nor preview what one would
+    // do. Neither the reach test nor ADR 0040's reversibility test ever said
+    // anything about a read — it decides nothing and does nothing — so the
+    // refusal was never resting on either.
+    let (status, _) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.readonly_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -9036,7 +9046,7 @@ async fn a_category_group_without_a_title_is_refused_by_field() {
 }
 
 #[tokio::test]
-async fn a_read_only_token_may_not_touch_category_groups_at_all() {
+async fn a_read_only_token_may_read_category_groups_and_not_write_them() {
     let harness = harness();
 
     let (status, body) = call(
@@ -9050,12 +9060,18 @@ async fn a_read_only_token_may_not_touch_category_groups_at_all() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
+    // This used to demand a refusal here too, and the demand rested on nothing:
+    // neither the reach test nor ADR 0040's reversibility test says anything
+    // about a read, which decides nothing and does nothing. What the refusal
+    // rested on was proximity — the credential routes sit in the same gate. It
+    // cost an agent the ability to see what it could aim a rule at while being
+    // admitted to write the rule (`iaam-xiy5`).
     let (status, body) = call(
         &harness.router,
         get("/v1/category-groups", Some(&harness.readonly_token)),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

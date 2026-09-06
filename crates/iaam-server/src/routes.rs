@@ -977,7 +977,7 @@ pub async fn reconciliation_balance(
     path = "/v1/classification-rules",
     responses(
         (status = 200, description = "Classification rule history", body = Vec<ClassificationRuleDto>),
-        (status = 403, description = "Owner only", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -985,7 +985,6 @@ pub async fn list_classification_rules(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<ClassificationRuleDto>>, ApiFailure> {
-    require_admin(&principal)?;
     let rules = list_rules(&state.services, &principal).await?;
     Ok(Json(
         rules
@@ -1087,7 +1086,7 @@ pub async fn delete_classification_rule(
     path = "/v1/category-groups",
     responses(
         (status = 200, description = "Owner category groups", body = Vec<CategoryGroupDto>),
-        (status = 403, description = "Owner only", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1095,7 +1094,6 @@ pub async fn list_category_groups(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<CategoryGroupDto>>, ApiFailure> {
-    require_admin(&principal)?;
     let groups = list_groups(&state.services, &principal).await?;
     Ok(Json(
         groups
@@ -1116,7 +1114,7 @@ pub async fn list_category_groups(
     request_body = CategoryGroupRequest,
     responses(
         (status = 201, description = "Category group added", body = CategoryGroupDto),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid category group", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1152,7 +1150,7 @@ pub async fn create_category_group_route(
     path = "/v1/categories",
     responses(
         (status = 200, description = "Owner category history", body = Vec<CategoryDto>),
-        (status = 403, description = "Owner only", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1160,7 +1158,6 @@ pub async fn list_category_reference(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<CategoryDto>>, ApiFailure> {
-    require_admin(&principal)?;
     let categories = list_categories(&state.services, &principal).await?;
     Ok(Json(
         categories.into_iter().map(CategoryDto::from_port).collect(),
@@ -1173,7 +1170,7 @@ pub async fn list_category_reference(
     request_body = CategoryRequest,
     responses(
         (status = 201, description = "Category added", body = CategoryDto),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 404, description = "Category group not found", body = ApiError),
         (status = 422, description = "Invalid category", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
@@ -1214,7 +1211,7 @@ pub async fn create_category_route(
     params(("id" = Uuid, Path, description = "Category identifier")),
     responses(
         (status = 204, description = "Category retired"),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 404, description = "Category not found", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
     ),
@@ -1236,7 +1233,7 @@ pub async fn delete_category(
     path = "/v1/category-rules",
     responses(
         (status = 200, description = "Category rule history", body = Vec<CategoryRuleDto>),
-        (status = 403, description = "Owner only", body = ApiError)
+        (status = 403, description = "Insufficient permissions", body = ApiError)
     ),
     security(("bearer" = []))
 )]
@@ -1244,7 +1241,6 @@ pub async fn list_category_rules_route(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<CategoryRuleDto>>, ApiFailure> {
-    require_admin(&principal)?;
     let rules = list_category_rules(&state.services, &principal).await?;
     Ok(Json(
         rules.into_iter().map(CategoryRuleDto::from_port).collect(),
@@ -1305,7 +1301,7 @@ pub async fn create_category_rule_route(
     request_body = CategoryRuleRequest,
     responses(
         (status = 200, description = "Category rule impact", body = CategoryRuleImpactDto),
-        (status = 403, description = "Owner only", body = ApiError),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 422, description = "Invalid category rule", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
@@ -1318,7 +1314,7 @@ pub async fn preview_category_rule_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<Json<CategoryRuleImpactDto>, ApiFailure> {
-    require_admin(&principal)?;
+    require_submit(&principal)?;
     let matcher = parse_category_matcher(request.matcher)?;
     let impact = preview_category_rule(
         &state.services,
@@ -5812,12 +5808,44 @@ async fn record_decision(
     Ok(())
 }
 
+/// A call an agent may make because its record can be put back.
+///
+/// The same predicate [`iaam_app::ports::required_scope`] gives every reversible
+/// operation, for routes that are not [`OperationKey`]s and so have no floor to
+/// read. Deliberately the same predicate and not a second one: a route gated
+/// here and an operation graded there must not be able to answer «may an agent
+/// do this» differently — which is exactly what happened
+/// (`iaam-xiy5`). `POST /v1/category-rules` is an `OperationKey`, graded by ADR
+/// 0040 and admitted; `POST /v1/category-rules/preview` is not one, stayed
+/// behind [`require_admin`], and was refused. So an agent could install a
+/// standing rule and could not see what it would do first, and the only way left
+/// to learn a rule's effect was to write it.
+///
+/// A preview is the most reversible call in this API — there is nothing to put
+/// back, because nothing was done. A read is the same argument one step further:
+/// neither the reach test nor the reversibility test ever said anything about
+/// it, because it decides nothing and does nothing.
+fn require_submit(principal: &Principal) -> Result<(), ApiFailure> {
+    if principal.scope.may_submit() {
+        Ok(())
+    } else {
+        Err(ApiFailure::forbidden(principal.scope.code()))
+    }
+}
+
 /// Refuse a call to an owner-only route that no [`OperationKey`] names.
 ///
-/// The routes left here are the ones the queue and the caveat register never
-/// offer — aliases and declarations, categories and groups, instruments,
-/// tokens, broker access — so there is no second reader of their authority and
-/// nothing for a floor to disagree with. A route that becomes an
+/// **Credentials are why this gate still exists** (ADR 0040 §3). Issuing a token
+/// is not a fact in a journal and no correction reverses it; a deleted broker
+/// access is one the owner must obtain and enter again. Reading the credential
+/// inventory is part of the same thing, so `GET /v1/tokens` and
+/// `GET /v1/broker-access` stay here.
+///
+/// Beside them are the routes the queue and the caveat register never offer —
+/// aliases and declarations, instruments — so there is no second reader of their
+/// authority and nothing for a floor to disagree with. That is an argument about
+/// where authority is stated, not about whether an act can be put back, and it
+/// is the argument `iaam-801g.1` is open on. A route that becomes an
 /// [`OperationKey`] moves to [`require`] in the same edit, which is what
 /// `every_offered_route_is_gated_by_the_floor_it_publishes` checks.
 fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {

@@ -4759,10 +4759,9 @@ fn provide_control_assertion_action(
 ) -> Action {
     let dimension = Dimension::Cash;
     let required_goals = match point {
-        BalancePoint::Opening => ReportGoals::of(&[
-            ReportGoal::AssetSnapshot,
-            ReportGoal::Reconciliation,
-        ]),
+        BalancePoint::Opening => {
+            ReportGoals::of(&[ReportGoal::AssetSnapshot, ReportGoal::Reconciliation])
+        }
         BalancePoint::Closing => ReportGoals::of(&[ReportGoal::Reconciliation]),
     };
     let mut preset = BTreeMap::new();

@@ -23795,6 +23795,15 @@ async fn answering_one_of_mixed_counterparty_rows_mints_no_rule() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{rows}");
+    let promised = classification_item_reason(&harness, &harness.owner_token).await;
+    assert!(
+        promised.contains("writes no rule"),
+        "the mixed ground must not promise a standing rule before the answer: {promised}"
+    );
+    assert!(
+        !promised.contains("settles by itself next time"),
+        "the mixed ground must not promise automatic generalisation: {promised}"
+    );
 
     let question = rows[0]["question_id"]
         .as_str()

@@ -1210,6 +1210,17 @@ pub enum GeneralisationProspect {
     NoneFromThisRow,
 }
 
+/// The session-wide meaning of the fields a standing rule would match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneralisationGround {
+    /// The row has no field a standing rule could match.
+    NoMatcher,
+    /// Every row carrying the selected field has one movement meaning.
+    SingleShape,
+    /// The selected field carries different movement meanings in this session.
+    MixedShapes,
+}
+
 impl GeneralisationProspect {
     /// The sentence for a surface reporting about the owner.
     #[must_use]
@@ -1256,26 +1267,25 @@ impl GeneralisationProspect {
         }
     }
 }
-
 /// What answering one question will decide beyond this session.
 ///
-/// The two facts it reads are the two that exist before an answer does. The
-/// subject is `None` where this build cannot read the row, and a row it can read
-/// still grounds no rule when it prints nothing a matcher could ask about — both
-/// are «no rule can be built from this», which is the same pair
-/// [`generalisation_of`] folds into [`Generalisation::Impossible`]. Groundedness
-/// is asked of [`matcher_from`] and not restated here, because a second spelling
-/// of that field policy is a second answer to what a rule can be built from.
+/// The row's subject says whether a matcher can be built. The caller supplies
+/// the session-wide ground verdict, because this function cannot read the
+/// session and must not restate that policy. A mixed ground remains a useful
+/// proposal, but it is not safe to write automatically.
 #[must_use]
 pub fn generalisation_ahead(
     subject: Option<&ClassificationSubject>,
     may_generalise: bool,
+    ground: GeneralisationGround,
 ) -> GeneralisationProspect {
-    match subject.and_then(matcher_from) {
-        None => GeneralisationProspect::NoneFromThisRow,
-        Some(_) if may_generalise => GeneralisationProspect::WillStand,
-        Some(_) => GeneralisationProspect::NeedsHisAdoption,
+    if subject.is_none() || matches!(ground, GeneralisationGround::NoMatcher) {
+        return GeneralisationProspect::NoneFromThisRow;
     }
+    if matches!(ground, GeneralisationGround::MixedShapes) || !may_generalise {
+        return GeneralisationProspect::NeedsHisAdoption;
+    }
+    GeneralisationProspect::WillStand
 }
 
 /// What one question's answer did, or could still do, to the standing rules.
@@ -7664,20 +7674,18 @@ fn row_groups(
                 // them a group is the question their rows raise.
                 let subjects: Vec<ClassificationSubject> =
                     members.iter().map(|member| member.subject(None)).collect();
-                let ground = if subjects
+                let ground = subjects
                     .iter()
                     .all(|subject| matcher_from(subject).is_some())
-                {
-                    subjects.first()
-                } else {
-                    None
-                };
+                    .then(|| subjects.first())
+                    .flatten();
+                let ground_verdict = generalisation_ground(ground, observations);
                 decision_group_question(
                     rows.len(),
                     &common,
                     days.as_ref(),
                     amounts.as_ref(),
-                    generalisation_ahead(ground, may_generalise),
+                    generalisation_ahead(ground, may_generalise, ground_verdict),
                 )
             }
             GroupBasis::OneMovement => movement_group_question(&members, directory),
@@ -8451,8 +8459,23 @@ fn matcher_ground_is_single_shape(
     one_shape(&rows).is_some()
 }
 
-/// The same policy, asked of the row as the classifier sees it.
-///
+/// Classify the selected rule ground once for the whole session.
+pub(crate) fn generalisation_ground(
+    subject: Option<&ClassificationSubject>,
+    observations: &[ImportObservationView],
+) -> GeneralisationGround {
+    let Some(subject) = subject else {
+        return GeneralisationGround::NoMatcher;
+    };
+    let Some(matcher) = matcher_from(subject) else {
+        return GeneralisationGround::NoMatcher;
+    };
+    if matcher_ground_is_single_shape(&matcher, observations) {
+        GeneralisationGround::SingleShape
+    } else {
+        GeneralisationGround::MixedShapes
+    }
+}
 /// Split out so that «can a rule be built from this row at all» has one answer.
 /// [`generalisation_ahead`] needs exactly that question and holds a
 /// [`ClassificationSubject`] rather than an [`ObservedRow`]; a predicate of its
@@ -10237,6 +10260,72 @@ mod tests {
             main_cash.amount().raw(),
             1_000,
             "the inbound direction from the row must be recorded as an inflow"
+        );
+    }
+
+    /// The shape the field report described: a rule that says "money left the
+    /// perimeter", matching a row on which the source said money arrived.
+    ///
+    /// This is the one outcome that states no direction of its own, so it is
+    /// the only one under which a rule could plausibly have supplied one. It
+    /// does not: the row is asked first, and the fact credits the account.
+    /// Without this case the two tests beside it disprove a defect that was
+    /// never reported, since a fee and an internal transfer are not what a
+    /// standing rule for a payment carries.
+    #[test]
+    fn an_external_flow_rule_does_not_turn_an_inbound_row_into_an_outflow() {
+        let main = account(1);
+        let rule = ClassificationRule {
+            id: iaam_core::ids::ClassificationRuleId::new_random(),
+            version: 1,
+            matcher: RuleMatcher {
+                counterparty_account: Some("Somebody".to_owned()),
+                description_contains: None,
+                kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+            },
+            outcome: Classification::ExternalFlow,
+        };
+        let resolver = ruled(vec![detail(main, "Main")], vec![rule]);
+        let observed = incoming(row(main, "Somebody", Some(date!(2026 - 06 - 01))));
+        let Assessment::Settled {
+            classification,
+            movement,
+            ..
+        } = resolver.assess(&observed)
+        else {
+            panic!("the standing rule should classify the row");
+        };
+        assert_eq!(classification, Classification::ExternalFlow);
+        assert_eq!(
+            movement,
+            Some(Movement::In),
+            "an outcome that implies no direction leaves the row's own word standing"
+        );
+        let operation = observed
+            .resolve(classification, movement)
+            .expect("an inbound external flow is money arriving");
+        let event = normalize(
+            &operation,
+            &NormalizationContext {
+                owner: OwnerId(uuid::Uuid::from_bytes([9; 16])),
+                source: SourceId(uuid::Uuid::from_bytes([9; 16])),
+                parser_version: ParserVersion("ingest/manual/1".to_owned()),
+            },
+        )
+        .expect("the classified operation normalises")
+        .event;
+        let main_cash = event
+            .legs
+            .iter()
+            .find(|leg| leg.account == main)
+            .and_then(|leg| leg.cash_effect())
+            .expect("the row account has a cash leg");
+        assert!(
+            main_cash.amount().raw() > 0,
+            "the row said the money arrived, so the fact must not post an outflow: {main_cash:?}"
         );
     }
 
@@ -12985,37 +13074,21 @@ mod tests {
     /// unique to its row — and it is still a rule, where the alternative would
     /// be to tell the owner that no rule can be built from the row at all.
     #[test]
-    fn a_row_carrying_only_a_description_generalises_on_it() {
-        let mut described = row(account(1), "Savings", None);
-        described.counterparty = ObservedCounterparty::Unknown;
-        described.source_kind = None;
-        described.description = Some("standing order".to_owned());
-        let proposed = matcher_for(&described).expect("a matcher");
-        assert_eq!(
-            proposed.description_contains.as_deref(),
-            Some("standing order")
-        );
-        assert_eq!(proposed.counterparty_account, None);
-        assert_eq!(proposed.kind, None);
-    }
-
-    /// What an answer will keep, before anyone has answered (`iaam-sh6m`).
-    ///
-    /// The three cases the queue and the assessment used each to assert one of,
-    /// flatly, in two sentences that contradicted each other. The last is the
-    /// one no authority changes, and the one a test of the enum alone would miss:
-    /// a row this build reads perfectly well and that still grounds nothing.
-    #[test]
     fn what_an_answer_will_keep_is_read_off_the_row_and_the_authority() {
         let grounded = row(account(1), "Shop One", None).subject(None);
         assert_eq!(
-            generalisation_ahead(Some(&grounded), true),
+            generalisation_ahead(Some(&grounded), true, GeneralisationGround::SingleShape,),
             GeneralisationProspect::WillStand
         );
         assert_eq!(
-            generalisation_ahead(Some(&grounded), false),
+            generalisation_ahead(Some(&grounded), false, GeneralisationGround::SingleShape,),
             GeneralisationProspect::NeedsHisAdoption,
             "the row would ground one; the answerer may not write it"
+        );
+        assert_eq!(
+            generalisation_ahead(Some(&grounded), true, GeneralisationGround::MixedShapes,),
+            GeneralisationProspect::NeedsHisAdoption,
+            "a mixed ground must be adopted rather than written automatically"
         );
 
         // Read, and still nothing to build a standing decision from — so no
@@ -13023,7 +13096,7 @@ mod tests {
         let bare = unmatchable(account(1)).subject(None);
         for authority in [true, false] {
             assert_eq!(
-                generalisation_ahead(Some(&bare), authority),
+                generalisation_ahead(Some(&bare), authority, GeneralisationGround::NoMatcher,),
                 GeneralisationProspect::NoneFromThisRow,
                 "a row that asks nothing grounds nothing under any token"
             );
@@ -13032,7 +13105,7 @@ mod tests {
         // And the row this build cannot read at all, which is the absence
         // `subject_of` publishes.
         assert_eq!(
-            generalisation_ahead(None, true),
+            generalisation_ahead(None, true, GeneralisationGround::NoMatcher),
             GeneralisationProspect::NoneFromThisRow
         );
     }

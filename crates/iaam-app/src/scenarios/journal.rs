@@ -508,7 +508,6 @@ pub async fn read_operation_history(
 /// One pass forward from the head, pairing at each step the reversal and the
 /// replacement that name the fact standing there.
 fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> OperationHistory {
-    let mut standing = &head.event;
     let mut steps = vec![HistoryStep {
         act: HistoryAct::Arrived,
         at: head.recorded_at.clone(),
@@ -518,36 +517,58 @@ fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> Operation
         replacement: None,
     }];
     let mut current = Some(head.event.id);
+    let mut consumed = Vec::new();
 
-    // Every act consumes at least one fact of the chain, so the chain's length
-    // bounds the number of acts. The bound is what stops a database the core
-    // could not have written from being walked forever.
-    for _ in 0..chain.len() {
-        let Some(target) = current else { break };
-        let reversal = reversal_of(chain, target);
-        let Some(replacement) = replacement_of(chain, target) else {
-            let Some(reversal) = reversal else { break };
-            steps.push(HistoryStep {
-                act: HistoryAct::Retracted,
-                at: reversal.recorded_at.clone(),
-                state: None,
-                changed: Vec::new(),
-                reversal: Some(reversal.event.id),
-                replacement: None,
-            });
-            current = None;
-            break;
-        };
-        steps.push(HistoryStep {
-            act: HistoryAct::Corrected,
-            at: recorded_first(reversal, replacement),
-            changed: changed_aspects(standing, &replacement.event),
-            state: Some(journal_event_view(&replacement.event)),
-            reversal: reversal.map(|reversal| reversal.event.id),
-            replacement: Some(replacement.event.id),
-        });
-        current = Some(replacement.event.id);
-        standing = &replacement.event;
+    for recorded in chain.iter().skip(1) {
+        if consumed.contains(&recorded.event.id) {
+            continue;
+        }
+        match recorded.event.relation {
+            Relation::Reversal { target } => {
+                let reversal = recorded;
+                let Some(replacement) = replacement_of(chain, target)
+                    .filter(|replacement| !consumed.contains(&replacement.event.id))
+                else {
+                    steps.push(HistoryStep {
+                        act: HistoryAct::Retracted,
+                        at: reversal.recorded_at.clone(),
+                        state: None,
+                        changed: Vec::new(),
+                        reversal: Some(reversal.event.id),
+                        replacement: None,
+                    });
+                    if current == Some(target) {
+                        current = None;
+                    }
+                    continue;
+                };
+                consumed.push(replacement.event.id);
+                steps.push(HistoryStep {
+                    act: HistoryAct::Corrected,
+                    at: recorded_first(Some(reversal), replacement),
+                    changed: state_for_target(chain, target).map_or_else(Vec::new, |before| {
+                        changed_aspects(before, &replacement.event)
+                    }),
+                    state: Some(journal_event_view(&replacement.event)),
+                    reversal: Some(reversal.event.id),
+                    replacement: Some(replacement.event.id),
+                });
+                current = Some(replacement.event.id);
+            }
+            Relation::Replacement { target } => {
+                steps.push(HistoryStep {
+                    act: HistoryAct::Corrected,
+                    at: recorded.recorded_at.clone(),
+                    changed: state_for_target(chain, target)
+                        .map_or_else(Vec::new, |before| changed_aspects(before, &recorded.event)),
+                    state: Some(journal_event_view(&recorded.event)),
+                    reversal: reversal_of(chain, target).map(|reversal| reversal.event.id),
+                    replacement: Some(recorded.event.id),
+                });
+                current = Some(recorded.event.id);
+            }
+            Relation::None => {}
+        }
     }
 
     OperationHistory { steps, current }
@@ -555,9 +576,8 @@ fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> Operation
 
 /// The fact that reverses the named one, where the chain holds it.
 ///
-/// The first such fact, not every one of them: a second reversal of one target
-/// is a second fact but not a second retraction, and a database that holds one
-/// must not turn into two acts about the same target.
+/// This supplies the reversal beside a replacement-only correction. The fold
+/// itself handles every reversal so that a second one cannot disappear.
 fn reversal_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEvent> {
     chain.iter().find(
         |recorded| matches!(recorded.event.relation, Relation::Reversal { target: named } if named == target),
@@ -566,14 +586,27 @@ fn reversal_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEven
 
 /// The fact that replaces the named one, where the chain holds it.
 ///
-/// The first, for the reason [`reversal_of`] takes the first: `resolve` refuses
-/// to admit a second replacement of one event, so a chain holding two is a
-/// database nothing here can have written, and following both would publish two
-/// futures for one fact.
+/// The first is the one this fold can publish. `resolve` refuses to admit a
+/// second replacement of one event, so a chain holding two is database state
+/// nothing here could have written.
 fn replacement_of(chain: &[RecordedEvent], target: EventId) -> Option<&RecordedEvent> {
     chain.iter().find(
         |recorded| matches!(recorded.event.relation, Relation::Replacement { target: named } if named == target),
     )
+}
+
+/// The state a replacement supersedes, if its target was a state-bearing fact.
+///
+/// Reversals never count as states. A replacement of one therefore starts a
+/// new state after a retraction and has no before-state to compare with.
+fn state_for_target(chain: &[RecordedEvent], target: EventId) -> Option<&Event> {
+    chain
+        .iter()
+        .find(|recorded| recorded.event.id == target)
+        .and_then(|recorded| match recorded.event.relation {
+            Relation::Reversal { .. } => None,
+            Relation::None | Relation::Replacement { .. } => Some(&recorded.event),
+        })
 }
 
 /// When an act of two facts reached the journal: the earlier of the two stamps.
@@ -1402,6 +1435,98 @@ mod tests {
             history.current, None,
             "no fact of this operation counts now"
         );
+    }
+
+    #[tokio::test]
+    async fn a_second_reversal_of_one_fact_is_visible_in_history() {
+        let ctx = Ctx::new();
+        let original = ctx.deposit(1, 4_500, ctx.main);
+        let first_reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.deposit(2, 4_500, ctx.main)
+        };
+        let second_reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.deposit(3, 4_500, ctx.main)
+        };
+        ctx.write(&[
+            original.clone(),
+            first_reversal.clone(),
+            second_reversal.clone(),
+        ])
+        .await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            vec![
+                HistoryAct::Arrived,
+                HistoryAct::Retracted,
+                HistoryAct::Retracted
+            ]
+        );
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .filter_map(|step| step.reversal)
+                .collect::<Vec<_>>(),
+            vec![first_reversal.id, second_reversal.id]
+        );
+        assert_eq!(history.current, None);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_of_a_reversal_is_visible_after_the_retraction() {
+        let ctx = Ctx::new();
+        let original = ctx.deposit(1, 4_500, ctx.main);
+        let reversal = iaam_core::event::Event {
+            relation: Relation::Reversal {
+                target: original.id,
+            },
+            ..ctx.deposit(2, 4_500, ctx.main)
+        };
+        let replacement = iaam_core::event::Event {
+            relation: Relation::Replacement {
+                target: reversal.id,
+            },
+            ..ctx.deposit(3, 5_200, ctx.savings)
+        };
+        ctx.write(&[original.clone(), reversal.clone(), replacement.clone()])
+            .await;
+
+        let history = ctx.history(original.id).await;
+
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .map(|step| step.act)
+                .collect::<Vec<_>>(),
+            vec![
+                HistoryAct::Arrived,
+                HistoryAct::Retracted,
+                HistoryAct::Corrected
+            ]
+        );
+        assert_eq!(
+            history
+                .steps
+                .iter()
+                .filter_map(|step| step.state.as_ref().map(|state| state.event))
+                .collect::<Vec<_>>(),
+            vec![original.id, replacement.id]
+        );
+        assert_eq!(history.current, Some(replacement.id));
     }
 
     /// Most of his journal is this: a fact that arrived and was never touched.

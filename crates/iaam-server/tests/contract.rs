@@ -19104,6 +19104,74 @@ async fn a_rule_on_the_sources_own_category_settles_a_row_naming_no_operation_wo
     );
 }
 
+/// A standing rule can turn a source outflow into an internal transfer fact.
+///
+/// The row is not absent from the journal, but it is absent from the money-flow
+/// report that an owner checking the source would read. The assessment must make
+/// that diversion explicit by naming both the fact kind and the rule that
+/// settled it, rather than presenting a complete-looking list of rows.
+#[tokio::test]
+async fn reconciliation_names_a_row_diverted_by_a_standing_transfer_rule() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+
+    let (status, rule) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": { "source_category": "Service" },
+                "outcome": { "kind": "internal_transfer", "to": savings },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{rule}");
+
+    let (session, _) = one_row_session(
+        &harness,
+        "diverted",
+        json!({
+            "account": account,
+            "type": "unresolved_direction",
+            "amount": "125.00",
+            "currency": "RUB",
+            "direction": "out",
+            "dates": { "cash_posted": "2025-03-31" },
+            "source_kind": "PAYMENT",
+            "source_category": "Service",
+            "idempotency_key": "diverted-row",
+        }),
+    )
+    .await;
+
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}/assessment"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let reconciliation = plan["commit_delta"]["reconciliation"]
+        .as_array()
+        .expect("row reconciliation");
+    assert_eq!(reconciliation.len(), 1, "{plan}");
+    assert_eq!(reconciliation[0]["row"], 1, "{plan}");
+    assert_eq!(reconciliation[0]["outcome"], "recorded", "{plan}");
+    assert_eq!(
+        reconciliation[0]["records_as"], "internal_transfer",
+        "the fact kind that removes the row from outflows must be visible: {plan}"
+    );
+    assert_eq!(
+        reconciliation[0]["settled_by"], "rule",
+        "the standing rule that diverted the row must be visible: {plan}"
+    );
+}
+
 /// A category condition does not fire on the operation word, or the reverse.
 ///
 /// The two words are separate fields end to end (decision 0020 §2), and a

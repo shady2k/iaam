@@ -3548,6 +3548,39 @@ pub struct ResemblingRow {
     pub resembles: EventId,
 }
 
+/// How one row is accounted for by the commit.
+///
+/// This is deliberately a row-shaped ledger rather than a count. A standing
+/// rule can record a source outflow as an internal transfer, which removes it
+/// from the outflow report without removing it from the journal; naming the
+/// fact kind and its basis is what makes that diversion visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowReconciliation {
+    pub row: u32,
+    pub outcome: ReconciliationOutcome,
+}
+
+/// The stated outcome for one row in a commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconciliationOutcome {
+    /// The row becomes a new journal fact. `records_as` names its
+    /// classification, not the concrete event kind in the journal.
+    Recorded {
+        records_as: &'static str,
+        settled_by: FactBasis,
+    },
+    /// The row is already represented by a keyed journal fact.
+    Duplicate {
+        records_as: &'static str,
+        settled_by: FactBasis,
+    },
+    /// The row is retained because it is unreadable or unanswered.
+    Retained { reason: RetentionReason },
+    /// The row correctly produces no fact, including when its partner records
+    /// the movement.
+    SettledWithoutFact { reason: NoFactReason },
+}
+
 /// What the journal gains, and what it does not.
 ///
 /// Every list here is a list of rows, and beside two of them is what those rows
@@ -3565,6 +3598,13 @@ pub struct ResemblingRow {
 pub struct CommitDelta {
     /// Facts that would be appended.
     pub facts: Vec<PlannedFact>,
+    /// One explicit outcome for every row the session holds, in row order.
+    ///
+    /// Unlike the specialised lists below, this is the complete accounting
+    /// journal. A caller can inspect one row and see whether it became a fact,
+    /// was already recorded, was retained, or was deliberately settled without
+    /// a fact.
+    pub reconciliation: Vec<RowReconciliation>,
     /// Rows the owner's journal already holds under a key of theirs. They
     /// commit to a `duplicate` verdict and add nothing — which is correct, and
     /// is also exactly what «every verdict was positive and half the rows are
@@ -4116,6 +4156,7 @@ pub async fn plan_session(
     // over the rows would describe a different import from the one that runs.
     let mut declined: Vec<DeclinedRow> = Vec::new();
     let mut settled_without_fact: Vec<SettledRow> = Vec::new();
+    let mut reconciliation = Vec::with_capacity(read_rows.len());
     for read in &read_rows {
         let Some(candidate) = &read.candidate else {
             // Settled, and settled is not retained: nothing is owed, nothing is
@@ -4127,6 +4168,10 @@ pub async fn plan_session(
                     row: read.row,
                     reason,
                 });
+                reconciliation.push(RowReconciliation {
+                    row: read.row,
+                    outcome: ReconciliationOutcome::SettledWithoutFact { reason },
+                });
             }
             continue;
         };
@@ -4134,8 +4179,22 @@ pub async fn plan_session(
             Ok(event) => {
                 let fact = planned_fact(read, event);
                 if recorded.holds(event) {
+                    reconciliation.push(RowReconciliation {
+                        row: read.row,
+                        outcome: ReconciliationOutcome::Duplicate {
+                            records_as: reconciliation_records_as(event),
+                            settled_by: fact.settled_by.clone(),
+                        },
+                    });
                     duplicates.push(fact);
                 } else {
+                    reconciliation.push(RowReconciliation {
+                        row: read.row,
+                        outcome: ReconciliationOutcome::Recorded {
+                            records_as: reconciliation_records_as(event),
+                            settled_by: fact.settled_by.clone(),
+                        },
+                    });
                     // Level five is asked only of a row the two key levels
                     // above said nothing about — `dedup::assess`'s own order,
                     // so a row already known to be recorded is never also
@@ -4176,10 +4235,24 @@ pub async fn plan_session(
                 };
                 retained.push(RetainedRow {
                     row: read.row,
-                    reason,
+                    reason: reason.clone(),
+                });
+                reconciliation.push(RowReconciliation {
+                    row: read.row,
+                    outcome: ReconciliationOutcome::Retained { reason },
                 });
             }
         }
+    }
+
+    if let Some(unaccounted) = read_rows
+        .iter()
+        .find(|read| !reconciliation.iter().any(|entry| entry.row == read.row))
+    {
+        return Err(AppError::Store(format!(
+            "row {} of the session has no reconciliation outcome",
+            unaccounted.row
+        )));
     }
 
     let resolved: Vec<PlannedFact> = facts.iter().chain(duplicates.iter()).cloned().collect();
@@ -4205,6 +4278,7 @@ pub async fn plan_session(
         fact_totals: batch_totals(&facts)?,
         duplicate_totals: batch_totals(&duplicates)?,
         facts,
+        reconciliation,
         duplicates,
         resembles_recorded: resembling,
         retained_unrecorded: retained,
@@ -4653,6 +4727,16 @@ fn scope_assessment(
         }
     }
     assessment
+}
+
+/// The reconciliation vocabulary names the classification a row records as,
+/// while [`PlannedFact::records_as`] names the concrete journal event kind.
+/// A complete cash transfer is the journal shape of an internal transfer.
+const fn reconciliation_records_as(event: &iaam_core::event::Event) -> &'static str {
+    match event.kind {
+        EventKind::CashTransfer { .. } => "internal_transfer",
+        _ => event.kind.discriminant(),
+    }
 }
 
 fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact {

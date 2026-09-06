@@ -1691,17 +1691,21 @@ pub async fn answer_question(
     // caller addressed. A rule per settled row would be one decision recorded
     // many times — and `matcher_for` builds them all from the same field of the
     // same subject, so they would be the same rule written over and over.
-    // Two filters and they refuse different things. `may_generalise` is about
-    // the **answerer**: an agent settles the row and the standing decision stays
+    // Three filters refuse different things. `may_generalise` is about the
+    // **answerer**: an agent settles the row and the standing decision stays
     // the owner's, and the rule it would have written is published as
     // [`Generalisation::Available`] for him to adopt. `generalises` is about the
     // **answer**: «it was between accounts of mine and I cannot say which» is a
     // fact about what this document did not contain, and a rule made of it would
     // file every later row of the same shape as unplaceable — including the ones
     // whose far half is in the export and which the pairing would settle whole.
-    // So there is nothing here for anybody to adopt, and the question reports
-    // [`Generalisation::DoesNotGeneralise`] rather than a proposal.
+    // The shared `one_shape` verdict is about the **ground**: a repeated token
+    // carrying opposing meanings in this session is shown to the owner as a
+    // proposal, never written automatically. Only the first two cases report
+    // [`Generalisation::DoesNotGeneralise`]; the mixed-ground case remains
+    // available for an informed owner adoption.
     let answered = match matcher_for(&observed)
+        .filter(|matcher| matcher_ground_is_single_shape(matcher, &contents.observations))
         .filter(|_| may_generalise(principal))
         .filter(|_| answer.shape().generalises())
     {
@@ -7985,25 +7989,10 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
     for ((filed_by, category), mut rows) in by_category {
         rows.sort_unstable();
         let covers: Vec<u32> = rows.iter().map(|(row, _)| *row).collect();
-        let mut shapes = shapes_of(&rows);
-        // Most-covering first inside the group too, and by the shape itself
-        // where two are equal: a caller showing a mixed word shows the largest
-        // share first, and the order does not move between two readings.
-        shapes.sort_by(|left, right| {
-            right
-                .rows
-                .len()
-                .cmp(&left.rows.len())
-                .then_with(|| shape_key_of(left).cmp(&shape_key_of(right)))
-        });
         // One shape or many, and the branch is the whole bead. `OfferedRule`
         // holds one `RowShape` and cannot hold two, so a group that is not one
         // thing is not representable as an offer at all.
-        let sole = if shapes.len() == 1 {
-            shapes.pop()
-        } else {
-            None
-        };
+        let sole = one_shape(&rows);
         if let Some(contains) = sole {
             // The word goes in the field that asks about the party who filed
             // it. A condition carrying the owner's own word in the source's
@@ -8028,6 +8017,17 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
                 contains,
             });
         } else {
+            let mut shapes = shapes_of(&rows);
+            // Most-covering first inside the group too, and by the shape itself
+            // where two are equal: a caller showing a mixed word shows the largest
+            // share first, and the order does not move between two readings.
+            shapes.sort_by(|left, right| {
+                right
+                    .rows
+                    .len()
+                    .cmp(&left.rows.len())
+                    .then_with(|| shape_key_of(left).cmp(&shape_key_of(right)))
+            });
             withheld.push(WithheldOffer {
                 reason: withheld_offer_reason(filed_by, &category, &shapes),
                 filed_by,
@@ -8105,6 +8105,15 @@ fn shapes_of(rows: &[(u32, RowShapeKey)]) -> Vec<RowShape> {
             rows,
         })
         .collect()
+}
+
+/// The one-shape verdict shared by offers and answer-derived matchers.
+///
+/// A condition may stand only when every row carrying its ground has one
+/// movement shape. The row numbers are incidental; the shared fold is not.
+fn one_shape(rows: &[(u32, RowShapeKey)]) -> Option<RowShape> {
+    let mut shapes = shapes_of(rows);
+    (shapes.len() == 1).then(|| shapes.pop()).flatten()
 }
 
 /// Why no rule is offered on a word, in one sentence for the owner.
@@ -8305,12 +8314,11 @@ fn offered_rule_question(
 /// A matcher on one field settles more rows than a matcher on several, and one
 /// of them can be settled wrongly: a source word like the one a bank prints on
 /// every transfer would carry a classification onto rows that do not deserve it.
-/// Two things bound that. The proposal is only ever *offered* — it is published
-/// as the body of `POST /v1/classification-rules` for the owner to read, narrow
-/// and send, and a rule he adopts is one he can retire, which replans the
-/// history it classified. And the rows this is computed for are rows the
-/// classifier could **not** settle, so the field it proposes is one that had no
-/// standing rule on it.
+/// Offers use [`one_shape`] to withhold a condition whose rows have mixed
+/// meanings. Answer-derived matchers use that same verdict across the whole
+/// session; when it is mixed, the answer publishes the exact condition for the
+/// owner to read and adopt rather than writing it silently. A rule he adopts is
+/// one he can retire, which replans the history it classified.
 fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
     // Through the subject, because the subject is the shape the whole field
     // policy below is written about and it is what `generalisation_ahead` holds.
@@ -8318,6 +8326,45 @@ fn matcher_for(row: &ObservedRow) -> Option<RuleMatcher> {
     // counterparty stays the name the source printed — which is the same reading
     // `subject_of` publishes and the same one this function has always taken.
     matcher_from(&row.subject(None))
+}
+
+/// Whether the rule's selected ground has one meaning in this session.
+///
+/// The selected field is the same priority `matcher_for` uses. Rows carrying
+/// that exact value are folded through [`one_shape`], so an answer cannot make
+/// a standing condition from a repeated word that means both inward and
+/// outward movement here.
+fn matcher_ground_is_single_shape(
+    matcher: &RuleMatcher,
+    observations: &[ImportObservationView],
+) -> bool {
+    let rows: Vec<(u32, RowShapeKey)> = observations
+        .iter()
+        .filter_map(|observation| {
+            let Intake::Observed { row, .. } = parse_intake(&observation.payload).ok()? else {
+                return None;
+            };
+            let same_ground = if let Some(counterparty) = &matcher.counterparty_account {
+                row.counterparty_name() == Some(counterparty.as_str())
+            } else if let Some(kind) = &matcher.kind {
+                row.source_kind.as_deref() == Some(kind.as_str())
+            } else if let Some(category) = &matcher.source_category {
+                row.source_category.as_deref() == Some(category.as_str())
+            } else if let Some(category) = &matcher.owner_category {
+                row.owner_category.as_deref() == Some(category.as_str())
+            } else if let Some(code) = &matcher.source_code {
+                row.source_code.as_deref() == Some(code.as_str())
+            } else if let Some(description) = &matcher.description_contains {
+                row.description
+                    .as_deref()
+                    .is_some_and(|value| value.contains(description))
+            } else {
+                false
+            };
+            same_ground.then_some((observation.row, shape_key(&row)))
+        })
+        .collect();
+    one_shape(&rows).is_some()
 }
 
 /// The same policy, asked of the row as the classifier sees it.
@@ -8819,6 +8866,27 @@ fn would_stand(observed: &ObservedRow, answer: Answer, may_generalise: bool) -> 
     }
 }
 
+/// The forecasted standing decision, with the session's mixed-ground guard.
+///
+/// A mixed ground remains a useful proposal, but it is not safe to write
+/// automatically: the owner must see the exact matcher before adopting it.
+fn would_stand_in_session(
+    observed: &ObservedRow,
+    answer: Answer,
+    may_generalise: bool,
+    observations: &[ImportObservationView],
+) -> WouldStand {
+    let stands = would_stand(observed, answer, may_generalise);
+    match stands {
+        WouldStand::Written(proposed)
+            if !matcher_ground_is_single_shape(&proposed.matcher, observations) =>
+        {
+            WouldStand::ForHisAdoption(proposed)
+        }
+        other => other,
+    }
+}
+
 /// One session as a forecast reads it: its lines, the questions they raised,
 /// and what the reading has already settled.
 ///
@@ -9213,7 +9281,12 @@ pub async fn preview_answer_rule(
         .into());
     }
     let observed = observed_row(&contents.observations, stored.row)?;
-    let stands = would_stand(&observed, answer, may_generalise(principal));
+    let stands = would_stand_in_session(
+        &observed,
+        answer,
+        may_generalise(principal),
+        &contents.observations,
+    );
     // Nothing is read that nothing would be said about. A forecast with no
     // standing decision in it has an empty reach whatever the journal holds, and
     // the state says why it is empty — so the three reads below are skipped

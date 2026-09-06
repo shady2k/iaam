@@ -23676,6 +23676,89 @@ async fn a_word_that_holds_two_things_is_published_with_its_contents_and_no_rule
     }
 }
 
+/// A repeated counterparty phrase is not necessarily the far side.
+///
+/// Both rows below carry the same service phrase, but one money movement leaves
+/// and the other arrives. Answering one must not mint a rule that silently
+/// matches the other meaning in the same session.
+#[tokio::test]
+async fn answering_one_of_mixed_counterparty_rows_mints_no_rule() {
+    let harness = harness();
+    let account = harness.account.inner();
+
+    let (status, session) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": account, "channel": "file", "label": "service-phrase" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let id = session["session"].as_str().expect("session").to_owned();
+
+    let filed = |key: &str, direction: &str| {
+        json!({
+            "account": account,
+            "type": "unresolved_direction",
+            "amount": "100.00",
+            "currency": "RUB",
+            "direction": direction,
+            "counterparty": "Service phrase",
+            "dates": { "cash_posted": "2025-03-18" },
+            "source_kind": "PAYMENT",
+            "source_category": "Service",
+            "idempotency_key": key,
+        })
+    };
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/rows"),
+            &harness.owner_token,
+            &json!({
+                "operations": [
+                    filed("mixed-counterparty-out", "out"),
+                    filed("mixed-counterparty-in", "in"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let question = rows[0]["question_id"]
+        .as_str()
+        .expect("the outward row has a question")
+        .to_owned();
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{id}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert!(
+        answered["generalisation"]["rule"].is_null(),
+        "the answer must not mint a standing rule from a mixed ground: {answered}"
+    );
+
+    let (status, rules) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rules}");
+    assert!(
+        rules.as_array().expect("rules").is_empty(),
+        "no rule may stand on the mixed service phrase: {rules}"
+    );
+}
+
 /// A commit against a reading the session no longer answers to is refused.
 ///
 /// The revision is stale when what the plan describes has changed — here by a

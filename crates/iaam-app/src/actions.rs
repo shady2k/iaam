@@ -162,16 +162,19 @@ impl ActionKind {
         Self::PossibleDuplicateUndecided,
     ];
 
-    /// The reports this kind's outstanding work stands between the owner and.
+    /// The reports this kind's outstanding work normally stands between the
+    /// owner and a complete report.
     ///
-    /// The single table, and the reason it lives on the kind rather than at each
-    /// producer: [`ActionCategory::required_for`] is the only way to build the
-    /// required category, so a kind cannot be graded required for one set of
-    /// goals in one branch and another set in the next.
+    /// The set is the default for kinds whose required reports do not depend on
+    /// a point or another payload. Most producers use [`ActionCategory::required_for`]
+    /// to apply it. `ProvideControlAssertion` is the deliberate exception:
+    /// [`provide_control_assertion_action`] derives its category from the point
+    /// and the resolutions it publishes, because its opening resolution also
+    /// reaches the asset snapshot while its closing resolution does not.
     ///
     /// Empty for the five kinds the queue never grades required — a blocking
-    /// item, two recommendations, two statements of fact — and empty is refused by
-    /// [`Action::new`], so an attempt to promote one of them without deciding
+    /// item, two recommendations, two statements of fact — and empty is refused
+    /// by [`Action::new`], so an attempt to promote one of them without deciding
     /// what it blocks fails at construction rather than publishing a required
     /// item that names nothing.
     ///
@@ -414,6 +417,17 @@ impl ActionCategory {
     #[must_use]
     pub const fn required_for(kind: ActionKind) -> Self {
         Self::RequiredForGoal(kind.goals())
+    }
+
+    /// Build required work from a goal set selected by the action's context.
+    ///
+    /// This is used where one [`ActionKind`] has different report consequences
+    /// at different points. The category carries the selected set into
+    /// [`report_standings`], so the queue does not ask a caller to reconstruct
+    /// it from the target.
+    #[must_use]
+    pub const fn required_for_goals(goals: ReportGoals) -> Self {
+        Self::RequiredForGoal(goals)
     }
 
     /// Urgency, most urgent first. The queue's order, and nothing else.
@@ -4744,6 +4758,13 @@ fn provide_control_assertion_action(
     point: BalancePoint,
 ) -> Action {
     let dimension = Dimension::Cash;
+    let required_goals = match point {
+        BalancePoint::Opening => ReportGoals::of(&[
+            ReportGoal::AssetSnapshot,
+            ReportGoal::Reconciliation,
+        ]),
+        BalancePoint::Closing => ReportGoals::of(&[ReportGoal::Reconciliation]),
+    };
     let mut preset = BTreeMap::new();
     preset.insert("account".to_owned(), account.id.inner().to_string().into());
     preset.insert("from".to_owned(), period.from.to_string().into());
@@ -4770,19 +4791,20 @@ fn provide_control_assertion_action(
                 dimension.code()
             ),
             kind: ActionKind::ProvideControlAssertion,
-            // Required for reconciliation, at either point, not `Recommended`.
-            // The opening target also exposes the separate operation that
-            // supplies the balances fold's starting leg.
-            category: ActionCategory::required_for(ActionKind::ProvideControlAssertion),
+            // Required for reconciliation at either point, and additionally
+            // for the asset snapshot when the opening resolution supplies its
+            // reconstructed starting leg.
+            category: ActionCategory::required_for_goals(required_goals),
             state: ActionState::NeedsOwnerInput,
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
         match point {
             BalancePoint::Opening => format!(
-                "Account {} ({}) has business facts from {} through {}; record its reconstructed \
-                 opening cash to supply the starting leg used by the balance figure. A separate \
-                 opening control assertion is reconciliation evidence only and does not change the \
-                 number.",
+                "Account {} ({}) has business facts from {} through {}; the amount it held \
+                 at the beginning is missing. If it stays missing, the closing amount will be \
+                 compared with an unrecorded opening and the difference will remain a \
+                 discrepancy. Record how much cash the account held then. A separate statement \
+                 can still be used as reconciliation evidence; it does not change the amount.",
                 account.id.inner(),
                 account.title,
                 period.from,
@@ -9276,6 +9298,10 @@ mod tests {
 
         let actions = assertion_queue(&account, period, &[]);
         let action = the_only_assertion_action(&actions);
+        assert_eq!(
+            action.category().goals().iter().collect::<Vec<_>>(),
+            vec![ReportGoal::AssetSnapshot, ReportGoal::Reconciliation]
+        );
         let request = assertion_preset(action);
         assert_eq!(request.preset["account"], account.id.inner().to_string());
         assert_eq!(request.preset["from"], period.from.to_string());
@@ -9353,6 +9379,10 @@ mod tests {
             )],
         );
         let closing = the_only_assertion_action(&after_opening);
+        assert_eq!(
+            closing.category().goals().iter().collect::<Vec<_>>(),
+            vec![ReportGoal::Reconciliation]
+        );
         assert_eq!(assertion_preset(closing).preset["at"], "closing");
 
         // Two questions about the same account and interval, one kind, two

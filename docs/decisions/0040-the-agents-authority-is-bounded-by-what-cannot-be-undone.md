@@ -153,5 +153,19 @@ that directly and costs less.
   covers it.
 - Nothing here relaxes the skill. An agent still never answers in the owner's
   place; what changes is which call carries his answer, not who decides.
+- **The enumeration above is of `OperationKey`, and that is not every write
+  route.** `require_admin` in `crates/iaam-server/src/routes.rs` gates a second
+  population that this decision did not reach: aliases and declarations,
+  categories and category groups, instruments, tokens, broker access. Tokens and
+  broker access are §3 and stay. The rest are not credentials and are plainly
+  reversible, so they are owner-only on grounds this decision removed. The reason
+  that function gives for holding them apart — that the queue and the caveat
+  register never offer them, so there is no second reader of their authority — is
+  a sound argument about where authority is stated and not an argument about
+  whether an act can be put back. Tracked as `iaam-801g.1`.
+- **After the regrade `required_scope` answers `Scope::Agent` for every
+  operation.** A grading with one outcome is not a grading. Whether the concept
+  collapses or the second population folds into it is the same question asked
+  from the other end, and it is open.
 - §5 is not optional and is tracked as `iaam-45gc`. If it is not built, this
   decision should be reversed rather than left standing alone.

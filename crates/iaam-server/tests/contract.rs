@@ -19188,8 +19188,8 @@ async fn reconciliation_names_a_row_diverted_by_a_standing_transfer_rule() {
     assert_eq!(reconciliation[0]["row"], 1, "{plan}");
     assert_eq!(reconciliation[0]["outcome"], "recorded", "{plan}");
     assert_eq!(
-        reconciliation[0]["records_as"], "internal_transfer",
-        "the fact kind that removes the row from outflows must be visible: {plan}"
+        reconciliation[0]["records_as"], "cash_transfer",
+        "the event kind that removes the row from outflows must be visible: {plan}"
     );
     assert_eq!(
         reconciliation[0]["settled_by"], "rule",

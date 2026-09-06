@@ -10749,6 +10749,7 @@ mod tests {
             // about is not consulted while that is true.
             generalisation: Generalisation::Unanswered,
             subject: None,
+            ground: GeneralisationGround::NoMatcher,
             // One row of this session and half of nothing. The pairing is
             // exercised where it is derived and through the queue's own
             // published items, not by asserting a relation into a fixture.

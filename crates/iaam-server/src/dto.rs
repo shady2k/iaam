@@ -11724,8 +11724,8 @@ pub struct RowReconciliationDto {
     pub row: u32,
     /// The outcome's meaning for this row.
     pub outcome: ReconciliationOutcomeDto,
-    /// The classification kind recorded by the row, for recorded and duplicate
-    /// rows. A complete cash-transfer fact is exposed here as `internal_transfer`.
+    /// The journal event kind recorded by the row, for recorded and duplicate
+    /// rows. A cash transfer is exposed here as `cash_transfer`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub records_as: Option<String>,
     /// What settled a recorded or duplicate row.

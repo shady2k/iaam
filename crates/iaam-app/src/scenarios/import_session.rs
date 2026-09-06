@@ -3573,8 +3573,8 @@ pub struct RowReconciliation {
 /// The stated outcome for one row in a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconciliationOutcome {
-    /// The row becomes a new journal fact. `records_as` names its
-    /// classification, not the concrete event kind in the journal.
+    /// The row becomes a new journal fact. `records_as` names its journal event
+    /// kind, using the same discriminant the journal publishes.
     Recorded {
         records_as: &'static str,
         settled_by: FactBasis,
@@ -4739,14 +4739,12 @@ fn scope_assessment(
     assessment
 }
 
-/// The reconciliation vocabulary names the classification a row records as,
-/// while [`PlannedFact::records_as`] names the concrete journal event kind.
-/// A complete cash transfer is the journal shape of an internal transfer.
+/// The reconciliation vocabulary uses the journal's own event-kind spelling.
+///
+/// This is deliberately not a classification vocabulary: a cash transfer is
+/// `cash_transfer` everywhere the journal exposes its kind, including here.
 const fn reconciliation_records_as(event: &iaam_core::event::Event) -> &'static str {
-    match event.kind {
-        EventKind::CashTransfer { .. } => "internal_transfer",
-        _ => event.kind.discriminant(),
-    }
+    event.kind.discriminant()
 }
 
 fn planned_fact(read: &ReadRow, event: &iaam_core::event::Event) -> PlannedFact {

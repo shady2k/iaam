@@ -12,7 +12,7 @@
 | [0004](0004-an-account-carries-the-identity-its-source-prints.md) | An account carries the identity its source prints | 2026-09-03 | proposed | `iaam-34f3` |
 | [0005](0005-two-maps-two-reasons-and-only-one-is-0004s.md) | Two maps, two reasons, and only one of them is 0004's | 2026-09-04 | proposed | `iaam-5wh2` |
 | [0006](0006-the-observation-channel-says-everything-the-conclusive-one-does.md) | The observation channel says everything the conclusive one does | 2026-09-04 | proposed | `iaam-7l7v` |
-| [0008](0008-a-proposed-rule-asks-about-one-field.md) | A rule minted from an answer asks about one field | 2026-09-04 | proposed | `iaam-g7yc` |
+| [0008](0008-a-proposed-rule-asks-about-one-field.md) | A rule minted from an answer asks about one field | 2026-09-04 | proposed · partially superseded by 0040 | `iaam-g7yc` |
 | [0009](0009-a-verdict-answers-a-write-and-confirmation-answers-a-read.md) | A verdict answers a write; confirmation answers a read | 2026-09-04 | proposed | `iaam-eio5` |
 | [0010](0010-a-document-names-an-account-the-way-a-batch-does.md) | A document names an account the way a batch does | 2026-09-04 | proposed | `iaam-w49n` |
 | [0011](0011-the-other-two-reconciliation-verdicts-and-why-they-differ.md) | The other two reconciliation verdicts, and why they differ | 2026-09-04 | proposed | `iaam-7b4t` |
@@ -31,14 +31,14 @@
 | [0026](0026-a-rule-may-ask-what-the-source-filed-the-row-under.md) | A rule may ask what the source filed the row under, and it is not scoped to a source | 2026-09-04 | proposed | `iaam-93lz` |
 | [0027](0027-a-field-the-owner-fills-in-carries-the-question-to-put-to-him.md) | A field the owner fills in carries the question to put to him | 2026-09-04 | proposed | `iaam-ytvf` |
 | [0028](0028-a-profile-transcribes-what-the-source-claims-and-the-engine-decides.md) | A profile transcribes what the source claims about a row, and the engine decides what follows | 2026-09-06 | proposed · amended | `iaam-b0r0`, `iaam-rdya`, `iaam-2hq0`, `iaam-f1nc` |
-| [0029](0029-one-answer-per-decision-and-a-question-published-with-its-answers.md) | One answer per decision, and a question published with the answers it admits | 2026-09-04 | proposed | `iaam-qn6d` |
+| [0029](0029-one-answer-per-decision-and-a-question-published-with-its-answers.md) | One answer per decision, and a question published with the answers it admits | 2026-09-04 | proposed · partially superseded by 0040 | `iaam-qn6d` |
 | [0030](0030-an-item-asks-what-he-knows-and-offers-what-he-may-answer.md) | An item asks what the owner knows, and offers what he may answer | 2026-09-04 | proposed | `iaam-9i83`, `iaam-mk1n` |
 | [0031](0031-one-movement-a-document-printed-twice-is-one-fact.md) | One movement a document printed twice is one fact | 2026-09-04 | proposed | `iaam-3qsq`, `iaam-9ck1`, `iaam-rdya` |
 | [0032](0032-a-question-carries-its-row-and-an-offer-carries-what-it-covers.md) | A question carries its row, and an offer carries what it covers | 2026-09-04 | proposed | `iaam-pm4w`, `iaam-briy`, `iaam-7iyg`, `iaam-xchm` |
 | [0033](0033-one-answer-over-a-set-and-a-question-he-may-decline-to-answer.md) | One answer over a set, the fields of one call together, and a question he may decline to answer | 2026-09-04 | proposed | `iaam-hdr7`, `iaam-zxc6`, `iaam-4fsw` |
 | [0034](0034-a-group-publishes-what-its-members-have-in-common.md) | A group publishes what its members have in common, and one answer settles it | 2026-09-05 | proposed | `iaam-cixz` |
 | [0035](0035-a-value-published-to-be-read-out-carries-what-he-can-read.md) | A value published to be read out to him carries what he can read | 2026-09-05 | proposed | `iaam-6jsj`, `iaam-f6y4` |
-| [0036](0036-a-state-for-an-item-that-wants-nothing-and-a-relay-in-his-voice.md) | A state for an item that wants nothing, and a relay in the owner's voice | 2026-09-05 | proposed | `iaam-c143`, `iaam-09tn` |
+| [0036](0036-a-state-for-an-item-that-wants-nothing-and-a-relay-in-his-voice.md) | A state for an item that wants nothing, and a relay in the owner's voice | 2026-09-05 | proposed · partially superseded by 0040 | `iaam-c143`, `iaam-09tn` |
 | [0037](0037-the-skill-keeps-the-process-and-the-reference-moves-beside-it.md) | The skill keeps the process, and the reference moves beside it | 2026-09-05 | superseded | `iaam-arad` |
 | [0038](0038-a-question-stops-being-open-where-the-reading-says-so.md) | A question stops being open where the reading says so, not where the store does | 2026-09-05 | proposed | `iaam-m2oi` |
 | [0039](0039-the-queue-says-which-reports-it-leaves-unobstructed.md) | The queue says which reports it leaves unobstructed, and names what stands in the way of the rest | 2026-09-05 | proposed | `iaam-i3nx` |

@@ -44,11 +44,10 @@ pub enum OperationKey {
     /// Write a standing classification rule: what a row matching a condition is.
     ///
     /// Named here because the queue offers it. An answered import question whose
-    /// answer wrote no rule — the answerer held a token that may not generalise
-    /// — publishes the rule it would have made, and this is the call that makes
-    /// it stand. Distinct from [`Self::CreateCategoryRule`], which files a
-    /// journal event under one of the owner's categories: this one decides what
-    /// the row **is**.
+    /// answer route wrote no rule publishes the exact rule body it would have
+    /// made, and this is the separate call that makes it stand. Distinct from
+    /// [`Self::CreateCategoryRule`], which files a journal event under one of
+    /// the owner's categories: this one decides what the row **is**.
     CreateClassificationRule,
     /// Record the owner's statement about one account's transfer partners.
     RecordAccountTransferPartners,

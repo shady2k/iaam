@@ -15,11 +15,12 @@ use crate::ports::{
     AnswerRule, BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment,
     BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore,
     CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
-    ControlAssertionView, CustodyView, Declared, DeclinedAccountNameView, DocumentToKeep,
-    ImportObservationView, ImportQuestionView, ImportSessionState, ImportSessionSummaryView,
-    ImportSessionView, InstrumentDirectory, InstrumentUpsert, InstrumentView, IssuedToken,
-    JournalQuery, NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store,
-    TokenAdmin, TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
+    ControlAssertionView, CustodyView, DecisionQuery, DecisionRecord, Declared,
+    DeclinedAccountNameView, DocumentToKeep, ImportObservationView, ImportQuestionView,
+    ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
+    InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, NewImportQuestion, Principal,
+    Recorded, RecordedEvent, Scope, SoleOwner, Store, TokenAdmin, TokenView,
+    UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -434,6 +435,63 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .list_journal_events(owner, &query)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_decisions(
+        &self,
+        owner: OwnerId,
+        query: DecisionQuery,
+    ) -> Result<Vec<DecisionRecord>, AppError> {
+        let from = query.from.map(|date| date.to_string());
+        let to = query.to.map(|date| date.to_string());
+        self.blocking(move |store| {
+            store
+                .list_decisions(owner, from.as_deref(), to.as_deref())
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| DecisionRecord {
+                            operation: row.operation,
+                            declared_by: row.declared_by,
+                            actor_scope: row.actor_scope.and_then(|scope| match scope.as_str() {
+                                "owner" => Some(Scope::Owner),
+                                "agent" => Some(Scope::Agent),
+                                "read_only" => Some(Scope::ReadOnly),
+                                _ => None,
+                            }),
+                            subject: row.subject,
+                            decision: row.decision,
+                            undo: row.undo,
+                            recorded_at: row.recorded_at,
+                        })
+                        .collect()
+                })
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn record_decision(
+        &self,
+        owner: OwnerId,
+        declared_by: iaam_core::ids::PrincipalId,
+        operation: String,
+        subject: String,
+        decision: serde_json::Value,
+        undo: String,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .record_decision(
+                    owner,
+                    Some(declared_by),
+                    &operation,
+                    &subject,
+                    &decision,
+                    &undo,
+                )
                 .map_err(store_error)
         })
         .await

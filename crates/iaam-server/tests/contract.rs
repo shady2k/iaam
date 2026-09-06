@@ -3720,11 +3720,10 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
     });
 }
 #[tokio::test]
-async fn an_agent_may_submit_but_may_not_administer() {
-    // Scope is a barrier, not a hint. The agent submits
-    // transactions, but does not create accounts or change the scope's composition: otherwise
-    // an external agent entrusted with data entry gains the right
-    // to redefine the scope boundary and thereby rewrite returns.
+async fn an_agent_may_submit_and_make_reversible_reference_decisions() {
+    // Scope is a barrier for credentials and read-only access, not a second
+    // authority grade for reversible decisions. The agent submits transactions
+    // and may create reference decisions whose undo is named by the contract.
     let harness = harness();
 
     let (status, body) = call(
@@ -3736,8 +3735,7 @@ async fn an_agent_may_submit_but_may_not_administer() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["code"], "forbidden");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let (status, body) = call(
         &harness.router,
@@ -3748,7 +3746,7 @@ async fn an_agent_may_submit_but_may_not_administer() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
     // But it can submit transactions.
     let (status, body) = call(
@@ -3772,6 +3770,68 @@ async fn an_agent_may_submit_but_may_not_administer() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body[0]["verdict"], "provisional");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/reconciliation/balance",
+            &harness.agent_token,
+            &json!({
+                "account": harness.account.inner(),
+                "from": "2025-01-01",
+                "to": "2025-01-31",
+                "at": "closing",
+                "cash": { "currency": "RUB", "amount": "100.00" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, decisions) = call(
+        &harness.router,
+        get("/v1/decisions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{decisions}");
+    let account_decision = decisions
+        .as_array()
+        .expect("decision list")
+        .iter()
+        .find(|decision| decision["operation"] == "create_account")
+        .expect("agent account decision");
+    assert_eq!(
+        account_decision["actor"]["scope"], "agent",
+        "{account_decision}"
+    );
+    assert!(
+        account_decision["undo"]
+            .as_str()
+            .expect("undo")
+            .contains("retire"),
+        "{account_decision}"
+    );
+
+    let journal_decision = decisions
+        .as_array()
+        .expect("decision list")
+        .iter()
+        .find(|decision| {
+            decision["operation"] == "journal_event"
+                && decision["decision"]["kind"]["ControlAssertion"].is_object()
+        })
+        .expect("agent balance event");
+    assert_eq!(
+        journal_decision["actor"]["scope"], "agent",
+        "{journal_decision}"
+    );
+
+    let (status, refusal) = call(
+        &harness.router,
+        get("/v1/decisions", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
 }
 
 #[tokio::test]
@@ -5110,7 +5170,7 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
 }
 
 #[tokio::test]
-async fn only_the_owner_can_manage_classification_rules() {
+async fn a_read_only_token_cannot_manage_classification_rules() {
     let harness = harness();
     let rule = json!({
         "matcher": { "kind": "income" },
@@ -9604,7 +9664,7 @@ async fn retired_category_group_failure_has_actionable_response_fields() {
 }
 
 #[tokio::test]
-async fn actions_endpoint_is_authenticated_and_reports_the_empty_owner_frontier() {
+async fn actions_endpoint_is_authenticated_and_reports_the_empty_frontier() {
     let harness = empty_owner_harness();
     let (status, body) = call(&harness.router, get("/v1/actions", None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -9630,7 +9690,7 @@ async fn actions_endpoint_is_authenticated_and_reports_the_empty_owner_frontier(
     assert_eq!(items[0]["kind"], "create_first_account");
     assert_eq!(items[0]["category"], "blocking");
     assert_eq!(items[0]["state"], "needs_owner_input");
-    assert_eq!(items[0]["required_scope"], "owner");
+    assert_eq!(items[0]["required_scope"], "agent");
     assert_eq!(items[0]["target"]["type"], "operation");
     assert_eq!(items[0]["target"]["operationId"], "create_account");
     assert_eq!(items[0]["target"]["method"], "POST");
@@ -10028,8 +10088,8 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
         "method": "POST",
         "path": "/v1/accounts",
         "requestSchema": "#/components/schemas/CreateAccountRequest",
-        "requiredScope": "owner",
-        "request": {"missing": [{"pointer": "/title", "provided_by": "owner"}]}
+        "requiredScope": "agent",
+        "request": {"missing": [{"pointer": "/title", "provided_by": "caller"}]}
     });
     let parsed: iaam_server::dto::ActionTargetDto =
         serde_json::from_value(target.clone()).expect("tagged target");
@@ -10591,7 +10651,7 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
         .unwrap_or_else(|| panic!("a rule-remediable item: {body}"));
     assert_eq!(outflow["state"], "needs_owner_input", "{outflow}");
     assert_eq!(outflow["category"], "recommended", "{outflow}");
-    assert_eq!(outflow["required_scope"], "owner", "{outflow}");
+    assert_eq!(outflow["required_scope"], "agent", "{outflow}");
     let target = &outflow["target"];
     assert_eq!(target["type"], "operation", "{outflow}");
     assert_eq!(target["operationId"], "create_category_rule", "{outflow}");
@@ -11172,15 +11232,13 @@ async fn an_unparsable_path_parameter_is_refused_in_the_documented_shape() {
     assert_eq!(body["field"], "id", "{body}");
 }
 
-/// The correction routes, their schemas, and the refusal an agent token gets.
+/// The correction routes, their schemas, and the distinct floors they keep.
 ///
-/// The permission is the point of the route existing separately from ingestion:
-/// `Scope::may_submit` admits an agent, so an agent that could carry a relation
-/// on an ingest row could retract the owner's history. That reasoning is
-/// unchanged by `iaam-rond`, which moved the gate on one of the two routes and
-/// not the shape of either.
+/// A correction is append-only and therefore reversible, so the ordinary
+/// correction call admits an agent token. Import-wide retraction still keeps
+/// its evidence-based bound in the scenario.
 #[tokio::test]
-async fn corrections_are_described_and_a_foreign_token_is_refused() {
+async fn corrections_are_described_and_scope_checked() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -11238,22 +11296,33 @@ async fn corrections_are_described_and_a_foreign_token_is_refused() {
         "unexpected relation tags: {relations:?}"
     );
 
-    // Reversing a named event of the owner's is a judgement about his history,
-    // and nothing about the caller's own conduct bounds it: both non-owner
-    // scopes are refused at the door.
-    for token in [&harness.agent_token, &harness.readonly_token] {
-        let (status, body) = call(
-            &harness.router,
-            post(
-                "/v1/corrections",
-                token,
-                &json!({"acknowledge_retraction": true}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(body["code"], "forbidden", "{body}");
-    }
+    // A correction is two append-only facts and can be undone by another
+    // correction, so an agent token reaches the route. The empty batch is
+    // rejected by the scenario after the scope check, proving the call crossed
+    // the gate rather than merely matching the OpenAPI document.
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.agent_token,
+            &json!({"acknowledge_retraction": true, "corrections": []}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request", "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.readonly_token,
+            &json!({"acknowledge_retraction": true, "corrections": []}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden", "{body}");
 
     // Retracting a whole import is not the same act (iaam-rond): an agent may
     // take back its own declaration, so the route keeps only the floor and the
@@ -13210,7 +13279,7 @@ async fn an_account_in_no_contour_is_named_by_the_queue() {
         "{item}"
     );
     assert_eq!(item["state"], "needs_owner_input", "{item}");
-    assert_eq!(item["required_scope"], "owner", "{item}");
+    assert_eq!(item["required_scope"], "agent", "{item}");
     // Two ways out, so the target is a set of options and not one of them.
     assert_eq!(item["target"]["type"], "options", "{item}");
     let membership = published_option(item, "add_contour_version")
@@ -13488,17 +13557,17 @@ async fn a_retirement_names_the_account_and_the_revision_it_minted() {
     assert_eq!(after["revision"], 1, "{after}");
 }
 
-/// Each of the four refusals, and each for its own reason.
+/// Each of the refusals, and each for its own reason.
 ///
 /// A second statement is refused rather than replacing the first, because
 /// replacing it would move the boundary under every snapshot already taken
 /// between the two dates. A future date is refused because a product that has
 /// not ceased has not ceased, and accepting it would arm a change to a report
 /// that begins on a day nobody revisits. An account the owner does not hold is
-/// not found, because an identifier is not an access right. And drawing the
-/// perimeter — in either direction, on either axis — is his judgement.
+/// not found, because an identifier is not an access right. The agent may make
+/// the reversible first statement; the route no longer gates it by actor.
 #[tokio::test]
-async fn a_retirement_refuses_a_second_statement_a_future_date_a_stranger_and_an_agent() {
+async fn a_retirement_refuses_a_second_statement_a_future_date_and_a_stranger() {
     let harness = harness();
     let (status, created) = call(
         &harness.router,
@@ -13529,7 +13598,7 @@ async fn a_retirement_refuses_a_second_statement_a_future_date_a_stranger_and_an
         post(&path, &harness.agent_token, &retire("2025-12-01")),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{agent}");
+    assert_eq!(status, StatusCode::OK, "{agent}");
 
     let (status, stranger) = call(
         &harness.router,
@@ -13547,7 +13616,7 @@ async fn a_retirement_refuses_a_second_statement_a_future_date_a_stranger_and_an
         post(&path, &harness.owner_token, &retire("2025-12-01")),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(status, StatusCode::CONFLICT, "{first}");
 
     let (status, second) = call(
         &harness.router,
@@ -14073,8 +14142,9 @@ async fn a_scope_decision_needs_a_reason_and_cannot_claim_membership() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{blank}");
 
-    // The perimeter is the owner's judgement in either direction.
-    let (status, refused) = call(
+    // The statement is reversible by recording the opposite disposition, so
+    // the agent may make it too.
+    let (status, recorded) = call(
         &harness.router,
         post(
             &scope_path,
@@ -14083,7 +14153,7 @@ async fn a_scope_decision_needs_a_reason_and_cannot_claim_membership() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(status, StatusCode::OK, "{recorded}");
 
     // A missing account and someone else's are the same answer.
     let (status, unknown) = call(
@@ -14630,7 +14700,7 @@ async fn an_account_the_owner_ruled_outside_stops_being_one_nobody_ruled_on() {
             "method": "POST",
             "path": "/v1/contours/{contour}/versions",
             "requestSchema": "#/components/schemas/AddContourVersionRequest",
-            "requiredScope": "owner",
+            "requiredScope": "agent",
         }]),
         "{ruled_out}"
     );
@@ -15753,12 +15823,9 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
     assert_eq!(item["category"], "required_for_goal", "{item}");
     assert_eq!(item["goals"], json!(["asset_snapshot"]), "{item}");
     assert_eq!(item["state"], "needs_owner_input", "{item}");
-    // `agent`, and this is `iaam-woeh`. The item's own scope is the narrowest
-    // of the floors its three resolutions keep, and the ordinary remedy — the
-    // reconstructed opening — is a call an agent token may make. It read
-    // `owner` while one field had to speak for three calls, and an agent that
-    // filtered the queue by its own scope dropped the item and never reached
-    // the call it could make.
+    // `agent`, because all three resolutions now name reversible operations.
+    // The item summary and each per-resolution floor therefore tell an agent
+    // filter exactly what the queue can carry out.
     assert_eq!(item["required_scope"], "agent", "{item}");
 
     // Three ways out, addressed, in the register's order. The two lists are one
@@ -15800,16 +15867,14 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
         "{item}"
     );
 
-    // Each way out publishes the authority it demands, and the three do not
-    // agree — which is why one field on the item could not say it. The register
-    // spells the same three the same way, because a caveat that named an
-    // owner-only remedy to an agent would have told it to make a call that will
-    // be refused.
+    // Each way out publishes the authority it demands. The three operations
+    // are reversible, so the queue and register now expose the agent floor for
+    // each one rather than reserving the whole item to the owner.
     let floors: Vec<&str> = options
         .iter()
         .map(|option| option["requiredScope"].as_str().expect("floor"))
         .collect();
-    assert_eq!(floors, vec!["agent", "owner", "owner"], "{item}");
+    assert_eq!(floors, vec!["agent", "agent", "agent"], "{item}");
     let named_floors: Vec<&str> = caveat["closed_by"]
         .as_array()
         .expect("remedies")
@@ -16050,14 +16115,14 @@ async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does(
                 "method": "POST",
                 "path": "/v1/contours/{contour}/versions",
                 "requestSchema": "#/components/schemas/AddContourVersionRequest",
-                "requiredScope": "owner",
+                "requiredScope": "agent",
             },
             {
                 "operationId": "record_account_scope",
                 "method": "POST",
                 "path": "/v1/accounts/{id}/scope",
                 "requestSchema": "#/components/schemas/RecordAccountScopeRequest",
-                "requiredScope": "owner",
+                "requiredScope": "agent",
             },
         ]),
         "{outside}"
@@ -16734,7 +16799,7 @@ async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_t
     // not its partner is known.
     assert_eq!(item["goals"], json!(["money_flow", "returns"]), "{item}");
     assert_eq!(item["state"], "needs_owner_input", "{item}");
-    assert_eq!(item["required_scope"], "owner", "{item}");
+    assert_eq!(item["required_scope"], "agent", "{item}");
     assert_eq!(
         item["target"]["operationId"], "record_account_transfer_partners",
         "{item}"
@@ -16758,8 +16823,9 @@ async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_t
         "{item}"
     );
 
-    // Drawing this relationship is the owner's judgement, not the agent's.
-    let (status, refusal) = call(
+    // Drawing this relationship is reversible by another statement, so an
+    // agent token may record it.
+    let (status, recorded) = call(
         &harness.router,
         put(
             &format!("/v1/accounts/{main}/transfer-partners"),
@@ -16768,7 +16834,7 @@ async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_t
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert_eq!(status, StatusCode::OK, "{recorded}");
 
     // An account is not the other side of itself.
     let (status, refusal) = call(
@@ -17019,13 +17085,12 @@ async fn a_batch_answers_several_accounts_at_once_without_answering_any_for_anot
     assert_eq!(asked[0]["subject"]["id"], spare["id"], "{asked:#?}");
 }
 
-/// Every refusal the single-account route makes, the batch makes.
+/// Every validation refusal the single-account route makes, the batch makes.
 ///
-/// The two share the checking function, so this test is about the answers being
-/// the same ones — a caller must be able to read a batch's refusal the way it
-/// reads the refusal of the call the batch replaced.
+/// A valid statement is accepted for an agent because replacing it is the
+/// statement's undo; the remaining cases prove the shared validation.
 #[tokio::test]
-async fn a_batch_refuses_exactly_what_a_single_transfer_statement_refuses() {
+async fn a_batch_accepts_reversible_statements_and_refuses_the_same_invalid_ones() {
     let harness = harness();
     let main = harness.account.inner().to_string();
     let stranger = Uuid::new_v4();
@@ -17042,8 +17107,9 @@ async fn a_batch_refuses_exactly_what_a_single_transfer_statement_refuses() {
     assert_eq!(status, StatusCode::CREATED, "{savings}");
     let savings = savings["id"].as_str().expect("account id").to_owned();
 
-    // Drawing the relationship is the owner's judgement, in bulk as singly.
-    let (status, refusal) = call(
+    // A valid relationship is reversible by another statement, so an agent
+    // token may record it in bulk.
+    let (status, recorded) = call(
         &harness.router,
         put(
             "/v1/accounts/transfer-partners",
@@ -17052,7 +17118,7 @@ async fn a_batch_refuses_exactly_what_a_single_transfer_statement_refuses() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert_eq!(status, StatusCode::OK, "{recorded}");
 
     // An account is not the other side of itself.
     let (status, refusal) = call(
@@ -24489,8 +24555,8 @@ async fn aliases_cannot_be_written_against_an_account_the_owner_does_not_hold() 
 #[tokio::test]
 async fn an_agent_may_not_state_an_accounts_aliases() {
     // An alias decides which printed identifier reaches which account, and
-    // therefore which account a row lands on. That is the owner's statement, by
-    // the same rule that keeps account creation out of the agent's hands.
+    // therefore which account a row lands on. This is instance administration,
+    // not the reversible account-creation operation.
     let harness = harness();
 
     let (status, refusal) = call(
@@ -24910,8 +24976,8 @@ async fn declarations_cannot_be_written_against_an_account_the_owner_does_not_ho
 
 #[tokio::test]
 async fn an_agent_may_not_state_an_accounts_declarations() {
-    // An identity decides which account a later import addresses, by the same
-    // rule that keeps account creation and aliases out of the agent's hands.
+    // An identity decides which account a later import addresses. This is
+    // instance administration, not the reversible account-creation operation.
     let harness = harness();
 
     let (status, refusal) = call(
@@ -26005,10 +26071,10 @@ async fn classification_rule_count(harness: &Harness) -> usize {
 
 /// An agent's answer settles the row and generalises nothing (iaam-hnod).
 ///
-/// The defect: writing a classification rule is owner-only at the route that
-/// says so, and answering a question wrote one too. The decision the agent could
-/// not make directly it made through a route whose name does not mention rules,
-/// and the only thing forbidding it was a sentence in the agent's document.
+/// The direct classification-rule operation is reversible and agent-reachable.
+/// This answer route remains deliberately split: an agent settles the row and
+/// receives the possible rule for a separate call, while an owner answer may
+/// mint it as a convenience.
 ///
 /// Both halves are asserted in one test on purpose. "An agent writes no rule" is
 /// satisfiable by breaking the feature outright, and the owner's half is what
@@ -26189,11 +26255,11 @@ async fn an_answer_that_could_not_generalise_publishes_the_rule_it_would_have_ma
 /// The proposal is also a queued act, and not only a field on a session
 /// (iaam-4hcy).
 ///
-/// The defect: `available` was honest and unreachable. A client could read that
-/// a rule was possible and that none had been written, and the action queue —
-/// the one surface that tells the owner what only he can do — said nothing about
-/// it. He had to know the field existed, know which session held it, and go and
-/// read it.
+/// The defect: `available` was honest and hard to act on. A client could read
+/// that a rule was possible and that none had been written, while the action
+/// queue — the one surface that tells the owner about the decision and the
+/// exact reversible call — said nothing. He had to know the field existed,
+/// know which session held it, and go and reconstruct the request.
 ///
 /// The item points at the route that already writes classification rules, with
 /// the proposal preset as the body. Posting the preset unedited is what this
@@ -26236,8 +26302,8 @@ async fn a_rule_an_answer_could_not_write_is_queued_for_the_owner_to_adopt() {
     );
     assert_eq!(item["state"], "needs_owner_input", "{item}");
     assert_eq!(
-        item["required_scope"], "owner",
-        "generalising is owner-only wherever it is reached from: {item}"
+        item["required_scope"], "agent",
+        "generalising is reversible and may be performed by an agent: {item}"
     );
     assert_eq!(item["subject"]["type"], "account", "{item}");
 
@@ -26301,12 +26367,11 @@ async fn a_rule_an_answer_could_not_write_is_queued_for_the_owner_to_adopt() {
     );
 }
 
-/// An agent may not be told to do what only the owner may.
-///
-/// The queue is read by both, and an item marked `owner` that an agent could
-/// send would make the gate on `POST /v1/classification-rules` protect nothing.
+/// The queue distinguishes answering a row from adopting the standing rule
+/// that an answer proposes. The latter is reversible, so an agent may send it
+/// through its own operation.
 #[tokio::test]
-async fn the_agent_is_refused_the_rule_the_queue_offers_the_owner() {
+async fn the_agent_can_send_the_reversible_rule_the_queue_offers() {
     let harness = harness();
     let savings = another_account(&harness, "Savings").await;
 
@@ -26326,13 +26391,13 @@ async fn the_agent_is_refused_the_rule_the_queue_offers_the_owner() {
     let items = adopt_rule_items(&harness).await;
     assert_eq!(items.len(), 1, "the proposal is queued: {items:?}");
     let preset = items[0]["target"]["request"]["preset"].clone();
-    let (status, refused) = call(
+    let (status, recorded) = call(
         &harness.router,
         post("/v1/classification-rules", &harness.agent_token, &preset),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
-    assert_eq!(classification_rule_count(&harness).await, 0);
+    assert_eq!(status, StatusCode::CREATED, "{recorded}");
+    assert_eq!(classification_rule_count(&harness).await, 1);
 }
 
 /// Every queued proposal the owner can adopt, read from the queue itself.
@@ -26942,8 +27007,8 @@ async fn the_owner_can_say_it_was_between_his_own_accounts_without_naming_which(
         "an alternative that says nothing about itself is the defect: {offered}"
     );
 
-    // Answered under the owner's own token — the one principal who may
-    // generalise — and still no rule stands.
+    // Answered under the owner's own token — the answer route's one principal
+    // whose answer may generalise — and still no rule stands.
     let (status, answered) = call(
         &harness.router,
         post(
@@ -28063,13 +28128,13 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
     }
 
     // The other resolution says the name is nobody's account of his, and asks
-    // for the one thing only he can supply: what it actually is. Everything else
-    // is preset, because an option that left the caller to guess the word would
-    // publish a route rather than a resolution.
+    // for the one thing the caller must supply: what it actually is. Everything
+    // else is preset, because an option that left the caller to guess the word
+    // would publish a route rather than a resolution.
     let declining = &options[1];
     assert_eq!(declining["request"]["preset"]["printed"], "Outside");
     assert_eq!(declining["request"]["preset"]["disposition"], "not_mine");
-    assert_eq!(declining["requiredScope"], "owner", "{declining}");
+    assert_eq!(declining["requiredScope"], "agent", "{declining}");
     let reasons = declining["request"]["missing"]
         .as_array()
         .expect("missing inputs");
@@ -28525,10 +28590,11 @@ async fn an_agent_token_reads_an_institution_s_export_into_a_session() {
 /// so a caller that read both had to pick one, which is how an owner came to be
 /// told a rule would not exist that would exist.
 ///
-/// Both are now read off one derivation, and the derivation takes the asking
-/// authority: the owner may generalise and an agent may not (`iaam-hnod`), so
-/// the same session answers differently to the two tokens and says so on both
-/// surfaces at once.
+/// Both are now read off one derivation, and the derivation keeps the answer
+/// route's deliberate split: an owner answer may generalise as a convenience,
+/// while an agent answer returns a proposal for the separate reversible
+/// operation. The same session answers differently to the two tokens and says
+/// so on both surfaces at once.
 ///
 /// Everything here is invented: the account is the harness's own `Main`, and the
 /// rows were made up for this test.

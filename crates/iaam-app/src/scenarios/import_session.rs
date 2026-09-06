@@ -27,7 +27,7 @@ use iaam_core::event::{
 };
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId,
-    SourceId,
+    PrincipalId, SourceId,
 };
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
@@ -200,7 +200,7 @@ pub struct AnswerableQuestion {
     ///
     /// **Published on the question rather than left to be inferred.** A caller
     /// holding a question whose `answered_at` is null used to have exactly one
-    /// reading of it — the owner must answer this — and after a standing rule
+    /// reading of it — an answer was still needed — and after a standing rule
     /// of his settles the row that reading is wrong in the direction that costs
     /// him an evening: it puts a decision to him that his own earlier decision
     /// already made. The word is [`QuestionSettlement`]'s and is the same word
@@ -210,7 +210,7 @@ pub struct AnswerableQuestion {
 }
 
 impl AnswerableQuestion {
-    /// Whether this question is still the owner's to answer.
+    /// Whether this question still awaits an answer.
     ///
     /// The one predicate a caller should branch on, and the reason the
     /// settlement is published beside the question rather than computed by
@@ -1085,12 +1085,10 @@ pub async fn add_rows(
 /// Five states, and only four of them can be true of an answered question.
 ///
 /// **Why states and not an `Option<rule>`.** The rule identifier alone cannot say
-/// why it is absent, and since the answering scope narrowed (`iaam-hnod`) it has
-/// been absent for two unrelated reasons: the row offered nothing a matcher
-/// could match on, or the answer arrived under a token that may not generalise.
-/// A client can tell those apart, because it knows what token it holds. The
-/// owner reading the session back cannot — he sees a question answered and no
-/// rule — and he is the one for whom the difference is actionable.
+/// why it is absent. The answer route may deliberately leave a reversible rule
+/// for the separate classification-rule operation; the response must distinguish
+/// that `available` state from a row that offers no matcher at all. A client can
+/// read the proposal and carry the owner's decision through the separate call.
 ///
 /// **Why this and not a column on `import_questions`.** A column would record
 /// the reason at answer time, and the reason is not what the owner needs: he
@@ -1118,9 +1116,10 @@ pub enum Generalisation {
     Unanswered,
     /// The answer created a standing rule, and this is its identifier.
     Recorded { rule: String },
-    /// A rule was possible and none was written, because the answerer may not
-    /// generalise (`iaam-hnod`). This is the rule it would have been, and the
-    /// owner makes it stand with one call under his own token.
+    /// A rule was possible and none was written because this answer route does
+    /// not generalise under the caller's token. This is the rule it would have
+    /// been; the owner may send the separate reversible operation as a
+    /// convenience, and an agent may carry it after the owner decides.
     ///
     /// It says what **this answer** wrote, not what rules now exist, and it goes
     /// on saying `available` after the owner adopts the proposal. That is
@@ -1202,8 +1201,10 @@ pub enum GeneralisationProspect {
     /// The answer is written as a rule, and a row matching it settles by itself
     /// next time.
     WillStand,
-    /// The answer settles this row and writes no rule, because the answerer may
-    /// not generalise. The rule is the owner's to make stand.
+    /// The answer settles this row and writes no rule because this answer
+    /// route does not generalise under the caller's token. The owner decides
+    /// whether the proposal should stand; the reversible operation may carry it
+    /// under an agent token after that decision.
     NeedsHisAdoption,
     /// No rule can be built from this row under any token: a matcher that asks
     /// nothing matches nothing.
@@ -1255,9 +1256,9 @@ impl GeneralisationProspect {
                  later statement is settled without asking you again."
             }
             Self::NeedsHisAdoption => {
-                "Your answer keeps no standing decision, because only you may make one: the \
-                 standing decision it would have been is published beside the answer, and one \
-                 call of your own makes it stand."
+                "Your answer keeps no standing decision through the answer route: the \
+                 reversible standing decision it proposes is published beside the answer, and \
+                 the separate operation carries it after the owner decides."
             }
             Self::NoneFromThisRow => {
                 "Your answer keeps no standing decision, because these lines carry nothing a \
@@ -1448,7 +1449,7 @@ fn decision_of_read_row(
     Some(stored_question(question)?.about(row.movement()))
 }
 
-/// Record the owner's answer to one question.
+/// Record the answer to one question.
 ///
 /// Three things happen, in this order and for these reasons:
 ///
@@ -1456,17 +1457,20 @@ fn decision_of_read_row(
 ///    answer the question does not admit is a different mistake from a wrong
 ///    answer, and only the first can be refused.
 /// 2. The answer is recorded on the question and on the row.
-/// 3. If the answerer may generalise, the decision is **then** written as a
-///    durable [`ClassificationRule`] and named on the question, so the next
-///    import of a matching row resolves without asking. See [`may_generalise`]:
-///    settling this row is import mechanics, and standing rules are the owner's
-///    judgement. A row that offers nothing to match on — no counterparty, no
-///    description, no operation word and no category of the source's own —
-///    gets **no** rule either way, because a matcher that asks nothing matches
-///    nothing and an "everything" rule would silently reclassify the portfolio.
+/// 3. If the answer route is allowed to mint, the decision is **then** written
+///    as a durable [`ClassificationRule`] and named on the question, so the
+///    next import of a matching row resolves without asking. Otherwise the
+///    answer response carries the exact body for the separate, reversible
+///    classification-rule operation. See [`may_generalise`]: settling the row
+///    and writing a standing rule are separate acts, even when one owner call
+///    performs both as a convenience. A row that offers nothing to match on —
+///    no counterparty, no description, no operation word and no category of the
+///    source's own — gets **no** rule either way, because a matcher that asks
+///    nothing matches nothing and an "everything" rule would silently
+///    reclassify the portfolio.
 ///
 /// Steps 2 and 3 were the other way round until `iaam-77hk`, and the swap is the
-/// whole of that bead: the answer is the owner's fact and the rule is derived
+/// whole of that bead: the answer is the recorded fact and the rule is derived
 /// from it, so the derived one is written second and a failure costs the
 /// derivation rather than the fact. The reasoning is at the call, together with
 /// what remains possible now that it cannot be made one transaction.
@@ -1891,8 +1895,8 @@ pub struct AnsweredQuestions {
 /// control section is opening balance, closing balance and turnover each way,
 /// and the journal has had the vocabulary for exactly those since §10.3. It has
 /// only ever been able to receive them *after* the rows were written, through
-/// the owner-only reconciliation route, against a journal that already held
-/// whatever the import got wrong.
+/// the reconciliation route, against a journal that already held whatever the
+/// import got wrong.
 ///
 /// Four things are refused here rather than at commit, because each is a mistake
 /// in the transcription and the transcriber is the only one who can fix it:
@@ -2108,11 +2112,13 @@ pub async fn commit_session(
     // intermediate state that misleads: for as long as it stands alone, the
     // figures look confirmable against a journal that is short the very rows
     // this attempt dropped.
-    let assertions = control_assertions(principal.owner, &planned.plan);
+    let declared_by = PrincipalId(principal.token_id);
+    let assertions = control_assertions(principal.owner, declared_by, &planned.plan);
     let stated = assertions.len();
     let mut writing = assertions;
     writing.extend(coverage_gaps(
         principal.owner,
+        declared_by,
         &planned.plan,
         &planned.declined,
     ));
@@ -2644,8 +2650,8 @@ pub struct Interpretation {
     /// answer is the same for most of them. The one field in the document that
     /// says what a row was **for** — the category the source filed it under — is
     /// transcribed by the profile, matchable by a rule since decision 0026, and
-    /// read by nothing on a first import, because a standing rule comes only
-    /// from answering a question and there are hundreds of those.
+    /// read by nothing on a first import, because no standing rule is derived
+    /// until an answer or a separate rule operation supplies one.
     ///
     /// So the session says what it has: the words its own unanswered rows were
     /// filed under, how many rows each accounts for, and the condition a rule on
@@ -5160,7 +5166,11 @@ fn control_assertion_key(
 ///
 /// [`ControlClaim::CashBalance`]: iaam_core::reconciliation::claim::ControlClaim::CashBalance
 /// [`ControlClaim::CashTurnover`]: iaam_core::reconciliation::claim::ControlClaim::CashTurnover
-fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event::Event> {
+fn control_assertions(
+    owner: OwnerId,
+    declared_by: PrincipalId,
+    plan: &ImportPlan,
+) -> Vec<iaam_core::event::Event> {
     let mut events = Vec::new();
     for section in plan
         .control_reconciliation
@@ -5198,7 +5208,8 @@ fn control_assertions(owner: OwnerId, plan: &ImportPlan) -> Vec<iaam_core::event
             section_hash(section),
             ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
         )
-        .with_import_session(plan.session.id);
+        .with_import_session(plan.session.id)
+        .with_declared_by(declared_by);
         for claim in claims {
             events.push(iaam_core::event::Event {
                 id: EventId::new_random(),
@@ -5404,6 +5415,7 @@ fn coverage_gap_key(account: AccountId, period: AssertionPeriod, rows: &[Refused
 /// statement.
 fn coverage_gaps(
     owner: OwnerId,
+    declared_by: PrincipalId,
     plan: &ImportPlan,
     declined: &[DeclinedRow],
 ) -> Vec<iaam_core::event::Event> {
@@ -5432,7 +5444,8 @@ fn coverage_gaps(
             RawHash::parse(&digest_hex(&key))
                 .expect("a SHA-256 digest is 64 hexadecimal characters"),
             ParserVersion(CONTROL_PARSER_VERSION.to_owned()),
-        );
+        )
+        .with_declared_by(declared_by);
         if let Some(event) = coverage_gap::gap_event(
             coverage_gap::GapTarget {
                 owner,
@@ -8658,22 +8671,17 @@ fn require_submit(principal: &Principal) -> Result<(), AppError> {
 /// from months the caller has not imported, and including rows it will never
 /// see, because a matched row is never asked about.
 ///
-/// The second act is the same one `POST /v1/classification-rules` performs, and
-/// that route is owner-only. Admitting the agent here and refusing it there
-/// would leave the harder gate protecting nothing: the agent would simply make
-/// the decision through the route whose name does not mention rules. So the
-/// answer is refused a rule rather than the whole call — the row still settles,
-/// and the import still finishes without waking the owner twice.
-///
-/// The cost is real and is the point: an agent relaying the owner's answers is
-/// asked about the same counterparty again next month, because nobody recorded
-/// that the answer generalises. Turning it into a rule is one call the owner
-/// makes with his own token, and it is a decision he can then read back, edit
-/// and retire.
+/// The rule is a separate reversible operation, so an agent may write it
+/// through `POST /v1/classification-rules`. This answer route deliberately
+/// keeps the acts separate for an agent: the row settles, while the response
+/// carries the possible rule for a separate call. An owner answer may perform
+/// both acts as a convenience.
 ///
 /// It reads [`crate::ports::Scope::may_administer`] and not a gate of its own:
-/// this **is** the administer decision, arriving by another door, and a second
-/// predicate beside it would be a second place for the two to drift apart.
+/// this is the administer decision for the answer route's convenience path,
+/// arriving by another door, and a second predicate beside it would be a second
+/// place for the two to drift apart.
+///
 ///
 /// **Public since `iaam-sh6m`,** because the queue must say what a caller's
 /// answer will keep and the authority is the caller's fact to supply: the route
@@ -8721,9 +8729,9 @@ pub struct ProposedRule {
 pub enum WouldStand {
     /// Answering writes it, because the answerer may generalise.
     Written(ProposedRule),
-    /// Answering writes nothing and publishes it, because only the owner may
-    /// make a standing decision (`iaam-hnod`). One call of his own makes it
-    /// stand, and this forecast does not make it.
+    /// Answering writes nothing through this route and publishes the rule
+    /// proposal; the separate reversible classification-rule operation carries
+    /// it after the owner decides.
     ForHisAdoption(ProposedRule),
     /// This answer is not one to generalise, so no standing decision comes of
     /// it under any token (`AnswerShape::generalises`).
@@ -14170,7 +14178,7 @@ mod tests {
         assert_eq!(
             would_stand(&asked, Answer::Paid, false).code(),
             "for_his_adoption",
-            "an answerer who may not make a standing decision is told what it \
+            "the answer route that does not mint a standing decision is told what it \
              would be, not that there is none"
         );
 

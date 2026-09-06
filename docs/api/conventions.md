@@ -486,61 +486,46 @@ document, and the wording on each says which.
 
 ## 4. What gates an act
 
-> **What gates an act is what it does to the owner's decisions, not which
-> endpoint it arrived at. Two acts that reach the same consequence are gated the
-> same way, even when one of them is a side effect of a route named after
-> something else — and one route that performs two acts of different consequence
-> is gated twice, once per act.**
+> **What gates an act is whether a wrong performance can be undone. An act is
+> owner-only when it cannot be put back; otherwise it is available to an agent
+> as well.** The operation's contract names the undo, and every route that
+> performs that operation publishes the same floor.
 
 ### 4.1 Why the endpoint is the wrong unit
 
-There are three scopes — owner, agent, read-only — and the temptation is to read
-them as three lists of routes. That reading fails in both directions, and it had
-failed in both by the time this section was written.
+There are three scopes — owner, agent, read-only — and the temptation is to
+read them as three lists of routes. That reading fails because a route is a
+name, not a consequence.
 
-It fails downward, by leaving a hole. `POST /v1/classification-rules` was
-owner-only, because a standing rule classifies rows nobody has looked at yet.
-Answering an import question was open to the agent, because an import is
-mechanics. But answering also wrote a classification rule, so the decision the
-agent could not make directly it made through a route whose name does not
-mention rules. The agent-facing document forbade it in prose — *never answer one
-yourself; relay what he says* — and prose is not a gate. The endpoint list said
-the rule route was protected while the thing it protected was reachable
-elsewhere.
-
-It fails upward, by refusing what it has no reason to refuse.
-`POST /v1/corrections/imports` was owner-only, and the reason recorded in the
-code was that "a reversal rewrites what every downstream report says, and the
-agent is an external client that does not decide the portfolio's shape". The
-first clause is true. The second was already false when it was written:
-committing an import session is open to the agent, and it rewrites every
-downstream report just as thoroughly. The agent does decide the portfolio's
-shape — by adding to it. The gate closed the safer of the two directions and
-left the other open, and the practical result was an agent that discovered by
-control total that it had written nonsense and could do nothing but wake the
-owner to undo the agent's own mistake.
-
-Both defects have one cause. Scope was being drawn around routes, and a route is
-a name, not a consequence.
+One route can perform two acts of different consequence and therefore needs two
+authority checks. Conversely, a route can expose a reversible act through a
+side effect or a differently named endpoint. The check belongs to the operation
+whose undo the owner would use, not to whichever route name carried the request.
 
 ### 4.2 The rule
 
-Ask what the act does to decisions the owner has made or will have to live with.
+Ask whether a wrong act can be put back. An operation is owner-only when
+performing it wrongly cannot be undone. It is the agent's otherwise: the owner
+can revisit a reversible decision, and a decision the agent cannot make is a
+decision the owner never gets to revisit.
 
-- **It disposes of something the caller itself submitted, and nothing else
-  changes.** Agent. Recording a row, settling a row, committing an import,
-  abandoning a session.
-- **It states a standing decision that will apply to things nobody has looked
-  at.** Owner. A classification rule, a category rule, a contour version, an
-  account and its declarations, a retirement, a token.
-- **It rules on what is already in the journal — which of the owner's facts
-  should stop counting, or what should have stood instead.** Owner.
-- **It returns the journal to the state before the caller acted, reversing no
-  decision of the owner's, because he made none about it.** Agent, under a bound
-  narrow enough to be checked rather than trusted. Today this is exactly one
-  act: §4.5.
+The undo must be part of the operation's contract:
 
-Read-only is the absence of all four.
+- `CreateAccount` is undone by retirement; an account with no facts is inert.
+- `CreateContour` and `AddContourVersion` are undone by their versioned contour
+  history.
+- Rules are undone by retirement, and retirement reports what the rule reached.
+- Transfer partners and account scope are restated under their existing keys.
+- Retirement is withdrawn under the same account key.
+- A name disposition is undone with `disposition: undecided`.
+- Corrections are append-only facts and are undone by another correction.
+- A control balance is restated under the same account and period. It is
+  admitted even though it is the owner's assertion about the outside world:
+  unlike a credential, it is still a reversible record.
+
+Issuing a token, issuing broker access and changing the encryption key remain
+owner-only because they cannot be put back. Read-only is the absence of every
+write above.
 
 ### 4.3 What each scope may do
 
@@ -549,20 +534,23 @@ Read-only is the absence of all four.
 | Read any report, the journal, the action queue, the profile catalogue | yes | yes | yes |
 | Submit rows, open and feed an import session — by row or by export | yes | yes | no |
 | Settle one row by answering its question | yes | yes | no |
-| Generalise that answer into a standing rule | yes | **no** | no |
+| Generalise that answer into a standing rule | yes | yes | no |
 | Commit or abandon an import session | yes | yes | no |
 | Synchronise a broker or the market reference | yes | yes | no |
 | Repair custody, upload and reparse a document | yes | yes | no |
-| Retract an import the caller declared, untouched | yes | **yes** | no |
+| Retract an import the caller declared, untouched | yes | yes | no |
 | Retract any other import | yes | no | no |
-| Reverse or replace a named journal event | yes | no | no |
-| Confirm a transfer pairing (writes two corrections) | yes | no | no |
-| Record a control balance | yes | no | no |
-| Write classification, category and account rules | yes | no | no |
-| Record or withdraw a product's retirement | yes | **no** | no |
-| Record or withdraw that a printed account name is not the owner's | yes | **no** | no |
-| Create accounts, contours, categories, instruments | yes | no | no |
+| Reverse or replace a named journal event | yes | yes | no |
+| Confirm a transfer pairing (writes two corrections) | yes | yes | no |
+| Record a control balance | yes | yes | no |
+| Write classification, category and account rules | yes | yes | no |
+| Record or withdraw a product's retirement | yes | yes | no |
+| Record or withdraw that a printed account name is not the owner's | yes | yes | no |
+| Create accounts, contours, categories, instruments | yes | yes | no |
 | Issue and revoke tokens and broker access | yes | no | no |
+
+The last row is the remaining authority boundary: credentials cannot be put
+back. Every other write is admitted because its contract names an undo.
 
 Two rows of that table are the ones §4.1 got wrong, and each is stated below with
 the line drawn where it is.
@@ -570,23 +558,27 @@ the line drawn where it is.
 ### 4.4 Answering a question, and generalising the answer
 
 Answering an import question does two things of different consequence, and they
-are now gated separately inside one route.
+are still gated separately inside one route.
 
 Settling the row is mechanics: it disposes of one line the caller already
 submitted, and the portfolio changes by exactly that line. Writing the
-classification rule generalises the settlement into a decision that will classify
-rows nobody has looked at — from months not yet imported, and including rows that
-will never be shown to anyone, because a row a rule matches is never asked about.
-That is the same act `POST /v1/classification-rules` performs, so it is gated the
-same way, and the agent's answer now settles the row and writes no rule.
+classification rule generalises the settlement into a standing decision that
+can later be retired, so `POST /v1/classification-rules` is available to an
+agent as well as to the owner.
+
+The answer route retains its deliberate split: an owner answer may mint the
+durable rule as a convenience, while an agent answer settles the row and
+returns the rule that could be written by a separate call. That is not a second
+authority grade for the rule; it keeps this route from silently combining two
+acts under one answer.
 
 The route was not closed to the agent, because the agent's half of it is
 legitimate and closing it would stop the import. What comes back instead of a
 bare `rule` identifier is `generalisation`, which names its own state:
 `recorded` when the answer created a rule, `available` when one was possible and
-the answerer may not write it, `impossible` when the row offers nothing a matcher
-could match on, and `unanswered` while the question is open.
-
+the answer route deliberately left it for a separate call, `impossible` when
+the row offers nothing a matcher could match on, and `unanswered` while the
+question is open.
 The identifier alone could not separate the middle two. Both were an absent
 field, and only a client could tell which applied, because only a client knows
 which token it holds. The owner reading a session back could not — he saw a
@@ -608,14 +600,13 @@ proposal: the rule he created is his own act, and it is read back from
 The proposal is also an item in the action queue, kind
 `adopt_classification_rule`, one per answered question that has one. A state the
 system reports truthfully with no act that resolves it is a dead end dressed as
-information, and `available` was one: the owner is the only principal who may
-generalise, the queue is where he is told what only he can do, and nothing in it
-mentioned the rule waiting for him. The item is `recommended` — the row it came
-from is settled and no report is short of anything — it names `owner` as the
-required scope, and its target is `POST /v1/classification-rules` with the
-proposal preset as the body and no missing field. What is missing is his
-decision, which is why the item's state is `needs_owner_input` rather than
-`ready`.
+information, and `available` was one: the queue must show the owner the decision
+still to be made and the exact call that carries it. The item is `recommended`
+— the row it came from is settled and no report is short of anything — and its
+target is `POST /v1/classification-rules` with the proposal preset as the body
+and no missing field. The operation's `agent` floor is the scope of the call;
+the item's state remains `needs_owner_input` because the owner decides whether
+the proposal should stand, rather than the queue silently invoking it.
 
 Because the question goes on saying `available`, the item's completion is read
 from his rules instead: it disappears once a standing rule of his classifies a
@@ -742,9 +733,9 @@ reached the call it could in fact have made. The queue told a client the server
 would refuse a request the server would have accepted.
 
 So the item's `requiredScope` is now derived and each **resolution** publishes
-one of its own. A caveat's `closed_by` entries carry the same field, for the same
-reason: a register that names an owner-only remedy to an agent has told it to
-make a call that will be refused.
+one of its own. A caveat's `closed_by` entries carry the same field, for the
+same reason: a register that names a remedy whose floor is above the caller has
+told it to make a call that will be refused.
 
 Two things a client should read off that:
 

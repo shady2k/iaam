@@ -12,6 +12,7 @@ pub mod market_source_codes;
 
 pub mod bundle;
 pub mod categories;
+pub mod decisions;
 pub mod documents;
 pub mod events;
 pub mod import_session;

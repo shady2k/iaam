@@ -14,7 +14,7 @@ use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::InstrumentId;
-use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId};
+use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId, PrincipalId};
 use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
 use iaam_http::HttpRequest;
 use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
@@ -165,7 +165,10 @@ pub async fn sync_broker(
                 continue;
             }
         };
-        let event = normalized.event;
+        let mut event = normalized.event;
+        event.provenance = event
+            .provenance
+            .with_declared_by(PrincipalId(principal.token_id));
         if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
         {
             refusals.push(refused_row(&operation, channel.source));
@@ -216,7 +219,7 @@ pub async fn sync_broker(
     // `None` where the refusals taint nothing — an attempt that refused only
     // valuations withheld no confirmation from anybody — and the whole block is
     // then skipped, because a gap that taints nothing is not a fact.
-    if let Some(gap) = coverage_gap_event(
+    if let Some(mut gap) = coverage_gap_event(
         AssertionTarget {
             owner: principal.owner,
             account,
@@ -233,6 +236,9 @@ pub async fn sync_broker(
             duplicates += 1;
             recorded.push(Verdict::Duplicate { existing });
         } else {
+            gap.provenance = gap
+                .provenance
+                .with_declared_by(PrincipalId(principal.token_id));
             let result = crate::scenarios::ingest::append_checked(
                 services,
                 vec![gap.clone()],
@@ -281,7 +287,7 @@ pub async fn sync_broker(
 
     let mut assertions = 0;
     for (index, claim) in snapshot.claims.into_iter().enumerate() {
-        let event = assertion_event(
+        let mut event = assertion_event(
             AssertionTarget {
                 owner: principal.owner,
                 account,
@@ -292,6 +298,9 @@ pub async fn sync_broker(
             &channel,
             index as u32 + 1,
         );
+        event.provenance = event
+            .provenance
+            .with_declared_by(PrincipalId(principal.token_id));
         let key = event.idempotency_key.clone();
         if let Some(existing) = known.iter().find_map(|record| {
             (record.idempotency_key.as_deref() == key.as_deref()).then_some(record.event)

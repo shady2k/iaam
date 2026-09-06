@@ -1,6 +1,9 @@
 # 0036. A state for an item that wants nothing, and a relay in the owner's voice
 
-Date: 2026-09-05 · Status: proposed · Bead: `iaam-c143`, `iaam-09tn`
+Date: 2026-09-05 · Status: partially superseded by ADR 0040 · Bead: `iaam-c143`, `iaam-09tn`
+
+The authority treatment of reversible operations is superseded by ADR 0040; the
+item state and relay decisions below remain.
 
 ## Context
 

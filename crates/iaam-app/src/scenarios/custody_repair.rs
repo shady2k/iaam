@@ -6,7 +6,7 @@ use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
-use iaam_core::ids::{AccountId, EventId};
+use iaam_core::ids::{AccountId, EventId, PrincipalId};
 use iaam_ingest::dedup::IdentityScope;
 use sha2::{Digest, Sha256};
 
@@ -117,7 +117,7 @@ pub async fn repair_custody(
     let affected_trades = targets.len();
     let mut written = 0;
     for original in targets {
-        let reversal = reversal_for(original);
+        let reversal = reversal_for(original, PrincipalId(principal.token_id));
         let target = original.id;
         let recorded = crate::scenarios::ingest::append_checked(
             services,
@@ -160,7 +160,7 @@ pub async fn repair_custody(
     })
 }
 
-fn reversal_for(original: &Event) -> Event {
+fn reversal_for(original: &Event, declared_by: PrincipalId) -> Event {
     let idempotency_key = format!(
         "custody-repair/{}/{}",
         original.account.inner(),
@@ -194,7 +194,8 @@ fn reversal_for(original: &Event) -> Event {
             original.provenance.source(),
             raw_hash,
             ParserVersion("custody-repair/1".to_owned()),
-        ),
+        )
+        .with_declared_by(declared_by),
         relation: Relation::Reversal {
             target: original.id,
         },

@@ -1,6 +1,9 @@
 # 0029. One answer per decision, and a question published with the answers it admits
 
-Date: 2026-09-04 · Status: proposed · Beads: `iaam-qn6d`, `iaam-q5og`, `iaam-ulib`
+Date: 2026-09-04 · Status: partially superseded by ADR 0040 · Beads: `iaam-qn6d`, `iaam-q5og`, `iaam-ulib`
+
+The authority treatment of classification-rule adoption is superseded by ADR
+0040; the answer-route split and the question publication decisions below remain.
 
 ## Context
 

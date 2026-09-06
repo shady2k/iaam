@@ -1,6 +1,9 @@
 # 0008. A rule minted from an answer asks about one field
 
-Date: 2026-09-04 · Status: proposed · Bead: `iaam-g7yc`
+Date: 2026-09-04 · Status: partially superseded by ADR 0040 · Bead: `iaam-g7yc`
+
+ADR 0040 supersedes only the authority treatment of classification-rule
+adoption; the one-field matcher decision below remains.
 
 ## Context
 

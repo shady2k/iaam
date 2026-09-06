@@ -5129,23 +5129,6 @@ pub struct JournalParams {
     /// carries `rule_settlement`, which says which of those it is.
     #[serde(default)]
     pub settled_by_rule: Option<Uuid>,
-    /// One version of that rule.
-    ///
-    /// A version counts the owner's decisions, not a rule's own revisions:
-    /// every rule he writes takes the next number in his sequence, and editing
-    /// one retires it and writes a new rule under a new identifier and the next
-    /// number. So a rule and its version are fixed together the moment it is
-    /// written, and a fact records the pair as it stood when the row was filed.
-    ///
-    /// Naming both here therefore asks for exactly the decision meant, and a
-    /// version that is not the named rule's matches no fact rather than falling
-    /// back to the rule's own rows.
-    ///
-    /// Supplied together with `settled_by_rule`. On its own it is a position in
-    /// his sequence and not a name for a rule, so it is refused rather than
-    /// quietly ignored.
-    #[serde(default)]
-    pub settled_by_rule_version: Option<u32>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date)]
@@ -5215,7 +5198,6 @@ pub async fn list_journal_events(
             source,
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
-            settled_by_rule_version: params.settled_by_rule_version,
             from,
             to,
             after: params.after,

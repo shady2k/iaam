@@ -82,16 +82,6 @@ pub struct JournalReadQuery {
     /// It composes with the rest rather than replacing them: «what this rule did
     /// in March, on that account» is one query.
     pub settled_by_rule: Option<ClassificationRuleId>,
-    /// One version of that rule, where the caller wants only its rows.
-    ///
-    /// A version counts his decisions rather than one rule's revisions: every
-    /// rule he writes takes the next number in his sequence, and an edit retires
-    /// the rule and writes a new one under a new identifier and the next number.
-    /// A fact records the pair as it stood when the row was filed, so naming
-    /// both asks for exactly one decision of his. Supplied together with the
-    /// rule; a version on its own is a position in that sequence and not a name
-    /// for a rule, and is refused rather than ignored.
-    pub settled_by_rule_version: Option<u32>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -242,8 +232,6 @@ pub async fn read_journal(
         .as_ref()
         .map(|declared| declared_source(owner, declared))
         .transpose()?;
-    let (settled_by_rule, settled_by_rule_version) =
-        rule_filter(query.settled_by_rule, query.settled_by_rule_version)?;
 
     // One row beyond the page: the difference between "there is more" and "that
     // was everything" cannot be inferred from a full page, and a caller that
@@ -257,8 +245,7 @@ pub async fn read_journal(
                 account: query.account,
                 source,
                 import_session: query.import_session,
-                settled_by_rule,
-                settled_by_rule_version,
+                settled_by_rule: query.settled_by_rule,
                 from: range.0,
                 to: range.1,
                 after,
@@ -942,31 +929,6 @@ fn stated_amount(event: &Event) -> Option<Money> {
     }
 }
 
-/// The rule narrowing, with the pair checked before either half is used.
-///
-/// A version is a position in the owner's sequence of decisions, not a name for
-/// a rule, so a version with no rule beside it addresses nothing a caller could
-/// have meant. Accepting it and ignoring it would answer a question nobody asked
-/// — every rule's rows under a request for one decision's — and the caller would
-/// have no way to tell that from a genuinely wide result.
-fn rule_filter(
-    rule: Option<ClassificationRuleId>,
-    version: Option<u32>,
-) -> Result<(Option<ClassificationRuleId>, Option<u32>), AppError> {
-    if rule.is_none() {
-        if let Some(version) = version {
-            return Err(AppError::Invalid {
-                field: "settled_by_rule_version".to_owned(),
-                expected: "a rule named beside the version, because a version is a position in \
-                           your sequence of decisions and not a name for a rule"
-                    .to_owned(),
-                actual: version.to_string(),
-            });
-        }
-    }
-    Ok((rule, version))
-}
-
 fn page_size(limit: Option<u32>) -> Result<u32, AppError> {
     let Some(limit) = limit else {
         return Ok(DEFAULT_PAGE_SIZE);
@@ -1120,37 +1082,6 @@ mod tests {
             };
             assert_eq!(field, "after");
         }
-    }
-
-    #[test]
-    fn a_rule_narrows_the_journal_and_a_version_narrows_it_further() {
-        let rule = ClassificationRuleId::new_random();
-        assert_eq!(
-            rule_filter(None, None).expect("no rule named"),
-            (None, None)
-        );
-        assert_eq!(
-            rule_filter(Some(rule), None).expect("the rule alone"),
-            (Some(rule), None)
-        );
-        assert_eq!(
-            rule_filter(Some(rule), Some(3)).expect("one version of it"),
-            (Some(rule), Some(3))
-        );
-    }
-
-    #[test]
-    fn a_rule_version_with_no_rule_beside_it_is_refused() {
-        // A version is a position in the owner's sequence of decisions, so
-        // «version 3» on its own names no rule. Accepting it and ignoring it
-        // would hand back every rule's rows under a question that asked for
-        // one decision's.
-        let error = rule_filter(None, Some(3)).expect_err("a version alone is refused");
-        let AppError::Invalid { field, actual, .. } = error else {
-            panic!("a lone version is refused as an invalid field");
-        };
-        assert_eq!(field, "settled_by_rule_version");
-        assert_eq!(actual, "3");
     }
 
     #[test]

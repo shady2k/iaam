@@ -1904,6 +1904,23 @@ async fn the_openapi_document_declares_bearer_security() {
 }
 
 #[tokio::test]
+async fn the_journal_openapi_does_not_advertise_rule_version_filter() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let parameters = spec["paths"]["/v1/journal/events"]["get"]["parameters"]
+        .as_array()
+        .expect("journal query parameters");
+    assert!(
+        parameters
+            .iter()
+            .all(|parameter| parameter["name"] != "settled_by_rule_version"),
+        "the journal no longer filters by a rule version: {parameters:?}"
+    );
+}
+
+#[tokio::test]
 async fn no_openapi_request_body_accepts_credential_fields() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
@@ -18395,36 +18412,6 @@ async fn the_journal_returns_the_rows_one_rule_filed_and_each_row_names_it() {
             .get("rule")
             .is_none(),
         "a settlement that names no rule prints none: {stated_row}"
-    );
-
-    // A version narrows further, and a version alone narrows nothing because it
-    // names nothing.
-    let (status, wrong_version) = call(
-        &harness.router,
-        get(
-            &format!("/v1/journal/events?settled_by_rule={rule}&settled_by_rule_version=99"),
-            Some(&harness.owner_token),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{wrong_version}");
-    assert!(
-        wrong_version["rows"].as_array().expect("rows").is_empty(),
-        "no version 99 of that rule filed anything: {wrong_version}"
-    );
-
-    let (status, lone_version) = call(
-        &harness.router,
-        get(
-            "/v1/journal/events?settled_by_rule_version=1",
-            Some(&harness.owner_token),
-        ),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "a version is a position in his sequence of decisions, so it names no rule alone: {lone_version}"
     );
 }
 

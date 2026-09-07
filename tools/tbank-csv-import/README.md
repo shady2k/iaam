@@ -109,6 +109,11 @@ present; only an ordinary offline `--dry-run` avoids the directory.
 With `--account-map` on an ordinary dry run, the preview contacts nothing
 because the file is its own contour:
 
+Journal reads request the route's maximum page size of 200. If the server
+returns `429`, the importer reads `Retry-After`, says that it is waiting while
+keeping the rows already fetched, then retries the same cursor and continues
+without restarting the traversal.
+
 ```bash
 python3 tools/tbank-csv-import/import.py \
   --export /path/to/export.csv \

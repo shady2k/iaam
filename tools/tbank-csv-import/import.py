@@ -7,13 +7,17 @@ time. Nothing identifying may be written into this file — it is checked in.
 
 import argparse
 import csv
+import email.utils
 import hashlib
 import json
+import math
 import os
 import sys
+import time
+import urllib.error
 import urllib.request
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import urlencode
 
@@ -106,20 +110,61 @@ def post(base_url, path, token, payload):
         return json.load(response)
 
 
+JOURNAL_PAGE_SIZE = 200
+
+
 def import_label(export_path):
     """Name the import exactly as the submit and retract declarations do."""
     return f"tbank-export {os.path.basename(export_path)}"
 
 
+def retry_after_seconds(error):
+    """Return the server's retry window, with a safe fallback."""
+    raw = error.headers.get("Retry-After") if error.headers else None
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(raw)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(
+                    0,
+                    math.ceil(
+                        (retry_at - datetime.now(timezone.utc)).total_seconds()
+                    ),
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return 1
+
+
 def journal_events(base_url, token, **filters):
     """Read every journal page for the supplied filters."""
     rows = []
+    filters.setdefault("limit", JOURNAL_PAGE_SIZE)
     while True:
-        query = urlencode({key: value for key, value in filters.items() if value is not None})
+        query = urlencode(
+            {key: value for key, value in filters.items() if value is not None}
+        )
         path = "/v1/journal/events"
         if query:
             path += f"?{query}"
-        page = get(base_url, path, token)
+        try:
+            page = get(base_url, path, token)
+        except urllib.error.HTTPError as error:
+            if error.code != 429:
+                raise
+            delay = retry_after_seconds(error)
+            print(
+                "journal rate limit: waiting "
+                f"{delay} seconds before retrying; fetched rows are kept",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+            continue
         rows.extend(page["rows"])
         if page.get("next") is None:
             return rows

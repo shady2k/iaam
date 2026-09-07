@@ -77,8 +77,9 @@ IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
 ```
 
 If that import was retracted, do not retry `--submit` with another channel.
-Use replacement mode. It reads the journal by the original source, learns the
-withdrawn import and each event identity, then sends the same converted rows to
+Use replacement mode. It filters the journal by the original declaration —
+account, channel and label — and reads that import's rows to recover each
+event identity. It then sends the same converted rows to
 `POST /v1/corrections` as `relation: replacement` with fresh idempotency keys:
 
 ```bash
@@ -91,10 +92,10 @@ IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
 ```
 
 The original channel is never changed to make withdrawn keys available again.
-The replacement targets are taken from the journal, not supplied as event or
-import identifiers by hand. A replacement is a correction fact, so its journal
-provenance records the correction route while the withdrawn source fact remains
-the one it replaces.
+The declaration is the identity the importer already holds; the published
+event and import UUIDs remain available for callers that hold either one.
+A replacement is a correction fact, so its journal provenance records the
+correction route while the withdrawn source fact remains the one it replaces.
 
 Each replacement key is `correction/replacement/<withdrawn event id>`, so a
 repeated replacement run addresses the same correction keys and cannot add a

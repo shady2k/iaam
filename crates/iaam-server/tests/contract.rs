@@ -12852,6 +12852,31 @@ async fn a_journal_row_names_the_import_that_carried_it() {
         vec![json!("named-by-a-label")],
         "the import filter accepts the identity published on each row: {by_import}"
     );
+    let declared = format!(
+        "/v1/journal/events?source_account={}&source_channel=file&source_label=march",
+        harness.account.inner()
+    );
+    let (status, by_declaration) =
+        call(&harness.router, get(&declared, Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::OK, "{by_declaration}");
+    let declared_rows = by_declaration["rows"].as_array().expect("rows");
+    assert_eq!(
+        declared_rows
+            .iter()
+            .map(|row| row["idempotency_key"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("named-by-a-label")],
+        "the declaration names the same import as retraction: {by_declaration}"
+    );
+
+    let missing_account = "/v1/journal/events?source_label=march";
+    let (status, body) = call(
+        &harness.router,
+        get(missing_account, Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "source_account");
 
     let (status, retracted) = call(
         &harness.router,

@@ -5469,6 +5469,12 @@ pub struct JournalParams {
     /// Channel of the declared source: `file`, `paste`, `manual`.
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// Label of the declared import. Supplied together with `source_account`
+    /// and `source_channel`; this is the declaration a caller that submitted
+    /// the import already holds, and the route derives the same import identity
+    /// that retraction takes. The UUID form in `import` remains available.
+    #[serde(default)]
+    pub source_label: Option<String>,
     /// The declared import that carried the rows. This is the identity a
     /// retraction takes; it is not the session that happened to commit them.
     #[serde(default)]
@@ -5573,6 +5579,11 @@ pub async fn list_journal_events(
         .map(|value| parse_query_date("to", value))
         .transpose()?;
     let source = declared_source_filter(params.source_account, params.source_channel)?;
+    let declared_import = declared_import_filter(
+        principal.owner,
+        source.as_ref(),
+        params.source_label,
+    )?;
     let page = read_journal(
         state.services.store.as_ref(),
         principal.owner,
@@ -5581,7 +5592,7 @@ pub async fn list_journal_events(
             account: params.account.map(AccountId),
             touching: params.touching.map(AccountId),
             source,
-            import: params.import.map(ImportId),
+            import: params.import.map(ImportId).or(declared_import),
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
             from,
@@ -5778,6 +5789,34 @@ fn declared_source_filter(
             "source_account",
             "an account, supplied together with source_channel",
         )),
+    }
+}
+
+/// Derive the import filter from the declaration a submitting caller already
+/// holds. The UUID query parameter remains a second, published handle; this
+/// path exists so a caller need not discover that UUID by scanning the journal.
+fn declared_import_filter(
+    owner: iaam_core::ids::OwnerId,
+    source: Option<&DeclaredSource>,
+    label: Option<String>,
+) -> Result<Option<ImportId>, ApiFailure> {
+    match (source, label) {
+        (None, None) => Ok(None),
+        (Some(source), Some(label)) => {
+            let label = declared_label("source_label", Some(&label))?
+                .expect("a supplied label is present");
+            Ok(Some(ImportId::declared(
+                owner,
+                source.account,
+                source.channel.trim(),
+                label,
+            )))
+        }
+        (None, Some(_)) => Err(missing_companion(
+            "source_account",
+            "an account, supplied with source_channel and source_label",
+        )),
+        (Some(_), None) => Ok(None),
     }
 }
 

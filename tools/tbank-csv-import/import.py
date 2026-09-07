@@ -106,6 +106,11 @@ def post(base_url, path, token, payload):
         return json.load(response)
 
 
+def import_label(export_path):
+    """Name the import exactly as the submit and retract declarations do."""
+    return f"tbank-export {os.path.basename(export_path)}"
+
+
 def journal_events(base_url, token, **filters):
     """Read every journal page for the supplied filters."""
     rows = []
@@ -121,32 +126,22 @@ def journal_events(base_url, token, **filters):
         filters["after"] = page["next"]
 
 
-def replacement_targets(base_url, token, account_id, channel, operations):
+def replacement_targets(base_url, token, account_id, channel, label, operations):
     """Find the withdrawn event each operation must replace.
 
-    The source listing discovers the import identity from the journal itself.
-    The second read uses that identity, so the importer never asks the operator
-    to copy an event id or import id by hand.
+    The declaration names the import directly. The UUID remains published on
+    each row, but the importer already holds the account, channel and label it
+    submitted under and must not scan the account's whole journal to rediscover
+    that same identity.
     """
     wanted = {operation["idempotency_key"] for operation in operations}
-    source_rows = journal_events(
+    imported_rows = journal_events(
         base_url,
         token,
         source_account=account_id,
         source_channel=channel,
+        source_label=label,
     )
-    matching = {
-        row["idempotency_key"]: row
-        for row in source_rows
-        if row.get("idempotency_key") in wanted
-    }
-    imports = {row.get("import") for row in matching.values()}
-    if len(matching) != len(wanted) or len(imports) != 1 or None in imports:
-        raise SystemExit(
-            "cannot identify one withdrawn import for every converted row from the journal"
-        )
-    import_id = next(iter(imports))
-    imported_rows = journal_events(base_url, token, **{"import": import_id})
     by_key = {
         row["idempotency_key"]: row
         for row in imported_rows
@@ -154,7 +149,7 @@ def replacement_targets(base_url, token, account_id, channel, operations):
     }
     if set(by_key) != wanted:
         raise SystemExit(
-            "the journal import does not contain exactly the rows in this export"
+            "the declared journal import does not contain exactly the rows in this export"
         )
     return {key: by_key[key]["event"] for key in wanted}
 
@@ -595,6 +590,7 @@ def main():
     summary["operations"] = operation_summary(operations, account_names)
     summary["accounts"] = account_summary(operations, account_names)
     summary["rejected"] = 0
+    source_label = import_label(args.export)
 
     by_account = defaultdict(list)
     for operation in operations:
@@ -603,7 +599,7 @@ def main():
     if args.replace_retracted:
         for account_id, batch in by_account.items():
             targets_by_account[account_id] = replacement_targets(
-                args.base_url, token, account_id, args.channel, batch
+                args.base_url, token, account_id, args.channel, source_label, batch
             )
         summary["replacements"] = [
             {
@@ -655,7 +651,7 @@ def main():
                     "source": {
                         "account": account_id,
                         "channel": args.channel,
-                        "label": f"tbank-export {os.path.basename(args.export)}",
+                        "label": source_label,
                     },
                     "operations": batch,
                 },

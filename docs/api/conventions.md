@@ -204,6 +204,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/category-groups` | `[CategoryGroupDto]` | bare array | whole list |
 | `GET /v1/category-rules` | `[CategoryRuleDto]` | bare array | whole history; the version is per rule, not per list |
 | `GET /v1/classification-rules` | `[ClassificationRuleDto]` | bare array | whole history; the version is per rule, not per list |
+| `GET /v1/journal/source-categories` | `[string]` | bare array | exact source vocabulary for the optional account and effective-date scope |
 | `GET /v1/tokens` | `[TokenDto]` | bare array | whole list, revoked included |
 | `GET /v1/broker-access` | `[BrokerAccessDto]` | bare array | whole list, revoked included |
 | `GET /v1/contours` | `[ContourDto]` | bare array | whole list; each contour carries its own version |

@@ -558,6 +558,14 @@ pub struct JournalQuery {
     /// Maximum rows to return.
     pub limit: u32,
 }
+/// Filters for the distinct source-category values in the journal.
+#[derive(Debug, Clone, Default)]
+pub struct SourceCategoryQuery {
+    pub account: Option<AccountId>,
+    pub from: Option<Date>,
+    pub to: Option<Date>,
+}
+
 
 impl SqliteStore {
     /// Read a narrowed page of the owner's journal in `(date, sequence)` order.
@@ -584,9 +592,61 @@ impl SqliteStore {
         }
         Ok(events)
     }
+
+    /// Distinct source-category evidence for the owner's journal scope.
+    ///
+    /// Facts written before schema version 14 used this storage slot for the
+    /// source's operation word, so those rows are intentionally excluded.
+    pub fn list_journal_source_categories(
+        &self,
+        owner: OwnerId,
+        query: &SourceCategoryQuery,
+    ) -> Result<Vec<String>, StoreError> {
+        let (sql, parameters) = source_categories_sql(owner, query);
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
 }
 
 /// Assemble the narrowed query and its bound parameters.
+fn source_categories_sql(
+    owner: OwnerId,
+    query: &SourceCategoryQuery,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::from(
+        "SELECT DISTINCT json_extract(payload, '$.provenance.source_category')
+         FROM events
+         WHERE owner = ?1
+           AND json_extract(payload, '$.schema_version') >= 14
+           AND json_extract(payload, '$.provenance.source_category') IS NOT NULL",
+    );
+    let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(owner.inner().to_string())];
+
+    let mut bind = |clause: &str, value: Box<dyn rusqlite::ToSql>| {
+        parameters.push(value);
+        sql.push_str(&clause.replace('?', &format!("?{}", parameters.len())));
+    };
+
+    if let Some(account) = query.account {
+        bind(
+            " AND account = ?",
+            Box::new(account.inner().to_string()),
+        );
+    }
+    if let Some(from) = query.from {
+        bind(" AND effective_date >= ?", Box::new(from.to_string()));
+    }
+    if let Some(to) = query.to {
+        bind(" AND effective_date <= ?", Box::new(to.to_string()));
+    }
+    sql.push_str(" ORDER BY 1");
+    (sql, parameters)
+}
+
 ///
 /// The SQL is built rather than written out because the handles are
 /// independent: spelling every combination would be sixteen statements that

@@ -38,7 +38,8 @@ use iaam_app::scenarios::import_session::{HeldRow, IntakeOutcome, SessionContent
 use iaam_app::scenarios::ingest::RowOrigin;
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::journal::{
-    DeclaredSource, JournalReadQuery, read_journal, read_operation_history,
+    DeclaredSource, JournalReadQuery, list_journal_source_categories, read_journal,
+    read_operation_history,
 };
 use iaam_app::scenarios::market_reference::{
     MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
@@ -5414,6 +5415,24 @@ pub struct JournalParams {
     pub limit: Option<u32>,
 }
 
+/// Filters for the exact source-category vocabulary in the journal.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct JournalSourceCategoryParams {
+    /// Only facts recorded against this account.
+    #[serde(default)]
+    pub account: Option<Uuid>,
+    /// Inclusive start of the effective-date interval, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub from: Option<String>,
+    /// Inclusive end of the effective-date interval, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub to: Option<String>,
+}
+
 /// The owner's journal events, a page at a time.
 ///
 /// **These are journal events, not the operations that were submitted.** Ingest
@@ -5481,6 +5500,47 @@ pub async fn list_journal_events(
             .collect(),
         next: page.next,
     }))
+}
+
+/// The exact source-category words recorded in the owner's journal.
+///
+/// Values are returned verbatim and sorted by the store. The optional scope is
+/// the same account and inclusive effective-date interval a journal reader can
+/// use; no source value is normalised because category matchers are exact.
+#[utoipa::path(
+    get,
+    path = "/v1/journal/source-categories",
+    params(JournalSourceCategoryParams),
+    responses(
+        (status = 200, description = "Distinct source-category values", body = Vec<String>),
+        (status = 422, description = "A parameter could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_journal_source_categories_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<JournalSourceCategoryParams>,
+) -> Result<Json<Vec<String>>, ApiFailure> {
+    let from = params
+        .from
+        .as_deref()
+        .map(|value| parse_query_date("from", value))
+        .transpose()?;
+    let to = params
+        .to
+        .as_deref()
+        .map(|value| parse_query_date("to", value))
+        .transpose()?;
+    let values = list_journal_source_categories(
+        state.services.store.as_ref(),
+        principal.owner,
+        params.account.map(AccountId),
+        from,
+        to,
+    )
+    .await?;
+    Ok(Json(values))
 }
 
 /// The owner's decision record: who acted, what was settled, and what undoes it.

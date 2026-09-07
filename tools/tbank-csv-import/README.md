@@ -76,6 +76,26 @@ IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
   --submit
 ```
 
+If that import was retracted, do not retry `--submit` with another channel.
+Use replacement mode. It reads the journal by the original source, learns the
+withdrawn import and each event identity, then sends the same converted rows to
+`POST /v1/corrections` as `relation: replacement` with fresh idempotency keys:
+
+```bash
+IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
+  --export /path/to/export.csv \
+  --base-url http://127.0.0.1:8080 \
+  --token-env IAAM_TOKEN \
+  --channel file \
+  --replace-retracted
+```
+
+The original channel is never changed to make withdrawn keys available again.
+The replacement targets are taken from the journal, not supplied as event or
+import identifiers by hand. A replacement is a correction fact, so its journal
+provenance records the correction route while the withdrawn source fact remains
+the one it replaces.
+
 With `--account-map` instead, the preview contacts nothing at all, because the
 file is its own contour:
 

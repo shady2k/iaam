@@ -9266,7 +9266,7 @@ async fn a_row_rule_pins_a_row_whose_source_named_no_identifier() {
             "/v1/category-rules/preview",
             &harness.owner_token,
             &json!({
-                "matcher": {"kind": "row", "value": {"key": "tbank/file/deadbeef/1"}},
+                "matcher": {"row": "tbank/file/deadbeef/1"},
                 "category": category_id,
             }),
         ),
@@ -9324,13 +9324,20 @@ async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate
     assert_ne!(verdicts[0]["verdict"], "rejected", "{verdicts}");
 
     // Case-insensitive substring, per category.rs:78.
+    //
+    // This call used to read `{"kind": …, "value": {"text": …}}`, a fourth
+    // spelling the fallback chain happened to accept. The field report behind
+    // `iaam-ecq1` had found two others, and the one a reader of the source
+    // guesses first was the single one refused. That this repository's own test
+    // used a shape neither the contract nor any caller used is the argument for
+    // publishing one.
     let (status, impact) = call(
         &harness.router,
         post(
             "/v1/category-rules/preview",
             &harness.owner_token,
             &json!({
-                "matcher": {"kind": "description_contains", "value": {"text": "corner shop"}},
+                "matcher": {"description_contains": "corner shop"},
                 "category": category_id,
             }),
         ),
@@ -9489,11 +9496,21 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["code"], "not_found");
 
+    // One shape per kind, and it is the shape the contract publishes.
+    //
+    // This list held five, and that was the defect (`iaam-ecq1`): a JSON string
+    // containing JSON, `{kind, value: "…"}`, `{kind, value: {key: …}}`,
+    // `{kind, value: {text: …}}` and `{field: "…"}` were all accepted, because
+    // the request was read by a chain of `or_else` calls rather than by a type.
+    // What the API accepted was therefore decided by the order of that chain,
+    // and the form a reader of the source guesses first — `{kind, text}`, after
+    // the internal `DescriptionContains { text }` — was the one it refused. The
+    // field report that found this had to read the source to write a rule at
+    // all, and this repository's own tests used two of the spellings the
+    // contract never mentioned.
     let matcher_forms = [
-        json!(r#"{"row":"row-1"}"#),
-        json!({"kind": "row", "value": "row-2"}),
-        json!({"kind": "source_category", "value": "Supermarkets"}),
-        json!({"kind": "description_contains", "value": "cafe"}),
+        json!({"row": "row-1"}),
+        json!({"source_category": "Supermarkets"}),
         json!({"description_contains": "bakery"}),
     ];
     for (index, matcher) in matcher_forms.into_iter().enumerate() {
@@ -9521,17 +9538,35 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
         (
             json!({}),
             "matcher",
-            "row, source_category or description_contains",
+            "one of `row`, `source_category`, `description_contains`",
         ),
         (
             json!({"kind": "unknown", "value": "x"}),
-            "matcher.kind",
-            "row, source_category or description_contains",
+            "matcher",
+            "one of `row`, `source_category`, `description_contains`",
+        ),
+        // The four spellings the fallback chain used to take. They are refused
+        // by the same sentence as anything else unknown: a shape nobody meant
+        // to accept is not a shape worth deprecating by name.
+        (
+            json!(r#"{"row":"row-1"}"#),
+            "matcher",
+            "a category matcher object",
         ),
         (
-            json!({"kind": "row", "value": {"not": "text"}}),
+            json!({"kind": "row", "value": "row-2"}),
             "matcher",
-            "a category matcher with a string value",
+            "one of `row`, `source_category`, `description_contains`",
+        ),
+        (
+            json!({"kind": "row", "value": {"key": "row-2"}}),
+            "matcher",
+            "one of `row`, `source_category`, `description_contains`",
+        ),
+        (
+            json!({"kind": "description_contains", "value": {"text": "cafe"}}),
+            "matcher",
+            "one of `row`, `source_category`, `description_contains`",
         ),
     ] {
         let (status, body) = call(
@@ -9545,8 +9580,8 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["code"], "invalid_request");
-        assert_eq!(body["field"], field);
-        assert_eq!(body["expected"], expected);
+        assert_eq!(body["field"], field, "{body}");
+        assert_eq!(body["expected"], expected, "{body}");
     }
 
     let (status, rules) = call(
@@ -9562,7 +9597,7 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
             "/v1/category-rules/preview",
             &harness.owner_token,
             &json!({
-                "matcher": {"kind": "source_category", "value": "unused"},
+                "matcher": {"source_category": "unused"},
                 "category": category,
             }),
         ),
@@ -9585,7 +9620,7 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
                 "/v1/category-rules/preview",
                 &harness.owner_token,
                 &json!({
-                    "matcher": {"kind": "source_category", "value": "x"},
+                    "matcher": {"source_category": "x"},
                     "category": category,
                 }),
             ),
@@ -9610,7 +9645,7 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
             "/v1/category-rules/preview",
             &harness.owner_token,
             &json!({
-                "matcher": {"kind": "source_category", "value": "x"},
+                "matcher": {"source_category": "x"},
                 "category": category,
             }),
         ),
@@ -15663,7 +15698,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
                 "/v1/category-rules",
                 &harness.owner_token,
                 &json!({
-                    "matcher": { "kind": "source_category", "value": "Shop One" },
+                    "matcher": { "source_category": "Shop One" },
                     "category": category["id"],
                 }),
             ),

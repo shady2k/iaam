@@ -366,12 +366,18 @@ fn matcher_json(matcher: &CategoryMatcher) -> Result<String, AppError> {
         CategoryMatcher::Row { key } => json!({ "row": key }),
         CategoryMatcher::SourceCategory { value } => json!({ "source_category": value }),
         CategoryMatcher::DescriptionContains { text } => json!({ "description_contains": text }),
-        CategoryMatcher::Description { text, mode } => json!({
-            "description_contains": {
-                "text": text,
-                "mode": mode.code(),
-            }
-        }),
+        CategoryMatcher::Description {
+            text,
+            mode: DescriptionMatchMode::Equals,
+        } => json!({ "description_equals": text }),
+        CategoryMatcher::Description {
+            text,
+            mode: DescriptionMatchMode::StartsWith,
+        } => json!({ "description_starts_with": text }),
+        CategoryMatcher::Description {
+            text,
+            mode: DescriptionMatchMode::Contains,
+        } => json!({ "description_contains": text }),
     };
     serde_json::to_string(&value)
         .map_err(|error| AppError::Store(format!("serialize category matcher: {error}")))
@@ -398,45 +404,29 @@ fn parse_matcher(raw: &str) -> Result<CategoryMatcher, AppError> {
             value: value.to_owned(),
         });
     }
-    if let Some(description) = object.get("description_contains") {
-        if let Some(text) = description.as_str() {
-            return Ok(CategoryMatcher::DescriptionContains {
-                text: text.to_owned(),
-            });
-        }
-        let description = description.as_object().ok_or_else(|| AppError::Invalid {
-            field: "matcher".to_owned(),
-            expected: "description_contains as text or {text, mode}".to_owned(),
-            actual: raw.to_owned(),
-        })?;
-        let text = description
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Invalid {
-                field: "matcher".to_owned(),
-                expected: "description_contains with text and mode".to_owned(),
-                actual: raw.to_owned(),
-            })?;
-        let mode = match description.get("mode").and_then(Value::as_str) {
-            Some("equals") => DescriptionMatchMode::Equals,
-            Some("starts_with") => DescriptionMatchMode::StartsWith,
-            Some("contains") => DescriptionMatchMode::Contains,
-            _ => {
-                return Err(AppError::Invalid {
-                    field: "matcher".to_owned(),
-                    expected: "description mode equals, starts_with, or contains".to_owned(),
-                    actual: raw.to_owned(),
-                });
-            }
-        };
+    if let Some(text) = object.get("description_equals").and_then(Value::as_str) {
         return Ok(CategoryMatcher::Description {
             text: text.to_owned(),
-            mode,
+            mode: DescriptionMatchMode::Equals,
+        });
+    }
+    if let Some(text) = object
+        .get("description_starts_with")
+        .and_then(Value::as_str)
+    {
+        return Ok(CategoryMatcher::Description {
+            text: text.to_owned(),
+            mode: DescriptionMatchMode::StartsWith,
+        });
+    }
+    if let Some(text) = object.get("description_contains").and_then(Value::as_str) {
+        return Ok(CategoryMatcher::DescriptionContains {
+            text: text.to_owned(),
         });
     }
     Err(AppError::Invalid {
         field: "matcher".to_owned(),
-        expected: "row, source_category, or description_contains".to_owned(),
+        expected: "row, source_category, description_equals, description_starts_with, or description_contains".to_owned(),
         actual: raw.to_owned(),
     })
 }

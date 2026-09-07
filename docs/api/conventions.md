@@ -808,16 +808,15 @@ in a vocabulary it may not be written in.
 ```json
 {"row":"source-row-key"}
 {"source_category":"Groceries"}
+{"description_equals":"market"}
+{"description_starts_with":"market"}
 {"description_contains":"market"}
-{"description_contains":{"text":"market","mode":"equals"}}
-{"description_contains":{"text":"market","mode":"starts_with"}}
-{"description_contains":{"text":"market","mode":"contains"}}
 ```
 
-The matcher is a required object, and exactly one of those three keys is
-accepted. A string `description_contains` value is the existing `contains`
-form; the object value selects `equals`, `starts_with` or `contains`. The
-legacy string remains a `contains` rule when it is read from storage. The old
+The matcher is a required object, and exactly one of those five keys is
+accepted. The three description forms say, in owner-facing words, that the
+payment purpose is exactly, begins with, or contains the supplied text. A
+legacy stored `description_contains` string remains a `contains` rule. The old
 stored-JSON string and the `kind`/`value` fallback forms are not part of the
 contract and are refused. `valid_from` and `valid_to` are inclusive date bounds
 on the same rule.

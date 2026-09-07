@@ -9524,20 +9524,13 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(body["code"], "not_found");
 
     // One shape per kind, and it is the shape the contract publishes.
-    //
-    // This list held five, and that was the defect (`iaam-ecq1`): a JSON string
-    // containing JSON, `{kind, value: "…"}`, `{kind, value: {key: …}}`,
-    // `{kind, value: {text: …}}` and `{field: "…"}` were all accepted, because
-    // the request was read by a chain of `or_else` calls rather than by a type.
-    // What the API accepted was therefore decided by the order of that chain,
-    // and the form a reader of the source guesses first — `{kind, text}`, after
-    // the internal `DescriptionContains { text }` — was the one it refused. The
-    // field report that found this had to read the source to write a rule at
-    // all, and this repository's own tests used two of the spellings the
-    // contract never mentioned.
+    // Nested description modes are intentionally refused: each mode has its
+    // own externally tagged key so the owner's choice is visible in the rule.
     let matcher_forms = [
         json!({"row": "row-1"}),
         json!({"source_category": "Supermarkets"}),
+        json!({"description_equals": "bakery"}),
+        json!({"description_starts_with": "bak"}),
         json!({"description_contains": "bakery"}),
     ];
     for (index, matcher) in matcher_forms.into_iter().enumerate() {
@@ -9565,12 +9558,12 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
         (
             json!({}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         (
             json!({"kind": "unknown", "value": "x"}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         // The four spellings the fallback chain used to take. They are refused
         // by the same sentence as anything else unknown: a shape nobody meant
@@ -9583,17 +9576,22 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
         (
             json!({"kind": "row", "value": "row-2"}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         (
             json!({"kind": "row", "value": {"key": "row-2"}}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         (
             json!({"kind": "description_contains", "value": {"text": "cafe"}}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
+        ),
+        (
+            json!({"description_contains": {"text": "cafe", "mode": "equals"}}),
+            "matcher",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
     ] {
         let (status, body) = call(
@@ -9685,7 +9683,7 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(body["field"], "matcher");
     assert_eq!(
         body["expected"],
-        "row, source_category, or description_contains"
+        "row, source_category, description_equals, description_starts_with, or description_contains"
     );
 
     drop(harness);

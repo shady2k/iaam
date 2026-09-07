@@ -7791,35 +7791,16 @@ impl CategoryDto {
 ///
 /// The externally tagged representation keeps the JSON key identical to the
 /// stored matcher:
-/// `{"row":"..."}`, `{"source_category":"..."}`, or
-/// `{"description_contains":"..."}`. The description value may be the
-/// legacy string (which means `contains`) or `{text, mode}`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DescriptionMatchModeDto {
-    Equals,
-    StartsWith,
-    Contains,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DescriptionMatcherDto {
-    pub text: String,
-    pub mode: DescriptionMatchModeDto,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(untagged)]
-pub enum DescriptionContainsDto {
-    Text(String),
-    Structured(DescriptionMatcherDto),
-}
-
+/// `{"row":"..."}`, `{"source_category":"..."}`,
+/// `{"description_equals":"..."}`, `{"description_starts_with":"..."}`, or
+/// `{"description_contains":"..."}`.
 #[derive(Debug, Clone, ToSchema)]
 pub enum CategoryMatcherDto {
     Row(String),
     SourceCategory(String),
-    DescriptionContains(DescriptionContainsDto),
+    DescriptionEquals(String),
+    DescriptionStartsWith(String),
+    DescriptionContains(String),
 }
 
 impl Serialize for CategoryMatcherDto {
@@ -7831,6 +7812,12 @@ impl Serialize for CategoryMatcherDto {
         match self {
             Self::Row(value) => object.serialize_entry("row", value)?,
             Self::SourceCategory(value) => object.serialize_entry("source_category", value)?,
+            Self::DescriptionEquals(value) => {
+                object.serialize_entry("description_equals", value)?;
+            }
+            Self::DescriptionStartsWith(value) => {
+                object.serialize_entry("description_starts_with", value)?;
+            }
             Self::DescriptionContains(value) => {
                 object.serialize_entry("description_contains", value)?;
             }
@@ -7852,36 +7839,24 @@ impl<'de> Deserialize<'de> for CategoryMatcherDto {
         };
         if object.len() != 1 {
             return Err(de::Error::custom(
-                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+                "invalid value, expected one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
             ));
         }
         let (kind, value) = object
             .iter()
             .next()
             .expect("a non-empty object has a matcher entry");
+        let value = value
+            .as_str()
+            .ok_or_else(|| de::Error::custom("invalid value, expected a string matcher value"))?;
         match kind.as_str() {
-            "row" => value
-                .as_str()
-                .map(|value| Self::Row(value.to_owned()))
-                .ok_or_else(|| de::Error::custom("invalid value, expected a string matcher value")),
-            "source_category" => value
-                .as_str()
-                .map(|value| Self::SourceCategory(value.to_owned()))
-                .ok_or_else(|| de::Error::custom("invalid value, expected a string matcher value")),
-            "description_contains" => {
-                if let Some(value) = value.as_str() {
-                    return Ok(Self::DescriptionContains(DescriptionContainsDto::Text(
-                        value.to_owned(),
-                    )));
-                }
-                let structured = serde_json::from_value::<DescriptionMatcherDto>(value.clone())
-                    .map_err(de::Error::custom)?;
-                Ok(Self::DescriptionContains(
-                    DescriptionContainsDto::Structured(structured),
-                ))
-            }
+            "row" => Ok(Self::Row(value.to_owned())),
+            "source_category" => Ok(Self::SourceCategory(value.to_owned())),
+            "description_equals" => Ok(Self::DescriptionEquals(value.to_owned())),
+            "description_starts_with" => Ok(Self::DescriptionStartsWith(value.to_owned())),
+            "description_contains" => Ok(Self::DescriptionContains(value.to_owned())),
             _ => Err(de::Error::custom(
-                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+                "invalid value, expected one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
             )),
         }
     }

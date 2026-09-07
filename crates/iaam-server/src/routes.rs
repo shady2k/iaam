@@ -92,15 +92,14 @@ use crate::dto::{
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto,
-    DescriptionContainsDto, DescriptionMatchModeDto, DocumentDto, DocumentParams, FxRateDto,
-    HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
-    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
-    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
-    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
-    OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
-    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
-    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto,
+    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
+    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
+    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
+    PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
     RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
     RenameAccountRequest, ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest,
@@ -5273,17 +5272,17 @@ fn parse_category_matcher(value: CategoryMatcherDto) -> CategoryMatcher {
     match value {
         CategoryMatcherDto::Row(key) => CategoryMatcher::Row { key },
         CategoryMatcherDto::SourceCategory(value) => CategoryMatcher::SourceCategory { value },
-        CategoryMatcherDto::DescriptionContains(description) => match description {
-            DescriptionContainsDto::Text(text) => CategoryMatcher::DescriptionContains { text },
-            DescriptionContainsDto::Structured(description) => CategoryMatcher::Description {
-                text: description.text,
-                mode: match description.mode {
-                    DescriptionMatchModeDto::Equals => DescriptionMatchMode::Equals,
-                    DescriptionMatchModeDto::StartsWith => DescriptionMatchMode::StartsWith,
-                    DescriptionMatchModeDto::Contains => DescriptionMatchMode::Contains,
-                },
-            },
+        CategoryMatcherDto::DescriptionEquals(text) => CategoryMatcher::Description {
+            text,
+            mode: DescriptionMatchMode::Equals,
         },
+        CategoryMatcherDto::DescriptionStartsWith(text) => CategoryMatcher::Description {
+            text,
+            mode: DescriptionMatchMode::StartsWith,
+        },
+        CategoryMatcherDto::DescriptionContains(text) => {
+            CategoryMatcher::DescriptionContains { text }
+        }
     }
 }
 /// Journal read parameters. Every filter is optional and they combine.

@@ -9351,26 +9351,27 @@ async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 1, "{impact}");
-    for mode in ["equals", "starts_with"] {
+    // A kind per mode, not one kind carrying a mode: `description_contains`
+    // goes on taking the string it took before, so a rule already written
+    // against it keeps its meaning and its spelling (`iaam-v77v`).
+    for (key, text) in [
+        ("description_equals", "corner shop"),
+        ("description_starts_with", "corner"),
+    ] {
         let (status, impact) = call(
             &harness.router,
             post(
                 "/v1/category-rules/preview",
                 &harness.owner_token,
                 &json!({
-                    "matcher": {
-                        "description_contains": {
-                            "text": if mode == "equals" { "corner shop" } else { "corner" },
-                            "mode": mode,
-                        },
-                    },
+                    "matcher": { key: text },
                     "category": category_id,
                 }),
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{impact}");
-        assert_eq!(impact["rows"], 1, "{mode}: {impact}");
+        assert_eq!(status, StatusCode::OK, "{key}: {impact}");
+        assert_eq!(impact["rows"], 1, "{key}: {impact}");
     }
 
     drop(harness);
@@ -9588,10 +9589,13 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
             "matcher",
             "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
+        // The shape a mode-carrying value would have had. Its refusal names the
+        // value rather than the key list, and that is the better sentence: the
+        // kind was understood and what it takes is a string.
         (
             json!({"description_contains": {"text": "cafe", "mode": "equals"}}),
             "matcher",
-            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
+            "a string matcher value",
         ),
     ] {
         let (status, body) = call(
@@ -9615,9 +9619,12 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{rules}");
-    // One per published matcher kind. It was five while five spellings were
-    // accepted, and three of those five were the same rule written differently.
-    assert_eq!(rules.as_array().expect("rule list").len(), 3);
+    // One per published matcher kind, and the number is the point: it was five
+    // when six spellings were accepted, because three of those were one rule
+    // written three ways. It is five again now for the opposite reason — five
+    // kinds, each said one way, and `description_equals` is a different rule
+    // from `description_contains` rather than the same one dressed differently.
+    assert_eq!(rules.as_array().expect("rule list").len(), 5);
     let (status, impact) = call(
         &harness.router,
         post(

@@ -231,7 +231,7 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| matches!(rule.matcher, CategoryMatcher::Row { .. }))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule_priority(*rule));
+        .max_by_key(|rule| rule_priority(rule));
     if let Some(rule) = row_rule {
         return assignment_for_rule(rule);
     }
@@ -241,7 +241,7 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| matches!(rule.matcher, CategoryMatcher::SourceCategory { .. }))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule_priority(*rule));
+        .max_by_key(|rule| rule_priority(rule));
     if let Some(rule) = source_rule {
         return assignment_for_rule(rule);
     }
@@ -256,7 +256,7 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         })
         .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule_priority(*rule));
+        .max_by_key(|rule| rule_priority(rule));
     if let Some(rule) = description_rule {
         return assignment_for_rule(rule);
     }

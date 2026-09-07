@@ -1,5 +1,6 @@
 ---
 source: crates/iaam-server/tests/contract.rs
+assertion_line: 3717
 expression: report
 ---
 {
@@ -18,7 +19,8 @@ expression: report
   "confidence": {
     "caveats": [],
     "complete": true,
-    "goal": "returns"
+    "goal": "returns",
+    "undecomposed_outflows": []
   },
   "contributed": {
     "value": "50000.00"

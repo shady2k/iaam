@@ -9143,7 +9143,7 @@ async fn category_rule_preview_does_not_write_and_rules_are_listed() {
     assert_eq!(status, StatusCode::CREATED, "{category}");
     let category_id = category["id"].as_str().expect("category id");
     let rule_body = json!({
-        "matcher": {"SourceCategory": {"value": "Supermarkets"}},
+        "matcher": {"source_category": "Supermarkets"},
         "category": category_id,
     });
 
@@ -9187,7 +9187,7 @@ async fn category_rule_preview_does_not_write_and_rules_are_listed() {
             "/v1/category-rules/preview",
             &harness.owner_token,
             &json!({
-                "matcher": {"SourceCategory": {"value": "Other"}},
+                "matcher": {"source_category": "Other"},
                 "category": category_id,
             }),
         ),
@@ -9374,7 +9374,7 @@ async fn flow_report_exposes_category_decomposition_residual_and_rule_versions()
             "/v1/category-rules",
             &harness.owner_token,
             &json!({
-                "matcher": {"SourceCategory": {"value": "Supermarkets"}},
+                "matcher": {"source_category": "Supermarkets"},
                 "category": category_id,
             }),
         ),
@@ -9590,7 +9590,9 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{rules}");
-    assert_eq!(rules.as_array().expect("rule list").len(), 5);
+    // One per published matcher kind. It was five while five spellings were
+    // accepted, and three of those five were the same rule written differently.
+    assert_eq!(rules.as_array().expect("rule list").len(), 3);
     let (status, impact) = call(
         &harness.router,
         post(

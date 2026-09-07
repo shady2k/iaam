@@ -2739,6 +2739,17 @@ pub struct ConfidenceDto {
     pub goal: String,
     /// The amount and proportion of outflows left without a category, by
     /// currency, before the report's figures.
+    ///
+    /// **Empty carries two meanings, and the `goal` above says which.** On
+    /// `money_flow` it means every outflow is decomposed. On the other three it
+    /// means this report does not decompose outflows at all — and a reader who
+    /// took it for the first would conclude that a snapshot or a return accounts
+    /// for spending it never looked at. That is the mistake this field exists to
+    /// stop, so it must not be made by the field itself.
+    ///
+    /// It lives here rather than on the money-flow report because a caller reads
+    /// one register to learn what a report is short of, and a second place to
+    /// look for incompleteness is what this register exists to prevent.
     pub undecomposed_outflows: Vec<UndecomposedOutflowShareDto>,
     /// Whether everything that would have to be true for these figures to be
     /// complete is true.

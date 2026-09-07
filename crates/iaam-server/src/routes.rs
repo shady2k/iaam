@@ -1135,7 +1135,7 @@ pub async fn create_category_group_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryGroupRequest>,
 ) -> Result<(StatusCode, Json<CategoryGroupDto>), ApiFailure> {
-    require_submit(&principal)?;
+    require(&principal, OperationKey::CreateCategoryGroup)?;
     let title = request.title.trim();
     if title.is_empty() {
         return Err(invalid_field("title", "a non-empty title", request.title));
@@ -1193,7 +1193,7 @@ pub async fn create_category_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryRequest>,
 ) -> Result<(StatusCode, Json<CategoryDto>), ApiFailure> {
-    require_submit(&principal)?;
+    require(&principal, OperationKey::CreateCategory)?;
     let category = create_category(
         &state.services,
         &principal,
@@ -6090,7 +6090,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// [`require_admin`] states: the queue and the caveat register are about the
 /// owner's money and these are about the shape of the instance, so there is no
 /// second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
     (
         "rename_account",
         "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
@@ -6154,6 +6154,14 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
     (
         "delete_classification_rule",
         "It uses the CreateClassificationRule floor: retiring a rule is the undo for the reversible rule decision.",
+    ),
+    (
+        "create_category_rule_batch",
+        "A bulk write of standing decisions is a caller convenience, not a computed remedy: no queue item can know the particular set of rules to write. It therefore stays outside the operation-key vocabulary, while each row uses the reversible create_category_rule floor.",
+    ),
+    (
+        "preview_category_rules_batch_route",
+        "A read over several proposed rules: it evaluates one shared journal and active-rule snapshot and writes neither a rule nor a verdict. Its batch shape saves request round trips, but no computed state offers it as a remedy.",
     ),
     (
         "delete_category",

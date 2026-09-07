@@ -6338,6 +6338,8 @@ mod tests {
             OwnerPrompt::MembershipAccounts => "MembershipAccounts",
             OwnerPrompt::ExclusionReason => "ExclusionReason",
             OwnerPrompt::TransferPartners => "TransferPartners",
+            OwnerPrompt::CategoryGroupTitle => "CategoryGroupTitle",
+            OwnerPrompt::CategoryTitle => "CategoryTitle",
             OwnerPrompt::BrokerChannel => "BrokerChannel",
             OwnerPrompt::SyncFrom => "SyncFrom",
             OwnerPrompt::SyncTo => "SyncTo",
@@ -6821,7 +6823,13 @@ mod tests {
                 | ActionKind::UnexplainedResidual => &[],
                 // Without a category rule, the flow report cannot answer where
                 // the money went: its category decomposition is empty.
-                ActionKind::UndecomposedOutflows => &[MoneyFlow],
+                //
+                // And with no category at all there is nothing for a rule to
+                // name, so the same report is short for a reason one step
+                // earlier. The two never appear together: while no category
+                // exists this item replaces the per-row ones, because a queue of
+                // requests that cannot name a target has stopped ordering work.
+                ActionKind::UndecomposedOutflows | ActionKind::CreateFirstCategory => &[MoneyFlow],
             };
 
             let goals: Vec<ReportGoal> = kind.goals().iter().collect();

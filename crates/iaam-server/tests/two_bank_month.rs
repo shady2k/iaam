@@ -161,10 +161,7 @@ struct StatementRow {
 
 /// Build an invented statement with 48 rows: 24 transfers, alternating
 /// `Main -> Savings` and `Savings -> Main` across two years.
-fn bidirectional_statement_fixture(
-    main: Uuid,
-    savings: Uuid,
-) -> (Vec<StatementRow>, Vec<Value>) {
+fn bidirectional_statement_fixture(main: Uuid, savings: Uuid) -> (Vec<StatementRow>, Vec<Value>) {
     let mut rows = Vec::with_capacity(48);
     let mut operations = Vec::with_capacity(24);
 
@@ -213,13 +210,11 @@ async fn both_sides_of_bidirectional_statement_match_asset_movements() {
     let savings = create_account(&harness, "Savings", "Northline").await;
     let (statement, operations) = bidirectional_statement_fixture(main, savings);
 
-    let expected: BTreeMap<Uuid, i64> = statement.iter().fold(
-        BTreeMap::new(),
-        |mut totals, row| {
+    let expected: BTreeMap<Uuid, i64> =
+        statement.iter().fold(BTreeMap::new(), |mut totals, row| {
             *totals.entry(row.account).or_default() += row.amount;
             totals
-        },
-    );
+        });
     assert_eq!(statement.len(), 48);
     assert_eq!(
         statement
@@ -267,7 +262,6 @@ async fn both_sides_of_bidirectional_statement_match_asset_movements() {
 // ---------------------------------------------------------------------------
 // Existing month fixture: one month, two institutions, invented from nothing
 // ---------------------------------------------------------------------------
-
 
 /// The month the whole file reports on.
 const MONTH_FROM: &str = "2025-03-01";

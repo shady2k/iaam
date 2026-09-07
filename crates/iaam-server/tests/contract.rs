@@ -1937,17 +1937,26 @@ async fn the_journal_openapi_distinguishes_account_and_touching_filters() {
         .iter()
         .find(|parameter| parameter["name"] == "touching")
         .expect("touching parameter");
-    assert!(
-        account["description"]
+    // The published description keeps the doc comment's line breaks, so a phrase
+    // that reads as one sentence is not one string. Compare on the words.
+    let sentence = |value: &serde_json::Value, what: &str| {
+        value
             .as_str()
-            .expect("account description")
-            .contains("own `account`")
+            .unwrap_or_else(|| panic!("{what} description"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert!(
+        sentence(&account["description"], "account").contains("own `account`"),
+        "{}",
+        account["description"]
     );
     assert!(
+        sentence(&touching["description"], "touching")
+            .contains("event's own account or any account carried by one of its legs"),
+        "{}",
         touching["description"]
-            .as_str()
-            .expect("touching description")
-            .contains("event's own account or any account carried by one of its legs")
     );
 }
 

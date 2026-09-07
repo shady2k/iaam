@@ -7839,7 +7839,15 @@ impl CategoryDto {
 /// `{"row":"..."}`, `{"source_category":"..."}`,
 /// `{"description_equals":"..."}`, `{"description_starts_with":"..."}`, or
 /// `{"description_contains":"..."}`.
+/// **The rename is not cosmetic.** `Serialize` and `Deserialize` below are
+/// written by hand and spell the key in snake case; `ToSchema` derives the
+/// published name from the Rust identifier, so without this the contract said
+/// `DescriptionEquals` while the route accepted only `description_equals`, and
+/// a client generated from the schema sent what the server refuses. The prose
+/// above was right and the schema beside it was not, which is the worse way
+/// round: a reader believes the machine-readable half.
 #[derive(Debug, Clone, ToSchema)]
+#[schema(rename_all = "snake_case")]
 pub enum CategoryMatcherDto {
     Row(String),
     SourceCategory(String),
@@ -9266,6 +9274,23 @@ pub struct JournalEventReadDto {
     /// A trade's basis-only fee, which is not repeated as a leg or a total.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basis_fee: Option<AmountDto>,
+    /// Whether this event still stands, reverses another, or replaces one.
+    ///
+    /// **A reversed event is not part of any total, and nothing else on this row
+    /// says so.** Its `kind` is the kind it always was — an income that was taken
+    /// back reads `income` — so a caller that groups by kind and sums counts it
+    /// twice. This field is the only thing that distinguishes a withdrawn fact
+    /// from a standing one, and a caller that has not read this sentence has no
+    /// reason to look for it.
+    ///
+    /// The journal is append-only: a correction is a reversal and, where one was
+    /// asked for, a replacement, so a fact taken back is still returned here.
+    /// That is deliberate — history is readable — and it is why the reader, not
+    /// the store, has to know which events count.
+    ///
+    /// This route cannot yet be asked for only what stands; `iaam-801g.4` is
+    /// that, and until it is decided a caller wanting totals excludes every row
+    /// whose relation is a reversal, together with the row each one names.
     pub relation: JournalRelationDto,
     pub confidence: JournalConfidenceDto,
     /// The client key supplied at ingest, if one was.

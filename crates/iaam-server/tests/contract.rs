@@ -29534,3 +29534,46 @@ async fn a_source_category_fed_to_a_session_reaches_the_committed_fact() {
     drop(harness);
     let _ = std::fs::remove_file(path);
 }
+
+/// The published matcher names are the ones the route accepts.
+///
+/// `Serialize` and `Deserialize` for `CategoryMatcherDto` are written by hand
+/// and spell the key in snake case; `ToSchema` derives the published name from
+/// the Rust identifier. Without a rename the contract said `DescriptionEquals`
+/// while the route accepted only `description_equals`, so a client generated
+/// from the schema sent what the server refuses — and the prose beside the
+/// schema was right, which is the worse way round, because a reader believes
+/// the machine-readable half (`iaam-801g.5`).
+#[tokio::test]
+async fn the_published_matcher_names_are_the_ones_the_route_accepts() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let published = serde_json::to_string(&spec["components"]["schemas"]["CategoryMatcherDto"])
+        .expect("the matcher schema");
+    for name in [
+        "row",
+        "source_category",
+        "description_equals",
+        "description_starts_with",
+        "description_contains",
+    ] {
+        assert!(
+            published.contains(&format!("\"{name}\"")),
+            "{name} is accepted and not published: {published}"
+        );
+    }
+    for identifier in [
+        "\"Row\"",
+        "\"SourceCategory\"",
+        "\"DescriptionEquals\"",
+        "\"DescriptionStartsWith\"",
+        "\"DescriptionContains\"",
+    ] {
+        assert!(
+            !published.contains(identifier),
+            "{identifier} is published and refused: {published}"
+        );
+    }
+}

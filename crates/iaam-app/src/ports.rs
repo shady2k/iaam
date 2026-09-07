@@ -615,6 +615,10 @@ pub struct JournalQuery {
     pub event: Option<iaam_core::ids::EventId>,
     pub idempotency_key: Option<String>,
     pub account: Option<AccountId>,
+    /// Only facts whose event account or one of their legs is this account.
+    /// This is the set of events that touched an account, which is distinct
+    /// from the event-account filter exposed by the journal route.
+    pub touching: Option<AccountId>,
     pub source: Option<iaam_core::ids::SourceId>,
     /// Only facts committed out of this import session. The session is stamped
     /// on the event's provenance at commit, so this narrows to what one act of

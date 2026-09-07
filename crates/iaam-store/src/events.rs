@@ -539,6 +539,8 @@ pub struct JournalQuery {
     pub event: Option<EventId>,
     pub idempotency_key: Option<String>,
     pub account: Option<AccountId>,
+    /// Only facts whose event account or one of their legs is this account.
+    pub touching: Option<AccountId>,
     pub source: Option<SourceId>,
     /// Only facts committed out of this import session.
     pub import_session: Option<ImportSessionId>,
@@ -668,6 +670,22 @@ fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rus
             &mut sql,
             " AND account = ?",
             Box::new(account.inner().to_string()),
+        );
+    }
+    if let Some(touching) = query.touching {
+        // The report fold reads event legs. Keep the event's own account in
+        // this predicate too: ordinary events carry their account there, and
+        // transfer events carry the receiving account only in a leg.
+        bind(
+            &mut sql,
+            " AND (account = ?",
+            Box::new(touching.inner().to_string()),
+        );
+        bind(
+            &mut sql,
+            " OR EXISTS (SELECT 1 FROM json_each(events.payload, '$.legs') AS leg \
+             WHERE json_extract(leg.value, '$.account') = ?))",
+            Box::new(touching.inner().to_string()),
         );
     }
     if let Some(source) = query.source {

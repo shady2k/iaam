@@ -15,6 +15,7 @@
 //! Nothing in this file is derived from any real export: the institutions, the
 //! accounts and every amount are invented (CLAUDE.md, "Conventions & Patterns").
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,7 +146,121 @@ fn post(path: &str, token: &str, body: &Value) -> Request<Body> {
 }
 
 // ---------------------------------------------------------------------------
-// The fixture: one month, two institutions, invented from nothing
+// Bead 1 diagnosis: both printed sides, both directions, and a long roll-up
+// ---------------------------------------------------------------------------
+
+/// One row as the institution printed it. The importer keeps only the outgoing
+/// row of each matched pair, but the report must still reproduce both rows'
+/// account-local arithmetic through the transfer's two legs.
+#[derive(Debug, Clone)]
+struct StatementRow {
+    account: Uuid,
+    amount: i64,
+    date: String,
+}
+
+/// Build an invented statement with 48 rows: 24 transfers, alternating
+/// `Main -> Savings` and `Savings -> Main` across two years.
+fn bidirectional_statement_fixture(main: Uuid, savings: Uuid) -> (Vec<StatementRow>, Vec<Value>) {
+    let mut rows = Vec::with_capacity(48);
+    let mut operations = Vec::with_capacity(24);
+
+    for index in 0..24 {
+        let amount = 1_000 + (index as i64 * 125);
+        let year = 2023 + index / 12;
+        let month = index % 12 + 1;
+        let date = format!("{year:04}-{month:02}-15");
+        let (from, to) = if index % 2 == 0 {
+            (main, savings)
+        } else {
+            (savings, main)
+        };
+
+        rows.push(StatementRow {
+            account: from,
+            amount: -amount,
+            date: date.clone(),
+        });
+        rows.push(StatementRow {
+            account: to,
+            amount,
+            date: date.clone(),
+        });
+        operations.push(json!({
+            "account": from,
+            "type": "transfer",
+            "to_account": to,
+            "amount": format!("{amount}.00"),
+            "currency": "RUB",
+            "dates": { "cash_posted": date },
+            "idempotency_key": format!("statement-transfer-{index}"),
+        }));
+    }
+
+    (rows, operations)
+}
+
+/// The diagnosis fixture compares `reports/assets` with the sum of each
+/// account's own statement rows. It deliberately uses no opening assertion, so
+/// the published cash is the report's movement figure, not a balance.
+#[tokio::test]
+async fn both_sides_of_bidirectional_statement_match_asset_movements() {
+    let harness = harness();
+    let main = create_account(&harness, "Main", "Northline").await;
+    let savings = create_account(&harness, "Savings", "Northline").await;
+    let (statement, operations) = bidirectional_statement_fixture(main, savings);
+
+    let expected: BTreeMap<Uuid, i64> =
+        statement.iter().fold(BTreeMap::new(), |mut totals, row| {
+            *totals.entry(row.account).or_default() += row.amount;
+            totals
+        });
+    assert_eq!(statement.len(), 48);
+    assert_eq!(
+        statement
+            .iter()
+            .map(|row| row.date.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        24
+    );
+
+    submit(
+        &harness,
+        &json!({
+            "source_label": "synthetic bidirectional statement",
+            "operations": operations,
+        }),
+    )
+    .await;
+    let contour = draw_contour(&harness, "Household", &[main, savings]).await;
+    let snapshot = asset_snapshot(&harness, &contour, "2025-01-01").await;
+
+    for (account, total) in expected {
+        let row = snapshot["accounts"]
+            .as_array()
+            .expect("asset rows")
+            .iter()
+            .find(|row| row["account"] == json!(account.to_string()))
+            .unwrap_or_else(|| panic!("asset report omitted {account}: {snapshot}"));
+        let cash = row["cash"].as_array().expect("cash rows");
+        let rub = cash
+            .iter()
+            .find(|cash| cash["currency"] == "RUB")
+            .unwrap_or_else(|| panic!("asset report omitted RUB for {account}: {row}"));
+        assert_eq!(
+            rub["kind"], "movement_since_unknown_start",
+            "diagnostic fixture must remain a movement: {row}"
+        );
+        assert_eq!(
+            rub["movement"],
+            format!("{total}.00"),
+            "asset movement differs from the account's own statement rows: {row}"
+        );
+    }
+}
+// ---------------------------------------------------------------------------
+// Existing month fixture: one month, two institutions, invented from nothing
 // ---------------------------------------------------------------------------
 
 /// The month the whole file reports on.

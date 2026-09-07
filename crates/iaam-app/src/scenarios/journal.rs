@@ -14,6 +14,7 @@
 //! one cash leg — and the route says so in its own description rather than
 //! leaving an agent to discover it from the field names.
 
+use iaam_core::category::row_key;
 use iaam_core::dates::EventDates;
 use iaam_core::event::kind::{
     EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TaxOrigin, TradeSide,
@@ -153,6 +154,11 @@ pub struct JournalEventView {
     pub relation: Relation,
     pub confidence: Confidence,
     pub idempotency_key: Option<String>,
+    /// The exact key consumed by `CategoryMatcher::Row`.
+    ///
+    /// A source operation id has precedence over the caller's idempotency key,
+    /// matching category assignment and category-rule preview.
+    pub row_key: Option<String>,
     pub source: SourceId,
     /// The import this fact arrived in, when the submission named one.
     ///
@@ -316,6 +322,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         relation: event.relation,
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
+        row_key: row_key(event).map(str::to_owned),
         source: event.provenance.source(),
         import: event.provenance.import(),
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),

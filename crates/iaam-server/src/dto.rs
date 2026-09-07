@@ -25,7 +25,9 @@ use iaam_app::ports::{
     TokenView,
 };
 use iaam_app::ports::{ImportSessionSummaryView, ImportSessionView, Recorded};
-use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
+use iaam_app::scenarios::categories::{
+    CategoryMove, CategoryPreviewRow, CategoryRuleImpact, MonthlyImpact,
+};
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
 };
@@ -102,6 +104,7 @@ use iaam_core::valuation::{
 };
 use rust_decimal::Decimal;
 use serde::de;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -7787,15 +7790,40 @@ impl CategoryDto {
 /// The exact matcher shapes accepted by category-rule create and preview.
 ///
 /// The externally tagged representation keeps the JSON key identical to the
-/// stored matcher and makes the value's meaning explicit:
-/// `{"row":"..."}`, `{"source_category":"..."}`, or
+/// stored matcher:
+/// `{"row":"..."}`, `{"source_category":"..."}`,
+/// `{"description_equals":"..."}`, `{"description_starts_with":"..."}`, or
 /// `{"description_contains":"..."}`.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, ToSchema)]
 pub enum CategoryMatcherDto {
     Row(String),
     SourceCategory(String),
+    DescriptionEquals(String),
+    DescriptionStartsWith(String),
     DescriptionContains(String),
+}
+
+impl Serialize for CategoryMatcherDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut object = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Row(value) => object.serialize_entry("row", value)?,
+            Self::SourceCategory(value) => object.serialize_entry("source_category", value)?,
+            Self::DescriptionEquals(value) => {
+                object.serialize_entry("description_equals", value)?;
+            }
+            Self::DescriptionStartsWith(value) => {
+                object.serialize_entry("description_starts_with", value)?;
+            }
+            Self::DescriptionContains(value) => {
+                object.serialize_entry("description_contains", value)?;
+            }
+        }
+        object.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for CategoryMatcherDto {
@@ -7811,24 +7839,24 @@ impl<'de> Deserialize<'de> for CategoryMatcherDto {
         };
         if object.len() != 1 {
             return Err(de::Error::custom(
-                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+                "invalid value, expected one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
             ));
         }
         let (kind, value) = object
             .iter()
             .next()
             .expect("a non-empty object has a matcher entry");
-        let Some(value) = value.as_str() else {
-            return Err(de::Error::custom(
-                "invalid value, expected one of `row`, `source_category`, `description_contains`",
-            ));
-        };
+        let value = value
+            .as_str()
+            .ok_or_else(|| de::Error::custom("invalid value, expected a string matcher value"))?;
         match kind.as_str() {
             "row" => Ok(Self::Row(value.to_owned())),
             "source_category" => Ok(Self::SourceCategory(value.to_owned())),
+            "description_equals" => Ok(Self::DescriptionEquals(value.to_owned())),
+            "description_starts_with" => Ok(Self::DescriptionStartsWith(value.to_owned())),
             "description_contains" => Ok(Self::DescriptionContains(value.to_owned())),
             _ => Err(de::Error::custom(
-                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+                "invalid value, expected one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
             )),
         }
     }
@@ -7924,6 +7952,8 @@ pub struct CategoryRuleRequest {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleImpactDto {
     pub rows: u64,
+    /// Each affected event before the monthly aggregates below.
+    pub preview_rows: Vec<CategoryPreviewRowDto>,
     /// The movements the proposed rule causes, month by month.
     ///
     /// **Everything a category rule can move is in this list.** Changing only a
@@ -7942,6 +7972,13 @@ pub struct CategoryRuleImpactDto {
     /// explanation of the same one. No rule performs that change, and it is not
     /// asked for here: it goes back through the channel the fact arrived by.
     pub months: Vec<MonthlyImpactDto>,
+}
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryPreviewRowDto {
+    pub row_key: Option<String>,
+    pub from: Option<Uuid>,
+    pub to: Uuid,
+    pub amount: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -7965,11 +8002,26 @@ impl CategoryRuleImpactDto {
     pub fn from_domain(impact: CategoryRuleImpact) -> Self {
         Self {
             rows: impact.rows,
+            preview_rows: impact
+                .preview_rows
+                .into_iter()
+                .map(CategoryPreviewRowDto::from_domain)
+                .collect(),
             months: impact
                 .months
                 .into_iter()
                 .map(MonthlyImpactDto::from_domain)
                 .collect(),
+        }
+    }
+}
+impl CategoryPreviewRowDto {
+    fn from_domain(row: CategoryPreviewRow) -> Self {
+        Self {
+            row_key: row.row_key,
+            from: row.from.map(|id| id.inner()),
+            to: row.to.inner(),
+            amount: row.amount.to_calc_dec().inner().to_string(),
         }
     }
 }
@@ -9168,6 +9220,9 @@ pub struct JournalEventReadDto {
     /// The client key supplied at ingest, if one was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// The exact key consumed by a `row` category matcher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_key: Option<String>,
     /// Identity of the source this row arrived from. Derived from the owner,
     /// the account and the channel when the caller declared a source, and
     /// minted per request when it did not.
@@ -9510,6 +9565,7 @@ impl JournalEventReadDto {
             relation: JournalRelationDto::from_domain(view.relation),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
+            row_key: view.row_key.clone(),
             source: view.source.inner(),
             import: view.import.map(|import| import.inner()),
             source_operation_id: view.source_operation_id.clone(),

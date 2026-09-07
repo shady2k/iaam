@@ -4101,6 +4101,7 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
             .iter()
             .find(|row| row["idempotency_key"] == key)
             .unwrap_or_else(|| panic!("{key} is in the journal: {recorded:?}"));
+        assert_eq!(row["row_key"], key);
         assert_eq!(
             row["account"],
             json!(harness.account.inner()),
@@ -9195,6 +9196,7 @@ async fn category_rule_preview_does_not_write_and_rules_are_listed() {
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 1);
+    assert_eq!(impact["preview_rows"][0]["row_key"], "preview-other");
     assert_eq!(impact["months"][0]["month"], "2026-08-01");
     assert_eq!(impact["months"][0]["moved"][0]["from"], Value::Null);
     assert_eq!(impact["months"][0]["moved"][0]["to"], category_id);
@@ -9274,6 +9276,10 @@ async fn a_row_rule_pins_a_row_whose_source_named_no_identifier() {
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 1, "{impact}");
+    assert_eq!(
+        impact["preview_rows"][0]["row_key"],
+        "tbank/file/deadbeef/1"
+    );
 }
 
 #[tokio::test]
@@ -9345,6 +9351,28 @@ async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 1, "{impact}");
+    // A kind per mode, not one kind carrying a mode: `description_contains`
+    // goes on taking the string it took before, so a rule already written
+    // against it keeps its meaning and its spelling (`iaam-v77v`).
+    for (key, text) in [
+        ("description_equals", "corner shop"),
+        ("description_starts_with", "corner"),
+    ] {
+        let (status, impact) = call(
+            &harness.router,
+            post(
+                "/v1/category-rules/preview",
+                &harness.owner_token,
+                &json!({
+                    "matcher": { key: text },
+                    "category": category_id,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{key}: {impact}");
+        assert_eq!(impact["rows"], 1, "{key}: {impact}");
+    }
 
     drop(harness);
     let _ = std::fs::remove_file(path);
@@ -9497,20 +9525,13 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(body["code"], "not_found");
 
     // One shape per kind, and it is the shape the contract publishes.
-    //
-    // This list held five, and that was the defect (`iaam-ecq1`): a JSON string
-    // containing JSON, `{kind, value: "…"}`, `{kind, value: {key: …}}`,
-    // `{kind, value: {text: …}}` and `{field: "…"}` were all accepted, because
-    // the request was read by a chain of `or_else` calls rather than by a type.
-    // What the API accepted was therefore decided by the order of that chain,
-    // and the form a reader of the source guesses first — `{kind, text}`, after
-    // the internal `DescriptionContains { text }` — was the one it refused. The
-    // field report that found this had to read the source to write a rule at
-    // all, and this repository's own tests used two of the spellings the
-    // contract never mentioned.
+    // Nested description modes are intentionally refused: each mode has its
+    // own externally tagged key so the owner's choice is visible in the rule.
     let matcher_forms = [
         json!({"row": "row-1"}),
         json!({"source_category": "Supermarkets"}),
+        json!({"description_equals": "bakery"}),
+        json!({"description_starts_with": "bak"}),
         json!({"description_contains": "bakery"}),
     ];
     for (index, matcher) in matcher_forms.into_iter().enumerate() {
@@ -9538,12 +9559,12 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
         (
             json!({}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         (
             json!({"kind": "unknown", "value": "x"}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         // The four spellings the fallback chain used to take. They are refused
         // by the same sentence as anything else unknown: a shape nobody meant
@@ -9556,17 +9577,25 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
         (
             json!({"kind": "row", "value": "row-2"}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         (
             json!({"kind": "row", "value": {"key": "row-2"}}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
         ),
         (
             json!({"kind": "description_contains", "value": {"text": "cafe"}}),
             "matcher",
-            "one of `row`, `source_category`, `description_contains`",
+            "one of `row`, `source_category`, `description_equals`, `description_starts_with`, `description_contains`",
+        ),
+        // The shape a mode-carrying value would have had. Its refusal names the
+        // value rather than the key list, and that is the better sentence: the
+        // kind was understood and what it takes is a string.
+        (
+            json!({"description_contains": {"text": "cafe", "mode": "equals"}}),
+            "matcher",
+            "a string matcher value",
         ),
     ] {
         let (status, body) = call(
@@ -9590,9 +9619,12 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{rules}");
-    // One per published matcher kind. It was five while five spellings were
-    // accepted, and three of those five were the same rule written differently.
-    assert_eq!(rules.as_array().expect("rule list").len(), 3);
+    // One per published matcher kind, and the number is the point: it was five
+    // when six spellings were accepted, because three of those were one rule
+    // written three ways. It is five again now for the opposite reason — five
+    // kinds, each said one way, and `description_equals` is a different rule
+    // from `description_contains` rather than the same one dressed differently.
+    assert_eq!(rules.as_array().expect("rule list").len(), 5);
     let (status, impact) = call(
         &harness.router,
         post(
@@ -9658,7 +9690,7 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(body["field"], "matcher");
     assert_eq!(
         body["expected"],
-        "row, source_category, or description_contains"
+        "row, source_category, description_equals, description_starts_with, or description_contains"
     );
 
     drop(harness);
@@ -20670,6 +20702,12 @@ async fn a_row_identified_by_its_source_is_a_duplicate_before_the_commit_says_so
         before + 1,
         "one statement fed twice is one movement"
     );
+    let recorded = journal_events(&harness).await;
+    let row = recorded
+        .iter()
+        .find(|row| row["source_operation_id"] == "statement-row-7")
+        .expect("source-identified row is in the journal");
+    assert_eq!(row["row_key"], "statement-row-7");
 }
 
 /// A row that names no identity at all is disclosed, never merged and never

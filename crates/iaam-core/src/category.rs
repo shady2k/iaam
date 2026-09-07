@@ -22,8 +22,23 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use time::Date;
 
+use crate::event::Event;
 use crate::ids::{CategoryId, CategoryRuleId};
 use crate::money::{CurrencyCode, Money, MoneyError};
+
+/// The stable row key used by category row matchers.
+///
+/// A source operation identifier outranks the caller's idempotency key because
+/// that is the same precedence used when a row is assigned. Publishing this
+/// helper's result keeps the journal and category-rule preview on the exact
+/// identity `CategoryMatcher::Row` matches.
+#[must_use]
+pub fn row_key(event: &Event) -> Option<&str> {
+    event
+        .provenance
+        .source_operation_id()
+        .or(event.idempotency_key.as_deref())
+}
 
 /// The inclusive validity interval of a category rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +73,25 @@ pub enum CategoryBasis {
 }
 
 /// A category rule matcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DescriptionMatchMode {
+    Equals,
+    StartsWith,
+    Contains,
+}
+
+impl DescriptionMatchMode {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Equals => "equals",
+            Self::StartsWith => "starts_with",
+            Self::Contains => "contains",
+        }
+    }
+}
+
+/// A category rule matcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CategoryMatcher {
     /// One specific row, by its stable key. The owner's hand-made decision.
@@ -65,7 +99,15 @@ pub enum CategoryMatcher {
     /// The source's own category value, matched exactly.
     SourceCategory { value: String },
     /// A case-insensitive substring of the counterparty or description.
+    ///
+    /// This is the legacy stored form. It remains a `contains` matcher so
+    /// existing rules retain their meaning.
     DescriptionContains { text: String },
+    /// A description matcher with an explicit mode.
+    Description {
+        text: String,
+        mode: DescriptionMatchMode,
+    },
 }
 
 impl CategoryMatcher {
@@ -76,18 +118,34 @@ impl CategoryMatcher {
                 !value.is_empty() && subject.source_category == Some(value.as_str())
             }
             Self::DescriptionContains { text } => {
-                if text.is_empty() {
-                    return false;
-                }
-                let wanted = text.to_lowercase();
-                subject
-                    .counterparty
-                    .into_iter()
-                    .chain(subject.description)
-                    .any(|candidate| candidate.to_lowercase().contains(&wanted))
+                description_matches(text, DescriptionMatchMode::Contains, subject)
             }
+            Self::Description { text, mode } => description_matches(text, *mode, subject),
         }
     }
+}
+
+fn description_matches(
+    text: &str,
+    mode: DescriptionMatchMode,
+    subject: &CategorySubject<'_>,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let wanted = text.to_lowercase();
+    subject
+        .counterparty
+        .into_iter()
+        .chain(subject.description)
+        .any(|candidate| {
+            let candidate = candidate.to_lowercase();
+            match mode {
+                DescriptionMatchMode::Equals => candidate == wanted,
+                DescriptionMatchMode::StartsWith => candidate.starts_with(&wanted),
+                DescriptionMatchMode::Contains => candidate.contains(&wanted),
+            }
+        })
 }
 
 /// A versioned rule assigning one owner category.
@@ -161,14 +219,19 @@ pub enum CategoryAssignment {
     NotDecomposed,
 }
 
-/// Assign a category using explicit precedence and the latest matching version.
+/// Assign a category using explicit precedence and a deterministic match priority.
+///
+/// The matcher arms remain ordered by kind. Within an arm, the longest matcher
+/// text wins, then the newest version, then the rule id. The final key is only
+/// a deterministic tie-breaker; assignment never depends on slice or store
+/// iteration order.
 pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> CategoryAssignment {
     let row_rule = rules
         .iter()
         .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| matches!(rule.matcher, CategoryMatcher::Row { .. }))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule.version);
+        .max_by_key(|rule| rule_priority(rule));
     if let Some(rule) = row_rule {
         return assignment_for_rule(rule);
     }
@@ -178,22 +241,37 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| matches!(rule.matcher, CategoryMatcher::SourceCategory { .. }))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule.version);
+        .max_by_key(|rule| rule_priority(rule));
     if let Some(rule) = source_rule {
         return assignment_for_rule(rule);
     }
 
     let description_rule = rules
         .iter()
+        .filter(|rule| {
+            matches!(
+                rule.matcher,
+                CategoryMatcher::DescriptionContains { .. } | CategoryMatcher::Description { .. }
+            )
+        })
         .filter(|rule| rule.interval.covers(subject.on))
-        .filter(|rule| matches!(rule.matcher, CategoryMatcher::DescriptionContains { .. }))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule.version);
+        .max_by_key(|rule| rule_priority(rule));
     if let Some(rule) = description_rule {
         return assignment_for_rule(rule);
     }
 
     CategoryAssignment::NotDecomposed
+}
+
+fn rule_priority(rule: &CategoryRule) -> (usize, u32, CategoryRuleId) {
+    let text_len = match &rule.matcher {
+        CategoryMatcher::Row { key } => key.chars().count(),
+        CategoryMatcher::SourceCategory { value } => value.chars().count(),
+        CategoryMatcher::DescriptionContains { text }
+        | CategoryMatcher::Description { text, .. } => text.chars().count(),
+    };
+    (text_len, rule.version, rule.id)
 }
 
 /// Assign using a not-yet-persisted proposal as the newest rule of its kind.
@@ -217,7 +295,7 @@ pub fn assign_with_proposed(
             },
         )
         | (
-            CategoryMatcher::DescriptionContains { .. },
+            CategoryMatcher::DescriptionContains { .. } | CategoryMatcher::Description { .. },
             CategoryAssignment::Assigned {
                 basis: CategoryBasis::Row { .. } | CategoryBasis::SourceCategory { .. },
                 ..
@@ -235,7 +313,7 @@ fn assignment_for_rule(rule: &CategoryRule) -> CategoryAssignment {
             CategoryMatcher::SourceCategory { .. } => {
                 CategoryBasis::SourceCategory { rule: rule.id }
             }
-            CategoryMatcher::DescriptionContains { .. } => {
+            CategoryMatcher::DescriptionContains { .. } | CategoryMatcher::Description { .. } => {
                 CategoryBasis::Description { rule: rule.id }
             }
         },
@@ -250,7 +328,7 @@ fn proposal_assignment(proposed: &CategoryRuleProposal) -> CategoryAssignment {
             CategoryMatcher::SourceCategory { .. } => {
                 CategoryBasis::SourceCategory { rule: proposed.id }
             }
-            CategoryMatcher::DescriptionContains { .. } => {
+            CategoryMatcher::DescriptionContains { .. } | CategoryMatcher::Description { .. } => {
                 CategoryBasis::Description { rule: proposed.id }
             }
         },
@@ -319,8 +397,8 @@ mod tests {
 
     use super::{
         CategoryAssignment, CategoryBasis, CategoryImpactRow, CategoryInterval, CategoryMatcher,
-        CategoryRule, CategoryRuleProposal, CategorySubject, assign, assign_with_proposed,
-        group_category_impacts,
+        CategoryRule, CategoryRuleProposal, CategorySubject, DescriptionMatchMode, assign,
+        assign_with_proposed, group_category_impacts,
     };
 
     fn rule(
@@ -556,6 +634,90 @@ mod tests {
             CategoryAssignment::Assigned { category, .. }
                 if category == CategoryId(uuid::Uuid::from_u128(new))
         ));
+    }
+    #[test]
+    fn overlapping_description_rules_choose_the_longest_match_not_slice_order() {
+        let short = rule(
+            1,
+            1,
+            CategoryMatcher::DescriptionContains {
+                text: "market".into(),
+            },
+            None,
+            None,
+            10,
+        );
+        let long = rule(
+            2,
+            1,
+            CategoryMatcher::Description {
+                text: "corner market".into(),
+                mode: DescriptionMatchMode::Contains,
+            },
+            None,
+            None,
+            20,
+        );
+        let subject = CategorySubject {
+            row_key: None,
+            source_category: None,
+            counterparty: None,
+            description: Some("Corner Market on Main"),
+            on: date!(2026 - 08 - 01),
+        };
+
+        for rules in [vec![short.clone(), long.clone()], vec![long, short]] {
+            assert_eq!(
+                assign(&subject, &rules),
+                CategoryAssignment::Assigned {
+                    category: CategoryId(uuid::Uuid::from_u128(20)),
+                    basis: CategoryBasis::Description {
+                        rule: CategoryRuleId(uuid::Uuid::from_u128(2)),
+                    },
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn description_match_modes_are_case_insensitive_and_bounded() {
+        let subject = |description| CategorySubject {
+            row_key: None,
+            source_category: None,
+            counterparty: None,
+            description: Some(description),
+            on: date!(2026 - 08 - 01),
+        };
+        for (mode, description, matches) in [
+            (DescriptionMatchMode::Equals, "CORNER SHOP", true),
+            (DescriptionMatchMode::Equals, "CORNER SHOP AT NOON", false),
+            (
+                DescriptionMatchMode::StartsWith,
+                "CORNER SHOP AT NOON",
+                true,
+            ),
+            (DescriptionMatchMode::StartsWith, "A CORNER SHOP", false),
+            (DescriptionMatchMode::Contains, "A CORNER SHOP", true),
+        ] {
+            let rules = [rule(
+                1,
+                1,
+                CategoryMatcher::Description {
+                    text: "corner shop".into(),
+                    mode,
+                },
+                None,
+                None,
+                10,
+            )];
+            assert_eq!(
+                matches!(
+                    assign(&subject(description), &rules),
+                    CategoryAssignment::Assigned { .. }
+                ),
+                matches
+            );
+        }
     }
 
     #[test]

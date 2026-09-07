@@ -53,7 +53,9 @@ use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
     sync_market_with_services as run_market_sync,
 };
-use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
+use iaam_core::category::{
+    CategoryInterval, CategoryMatcher, CategoryRuleProposal, DescriptionMatchMode,
+};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
@@ -5270,6 +5272,14 @@ fn parse_category_matcher(value: CategoryMatcherDto) -> CategoryMatcher {
     match value {
         CategoryMatcherDto::Row(key) => CategoryMatcher::Row { key },
         CategoryMatcherDto::SourceCategory(value) => CategoryMatcher::SourceCategory { value },
+        CategoryMatcherDto::DescriptionEquals(text) => CategoryMatcher::Description {
+            text,
+            mode: DescriptionMatchMode::Equals,
+        },
+        CategoryMatcherDto::DescriptionStartsWith(text) => CategoryMatcher::Description {
+            text,
+            mode: DescriptionMatchMode::StartsWith,
+        },
         CategoryMatcherDto::DescriptionContains(text) => {
             CategoryMatcher::DescriptionContains { text }
         }

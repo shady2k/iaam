@@ -10680,7 +10680,8 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
         .find(|action| action["kind"] == "undecomposed_outflows")
         .unwrap_or_else(|| panic!("a rule-remediable item: {body}"));
     assert_eq!(outflow["state"], "needs_owner_input", "{outflow}");
-    assert_eq!(outflow["category"], "recommended", "{outflow}");
+    assert_eq!(outflow["category"], "required_for_goal", "{outflow}");
+    assert_eq!(outflow["goals"], json!(["money_flow"]), "{outflow}");
     assert_eq!(outflow["required_scope"], "agent", "{outflow}");
     let target = &outflow["target"];
     assert_eq!(target["type"], "operation", "{outflow}");

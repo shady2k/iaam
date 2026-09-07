@@ -726,12 +726,14 @@ fn correction_refusal(error: &CorrectionError, candidates: &[EventId]) -> AppErr
     }
 }
 
-/// Refuse a correction whose idempotency key is held by an unrelated event.
+/// Refuse a correction whose idempotency key is already occupied.
 ///
-/// Without this the store would answer «duplicate», which the caller reads as
-/// «already corrected», while the correction was in fact swallowed by an
-/// ordinary operation that happened to be submitted under that key. Custody
-/// repair makes the same check for the same reason.
+/// Keys identify submissions forever, including facts that no longer count.
+/// A key held by an unrelated live event is still the old conflict. A key held
+/// by an event that a reversal or replacement removed from the effective
+/// journal needs a different answer: it is occupied, but the event named by
+/// the duplicate is not still standing, and the caller must state the
+/// replacement correction explicitly.
 fn refuse_occupied_keys(journal: &[Event], candidates: &[Event]) -> Result<(), AppError> {
     let occupied: BTreeMap<&str, &Event> = journal
         .iter()
@@ -744,6 +746,17 @@ fn refuse_occupied_keys(journal: &[Event], candidates: &[Event]) -> Result<(), A
         let Some(existing) = occupied.get(key) else {
             continue;
         };
+        if let Some(disposition) = removal_disposition(journal, existing.id) {
+            return Err(AppError::Conflict {
+                what: format!(
+                    "correction idempotency key {key} is held by event {:?}, which was \
+                     {disposition}; submit POST /v1/corrections with a new idempotency key \
+                     and a replacement correction operation (relation: replacement, target: {:?}) \
+                     to record the corrected value",
+                    existing.id, existing.id
+                ),
+            });
+        }
         if existing.relation != candidate.relation {
             return Err(AppError::Conflict {
                 what: format!(
@@ -754,6 +767,29 @@ fn refuse_occupied_keys(journal: &[Event], candidates: &[Event]) -> Result<(), A
         }
     }
     Ok(())
+}
+
+/// Why an event with an occupied key is no longer effective, if a correction
+/// removed it from the journal's effective set.
+fn removal_disposition(journal: &[Event], event: EventId) -> Option<&'static str> {
+    let withdrawn = journal.iter().any(|candidate| {
+        matches!(
+            candidate.relation,
+            Relation::Reversal { target } if target == event
+        )
+    });
+    let superseded = journal.iter().any(|candidate| {
+        matches!(
+            candidate.relation,
+            Relation::Replacement { target } if target == event
+        )
+    });
+    match (withdrawn, superseded) {
+        (true, true) => Some("withdrawn and superseded"),
+        (true, false) => Some("withdrawn"),
+        (false, true) => Some("superseded"),
+        (false, false) => None,
+    }
 }
 
 /// Build the event one correction writes.
@@ -1262,9 +1298,85 @@ mod tests {
 
         let error = checked_against_resolve(vec![original, squatter], vec![candidate])
             .expect_err("the key is held by an ordinary operation");
+        let AppError::Conflict { what } = error else {
+            panic!("expected a conflict, got {error:?}");
+        };
+        assert!(what.contains("not this correction"), "{what}");
+        assert!(!what.contains("withdrawn"), "{what}");
+        assert!(!what.contains("superseded"), "{what}");
+    }
+
+    #[test]
+    fn a_correction_key_held_by_a_withdrawn_event_requires_a_replacement() {
+        let source = SourceId::new_random();
+        let mut original = deposit(1, source);
+        original.idempotency_key = Some("corrected-value".to_owned());
+        let reversal = reversal_for(&original, PrincipalId(uuid::Uuid::from_u128(4)));
+
+        let mut candidate = deposit(2, source);
+        candidate.relation = Relation::Replacement {
+            target: original.id,
+        };
+        candidate.idempotency_key = original.idempotency_key.clone();
+
+        let error = checked_against_resolve(vec![original.clone(), reversal], vec![candidate])
+            .expect_err("an occupied key from a withdrawn event is not reusable");
+        let AppError::Conflict { what } = error else {
+            panic!("expected a conflict, got {error:?}");
+        };
+        assert!(what.contains("withdrawn"), "{what}");
+        assert!(what.contains("POST /v1/corrections"), "{what}");
+        assert!(what.contains("relation: replacement"), "{what}");
+        assert!(what.contains("replacement correction operation"), "{what}");
+        assert!(what.contains("new idempotency key"), "{what}");
+        assert!(what.contains(&original.id.inner().to_string()), "{what}");
+        assert!(!what.contains("duplicate"), "{what}");
+    }
+
+    #[test]
+    fn a_correction_key_held_by_a_superseded_event_requires_a_replacement() {
+        let source = SourceId::new_random();
+        let original = deposit(1, source);
+        let mut superseded = deposit(2, source);
+        superseded.idempotency_key = Some("superseded-value".to_owned());
+        superseded.relation = Relation::Replacement {
+            target: original.id,
+        };
+        let mut current = deposit(3, source);
+        current.relation = Relation::Replacement {
+            target: superseded.id,
+        };
+
+        let mut candidate = deposit(4, source);
+        candidate.relation = Relation::Reversal {
+            target: superseded.id,
+        };
+        candidate.idempotency_key = superseded.idempotency_key.clone();
+
+        let error =
+            checked_against_resolve(vec![original, superseded.clone(), current], vec![candidate])
+                .expect_err("a key held by a superseded event is not reusable");
+        let AppError::Conflict { what } = error else {
+            panic!("expected a conflict, got {error:?}");
+        };
+        assert!(what.contains("superseded"), "{what}");
+        assert!(what.contains("POST /v1/corrections"), "{what}");
+        assert!(what.contains("relation: replacement"), "{what}");
+        assert!(what.contains("replacement correction operation"), "{what}");
+        assert!(what.contains("new idempotency key"), "{what}");
+        assert!(what.contains(&superseded.id.inner().to_string()), "{what}");
+        assert!(!what.contains("duplicate"), "{what}");
+    }
+
+    #[test]
+    fn a_repeat_of_the_same_correction_remains_an_idempotent_duplicate() {
+        let original = deposit(1, SourceId::new_random());
+        let existing = reversal_for(&original, PrincipalId(uuid::Uuid::from_u128(4)));
+        let candidate = reversal_for(&original, PrincipalId(uuid::Uuid::from_u128(4)));
+
         assert!(
-            matches!(error, AppError::Conflict { .. }),
-            "expected a conflict, got {error:?}"
+            checked_against_resolve(vec![original, existing], vec![candidate]).is_ok(),
+            "the same correction key remains eligible for the store's duplicate verdict"
         );
     }
 

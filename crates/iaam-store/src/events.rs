@@ -6,7 +6,7 @@ use iaam_core::event::kind::{
 };
 use iaam_core::event::{Event, Relation};
 use iaam_core::ids::{
-    AccountId, ClassificationRuleId, EventId, ImportSessionId, OwnerId, SourceId,
+    AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
 };
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};

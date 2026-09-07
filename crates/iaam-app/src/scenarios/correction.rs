@@ -771,7 +771,7 @@ fn refuse_occupied_keys(journal: &[Event], candidates: &[Event]) -> Result<(), A
 
 /// Why an event with an occupied key is no longer effective, if a correction
 /// removed it from the journal's effective set.
-fn removal_disposition(journal: &[Event], event: EventId) -> Option<&'static str> {
+pub(crate) fn removal_disposition(journal: &[Event], event: EventId) -> Option<&'static str> {
     let withdrawn = journal.iter().any(|candidate| {
         matches!(
             candidate.relation,

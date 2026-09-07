@@ -307,13 +307,37 @@ pub async fn record_candidate(
     if let Some(rejection) = structural_rejection(&event, field) {
         return Ok(Verdict::Rejected { rejection });
     }
-
+    let owner = event.owner;
+    let idempotency_key = event.idempotency_key.as_deref().map(str::to_owned);
     let recorded = append_checked(services, vec![event], IdentityScope::Source).await?;
     Ok(match recorded.first() {
         Some(Recorded::Inserted { id }) => Verdict::Provisional { event: *id },
-        Some(Recorded::Duplicate { existing }) => Verdict::Duplicate {
-            existing: *existing,
-        },
+        Some(Recorded::Duplicate { existing }) => {
+            let journal = services
+                .store
+                .load_events_through(owner, time::Date::MAX)
+                .await?;
+            if let Some(disposition) =
+                crate::scenarios::correction::removal_disposition(&journal, *existing)
+            {
+                let identity = idempotency_key.as_deref().map_or_else(
+                    || "the source operation identity".to_owned(),
+                    |key| format!("idempotency key {key}"),
+                );
+                return Err(AppError::Conflict {
+                    what: format!(
+                        "{identity} is held by event {:?}, which was {disposition}; submit \
+                         POST /v1/corrections with a new idempotency key and a replacement \
+                         correction operation (relation: replacement, target: {:?}) to record \
+                         the corrected value",
+                        existing, existing
+                    ),
+                });
+            }
+            Verdict::Duplicate {
+                existing: *existing,
+            }
+        }
         None => Verdict::Rejected {
             rejection: Rejection {
                 field: "storage".into(),

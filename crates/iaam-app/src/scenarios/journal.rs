@@ -16,6 +16,7 @@
 
 use iaam_core::category::row_key;
 use iaam_core::dates::EventDates;
+use iaam_core::event::correction::{SupersededBy, resolve_with_supersession};
 use iaam_core::event::kind::{
     EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TaxOrigin, TradeSide,
 };
@@ -153,9 +154,12 @@ pub struct JournalEventView {
     /// This is separate from `amount`: a trade already publishes its cash and
     /// security legs, while this fee is an audit figure that is not a leg.
     pub basis_fee: Option<Money>,
-    /// Whether this event reverses or replaces another. A reader who cannot see
-    /// that an event was reversed reads a retracted fact as a live one.
+    /// Whether this event reverses or replaces another.
     pub relation: Relation,
+    /// Whether this event was withdrawn without a replacement, or replaced by
+    /// the named event. This is derived from the same correction resolution
+    /// that computes the effective set.
+    pub superseded_by: Option<SupersededBy>,
     pub confidence: Confidence,
     pub idempotency_key: Option<String>,
     /// The exact key consumed by `CategoryMatcher::Row`.
@@ -269,6 +273,16 @@ pub async fn read_journal(
             },
         )
         .await?;
+    let all_events = store
+        .list_journal_events(
+            owner,
+            JournalQuery {
+                limit: u32::MAX,
+                ..JournalQuery::default()
+            },
+        )
+        .await?;
+    let resolution = resolve_with_supersession(&all_events).map_err(AppError::Correction)?;
 
     if events.is_empty() {
         if let Some(key) = query.idempotency_key {
@@ -283,7 +297,7 @@ pub async fn read_journal(
     let rows: Vec<JournalEventView> = events
         .iter()
         .take(limit as usize)
-        .map(journal_event_view)
+        .map(|event| journal_event_view(event, Some(&resolution)))
         .collect();
     let next = has_more
         .then(|| {
@@ -312,7 +326,10 @@ pub async fn list_journal_source_categories(
         .await
 }
 
-fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
+fn journal_event_view(
+    event: &iaam_core::event::Event,
+    resolution: Option<&iaam_core::event::correction::Resolution<'_>>,
+) -> JournalEventView {
     JournalEventView {
         event: event.id,
         account: event.account,
@@ -325,6 +342,7 @@ fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {
         amount: stated_amount(event),
         basis_fee: stated_basis_fee(event),
         relation: event.relation,
+        superseded_by: resolution.and_then(|value| value.superseded_by(event.id)),
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
         row_key: row_key(event).map(str::to_owned),
@@ -548,7 +566,7 @@ fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> Operation
     let mut steps = vec![HistoryStep {
         act: HistoryAct::Arrived,
         at: head.recorded_at.clone(),
-        state: Some(journal_event_view(&head.event)),
+        state: Some(journal_event_view(&head.event, None)),
         changed: Vec::new(),
         reversal: None,
         replacement: None,
@@ -586,7 +604,7 @@ fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> Operation
                     changed: state_for_target(chain, target).map_or_else(Vec::new, |before| {
                         changed_aspects(before, &replacement.event)
                     }),
-                    state: Some(journal_event_view(&replacement.event)),
+                    state: Some(journal_event_view(&replacement.event, None)),
                     reversal: Some(reversal.event.id),
                     replacement: Some(replacement.event.id),
                 });
@@ -598,7 +616,7 @@ fn acts_of<'a>(head: &'a RecordedEvent, chain: &'a [RecordedEvent]) -> Operation
                     at: recorded.recorded_at.clone(),
                     changed: state_for_target(chain, target)
                         .map_or_else(Vec::new, |before| changed_aspects(before, &recorded.event)),
-                    state: Some(journal_event_view(&recorded.event)),
+                    state: Some(journal_event_view(&recorded.event, None)),
                     reversal: reversal_of(chain, target).map(|reversal| reversal.event.id),
                     replacement: Some(recorded.event.id),
                 });
@@ -1819,7 +1837,7 @@ mod tests {
         let ctx = Ctx::new();
         let posted = ctx.deposit(1, 4_500, ctx.main);
 
-        let view = journal_event_view(&posted);
+        let view = journal_event_view(&posted, None);
 
         assert_eq!(view.legs.len(), 1, "the deposit posts its money");
         assert_eq!(view.amount, None, "and states it nowhere else");

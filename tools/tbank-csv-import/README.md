@@ -90,6 +90,16 @@ retracts exactly this run and leaves other months imported through the same
 account and channel in force. Two runs of the same export file are one import
 and the second adds nothing.
 
+The JSON summary includes an `accounts` list for both dry runs and submissions.
+Each entry names the destination account, counts its converted rows, and gives
+money in (`inflow`), money out (`outflow`), and net movement (`net`). The row
+count is intentionally the converted-row count; a paired transfer's discarded
+second leg remains visible in the top-level `dropped_second_leg` counter. The
+`operations` entries also carry the same display name, so a preview shows both
+the per-row destination and the per-account movement. Unpaired internal-transfer
+legs remain counted in `unmatched_legs` and are listed in `unmatched` with their
+statement line, account, timestamp, amount and description.
+
 ## Checking the tool
 
 The fixtures are invented from end to end and exercise every rule below. A

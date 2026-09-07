@@ -284,6 +284,7 @@ def build(
         "dropped_second_leg": 0,
         "skipped_outside_contour": 0,
         "unmatched_legs": 0,
+        "unmatched": [],
         "own_transfers": 0,
     }
 
@@ -322,6 +323,15 @@ def build(
             continue
         if is_internal_transfer(row):
             summary["unmatched_legs"] += 1
+            summary["unmatched"].append(
+                {
+                    "line": positions[id(row)] + 2,
+                    "account": row["Имя счёта"],
+                    "date": row["Дата операции"],
+                    "amount": amount_of(row),
+                    "description": row["Описание"],
+                }
+            )
             print(
                 f"unmatched transfer leg: {row['Дата операции']} {amount_of(row)}",
                 file=sys.stderr,
@@ -349,8 +359,9 @@ def build(
     return operations, summary
 
 
-def operation_summary(operations):
+def operation_summary(operations, account_names=None):
     """Create the compact, stable summary used by the synthetic proof."""
+    account_names = account_names or {}
     hash_counts = defaultdict(int)
     for operation in operations:
         key_parts = operation["idempotency_key"].split("/")
@@ -362,6 +373,7 @@ def operation_summary(operations):
     result = []
     for operation in operations:
         item = {
+            "account": account_names.get(operation["account"], operation["account"]),
             "kind": operation["type"],
             "amount": operation["amount"],
         }
@@ -374,6 +386,36 @@ def operation_summary(operations):
             item["ordinal"] = ordinal
         result.append(item)
     return result
+
+
+def account_summary(operations, account_names=None):
+    """Summarise converted rows as money in, money out, and net movement."""
+    account_names = account_names or {}
+    totals = defaultdict(
+        lambda: {
+            "converted_rows": 0,
+            "inflow": Decimal("0.00"),
+            "outflow": Decimal("0.00"),
+        }
+    )
+    for operation in operations:
+        name = account_names.get(operation["account"], operation["account"])
+        amount = Decimal(operation["amount"])
+        totals[name]["converted_rows"] += 1
+        if operation["type"] in {"withdrawal", "transfer"}:
+            totals[name]["outflow"] += amount
+        else:
+            totals[name]["inflow"] += amount
+    return [
+        {
+            "account": name,
+            "converted_rows": values["converted_rows"],
+            "inflow": format(values["inflow"], "f"),
+            "outflow": format(values["outflow"], "f"),
+            "net": format(values["inflow"] - values["outflow"], "f"),
+        }
+        for name, values in sorted(totals.items())
+    ]
 
 
 def main():
@@ -419,21 +461,31 @@ def main():
     raw_lines = {id(row): line for row, line in zip(rows, lines[1:])}
 
     token = os.environ.get(args.token_env, "")
+    account_names = {}
     if args.account_map:
         with open(args.account_map, encoding="utf-8") as handle:
             account_map = json.load(handle)
         # The map is its own contour, so the preview needs no directory: a name
-        # the file does not list is outside, whatever the server holds.
         if args.dry_run:
             accounts = {export_name: export_name for export_name in account_map}
+            account_names = {
+                export_name: title for export_name, title in account_map.items()
+            }
         else:
             accounts = resolve_accounts(args.base_url, token, account_map)
+            account_names = {
+                accounts[export_name]: title
+                for export_name, title in account_map.items()
+            }
     else:
         # No file: the contour is what iaam identifies. That is a directory
         # read, and a dry run performs it -- a dry run writes nothing, which is
         # not the same promise as touching nothing.
         printed_names = sorted({row["Имя счёта"] for row in rows})
         accounts = identify_accounts(args.base_url, token, printed_names)
+        account_names = {
+            accounts[name]: name for name in printed_names if name in accounts
+        }
         # An unrecognised name is a whole account's month dropped in silence,
         # where a missing line in the map used to be a refusal. It is reported
         # before anything is submitted, because the fix is to declare that
@@ -472,7 +524,8 @@ def main():
         + summary["unmatched_legs"]
     )
     summary["unaccounted"] = len(rows) - accounted
-    summary["operations"] = operation_summary(operations)
+    summary["operations"] = operation_summary(operations, account_names)
+    summary["accounts"] = account_summary(operations, account_names)
     summary["rejected"] = 0
 
     if args.dry_run:

@@ -200,6 +200,13 @@ pub enum OperationKey {
     AddImportRows,
     /// Answer one classification question held open by an import session.
     AnswerImportQuestion,
+    /// Withdraw an answered decision from an open import question.
+    ///
+    /// The question and every uncommitted row settled by the answer are
+    /// reopened together. The retired rule remains in history; this operation
+    /// never revives or edits a standing rule.
+    WithdrawImportAnswer,
+
     /// Write everything one import session holds into the journal, once.
     ///
     /// Named beside [`Self::AbandonImportSession`] because the two are the only
@@ -232,10 +239,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a twenty-first variant to
+    /// The declared length is the only thing holding the twenty-second variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -254,10 +261,12 @@ impl OperationKey {
         Self::ReadImportDocument,
         Self::AddImportRows,
         Self::AnswerImportQuestion,
+        Self::WithdrawImportAnswer,
         Self::CommitImportSession,
         Self::AbandonImportSession,
         Self::SubmitCorrections,
     ];
+
     /// The route operation identifier declared by the transport.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -280,6 +289,7 @@ impl OperationKey {
             Self::ReadImportDocument => "read_import_document",
             Self::AddImportRows => "add_import_rows",
             Self::AnswerImportQuestion => "answer_import_question",
+            Self::WithdrawImportAnswer => "withdraw_import_answer",
             Self::CommitImportSession => "commit_import_session",
             Self::AbandonImportSession => "abandon_import_session",
             Self::SubmitCorrections => "submit_corrections",

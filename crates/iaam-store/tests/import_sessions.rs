@@ -299,6 +299,85 @@ fn an_answer_reaches_both_the_question_and_the_row_it_is_about() {
 }
 
 #[test]
+fn withdrawing_a_retired_answer_reopens_question_and_clears_its_row() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let row = store
+        .add_import_observation(owner, session, Some("row/withdraw"), false, "{}")
+        .expect("row added")
+        .row;
+    let question = store
+        .record_import_question(owner, session, row, &asking())
+        .expect("question recorded");
+    store
+        .answer_import_question(owner, session, question.id, r#"{"answer":"paid"}"#)
+        .expect("answer recorded");
+    store
+        .attach_import_question_rule(owner, session, question.id, "retired-rule")
+        .expect("rule attached");
+
+    let withdrawn = store
+        .withdraw_import_answer(owner, session, question.id)
+        .expect("withdrawal clears provisional state");
+    assert!(withdrawn.is_open());
+    assert_eq!(withdrawn.answer, None);
+    assert_eq!(withdrawn.rule, None);
+    let rows = store.list_import_observations(session).expect("rows");
+    assert_eq!(rows[0].answer, None);
+    assert_eq!(rows[0].answer_rule, None);
+
+    // A second withdrawal cannot erase a different state or pretend the first
+    // one was not already consumed.
+    assert!(
+        store
+            .withdraw_import_answer(owner, session, question.id)
+            .is_err()
+    );
+}
+
+#[test]
+fn withdrawal_refuses_when_a_rule_is_named_by_another_question() {
+    let mut store = store();
+    let owner = OwnerId::new_random();
+    let session = store
+        .open_import_session(owner, None, None, None)
+        .expect("session opens")
+        .id;
+    let first_row = store
+        .add_import_observation(owner, session, Some("row/shared-one"), false, "{}")
+        .expect("row added")
+        .row;
+    let second_row = store
+        .add_import_observation(owner, session, Some("row/shared-two"), false, "{}")
+        .expect("row added")
+        .row;
+    let first = store
+        .record_import_question(owner, session, first_row, &asking())
+        .expect("question recorded");
+    let second = store
+        .record_import_question(owner, session, second_row, &asking())
+        .expect("question recorded");
+    for question in [first.id, second.id] {
+        store
+            .answer_import_question(owner, session, question, r#"{"answer":"paid"}"#)
+            .expect("answer recorded");
+        store
+            .attach_import_question_rule(owner, session, question, "shared-rule")
+            .expect("rule attached");
+    }
+
+    assert!(
+        store
+            .withdraw_import_answer(owner, session, first.id)
+            .is_err(),
+        "one minted rule must not make withdrawal clear another question's answer"
+    );
+}
+#[test]
 fn a_closed_session_takes_nothing_more_and_closes_once() {
     let mut store = store();
     let owner = OwnerId::new_random();

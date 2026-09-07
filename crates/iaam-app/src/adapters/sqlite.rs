@@ -1273,6 +1273,20 @@ impl Store for SqliteAdapter {
         })
         .await
     }
+    async fn withdraw_import_answer(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+    ) -> Result<ImportQuestionView, AppError> {
+        self.blocking(move |store| {
+            store
+                .withdraw_import_answer(owner, session, question)
+                .map(import_question_view)
+                .map_err(import_session_error)
+        })
+        .await
+    }
 
     async fn attach_import_question_rule(
         &self,

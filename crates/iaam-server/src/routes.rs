@@ -4252,6 +4252,42 @@ pub async fn answer_import_question(
     .await?;
     Ok(Json(ImportQuestionDto::from_answered(&answered)))
 }
+/// Withdraw an answer whose standing rule has been retired.
+///
+/// This is the reversible pre-commit half of correcting a mistaken answer.
+/// It clears the question and every uncommitted row that answer settled, while
+/// leaving the retired rule and all committed journal facts unchanged. The
+/// caller then answers the reopened question through the ordinary answer route.
+#[utoipa::path(
+    delete,
+    path = "/v1/import-sessions/{session}/questions/{question}/answer",
+    params(
+        ("session" = Uuid, Path, description = "Import session identifier"),
+        ("question" = Uuid, Path, description = "Question identifier")
+    ),
+    responses(
+        (status = 200, description = "The reopened question", body = ImportQuestionDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "No such question or minted classification rule", body = ApiError),
+        (status = 409, description = "The standing rule is still active", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn withdraw_import_answer(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath((session, question)): ApiPath<(Uuid, Uuid)>,
+) -> Result<Json<ImportQuestionDto>, ApiFailure> {
+    require(&principal, OperationKey::WithdrawImportAnswer)?;
+    let withdrawn = iaam_app::scenarios::import_session::withdraw_answer(
+        &state.services,
+        &principal,
+        ImportSessionId(session),
+        ImportQuestionId(question),
+    )
+    .await?;
+    Ok(Json(ImportQuestionDto::from_domain(&withdrawn)))
+}
 
 /// What the standing decision one answer would keep would settle, before it
 /// stands.

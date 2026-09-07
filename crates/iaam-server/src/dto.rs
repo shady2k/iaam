@@ -1187,6 +1187,13 @@ pub struct CorrectImportRequest {
     /// that re-submitting the same rows does not bring them back.
     #[serde(default)]
     pub acknowledge_retraction: bool,
+    /// Return the impact without appending reversal facts.
+    ///
+    /// Preview uses the same target selection and journal snapshot as a real
+    /// correction. It does not require acknowledgement because it writes
+    /// nothing.
+    #[serde(default)]
+    pub dry_run: bool,
     /// The declaration the import was submitted under — the same account,
     /// channel and label.
     ///
@@ -1207,8 +1214,36 @@ pub struct CorrectImportRequest {
     pub source: DeclaredSourceDto,
 }
 
+/// One account's cash figure before and after an import retraction.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportCorrectionFigureDto {
+    pub currency: CurrencyDto,
+    pub before: String,
+    pub after: String,
+}
+
+/// The facts and cash figures an import retraction touches on one account.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportCorrectionAccountDto {
+    pub account: Uuid,
+    pub facts: usize,
+    pub figures: Vec<ImportCorrectionFigureDto>,
+}
+
+/// Impact summary computed before an import correction is written.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportCorrectionPreviewDto {
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub from: Option<Date>,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub to: Option<Date>,
+    pub accounts: Vec<ImportCorrectionAccountDto>,
+}
+
 /// Outcome of correcting one whole declared import.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportCorrectionDto {
     /// The source the retracted rows arrived through.
     pub source: Uuid,
@@ -1225,6 +1260,10 @@ pub struct ImportCorrectionDto {
     /// Reversal facts written by this run. Nothing was deleted and nothing was
     /// mutated: each is a new event referencing the one it retracts.
     pub written: usize,
+    /// The impact summary computed from the same target set before writing.
+    pub preview: ImportCorrectionPreviewDto,
+    /// Whether this call only previewed and deliberately wrote no facts.
+    pub dry_run: bool,
 }
 
 impl CorrectionDto {
@@ -1350,21 +1389,38 @@ fn changing_a_standing_rule_costs(still_filed: usize) -> String {
          now on: {left_behind}"
     )
 }
-
 impl ImportCorrectionDto {
     #[must_use]
-    pub const fn from_domain(outcome: ImportCorrectionOutcome) -> Self {
+    pub fn from_domain(outcome: ImportCorrectionOutcome) -> Self {
+        let preview = outcome.preview;
         Self {
             source: outcome.source.inner(),
-            // `Option::map` is not a const function, and this conversion is
-            // worth keeping const beside its neighbours.
-            import: match outcome.import {
-                Some(import) => Some(import.inner()),
-                None => None,
-            },
+            import: outcome.import.map(|import| import.inner()),
             affected: outcome.affected,
             already_reversed: outcome.already_reversed,
             written: outcome.written,
+            preview: ImportCorrectionPreviewDto {
+                from: preview.from,
+                to: preview.to,
+                accounts: preview
+                    .accounts
+                    .into_iter()
+                    .map(|account| ImportCorrectionAccountDto {
+                        account: account.account.inner(),
+                        facts: account.facts,
+                        figures: account
+                            .figures
+                            .into_iter()
+                            .map(|figure| ImportCorrectionFigureDto {
+                                currency: CurrencyDto::from_domain(figure.currency),
+                                before: decimal_amount(figure.before),
+                                after: decimal_amount(figure.after),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            },
+            dry_run: outcome.dry_run,
         }
     }
 }
@@ -8308,6 +8364,11 @@ pub struct RuleMatcherDto {
     /// merchant, and such a row is read all the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_code: Option<String>,
+    /// The direction the source stated for the row, matched exactly. This is
+    /// row evidence: it is never inferred from the classification outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub movement: Option<Movement>,
 }
 
 impl RuleMatcherDto {
@@ -8320,6 +8381,7 @@ impl RuleMatcherDto {
             source_category: matcher.source_category.clone(),
             owner_category: matcher.owner_category.clone(),
             source_code: matcher.source_code.clone(),
+            movement: matcher.movement,
         }
     }
 
@@ -8332,6 +8394,7 @@ impl RuleMatcherDto {
             source_category: self.source_category.clone(),
             owner_category: self.owner_category.clone(),
             source_code: self.source_code.clone(),
+            movement: self.movement,
         }
     }
 }

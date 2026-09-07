@@ -29,6 +29,7 @@ fn matcher(
     kind: Option<&str>,
 ) -> RuleMatcher {
     RuleMatcher {
+        movement: None,
         counterparty_account: counterparty.map(str::to_owned),
         description_contains: description.map(str::to_owned),
         kind: kind.map(str::to_owned),
@@ -41,6 +42,7 @@ fn matcher(
 /// A condition asking only about the category the source filed the row under.
 fn filed_under(category: &str) -> RuleMatcher {
     RuleMatcher {
+        movement: None,
         counterparty_account: None,
         description_contains: None,
         kind: None,
@@ -266,6 +268,53 @@ fn a_rule_explains_itself_in_words() {
     assert!(text.contains("commission"), "{text}");
     assert!(text.contains("Other"), "{text}");
     assert!(!text.is_empty());
+}
+#[test]
+fn a_rule_matches_the_direction_stated_by_the_row_not_its_outcome() {
+    let account = AccountId::new_random();
+    let row = ClassificationSubject {
+        account,
+        counterparty: Counterparty::Named("other".to_owned()),
+        description: None,
+        source_kind: None,
+        source_category: None,
+        owner_category: None,
+        source_code: None,
+        movement: Some(Movement::In),
+        far_side: FarSide::Unstated,
+    };
+    let rule = rule(
+        1,
+        RuleMatcher {
+            movement: Some(Movement::In),
+            ..matcher(None, None, None)
+        },
+        Classification::Fee {
+            origin: FeeOrigin::Brokerage,
+        },
+    );
+
+    assert!(matches!(
+        classify(&row, &[rule]),
+        ClassificationResult::Resolved {
+            classification: Classification::Fee { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn a_direction_condition_is_explained_as_money_in_or_out() {
+    let rule = rule(
+        1,
+        RuleMatcher {
+            movement: Some(Movement::Out),
+            ..matcher(None, None, None)
+        },
+        Classification::ExternalFlow,
+    );
+
+    assert!(rule.describe().contains("money going out"));
 }
 
 #[test]
@@ -781,6 +830,7 @@ fn the_fields_of_one_condition_are_joined_with_and() {
     // scoped to a source.
     let mine = AccountId::new_random();
     let both = RuleMatcher {
+        movement: None,
         counterparty_account: Some("Shop One".to_owned()),
         description_contains: None,
         kind: None,
@@ -810,6 +860,7 @@ fn a_rule_reads_back_every_condition_it_was_written_with() {
         id: ClassificationRuleId::new_random(),
         version: 3,
         matcher: RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: Some("credit".to_owned()),
@@ -849,6 +900,7 @@ fn a_rule_may_ask_what_the_owner_filed_the_row_under_and_what_code_it_carries() 
     };
 
     let by_owner_category = RuleMatcher {
+        movement: None,
         counterparty_account: None,
         description_contains: None,
         kind: None,
@@ -857,6 +909,7 @@ fn a_rule_may_ask_what_the_owner_filed_the_row_under_and_what_code_it_carries() 
         source_code: None,
     };
     let by_code = RuleMatcher {
+        movement: None,
         counterparty_account: None,
         description_contains: None,
         kind: None,
@@ -873,6 +926,7 @@ fn a_rule_may_ask_what_the_owner_filed_the_row_under_and_what_code_it_carries() 
     // Exactly, and each against its own field: the owner's word is not the
     // source's word, and neither is the code.
     let other_owner_category = RuleMatcher {
+        movement: None,
         owner_category: Some("Supermarkets".to_owned()),
         ..by_owner_category.clone()
     };
@@ -894,6 +948,7 @@ fn a_rule_may_ask_what_the_owner_filed_the_row_under_and_what_code_it_carries() 
     let wording = rule(
         1,
         RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: None,
@@ -982,6 +1037,7 @@ fn a_rule_the_owner_wrote_beats_the_word_the_source_printed() {
         id: iaam_core::ids::ClassificationRuleId::new_random(),
         version: 1,
         matcher: RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: Some("INNER".to_owned()),

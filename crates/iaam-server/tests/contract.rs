@@ -4329,6 +4329,57 @@ async fn retract_csv_import(harness: &Harness, label: Option<&str>) -> (StatusCo
     .await
 }
 
+async fn preview_csv_import(harness: &Harness, label: &str) -> (StatusCode, Value) {
+    let source = json!({
+        "account": harness.account.inner(),
+        "channel": "csv",
+        "label": label,
+    });
+    call(
+        &harness.router,
+        post(
+            "/v1/corrections/imports",
+            &harness.owner_token,
+            &json!({ "dry_run": true, "source": source }),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn import_preview_describes_the_swap_without_writing_it() {
+    let harness = harness();
+    let document = format!(
+        "{CSV_HEADER}\n\
+         2025-01-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
+         2025-01-02,deposit,Brokerage,,,,,110.00,,,RUB\n"
+    );
+    let (status, body) = post_csv(&harness, "?label=preview", &document).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, preview) = preview_csv_import(&harness, "preview").await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["dry_run"], true, "{preview}");
+    assert_eq!(preview["affected"], 2, "{preview}");
+    assert_eq!(preview["written"], 0, "{preview}");
+    assert_eq!(preview["preview"]["from"], "2025-01-01", "{preview}");
+    assert_eq!(preview["preview"]["to"], "2025-01-02", "{preview}");
+    assert_eq!(preview["preview"]["accounts"][0]["facts"], 2, "{preview}");
+    assert_eq!(
+        preview["preview"]["accounts"][0]["figures"][0]["before"], "210",
+        "{preview}"
+    );
+    assert_eq!(
+        preview["preview"]["accounts"][0]["figures"][0]["after"], "0",
+        "{preview}"
+    );
+
+    let (status, retracted) = retract_csv_import(&harness, Some("preview")).await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["affected"], 2, "{retracted}");
+    assert_eq!(retracted["written"], 2, "{retracted}");
+}
+
 #[tokio::test]
 async fn rows_submitted_as_csv_are_retractable_as_an_import() {
     // iaam-0f8f / iaam-ewcl. The route minted `SourceId::new_random()` per
@@ -11443,7 +11494,14 @@ async fn corrections_are_described_and_scope_checked() {
         imports["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
         "#/components/schemas/ImportCorrectionDto"
     );
-    for field in ["source", "affected", "already_reversed", "written"] {
+    for field in [
+        "source",
+        "affected",
+        "already_reversed",
+        "written",
+        "preview",
+        "dry_run",
+    ] {
         assert!(
             spec["components"]["schemas"]["ImportCorrectionDto"]["properties"][field].is_object(),
             "response schema is missing {field}: {spec}"
@@ -11456,6 +11514,10 @@ async fn corrections_are_described_and_scope_checked() {
             "{schema} does not require the acknowledgement: {spec}"
         );
     }
+    assert!(
+        spec["components"]["schemas"]["CorrectImportRequest"]["properties"]["dry_run"].is_object(),
+        "CorrectImportRequest does not expose dry_run: {spec}"
+    );
     // The wire word for a relation is the journal's own word: a caller reading
     // the contract must not have to translate between two vocabularies.
     let relations = spec["components"]["schemas"]["CorrectionDto"]["oneOf"]

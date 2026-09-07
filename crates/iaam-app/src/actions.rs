@@ -11490,6 +11490,7 @@ mod tests {
     /// The condition that proposal asks about: one field, per decision 0008.
     fn shop_matcher() -> RuleMatcher {
         RuleMatcher {
+            movement: None,
             counterparty_account: Some("Shop One".to_owned()),
             description_contains: None,
             kind: None,
@@ -11654,6 +11655,7 @@ mod tests {
         let question = answered_without_a_rule(ImportSessionId::new_random(), main.id, 3);
         let narrowed = standing(
             RuleMatcher {
+                movement: None,
                 counterparty_account: Some("Shop One".to_owned()),
                 description_contains: Some("card purchase".to_owned()),
                 kind: None,

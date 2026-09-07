@@ -91,6 +91,7 @@ fn proposal() -> (RuleMatcher, Classification) {
             source_category: None,
             owner_category: None,
             source_code: None,
+            movement: None,
         },
         Classification::ExternalFlow,
     )

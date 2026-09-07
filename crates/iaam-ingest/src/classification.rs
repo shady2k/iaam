@@ -227,8 +227,8 @@ pub struct RuleMatcher {
     /// `SourceId` is derived from owner, account and channel, so a rule scoped
     /// by it would have to be rewritten for every account the same bank's
     /// exports arrive on, and a `ParserVersion` names a profile *and its
-    /// version*, so a rule scoped by it would stop firing the day the profile is
-    /// corrected. The bound on a rule that is too wide is the one every other
+    /// version*, so a rule scoped by it would stop firing the day the profile
+    /// is corrected. The bound on a rule that is too wide is the one every other
     /// arm of this matcher already relies on: the fields join with «and», so a
     /// category condition can be narrowed by a counterparty or a description
     /// beside it, and a rule that fires wrongly is one the owner retires, which
@@ -257,8 +257,8 @@ pub struct RuleMatcher {
     ///
     /// **The one arm of this matcher that is not scoped to a vocabulary one
     /// institution controls.** The code is assigned by the payment network, so
-    /// a rule written on it holds across institutions, where a rule written on a
-    /// source's own category holds for one bank until it renames something. It
+    /// a rule written on it holds across institutions, where a rule written on
+    /// a source's own category holds for one bank until it renames something. It
     /// also generalises differently: as the ground for a rule it covers a whole
     /// kind of spending, where a description condition covers one merchant
     /// string.
@@ -268,6 +268,9 @@ pub struct RuleMatcher {
     /// matched by no code condition — the source said nothing, and a condition
     /// asking what it said is not answered.
     pub source_code: Option<String>,
+    /// The direction the source stated for the row. This is an exact condition
+    /// on row evidence, not the direction an outcome would imply.
+    pub movement: Option<Movement>,
 }
 
 impl RuleMatcher {
@@ -283,6 +286,7 @@ impl RuleMatcher {
             && self.source_category.is_none()
             && self.owner_category.is_none()
             && self.source_code.is_none()
+            && self.movement.is_none()
     }
 
     /// Whether the condition matches the row.
@@ -331,12 +335,16 @@ impl RuleMatcher {
             .source_code
             .as_deref()
             .is_none_or(|wanted| subject.source_code.as_deref() == Some(wanted));
+        let by_movement = self
+            .movement
+            .is_none_or(|wanted| subject.movement == Some(wanted));
         by_counterparty
             && by_description
             && by_kind
             && by_source_category
             && by_owner_category
             && by_source_code
+            && by_movement
     }
 }
 
@@ -489,6 +497,12 @@ impl ClassificationRule {
         }
         if let Some(text) = &self.matcher.description_contains {
             conditions.push(format!("payment purpose contains «{text}»"));
+        }
+        if let Some(movement) = self.matcher.movement {
+            conditions.push(match movement {
+                Movement::In => "money coming in".to_owned(),
+                Movement::Out => "money going out".to_owned(),
+            });
         }
         if let Some(kind) = &self.matcher.kind {
             conditions.push(format!("source called the operation «{kind}»"));

@@ -8175,6 +8175,7 @@ fn offers(observations: &[ImportObservationView], open: &[OpenQuestion]) -> Offe
             offered.push(OfferedRule {
                 question: offered_rule_question(filed_by, &category, covers.len(), &contains),
                 matcher: RuleMatcher {
+                    movement: None,
                     counterparty_account: None,
                     description_contains: None,
                     kind: None,
@@ -8561,6 +8562,7 @@ pub(crate) fn generalisation_ground(
 fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
     let matcher = if let Counterparty::Named(counterparty) = &subject.counterparty {
         RuleMatcher {
+            movement: None,
             counterparty_account: Some(counterparty.clone()),
             description_contains: None,
             kind: None,
@@ -8570,6 +8572,7 @@ fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
         }
     } else if let Some(kind) = subject.source_kind.clone() {
         RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: Some(kind),
@@ -8579,6 +8582,7 @@ fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
         }
     } else if let Some(category) = subject.source_category.clone() {
         RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: None,
@@ -8588,6 +8592,7 @@ fn matcher_from(subject: &ClassificationSubject) -> Option<RuleMatcher> {
         }
     } else {
         RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: subject.description.clone(),
             kind: None,
@@ -9207,6 +9212,7 @@ fn unvouched_word(matcher: &RuleMatcher, event: &Event, read: &ClassificationSub
         return false;
     }
     let rest = RuleMatcher {
+        movement: None,
         kind: None,
         source_category: None,
         ..matcher.clone()
@@ -10246,6 +10252,7 @@ mod tests {
             id: iaam_core::ids::ClassificationRuleId::new_random(),
             version: 1,
             matcher: RuleMatcher {
+                movement: None,
                 counterparty_account: Some("Somebody".to_owned()),
                 description_contains: None,
                 kind: None,
@@ -10286,6 +10293,7 @@ mod tests {
             id: iaam_core::ids::ClassificationRuleId::new_random(),
             version: 1,
             matcher: RuleMatcher {
+                movement: None,
                 counterparty_account: Some("Somebody".to_owned()),
                 description_contains: None,
                 kind: None,
@@ -10351,6 +10359,7 @@ mod tests {
             id: iaam_core::ids::ClassificationRuleId::new_random(),
             version: 1,
             matcher: RuleMatcher {
+                movement: None,
                 counterparty_account: Some("Somebody".to_owned()),
                 description_contains: None,
                 kind: None,
@@ -10410,6 +10419,7 @@ mod tests {
             id: iaam_core::ids::ClassificationRuleId::new_random(),
             version: 1,
             matcher: RuleMatcher {
+                movement: None,
                 counterparty_account: Some("Somebody".to_owned()),
                 description_contains: None,
                 kind: None,
@@ -10512,6 +10522,7 @@ mod tests {
                     source_category: None,
                     owner_category: None,
                     source_code: None,
+                    movement: None,
                 },
                 outcome: Classification::Fee {
                     origin: FeeOrigin::AccountMaintenance,
@@ -12334,6 +12345,7 @@ mod tests {
             id: iaam_core::ids::ClassificationRuleId::new_random(),
             version: 1,
             matcher: RuleMatcher {
+                movement: None,
                 counterparty_account: None,
                 description_contains: None,
                 kind: None,
@@ -13275,6 +13287,7 @@ mod tests {
             .code(),
             Generalisation::Available {
                 matcher: RuleMatcher {
+                    movement: None,
                     counterparty_account: None,
                     description_contains: None,
                     kind: None,

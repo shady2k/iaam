@@ -139,6 +139,7 @@ fn a_row_naming_only_a_category_settles_under_the_owners_standing_rule() {
         id: ClassificationRuleId::new_random(),
         version: 1,
         matcher: RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: None,
@@ -187,6 +188,7 @@ fn a_rule_the_owner_already_wrote_settles_the_row_without_asking_again() {
         id: ClassificationRuleId::new_random(),
         version: 1,
         matcher: RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: Some("INNER".to_owned()),

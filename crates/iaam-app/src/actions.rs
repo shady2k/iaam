@@ -270,7 +270,8 @@ impl ActionKind {
             Self::CoverageGapUnrepaired
             | Self::IndependentConfirmationMissing
             | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
-            // Recommended and informational: never required, so no goal.
+            // Recommended and informational items are never required, but a
+            // recommendation still names the report it stands between.
             //
             // `AdoptClassificationRule` is here and not beside the question it
             // comes from, and the difference is the whole of its grading. The
@@ -279,9 +280,9 @@ impl ActionKind {
             // from is settled — and only decides what happens to rows nobody has
             // submitted yet. No report the owner can run today is waiting on it.
             Self::AdoptClassificationRule
-            | Self::UndecomposedOutflows
             | Self::ExternalTransfersUncategorised
             | Self::UnexplainedResidual => ReportGoals::NONE,
+            Self::UndecomposedOutflows => ReportGoals::of(&[MoneyFlow]),
         }
     }
 }

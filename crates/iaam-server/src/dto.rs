@@ -2736,6 +2736,9 @@ pub struct ConfidenceDto {
     /// The same four names the outstanding-work queue grades its items by, so a
     /// caller holding a report with caveats can ask the queue what closes them.
     pub goal: String,
+    /// The amount and proportion of outflows left without a category, by
+    /// currency, before the report's figures.
+    pub undecomposed_outflows: Vec<UndecomposedOutflowShareDto>,
     /// Whether everything that would have to be true for these figures to be
     /// complete is true.
     ///
@@ -2753,6 +2756,40 @@ pub struct ConfidenceDto {
     /// `complete` is true.
     pub caveats: Vec<CaveatDto>,
 }
+
+/// The undecomposed outflow share, derived from the money-flow fold.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UndecomposedOutflowShareDto {
+    pub currency: CurrencyDto,
+    pub count: u64,
+    pub amount: AmountDto,
+    pub total_outflow: AmountDto,
+    /// `amount / total_outflow`, or `null` when the denominator is zero.
+    pub proportion: Option<String>,
+}
+
+impl UndecomposedOutflowShareDto {
+    fn from_domain(share: &iaam_core::report::confidence::UndecomposedShare) -> Self {
+        let proportion = if share.total_outflow.is_zero() {
+            None
+        } else {
+            share
+                .amount
+                .to_calc_dec()
+                .inner()
+                .checked_div(share.total_outflow.to_calc_dec().inner())
+                .map(|ratio| ratio.normalize().to_string())
+        };
+        Self {
+            currency: CurrencyDto::from_domain(share.currency),
+            count: share.count,
+            amount: AmountDto::from_money(share.amount),
+            total_outflow: AmountDto::from_money(share.total_outflow),
+            proportion,
+        }
+    }
+}
+
 
 /// One specific, checkable thing a report's figures do not account for.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -2872,6 +2909,11 @@ impl ConfidenceDto {
     pub fn from_domain(confidence: &ReportConfidence, catalog: &ActionCatalog) -> Self {
         Self {
             goal: confidence.goal().code().to_owned(),
+            undecomposed_outflows: confidence
+                .undecomposed_outflows()
+                .iter()
+                .map(UndecomposedOutflowShareDto::from_domain)
+                .collect(),
             // From the register, never beside it: the domain type has no
             // `complete` field to copy, so the two cannot fall out of step.
             complete: confidence.complete(),

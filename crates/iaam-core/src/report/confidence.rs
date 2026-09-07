@@ -43,7 +43,7 @@
 
 use crate::goal::ReportGoal;
 use crate::ids::{AccountId, InstrumentId};
-use crate::money::CurrencyCode;
+use crate::money::{CurrencyCode, Money};
 use crate::operation::OperationKey;
 use crate::projection::money_flow::{MoneyFlow, MoneyFlowError};
 use crate::returns::ReturnsReport;
@@ -431,19 +431,45 @@ impl Caveat {
 /// asserting completeness beside a register of its gaps is the failure this
 /// whole block exists to prevent — a confident number over an incomplete
 /// population.
+/// The undecomposed outflow amount and its denominator from one money-flow fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UndecomposedShare {
+    pub currency: CurrencyCode,
+    pub count: u64,
+    pub amount: Money,
+    pub total_outflow: Money,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportConfidence {
     goal: ReportGoal,
     caveats: Vec<Caveat>,
+    undecomposed_outflows: Vec<UndecomposedShare>,
 }
 
 impl ReportConfidence {
     #[must_use]
     pub fn new(goal: ReportGoal, caveats: Vec<Caveat>) -> Self {
-        Self { goal, caveats }
+        Self {
+            goal,
+            caveats,
+            undecomposed_outflows: Vec::new(),
+        }
     }
 
-    /// Which of the four goals this report answers.
+    #[must_use]
+    pub fn with_undecomposed_outflows(mut self, shares: Vec<UndecomposedShare>) -> Self {
+        self.undecomposed_outflows = shares;
+        self
+    }
+
+    /// The undecomposed share, before the report figures it qualifies.
+    #[must_use]
+    pub fn undecomposed_outflows(&self) -> &[UndecomposedShare] {
+        &self.undecomposed_outflows
+    }
+
+    /// Which of the four report goals this confidence register qualifies.
     #[must_use]
     pub const fn goal(&self) -> ReportGoal {
         self.goal
@@ -451,19 +477,18 @@ impl ReportConfidence {
 
     /// Whether everything that would have to be true for the figures to be
     /// complete is true.
-    ///
-    /// Derived, never stored.
     #[must_use]
     pub fn complete(&self) -> bool {
         self.caveats.is_empty()
     }
 
-    /// The specific things that are not. Empty exactly when [`Self::complete`].
+    /// The specific things that are not.
     #[must_use]
     pub fn caveats(&self) -> &[Caveat] {
         &self.caveats
     }
 }
+
 
 /// The flow report's register.
 ///
@@ -480,9 +505,19 @@ pub fn money_flow_confidence(
     flow: &MoneyFlow,
 ) -> Result<ReportConfidence, MoneyFlowError> {
     let mut caveats = population.caveats();
+    let mut undecomposed_outflows = Vec::new();
     for currency in flow.currencies().collect::<Vec<_>>() {
-        for (account, count, _amount) in flow.not_decomposed_by_account(currency)? {
-            if count == 0 {
+        let (count, amount) = flow.not_decomposed(currency)?;
+        if count > 0 {
+            undecomposed_outflows.push(UndecomposedShare {
+                currency,
+                count,
+                amount,
+                total_outflow: flow.went_out(currency)?,
+            });
+        }
+        for (account, account_count, _amount) in flow.not_decomposed_by_account(currency)? {
+            if account_count == 0 {
                 continue;
             }
             caveats.push(Caveat::new(
@@ -503,7 +538,10 @@ pub fn money_flow_confidence(
             },
         ));
     }
-    Ok(ReportConfidence::new(ReportGoal::MoneyFlow, caveats))
+    Ok(
+        ReportConfidence::new(ReportGoal::MoneyFlow, caveats)
+            .with_undecomposed_outflows(undecomposed_outflows),
+    )
 }
 
 /// The returns report's register.

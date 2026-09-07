@@ -1,6 +1,7 @@
 # 0039. The queue says which reports it leaves unobstructed, and names what stands in the way of the rest
 
-Date: 2026-09-05 · Status: proposed · Beads: `iaam-i3nx`
+Date: 2026-09-05 · Status: accepted · Beads: `iaam-i3nx`
+Note: The money-flow confidence register now carries the undecomposed outflow share before the report figures, and the queue grades that work for `money_flow`.
 
 ## Context
 

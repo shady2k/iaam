@@ -6,7 +6,8 @@ use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{
-    AccountId, ClassificationRuleId, EventId, ImportSessionId, OwnerId, SourceId, TransferId,
+    AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
+    TransferId,
 };
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::Dimension;
@@ -194,6 +195,40 @@ fn the_journal_narrows_to_the_import_session_that_wrote_it() {
         )
         .unwrap();
     assert_eq!(everything.len(), 2, "the unnarrowed page still holds both");
+}
+
+#[test]
+fn the_journal_narrows_to_the_declared_import() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let import = ImportId::new_random();
+
+    let carried = {
+        let mut event = ctx.deposit(1, 100_000);
+        event.provenance = event.provenance.with_import(import);
+        event
+    };
+    let other = ctx.deposit(2, 200_000);
+    for event in [&carried, &other] {
+        store.append_event(event, IdentityScope::Source).unwrap();
+    }
+
+    let narrowed = store
+        .list_journal_events(
+            ctx.owner,
+            &JournalQuery {
+                import: Some(import),
+                limit: 10,
+                ..JournalQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        narrowed.iter().map(|event| event.id).collect::<Vec<_>>(),
+        vec![carried.id],
+        "only rows carrying the named import"
+    );
+    assert_eq!(narrowed[0].provenance.import(), Some(import));
 }
 
 /// A page of the journal can be narrowed to the rows one standing rule filed.

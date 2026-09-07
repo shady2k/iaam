@@ -544,6 +544,10 @@ pub struct JournalQuery {
     pub source: Option<SourceId>,
     /// Only facts committed out of this import session.
     pub import_session: Option<ImportSessionId>,
+    /// Only facts carrying this declared import. Unlike `import_session`, the
+    /// import survives across several sessions and is the key a retraction
+    /// takes.
+    pub import: Option<ImportId>,
     /// Only facts one of the owner's standing classification rules filed.
     ///
     /// A fact whose reading found no rule, and a fact recorded before the rule
@@ -693,6 +697,13 @@ fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rus
             &mut sql,
             " AND source = ?",
             Box::new(source.inner().to_string()),
+        );
+    }
+    if let Some(import) = query.import {
+        bind(
+            &mut sql,
+            " AND json_extract(payload, '$.provenance.import') = ?",
+            Box::new(import.inner().to_string()),
         );
     }
     if let Some(session) = query.import_session {

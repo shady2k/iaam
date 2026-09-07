@@ -1103,10 +1103,11 @@ pub(crate) fn reclassification_candidates_for_plan(
     owner: iaam_core::ids::OwnerId,
     original: &Event,
     classification: Classification,
+    index: usize,
 ) -> Result<Vec<Event>, AppError> {
     Ok(vec![
         reversal_for_with(original, None),
-        reclassification_for(owner, original, classification, None, 0)?,
+        reclassification_for(owner, original, classification, None, index)?,
     ])
 }
 
@@ -1494,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn reclassifying_a_directionless_own_account_row_uses_its_recorded_amount() {
+    fn reclassifying_a_directionless_own_account_row_preserves_its_unresolved_amount() {
         let amount = Money::new(PostedMinor::new(1_000), CurrencyCode::Rub);
         let mut unresolved = deposit(8, SourceId::new_random());
         unresolved.kind = EventKind::UnresolvedOwnAccountMovement { amount };
@@ -1510,7 +1511,10 @@ mod tests {
         .expect("the unresolved own-account amount is enough for this classification");
 
         assert_eq!(replacement.account, account());
-        assert_eq!(replacement.kind, EventKind::OwnAccountMovement { amount });
+        assert_eq!(
+            replacement.kind,
+            EventKind::UnresolvedOwnAccountMovement { amount }
+        );
         assert!(replacement.legs.is_empty());
     }
 

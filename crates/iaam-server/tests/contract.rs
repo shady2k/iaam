@@ -13460,6 +13460,25 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     // The later decision wins: the rule naming the source's own word is the
     // owner's most recent answer about this row.
     assert_eq!(corrections[0]["becomes"]["kind"], "income", "{second}");
+    let refusal = corrections[0]["refusal"]
+        .as_object()
+        .expect("the plan reports why this row cannot be applied");
+    assert_eq!(
+        refusal["field"], "corrections[0].classified_as.answer",
+        "{second}"
+    );
+    assert!(
+        refusal["expected"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "{second}"
+    );
+    assert!(
+        refusal["actual"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "{second}"
+    );
     let newest = second["id"].as_str().expect("identifier").to_owned();
 
     // Retiring is symmetric: it recomputes and answers with the plan too,

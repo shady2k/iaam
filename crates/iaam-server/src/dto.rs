@@ -30,8 +30,8 @@ use iaam_app::scenarios::categories::{
     CategoryMove, CategoryPreviewRow, CategoryRuleImpact, MonthlyImpact,
 };
 use iaam_app::scenarios::classification::{
-    ClassifiedAs, PlannedCorrection, RecomputePlan, RuleChange, classified_as, outcome_from,
-    rule_from_view,
+    ClassifiedAs, PlannedCorrection, PlannedCorrectionRefusal, RecomputePlan, RuleChange,
+    classified_as, outcome_from, rule_from_view,
 };
 use iaam_app::scenarios::correction::{
     CorrectionOutcome, CorrectionRequest, ImportCorrectionOutcome, StandingRule,
@@ -8517,12 +8517,34 @@ impl ClassifiedAsDto {
     }
 }
 
+/// Why one planned correction cannot be constructed yet.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlannedCorrectionRefusalDto {
+    pub field: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+impl PlannedCorrectionRefusalDto {
+    fn from_domain(refusal: PlannedCorrectionRefusal) -> Self {
+        Self {
+            field: refusal.field,
+            expected: refusal.expected,
+            actual: refusal.actual,
+        }
+    }
+}
+
 /// One event a rule change requires correcting.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PlannedCorrectionDto {
     pub event: Uuid,
     pub was: ClassifiedAsDto,
     pub becomes: ClassifiedAsDto,
+    /// Present when the plan can name the desired classification but cannot
+    /// construct the append-only facts for this historical row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<PlannedCorrectionRefusalDto>,
 }
 
 impl PlannedCorrectionDto {
@@ -8531,6 +8553,9 @@ impl PlannedCorrectionDto {
             event: correction.event.inner(),
             was: ClassifiedAsDto::from_domain(correction.was),
             becomes: ClassifiedAsDto::from_domain(correction.becomes),
+            refusal: correction
+                .refusal
+                .map(PlannedCorrectionRefusalDto::from_domain),
         }
     }
 }

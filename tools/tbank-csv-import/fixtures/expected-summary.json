@@ -3,52 +3,75 @@
   "submitted": 10,
   "dropped_second_leg": 1,
   "skipped_outside_contour": 2,
-  "own_transfers": 1,
   "unmatched_legs": 0,
+  "unmatched": [],
+  "own_transfers": 1,
   "unaccounted": 0,
-  "rejected": 0,
   "operations": [
     {
+      "account": "Main",
       "kind": "withdrawal",
       "amount": "100.00",
       "ordinal": 1
     },
     {
+      "account": "Main",
       "kind": "withdrawal",
       "amount": "42.00"
     },
     {
+      "account": "Main",
       "kind": "withdrawal",
       "amount": "100.00",
       "ordinal": 2
     },
     {
+      "account": "Main",
       "kind": "transfer",
       "amount": "5000.00"
     },
     {
+      "account": "Main",
       "kind": "withdrawal",
       "amount": "700.00"
     },
     {
+      "account": "Main",
       "kind": "deposit",
       "amount": "12000.00"
     },
     {
+      "account": "Savings",
       "kind": "income",
       "amount": "12.34"
     },
     {
+      "account": "Main",
       "kind": "income",
       "amount": "350.00"
     },
     {
+      "account": "Main",
       "kind": "transfer",
       "amount": "2000.00"
     },
     {
+      "account": "Main",
       "kind": "refund",
       "amount": "80.00"
     }
-  ]
+  ],
+  "accounts": [
+    {
+      "account": "Main",
+      "rows": 9,
+      "total": "20372.00"
+    },
+    {
+      "account": "Savings",
+      "rows": 1,
+      "total": "12.34"
+    }
+  ],
+  "rejected": 0
 }

@@ -507,16 +507,19 @@ def main():
         "between his own accounts instead of money crossing the contour. Owner "
         "knowledge, supplied per run and never stored in this tool.",
     )
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--submit", action="store_true")
-    mode.add_argument(
+    parser.add_argument(
         "--replace-retracted",
         action="store_true",
         help="replace the withdrawn events of this export through the corrections "
-        "route; the original channel is never changed",
+        "route; combine with --dry-run to preview, or use alone to submit; the "
+        "original channel is never changed",
     )
     args = parser.parse_args()
+    if not (args.dry_run or args.submit or args.replace_retracted):
+        parser.error("choose --dry-run, --submit, or --replace-retracted")
 
     with open(args.export, encoding="utf-8-sig", newline="") as handle:
         text = handle.read()
@@ -525,12 +528,13 @@ def main():
     raw_lines = {id(row): line for row, line in zip(rows, lines[1:])}
 
     token = os.environ.get(args.token_env, "")
+    offline_preview = args.dry_run and not args.replace_retracted
     account_names = {}
     if args.account_map:
         with open(args.account_map, encoding="utf-8") as handle:
             account_map = json.load(handle)
-        # The map is its own contour, so the preview needs no directory: a name
-        if args.dry_run:
+        # The offline preview needs no directory: a name maps to itself.
+        if offline_preview:
             accounts = {export_name: export_name for export_name in account_map}
             account_names = {
                 export_name: title for export_name, title in account_map.items()
@@ -567,7 +571,7 @@ def main():
         if args.counterparty_map
         else {}
     )
-    if args.dry_run:
+    if offline_preview:
         counterparties = {name: title for name, title in counterparty_map.items()}
     else:
         counterparties = resolve_accounts(args.base_url, token, counterparty_map)
@@ -592,19 +596,32 @@ def main():
     summary["accounts"] = account_summary(operations, account_names)
     summary["rejected"] = 0
 
+    by_account = defaultdict(list)
+    for operation in operations:
+        by_account[operation["account"]].append(operation)
+    targets_by_account = {}
+    if args.replace_retracted:
+        for account_id, batch in by_account.items():
+            targets_by_account[account_id] = replacement_targets(
+                args.base_url, token, account_id, args.channel, batch
+            )
+        summary["replacements"] = [
+            {
+                "account": account_names.get(account_id, account_id),
+                "rows": len(batch),
+                "events": len(targets_by_account[account_id]),
+            }
+            for account_id, batch in by_account.items()
+        ]
+
     if args.dry_run:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
 
-    by_account = defaultdict(list)
-    for operation in operations:
-        by_account[operation["account"]].append(operation)
     verdicts_by_kind = defaultdict(int)
     for account_id, batch in by_account.items():
         if args.replace_retracted:
-            targets = replacement_targets(
-                args.base_url, token, account_id, args.channel, batch
-            )
+            targets = targets_by_account[account_id]
             corrections = []
             for operation in batch:
                 target = targets[operation["idempotency_key"]]

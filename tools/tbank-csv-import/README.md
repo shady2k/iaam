@@ -96,8 +96,17 @@ import identifiers by hand. A replacement is a correction fact, so its journal
 provenance records the correction route while the withdrawn source fact remains
 the one it replaces.
 
-With `--account-map` instead, the preview contacts nothing at all, because the
-file is its own contour:
+Each replacement key is `correction/replacement/<withdrawn event id>`, so a
+repeated replacement run addresses the same correction keys and cannot add a
+second replacement.
+
+`--replace-retracted --dry-run` performs the same journal reads without posting
+corrections and adds a `replacements` summary with per-account row and event
+counts. It must resolve the live account directory even when `--account-map` is
+present; only an ordinary offline `--dry-run` avoids the directory.
+
+With `--account-map` on an ordinary dry run, the preview contacts nothing
+because the file is its own contour:
 
 ```bash
 python3 tools/tbank-csv-import/import.py \

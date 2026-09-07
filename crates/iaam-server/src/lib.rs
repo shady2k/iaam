@@ -155,6 +155,8 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::list_category_rules_route))
         .routes(routes!(routes::create_category_rule_route))
         .routes(routes!(routes::preview_category_rule_route))
+        .routes(routes!(routes::create_category_rules_batch_route))
+        .routes(routes!(routes::preview_category_rules_batch_route))
         .routes(routes!(routes::sync_broker))
         .routes(routes!(routes::sync_market))
         .routes(routes!(routes::list_market_key_rate))

@@ -9,6 +9,7 @@
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
 use crate::action_catalog::ActionCatalog;
+use crate::error::ApiError;
 use iaam_app::error::AppError;
 use iaam_app::ingest::classification::{
     Answer, AnswerShape, Classification, FarSide, Movement, RuleMatcher,
@@ -1600,6 +1601,50 @@ impl VerdictDto {
                 detail: Some(reason.clone()),
                 ..base
             },
+        }
+    }
+}
+
+impl VerdictDto {
+    /// Use the §10.1 verdict shape for a recorded category-rule batch row.
+    #[must_use]
+    pub fn accepted_category_rule(row: usize, rule_id: Uuid) -> Self {
+        Self {
+            row,
+            verdict: VerdictCodeDto::Provisional,
+            event_id: None,
+            of_event_id: None,
+            level: None,
+            field: None,
+            expected: None,
+            actual: None,
+            detail: Some(format!("category rule {rule_id} was recorded")),
+            account_id: None,
+            dimension: None,
+            session_id: None,
+            question_id: None,
+            alternatives: None,
+        }
+    }
+
+    /// Use the §10.1 verdict shape for a refused category-rule batch row.
+    #[must_use]
+    pub fn rejected_category_rule(row: usize, error: ApiError) -> Self {
+        Self {
+            row,
+            verdict: VerdictCodeDto::Rejected,
+            event_id: None,
+            of_event_id: None,
+            level: None,
+            field: error.field,
+            expected: error.expected,
+            actual: error.actual,
+            detail: Some(error.message),
+            account_id: None,
+            dimension: None,
+            session_id: None,
+            question_id: None,
+            alternatives: None,
         }
     }
 }
@@ -7934,7 +7979,7 @@ pub struct CategoryRequest {
 /// Category matcher and validity interval for a new rule.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CategoryRuleRequest {
-    /// One of the three externally tagged matcher shapes in
+    /// One of the five externally tagged matcher shapes in
     /// [`CategoryMatcherDto`].
     pub matcher: CategoryMatcherDto,
     pub category: Uuid,
@@ -7947,6 +7992,13 @@ pub struct CategoryRuleRequest {
     #[serde(default)]
     pub replaces: Option<Uuid>,
 }
+
+/// Several independent category-rule creates in one request.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CategoryRuleBatchRequest {
+    pub rules: Vec<CategoryRuleRequest>,
+}
+
 
 /// The rows and monthly movements caused by a proposed category rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]

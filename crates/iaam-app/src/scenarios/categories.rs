@@ -175,6 +175,18 @@ pub async fn preview_category_rule(
     principal: &Principal,
     proposed: &CategoryRuleProposal,
 ) -> Result<CategoryRuleImpact, AppError> {
+    preview_category_rules(services, principal, std::slice::from_ref(proposed))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Store("category rule preview returned no result".to_owned()))
+}
+
+pub async fn preview_category_rules(
+    services: &AppServices,
+    principal: &Principal,
+    proposed: &[CategoryRuleProposal],
+) -> Result<Vec<CategoryRuleImpact>, AppError> {
     let active_rules = services
         .categories
         .list_category_rules(principal.owner)
@@ -183,22 +195,34 @@ pub async fn preview_category_rule(
         .filter(|rule| rule.retired_at.is_none())
         .map(domain_rule)
         .collect::<Result<Vec<_>, _>>()?;
-
-    let current = LoadedCategoryIndex {
-        rules: active_rules.clone(),
-        versions: Vec::new(),
-        proposed: None,
-    };
-    let proposed_index = LoadedCategoryIndex {
-        rules: active_rules,
-        versions: Vec::new(),
-        proposed: Some(proposed.clone()),
-    };
-
     let events = services
         .store
         .load_events_through(principal.owner, time::Date::MAX)
         .await?;
+
+    proposed
+        .iter()
+        .map(|proposal| preview_category_rule_from(&events, &active_rules, proposal))
+        .collect()
+}
+
+fn preview_category_rule_from(
+    events: &[Event],
+    active_rules: &[CategoryRule],
+    proposed: &CategoryRuleProposal,
+) -> Result<CategoryRuleImpact, AppError> {
+    let current = LoadedCategoryIndex {
+        rules: active_rules.to_vec(),
+        versions: Vec::new(),
+        category_count: 0,
+        proposed: None,
+    };
+    let proposed_index = LoadedCategoryIndex {
+        rules: active_rules.to_vec(),
+        versions: Vec::new(),
+        category_count: 0,
+        proposed: Some(proposed.clone()),
+    };
     let mut moved = Vec::new();
     let mut preview_rows = Vec::new();
     for event in events {
@@ -206,11 +230,12 @@ pub async fn preview_category_rule(
             continue;
         }
 
-        let previous = match current.assignment(&event) {
+        let previous = match current.assignment(event) {
             CategoryAssignment::Assigned { category, .. } => Some(category),
             CategoryAssignment::NotDecomposed => None,
         };
-        let CategoryAssignment::Assigned { category: next, .. } = proposed_index.assignment(&event)
+        let CategoryAssignment::Assigned { category: next, .. } =
+            proposed_index.assignment(event)
         else {
             continue;
         };
@@ -243,7 +268,7 @@ pub async fn preview_category_rule(
             amount,
         });
         preview_rows.push(CategoryPreviewRow {
-            row_key: category_row_key(&event).map(str::to_owned),
+            row_key: category_row_key(event).map(str::to_owned),
             from: previous,
             to: next,
             amount,
@@ -289,12 +314,17 @@ pub async fn retire_category_rule(
 pub(crate) struct LoadedCategoryIndex {
     rules: Vec<CategoryRule>,
     versions: Vec<u32>,
+    category_count: usize,
     proposed: Option<CategoryRuleProposal>,
 }
 
 impl LoadedCategoryIndex {
     pub(crate) fn versions(&self) -> &[u32] {
         &self.versions
+    }
+
+    pub(crate) fn has_categories(&self) -> bool {
+        self.category_count > 0
     }
 }
 
@@ -331,6 +361,13 @@ pub(crate) async fn load_index(
     services: &AppServices,
     principal: &Principal,
 ) -> Result<LoadedCategoryIndex, AppError> {
+    let category_count = services
+        .categories
+        .list_categories(principal.owner)
+        .await?
+        .into_iter()
+        .filter(|category| category.retired_at.is_none())
+        .count();
     let stored = services
         .categories
         .list_category_rules(principal.owner)
@@ -344,6 +381,7 @@ pub(crate) async fn load_index(
     Ok(LoadedCategoryIndex {
         rules: active,
         versions,
+        category_count,
         proposed: None,
     })
 }

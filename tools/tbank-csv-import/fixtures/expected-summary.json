@@ -64,13 +64,17 @@
   "accounts": [
     {
       "account": "Main",
-      "rows": 9,
-      "total": "20372.00"
+      "converted_rows": 9,
+      "inflow": "12430.00",
+      "outflow": "7942.00",
+      "net": "4488.00"
     },
     {
       "account": "Savings",
-      "rows": 1,
-      "total": "12.34"
+      "converted_rows": 1,
+      "inflow": "12.34",
+      "outflow": "0.00",
+      "net": "12.34"
     }
   ],
   "rejected": 0

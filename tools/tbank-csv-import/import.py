@@ -389,16 +389,32 @@ def operation_summary(operations, account_names=None):
 
 
 def account_summary(operations, account_names=None):
-    """Summarise the converted operations by their destination account."""
+    """Summarise converted rows as money in, money out, and net movement."""
     account_names = account_names or {}
-    totals = defaultdict(lambda: [0, Decimal("0")])
+    totals = defaultdict(
+        lambda: {
+            "converted_rows": 0,
+            "inflow": Decimal("0.00"),
+            "outflow": Decimal("0.00"),
+        }
+    )
     for operation in operations:
         name = account_names.get(operation["account"], operation["account"])
-        totals[name][0] += 1
-        totals[name][1] += Decimal(operation["amount"])
+        amount = Decimal(operation["amount"])
+        totals[name]["converted_rows"] += 1
+        if operation["type"] in {"withdrawal", "transfer"}:
+            totals[name]["outflow"] += amount
+        else:
+            totals[name]["inflow"] += amount
     return [
-        {"account": name, "rows": count, "total": format(total, "f")}
-        for name, (count, total) in sorted(totals.items())
+        {
+            "account": name,
+            "converted_rows": values["converted_rows"],
+            "inflow": format(values["inflow"], "f"),
+            "outflow": format(values["outflow"], "f"),
+            "net": format(values["inflow"] - values["outflow"], "f"),
+        }
+        for name, values in sorted(totals.items())
     ]
 
 

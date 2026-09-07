@@ -9351,6 +9351,27 @@ async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 1, "{impact}");
+    for mode in ["equals", "starts_with"] {
+        let (status, impact) = call(
+            &harness.router,
+            post(
+                "/v1/category-rules/preview",
+                &harness.owner_token,
+                &json!({
+                    "matcher": {
+                        "description_contains": {
+                            "text": if mode == "equals" { "corner shop" } else { "corner" },
+                            "mode": mode,
+                        },
+                    },
+                    "category": category_id,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{impact}");
+        assert_eq!(impact["rows"], 1, "{mode}: {impact}");
+    }
 
     drop(harness);
     let _ = std::fs::remove_file(path);

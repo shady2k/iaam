@@ -53,7 +53,9 @@ use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
     sync_market_with_services as run_market_sync,
 };
-use iaam_core::category::{CategoryInterval, CategoryMatcher, CategoryRuleProposal};
+use iaam_core::category::{
+    CategoryInterval, CategoryMatcher, CategoryRuleProposal, DescriptionMatchMode,
+};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
@@ -90,14 +92,15 @@ use crate::dto::{
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto,
-    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
-    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
-    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
-    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
-    PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto,
+    DescriptionContainsDto, DescriptionMatchModeDto, DocumentDto, DocumentParams, FxRateDto,
+    HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, IssuedTokenDto,
+    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
+    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
+    OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
+    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
+    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
     RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
     RenameAccountRequest, ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest,
@@ -5270,9 +5273,17 @@ fn parse_category_matcher(value: CategoryMatcherDto) -> CategoryMatcher {
     match value {
         CategoryMatcherDto::Row(key) => CategoryMatcher::Row { key },
         CategoryMatcherDto::SourceCategory(value) => CategoryMatcher::SourceCategory { value },
-        CategoryMatcherDto::DescriptionContains(text) => {
-            CategoryMatcher::DescriptionContains { text }
-        }
+        CategoryMatcherDto::DescriptionContains(description) => match description {
+            DescriptionContainsDto::Text(text) => CategoryMatcher::DescriptionContains { text },
+            DescriptionContainsDto::Structured(description) => CategoryMatcher::Description {
+                text: description.text,
+                mode: match description.mode {
+                    DescriptionMatchModeDto::Equals => DescriptionMatchMode::Equals,
+                    DescriptionMatchModeDto::StartsWith => DescriptionMatchMode::StartsWith,
+                    DescriptionMatchModeDto::Contains => DescriptionMatchMode::Contains,
+                },
+            },
+        },
     }
 }
 /// Journal read parameters. Every filter is optional and they combine.

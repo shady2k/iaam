@@ -29095,3 +29095,66 @@ async fn history_contract_explains_that_transfer_counterparts_are_not_included()
         );
     }
 }
+
+/// The title is the one part of an account the owner reads, and it can be
+/// corrected.
+///
+/// Three accounts were named after the cards they were first met through while
+/// holding a whole institution, and no call changed a name: `POST /v1/accounts`
+/// upserts by identity and deliberately changes nothing about a known one, and
+/// retirement removes an account the owner wants (`iaam-j485`).
+#[tokio::test]
+async fn an_account_can_be_renamed_and_the_old_name_stops_reaching_it() {
+    let harness = harness();
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({"title": "Card 1234"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("account id").to_owned();
+
+    // An agent may do it: restating a title puts the previous one back, so it
+    // takes the floor every reversible call takes (ADR 0040).
+    let (status, renamed) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{id}/title"),
+            &harness.agent_token,
+            &json!({"title": "Main"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["title"], "Main", "{renamed}");
+
+    // A name of spaces is not a name.
+    let (status, refused) = call(
+        &harness.router,
+        put(
+            &format!("/v1/accounts/{id}/title"),
+            &harness.agent_token,
+            &json!({"title": "   "}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "title", "{refused}");
+
+    // The old title no longer reaches the account. It is the last tier a name
+    // resolves through, and the name was changed because it was wrong; keeping
+    // it silently resolving would keep the wrong answer available.
+    let (status, rejected) = post_csv(
+        &harness,
+        "",
+        "date,type,account,amount,currency\n2026-08-05,expense,Card 1234,-1.00,RUB\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rejected}");
+    assert_eq!(rejected[0]["verdict"], "rejected", "{rejected}");
+    assert_eq!(rejected[0]["field"], "account", "{rejected}");
+}

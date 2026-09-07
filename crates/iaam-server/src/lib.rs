@@ -85,6 +85,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         ))
         .routes(routes!(routes::record_account_name_disposition))
         .routes(routes!(routes::replace_account_aliases))
+        .routes(routes!(routes::rename_account))
         .routes(routes!(routes::replace_account_declarations))
         .routes(routes!(
             routes::get_account_transfer_partners,

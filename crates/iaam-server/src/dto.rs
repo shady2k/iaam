@@ -5443,6 +5443,18 @@ pub struct ReplaceAccountAliasesRequest {
     pub aliases: Vec<AccountAliasDto>,
 }
 
+/// What the owner calls an account, as he now calls it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RenameAccountRequest {
+    /// The new title. Trimmed, and refused when nothing is left of it.
+    ///
+    /// It replaces the old one rather than joining it: a title is the last tier
+    /// an account name resolves through, so the previous name stops reaching
+    /// this account. That is deliberate — a name is changed because it was
+    /// wrong. To keep the old one reaching it, state it as an alias.
+    pub title: String,
+}
+
 /// The declarations an account carries beside its title, as the owner now
 /// states them.
 ///

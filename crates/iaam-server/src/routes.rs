@@ -99,9 +99,9 @@ use crate::dto::{
     RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
     RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
-    ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest, RequestPlanDto,
-    RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest, ResolvedInstrumentDto,
-    ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
+    RenameAccountRequest, ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest,
+    RequestPlanDto, RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest,
+    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
     SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
 };
 use crate::dto::{
@@ -153,6 +153,7 @@ pub const RECORD_ACCOUNT_RETIREMENT_OPERATION_ID: &str = "record_account_retirem
 /// it.
 pub const RECORD_ACCOUNT_NAME_DISPOSITION_OPERATION_ID: &str = "record_account_name_disposition";
 pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
+pub const RENAME_ACCOUNT_OPERATION_ID: &str = "rename_account";
 pub const REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID: &str = "replace_account_declarations";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
 /// The batch form. Deliberately absent from [`OperationKey`]: the action queue
@@ -1866,6 +1867,103 @@ pub async fn replace_account_aliases(
         .await?
         .into_iter()
         .find(|held| held.id == account)
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                ApiError::simple("not_found", format!("not found: account {id}")),
+            )
+        })?;
+    Ok(Json(account_dto(stored)))
+}
+
+/// Change what the owner calls an account.
+///
+/// **The one part of an account he reads, and the only part he could not
+/// correct** (`iaam-j485`). The title is set at creation and appears in every
+/// report heading, every question about a row and every relay; three accounts
+/// were named after the cards they were first met through while in fact holding
+/// a whole institution, and there was no call that changed a name.
+///
+/// `POST /v1/accounts` is not that call: it upserts by external identity, so a
+/// create repeating a known identity returns the account made last time and
+/// deliberately changes nothing. Retirement is not it either — the account is
+/// wanted, correctly named.
+///
+/// **The old name stops resolving, and that is the point rather than a cost.**
+/// A title is the last tier `iaam_ingest::csv_source::AccountNames::resolve`
+/// tries, after the iaam identifier and the identifier the source prints
+/// (decision 0010), so a row naming the old title is refused after a rename
+/// rather than landing somewhere. The name is being changed because it was
+/// wrong; keeping it silently resolving would keep the wrong answer available.
+/// An owner who wants the old name to go on reaching the account states it as an
+/// alias, deliberately — `PUT /v1/accounts/{id}/aliases` — and the two are not
+/// merged here: an alias is an identifier a **source** prints, and folding a
+/// name he chose into that set would put his own words among the bank's.
+///
+/// Reversible by restating, so it takes the floor every reversible call takes
+/// (ADR 0040). It is not an [`OperationKey`]: the queue never offers a rename,
+/// because nothing computes that a name is wrong.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/title",
+    operation_id = RENAME_ACCOUNT_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = RenameAccountRequest,
+    responses(
+        (status = 200, description = "The account under its new name", body = AccountDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "The title is blank", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn rename_account(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<RenameAccountRequest>,
+) -> Result<Json<AccountDto>, ApiFailure> {
+    require_submit(&principal)?;
+    let account = AccountId(id);
+    let held = owned_account(&state, &principal, account).await?;
+
+    // Trimmed and refused when nothing is left, exactly as a category group's
+    // title is: a name of spaces is not a name, and storing one would leave a
+    // heading the owner cannot tell from a missing one.
+    let title = request.title.trim();
+    if title.is_empty() {
+        return Err(unprocessable(
+            "title",
+            "a title with something in it",
+            "blank",
+            "a name of spaces reads as a missing name in every report heading it \
+             appears in, and the owner cannot tell the two apart",
+        ));
+    }
+
+    state
+        .services
+        .store
+        .upsert_account(
+            principal.owner,
+            AccountView {
+                id: account,
+                title: title.to_owned(),
+                institution: held.institution.clone(),
+            },
+        )
+        .await?;
+
+    let stored = state
+        .services
+        .store
+        .list_account_details(principal.owner)
+        .await?
+        .into_iter()
+        .find(|account_held| account_held.id == account)
         .ok_or_else(|| {
             ApiFailure::new(
                 StatusCode::NOT_FOUND,
@@ -5888,7 +5986,11 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// the reason [`require_admin`] states: the queue and the caveat register are
 /// about the owner's money and these are about the shape of the instance, so
 /// there is no second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 25] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
+    (
+        "rename_account",
+        "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
+    ),
     (
         "resolve_instrument",
         "A read that takes a body: it answers which instrument a namespace, a value and a date name, and records nothing. A target is a call that changes something — see list_source_profiles.",

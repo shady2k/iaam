@@ -101,6 +101,7 @@ use iaam_core::valuation::{
     UncoveredReason as CandidateUncoveredReason,
 };
 use rust_decimal::Decimal;
+use serde::de;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -7778,12 +7779,48 @@ impl CategoryDto {
 /// stored matcher and makes the value's meaning explicit:
 /// `{"row":"..."}`, `{"source_category":"..."}`, or
 /// `{"description_contains":"..."}`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CategoryMatcherDto {
     Row(String),
     SourceCategory(String),
     DescriptionContains(String),
+}
+
+impl<'de> Deserialize<'de> for CategoryMatcherDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object() else {
+            return Err(de::Error::custom(
+                "invalid type, expected a category matcher object",
+            ));
+        };
+        if object.len() != 1 {
+            return Err(de::Error::custom(
+                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+            ));
+        }
+        let (kind, value) = object
+            .iter()
+            .next()
+            .expect("a non-empty object has a matcher entry");
+        let Some(value) = value.as_str() else {
+            return Err(de::Error::custom(
+                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+            ));
+        };
+        match kind.as_str() {
+            "row" => Ok(Self::Row(value.to_owned())),
+            "source_category" => Ok(Self::SourceCategory(value.to_owned())),
+            "description_contains" => Ok(Self::DescriptionContains(value.to_owned())),
+            _ => Err(de::Error::custom(
+                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+            )),
+        }
+    }
 }
 
 impl CategoryMatcherDto {

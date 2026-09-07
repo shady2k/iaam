@@ -780,3 +780,4 @@
 {"id":"int-0d04b41944858bd76c1b0f37a894e954","kind":"field_change","created_at":"2026-09-06T21:26:02.39887537Z","actor":"shady2k","issue_id":"iaam-uihq","extra":{"field":"status","new_value":"closed","old_value":"open"}}
 {"id":"int-ef4967886c2dac8c54ddb5504e7ad967","kind":"field_change","created_at":"2026-09-06T21:39:17.73122572Z","actor":"shady2k","issue_id":"iaam-q9ns","extra":{"field":"status","new_value":"open","old_value":"in_progress"}}
 {"id":"int-c32c87e34682d0bdf290ff96160a2d8a","kind":"field_change","created_at":"2026-09-07T06:40:37.460294004Z","actor":"shady2k","issue_id":"iaam-f53t","extra":{"field":"priority","new_value":"1","old_value":"0"}}
+{"id":"int-4fcd1d55acc3032d7fe19a355d9cb021","kind":"field_change","created_at":"2026-09-07T10:49:10.110937649Z","actor":"shady2k","issue_id":"iaam-2a74","extra":{"field":"priority","new_value":"3","old_value":"1"}}

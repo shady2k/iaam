@@ -165,6 +165,8 @@ pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_BATCH_OPERATION_ID: &str =
     "record_account_transfer_partners_batch";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
+pub const CREATE_CATEGORY_GROUP_OPERATION_ID: &str = "create_category_group";
+pub const CREATE_CATEGORY_OPERATION_ID: &str = "create_category";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 pub const CREATE_CATEGORY_RULE_BATCH_OPERATION_ID: &str = "create_category_rule_batch";
 
@@ -1116,6 +1118,7 @@ pub async fn list_category_groups(
 #[utoipa::path(
     post,
     path = "/v1/category-groups",
+    operation_id = CREATE_CATEGORY_GROUP_OPERATION_ID,
     request_body = CategoryGroupRequest,
     responses(
         (status = 201, description = "Category group added", body = CategoryGroupDto),
@@ -1132,7 +1135,7 @@ pub async fn create_category_group_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryGroupRequest>,
 ) -> Result<(StatusCode, Json<CategoryGroupDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require_submit(&principal)?;
     let title = request.title.trim();
     if title.is_empty() {
         return Err(invalid_field("title", "a non-empty title", request.title));
@@ -1172,6 +1175,7 @@ pub async fn list_category_reference(
 #[utoipa::path(
     post,
     path = "/v1/categories",
+    operation_id = CREATE_CATEGORY_OPERATION_ID,
     request_body = CategoryRequest,
     responses(
         (status = 201, description = "Category added", body = CategoryDto),
@@ -1189,7 +1193,7 @@ pub async fn create_category_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryRequest>,
 ) -> Result<(StatusCode, Json<CategoryDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require_submit(&principal)?;
     let category = create_category(
         &state.services,
         &principal,
@@ -6081,12 +6085,12 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// says *what would have to be true* for the key to be wanted rather than
 /// merely that nothing wants it today.
 ///
-/// Owner-only administration — accounts' aliases and declarations, categories
-/// and groups, instruments, tokens, broker access — shares one reason and it is
-/// the reason [`require_admin`] states: the queue and the caveat register are
-/// about the owner's money and these are about the shape of the instance, so
-/// there is no second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
+/// Owner-only administration — accounts' aliases and declarations, instruments,
+/// tokens and broker access — shares one reason and it is the reason
+/// [`require_admin`] states: the queue and the caveat register are about the
+/// owner's money and these are about the shape of the instance, so there is no
+/// second reader of their authority for a floor to disagree with.
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 24] = [
     (
         "rename_account",
         "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
@@ -6150,14 +6154,6 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
     (
         "delete_classification_rule",
         "It uses the CreateClassificationRule floor: retiring a rule is the undo for the reversible rule decision.",
-    ),
-    (
-        "create_category_group_route",
-        "Owner-only administration: the shape of his own vocabulary.",
-    ),
-    (
-        "create_category_route",
-        "Owner-only administration: the shape of his own vocabulary. The item about an undecomposed outflow offers create_category_rule, which files an event under a category that exists.",
     ),
     (
         "delete_category",

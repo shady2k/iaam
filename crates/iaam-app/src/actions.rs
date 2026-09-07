@@ -851,6 +851,10 @@ pub enum OwnerPrompt {
     /// **costs** differs between the two states it can be asked in. What an
     /// institution is for does not differ, and neither does what turns on it, so
     /// there is nothing for a datum to vary.
+    /// The owner's name for the group that will contain categories.
+    CategoryGroupTitle,
+    /// The owner's name for a category within an existing group.
+    CategoryTitle,
     AccountInstitution,
     /// What a name a document printed is, where it is not an account of his.
     ///
@@ -873,6 +877,7 @@ impl OwnerPrompt {
     #[must_use]
     pub const fn pointer(&self) -> &'static str {
         match self {
+            Self::CategoryGroupTitle | Self::CategoryTitle => "/title",
             Self::AccountTitle { .. } | Self::ContourTitle => "/title",
             Self::ContourAccounts | Self::MembershipAccounts => "/accounts",
             Self::MembershipContour => "/contour",
@@ -907,6 +912,8 @@ impl OwnerPrompt {
     #[must_use]
     pub const fn asked_by(&self) -> OperationKey {
         match self {
+            Self::CategoryGroupTitle => OperationKey::CreateCategoryGroup,
+            Self::CategoryTitle => OperationKey::CreateCategory,
             Self::AccountTitle { .. } => OperationKey::CreateAccount,
             Self::ContourTitle | Self::ContourAccounts => OperationKey::CreateContour,
             Self::MembershipContour | Self::MembershipAccounts => OperationKey::AddContourVersion,
@@ -1137,6 +1144,20 @@ impl OwnerPrompt {
                  an account of yours: money that went to somebody else is one of the other \
                  answers, and answering this way about somebody else's account would hide real \
                  spending as an internal move."
+                    .to_owned(),
+            ),
+            Self::CategoryGroupTitle => (
+                "What do you want to call this category group?".to_owned(),
+                "The group is the heading under which its categories are listed. It does not \
+                 change any journal row by itself, but the category you create under it is what \
+                 lets spending be filed in the money-flow report."
+                    .to_owned(),
+            ),
+            Self::CategoryTitle => (
+                "What do you want to call this category?".to_owned(),
+                "This name becomes the heading under which matching spending is counted in the \
+                 money-flow report. Creating the category does not classify any existing row by \
+                 itself; it makes a category available for the rule or assignment that does."
                     .to_owned(),
             ),
             Self::AccountInstitution => (
@@ -3039,16 +3060,38 @@ pub fn flow_diagnostics(
 }
 
 fn no_categories_action() -> Action {
-    blocked_action(
-        identity(ActionKind::CreateFirstCategory),
-        ActionKind::CreateFirstCategory,
-        ActionCategory::required_for(ActionKind::CreateFirstCategory),
-        None,
+    let create_group = ResolutionOption {
+        operation: OperationKey::CreateCategoryGroup,
+        request: RequestPlan {
+            preset: BTreeMap::new(),
+            missing: vec![MissingInput::asked(OwnerPrompt::CategoryGroupTitle)],
+        },
+    };
+    let create_category = ResolutionOption {
+        operation: OperationKey::CreateCategory,
+        request: RequestPlan {
+            preset: BTreeMap::new(),
+            missing: vec![
+                MissingInput::plain("/group", NobodyIsAsked::Caller),
+                MissingInput::asked(OwnerPrompt::CategoryTitle),
+            ],
+        },
+    };
+    Action::new(
+        ActionFacts {
+            id: identity(ActionKind::CreateFirstCategory),
+            kind: ActionKind::CreateFirstCategory,
+            category: ActionCategory::required_for(ActionKind::CreateFirstCategory),
+            state: ActionState::NeedsOwnerInput,
+            subject: None,
+        },
         "No category exists, so no spending can be filed under a category. Create a \
-         category before writing a category rule; until then, undecomposed outflow \
-         rows cannot be acted on."
-            .to_owned(),
+         category group first and then a category under it; when a group already exists, \
+         create the category under that group. Until then, undecomposed outflow rows cannot \
+         be acted on.",
+        ActionTarget::from_options(vec![create_group, create_category]),
     )
+    .expect("missing-category prerequisite names category creation operations")
 }
 
 /// The cash an account's own quantities do not account for.
@@ -10836,8 +10879,16 @@ mod tests {
             first.category(),
             ActionCategory::required_for(ActionKind::CreateFirstCategory)
         );
-        assert_eq!(first.state(), ActionState::Blocked);
-        assert_eq!(first.target(), &ActionTarget::None);
+        assert_eq!(first.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(first.target().resolutions().len(), 2);
+        assert_eq!(
+            first.target().resolutions()[0].0,
+            OperationKey::CreateCategoryGroup
+        );
+        assert_eq!(
+            first.target().resolutions()[1].0,
+            OperationKey::CreateCategory
+        );
         assert!(first.reason().contains("no spending can be filed"));
         assert!(
             actions

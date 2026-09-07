@@ -9288,9 +9288,21 @@ pub struct JournalEventReadDto {
     /// That is deliberate — history is readable — and it is why the reader, not
     /// the store, has to know which events count.
     ///
-    /// This route cannot yet be asked for only what stands; `iaam-801g.4` is
-    /// that, and until it is decided a caller wanting totals excludes every row
-    /// whose relation is a reversal, together with the row each one names.
+    /// **Reading this field is not enough, and an earlier version of this
+    /// sentence said it was.** It told a caller wanting totals to drop every row
+    /// whose relation is a reversal together with the row it names. That fails
+    /// exactly where it matters: the reversing or replacing event is filed
+    /// against **its own** account, which need not be the account being read, so
+    /// a caller narrowing by `account` or `touching` sees the withdrawn row
+    /// whole and unmarked and never receives the row that withdrew it. In the
+    /// field this stood between a corrected journal and a report the owner could
+    /// not reproduce.
+    ///
+    /// So: a superseded event carries nothing saying it was superseded, and the
+    /// evidence that it was may be outside any narrowing a caller can express.
+    /// Until `iaam-801g.4` is decided, the report is the only place the effective
+    /// set is folded correctly, and a total assembled from these rows is not
+    /// safe to trust against it.
     pub relation: JournalRelationDto,
     pub confidence: JournalConfidenceDto,
     /// The client key supplied at ingest, if one was.

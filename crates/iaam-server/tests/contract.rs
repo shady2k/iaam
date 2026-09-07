@@ -29158,3 +29158,78 @@ async fn an_account_can_be_renamed_and_the_old_name_stops_reaching_it() {
     assert_eq!(rejected[0]["verdict"], "rejected", "{rejected}");
     assert_eq!(rejected[0]["field"], "account", "{rejected}");
 }
+
+/// A category the source stated survives a session, not only the conclusive
+/// route.
+///
+/// Two tests already drive `source_category` through `POST /v1/ingest/operations`
+/// and neither drives a session, which is the channel a carried-in history
+/// actually arrives on: `AddImportRowsRequest` takes the same `OperationDto`, so
+/// the two were assumed to behave alike and nothing said so. A history of the
+/// owner's own labelling arrived with the field empty and the question — whether
+/// the path dropped it or the submission never carried it — could not be settled
+/// from either side (`iaam-f53t`). It is settled here.
+///
+/// Invented end to end: `Groceries` is the *shape* of word an export prints.
+#[tokio::test]
+async fn a_source_category_fed_to_a_session_reaches_the_committed_fact() {
+    let (harness, path) = harness_on_disk();
+    let (status, opened) = call(
+        &harness.router,
+        post(
+            "/v1/import-sessions",
+            &harness.owner_token,
+            &json!({ "source": { "account": harness.account.inner(), "channel": "file" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let session = opened["session"].as_str().expect("session").to_owned();
+
+    let (status, rows) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/rows"),
+            &harness.owner_token,
+            &json!({ "operations": [{
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "1200.00",
+                "currency": "RUB",
+                "dates": { "cash_posted": "2026-08-05" },
+                "idempotency_key": "carried-1",
+                "source_category": "Groceries",
+            }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+
+    let (status, committed) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/commit"),
+            &harness.owner_token,
+            &json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+
+    let events = SqliteStore::open(&path)
+        .expect("second connection")
+        .load_events(harness.owner)
+        .expect("stored events");
+    let event = events
+        .into_iter()
+        .find(|event| event.idempotency_key.as_deref() == Some("carried-1"))
+        .expect("the committed row");
+    assert_eq!(
+        event.provenance.source_category(),
+        Some("Groceries"),
+        "the word the source stated reaches the fact through a session too"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}

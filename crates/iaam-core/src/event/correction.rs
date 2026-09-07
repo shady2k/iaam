@@ -66,7 +66,11 @@ impl<'a> Resolution<'a> {
             .get(&event)
             .copied()
             .map(SupersededBy::Replacement)
-            .or_else(|| self.reversed.contains(&event).then_some(SupersededBy::Reversal))
+            .or_else(|| {
+                self.reversed
+                    .contains(&event)
+                    .then_some(SupersededBy::Reversal)
+            })
     }
 
     /// Consume the resolution and return its effective events.
@@ -75,7 +79,6 @@ impl<'a> Resolution<'a> {
         self.effective
     }
 }
-
 
 /// Resolve corrections once, retaining both the effective set and its
 /// row-level explanations.

@@ -9663,9 +9663,7 @@ impl JournalEventReadDto {
             amount: view.amount.map(AmountDto::from_money),
             basis_fee: view.basis_fee.map(AmountDto::from_money),
             relation: JournalRelationDto::from_domain(view.relation),
-            superseded_by: view
-                .superseded_by
-                .map(JournalSupersededByDto::from_domain),
+            superseded_by: view.superseded_by.map(JournalSupersededByDto::from_domain),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
             row_key: view.row_key.clone(),

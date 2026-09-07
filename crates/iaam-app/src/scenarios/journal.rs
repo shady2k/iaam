@@ -16,13 +16,13 @@
 
 use iaam_core::category::row_key;
 use iaam_core::dates::EventDates;
+use iaam_core::event::correction::{SupersededBy, resolve_with_supersession};
 use iaam_core::event::kind::{
     EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TaxOrigin, TradeSide,
 };
 use iaam_core::event::leg::{Leg, LegKind};
 use iaam_core::event::provenance::RuleSettlement;
 use iaam_core::event::{Confidence, Event, Relation};
-use iaam_core::event::correction::{resolve_with_supersession, SupersededBy};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId, InstrumentId,
     OwnerId, SourceId,
@@ -282,9 +282,7 @@ pub async fn read_journal(
             },
         )
         .await?;
-    let resolution =
-        resolve_with_supersession(&all_events).map_err(AppError::Correction)?;
-
+    let resolution = resolve_with_supersession(&all_events).map_err(AppError::Correction)?;
 
     if events.is_empty() {
         if let Some(key) = query.idempotency_key {

@@ -25,7 +25,9 @@ use iaam_app::ports::{
     TokenView,
 };
 use iaam_app::ports::{ImportSessionSummaryView, ImportSessionView, Recorded};
-use iaam_app::scenarios::categories::{CategoryMove, CategoryRuleImpact, MonthlyImpact};
+use iaam_app::scenarios::categories::{
+    CategoryMove, CategoryPreviewRow, CategoryRuleImpact, MonthlyImpact,
+};
 use iaam_app::scenarios::classification::{
     ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
 };
@@ -7924,6 +7926,8 @@ pub struct CategoryRuleRequest {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleImpactDto {
     pub rows: u64,
+    /// Each affected event before the monthly aggregates below.
+    pub preview_rows: Vec<CategoryPreviewRowDto>,
     /// The movements the proposed rule causes, month by month.
     ///
     /// **Everything a category rule can move is in this list.** Changing only a
@@ -7942,6 +7946,13 @@ pub struct CategoryRuleImpactDto {
     /// explanation of the same one. No rule performs that change, and it is not
     /// asked for here: it goes back through the channel the fact arrived by.
     pub months: Vec<MonthlyImpactDto>,
+}
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryPreviewRowDto {
+    pub row_key: Option<String>,
+    pub from: Option<Uuid>,
+    pub to: Uuid,
+    pub amount: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -7965,11 +7976,27 @@ impl CategoryRuleImpactDto {
     pub fn from_domain(impact: CategoryRuleImpact) -> Self {
         Self {
             rows: impact.rows,
+            preview_rows: impact
+                .preview_rows
+                .into_iter()
+                .map(CategoryPreviewRowDto::from_domain)
+                .collect(),
             months: impact
                 .months
                 .into_iter()
                 .map(MonthlyImpactDto::from_domain)
                 .collect(),
+        }
+    }
+}
+
+impl CategoryPreviewRowDto {
+    fn from_domain(row: CategoryPreviewRow) -> Self {
+        Self {
+            row_key: row.row_key,
+            from: row.from.map(|id| id.inner()),
+            to: row.to.inner(),
+            amount: row.amount.to_calc_dec().inner().to_string(),
         }
     }
 }
@@ -9168,6 +9195,9 @@ pub struct JournalEventReadDto {
     /// The client key supplied at ingest, if one was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// The exact key consumed by a `row` category matcher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_key: Option<String>,
     /// Identity of the source this row arrived from. Derived from the owner,
     /// the account and the channel when the caller declared a source, and
     /// minted per request when it did not.
@@ -9510,6 +9540,7 @@ impl JournalEventReadDto {
             relation: JournalRelationDto::from_domain(view.relation),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
+            row_key: view.row_key.clone(),
             source: view.source.inner(),
             import: view.import.map(|import| import.inner()),
             source_operation_id: view.source_operation_id.clone(),

@@ -3,6 +3,7 @@
 use iaam_core::category::{
     CategoryAssignment, CategoryImpactRow, CategoryInterval, CategoryMatcher, CategoryRule,
     CategoryRuleProposal, CategorySubject, assign_with_proposed, group_category_impacts,
+    row_key as category_row_key,
 };
 use iaam_core::event::Event;
 use iaam_core::event::kind::EventKind;
@@ -24,12 +25,23 @@ pub struct CategoryRuleInput {
     pub interval: CategoryInterval,
     pub replaces: Option<CategoryRuleId>,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryRuleImpact {
     pub rows: u64,
+    /// Every affected journal row, before the monthly aggregates below.
+    pub preview_rows: Vec<CategoryPreviewRow>,
     /// By month, oldest first: what moved, and between which categories.
     pub months: Vec<MonthlyImpact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryPreviewRow {
+    /// The exact key consumed by `CategoryMatcher::Row`, when the event has one.
+    pub row_key: Option<String>,
+    /// `None` means the row was not previously decomposed.
+    pub from: Option<CategoryId>,
+    pub to: CategoryId,
+    pub amount: Money,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +200,7 @@ pub async fn preview_category_rule(
         .load_events_through(principal.owner, time::Date::MAX)
         .await?;
     let mut moved = Vec::new();
-
+    let mut preview_rows = Vec::new();
     for event in events {
         if !matches!(event.kind, EventKind::CashOut { .. }) {
             continue;
@@ -230,12 +242,19 @@ pub async fn preview_category_rule(
             to: next,
             amount,
         });
+        preview_rows.push(CategoryPreviewRow {
+            row_key: category_row_key(&event).map(str::to_owned),
+            from: previous,
+            to: next,
+            amount,
+        });
     }
 
     let grouped = group_category_impacts(moved)
         .map_err(|error| AppError::Store(format!("aggregate category preview: {error}")))?;
     Ok(CategoryRuleImpact {
         rows: grouped.rows,
+        preview_rows,
         months: grouped
             .months
             .into_iter()
@@ -287,10 +306,9 @@ impl CategoryIndex for LoadedCategoryIndex {
         // row at all, and the strongest precedence level is dead for exactly
         // the imports that need it most. Provenance is untouched: it still
         // records that the source named nothing.
-        let row_key = event
-            .provenance
-            .source_operation_id()
-            .or(event.idempotency_key.as_deref());
+        // The same helper is published on journal and preview rows, so a Row
+        // matcher always receives the identity the API tells the caller to use.
+        let row_key = category_row_key(event);
         let subject = CategorySubject {
             row_key,
             source_category: event.provenance.source_category(),

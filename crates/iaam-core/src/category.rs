@@ -22,8 +22,23 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use time::Date;
 
+use crate::event::Event;
 use crate::ids::{CategoryId, CategoryRuleId};
 use crate::money::{CurrencyCode, Money, MoneyError};
+
+/// The stable row key used by category row matchers.
+///
+/// A source operation identifier outranks the caller's idempotency key because
+/// that is the same precedence used when a row is assigned. Publishing this
+/// helper's result keeps the journal and category-rule preview on the exact
+/// identity `CategoryMatcher::Row` matches.
+#[must_use]
+pub fn row_key(event: &Event) -> Option<&str> {
+    event
+        .provenance
+        .source_operation_id()
+        .or(event.idempotency_key.as_deref())
+}
 
 /// The inclusive validity interval of a category rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

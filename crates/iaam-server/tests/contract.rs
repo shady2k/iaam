@@ -4101,6 +4101,7 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
             .iter()
             .find(|row| row["idempotency_key"] == key)
             .unwrap_or_else(|| panic!("{key} is in the journal: {recorded:?}"));
+        assert_eq!(row["row_key"], key);
         assert_eq!(
             row["account"],
             json!(harness.account.inner()),
@@ -9195,6 +9196,7 @@ async fn category_rule_preview_does_not_write_and_rules_are_listed() {
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 1);
+    assert_eq!(impact["preview_rows"][0]["row_key"], "preview-other");
     assert_eq!(impact["months"][0]["month"], "2026-08-01");
     assert_eq!(impact["months"][0]["moved"][0]["from"], Value::Null);
     assert_eq!(impact["months"][0]["moved"][0]["to"], category_id);
@@ -9274,6 +9276,10 @@ async fn a_row_rule_pins_a_row_whose_source_named_no_identifier() {
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 1, "{impact}");
+    assert_eq!(
+        impact["preview_rows"][0]["row_key"],
+        "tbank/file/deadbeef/1"
+    );
 }
 
 #[tokio::test]
@@ -20670,6 +20676,12 @@ async fn a_row_identified_by_its_source_is_a_duplicate_before_the_commit_says_so
         before + 1,
         "one statement fed twice is one movement"
     );
+    let recorded = journal_events(&harness).await;
+    let row = recorded
+        .iter()
+        .find(|row| row["source_operation_id"] == "statement-row-7")
+        .expect("source-identified row is in the journal");
+    assert_eq!(row["row_key"], "statement-row-7");
 }
 
 /// A row that names no identity at all is disclosed, never merged and never

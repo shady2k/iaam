@@ -4366,11 +4366,15 @@ async fn import_preview_describes_the_swap_without_writing_it() {
     assert_eq!(preview["preview"]["to"], "2025-01-02", "{preview}");
     assert_eq!(preview["preview"]["accounts"][0]["facts"], 2, "{preview}");
     assert_eq!(
-        preview["preview"]["accounts"][0]["figures"][0]["before"], "210",
+        // Two decimal places, as every other amount this API publishes. The
+        // expectation said "210" and the response says "210.00"; the response
+        // is right, and a preview that formatted money its own way would be a
+        // second vocabulary for the one thing the owner reads most.
+        preview["preview"]["accounts"][0]["figures"][0]["before"], "210.00",
         "{preview}"
     );
     assert_eq!(
-        preview["preview"]["accounts"][0]["figures"][0]["after"], "0",
+        preview["preview"]["accounts"][0]["figures"][0]["after"], "0.00",
         "{preview}"
     );
 

@@ -631,6 +631,20 @@ pub struct JournalQuery {
     /// Maximum rows the store may return.
     pub limit: u32,
 }
+/// Filters for the distinct source-category vocabulary recorded in the journal.
+///
+/// This is deliberately separate from [`JournalQuery`]: it asks for the set
+/// rather than a page of rows, so a caller can learn the values without
+/// materialising the journal.
+#[derive(Debug, Clone, Default)]
+pub struct JournalSourceCategoryQuery {
+    /// Only facts recorded against this account.
+    pub account: Option<AccountId>,
+    /// Inclusive lower bound on the effective date.
+    pub from: Option<Date>,
+    /// Inclusive upper bound on the effective date.
+    pub to: Option<Date>,
+}
 
 /// One decision the owner can review, including its actor and undo.
 #[derive(Debug, Clone, PartialEq)]
@@ -771,6 +785,15 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         query: JournalQuery,
     ) -> Result<Vec<Event>, AppError>;
+    /// Distinct source-category values recorded for the owner's journal scope.
+    ///
+    /// The store performs the distinct projection so this does not become a
+    /// row-by-row read hidden behind the application port.
+    async fn list_journal_source_categories(
+        &self,
+        owner: OwnerId,
+        query: JournalSourceCategoryQuery,
+    ) -> Result<Vec<String>, AppError>;
 
     /// All journal facts and standing decisions attributable to the owner,
     /// bounded by the moment this instance recorded them.

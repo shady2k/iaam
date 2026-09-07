@@ -2,6 +2,10 @@
 
 Date: 2026-09-05 · Status: proposed · Beads: `iaam-i3nx`
 
+Since `iaam-tz2x`: the money-flow confidence register carries the undecomposed
+share before the figures, and the queue grades that work for `money_flow` rather
+than for no goal at all.
+
 ## Context
 
 An agent that knows nothing about this system is handed an address and a token

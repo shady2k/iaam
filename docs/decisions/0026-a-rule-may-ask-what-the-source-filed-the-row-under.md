@@ -2,6 +2,10 @@
 
 Date: 2026-09-04 · Status: proposed · Bead: `iaam-93lz`
 
+Since `iaam-zo7i`: the journal publishes the source category on each read event
+and the exact distinct vocabulary for an account and date range, so a rule can be
+aimed at a value the caller has seen rather than guessed.
+
 ## Context
 
 Decision 0019 §6 settles what a source profile does with an institution's own

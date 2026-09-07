@@ -38,7 +38,8 @@ use iaam_app::scenarios::import_session::{HeldRow, IntakeOutcome, SessionContent
 use iaam_app::scenarios::ingest::RowOrigin;
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::journal::{
-    DeclaredSource, JournalReadQuery, read_journal, read_operation_history,
+    DeclaredSource, JournalReadQuery, list_journal_source_categories, read_journal,
+    read_operation_history,
 };
 use iaam_app::scenarios::market_reference::{
     MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
@@ -84,8 +85,8 @@ use crate::dto::{
     AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
     ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto,
     BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    CategoryGroupRequest, CategoryMatcherDto, CategoryRequest, CategoryRuleDto,
+    CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
     CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
@@ -1269,7 +1270,7 @@ pub async fn create_category_rule_route(
     ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<(StatusCode, Json<CategoryRuleDto>), ApiFailure> {
     require(&principal, OperationKey::CreateCategoryRule)?;
-    let matcher = parse_category_matcher(request.matcher)?;
+    let matcher = parse_category_matcher(request.matcher);
     let rule = create_category_rule(
         &state.services,
         &principal,
@@ -1316,7 +1317,7 @@ pub async fn preview_category_rule_route(
     ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<Json<CategoryRuleImpactDto>, ApiFailure> {
     require_submit(&principal)?;
-    let matcher = parse_category_matcher(request.matcher)?;
+    let matcher = parse_category_matcher(request.matcher);
     let impact = preview_category_rule(
         &state.services,
         &principal,
@@ -5265,94 +5266,14 @@ fn market_key_rate_dto(
     }
 }
 
-fn parse_category_matcher(value: serde_json::Value) -> Result<CategoryMatcher, ApiFailure> {
-    if let Some(raw) = value.as_str() {
-        let parsed = serde_json::from_str(raw)
-            .map_err(|_| invalid_field("matcher", "a category matcher object", raw.to_owned()))?;
-        return parse_category_matcher(parsed);
-    }
-    let Some(object) = value.as_object() else {
-        return Err(invalid_field(
-            "matcher",
-            "a category matcher object",
-            value.to_string(),
-        ));
-    };
-
-    if let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) {
-        let payload = object.get("value").unwrap_or(&serde_json::Value::Null);
-        return Ok(match kind {
-            "row" => CategoryMatcher::Row {
-                key: matcher_text(payload, "key")?,
-            },
-            "source_category" => CategoryMatcher::SourceCategory {
-                value: matcher_text(payload, "value")?,
-            },
-            "description_contains" => CategoryMatcher::DescriptionContains {
-                text: matcher_text(payload, "text")?,
-            },
-            _ => {
-                return Err(invalid_field(
-                    "matcher.kind",
-                    "row, source_category or description_contains",
-                    kind.to_owned(),
-                ));
-            }
-        });
-    }
-
-    let (kind, payload) = [
-        "Row",
-        "row",
-        "row_key",
-        "SourceCategory",
-        "source_category",
-        "DescriptionContains",
-        "description_contains",
-    ]
-    .iter()
-    .find_map(|key| object.get(*key).map(|payload| (*key, payload)))
-    .ok_or_else(|| {
-        invalid_field(
-            "matcher",
-            "row, source_category or description_contains",
-            value.to_string(),
-        )
-    })?;
-    let text = matcher_text(
-        payload,
-        match kind {
-            "Row" | "row" | "row_key" => "key",
-            "SourceCategory" | "source_category" => "value",
-            "DescriptionContains" | "description_contains" => "text",
-            _ => unreachable!("matcher key was selected above"),
-        },
-    )?;
-    Ok(match kind {
-        "Row" | "row" | "row_key" => CategoryMatcher::Row { key: text },
-        "SourceCategory" | "source_category" => CategoryMatcher::SourceCategory { value: text },
-        "DescriptionContains" | "description_contains" => {
+fn parse_category_matcher(value: CategoryMatcherDto) -> CategoryMatcher {
+    match value {
+        CategoryMatcherDto::Row(key) => CategoryMatcher::Row { key },
+        CategoryMatcherDto::SourceCategory(value) => CategoryMatcher::SourceCategory { value },
+        CategoryMatcherDto::DescriptionContains(text) => {
             CategoryMatcher::DescriptionContains { text }
         }
-        _ => unreachable!("matcher key was selected above"),
-    })
-}
-
-fn matcher_text(value: &serde_json::Value, field: &str) -> Result<String, ApiFailure> {
-    value
-        .as_str()
-        .or_else(|| value.get(field).and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("value").and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            invalid_field(
-                "matcher",
-                "a category matcher with a string value",
-                value.to_string(),
-            )
-        })
+    }
 }
 /// Journal read parameters. Every filter is optional and they combine.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -5412,6 +5333,24 @@ pub struct JournalParams {
     /// Rows per page, 1 to 200. Absent means 50.
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Filters for the exact source-category vocabulary in the journal.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct JournalSourceCategoryParams {
+    /// Only facts recorded against this account.
+    #[serde(default)]
+    pub account: Option<Uuid>,
+    /// Inclusive start of the effective-date interval, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub from: Option<String>,
+    /// Inclusive end of the effective-date interval, YYYY-MM-DD.
+    #[serde(default)]
+    #[param(value_type = Option<String>, format = Date)]
+    pub to: Option<String>,
 }
 
 /// The owner's journal events, a page at a time.
@@ -5481,6 +5420,47 @@ pub async fn list_journal_events(
             .collect(),
         next: page.next,
     }))
+}
+
+/// The exact source-category words recorded in the owner's journal.
+///
+/// Values are returned verbatim and sorted by the store. The optional scope is
+/// the same account and inclusive effective-date interval a journal reader can
+/// use; no source value is normalised because category matchers are exact.
+#[utoipa::path(
+    get,
+    path = "/v1/journal/source-categories",
+    params(JournalSourceCategoryParams),
+    responses(
+        (status = 200, description = "Distinct source-category values", body = Vec<String>),
+        (status = 422, description = "A parameter could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn list_journal_source_categories_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<JournalSourceCategoryParams>,
+) -> Result<Json<Vec<String>>, ApiFailure> {
+    let from = params
+        .from
+        .as_deref()
+        .map(|value| parse_query_date("from", value))
+        .transpose()?;
+    let to = params
+        .to
+        .as_deref()
+        .map(|value| parse_query_date("to", value))
+        .transpose()?;
+    let values = list_journal_source_categories(
+        state.services.store.as_ref(),
+        principal.owner,
+        params.account.map(AccountId),
+        from,
+        to,
+    )
+    .await?;
+    Ok(Json(values))
 }
 
 /// The owner's decision record: who acted, what was settled, and what undoes it.

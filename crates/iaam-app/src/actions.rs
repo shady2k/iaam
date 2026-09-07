@@ -270,7 +270,12 @@ impl ActionKind {
             Self::CoverageGapUnrepaired
             | Self::IndependentConfirmationMissing
             | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
-            // Recommended and informational: never required, so no goal.
+            // The category-rule item is required for the report's own question:
+            // without a match, `went_out_by_category` cannot answer where the
+            // money went. It is deliberately not required for any other report.
+            Self::UndecomposedOutflows => ReportGoals::of(&[MoneyFlow]),
+            // Recommended and informational items are never required and carry
+            // no goal.
             //
             // `AdoptClassificationRule` is here and not beside the question it
             // comes from, and the difference is the whole of its grading. The
@@ -279,7 +284,6 @@ impl ActionKind {
             // from is settled — and only decides what happens to rows nobody has
             // submitted yet. No report the owner can run today is waiting on it.
             Self::AdoptClassificationRule
-            | Self::UndecomposedOutflows
             | Self::ExternalTransfersUncategorised
             | Self::UnexplainedResidual => ReportGoals::NONE,
         }
@@ -3071,14 +3075,10 @@ fn unexplained_residual_action(account: &AccountView, amount: Money) -> Action {
 /// completed contract, not a report-local namespace, and the operation's
 /// required scope is read from [`crate::ports::required_scope`].
 ///
-/// `Recommended`, not `RequiredForGoal`. The distinction the control-assertion
-/// actions were promoted on is whether the absence makes the reported number mean
-/// something other than what it says: without an opening assertion the cash figure
-/// is a movement and not a balance, so the figure is wrong. Nothing here is wrong.
-/// `went_out` already counts these rows in full, the report names the undecomposed
-/// amount as its own line rather than hiding it in a bucket, and the identity still
-/// closes. What is missing is the breakdown by what the money was for — real quality
-/// work, and optional in the sense the category intends.
+/// `RequiredForGoal(MoneyFlow)`, because this is the report's own question:
+/// without a category assignment, `went_out_by_category` cannot answer where
+/// the money went. `went_out` counts the rows and the confidence register names
+/// their amount, but neither supplies the missing decomposition.
 ///
 /// Nothing is preset. The rule request takes a matcher, a category and a validity
 /// interval, and this aggregate justifies none of them:
@@ -3108,7 +3108,7 @@ fn undecomposed_outflows_action(
                 currency.code()
             ),
             kind: ActionKind::UndecomposedOutflows,
-            category: ActionCategory::Recommended,
+            category: ActionCategory::required_for(ActionKind::UndecomposedOutflows),
             state: ActionState::NeedsOwnerInput,
             subject: Some(ActionSubject::Account(AccountSubject::of(account))),
         },
@@ -6745,9 +6745,11 @@ mod tests {
                 // was learned from is already settled, so no report is short of
                 // anything while it stands unwritten.
                 ActionKind::AdoptClassificationRule
-                | ActionKind::UndecomposedOutflows
                 | ActionKind::ExternalTransfersUncategorised
                 | ActionKind::UnexplainedResidual => &[],
+                // Without a category rule, the flow report cannot answer where
+                // the money went: its category decomposition is empty.
+                ActionKind::UndecomposedOutflows => &[MoneyFlow],
             };
 
             let goals: Vec<ReportGoal> = kind.goals().iter().collect();
@@ -9883,7 +9885,10 @@ mod tests {
             .iter()
             .find(|action| action.kind() == ActionKind::UndecomposedOutflows)
             .expect("undecomposed diagnostic");
-        assert_eq!(undecomposed.category(), ActionCategory::Recommended);
+        assert_eq!(
+            undecomposed.category(),
+            ActionCategory::required_for(ActionKind::UndecomposedOutflows)
+        );
         assert!(undecomposed.reason().contains(&account.inner().to_string()));
         assert_eq!(undecomposed.state(), ActionState::NeedsOwnerInput);
         assert_eq!(undecomposed.required_scope(), Some(Scope::Agent));

@@ -101,6 +101,7 @@ use iaam_core::valuation::{
     UncoveredReason as CandidateUncoveredReason,
 };
 use rust_decimal::Decimal;
+use serde::de;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -2736,6 +2737,20 @@ pub struct ConfidenceDto {
     /// The same four names the outstanding-work queue grades its items by, so a
     /// caller holding a report with caveats can ask the queue what closes them.
     pub goal: String,
+    /// The amount and proportion of outflows left without a category, by
+    /// currency, before the report's figures.
+    ///
+    /// **Empty carries two meanings, and the `goal` above says which.** On
+    /// `money_flow` it means every outflow is decomposed. On the other three it
+    /// means this report does not decompose outflows at all — and a reader who
+    /// took it for the first would conclude that a snapshot or a return accounts
+    /// for spending it never looked at. That is the mistake this field exists to
+    /// stop, so it must not be made by the field itself.
+    ///
+    /// It lives here rather than on the money-flow report because a caller reads
+    /// one register to learn what a report is short of, and a second place to
+    /// look for incompleteness is what this register exists to prevent.
+    pub undecomposed_outflows: Vec<UndecomposedOutflowShareDto>,
     /// Whether everything that would have to be true for these figures to be
     /// complete is true.
     ///
@@ -2752,6 +2767,39 @@ pub struct ConfidenceDto {
     /// The specific things that are not. Always present; empty exactly when
     /// `complete` is true.
     pub caveats: Vec<CaveatDto>,
+}
+
+/// The undecomposed outflow share, derived from the money-flow fold.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UndecomposedOutflowShareDto {
+    pub currency: CurrencyDto,
+    pub count: u64,
+    pub amount: AmountDto,
+    pub total_outflow: AmountDto,
+    /// `amount / total_outflow`, or `null` when the denominator is zero.
+    pub proportion: Option<String>,
+}
+
+impl UndecomposedOutflowShareDto {
+    fn from_domain(share: &iaam_core::report::confidence::UndecomposedShare) -> Self {
+        let proportion = if share.total_outflow.is_zero() {
+            None
+        } else {
+            share
+                .amount
+                .to_calc_dec()
+                .inner()
+                .checked_div(share.total_outflow.to_calc_dec().inner())
+                .map(|ratio| ratio.normalize().to_string())
+        };
+        Self {
+            currency: CurrencyDto::from_domain(share.currency),
+            count: share.count,
+            amount: AmountDto::from_money(share.amount),
+            total_outflow: AmountDto::from_money(share.total_outflow),
+            proportion,
+        }
+    }
 }
 
 /// One specific, checkable thing a report's figures do not account for.
@@ -2872,6 +2920,11 @@ impl ConfidenceDto {
     pub fn from_domain(confidence: &ReportConfidence, catalog: &ActionCatalog) -> Self {
         Self {
             goal: confidence.goal().code().to_owned(),
+            undecomposed_outflows: confidence
+                .undecomposed_outflows()
+                .iter()
+                .map(UndecomposedOutflowShareDto::from_domain)
+                .collect(),
             // From the register, never beside it: the domain type has no
             // `complete` field to copy, so the two cannot fall out of step.
             complete: confidence.complete(),
@@ -7731,12 +7784,69 @@ impl CategoryDto {
     }
 }
 
+/// The exact matcher shapes accepted by category-rule create and preview.
+///
+/// The externally tagged representation keeps the JSON key identical to the
+/// stored matcher and makes the value's meaning explicit:
+/// `{"row":"..."}`, `{"source_category":"..."}`, or
+/// `{"description_contains":"..."}`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CategoryMatcherDto {
+    Row(String),
+    SourceCategory(String),
+    DescriptionContains(String),
+}
+
+impl<'de> Deserialize<'de> for CategoryMatcherDto {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object() else {
+            return Err(de::Error::custom(
+                "invalid type, expected a category matcher object",
+            ));
+        };
+        if object.len() != 1 {
+            return Err(de::Error::custom(
+                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+            ));
+        }
+        let (kind, value) = object
+            .iter()
+            .next()
+            .expect("a non-empty object has a matcher entry");
+        let Some(value) = value.as_str() else {
+            return Err(de::Error::custom(
+                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+            ));
+        };
+        match kind.as_str() {
+            "row" => Ok(Self::Row(value.to_owned())),
+            "source_category" => Ok(Self::SourceCategory(value.to_owned())),
+            "description_contains" => Ok(Self::DescriptionContains(value.to_owned())),
+            _ => Err(de::Error::custom(
+                "invalid value, expected one of `row`, `source_category`, `description_contains`",
+            )),
+        }
+    }
+}
+
+impl CategoryMatcherDto {
+    #[must_use]
+    pub fn from_stored(raw: &str) -> Self {
+        serde_json::from_str(raw).expect("stored category matcher must match its contract")
+    }
+}
+
 /// Owner category rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleDto {
     pub id: Uuid,
     pub version: u32,
-    pub matcher: String,
+    pub matcher: CategoryMatcherDto,
     pub category: Uuid,
     #[serde(with = "iso_date::option")]
     #[schema(value_type = Option<String>, format = Date)]
@@ -7755,7 +7865,7 @@ impl CategoryRuleDto {
         Self {
             id: rule.id.inner(),
             version: rule.version,
-            matcher: rule.matcher,
+            matcher: CategoryMatcherDto::from_stored(&rule.matcher),
             category: rule.category.inner(),
             valid_from: rule.valid_from,
             valid_to: rule.valid_to,
@@ -7796,8 +7906,9 @@ pub struct CategoryRequest {
 /// Category matcher and validity interval for a new rule.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CategoryRuleRequest {
-    /// Matcher object. Its accepted forms mirror the stored category matcher.
-    pub matcher: serde_json::Value,
+    /// One of the three externally tagged matcher shapes in
+    /// [`CategoryMatcherDto`].
+    pub matcher: CategoryMatcherDto,
     pub category: Uuid,
     #[serde(default, with = "iso_date::option")]
     #[schema(value_type = Option<String>, format = Date)]

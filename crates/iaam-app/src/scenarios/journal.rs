@@ -30,7 +30,7 @@ use iaam_core::valuation::PriceQuality;
 use time::{Date, Time};
 
 use crate::error::AppError;
-use crate::ports::{JournalCursor, JournalQuery, RecordedEvent, Store};
+use crate::ports::{JournalCursor, JournalQuery, JournalSourceCategoryQuery, RecordedEvent, Store};
 
 /// Rows returned when the caller names no size.
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
@@ -281,6 +281,24 @@ pub async fn read_journal(
         })
         .flatten();
     Ok(JournalPage { rows, next })
+}
+
+/// List the exact source-category vocabulary in a journal scope.
+///
+/// The store performs the distinct projection over the same journal facts that
+/// [`read_journal`] returns; no spelling is normalised because matchers use the
+/// recorded string exactly.
+pub async fn list_journal_source_categories(
+    store: &dyn Store,
+    owner: OwnerId,
+    account: Option<AccountId>,
+    from: Option<Date>,
+    to: Option<Date>,
+) -> Result<Vec<String>, AppError> {
+    let (from, to) = date_range(from, to)?;
+    store
+        .list_journal_source_categories(owner, JournalSourceCategoryQuery { account, from, to })
+        .await
 }
 
 fn journal_event_view(event: &iaam_core::event::Event) -> JournalEventView {

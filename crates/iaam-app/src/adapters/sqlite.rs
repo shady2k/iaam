@@ -18,9 +18,9 @@ use crate::ports::{
     ControlAssertionView, CustodyView, DecisionQuery, DecisionRecord, Declared,
     DeclinedAccountNameView, DocumentToKeep, ImportObservationView, ImportQuestionView,
     ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
-    InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, NewImportQuestion, Principal,
-    Recorded, RecordedEvent, Scope, SoleOwner, Store, TokenAdmin, TokenView,
-    UnresolvedAccountSourceView, UnresolvedAccountView,
+    InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery,
+    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store, TokenAdmin,
+    TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -54,7 +54,7 @@ use iaam_store::documents::{
 };
 use iaam_store::events::{
     AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
-    JournalQuery as StoredJournalQuery,
+    JournalQuery as StoredJournalQuery, SourceCategoryQuery as StoredSourceCategoryQuery,
 };
 use iaam_store::import_session::{
     NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredControlFigures,
@@ -435,6 +435,24 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             store
                 .list_journal_events(owner, &query)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn list_journal_source_categories(
+        &self,
+        owner: OwnerId,
+        query: JournalSourceCategoryQuery,
+    ) -> Result<Vec<String>, AppError> {
+        let query = StoredSourceCategoryQuery {
+            account: query.account,
+            from: query.from,
+            to: query.to,
+        };
+        self.blocking(move |store| {
+            store
+                .list_journal_source_categories(owner, &query)
                 .map_err(store_error)
         })
         .await

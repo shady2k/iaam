@@ -29,7 +29,8 @@ use iaam_app::ports::{
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
-    list_category_rules, list_groups, preview_category_rule, preview_category_rules, retire_category,
+    list_category_rules, list_groups, preview_category_rule, preview_category_rules,
+    retire_category,
 };
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::correction::{ImportTarget, correct_events};
@@ -1392,7 +1393,10 @@ pub async fn create_category_rules_batch_route(
                     "retire the category rule; its history remains available",
                 )
                 .await?;
-                verdicts.push(VerdictDto::accepted_category_rule(index + 1, rule.id.inner()));
+                verdicts.push(VerdictDto::accepted_category_rule(
+                    index + 1,
+                    rule.id.inner(),
+                ));
             }
             Err(error) => verdicts.push(VerdictDto::rejected_category_rule(
                 index + 1,
@@ -1402,7 +1406,6 @@ pub async fn create_category_rules_batch_route(
     }
     Ok(Json(verdicts))
 }
-
 
 /// Preview several category rules against the same current journal and rule set.
 #[utoipa::path(
@@ -5030,9 +5033,9 @@ pub async fn flow_report(
         &accounts,
         outcome.categories_exist(),
     )?
-        .iter()
-        .map(|action| action_dto(action, &catalog))
-        .collect();
+    .iter()
+    .map(|action| action_dto(action, &catalog))
+    .collect();
     let dto = MoneyFlowReportDto::from_domain(&outcome, actions, &catalog)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))

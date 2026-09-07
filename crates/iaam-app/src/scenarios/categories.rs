@@ -234,8 +234,7 @@ fn preview_category_rule_from(
             CategoryAssignment::Assigned { category, .. } => Some(category),
             CategoryAssignment::NotDecomposed => None,
         };
-        let CategoryAssignment::Assigned { category: next, .. } =
-            proposed_index.assignment(event)
+        let CategoryAssignment::Assigned { category: next, .. } = proposed_index.assignment(event)
         else {
             continue;
         };

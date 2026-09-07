@@ -10750,11 +10750,14 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
         .unwrap_or_else(|| panic!("the empty-category prerequisite: {body}"));
     assert_eq!(prerequisite["state"], "needs_owner_input", "{prerequisite}");
     assert_eq!(
-        prerequisite["category"],
-        "required_for_goal",
+        prerequisite["category"], "required_for_goal",
         "{prerequisite}"
     );
-    assert_eq!(prerequisite["goals"], json!(["money_flow"]), "{prerequisite}");
+    assert_eq!(
+        prerequisite["goals"],
+        json!(["money_flow"]),
+        "{prerequisite}"
+    );
     assert_eq!(prerequisite["required_scope"], "agent", "{prerequisite}");
 
     let target = &prerequisite["target"];
@@ -10778,13 +10781,11 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
         "{prerequisite}"
     );
     assert_eq!(
-        options[0]["request"]["missing"][0]["pointer"],
-        "/title",
+        options[0]["request"]["missing"][0]["pointer"], "/title",
         "{prerequisite}"
     );
     assert_eq!(
-        options[0]["request"]["missing"][0]["provided_by"],
-        "owner",
+        options[0]["request"]["missing"][0]["provided_by"], "owner",
         "{prerequisite}"
     );
     let category_missing = options[1]["request"]["missing"]
@@ -10798,8 +10799,14 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
         vec!["/group", "/title"],
         "{prerequisite}"
     );
-    assert_eq!(category_missing[0]["provided_by"], "caller", "{prerequisite}");
-    assert_eq!(category_missing[1]["provided_by"], "owner", "{prerequisite}");
+    assert_eq!(
+        category_missing[0]["provided_by"], "caller",
+        "{prerequisite}"
+    );
+    assert_eq!(
+        category_missing[1]["provided_by"], "owner",
+        "{prerequisite}"
+    );
 
     // The same invariant `/v1/actions` is held to, asserted here because this
     // action reaches the owner through the report and not through that endpoint.
@@ -10844,7 +10851,7 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
             .contains("category rule cannot decompose"),
         "{transfer}"
     );
-    assert_ne!(outflow["id"], transfer["id"], "{body}");
+    assert_ne!(prerequisite["id"], transfer["id"], "{body}");
 }
 
 /// Category alone leaves ties in generation order, which is not assertable. Two

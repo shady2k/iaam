@@ -275,9 +275,7 @@ impl ActionKind {
             | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
             // No category can receive a category rule, so undecomposed spending
             // cannot be acted on until the owner creates one.
-            Self::CreateFirstCategory | Self::UndecomposedOutflows => {
-                ReportGoals::of(&[MoneyFlow])
-            }
+            Self::CreateFirstCategory | Self::UndecomposedOutflows => ReportGoals::of(&[MoneyFlow]),
             // Recommended and informational items are never required and carry
             // no goal.
             //
@@ -796,7 +794,9 @@ pub enum OwnerPrompt {
     /// invisible to a caller, which is how an agent came to show the owner a
     /// filled-in field he has no business seeing. Said in the question, it stops
     /// being invisible without the preset having to grow a shape of its own.
-    AccountTitle { printed: Option<String> },
+    AccountTitle {
+        printed: Option<String>,
+    },
     /// His name for a reporting perimeter.
     ContourTitle,
     /// Which accounts a new perimeter holds.
@@ -3030,17 +3030,13 @@ pub fn flow_diagnostics(
             let named = names.get(account)?;
             match cause {
                 UndecomposedCause::NoRuleMatched if categories_exist => {
-                    actions.push(undecomposed_outflows_action(
-                        named, currency, count, amount,
-                    ));
+                    actions.push(undecomposed_outflows_action(named, currency, count, amount));
                 }
                 UndecomposedCause::NoRuleMatched => {
                     has_unfiled_spending = true;
                 }
                 UndecomposedCause::ExternalTransfer => {
-                    actions.push(external_transfers_action(
-                        named, currency, count, amount,
-                    ));
+                    actions.push(external_transfers_action(named, currency, count, amount));
                 }
             }
         }
@@ -6735,7 +6731,7 @@ mod tests {
             "two kinds share an identity, or one is listed twice: {:?}",
             ActionKind::ALL.map(ActionKind::id)
         );
-        assert_eq!(ActionKind::ALL.len(), 19, "a kind was added without a goal");
+        assert_eq!(ActionKind::ALL.len(), 20, "a kind was added without a goal");
     }
 
     /// Every kind graded `RequiredForGoal` names at least one goal, and every
@@ -10876,8 +10872,7 @@ mod tests {
     #[test]
     fn no_categories_replaces_unmatched_outflow_items() {
         let account = AccountId::new_random();
-        let actions =
-            flow_actions_with_categories(&undecomposed_report(&[account]), false);
+        let actions = flow_actions_with_categories(&undecomposed_report(&[account]), false);
 
         let first = actions
             .iter()

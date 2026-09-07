@@ -7999,7 +7999,6 @@ pub struct CategoryRuleBatchRequest {
     pub rules: Vec<CategoryRuleRequest>,
 }
 
-
 /// The rows and monthly movements caused by a proposed category rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleImpactDto {

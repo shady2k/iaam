@@ -78,6 +78,7 @@ use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin
 use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection, IntervalFit};
 use iaam_core::bond::offer::OfferChoice;
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
+use iaam_core::event::correction::SupersededBy;
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::source_row::{RefusedRow, RowName};
@@ -9226,6 +9227,18 @@ pub struct JournalPageDto {
     pub next: Option<String>,
 }
 
+/// Why a journal event no longer belongs to the effective set.
+///
+/// Reversal and replacement remain separate states: a reversal has no
+/// replacement to fetch, while a replacement names the event that took the
+/// target's place.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JournalSupersededByDto {
+    Reversal,
+    Replacement { event: Uuid },
+}
+
 /// A recorded journal event.
 ///
 /// This is the fact as the journal holds it, not the operation that was
@@ -9283,27 +9296,15 @@ pub struct JournalEventReadDto {
     /// from a standing one, and a caller that has not read this sentence has no
     /// reason to look for it.
     ///
-    /// The journal is append-only: a correction is a reversal and, where one was
-    /// asked for, a replacement, so a fact taken back is still returned here.
-    /// That is deliberate — history is readable — and it is why the reader, not
-    /// the store, has to know which events count.
-    ///
-    /// **Reading this field is not enough, and an earlier version of this
-    /// sentence said it was.** It told a caller wanting totals to drop every row
-    /// whose relation is a reversal together with the row it names. That fails
-    /// exactly where it matters: the reversing or replacing event is filed
-    /// against **its own** account, which need not be the account being read, so
-    /// a caller narrowing by `account` or `touching` sees the withdrawn row
-    /// whole and unmarked and never receives the row that withdrew it. In the
-    /// field this stood between a corrected journal and a report the owner could
-    /// not reproduce.
-    ///
-    /// So: a superseded event carries nothing saying it was superseded, and the
-    /// evidence that it was may be outside any narrowing a caller can express.
-    /// Until `iaam-801g.4` is decided, the report is the only place the effective
-    /// set is folded correctly, and a total assembled from these rows is not
-    /// safe to trust against it.
+    /// The journal relation this event carries: standalone, reversal, or
+    /// replacement. It describes what this event did to another event.
     pub relation: JournalRelationDto,
+    /// Whether this event was reversed without a replacement, or was replaced
+    /// by the named event. This is published on the withdrawn row itself, so
+    /// an account or touching filter does not hide the correction that explains
+    /// it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<JournalSupersededByDto>,
     pub confidence: JournalConfidenceDto,
     /// The client key supplied at ingest, if one was.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9584,6 +9585,17 @@ pub struct JournalRelationDto {
     pub target: Option<Uuid>,
 }
 
+impl JournalSupersededByDto {
+    const fn from_domain(value: SupersededBy) -> Self {
+        match value {
+            SupersededBy::Reversal => Self::Reversal,
+            SupersededBy::Replacement(event) => Self::Replacement {
+                event: event.inner(),
+            },
+        }
+    }
+}
+
 impl JournalRelationDto {
     const fn from_domain(relation: iaam_core::event::Relation) -> Self {
         match relation {
@@ -9651,6 +9663,9 @@ impl JournalEventReadDto {
             amount: view.amount.map(AmountDto::from_money),
             basis_fee: view.basis_fee.map(AmountDto::from_money),
             relation: JournalRelationDto::from_domain(view.relation),
+            superseded_by: view
+                .superseded_by
+                .map(JournalSupersededByDto::from_domain),
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
             row_key: view.row_key.clone(),

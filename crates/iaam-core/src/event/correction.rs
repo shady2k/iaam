@@ -30,14 +30,60 @@ pub enum CorrectionError {
     #[error("event {id:?} occurs more than once in the slice")]
     DuplicateEvent { id: EventId },
 }
-
-/// Effective event set.
+/// What happened to an event that is absent from the effective set.
 ///
-/// Returns events sorted by [`crate::dates::EffectiveOrder`], excluding
-/// reversed and replaced events. The result **does not depend** on input order:
-/// an ordered map is used internally, and conflicts are errors rather than a
-/// reason to choose the “last” event.
-pub fn resolve(events: &[Event]) -> Result<Vec<&Event>, CorrectionError> {
+/// A reversal with no replacement and a replacement are different facts to a
+/// journal reader, so they remain distinct instead of collapsing into a
+/// boolean "superseded" flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededBy {
+    /// The event was reversed and no replacement supersedes it.
+    Reversal,
+    /// The replacement event that supersedes this event.
+    Replacement(EventId),
+}
+
+/// The result of resolving corrections, including the facts needed to explain
+/// why an event is absent from the effective set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolution<'a> {
+    effective: Vec<&'a Event>,
+    reversed: BTreeSet<EventId>,
+    replaced_by: BTreeMap<EventId, EventId>,
+}
+
+impl<'a> Resolution<'a> {
+    /// Events that still stand after applying corrections.
+    #[must_use]
+    pub fn effective(&self) -> &[&'a Event] {
+        &self.effective
+    }
+
+    /// Explain whether an event was reversed or replaced.
+    #[must_use]
+    pub fn superseded_by(&self, event: EventId) -> Option<SupersededBy> {
+        self.replaced_by
+            .get(&event)
+            .copied()
+            .map(SupersededBy::Replacement)
+            .or_else(|| self.reversed.contains(&event).then_some(SupersededBy::Reversal))
+    }
+
+    /// Consume the resolution and return its effective events.
+    #[must_use]
+    pub fn into_effective(self) -> Vec<&'a Event> {
+        self.effective
+    }
+}
+
+
+/// Resolve corrections once, retaining both the effective set and its
+/// row-level explanations.
+///
+/// The returned metadata is the same `reversed` set and `replaced_by` map that
+/// determine the effective set. Callers publishing journal rows must use this
+/// result rather than reconstructing correction state from the raw relations.
+pub fn resolve_with_supersession(events: &[Event]) -> Result<Resolution<'_>, CorrectionError> {
     // 1. Index by identifier, checking for duplicates.
     let mut by_id: BTreeMap<EventId, &Event> = BTreeMap::new();
     for e in events {
@@ -72,11 +118,6 @@ pub fn resolve(events: &[Event]) -> Result<Vec<&Event>, CorrectionError> {
                 if let Some(existing) = replaced_by.insert(target, e.id) {
                     // Deterministic message order: lower identifier first, so
                     // the error text does not depend on import order.
-                    //
-                    // `min`/`max`, not `if existing < e.id`: strictness is
-                    // unobservable here — equal identifiers were rejected as
-                    // duplicates above — so neither `<` nor `<=` is tested or
-                    // testable.
                     let (first, second) = (existing.min(e.id), existing.max(e.id));
                     return Err(CorrectionError::ConflictingReplacements {
                         target,
@@ -100,7 +141,21 @@ pub fn resolve(events: &[Event]) -> Result<Vec<&Event>, CorrectionError> {
     // Source times order known moments first; raw hashes reproduce equal-time ties.
     effective.sort_by(|left, right| crate::event::compare_for_replay(left, right));
 
-    Ok(effective)
+    Ok(Resolution {
+        effective,
+        reversed,
+        replaced_by,
+    })
+}
+
+/// Effective event set.
+///
+/// Returns events sorted by [`crate::dates::EffectiveOrder`], excluding
+/// reversed and replaced events. The result **does not depend** on input order:
+/// an ordered map is used internally, and conflicts are errors rather than a
+/// reason to choose the “last” event.
+pub fn resolve(events: &[Event]) -> Result<Vec<&Event>, CorrectionError> {
+    resolve_with_supersession(events).map(Resolution::into_effective)
 }
 
 #[cfg(test)]

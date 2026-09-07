@@ -9420,19 +9420,27 @@ pub struct JournalEventReadDto {
     /// A trade's basis-only fee, which is not repeated as a leg or a total.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub basis_fee: Option<AmountDto>,
-    /// Whether this event still stands, reverses another, or replaces one.
+    /// What this event did to another event: standalone, reversal, or
+    /// replacement. A reversal carries the target's same signed money and is
+    /// a correction marker, not a second movement for a total.
     ///
-    /// **A reversed event is not part of any total, and nothing else on this row
-    /// says so.** Its `kind` is the kind it always was — an income that was taken
-    /// back reads `income` — so a caller that groups by kind and sums counts it
-    /// twice. This field is the only thing that distinguishes a withdrawn fact
-    /// from a standing one, and a caller that has not read this sentence has no
-    /// reason to look for it.
-    ///
-    /// The journal relation this event carries: standalone, reversal, or
-    /// replacement. It describes what this event did to another event.
+    /// **Use `stands` when folding totals.** Counting a reversal marker along
+    /// with the target double-counts the money even though its `kind` is
+    /// ordinary.
     pub relation: JournalRelationDto,
-    /// Whether this event was reversed without a replacement, or was replaced
+    /// Whether this row belongs to the effective set, the set every report
+    /// folds. A caller that folds rows without this fact can count correction
+    /// money twice.
+    ///
+    /// `false` has two different meanings, and they are not the same fact:
+    /// the row was withdrawn (`superseded_by` says which way), or the row is a
+    /// correction marker (`relation` is a reversal) whose money is its target's
+    /// money and would be counted twice.
+    ///
+    /// `superseded_by` alone is not the test: it names the withdrawn row and
+    /// never the reversal that withdrew it.
+    pub stands: bool,
+    /// Whether this event was withdrawn without a replacement, or was replaced
     /// by the named event. This is published on the withdrawn row itself, so
     /// an account or touching filter does not hide the correction that explains
     /// it.
@@ -9797,6 +9805,7 @@ impl JournalEventReadDto {
             basis_fee: view.basis_fee.map(AmountDto::from_money),
             relation: JournalRelationDto::from_domain(view.relation),
             superseded_by: view.superseded_by.map(JournalSupersededByDto::from_domain),
+            stands: view.stands,
             confidence: JournalConfidenceDto::from_domain(view.confidence),
             idempotency_key: view.idempotency_key.clone(),
             row_key: view.row_key.clone(),

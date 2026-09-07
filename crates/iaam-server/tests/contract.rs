@@ -1921,6 +1921,27 @@ async fn the_journal_openapi_does_not_advertise_rule_version_filter() {
 }
 
 #[tokio::test]
+async fn the_journal_openapi_requires_and_describes_stands() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let schema = &spec["components"]["schemas"]["JournalEventReadDto"];
+    let required = schema["required"]
+        .as_array()
+        .expect("journal event required fields");
+    assert!(
+        required.iter().any(|field| field == "stands"),
+        "stands must be required: {schema}"
+    );
+    let description = property_description(&spec, "JournalEventReadDto", "stands");
+    assert!(
+        description.contains("effective set"),
+        "stands must explain the set reports fold: {description}"
+    );
+}
+
+#[tokio::test]
 async fn the_journal_openapi_distinguishes_account_and_touching_filters() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
@@ -12472,6 +12493,111 @@ async fn an_ingested_operation_can_be_read_back_by_its_idempotency_key() {
     assert_eq!(legs[0]["amount"], "1000.00");
     assert_eq!(legs[0]["currency"], "RUB");
 }
+#[tokio::test]
+async fn the_journal_marks_only_effective_correction_rows_as_standing() {
+    let (harness, path) = harness_on_disk();
+    let plain = seed_correctable_deposit(&harness, "stands", "stands-plain", "1.01").await;
+    let reversed = seed_correctable_deposit(&harness, "stands", "stands-reversed", "2.02").await;
+    let replaced = seed_correctable_deposit(&harness, "stands", "stands-replaced", "3.03").await;
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": reversed }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reversal = body[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("reversal event");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{
+                    "relation": "replacement",
+                    "target": replaced,
+                    "operation": {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "4.04",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "stands-replacement"
+                    }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let replacement = body[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("replacement event");
+
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("journal rows");
+    assert_eq!(rows.len(), 5, "{page}");
+    let stands: std::collections::BTreeMap<Uuid, bool> = rows
+        .iter()
+        .map(|row| {
+            (
+                Uuid::parse_str(row["event"].as_str().expect("event")).expect("event uuid"),
+                row["stands"].as_bool().expect("stands"),
+            )
+        })
+        .collect();
+    assert_eq!(stands.get(&plain), Some(&true));
+    assert_eq!(stands.get(&reversed), Some(&false));
+    assert_eq!(stands.get(&reversal), Some(&false));
+    assert_eq!(stands.get(&replaced), Some(&false));
+    assert_eq!(stands.get(&replacement), Some(&true));
+
+    let events = journal_of(&path, harness.owner);
+    let resolution =
+        iaam_core::event::correction::resolve_with_supersession(&events).expect("resolution");
+    let expected_cash: i64 = resolution
+        .effective()
+        .iter()
+        .flat_map(|event| event.legs.iter())
+        .filter(|leg| leg.kind == iaam_core::event::leg::LegKind::Cash)
+        .filter_map(|leg| leg.money.map(|money| money.amount().raw()))
+        .sum();
+    let to_minor = |amount: &str| {
+        let (whole, fraction) = amount.split_once('.').expect("two decimal places");
+        whole.parse::<i64>().expect("whole amount") * 100
+            + fraction.parse::<i64>().expect("fractional amount")
+    };
+    let actual_cash: i64 = rows
+        .iter()
+        .filter(|row| row["stands"] == json!(true))
+        .flat_map(|row| row["legs"].as_array().expect("legs"))
+        .filter(|leg| leg["kind"] == json!("cash"))
+        .map(|leg| to_minor(leg["amount"].as_str().expect("cash amount")))
+        .sum();
+    assert_eq!(actual_cash, expected_cash);
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn an_idempotency_key_that_addresses_nothing_is_a_clean_not_found() {
     // An empty page would say "the journal holds no such row" in the same
@@ -29539,6 +29665,55 @@ async fn an_operation_reads_back_as_the_acts_the_owner_took_on_it() {
     .await;
     assert_eq!(status, StatusCode::OK, "{entered}");
     assert_eq!(entered, history, "{entered}");
+}
+
+#[tokio::test]
+async fn a_history_with_an_unheld_target_still_publishes_its_arrival() {
+    let (harness, path) = harness_on_disk();
+    let mut head = {
+        seed_correctable_deposit(&harness, "history", "history-unheld", "5.05").await;
+        journal_of(&path, harness.owner)
+            .into_iter()
+            .next()
+            .expect("seeded history head")
+    };
+    let target = iaam_core::ids::EventId::new_random();
+    head.id = iaam_core::ids::EventId::new_random();
+    head.order = EffectiveOrder::new(date!(2099 - 01 - 01), 99);
+    head.dates = EventDates::for_cash(CashPostedDate(date!(2099 - 01 - 01)));
+    head.relation = iaam_core::event::Relation::Replacement { target };
+    head.idempotency_key = Some("history-unheld-head".to_owned());
+    head.provenance = head.provenance.with_raw_hash(
+        iaam_core::event::provenance::RawHash::parse(&"d".repeat(64)).expect("raw hash"),
+    );
+    SqliteStore::open(&path)
+        .expect("second connection")
+        .append_event(&head, IdentityScope::Source)
+        .expect("unheld-target history head");
+
+    let (status, history) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events/{}/history", head.id.inner()),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["steps"][0]["act"], json!("arrived"), "{history}");
+    assert_eq!(
+        history["steps"][0]["state"]["stands"],
+        json!(true),
+        "{history}"
+    );
+    assert_eq!(
+        history["steps"][0]["state"]["relation"],
+        json!({ "kind": "replacement", "target": target.inner() }),
+        "the arrival retains its unheld target relation: {history}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// An event identifier is a UUID, and a UUID that addresses no event of his is a

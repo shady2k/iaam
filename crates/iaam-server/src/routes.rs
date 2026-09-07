@@ -5579,11 +5579,8 @@ pub async fn list_journal_events(
         .map(|value| parse_query_date("to", value))
         .transpose()?;
     let source = declared_source_filter(params.source_account, params.source_channel)?;
-    let declared_import = declared_import_filter(
-        principal.owner,
-        source.as_ref(),
-        params.source_label,
-    )?;
+    let declared_import =
+        declared_import_filter(principal.owner, source.as_ref(), params.source_label)?;
     let page = read_journal(
         state.services.store.as_ref(),
         principal.owner,
@@ -5803,8 +5800,8 @@ fn declared_import_filter(
     match (source, label) {
         (None, None) => Ok(None),
         (Some(source), Some(label)) => {
-            let label = declared_label("source_label", Some(&label))?
-                .expect("a supplied label is present");
+            let label =
+                declared_label("source_label", Some(&label))?.expect("a supplied label is present");
             Ok(Some(ImportId::declared(
                 owner,
                 source.account,

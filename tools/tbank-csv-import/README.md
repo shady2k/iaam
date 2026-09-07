@@ -18,8 +18,13 @@ these source columns:
 - `Сумма в валюте счёта`: signed account-currency amount; negative is a
   `withdrawal`, positive is a `deposit`.
 - `Категория по-умолчанию`: copied verbatim to `source_category`.
+- `Ваша категория`: copied verbatim to `owner_category` when present.
 - `Описание`: copied verbatim to `description` and used to identify internal
   transfer legs.
+
+`source_category` and `owner_category` are evidence from two different
+vocabularies. The importer does not translate, normalise or map either value;
+the owner's rules decide what the recorded words mean.
 
 All other export columns are retained only as part of the raw row text used for
 idempotency. The importer does not translate or normalise source category or

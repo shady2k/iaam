@@ -196,6 +196,7 @@ def operation_of(row, account_id, currency="RUB"):
         "currency": currency,
         "dates": {"cash_posted": date_of(row).date().isoformat()},
         "source_category": source_category,
+        "owner_category": row["Ваша категория"] or None,
         "description": row["Описание"],
     }
     if Decimal(value) > 0:
@@ -232,6 +233,7 @@ def transfer_to_own_account(row, statement_account_id, other_account_id, currenc
         "currency": currency,
         "dates": {"cash_posted": date_of(row).date().isoformat()},
         "source_category": row["Категория по-умолчанию"],
+        "owner_category": row["Ваша категория"] or None,
         "description": row["Описание"],
     }
 
@@ -376,6 +378,8 @@ def operation_summary(operations, account_names=None):
             "account": account_names.get(operation["account"], operation["account"]),
             "kind": operation["type"],
             "amount": operation["amount"],
+            "source_category": operation.get("source_category"),
+            "owner_category": operation.get("owner_category"),
         }
         key_parts = operation["idempotency_key"].split("/")
         ordinal = int(key_parts[-1])

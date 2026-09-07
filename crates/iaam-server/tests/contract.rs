@@ -4370,7 +4370,8 @@ async fn import_preview_describes_the_swap_without_writing_it() {
         // expectation said "210" and the response says "210.00"; the response
         // is right, and a preview that formatted money its own way would be a
         // second vocabulary for the one thing the owner reads most.
-        preview["preview"]["accounts"][0]["figures"][0]["before"], "210.00",
+        preview["preview"]["accounts"][0]["figures"][0]["before"],
+        "210.00",
         "{preview}"
     );
     assert_eq!(

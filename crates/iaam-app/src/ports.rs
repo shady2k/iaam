@@ -185,6 +185,7 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         | OperationKey::ReadImportDocument
         | OperationKey::AddImportRows
         | OperationKey::AnswerImportQuestion
+        | OperationKey::WithdrawImportAnswer
         | OperationKey::CommitImportSession
         | OperationKey::AbandonImportSession => Scope::Agent,
     }
@@ -1245,6 +1246,19 @@ pub trait Store: Send + Sync {
         session: ImportSessionId,
         question: ImportQuestionId,
         answer: String,
+    ) -> Result<ImportQuestionView, AppError>;
+    /// Withdraw an answer whose standing rule has already been retired.
+    ///
+    /// The question, its addressed observation, and every observation in this
+    /// open session stamped with the same minted rule are reopened in one store
+    /// transaction. The rule remains retired and any journal facts from an
+    /// earlier commit remain untouched; this operation is only for the
+    /// pre-commit session state.
+    async fn withdraw_import_answer(
+        &self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
     ) -> Result<ImportQuestionView, AppError>;
 
     /// Name the standing rule an already-recorded answer was generalised into.

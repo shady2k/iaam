@@ -616,6 +616,84 @@ impl SqliteStore {
         transaction.commit()?;
         Ok(stored)
     }
+    /// Withdraw a retired rule's answer from an open session.
+    ///
+    /// The question and all observations this answer settled are mutable
+    /// pre-journal state. They are cleared together so a later commit cannot
+    /// claim that the withdrawn answer still filed a row. The rule itself is
+    /// historical and remains retired; committed journal facts are outside this
+    /// operation's boundary.
+    pub fn withdraw_import_answer(
+        &mut self,
+        owner: OwnerId,
+        session: ImportSessionId,
+        question: ImportQuestionId,
+    ) -> Result<StoredQuestion, StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_open(&transaction, owner, session)?;
+        let rule: String = transaction
+            .query_row(
+                "SELECT rule FROM import_questions
+                 WHERE session = ?1 AND id = ?2
+                   AND answered_at IS NOT NULL AND rule IS NOT NULL",
+                params![session.inner().to_string(), question.inner().to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound {
+                    what: "an answered import question with a standing rule",
+                    id: question.inner().to_string(),
+                },
+                other => StoreError::from(other),
+            })?;
+        let shared = transaction
+            .query_row(
+                "SELECT id FROM import_questions
+                 WHERE session = ?1 AND rule = ?2 AND id <> ?3
+                 LIMIT 1",
+                params![
+                    session.inner().to_string(),
+                    rule,
+                    question.inner().to_string()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if shared.is_some() {
+            return Err(StoreError::AlreadyExists {
+                what: "a second import question names the same minted rule",
+            });
+        }
+        transaction.execute(
+            "UPDATE import_questions
+             SET answered_at = NULL, answer = NULL, rule = NULL
+             WHERE session = ?1 AND id = ?2",
+            params![session.inner().to_string(), question.inner().to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE import_observations
+             SET answer = NULL, answer_rule = NULL, answer_rule_version = NULL
+             WHERE session = ?1
+               AND (answer_rule = ?2 OR row = (
+                   SELECT row FROM import_questions
+                   WHERE session = ?1 AND id = ?3
+               ))",
+            params![
+                session.inner().to_string(),
+                rule,
+                question.inner().to_string()
+            ],
+        )?;
+        let stored =
+            question_by_id(&transaction, session, question)?.ok_or(StoreError::NotFound {
+                what: "an import question",
+                id: question.inner().to_string(),
+            })?;
+        transaction.commit()?;
+        Ok(stored)
+    }
 
     /// Name the standing rule an answer was generalised into.
     ///

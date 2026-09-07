@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::AppError;
 use crate::ports::{
@@ -85,7 +85,13 @@ pub enum ActionKind {
     /// [`frontier`] emits its items last and one of its tests requires the
     /// frontier's order to be non-decreasing in this enum's order.
     AnswerClassificationQuestion,
+    /// A retired standing rule's answer can be withdrawn from an open import
+    /// session, reopening the question and every uncommitted row it settled.
     ///
+    /// Declared after the question it comes from because the queue emits this
+    /// settled item immediately after open-question work. The rule remains
+    /// historical; the operation never revives it or changes committed facts.
+    WithdrawImportAnswer,
     /// A question the owner answered wrote no standing rule, and one was
     /// possible. The caller can send the separate classification-rule
     /// operation if the owner decides to make it stand.
@@ -123,14 +129,10 @@ impl ActionKind {
             Self::ResolveTransferRelationships => "resolve_transfer_relationships",
             Self::StartAccountImport => "start_account_import",
             Self::ProvideControlAssertion => "provide_control_assertion",
-            // The same code the caveat register carries for the same state, and
-            // deliberately so: a client holding a snapshot with
-            // `retired_account_not_empty` in its `confidence` and a queue with
-            // an item of this kind is holding one fact twice, and the two names
-            // agreeing is what lets it say so.
             Self::RetiredAccountNotEmpty => "retired_account_not_empty",
             Self::RetirementNotAssessed => "retirement_not_assessed",
             Self::AnswerClassificationQuestion => "answer_classification_question",
+            Self::WithdrawImportAnswer => "withdraw_import_answer",
             Self::AdoptClassificationRule => "adopt_classification_rule",
             Self::ImportSessionUnfinished => "import_session_unfinished",
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
@@ -145,7 +147,7 @@ impl ActionKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::CreateFirstAccount,
         Self::CreateAccountNamedByDocument,
         Self::CreateFirstContour,
@@ -156,6 +158,7 @@ impl ActionKind {
         Self::RetiredAccountNotEmpty,
         Self::RetirementNotAssessed,
         Self::AnswerClassificationQuestion,
+        Self::WithdrawImportAnswer,
         Self::AdoptClassificationRule,
         Self::ImportSessionUnfinished,
         Self::CoverageGapUnrepaired,
@@ -262,8 +265,10 @@ impl ActionKind {
                 ReportGoals::of(&[AssetSnapshot, MoneyFlow, Returns])
             }
             Self::ResolveTransferRelationships => ReportGoals::of(&[MoneyFlow, Returns]),
+
             Self::StartAccountImport
             | Self::AnswerClassificationQuestion
+            | Self::WithdrawImportAnswer
             | Self::ImportSessionUnfinished
             | Self::PossibleDuplicateUndecided => ReportGoals::ALL,
             Self::ProvideControlAssertion => ReportGoals::of(&[Reconciliation]),
@@ -2234,6 +2239,12 @@ pub struct ClassificationQuestion {
     /// build cannot read the row, which is the same row the generalisation calls
     /// `Impossible`.
     pub subject: Option<ClassificationSubject>,
+    /// Whether the rule this answer minted is retired and can be withdrawn.
+    ///
+    /// Computed from the complete rule history, not from the active-rule
+    /// slice used for adoption. A missing or malformed rule is never made
+    /// withdrawable by this flag.
+    pub rule_retired: bool,
     /// The movement this row is one of the two legs of, where the session's
     /// reading pairs it with another row (`iaam-lkvb`, decision 0031).
     ///
@@ -2243,7 +2254,6 @@ pub struct ClassificationQuestion {
     /// second time here would eventually pair rows the assessment does not, and
     /// the two surfaces would disagree about how many decisions the owner has
     /// left — one of them while telling him that answering settles both.
-    ///
     /// `None` is «this row is half of nothing this reading can see», which is
     /// the ordinary row and stays the ordinary item.
     pub pair: Option<OneMovement>,
@@ -2289,6 +2299,12 @@ pub async fn frontier(
     let exclusions = store.list_account_scope_exclusions(owner).await?;
     let transfers = store.list_account_transfer_statements(owner).await?;
     let activity = store.list_account_activity(owner).await?;
+    let rule_views = rules.list_rules(owner).await?;
+    let retired_rule_ids: BTreeSet<String> = rule_views
+        .iter()
+        .filter(|rule| rule.retired_at.is_some())
+        .map(|rule| rule.id.to_string())
+        .collect();
     // The reads that make a question outlive the response that raised it, and
     // that make a session outlive its questions. Every session is asked, not
     // only the open ones: eligibility is a property of the item and is decided
@@ -2329,6 +2345,10 @@ pub async fn frontier(
                 generalisation: import_session::generalisation_of(&observations, &view),
                 ground,
                 subject,
+                rule_retired: view
+                    .rule
+                    .as_ref()
+                    .is_some_and(|rule| retired_rule_ids.contains(rule)),
                 pair: pairs.get(&view.row).copied(),
                 view,
                 session_state: session.state,
@@ -2336,7 +2356,7 @@ pub async fn frontier(
             });
         }
     }
-    let rules = standing_rules(owner, rules).await?;
+    let rules = standing_rules(rule_views);
     let retirements = retired_products(owner, store).await?;
     let wanted_accounts = accounts_named_by_documents(owner, store).await?;
     let mut assertions = Vec::new();
@@ -2628,17 +2648,14 @@ impl<'a> RetirementAssessment<'a> {
 /// him what to do about it. What a skipped rule costs is exact: one item may go
 /// on offering a proposal that a rule nobody can read already covers, which is a
 /// duplicate rule at worst.
-async fn standing_rules(
-    owner: OwnerId,
-    rules: &dyn ClassificationRuleStore,
-) -> Result<Vec<ClassificationRule>, AppError> {
-    Ok(rules
-        .list_rules(owner)
-        .await?
+fn standing_rules(
+    rule_views: Vec<crate::ports::ClassificationRuleView>,
+) -> Vec<ClassificationRule> {
+    rule_views
         .into_iter()
         .filter(|rule| rule.retired_at.is_none())
         .filter_map(|rule| rule_from_view(rule).ok())
-        .collect())
+        .collect()
 }
 
 /// Find every unresolved or informational fact in a reconciliation ledger.
@@ -3505,6 +3522,17 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
             may_generalise,
         ));
     }
+    for question in questions.iter().filter(|question| {
+        question.session_state == ImportSessionState::Open
+            && question.view.answered_at.is_some()
+            && question.view.rule.is_some()
+            && question.rule_retired
+    }) {
+        actions.push(withdraw_import_answer_action(
+            question,
+            names.get(question.asked.account())?,
+        ));
+    }
     // After them, for the same reason and in the same order: an answered
     // question's rule is declared after the question it comes out of.
     for question in questions {
@@ -3767,6 +3795,55 @@ fn answer_classification_question_action(
         },
     )
     .expect("classification question action has an operation target")
+}
+/// A retired standing rule leaves its source answer as a reversible session
+/// decision.
+///
+/// `NeedsOwnerInput` is intentional: an agent may transmit the operation, but
+/// only the owner decides that the answer was wrong. The store clears the
+/// question and every uncommitted row settled by that answer together; it
+/// neither revives the rule nor changes journal facts already committed.
+fn withdraw_import_answer_action(
+    question: &ClassificationQuestion,
+    account: &AccountView,
+) -> Action {
+    let mut preset = BTreeMap::new();
+    preset.insert(
+        "session".to_owned(),
+        question.view.session.inner().to_string().into(),
+    );
+    preset.insert(
+        "question".to_owned(),
+        question.view.id.inner().to_string().into(),
+    );
+    Action::new(
+        ActionFacts {
+            id: format!(
+                "{}:{}",
+                ActionKind::WithdrawImportAnswer.id(),
+                question.view.id.inner()
+            ),
+            kind: ActionKind::WithdrawImportAnswer,
+            category: ActionCategory::required_for(ActionKind::WithdrawImportAnswer),
+            state: ActionState::NeedsOwnerInput,
+            subject: Some(ActionSubject::Account(AccountSubject::of(account))),
+        },
+        format!(
+            "The answer to row {} of import session {} came from a standing decision that is \
+             now retired. Withdraw the answer before answering the question again; this reopens \
+             every uncommitted row that answer settled. Committed journal facts remain unchanged.",
+            question.view.row,
+            question.view.session.inner(),
+        ),
+        ActionTarget::Operation {
+            operation: OperationKey::WithdrawImportAnswer,
+            request: RequestPlan {
+                preset,
+                missing: Vec::new(),
+            },
+        },
+    )
+    .expect("withdraw import answer action has an operation target")
 }
 
 /// The other leg's row, where this question is half of a movement both of whose
@@ -6787,6 +6864,7 @@ mod tests {
                 // recorded, so it may be the same money twice.
                 ActionKind::StartAccountImport
                 | ActionKind::AnswerClassificationQuestion
+                | ActionKind::WithdrawImportAnswer
                 | ActionKind::ImportSessionUnfinished
                 | ActionKind::PossibleDuplicateUndecided => {
                     &[AssetSnapshot, MoneyFlow, Returns, Reconciliation]
@@ -10974,6 +11052,7 @@ mod tests {
             generalisation: Generalisation::Unanswered,
             subject: None,
             ground: GeneralisationGround::NoMatcher,
+            rule_retired: false,
             // One row of this session and half of nothing. The pairing is
             // exercised where it is derived and through the queue's own
             // published items, not by asserting a relation into a fixture.

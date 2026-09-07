@@ -1449,6 +1449,70 @@ fn decision_of_read_row(
     Some(stored_question(question)?.about(row.movement()))
 }
 
+/// Withdraw a retired rule's answer from an open import session.
+///
+/// This is deliberately two calls from the owner's perspective: retiring the
+/// standing rule remains its own action, and this operation then withdraws the
+/// answer that rule came from. The store clears the question and every
+/// uncommitted observation stamped by that rule in one transaction. A rule is
+/// never revived, and facts already committed to the journal are not touched.
+pub async fn withdraw_answer(
+    services: &AppServices,
+    principal: &Principal,
+    session: ImportSessionId,
+    question: ImportQuestionId,
+) -> Result<AnswerableQuestion, AppError> {
+    require_submit(principal)?;
+    let contents = read_session(services, principal, session).await?;
+    let stored = contents
+        .questions
+        .iter()
+        .find(|candidate| candidate.id == question)
+        .ok_or(AppError::NotFound {
+            what: "an import question",
+            id: question.inner().to_string(),
+        })?;
+    let rule = stored.rule.as_deref().ok_or_else(|| AppError::Conflict {
+        what: format!(
+            "import question {} has no minted standing rule to withdraw",
+            question.inner()
+        ),
+    })?;
+    let rule_id = Uuid::parse_str(rule).map_err(|error| {
+        AppError::Store(format!("stored import question has invalid rule: {error}"))
+    })?;
+    let rule = services
+        .rules
+        .list_rules(principal.owner)
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.id == rule_id)
+        .ok_or(AppError::NotFound {
+            what: "the classification rule minted by this import answer",
+            id: rule_id.to_string(),
+        })?;
+    if rule.retired_at.is_none() {
+        return Err(AppError::Conflict {
+            what: format!(
+                "classification rule {rule_id} still stands; retire it before withdrawing \
+                 the answer that minted it"
+            ),
+        });
+    }
+    let withdrawn = services
+        .store
+        .withdraw_import_answer(principal.owner, session, question)
+        .await?;
+    let reopened = read_session(services, principal, session).await?;
+    answerable_questions(services, principal, &reopened, &[withdrawn])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(AppError::Store(
+            "withdrawn import question could not be read back".to_owned(),
+        ))
+}
+
 /// Record the answer to one question.
 ///
 /// Three things happen, in this order and for these reasons:

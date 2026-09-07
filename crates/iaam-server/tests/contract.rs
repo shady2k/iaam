@@ -21219,6 +21219,122 @@ async fn an_open_classification_question_is_an_item_in_the_action_queue() {
     assert_ne!(left[0]["id"], item["id"], "{left:?}");
 }
 
+/// Retiring a rule makes its source answer an explicit, reversible action.
+///
+/// The whole journey is the contract: a wrong answer mints a rule, retirement
+/// leaves that rule historical, the action queue points at withdrawal, DELETE
+/// reopens the question and clears its provisional settlement, and the
+/// ordinary answer route can then be used again without abandoning the session.
+#[tokio::test]
+async fn a_retired_import_rule_can_be_withdrawn_and_answered_again() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let savings = another_account(&harness, "Savings").await;
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "reversible" },
+                "operations": [unresolved_row(account, "reversible-question")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let session = verdicts[0]["session_id"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+    let question = verdicts[0]["question_id"]
+        .as_str()
+        .expect("question")
+        .to_owned();
+
+    let (status, answered) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "sent_to_own_account", "account": savings }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    let rule = answered["generalisation"]["rule"]
+        .as_str()
+        .expect("minted rule")
+        .to_owned();
+
+    let (status, retired) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/classification-rules/{rule}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retired}");
+
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    let withdrawal = actions["items"]
+        .as_array()
+        .expect("action items")
+        .iter()
+        .find(|item| item["kind"] == "withdraw_import_answer")
+        .unwrap_or_else(|| panic!("retired answer has no withdrawal action: {actions}"));
+    assert_eq!(withdrawal["state"], "needs_owner_input", "{withdrawal}");
+    assert_eq!(
+        withdrawal["target"]["operationId"], "withdraw_import_answer",
+        "{withdrawal}"
+    );
+    assert_eq!(
+        withdrawal["target"]["path"], "/v1/import-sessions/{session}/questions/{question}/answer",
+        "{withdrawal}"
+    );
+    assert_eq!(withdrawal["target"]["method"], "DELETE", "{withdrawal}");
+
+    let (status, reopened) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reopened}");
+    assert!(reopened["answered_at"].is_null(), "{reopened}");
+    assert_eq!(
+        reopened["generalisation"]["state"], "unanswered",
+        "{reopened}"
+    );
+
+    let (status, answered_again) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{question}/answer"),
+            &harness.owner_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered_again}");
+    assert!(
+        answered_again["answered_at"].is_string(),
+        "{answered_again}"
+    );
+    assert!(
+        answered_again["generalisation"]["rule"].is_string(),
+        "the reopened question can mint a fresh rule: {answered_again}"
+    );
+}
+
 /// The queue's items for open classification questions, and nothing else.
 async fn open_question_items(harness: &Harness) -> Vec<Value> {
     let (status, actions) = call(

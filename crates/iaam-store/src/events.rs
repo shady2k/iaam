@@ -566,7 +566,6 @@ pub struct SourceCategoryQuery {
     pub to: Option<Date>,
 }
 
-
 impl SqliteStore {
     /// Read a narrowed page of the owner's journal in `(date, sequence)` order.
     ///
@@ -609,7 +608,6 @@ impl SqliteStore {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
-
 }
 
 /// Assemble the narrowed query and its bound parameters.
@@ -632,10 +630,7 @@ fn source_categories_sql(
     };
 
     if let Some(account) = query.account {
-        bind(
-            " AND account = ?",
-            Box::new(account.inner().to_string()),
-        );
+        bind(" AND account = ?", Box::new(account.inner().to_string()));
     }
     if let Some(from) = query.from {
         bind(" AND effective_date >= ?", Box::new(from.to_string()));

@@ -646,7 +646,6 @@ pub struct JournalSourceCategoryQuery {
     pub to: Option<Date>,
 }
 
-
 /// One decision the owner can review, including its actor and undo.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionRecord {
@@ -795,7 +794,6 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         query: JournalSourceCategoryQuery,
     ) -> Result<Vec<String>, AppError>;
-
 
     /// All journal facts and standing decisions attributable to the owner,
     /// bounded by the moment this instance recorded them.

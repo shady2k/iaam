@@ -30,9 +30,7 @@ use iaam_core::valuation::PriceQuality;
 use time::{Date, Time};
 
 use crate::error::AppError;
-use crate::ports::{
-    JournalCursor, JournalQuery, JournalSourceCategoryQuery, RecordedEvent, Store,
-};
+use crate::ports::{JournalCursor, JournalQuery, JournalSourceCategoryQuery, RecordedEvent, Store};
 
 /// Rows returned when the caller names no size.
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
@@ -299,10 +297,7 @@ pub async fn list_journal_source_categories(
 ) -> Result<Vec<String>, AppError> {
     let (from, to) = date_range(from, to)?;
     store
-        .list_journal_source_categories(
-            owner,
-            JournalSourceCategoryQuery { account, from, to },
-        )
+        .list_journal_source_categories(owner, JournalSourceCategoryQuery { account, from, to })
         .await
 }
 

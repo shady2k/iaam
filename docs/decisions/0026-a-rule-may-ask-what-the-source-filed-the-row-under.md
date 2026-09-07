@@ -1,7 +1,10 @@
 # 0026. A rule may ask what the source filed the row under, and it is not scoped to a source
 
-Date: 2026-09-04 · Status: accepted · Bead: `iaam-93lz`
-Note: The journal now publishes source-category evidence on each read event and exposes the exact distinct vocabulary for account and date scopes.
+Date: 2026-09-04 · Status: proposed · Bead: `iaam-93lz`
+
+Since `iaam-zo7i`: the journal publishes the source category on each read event
+and the exact distinct vocabulary for an account and date range, so a rule can be
+aimed at a value the caller has seen rather than guessed.
 
 ## Context
 

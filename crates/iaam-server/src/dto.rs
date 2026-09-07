@@ -2790,7 +2790,6 @@ impl UndecomposedOutflowShareDto {
     }
 }
 
-
 /// One specific, checkable thing a report's figures do not account for.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CaveatDto {

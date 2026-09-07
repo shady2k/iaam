@@ -489,7 +489,6 @@ impl ReportConfidence {
     }
 }
 
-
 /// The flow report's register.
 ///
 /// The population's caveats first: an account left out is a larger silence than
@@ -538,10 +537,8 @@ pub fn money_flow_confidence(
             },
         ));
     }
-    Ok(
-        ReportConfidence::new(ReportGoal::MoneyFlow, caveats)
-            .with_undecomposed_outflows(undecomposed_outflows),
-    )
+    Ok(ReportConfidence::new(ReportGoal::MoneyFlow, caveats)
+        .with_undecomposed_outflows(undecomposed_outflows))
 }
 
 /// The returns report's register.

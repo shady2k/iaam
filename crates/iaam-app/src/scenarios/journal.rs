@@ -60,6 +60,10 @@ pub struct JournalReadQuery {
     /// The client key supplied at ingest. It addresses at most one event.
     pub idempotency_key: Option<String>,
     pub account: Option<AccountId>,
+    /// Only events whose own `account` column names this account. This is
+    /// different from [`Self::touching`], which also includes an event whose
+    /// leg posts to the account.
+    pub touching: Option<AccountId>,
     pub source: Option<DeclaredSource>,
     /// The import session whose commit wrote these rows.
     ///
@@ -254,6 +258,7 @@ pub async fn read_journal(
                 event: None,
                 idempotency_key: query.idempotency_key.clone(),
                 account: query.account,
+                touching: query.touching,
                 source,
                 import_session: query.import_session,
                 settled_by_rule: query.settled_by_rule,

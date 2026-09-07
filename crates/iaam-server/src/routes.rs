@@ -5448,9 +5448,16 @@ pub struct JournalParams {
     /// as an empty page.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// Only events recorded against this account.
+    /// Only events whose own `account` column is this account. It does not
+    /// include an event recorded against another account whose leg posts here;
+    /// use `touching` for that question.
     #[serde(default)]
     pub account: Option<Uuid>,
+    /// Only events that touched this account: the event's own account or any
+    /// account carried by one of its legs. This is the event set a report fold
+    /// uses for an account, while `account` asks only where the event is filed.
+    #[serde(default)]
+    pub touching: Option<Uuid>,
     /// Account of the source the caller declared when it submitted. Supplied
     /// together with `source_channel`; the pair is how a caller asks what one
     /// import put in.
@@ -5565,6 +5572,7 @@ pub async fn list_journal_events(
         JournalReadQuery {
             idempotency_key: params.idempotency_key,
             account: params.account.map(AccountId),
+            touching: params.touching.map(AccountId),
             source,
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),

@@ -1921,6 +1921,37 @@ async fn the_journal_openapi_does_not_advertise_rule_version_filter() {
 }
 
 #[tokio::test]
+async fn the_journal_openapi_distinguishes_account_and_touching_filters() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let parameters = spec["paths"]["/v1/journal/events"]["get"]["parameters"]
+        .as_array()
+        .expect("journal query parameters");
+    let account = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "account")
+        .expect("account parameter");
+    let touching = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "touching")
+        .expect("touching parameter");
+    assert!(
+        account["description"]
+            .as_str()
+            .expect("account description")
+            .contains("own `account`")
+    );
+    assert!(
+        touching["description"]
+            .as_str()
+            .expect("touching description")
+            .contains("event's own account or any account carried by one of its legs")
+    );
+}
+
+#[tokio::test]
 async fn no_openapi_request_body_accepts_credential_fields() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
@@ -12421,6 +12452,71 @@ async fn the_journal_narrows_by_account_and_by_date_range() {
     let rows = page["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 1, "the range excludes April: {page}");
     assert_eq!(rows[0]["idempotency_key"], "main-march");
+}
+
+#[tokio::test]
+async fn the_journal_can_filter_events_touching_the_receiving_account() {
+    let harness = harness();
+    let savings = create_account(&harness, "Savings").await;
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "touching-filter fixture",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "transfer",
+                    "to_account": savings.inner(),
+                    "amount": "1250.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-05-01" },
+                    "idempotency_key": "main-to-savings-touching",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, account_page) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?account={}", savings.inner()),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{account_page}");
+    assert!(
+        account_page["rows"]
+            .as_array()
+            .expect("account rows")
+            .is_empty(),
+        "the event is filed against the sending account: {account_page}"
+    );
+
+    let (status, touching_page) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?touching={}", savings.inner()),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{touching_page}");
+    let rows = touching_page["rows"].as_array().expect("touching rows");
+    assert_eq!(rows.len(), 1, "{touching_page}");
+    assert_eq!(rows[0]["account"], harness.account.inner().to_string());
+    assert!(
+        rows[0]["legs"]
+            .as_array()
+            .expect("legs")
+            .iter()
+            .any(|leg| leg["account"] == json!(savings.inner().to_string())),
+        "the touching result must expose the receiving leg: {touching_page}"
+    );
 }
 #[tokio::test]
 async fn the_journal_narrows_by_the_source_the_caller_declared() {

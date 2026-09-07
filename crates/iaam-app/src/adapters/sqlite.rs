@@ -421,6 +421,7 @@ impl Store for SqliteAdapter {
             event: query.event,
             idempotency_key: query.idempotency_key,
             account: query.account,
+            touching: query.touching,
             source: query.source,
             import_session: query.import_session,
             settled_by_rule: query.settled_by_rule,

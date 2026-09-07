@@ -15,6 +15,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
+from urllib.parse import urlencode
 
 
 CHANNEL_DEFAULT = "file"
@@ -103,6 +104,59 @@ def post(base_url, path, token, payload):
     request.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(request) as response:
         return json.load(response)
+
+
+def journal_events(base_url, token, **filters):
+    """Read every journal page for the supplied filters."""
+    rows = []
+    while True:
+        query = urlencode({key: value for key, value in filters.items() if value is not None})
+        path = "/v1/journal/events"
+        if query:
+            path += f"?{query}"
+        page = get(base_url, path, token)
+        rows.extend(page["rows"])
+        if page.get("next") is None:
+            return rows
+        filters["after"] = page["next"]
+
+
+def replacement_targets(base_url, token, account_id, channel, operations):
+    """Find the withdrawn event each operation must replace.
+
+    The source listing discovers the import identity from the journal itself.
+    The second read uses that identity, so the importer never asks the operator
+    to copy an event id or import id by hand.
+    """
+    wanted = {operation["idempotency_key"] for operation in operations}
+    source_rows = journal_events(
+        base_url,
+        token,
+        source_account=account_id,
+        source_channel=channel,
+    )
+    matching = {
+        row["idempotency_key"]: row
+        for row in source_rows
+        if row.get("idempotency_key") in wanted
+    }
+    imports = {row.get("import") for row in matching.values()}
+    if len(matching) != len(wanted) or len(imports) != 1 or None in imports:
+        raise SystemExit(
+            "cannot identify one withdrawn import for every converted row from the journal"
+        )
+    import_id = next(iter(imports))
+    imported_rows = journal_events(base_url, token, **{"import": import_id})
+    by_key = {
+        row["idempotency_key"]: row
+        for row in imported_rows
+        if row.get("idempotency_key") in wanted
+    }
+    if set(by_key) != wanted:
+        raise SystemExit(
+            "the journal import does not contain exactly the rows in this export"
+        )
+    return {key: by_key[key]["event"] for key in wanted}
 
 
 def resolve_accounts(base_url, token, account_map):
@@ -196,6 +250,7 @@ def operation_of(row, account_id, currency="RUB"):
         "currency": currency,
         "dates": {"cash_posted": date_of(row).date().isoformat()},
         "source_category": source_category,
+        "owner_category": row["Ваша категория"] or None,
         "description": row["Описание"],
     }
     if Decimal(value) > 0:
@@ -232,6 +287,7 @@ def transfer_to_own_account(row, statement_account_id, other_account_id, currenc
         "currency": currency,
         "dates": {"cash_posted": date_of(row).date().isoformat()},
         "source_category": row["Категория по-умолчанию"],
+        "owner_category": row["Ваша категория"] or None,
         "description": row["Описание"],
     }
 
@@ -376,6 +432,8 @@ def operation_summary(operations, account_names=None):
             "account": account_names.get(operation["account"], operation["account"]),
             "kind": operation["type"],
             "amount": operation["amount"],
+            "source_category": operation.get("source_category"),
+            "owner_category": operation.get("owner_category"),
         }
         key_parts = operation["idempotency_key"].split("/")
         ordinal = int(key_parts[-1])
@@ -449,10 +507,19 @@ def main():
         "between his own accounts instead of money crossing the contour. Owner "
         "knowledge, supplied per run and never stored in this tool.",
     )
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--submit", action="store_true")
+    parser.add_argument(
+        "--replace-retracted",
+        action="store_true",
+        help="replace the withdrawn events of this export through the corrections "
+        "route; combine with --dry-run to preview, or use alone to submit; the "
+        "original channel is never changed",
+    )
     args = parser.parse_args()
+    if not (args.dry_run or args.submit or args.replace_retracted):
+        parser.error("choose --dry-run, --submit, or --replace-retracted")
 
     with open(args.export, encoding="utf-8-sig", newline="") as handle:
         text = handle.read()
@@ -461,12 +528,13 @@ def main():
     raw_lines = {id(row): line for row, line in zip(rows, lines[1:])}
 
     token = os.environ.get(args.token_env, "")
+    offline_preview = args.dry_run and not args.replace_retracted
     account_names = {}
     if args.account_map:
         with open(args.account_map, encoding="utf-8") as handle:
             account_map = json.load(handle)
-        # The map is its own contour, so the preview needs no directory: a name
-        if args.dry_run:
+        # The offline preview needs no directory: a name maps to itself.
+        if offline_preview:
             accounts = {export_name: export_name for export_name in account_map}
             account_names = {
                 export_name: title for export_name, title in account_map.items()
@@ -503,7 +571,7 @@ def main():
         if args.counterparty_map
         else {}
     )
-    if args.dry_run:
+    if offline_preview:
         counterparties = {name: title for name, title in counterparty_map.items()}
     else:
         counterparties = resolve_accounts(args.base_url, token, counterparty_map)
@@ -528,38 +596,77 @@ def main():
     summary["accounts"] = account_summary(operations, account_names)
     summary["rejected"] = 0
 
+    by_account = defaultdict(list)
+    for operation in operations:
+        by_account[operation["account"]].append(operation)
+    targets_by_account = {}
+    if args.replace_retracted:
+        for account_id, batch in by_account.items():
+            targets_by_account[account_id] = replacement_targets(
+                args.base_url, token, account_id, args.channel, batch
+            )
+        summary["replacements"] = [
+            {
+                "account": account_names.get(account_id, account_id),
+                "rows": len(batch),
+                "events": len(targets_by_account[account_id]),
+            }
+            for account_id, batch in by_account.items()
+        ]
+
     if args.dry_run:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
 
-    by_account = defaultdict(list)
-    for operation in operations:
-        by_account[operation["account"]].append(operation)
     verdicts_by_kind = defaultdict(int)
     for account_id, batch in by_account.items():
-        verdicts = post(
-            args.base_url,
-            "/v1/ingest/operations",
-            token,
-            {
-                # The label names this import within the account and channel.
-                # The export's file name is what distinguishes one month from
-                # the next, and it is the label the operator repeats to
-                # POST /v1/corrections/imports to retract exactly this run.
-                "source": {
-                    "account": account_id,
-                    "channel": args.channel,
-                    "label": f"tbank-export {os.path.basename(args.export)}",
+        if args.replace_retracted:
+            targets = targets_by_account[account_id]
+            corrections = []
+            for operation in batch:
+                target = targets[operation["idempotency_key"]]
+                replacement = dict(operation)
+                replacement["idempotency_key"] = f"correction/replacement/{target}"
+                corrections.append(
+                    {
+                        "relation": "replacement",
+                        "target": target,
+                        "operation": replacement,
+                    }
+                )
+            verdicts = post(
+                args.base_url,
+                "/v1/corrections",
+                token,
+                {
+                    "acknowledge_retraction": True,
+                    "corrections": corrections,
                 },
-                "operations": batch,
-            },
-        )
+            )
+        else:
+            verdicts = post(
+                args.base_url,
+                "/v1/ingest/operations",
+                token,
+                {
+                    # This declaration names the original import. A retracted
+                    # import is replaced through /v1/corrections instead of
+                    # changing this channel to evade its withdrawn keys.
+                    "source": {
+                        "account": account_id,
+                        "channel": args.channel,
+                        "label": f"tbank-export {os.path.basename(args.export)}",
+                    },
+                    "operations": batch,
+                },
+            )
         for verdict in verdicts:
-            verdicts_by_kind[verdict["verdict"]] += 1
-            if verdict["verdict"] == "rejected":
+            verdict_by_kind = verdict["verdict"]
+            verdicts_by_kind[verdict_by_kind] += 1
+            if verdict_by_kind == "rejected":
                 print(json.dumps(verdict, ensure_ascii=False), file=sys.stderr)
     # The whole tally, not a chosen pair of counters. "submitted" is what was
-    # sent; only the verdicts say what the journal did with it, and a re-import
+    # sent; only the verdicts say what the journal did, and a re-import
     # that changed nothing must be able to prove it rather than look identical
     # to the first run. The vocabulary is the API's: accepted, provisional,
     # duplicate, possible_duplicate, discrepancy, needs_reconciliation,

@@ -620,6 +620,9 @@ pub struct JournalQuery {
     /// from the event-account filter exposed by the journal route.
     pub touching: Option<AccountId>,
     pub source: Option<iaam_core::ids::SourceId>,
+    /// Only facts carrying this declared import, the identity a retraction
+    /// takes. This is distinct from the import session that committed them.
+    pub import: Option<iaam_core::ids::ImportId>,
     /// Only facts committed out of this import session. The session is stamped
     /// on the event's provenance at commit, so this narrows to what one act of
     /// importing put in — which the declared source cannot, since a source

@@ -12772,6 +12772,20 @@ async fn a_journal_row_names_the_import_that_carried_it() {
         "one account and one channel is one source: {page}"
     );
 
+    let narrowed = format!("/v1/journal/events?import={published}");
+    let (status, by_import) =
+        call(&harness.router, get(&narrowed, Some(&harness.agent_token))).await;
+    assert_eq!(status, StatusCode::OK, "{by_import}");
+    let import_rows = by_import["rows"].as_array().expect("rows");
+    assert_eq!(
+        import_rows
+            .iter()
+            .map(|row| row["idempotency_key"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("named-by-a-label")],
+        "the import filter accepts the identity published on each row: {by_import}"
+    );
+
     let (status, retracted) = call(
         &harness.router,
         post(

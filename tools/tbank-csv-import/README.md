@@ -18,8 +18,13 @@ these source columns:
 - `Сумма в валюте счёта`: signed account-currency amount; negative is a
   `withdrawal`, positive is a `deposit`.
 - `Категория по-умолчанию`: copied verbatim to `source_category`.
+- `Ваша категория`: copied verbatim to `owner_category` when present.
 - `Описание`: copied verbatim to `description` and used to identify internal
   transfer legs.
+
+`source_category` and `owner_category` are evidence from two different
+vocabularies. The importer does not translate, normalise or map either value;
+the owner's rules decide what the recorded words mean.
 
 All other export columns are retained only as part of the raw row text used for
 idempotency. The importer does not translate or normalise source category or
@@ -71,8 +76,37 @@ IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
   --submit
 ```
 
-With `--account-map` instead, the preview contacts nothing at all, because the
-file is its own contour:
+If that import was retracted, do not retry `--submit` with another channel.
+Use replacement mode. It reads the journal by the original source, learns the
+withdrawn import and each event identity, then sends the same converted rows to
+`POST /v1/corrections` as `relation: replacement` with fresh idempotency keys:
+
+```bash
+IAAM_TOKEN=... python3 tools/tbank-csv-import/import.py \
+  --export /path/to/export.csv \
+  --base-url http://127.0.0.1:8080 \
+  --token-env IAAM_TOKEN \
+  --channel file \
+  --replace-retracted
+```
+
+The original channel is never changed to make withdrawn keys available again.
+The replacement targets are taken from the journal, not supplied as event or
+import identifiers by hand. A replacement is a correction fact, so its journal
+provenance records the correction route while the withdrawn source fact remains
+the one it replaces.
+
+Each replacement key is `correction/replacement/<withdrawn event id>`, so a
+repeated replacement run addresses the same correction keys and cannot add a
+second replacement.
+
+`--replace-retracted --dry-run` performs the same journal reads without posting
+corrections and adds a `replacements` summary with per-account row and event
+counts. It must resolve the live account directory even when `--account-map` is
+present; only an ordinary offline `--dry-run` avoids the directory.
+
+With `--account-map` on an ordinary dry run, the preview contacts nothing
+because the file is its own contour:
 
 ```bash
 python3 tools/tbank-csv-import/import.py \

@@ -423,6 +423,7 @@ impl Store for SqliteAdapter {
             account: query.account,
             touching: query.touching,
             source: query.source,
+            import: query.import,
             import_session: query.import_session,
             settled_by_rule: query.settled_by_rule,
             from: query.from,

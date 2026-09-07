@@ -5466,6 +5466,10 @@ pub struct JournalParams {
     /// Channel of the declared source: `file`, `paste`, `manual`.
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// The declared import that carried the rows. This is the identity a
+    /// retraction takes; it is not the session that happened to commit them.
+    #[serde(default)]
+    pub import: Option<Uuid>,
     /// The import session whose commit wrote the rows. Narrower than the
     /// declared source, which covers every import that came through one
     /// channel: this names one act of importing, and it is the identifier
@@ -5574,6 +5578,7 @@ pub async fn list_journal_events(
             account: params.account.map(AccountId),
             touching: params.touching.map(AccountId),
             source,
+            import: params.import.map(ImportId),
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
             from,

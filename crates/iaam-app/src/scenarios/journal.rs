@@ -66,6 +66,10 @@ pub struct JournalReadQuery {
     /// leg posts to the account.
     pub touching: Option<AccountId>,
     pub source: Option<DeclaredSource>,
+    /// The declared import that carried these rows. Unlike `import_session`,
+    /// this survives across multiple sessions for the same statement and is the
+    /// identity `POST /v1/corrections/imports` retracts.
+    pub import: Option<ImportId>,
     /// The import session whose commit wrote these rows.
     ///
     /// The finest handle this route offers, and the only one that names an
@@ -251,10 +255,6 @@ pub async fn read_journal(
         .as_ref()
         .map(|declared| declared_source(owner, declared))
         .transpose()?;
-
-    // One row beyond the page: the difference between "there is more" and "that
-    // was everything" cannot be inferred from a full page, and a caller that
-    // guesses wrong either stops early or asks for a page that is never there.
     let events = store
         .list_journal_events(
             owner,
@@ -264,6 +264,7 @@ pub async fn read_journal(
                 account: query.account,
                 touching: query.touching,
                 source,
+                import: query.import,
                 import_session: query.import_session,
                 settled_by_rule: query.settled_by_rule,
                 from: range.0,

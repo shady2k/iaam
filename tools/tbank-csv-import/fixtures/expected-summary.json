@@ -12,53 +12,73 @@
       "account": "Main",
       "kind": "withdrawal",
       "amount": "100.00",
+      "source_category": "Супермаркеты",
+      "owner_category": "Everyday",
       "ordinal": 1
     },
     {
       "account": "Main",
       "kind": "withdrawal",
-      "amount": "42.00"
+      "amount": "42.00",
+      "source_category": "Супермаркеты",
+      "owner_category": "Eating out"
     },
     {
       "account": "Main",
       "kind": "withdrawal",
       "amount": "100.00",
+      "source_category": "Супермаркеты",
+      "owner_category": "Everyday",
       "ordinal": 2
     },
     {
       "account": "Main",
       "kind": "transfer",
-      "amount": "5000.00"
+      "amount": "5000.00",
+      "source_category": "Переводы",
+      "owner_category": null
     },
     {
       "account": "Main",
       "kind": "withdrawal",
-      "amount": "700.00"
+      "amount": "700.00",
+      "source_category": "Переводы",
+      "owner_category": null
     },
     {
       "account": "Main",
       "kind": "deposit",
-      "amount": "12000.00"
+      "amount": "12000.00",
+      "source_category": "Пополнения",
+      "owner_category": null
     },
     {
       "account": "Savings",
       "kind": "income",
-      "amount": "12.34"
+      "amount": "12.34",
+      "source_category": "Проценты",
+      "owner_category": null
     },
     {
       "account": "Main",
       "kind": "income",
-      "amount": "350.00"
+      "amount": "350.00",
+      "source_category": "Бонусы",
+      "owner_category": null
     },
     {
       "account": "Main",
       "kind": "transfer",
-      "amount": "2000.00"
+      "amount": "2000.00",
+      "source_category": "Переводы",
+      "owner_category": null
     },
     {
       "account": "Main",
       "kind": "refund",
-      "amount": "80.00"
+      "amount": "80.00",
+      "source_category": "Супермаркеты",
+      "owner_category": null
     }
   ],
   "accounts": [

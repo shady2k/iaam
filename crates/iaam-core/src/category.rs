@@ -80,6 +80,9 @@ pub enum CategoryMatcher {
     /// The source's own category value, matched exactly.
     SourceCategory { value: String },
     /// A case-insensitive substring of the counterparty or description.
+    ///
+    /// This is the legacy stored form. It remains a `contains` matcher so
+    /// existing rules retain their meaning.
     DescriptionContains { text: String },
 }
 
@@ -176,14 +179,19 @@ pub enum CategoryAssignment {
     NotDecomposed,
 }
 
-/// Assign a category using explicit precedence and the latest matching version.
+/// Assign a category using explicit precedence and a deterministic match priority.
+///
+/// The matcher arms remain ordered by kind. Within an arm, the longest matcher
+/// text wins, then the newest version, then the rule id. The final key is only
+/// a deterministic tie-breaker; assignment never depends on slice or store
+/// iteration order.
 pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> CategoryAssignment {
     let row_rule = rules
         .iter()
         .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| matches!(rule.matcher, CategoryMatcher::Row { .. }))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule.version);
+        .max_by_key(|rule| rule_priority(*rule));
     if let Some(rule) = row_rule {
         return assignment_for_rule(rule);
     }
@@ -193,22 +201,31 @@ pub fn assign(subject: &CategorySubject<'_>, rules: &[CategoryRule]) -> Category
         .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| matches!(rule.matcher, CategoryMatcher::SourceCategory { .. }))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule.version);
+        .max_by_key(|rule| rule_priority(*rule));
     if let Some(rule) = source_rule {
         return assignment_for_rule(rule);
     }
 
     let description_rule = rules
         .iter()
-        .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| matches!(rule.matcher, CategoryMatcher::DescriptionContains { .. }))
+        .filter(|rule| rule.interval.covers(subject.on))
         .filter(|rule| rule.matcher.matches(subject))
-        .max_by_key(|rule| rule.version);
+        .max_by_key(|rule| rule_priority(*rule));
     if let Some(rule) = description_rule {
         return assignment_for_rule(rule);
     }
 
     CategoryAssignment::NotDecomposed
+}
+
+fn rule_priority(rule: &CategoryRule) -> (usize, u32, CategoryRuleId) {
+    let text_len = match &rule.matcher {
+        CategoryMatcher::Row { key } => key.chars().count(),
+        CategoryMatcher::SourceCategory { value } => value.chars().count(),
+        CategoryMatcher::DescriptionContains { text } => text.chars().count(),
+    };
+    (text_len, rule.version, rule.id)
 }
 
 /// Assign using a not-yet-persisted proposal as the newest rule of its kind.
@@ -333,7 +350,6 @@ mod tests {
     use crate::money::{CurrencyCode, Money, PostedMinor};
 
     use super::{
-        CategoryAssignment, CategoryBasis, CategoryImpactRow, CategoryInterval, CategoryMatcher,
         CategoryRule, CategoryRuleProposal, CategorySubject, assign, assign_with_proposed,
         group_category_impacts,
     };
@@ -571,6 +587,48 @@ mod tests {
             CategoryAssignment::Assigned { category, .. }
                 if category == CategoryId(uuid::Uuid::from_u128(new))
         ));
+    }
+    #[test]
+    fn overlapping_description_rules_choose_the_longest_match_not_slice_order() {
+        let short = rule(
+            1,
+            1,
+            CategoryMatcher::DescriptionContains {
+                text: "market".into(),
+            },
+            None,
+            None,
+            10,
+        );
+        let long = rule(
+            2,
+            1,
+            CategoryMatcher::DescriptionContains {
+                text: "corner market".into(),
+            },
+            None,
+            None,
+            20,
+        );
+        let subject = CategorySubject {
+            row_key: None,
+            source_category: None,
+            counterparty: None,
+            description: Some("Corner Market on Main"),
+            on: date!(2026 - 08 - 01),
+        };
+
+        for rules in [vec![short.clone(), long.clone()], vec![long, short]] {
+            assert_eq!(
+                assign(&subject, &rules),
+                CategoryAssignment::Assigned {
+                    category: CategoryId(uuid::Uuid::from_u128(20)),
+                    basis: CategoryBasis::Description {
+                        rule: CategoryRuleId(uuid::Uuid::from_u128(2)),
+                    },
+                }
+            );
+        }
     }
 
     #[test]

@@ -324,18 +324,22 @@ pub async fn record_candidate(
                     || "the source operation identity".to_owned(),
                     |key| format!("idempotency key {key}"),
                 );
-                return Err(AppError::Conflict {
-                    what: format!(
+                Verdict::Quarantined {
+                    reason: format!(
                         "{identity} is held by event {:?}, which was {disposition}; submit \
                          POST /v1/corrections with a new idempotency key and a replacement \
                          correction operation (relation: replacement, target: {:?}) to record \
                          the corrected value",
                         existing, existing
                     ),
-                });
-            }
-            Verdict::Duplicate {
-                existing: *existing,
+                }
+            } else {
+                // The key is held by an event that still stands, which is the
+                // ordinary duplicate: the caller sent something already
+                // recorded and nothing is wrong.
+                Verdict::Duplicate {
+                    existing: *existing,
+                }
             }
         }
         None => Verdict::Rejected {

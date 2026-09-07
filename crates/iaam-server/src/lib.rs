@@ -119,6 +119,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             routes::answer_import_question,
             routes::withdraw_import_answer
         ))
+        .routes(routes!(routes::state_import_control_figures))
         .routes(routes!(routes::preview_import_answer))
         .routes(routes!(routes::assess_import_session))
         .routes(routes!(routes::commit_import_session))

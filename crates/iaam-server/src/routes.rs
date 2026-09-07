@@ -3663,7 +3663,6 @@ fn contour_version_dto(contour: &ContourView, created: bool) -> ContourVersionDt
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 409, description = "The submission identity names an event withdrawn or superseded by a correction", body = ApiError),
         (status = 422, description = "Request could not be read", body = ApiError)
     ),
     security(("bearer" = []))

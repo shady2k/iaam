@@ -2167,8 +2167,10 @@ pub async fn commit_session(
     // an assertion is a statement about a period, and one written over a journal
     // that does not yet hold the period's rows is a discrepancy against an empty
     // interval. A failure between the two leaves the session open, so committing
-    // again re-submits the rows — which their idempotency keys answer with
-    // `duplicate` — and retries the assertions, whose own keys do the same.
+    // again re-submits only candidates not already held by the journal: active
+    // identities answer `duplicate`, while a direct per-row submission whose
+    // identity names a withdrawn or superseded event is `quarantined` with
+    // correction guidance. The assertions' own keys answer `duplicate`.
     //
     // The coverage gaps go in **with** the assertions and not after them, in one
     // call. A gap says what this commit was handed and declined, and an

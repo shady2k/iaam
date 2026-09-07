@@ -11483,9 +11483,9 @@ async fn corrections_are_described_and_scope_checked() {
     assert_eq!(body["code"], "forbidden", "{body}");
 }
 
-/// A key held by a reversed event stays occupied but names the replacement path.
+/// A key held by a reversed event is quarantined without aborting its batch.
 #[tokio::test]
-async fn a_reversed_event_key_refusal_names_replacement() {
+async fn a_reversed_event_key_quarantine_names_replacement() {
     let harness = harness();
     let event = seed_correctable_deposit(&harness, "file", "key-held", "100.00").await;
 
@@ -11503,7 +11503,7 @@ async fn a_reversed_event_key_refusal_names_replacement() {
     .await;
     assert_eq!(status, StatusCode::OK, "{reversed}");
 
-    let (status, refused) = call(
+    let (status, outcomes) = call(
         &harness.router,
         post(
             "/v1/ingest/operations",
@@ -11511,24 +11511,44 @@ async fn a_reversed_event_key_refusal_names_replacement() {
             &json!({
                 "source_label": "correction-contract",
                 "source": { "account": harness.account.inner(), "channel": "file" },
-                "operations": [{
-                    "account": harness.account.inner(),
-                    "type": "deposit",
-                    "amount": "100.00",
-                    "currency": "RUB",
-                    "dates": { "cash_posted": "2026-08-05" },
-                    "idempotency_key": "key-held"
-                }]
+                "operations": [
+                    {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "1.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "before-withdrawn"
+                    },
+                    {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "100.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "key-held"
+                    },
+                    {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "2.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "after-withdrawn"
+                    }
+                ]
             }),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-    assert_eq!(refused["code"], "already_exists", "{refused}");
-    let explanation = refused["message"].as_str().expect("conflict explanation");
-    assert!(explanation.contains("withdrawn"), "{refused}");
-    assert!(explanation.contains("relation: replacement"), "{refused}");
-    assert!(explanation.contains(&event.to_string()), "{refused}");
+    assert_eq!(status, StatusCode::OK, "{outcomes}");
+    assert_eq!(outcomes[0]["verdict"], "provisional", "{outcomes}");
+    assert_eq!(outcomes[1]["verdict"], "quarantined", "{outcomes}");
+    let explanation = outcomes[1]["detail"].as_str().expect("quarantine detail");
+    assert!(explanation.contains("withdrawn"), "{outcomes}");
+    assert!(explanation.contains("relation: replacement"), "{outcomes}");
+    assert!(explanation.contains(&event.to_string()), "{outcomes}");
+    assert_eq!(outcomes[2]["verdict"], "provisional", "{outcomes}");
 }
 
 /// Seed one deposit and return the event identifier the server minted for it.

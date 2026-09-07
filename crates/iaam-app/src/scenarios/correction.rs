@@ -22,6 +22,9 @@ use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, ImportId, PrincipalId, SourceId};
+use iaam_core::money::{CurrencyCode, Money};
+use iaam_core::projection::ProjectionError;
+use iaam_core::projection::balances::Balances;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{SubmittedOperation, Verdict, normalize};
@@ -184,9 +187,32 @@ pub struct StandingRule {
     /// replaced, which stopped counting before he asked.
     pub still_filed: usize,
 }
+/// Cash figures for one account in an import correction preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCorrectionFigure {
+    pub currency: CurrencyCode,
+    pub before: Money,
+    pub after: Money,
+}
+
+/// Facts and cash figures affected on one account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCorrectionAccount {
+    pub account: AccountId,
+    pub facts: usize,
+    pub figures: Vec<ImportCorrectionFigure>,
+}
+
+/// The journal impact of retracting an import, computed before any write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCorrectionPreview {
+    pub from: Option<time::Date>,
+    pub to: Option<time::Date>,
+    pub accounts: Vec<ImportCorrectionAccount>,
+}
 
 /// Outcome of correcting one whole declared import.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportCorrectionOutcome {
     /// The source identity the retracted rows arrived through.
     pub source: SourceId,
@@ -200,6 +226,85 @@ pub struct ImportCorrectionOutcome {
     pub already_reversed: usize,
     /// Reversal facts written by this run.
     pub written: usize,
+    /// The impact summary computed from the same target set before writing.
+    pub preview: ImportCorrectionPreview,
+    /// Whether this call only previewed and deliberately wrote no facts.
+    pub dry_run: bool,
+}
+
+/// Build the impact of removing `targets` from the effective journal.
+///
+/// The before and after figures are folded from the exact effective set used
+/// for target selection. This is deliberately the scenario's preview, rather
+/// than a transport-side second read or a guessed delta.
+fn preview_for(
+    effective: &[&Event],
+    targets: &[Event],
+) -> Result<ImportCorrectionPreview, AppError> {
+    let target_ids: BTreeSet<EventId> = targets.iter().map(|event| event.id).collect();
+    let mut fact_counts: BTreeMap<AccountId, usize> = BTreeMap::new();
+    let mut figure_keys = BTreeSet::new();
+    let mut from: Option<time::Date> = None;
+    let mut to: Option<time::Date> = None;
+
+    for event in targets {
+        let date = event.order.date();
+        from = Some(from.map_or(date, |current| current.min(date)));
+        to = Some(to.map_or(date, |current| current.max(date)));
+        for account in touched(event) {
+            *fact_counts.entry(account).or_default() += 1;
+        }
+        for leg in &event.legs {
+            if let Some(money) = leg.cash_effect() {
+                figure_keys.insert((leg.account, money.currency()));
+            }
+        }
+    }
+
+    let fold = |events: &[&Event]| -> Result<Balances, AppError> {
+        let mut balances = Balances::new();
+        for event in events {
+            balances
+                .apply(event)
+                .map_err(ProjectionError::from)
+                .map_err(AppError::from_projection)?;
+        }
+        Ok(balances)
+    };
+    let effective_refs = effective.to_vec();
+    let after_refs: Vec<&Event> = effective
+        .iter()
+        .copied()
+        .filter(|event| !target_ids.contains(&event.id))
+        .collect();
+    let before = fold(&effective_refs)?;
+    let after = fold(&after_refs)?;
+
+    let mut figures_by_account: BTreeMap<AccountId, Vec<ImportCorrectionFigure>> = BTreeMap::new();
+    for (account, currency) in figure_keys {
+        let zero = || Money::new(iaam_core::money::PostedMinor::new(0), currency);
+        figures_by_account
+            .entry(account)
+            .or_default()
+            .push(ImportCorrectionFigure {
+                currency,
+                before: before.cash(account, currency).unwrap_or_else(zero),
+                after: after.cash(account, currency).unwrap_or_else(zero),
+            });
+    }
+
+    Ok(ImportCorrectionPreview {
+        from,
+        to,
+        accounts: fact_counts
+            .into_iter()
+            .map(|(account, facts)| ImportCorrectionAccount {
+                account,
+                facts,
+                figures: figures_by_account.remove(&account).unwrap_or_default(),
+            })
+            .collect(),
+    })
 }
 
 /// Correct the events the owner names, one correction fact each.
@@ -365,14 +470,17 @@ pub async fn correct_import(
     services: &AppServices,
     principal: &Principal,
     acknowledge_retraction: bool,
+    dry_run: bool,
     target: ImportTarget,
 ) -> Result<ImportCorrectionOutcome, AppError> {
     may_retract_an_import(principal)?;
-    acknowledged(acknowledge_retraction)?;
+    if !dry_run {
+        acknowledged(acknowledge_retraction)?;
+    }
 
     let events = load_journal(services, principal).await?;
 
-    let (targets, already_reversed) = {
+    let (effective, targets, already_reversed) = {
         let effective = resolve(&events).map_err(AppError::Correction)?;
         let targets: Vec<Event> = effective
             .iter()
@@ -406,17 +514,20 @@ pub async fn correct_import(
                     .is_some_and(|event| target.covers(event))
             })
             .count();
-        (targets, already_reversed)
+        (effective, targets, already_reversed)
     };
 
     let affected = targets.len();
-    if targets.is_empty() {
+    let preview = preview_for(&effective, &targets)?;
+    if dry_run || targets.is_empty() {
         return Ok(ImportCorrectionOutcome {
             source: target.source(),
             import: target.import(),
             affected,
             already_reversed,
             written: 0,
+            preview,
+            dry_run,
         });
     }
 
@@ -448,6 +559,8 @@ pub async fn correct_import(
         affected,
         already_reversed,
         written,
+        preview,
+        dry_run,
     })
 }
 
@@ -978,6 +1091,29 @@ mod tests {
             "the account it is filed under"
         );
         assert!(touched.contains(&far), "and the one its other leg moves");
+    }
+
+    #[test]
+    fn import_preview_reports_dates_accounts_and_before_after_cash() {
+        let source = SourceId::new_random();
+        let original = deposit(1, source);
+        let later = deposit(2, source);
+        let preview = preview_for(&[&original, &later], std::slice::from_ref(&original))
+            .expect("preview should fold the effective journal");
+
+        assert_eq!(preview.from, Some(date!(2026 - 03 - 01)));
+        assert_eq!(preview.to, Some(date!(2026 - 03 - 01)));
+        assert_eq!(preview.accounts.len(), 1);
+        assert_eq!(preview.accounts[0].account, account());
+        assert_eq!(preview.accounts[0].facts, 1);
+        assert_eq!(
+            preview.accounts[0].figures[0].before,
+            Money::new(PostedMinor::new(2_000), CurrencyCode::Rub)
+        );
+        assert_eq!(
+            preview.accounts[0].figures[0].after,
+            Money::new(PostedMinor::new(1_000), CurrencyCode::Rub)
+        );
     }
 
     #[test]

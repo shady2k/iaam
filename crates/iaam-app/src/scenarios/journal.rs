@@ -1695,6 +1695,7 @@ mod tests {
             &ctx.services,
             &ctx.principal,
             true,
+            false,
             ImportTarget::Named {
                 source: ctx.source,
                 import: batch,

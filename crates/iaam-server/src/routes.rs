@@ -777,11 +777,13 @@ pub async fn submit_corrections(
                    request without a label retracts every row of that account \
                    and channel that named no import. One reversal fact per \
                    retracted event; nothing is deleted and nothing is mutated. \
-                   The owner may retract any import. An agent may retract only \
-                   one it declared itself, under the label it submitted under, \
-                   and only while every row of it is still effective and no \
-                   control assertion covers them; anything else is refused and \
-                   the refusal says which of those it was.",
+                   Set `dry_run` to return the affected facts, accounts, dates \
+                   and before/after cash figures without writing. The owner may \
+                   retract any import. An agent may retract only one it declared \
+                   itself, under the label it submitted under, and only while \
+                   every row of it is still effective and no control assertion \
+                   covers them; anything else is refused and the refusal says \
+                   which of those it was.",
     request_body = CorrectImportRequest,
     responses(
         (status = 200, description = "What the correction retracted", body = ImportCorrectionDto),
@@ -819,6 +821,7 @@ pub async fn correct_import(
         &state.services,
         &principal,
         request.acknowledge_retraction,
+        request.dry_run,
         target,
     )
     .await?;

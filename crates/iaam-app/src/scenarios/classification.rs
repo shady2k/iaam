@@ -166,12 +166,13 @@ pub fn matcher_json(matcher: &RuleMatcher) -> Value {
         "source_category": matcher.source_category,
         "owner_category": matcher.owner_category,
         "source_code": matcher.source_code,
+        "movement": matcher.movement,
     })
 }
 
 /// The condition, in the form a request body carries it.
 ///
-/// The same six fields as [`matcher_json`] and deliberately not the same
+/// The same seven fields as [`matcher_json`] and deliberately not the same
 /// shape: what a rule is **stored** as states every key, so a reader of the
 /// store sees what the rule does not ask about; what a rule is **sent** as is
 /// the shape `RuleMatcherDto` publishes, which omits an absent field, and that
@@ -203,6 +204,15 @@ pub fn matcher_request_json(matcher: &RuleMatcher) -> Value {
         if let Some(value) = value {
             object.insert(field.to_owned(), Value::String(value.clone()));
         }
+    }
+    if let Some(movement) = matcher.movement {
+        object.insert(
+            "movement".to_owned(),
+            Value::String(match movement {
+                Movement::In => "in".to_owned(),
+                Movement::Out => "out".to_owned(),
+            }),
+        );
     }
     Value::Object(object)
 }
@@ -430,6 +440,7 @@ fn matcher_and_outcome(
             counterparty_account: optional_string(&matcher, "counterparty_account", "matcher")?,
             description_contains: optional_string(&matcher, "description_contains", "matcher")?,
             kind: optional_string(&matcher, "kind", "matcher")?,
+            movement: optional_movement(&matcher, "movement", "matcher")?,
             // Absent from every rule stored before `iaam-93lz`, and `None` is
             // what those rules meant: the condition could not be written, so no
             // rule that predates the field is silently widened by reading it.
@@ -472,6 +483,32 @@ fn optional_string(
         Some(actual) => Err(AppError::Invalid {
             field: group.to_owned(),
             expected: format!("field {field} is a string"),
+            actual: actual.to_string(),
+        }),
+    }
+}
+fn optional_movement(
+    object: &Map<String, Value>,
+    field: &str,
+    group: &str,
+) -> Result<Option<Movement>, AppError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => match value.as_str() {
+            "in" => Ok(Some(Movement::In)),
+            "out" => Ok(Some(Movement::Out)),
+            _ => Err(AppError::Invalid {
+                field: group.to_owned(),
+                expected: format!("field {field} is \"in\" or \"out\""),
+                actual: value.clone(),
+            }),
+        },
+        actual => Err(AppError::Invalid {
+            field: group.to_owned(),
+            expected: format!("field {field} is \"in\" or \"out\""),
             actual: actual.to_string(),
         }),
     }
@@ -820,6 +857,7 @@ mod tests {
                 source_category: None,
                 owner_category: None,
                 source_code: None,
+                movement: None,
             })
             .matcher
             .matches(&subject),
@@ -851,6 +889,7 @@ mod tests {
                 source_category: None,
                 owner_category: None,
                 source_code: None,
+                movement: None,
             })
             .matcher
             .matches(&subject),
@@ -923,6 +962,7 @@ mod tests {
                 source_category: Some("Bank interest".to_owned()),
                 owner_category: None,
                 source_code: None,
+                movement: None,
             })
             .matcher
             .matches(&subject),
@@ -954,6 +994,7 @@ mod tests {
                 source_category: Some("INNER".to_owned()),
                 owner_category: None,
                 source_code: None,
+                movement: None,
             })
             .matcher
             .matches(&subject),
@@ -969,6 +1010,7 @@ mod tests {
         // are checked, because the action queue presets the first and the
         // classifier reads the second.
         let matcher = RuleMatcher {
+            movement: None,
             counterparty_account: None,
             description_contains: None,
             kind: None,

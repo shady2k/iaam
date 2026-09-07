@@ -84,10 +84,9 @@ use crate::dto::{
     AccountNegativeBalanceExpectationStatementDto, AccountScopeDispositionDto, AccountScopeDto,
     AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
     ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto,
-    BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryRequest, CategoryRuleDto, CategoryRuleImpactDto,
-    CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
-    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
+    CategoryGroupRequest, CategoryRequest, CategoryMatcherDto, CategoryRuleDto,
+    CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourDto, ContourVersionDto,
     CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
     CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto,
@@ -1270,7 +1269,7 @@ pub async fn create_category_rule_route(
     ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<(StatusCode, Json<CategoryRuleDto>), ApiFailure> {
     require(&principal, OperationKey::CreateCategoryRule)?;
-    let matcher = parse_category_matcher(request.matcher)?;
+    let matcher = parse_category_matcher(request.matcher);
     let rule = create_category_rule(
         &state.services,
         &principal,
@@ -1317,7 +1316,7 @@ pub async fn preview_category_rule_route(
     ApiJson(request): ApiJson<CategoryRuleRequest>,
 ) -> Result<Json<CategoryRuleImpactDto>, ApiFailure> {
     require_submit(&principal)?;
-    let matcher = parse_category_matcher(request.matcher)?;
+    let matcher = parse_category_matcher(request.matcher);
     let impact = preview_category_rule(
         &state.services,
         &principal,
@@ -5266,94 +5265,14 @@ fn market_key_rate_dto(
     }
 }
 
-fn parse_category_matcher(value: serde_json::Value) -> Result<CategoryMatcher, ApiFailure> {
-    if let Some(raw) = value.as_str() {
-        let parsed = serde_json::from_str(raw)
-            .map_err(|_| invalid_field("matcher", "a category matcher object", raw.to_owned()))?;
-        return parse_category_matcher(parsed);
-    }
-    let Some(object) = value.as_object() else {
-        return Err(invalid_field(
-            "matcher",
-            "a category matcher object",
-            value.to_string(),
-        ));
-    };
-
-    if let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) {
-        let payload = object.get("value").unwrap_or(&serde_json::Value::Null);
-        return Ok(match kind {
-            "row" => CategoryMatcher::Row {
-                key: matcher_text(payload, "key")?,
-            },
-            "source_category" => CategoryMatcher::SourceCategory {
-                value: matcher_text(payload, "value")?,
-            },
-            "description_contains" => CategoryMatcher::DescriptionContains {
-                text: matcher_text(payload, "text")?,
-            },
-            _ => {
-                return Err(invalid_field(
-                    "matcher.kind",
-                    "row, source_category or description_contains",
-                    kind.to_owned(),
-                ));
-            }
-        });
-    }
-
-    let (kind, payload) = [
-        "Row",
-        "row",
-        "row_key",
-        "SourceCategory",
-        "source_category",
-        "DescriptionContains",
-        "description_contains",
-    ]
-    .iter()
-    .find_map(|key| object.get(*key).map(|payload| (*key, payload)))
-    .ok_or_else(|| {
-        invalid_field(
-            "matcher",
-            "row, source_category or description_contains",
-            value.to_string(),
-        )
-    })?;
-    let text = matcher_text(
-        payload,
-        match kind {
-            "Row" | "row" | "row_key" => "key",
-            "SourceCategory" | "source_category" => "value",
-            "DescriptionContains" | "description_contains" => "text",
-            _ => unreachable!("matcher key was selected above"),
-        },
-    )?;
-    Ok(match kind {
-        "Row" | "row" | "row_key" => CategoryMatcher::Row { key: text },
-        "SourceCategory" | "source_category" => CategoryMatcher::SourceCategory { value: text },
-        "DescriptionContains" | "description_contains" => {
+fn parse_category_matcher(value: CategoryMatcherDto) -> CategoryMatcher {
+    match value {
+        CategoryMatcherDto::Row(key) => CategoryMatcher::Row { key },
+        CategoryMatcherDto::SourceCategory(value) => CategoryMatcher::SourceCategory { value },
+        CategoryMatcherDto::DescriptionContains(text) => {
             CategoryMatcher::DescriptionContains { text }
         }
-        _ => unreachable!("matcher key was selected above"),
-    })
-}
-
-fn matcher_text(value: &serde_json::Value, field: &str) -> Result<String, ApiFailure> {
-    value
-        .as_str()
-        .or_else(|| value.get(field).and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("value").and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
-        .or_else(|| value.get("key").and_then(serde_json::Value::as_str))
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            invalid_field(
-                "matcher",
-                "a category matcher with a string value",
-                value.to_string(),
-            )
-        })
+    }
 }
 /// Journal read parameters. Every filter is optional and they combine.
 #[derive(Debug, Clone, Deserialize, IntoParams)]

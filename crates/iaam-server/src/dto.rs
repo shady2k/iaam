@@ -7731,12 +7731,33 @@ impl CategoryDto {
     }
 }
 
+/// The exact matcher shapes accepted by category-rule create and preview.
+///
+/// The externally tagged representation keeps the JSON key identical to the
+/// stored matcher and makes the value's meaning explicit:
+/// `{"row":"..."}`, `{"source_category":"..."}`, or
+/// `{"description_contains":"..."}`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CategoryMatcherDto {
+    Row(String),
+    SourceCategory(String),
+    DescriptionContains(String),
+}
+
+impl CategoryMatcherDto {
+    #[must_use]
+    pub fn from_stored(raw: &str) -> Self {
+        serde_json::from_str(raw).expect("stored category matcher must match its contract")
+    }
+}
+
 /// Owner category rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleDto {
     pub id: Uuid,
     pub version: u32,
-    pub matcher: String,
+    pub matcher: CategoryMatcherDto,
     pub category: Uuid,
     #[serde(with = "iso_date::option")]
     #[schema(value_type = Option<String>, format = Date)]
@@ -7755,7 +7776,7 @@ impl CategoryRuleDto {
         Self {
             id: rule.id.inner(),
             version: rule.version,
-            matcher: rule.matcher,
+            matcher: CategoryMatcherDto::from_stored(&rule.matcher),
             category: rule.category.inner(),
             valid_from: rule.valid_from,
             valid_to: rule.valid_to,
@@ -7796,8 +7817,9 @@ pub struct CategoryRequest {
 /// Category matcher and validity interval for a new rule.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CategoryRuleRequest {
-    /// Matcher object. Its accepted forms mirror the stored category matcher.
-    pub matcher: serde_json::Value,
+    /// One of the three externally tagged matcher shapes in
+    /// [`CategoryMatcherDto`].
+    pub matcher: CategoryMatcherDto,
     pub category: Uuid,
     #[serde(default, with = "iso_date::option")]
     #[schema(value_type = Option<String>, format = Date)]

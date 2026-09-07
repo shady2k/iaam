@@ -800,15 +800,21 @@ storage boundary. What reaches the wire is the parsed structure, read by the sam
 function the classifier reads it with — one reader, so a rule cannot be printed
 in a vocabulary it may not be written in.
 
-### 5.3 Where the rule is not yet kept
+### 5.3 The category matcher shape
 
-`GET /v1/category-rules` prints `matcher` as a string holding the stored JSON,
-while `POST /v1/category-rules` documents an object. The write side does also
-accept the string, in seven spellings, so a client that copies what it read is
-accepted — the asymmetry is in what the two sides *say*, and a client that
-follows the specification writes a shape it will never read back. Straightening
-it means choosing one spelling of a category matcher and retiring the other six,
-which is its own decision about breaking a client and is not made here.
+`GET /v1/category-rules`, `POST /v1/category-rules` and
+`POST /v1/category-rules/preview` use the same externally tagged object:
+
+```json
+{"row":"source-row-key"}
+{"source_category":"Groceries"}
+{"description_contains":"market"}
+```
+
+The matcher is a required object, and exactly one of those three keys is
+accepted. The old stored-JSON string and the `kind`/`value` fallback forms are
+not part of the contract and are refused. `valid_from` and `valid_to` are
+inclusive date bounds on the same rule.
 
 ---
 

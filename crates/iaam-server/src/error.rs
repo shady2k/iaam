@@ -357,6 +357,18 @@ impl ApiFailure {
         Self::render(error, Some(catalog))
     }
 
+    /// Convert an application error to the structured body used by a per-item
+    /// batch verdict.
+    #[must_use]
+    pub fn body_from_app(error: AppError, catalog: &ActionCatalog) -> ApiError {
+        match Self::render(error, Some(catalog)).body {
+            ApiFailureBody::Json(body) => *body,
+            ApiFailureBody::Static(_) => {
+                ApiError::simple("unauthorized", "the request is not authenticated")
+            }
+        }
+    }
+
     fn render(error: AppError, catalog: Option<&ActionCatalog>) -> Self {
         match error {
             AppError::Invalid {

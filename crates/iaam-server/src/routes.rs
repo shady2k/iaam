@@ -29,7 +29,8 @@ use iaam_app::ports::{
 };
 use iaam_app::scenarios::categories::{
     CategoryRuleInput, create_category, create_category_rule, create_group, list_categories,
-    list_category_rules, list_groups, preview_category_rule, retire_category,
+    list_category_rules, list_groups, preview_category_rule, preview_category_rules,
+    retire_category,
 };
 use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
 use iaam_app::scenarios::correction::{ImportTarget, correct_events};
@@ -87,10 +88,10 @@ use crate::dto::{
     AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
     ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto,
     BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryMatcherDto, CategoryRequest, CategoryRuleDto,
-    CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
-    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
-    CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
+    CategoryGroupRequest, CategoryMatcherDto, CategoryRequest, CategoryRuleBatchRequest,
+    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
+    ClassificationRuleDto, ClassificationRuleRequest, ContourDto, ContourVersionDto,
+    CorrectImportRequest, CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
     CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto,
     DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
@@ -165,7 +166,10 @@ pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_BATCH_OPERATION_ID: &str =
     "record_account_transfer_partners_batch";
 pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
+pub const CREATE_CATEGORY_GROUP_OPERATION_ID: &str = "create_category_group";
+pub const CREATE_CATEGORY_OPERATION_ID: &str = "create_category";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
+pub const CREATE_CATEGORY_RULE_BATCH_OPERATION_ID: &str = "create_category_rule_batch";
 
 /// The computed actions currently blocking or advancing owner setup, and which
 /// of the four reports they stand between the owner and.
@@ -1115,6 +1119,7 @@ pub async fn list_category_groups(
 #[utoipa::path(
     post,
     path = "/v1/category-groups",
+    operation_id = CREATE_CATEGORY_GROUP_OPERATION_ID,
     request_body = CategoryGroupRequest,
     responses(
         (status = 201, description = "Category group added", body = CategoryGroupDto),
@@ -1131,7 +1136,7 @@ pub async fn create_category_group_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryGroupRequest>,
 ) -> Result<(StatusCode, Json<CategoryGroupDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::CreateCategoryGroup)?;
     let title = request.title.trim();
     if title.is_empty() {
         return Err(invalid_field("title", "a non-empty title", request.title));
@@ -1171,6 +1176,7 @@ pub async fn list_category_reference(
 #[utoipa::path(
     post,
     path = "/v1/categories",
+    operation_id = CREATE_CATEGORY_OPERATION_ID,
     request_body = CategoryRequest,
     responses(
         (status = 201, description = "Category added", body = CategoryDto),
@@ -1188,7 +1194,7 @@ pub async fn create_category_route(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<CategoryRequest>,
 ) -> Result<(StatusCode, Json<CategoryDto>), ApiFailure> {
-    require_admin(&principal)?;
+    require(&principal, OperationKey::CreateCategory)?;
     let category = create_category(
         &state.services,
         &principal,
@@ -1335,6 +1341,113 @@ pub async fn preview_category_rule_route(
     )
     .await?;
     Ok(Json(CategoryRuleImpactDto::from_domain(impact)))
+}
+
+/// Create category rules independently and return one verdict per request row.
+#[utoipa::path(
+    post,
+    path = "/v1/category-rules/batch",
+    operation_id = CREATE_CATEGORY_RULE_BATCH_OPERATION_ID,
+    request_body = CategoryRuleBatchRequest,
+    responses(
+        (status = 200, description = "One verdict per category rule", body = Vec<VerdictDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_category_rules_batch_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiJson(request): ApiJson<CategoryRuleBatchRequest>,
+) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
+    require(&principal, OperationKey::CreateCategoryRule)?;
+    let mut verdicts = Vec::with_capacity(request.rules.len());
+    for (index, request) in request.rules.into_iter().enumerate() {
+        let matcher = parse_category_matcher(request.matcher);
+        match create_category_rule(
+            &state.services,
+            &principal,
+            CategoryRuleInput {
+                matcher,
+                category: CategoryId(request.category),
+                interval: CategoryInterval {
+                    from: request.valid_from,
+                    to: request.valid_to,
+                },
+                replaces: request.replaces.map(CategoryRuleId),
+            },
+        )
+        .await
+        {
+            Ok(rule) => {
+                record_decision(
+                    &state,
+                    &principal,
+                    OperationKey::CreateCategoryRule,
+                    rule.id.inner().to_string(),
+                    serde_json::json!({"rule": rule.id.inner()}),
+                    "retire the category rule; its history remains available",
+                )
+                .await?;
+                verdicts.push(VerdictDto::accepted_category_rule(
+                    index + 1,
+                    rule.id.inner(),
+                ));
+            }
+            Err(error) => verdicts.push(VerdictDto::rejected_category_rule(
+                index + 1,
+                ApiFailure::body_from_app(error, &catalog),
+            )),
+        }
+    }
+    Ok(Json(verdicts))
+}
+
+/// Preview several category rules against the same current journal and rule set.
+#[utoipa::path(
+    post,
+    path = "/v1/category-rules/preview/batch",
+    request_body = CategoryRuleBatchRequest,
+    responses(
+        (status = 200, description = "One impact per category rule", body = Vec<CategoryRuleImpactDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 422, description = "Invalid category rule", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn preview_category_rules_batch_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiJson(request): ApiJson<CategoryRuleBatchRequest>,
+) -> Result<Json<Vec<CategoryRuleImpactDto>>, ApiFailure> {
+    require_submit(&principal)?;
+    let proposals = request
+        .rules
+        .into_iter()
+        .map(|request| CategoryRuleProposal {
+            id: CategoryRuleId::new_random(),
+            interval: CategoryInterval {
+                from: request.valid_from,
+                to: request.valid_to,
+            },
+            matcher: parse_category_matcher(request.matcher),
+            category: CategoryId(request.category),
+        })
+        .collect::<Vec<_>>();
+    let impacts = preview_category_rules(&state.services, &principal, &proposals).await?;
+    Ok(Json(
+        impacts
+            .into_iter()
+            .map(CategoryRuleImpactDto::from_domain)
+            .collect(),
+    ))
 }
 
 /// Synchronise one broker channel over an interval.
@@ -4915,10 +5028,14 @@ pub async fn flow_report(
     // report cannot name an account it does not cover. The accounts are read for
     // the names the items carry, not to narrow them.
     let accounts = state.services.store.list_accounts(principal.owner).await?;
-    let actions = iaam_app::actions::flow_diagnostics(&outcome.report, &accounts)?
-        .iter()
-        .map(|action| action_dto(action, &catalog))
-        .collect();
+    let actions = iaam_app::actions::flow_diagnostics(
+        &outcome.report,
+        &accounts,
+        outcome.categories_exist(),
+    )?
+    .iter()
+    .map(|action| action_dto(action, &catalog))
+    .collect();
     let dto = MoneyFlowReportDto::from_domain(&outcome, actions, &catalog)
         .map_err(iaam_app::error::AppError::from)?;
     Ok(Json(dto))
@@ -5971,11 +6088,11 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// says *what would have to be true* for the key to be wanted rather than
 /// merely that nothing wants it today.
 ///
-/// Owner-only administration — accounts' aliases and declarations, categories
-/// and groups, instruments, tokens, broker access — shares one reason and it is
-/// the reason [`require_admin`] states: the queue and the caveat register are
-/// about the owner's money and these are about the shape of the instance, so
-/// there is no second reader of their authority for a floor to disagree with.
+/// Owner-only administration — accounts' aliases and declarations, instruments,
+/// tokens and broker access — shares one reason and it is the reason
+/// [`require_admin`] states: the queue and the caveat register are about the
+/// owner's money and these are about the shape of the instance, so there is no
+/// second reader of their authority for a floor to disagree with.
 pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
     (
         "rename_account",
@@ -6042,12 +6159,12 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
         "It uses the CreateClassificationRule floor: retiring a rule is the undo for the reversible rule decision.",
     ),
     (
-        "create_category_group_route",
-        "Owner-only administration: the shape of his own vocabulary.",
+        "create_category_rule_batch",
+        "A bulk write of standing decisions is a caller convenience, not a computed remedy: no queue item can know the particular set of rules to write. It therefore stays outside the operation-key vocabulary, while each row uses the reversible create_category_rule floor.",
     ),
     (
-        "create_category_route",
-        "Owner-only administration: the shape of his own vocabulary. The item about an undecomposed outflow offers create_category_rule, which files an event under a category that exists.",
+        "preview_category_rules_batch_route",
+        "A read over several proposed rules: it evaluates one shared journal and active-rule snapshot and writes neither a rule nor a verdict. Its batch shape saves request round trips, but no computed state offers it as a remedy.",
     ),
     (
         "delete_category",

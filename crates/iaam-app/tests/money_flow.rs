@@ -34,13 +34,23 @@ fn services() -> AppServices {
     let adapter = Arc::new(SqliteAdapter::new(
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}")),
     ));
-    AppServices::new(
+    let mut services = AppServices::new(
         adapter.clone(),
         adapter.clone(),
         adapter.clone(),
-        adapter,
+        adapter.clone(),
         Arc::new(FixedClock),
-    )
+    );
+    // The flow report reads the owner's categories as well as his rules, and
+    // `AppServices::new` leaves the category store unavailable by default.
+    // Until now the report reached that store only for the rules, and
+    // `UnavailableCategoryStore` answers that one question `Ok(vec![])` while
+    // answering every other `NotConfigured` — so this test was passing on an
+    // absent store telling it there were no rules. The asymmetry is filed as
+    // `iaam-801g.3`; here the store is wired, which is what a report about a
+    // person's categories needs.
+    services.categories = adapter;
+    services
 }
 
 fn principal(owner: OwnerId) -> Principal {

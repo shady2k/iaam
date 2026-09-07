@@ -10744,55 +10744,96 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     let actions = body["actions"].as_array().expect("actions");
-    let outflow = actions
+    let prerequisite = actions
         .iter()
-        .find(|action| action["kind"] == "undecomposed_outflows")
-        .unwrap_or_else(|| panic!("a rule-remediable item: {body}"));
-    assert_eq!(outflow["state"], "needs_owner_input", "{outflow}");
-    assert_eq!(outflow["category"], "required_for_goal", "{outflow}");
-    assert_eq!(outflow["goals"], json!(["money_flow"]), "{outflow}");
-    assert_eq!(outflow["required_scope"], "agent", "{outflow}");
-    let target = &outflow["target"];
-    assert_eq!(target["type"], "operation", "{outflow}");
-    assert_eq!(target["operationId"], "create_category_rule", "{outflow}");
-    assert_eq!(target["method"], "POST", "{outflow}");
-    assert_eq!(target["path"], "/v1/category-rules", "{outflow}");
-    assert!(
-        target["request"].get("preset").is_none(),
-        "a report window is not a rule's validity interval, and no matcher is \
-         derivable from this aggregate: {outflow}"
+        .find(|action| action["kind"] == "create_first_category")
+        .unwrap_or_else(|| panic!("the empty-category prerequisite: {body}"));
+    assert_eq!(prerequisite["state"], "needs_owner_input", "{prerequisite}");
+    assert_eq!(
+        prerequisite["category"], "required_for_goal",
+        "{prerequisite}"
     );
-    let missing: Vec<&str> = target["request"]["missing"]
+    assert_eq!(
+        prerequisite["goals"],
+        json!(["money_flow"]),
+        "{prerequisite}"
+    );
+    assert_eq!(prerequisite["required_scope"], "agent", "{prerequisite}");
+
+    let target = &prerequisite["target"];
+    assert_eq!(target["type"], "options", "{prerequisite}");
+    let options = target["options"].as_array().expect("resolution options");
+    assert_eq!(options.len(), 2, "{prerequisite}");
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option["operationId"].as_str().expect("operation id"))
+            .collect::<Vec<_>>(),
+        vec!["create_category_group", "create_category"],
+        "{prerequisite}"
+    );
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option["requiredScope"].as_str().expect("required scope"))
+            .collect::<Vec<_>>(),
+        vec!["agent", "agent"],
+        "{prerequisite}"
+    );
+    assert_eq!(
+        options[0]["request"]["missing"][0]["pointer"], "/title",
+        "{prerequisite}"
+    );
+    assert_eq!(
+        options[0]["request"]["missing"][0]["provided_by"], "owner",
+        "{prerequisite}"
+    );
+    let category_missing = options[1]["request"]["missing"]
         .as_array()
-        .expect("missing inputs")
-        .iter()
-        .map(|input| input["pointer"].as_str().expect("pointer"))
-        .collect();
-    assert_eq!(missing, vec!["/matcher", "/category"], "{outflow}");
-    for input in target["request"]["missing"]
-        .as_array()
-        .expect("missing inputs")
-    {
-        assert_eq!(input["provided_by"], "owner", "{outflow}");
-    }
+        .expect("category missing inputs");
+    assert_eq!(
+        category_missing
+            .iter()
+            .map(|input| input["pointer"].as_str().expect("pointer"))
+            .collect::<Vec<_>>(),
+        vec!["/group", "/title"],
+        "{prerequisite}"
+    );
+    assert_eq!(
+        category_missing[0]["provided_by"], "caller",
+        "{prerequisite}"
+    );
+    assert_eq!(
+        category_missing[1]["provided_by"], "owner",
+        "{prerequisite}"
+    );
 
     // The same invariant `/v1/actions` is held to, asserted here because this
     // action reaches the owner through the report and not through that endpoint.
     let spec = serde_json::to_value(&harness.api).expect("OpenAPI JSON");
-    let schema_name = target["requestSchema"]
-        .as_str()
-        .expect("request schema reference")
-        .strip_prefix("#/components/schemas/")
-        .expect("component schema reference");
-    for field in spec["components"]["schemas"][schema_name]["required"]
-        .as_array()
-        .expect("required request fields")
-    {
-        let pointer = format!("/{}", field.as_str().expect("field name"));
-        assert!(
-            missing.contains(&pointer.as_str()),
-            "{schema_name} requires {pointer} and the action does not advertise it: {outflow}"
-        );
+    for option in options {
+        let schema_name = option["requestSchema"]
+            .as_str()
+            .expect("request schema reference")
+            .strip_prefix("#/components/schemas/")
+            .expect("component schema reference");
+        let missing: Vec<&str> = option["request"]["missing"]
+            .as_array()
+            .expect("missing inputs")
+            .iter()
+            .map(|input| input["pointer"].as_str().expect("pointer"))
+            .collect();
+        for field in spec["components"]["schemas"][schema_name]["required"]
+            .as_array()
+            .expect("required request fields")
+        {
+            let pointer = format!("/{}", field.as_str().expect("field name"));
+            assert!(
+                missing.contains(&pointer.as_str()),
+                "{schema_name} requires {pointer} and the action does not advertise it: \
+                 {prerequisite}"
+            );
+        }
     }
 
     let transfer = actions
@@ -10810,7 +10851,7 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
             .contains("category rule cannot decompose"),
         "{transfer}"
     );
-    assert_ne!(outflow["id"], transfer["id"], "{body}");
+    assert_ne!(prerequisite["id"], transfer["id"], "{body}");
 }
 
 /// Category alone leaves ties in generation order, which is not assertable. Two

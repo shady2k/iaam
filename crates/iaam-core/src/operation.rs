@@ -40,6 +40,8 @@ pub enum OperationKey {
     /// Add a version to a contour that exists, naming it in the path.
     AddContourVersion,
     RecordOwnerBalance,
+    CreateCategoryGroup,
+    CreateCategory,
     CreateCategoryRule,
     /// Write a standing classification rule: what a row matching a condition is.
     ///
@@ -230,14 +232,16 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding a twentieth variant to
+    /// The declared length is the only thing holding a twenty-first variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 21] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
         Self::RecordOwnerBalance,
+        Self::CreateCategoryGroup,
+        Self::CreateCategory,
         Self::CreateCategoryRule,
         Self::CreateClassificationRule,
         Self::RecordAccountTransferPartners,
@@ -254,7 +258,6 @@ impl OperationKey {
         Self::AbandonImportSession,
         Self::SubmitCorrections,
     ];
-
     /// The route operation identifier declared by the transport.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -263,6 +266,8 @@ impl OperationKey {
             Self::CreateContour => "create_contour_version",
             Self::AddContourVersion => "add_contour_version",
             Self::RecordOwnerBalance => "record_owner_balance",
+            Self::CreateCategoryGroup => "create_category_group",
+            Self::CreateCategory => "create_category",
             Self::CreateCategoryRule => "create_category_rule",
             Self::CreateClassificationRule => "create_classification_rule",
             Self::RecordAccountTransferPartners => "record_account_transfer_partners",

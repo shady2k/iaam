@@ -505,6 +505,7 @@ pub struct MoneyFlowOutcome {
     /// The held rows these figures were folded over, and what they could not
     /// include.
     pub held_rows: HeldRows,
+    categories_exist: bool,
 }
 
 impl MoneyFlowOutcome {
@@ -520,6 +521,12 @@ impl MoneyFlowOutcome {
         &self,
     ) -> Result<ReportConfidence, iaam_core::projection::money_flow::MoneyFlowError> {
         money_flow_confidence(&self.population, &self.report.flow)
+    }
+
+    /// Whether the owner has at least one category to receive a rule.
+    #[must_use]
+    pub fn categories_exist(&self) -> bool {
+        self.categories_exist
     }
 }
 
@@ -727,6 +734,7 @@ pub async fn money_flow(
     // account keys would name only the accounts that happened to move money.
     let population = report_population(services, principal, &definition).await?;
     let categories = load_index(services, principal).await?;
+    let categories_exist = categories.has_categories();
     let category_rule_versions = categories.versions().to_vec();
     let held = held_facts(services, principal, &query.held, query.to).await?;
     let mut events = services
@@ -764,6 +772,7 @@ pub async fn money_flow(
         },
         population,
         held_rows: held.statement,
+        categories_exist,
     })
 }
 

@@ -138,7 +138,7 @@ impl Scope {
 /// what the request says or for what the journal holds.
 ///
 /// Exhaustive on purpose, like [`crate::actions::ActionKind::goals`]: a
-/// nineteenth [`OperationKey`] cannot compile until someone has said what
+/// twenty-first [`OperationKey`] cannot compile until someone has said what
 /// authority its call demands.
 #[must_use]
 pub const fn required_scope(operation: OperationKey) -> Scope {
@@ -156,6 +156,9 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         // everything else is checked by. The test still admits it because the
         // record itself has an undo.
         OperationKey::RecordOwnerBalance => Scope::Agent,
+        // Category groups and categories are retired rather than destroyed,
+        // so both reversible writes are reachable by an agent.
+        OperationKey::CreateCategoryGroup | OperationKey::CreateCategory => Scope::Agent,
         // A category rule is retired, preserving the history it reached.
         OperationKey::CreateCategoryRule => Scope::Agent,
         // A classification rule is retired, and retirement reports what it
@@ -2172,7 +2175,7 @@ mod tests {
 
     /// Each operation ADR 0040 newly admits is reachable by an agent token.
     ///
-    /// Keep the twelve named calls explicit: this test is the acceptance
+    /// Keep the thirteen named calls explicit: this test is the acceptance
     /// proof for the authority change, not only a count over the vocabulary.
     #[test]
     fn an_agent_token_reaches_each_newly_admitted_operation() {
@@ -2181,6 +2184,8 @@ mod tests {
             OperationKey::CreateContour,
             OperationKey::AddContourVersion,
             OperationKey::RecordOwnerBalance,
+            OperationKey::CreateCategoryGroup,
+            OperationKey::CreateCategory,
             OperationKey::CreateCategoryRule,
             OperationKey::CreateClassificationRule,
             OperationKey::RecordAccountTransferPartners,
@@ -2206,6 +2211,8 @@ mod tests {
             OperationKey::CreateContour,
             OperationKey::AddContourVersion,
             OperationKey::RecordOwnerBalance,
+            OperationKey::CreateCategoryGroup,
+            OperationKey::CreateCategory,
             OperationKey::CreateCategoryRule,
             OperationKey::CreateClassificationRule,
             OperationKey::RecordAccountTransferPartners,
@@ -2214,7 +2221,7 @@ mod tests {
             OperationKey::RecordAccountNameDisposition,
             OperationKey::SubmitCorrections,
         ];
-        assert_eq!(newly_admitted.len(), 11);
+        assert_eq!(newly_admitted.len(), 13);
         assert!(
             newly_admitted
                 .iter()

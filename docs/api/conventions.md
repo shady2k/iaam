@@ -821,6 +821,14 @@ stored-JSON string and the `kind`/`value` fallback forms are not part of the
 contract and are refused. `valid_from` and `valid_to` are inclusive date bounds
 on the same rule.
 
+
+The batch forms use the same rule object inside `{"rules":[...]}`:
+`POST /v1/category-rules/preview/batch` returns one
+`CategoryRuleImpactDto` per matcher, while
+`POST /v1/category-rules/batch` returns the existing §10.1 `VerdictDto`
+shape, one-based `row` included, per rule. A refused row does not refuse the
+others. The preview batch consumes the same one authenticated request window as
+any other call; it saves that budget by reading the journal and active rules once.
 ---
 
 ## 6. Two axes: what a report folds, and what still exists

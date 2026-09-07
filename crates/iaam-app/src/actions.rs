@@ -104,6 +104,7 @@ pub enum ActionKind {
     CoverageGapUnrepaired,
     IndependentConfirmationMissing,
     DiscrepancyUnresolved,
+    CreateFirstCategory,
     UndecomposedOutflows,
     ExternalTransfersUncategorised,
     UnexplainedResidual,
@@ -135,6 +136,7 @@ impl ActionKind {
             Self::CoverageGapUnrepaired => "coverage_gap_unrepaired",
             Self::IndependentConfirmationMissing => "independent_confirmation_missing",
             Self::DiscrepancyUnresolved => "discrepancy_unresolved",
+            Self::CreateFirstCategory => "create_first_category",
             Self::UndecomposedOutflows => "undecomposed_outflows",
             Self::ExternalTransfersUncategorised => "external_transfers_uncategorised",
             Self::UnexplainedResidual => "unexplained_residual",
@@ -143,7 +145,7 @@ impl ActionKind {
     }
 
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::CreateFirstAccount,
         Self::CreateAccountNamedByDocument,
         Self::CreateFirstContour,
@@ -159,6 +161,7 @@ impl ActionKind {
         Self::CoverageGapUnrepaired,
         Self::IndependentConfirmationMissing,
         Self::DiscrepancyUnresolved,
+        Self::CreateFirstCategory,
         Self::UndecomposedOutflows,
         Self::ExternalTransfersUncategorised,
         Self::UnexplainedResidual,
@@ -270,10 +273,9 @@ impl ActionKind {
             Self::CoverageGapUnrepaired
             | Self::IndependentConfirmationMissing
             | Self::DiscrepancyUnresolved => ReportGoals::of(&[Reconciliation]),
-            // The category-rule item is required for the report's own question:
-            // without a match, `went_out_by_category` cannot answer where the
-            // money went. It is deliberately not required for any other report.
-            Self::UndecomposedOutflows => ReportGoals::of(&[MoneyFlow]),
+            // No category can receive a category rule, so undecomposed spending
+            // cannot be acted on until the owner creates one.
+            Self::CreateFirstCategory | Self::UndecomposedOutflows => ReportGoals::of(&[MoneyFlow]),
             // Recommended and informational items are never required and carry
             // no goal.
             //
@@ -792,7 +794,9 @@ pub enum OwnerPrompt {
     /// invisible to a caller, which is how an agent came to show the owner a
     /// filled-in field he has no business seeing. Said in the question, it stops
     /// being invisible without the preset having to grow a shape of its own.
-    AccountTitle { printed: Option<String> },
+    AccountTitle {
+        printed: Option<String>,
+    },
     /// His name for a reporting perimeter.
     ContourTitle,
     /// Which accounts a new perimeter holds.
@@ -847,6 +851,10 @@ pub enum OwnerPrompt {
     /// **costs** differs between the two states it can be asked in. What an
     /// institution is for does not differ, and neither does what turns on it, so
     /// there is nothing for a datum to vary.
+    /// The owner's name for the group that will contain categories.
+    CategoryGroupTitle,
+    /// The owner's name for a category within an existing group.
+    CategoryTitle,
     AccountInstitution,
     /// What a name a document printed is, where it is not an account of his.
     ///
@@ -869,6 +877,7 @@ impl OwnerPrompt {
     #[must_use]
     pub const fn pointer(&self) -> &'static str {
         match self {
+            Self::CategoryGroupTitle | Self::CategoryTitle => "/title",
             Self::AccountTitle { .. } | Self::ContourTitle => "/title",
             Self::ContourAccounts | Self::MembershipAccounts => "/accounts",
             Self::MembershipContour => "/contour",
@@ -903,6 +912,8 @@ impl OwnerPrompt {
     #[must_use]
     pub const fn asked_by(&self) -> OperationKey {
         match self {
+            Self::CategoryGroupTitle => OperationKey::CreateCategoryGroup,
+            Self::CategoryTitle => OperationKey::CreateCategory,
             Self::AccountTitle { .. } => OperationKey::CreateAccount,
             Self::ContourTitle | Self::ContourAccounts => OperationKey::CreateContour,
             Self::MembershipContour | Self::MembershipAccounts => OperationKey::AddContourVersion,
@@ -1133,6 +1144,20 @@ impl OwnerPrompt {
                  an account of yours: money that went to somebody else is one of the other \
                  answers, and answering this way about somebody else's account would hide real \
                  spending as an internal move."
+                    .to_owned(),
+            ),
+            Self::CategoryGroupTitle => (
+                "What do you want to call this category group?".to_owned(),
+                "The group is the heading under which its categories are listed. It does not \
+                 change any journal row by itself, but the category you create under it is what \
+                 lets spending be filed in the money-flow report."
+                    .to_owned(),
+            ),
+            Self::CategoryTitle => (
+                "What do you want to call this category?".to_owned(),
+                "This name becomes the heading under which matching spending is counted in the \
+                 money-flow report. Creating the category does not classify any existing row by \
+                 itself; it makes a category available for the rule or assignment that does."
                     .to_owned(),
             ),
             Self::AccountInstitution => (
@@ -2991,9 +3016,11 @@ fn discrepancy_action(
 pub fn flow_diagnostics(
     report: &MoneyFlowReport,
     accounts: &[AccountView],
+    categories_exist: bool,
 ) -> Result<Vec<Action>, AppError> {
     let names = AccountNames::new(accounts);
     let mut actions = Vec::new();
+    let mut has_unfiled_spending = false;
     for currency in report.flow.currencies() {
         let undecomposed = report
             .flow
@@ -3001,15 +3028,21 @@ pub fn flow_diagnostics(
             .expect("money flow undecomposed breakdown");
         for (account, cause, count, amount) in undecomposed {
             let named = names.get(account)?;
-            actions.push(match cause {
+            match cause {
+                UndecomposedCause::NoRuleMatched if categories_exist => {
+                    actions.push(undecomposed_outflows_action(named, currency, count, amount));
+                }
                 UndecomposedCause::NoRuleMatched => {
-                    undecomposed_outflows_action(named, currency, count, amount)
+                    has_unfiled_spending = true;
                 }
                 UndecomposedCause::ExternalTransfer => {
-                    external_transfers_action(named, currency, count, amount)
+                    actions.push(external_transfers_action(named, currency, count, amount));
                 }
-            });
+            }
         }
+    }
+    if has_unfiled_spending {
+        actions.push(no_categories_action());
     }
     for (account, amount) in report
         .flow
@@ -3020,6 +3053,41 @@ pub fn flow_diagnostics(
     }
     sort_actions(&mut actions);
     Ok(actions)
+}
+
+fn no_categories_action() -> Action {
+    let create_group = ResolutionOption {
+        operation: OperationKey::CreateCategoryGroup,
+        request: RequestPlan {
+            preset: BTreeMap::new(),
+            missing: vec![MissingInput::asked(OwnerPrompt::CategoryGroupTitle)],
+        },
+    };
+    let create_category = ResolutionOption {
+        operation: OperationKey::CreateCategory,
+        request: RequestPlan {
+            preset: BTreeMap::new(),
+            missing: vec![
+                MissingInput::plain("/group", NobodyIsAsked::Caller),
+                MissingInput::asked(OwnerPrompt::CategoryTitle),
+            ],
+        },
+    };
+    Action::new(
+        ActionFacts {
+            id: identity(ActionKind::CreateFirstCategory),
+            kind: ActionKind::CreateFirstCategory,
+            category: ActionCategory::required_for(ActionKind::CreateFirstCategory),
+            state: ActionState::NeedsOwnerInput,
+            subject: None,
+        },
+        "No category exists, so no spending can be filed under a category. Create a \
+         category group first and then a category under it; when a group already exists, \
+         create the category under that group. Until then, undecomposed outflow rows cannot \
+         be acted on.",
+        ActionTarget::from_options(vec![create_group, create_category]),
+    )
+    .expect("missing-category prerequisite names category creation operations")
 }
 
 /// The cash an account's own quantities do not account for.
@@ -6266,6 +6334,8 @@ mod tests {
             OwnerPrompt::MembershipAccounts => "MembershipAccounts",
             OwnerPrompt::ExclusionReason => "ExclusionReason",
             OwnerPrompt::TransferPartners => "TransferPartners",
+            OwnerPrompt::CategoryGroupTitle => "CategoryGroupTitle",
+            OwnerPrompt::CategoryTitle => "CategoryTitle",
             OwnerPrompt::BrokerChannel => "BrokerChannel",
             OwnerPrompt::SyncFrom => "SyncFrom",
             OwnerPrompt::SyncTo => "SyncTo",
@@ -6661,7 +6731,7 @@ mod tests {
             "two kinds share an identity, or one is listed twice: {:?}",
             ActionKind::ALL.map(ActionKind::id)
         );
-        assert_eq!(ActionKind::ALL.len(), 19, "a kind was added without a goal");
+        assert_eq!(ActionKind::ALL.len(), 20, "a kind was added without a goal");
     }
 
     /// Every kind graded `RequiredForGoal` names at least one goal, and every
@@ -6749,7 +6819,13 @@ mod tests {
                 | ActionKind::UnexplainedResidual => &[],
                 // Without a category rule, the flow report cannot answer where
                 // the money went: its category decomposition is empty.
-                ActionKind::UndecomposedOutflows => &[MoneyFlow],
+                //
+                // And with no category at all there is nothing for a rule to
+                // name, so the same report is short for a reason one step
+                // earlier. The two never appear together: while no category
+                // exists this item replaces the per-row ones, because a queue of
+                // requests that cannot name a target has stopped ordering work.
+                ActionKind::UndecomposedOutflows | ActionKind::CreateFirstCategory => &[MoneyFlow],
             };
 
             let goals: Vec<ReportGoal> = kind.goals().iter().collect();
@@ -6906,7 +6982,14 @@ mod tests {
     }
 
     fn flow_actions(report: &MoneyFlowReport) -> Vec<Action> {
-        flow_diagnostics(report, &flow_accounts(report))
+        flow_actions_with_categories(report, true)
+    }
+
+    fn flow_actions_with_categories(
+        report: &MoneyFlowReport,
+        categories_exist: bool,
+    ) -> Vec<Action> {
+        flow_diagnostics(report, &flow_accounts(report), categories_exist)
             .expect("every account the flow names is one of the owner's")
     }
 
@@ -10782,6 +10865,46 @@ mod tests {
             .collect();
         assert_eq!(undecomposed.len(), 2);
         assert_ne!(undecomposed[0].id(), undecomposed[1].id());
+    }
+
+    /// Empty category setup is one blocking prerequisite, not one impossible
+    /// rule request per unmatched row.
+    #[test]
+    fn no_categories_replaces_unmatched_outflow_items() {
+        let account = AccountId::new_random();
+        let actions = flow_actions_with_categories(&undecomposed_report(&[account]), false);
+
+        let first = actions
+            .iter()
+            .find(|action| action.kind() == ActionKind::CreateFirstCategory)
+            .expect("missing-category prerequisite");
+        assert_eq!(
+            first.category(),
+            ActionCategory::required_for(ActionKind::CreateFirstCategory)
+        );
+        assert_eq!(first.state(), ActionState::NeedsOwnerInput);
+        assert_eq!(first.target().resolutions().len(), 2);
+        assert_eq!(
+            first.target().resolutions()[0].0,
+            OperationKey::CreateCategoryGroup
+        );
+        assert_eq!(
+            first.target().resolutions()[1].0,
+            OperationKey::CreateCategory
+        );
+        assert!(first.reason().contains("no spending can be filed"));
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.kind() != ActionKind::UndecomposedOutflows)
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.kind() == ActionKind::CreateFirstCategory)
+                .count(),
+            1
+        );
     }
 
     /// Nothing outstanding, nothing informational: the detectors say nothing

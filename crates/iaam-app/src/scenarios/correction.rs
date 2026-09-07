@@ -1145,7 +1145,7 @@ fn observed_for(original: &Event, index: usize) -> Result<ObservedRow, AppError>
         .legs
         .iter()
         .find_map(|leg| leg.cash_effect())
-        .or_else(|| match &original.kind {
+        .or(match &original.kind {
             EventKind::UnresolvedOwnAccountMovement { amount } => Some(*amount),
             _ => None,
         })
@@ -1482,7 +1482,11 @@ mod tests {
         }
         assert!(
             replacement.legs.iter().any(|leg| leg.account == sender
-                && leg.money == Some(amount.checked_negate().expect("negate"))),
+                // Stated, not derived: the architecture guard refuses monetary
+                // arithmetic in this crate, tests included, and a test that
+                // computes its own expectation would agree with the code by
+                // sharing its mistake.
+                && leg.money == Some(Money::new(PostedMinor::new(-1_000), CurrencyCode::Rub))),
             "the sender leg is an outflow"
         );
         assert!(

@@ -11538,10 +11538,22 @@ async fn corrections_are_described_and_scope_checked() {
         .collect();
     assert_eq!(
         tags,
-        ["replacement".to_owned(), "reversal".to_owned()]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<String>>(),
+        [
+            "reclassification".to_owned(),
+            "replacement".to_owned(),
+            "reversal".to_owned()
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<String>>(),
         "unexpected relation tags: {relations:?}"
+    );
+    let reclassification = relations
+        .iter()
+        .find(|variant| variant["properties"]["relation"]["enum"][0] == "reclassification")
+        .expect("the reclassification variant is described");
+    assert!(
+        reclassification["properties"]["classified_as"].is_object(),
+        "reclassification does not carry the planned classification: {relations:?}"
     );
 
     // A correction is two append-only facts and can be undone by another
@@ -13415,6 +13427,14 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
         corrections[0]["becomes"]["origin"], "account_maintenance",
         "{first}"
     );
+    let preview_accounts = first["plan"]["preview"]["accounts"]
+        .as_array()
+        .expect("the plan publishes its correction preview");
+    assert_eq!(preview_accounts.len(), 1, "{first}");
+    assert_eq!(
+        preview_accounts[0]["facts"], 2,
+        "reclassification writes a reversal and replacement: {first}"
+    );
 
     // A rule on the word the source used for the row — not on `cash_out`,
     // which is the classification this rule exists to revise.
@@ -13440,6 +13460,25 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     // The later decision wins: the rule naming the source's own word is the
     // owner's most recent answer about this row.
     assert_eq!(corrections[0]["becomes"]["kind"], "income", "{second}");
+    let refusal = corrections[0]["refusal"]
+        .as_object()
+        .expect("the plan reports why this row cannot be applied");
+    assert_eq!(
+        refusal["field"], "corrections[0].classified_as.answer",
+        "{second}"
+    );
+    assert!(
+        refusal["expected"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "{second}"
+    );
+    assert!(
+        refusal["actual"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "{second}"
+    );
     let newest = second["id"].as_str().expect("identifier").to_owned();
 
     // Retiring is symmetric: it recomputes and answers with the plan too,
@@ -13458,6 +13497,21 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
     assert_eq!(corrections.len(), 1, "{plan}");
     assert_eq!(corrections[0]["event"], event, "{plan}");
     assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{plan}");
+    let correction = json!({
+        "acknowledge_retraction": true,
+        "corrections": [{
+            "relation": "reclassification",
+            "target": event,
+            "classified_as": corrections[0]["becomes"].clone()
+        }]
+    });
+    let (status, applied) = call(
+        &harness.router,
+        post("/v1/corrections", &harness.owner_token, &correction),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied[0]["verdict"], "provisional", "{applied}");
 }
 
 /// What the listing prints is what the create route accepts, unchanged.

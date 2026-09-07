@@ -61,15 +61,33 @@ pub struct PlannedCorrection {
     pub event: EventId,
     pub was: ClassifiedAs,
     pub becomes: ClassifiedAs,
+    pub refusal: Option<PlannedCorrectionRefusal>,
+}
+
+/// Why one planned correction cannot be constructed yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedCorrectionRefusal {
+    pub field: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+/// What applying a recomputation plan will write.
+///
+/// The preview is folded from the same reversal and replacement candidates the
+/// correction route will append, so account count and cash figures do not ask
+/// the caller to derive a second operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecomputePlan {
+    pub corrections: Vec<PlannedCorrection>,
+    pub preview: crate::scenarios::correction::ImportCorrectionPreview,
 }
 
 /// A rule that was stored, together with what storing it would correct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleChange {
     pub rule: ClassificationRuleView,
-    /// Empty means the rule changes nothing already in the journal — not that
-    /// the plan was not computed.
-    pub plan: Vec<PlannedCorrection>,
+    pub plan: RecomputePlan,
 }
 
 /// Store a rule stated in the classifier's own types, and say what it corrects.
@@ -268,7 +286,7 @@ pub async fn retire_rule(
     services: &AppServices,
     principal: &Principal,
     id: Uuid,
-) -> Result<Vec<PlannedCorrection>, AppError> {
+) -> Result<RecomputePlan, AppError> {
     for rule in services.rules.list_rules(principal.owner).await? {
         if rule.retired_at.is_none() {
             rule_from_view(rule)?;
@@ -312,11 +330,12 @@ pub async fn retire_rule(
 ///
 /// `recompute_plan` remains the sole place that determines which events require
 /// correction. This scenario does not modify events itself or perform monetary
-/// arithmetic in the wrapper.
+/// arithmetic in the wrapper; it only builds the same correction candidates and
+/// preview that the acknowledged route will later write.
 async fn recompute_history(
     services: &AppServices,
     owner: OwnerId,
-) -> Result<Vec<PlannedCorrection>, AppError> {
+) -> Result<RecomputePlan, AppError> {
     let events = services.store.load_events_through(owner, Date::MAX).await?;
     let stored = services.rules.list_rules(owner).await?;
     let rules = stored
@@ -328,16 +347,85 @@ async fn recompute_history(
         .iter()
         .filter_map(|event| subject(event).map(|subject| (event.id, subject)))
         .collect::<BTreeMap<EventId, ClassificationSubject>>();
-    recompute_plan(&events, &subjects, &rules)
-        .map(|plan| plan.iter().map(planned).collect())
-        .map_err(|error| AppError::Store(format!("classification recomputation: {error}")))
+    let corrections = recompute_plan(&events, &subjects, &rules)
+        .map_err(|error| AppError::Store(format!("classification recomputation: {error}")))?;
+    let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
+    let by_id: BTreeMap<EventId, &Event> = events.iter().map(|event| (event.id, event)).collect();
+    let mut targets = Vec::with_capacity(corrections.len());
+    let mut candidates = Vec::with_capacity(corrections.len() * 2);
+    let mut planned_corrections = Vec::with_capacity(corrections.len());
+    for (index, correction) in corrections.iter().enumerate() {
+        let Some(target) = by_id.get(&correction.target).copied() else {
+            planned_corrections.push(planned(
+                correction,
+                Some(PlannedCorrectionRefusal {
+                    field: format!("corrections[{index}].target"),
+                    expected: "an identifier of an event in this owner's journal".to_owned(),
+                    actual: correction.target.inner().to_string(),
+                }),
+            ));
+            continue;
+        };
+        match crate::scenarios::correction::reclassification_candidates_for_plan(
+            owner,
+            target,
+            correction.becomes,
+            index,
+        ) {
+            Ok(mut row_candidates) => {
+                targets.push(target);
+                candidates.append(&mut row_candidates);
+                planned_corrections.push(planned(correction, None));
+            }
+            Err(error) => {
+                planned_corrections.push(planned(correction, Some(planned_refusal(error, index))));
+            }
+        }
+    }
+    let preview = crate::scenarios::correction::preview_for_reclassification_batch(
+        &effective,
+        &targets,
+        &candidates,
+    )?;
+    Ok(RecomputePlan {
+        corrections: planned_corrections,
+        preview,
+    })
 }
 
-fn planned(correction: &Correction) -> PlannedCorrection {
+fn planned(
+    correction: &Correction,
+    refusal: Option<PlannedCorrectionRefusal>,
+) -> PlannedCorrection {
     PlannedCorrection {
         event: correction.target,
         was: classified_as(correction.was),
         becomes: classified_as(correction.becomes),
+        refusal,
+    }
+}
+
+fn planned_refusal(error: AppError, index: usize) -> PlannedCorrectionRefusal {
+    match error {
+        AppError::Invalid {
+            field,
+            expected,
+            actual,
+        } => PlannedCorrectionRefusal {
+            field,
+            expected,
+            actual,
+        },
+        AppError::InvalidField(rejection) => PlannedCorrectionRefusal {
+            field: rejection.field,
+            expected: rejection.expected,
+            actual: rejection.actual,
+        },
+        other => PlannedCorrectionRefusal {
+            field: format!("corrections[{index}].correction"),
+            expected: "a correction the server can construct".to_owned(),
+            actual: other.to_string(),
+        },
     }
 }
 

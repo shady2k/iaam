@@ -30,7 +30,8 @@ use iaam_app::scenarios::categories::{
     CategoryMove, CategoryPreviewRow, CategoryRuleImpact, MonthlyImpact,
 };
 use iaam_app::scenarios::classification::{
-    ClassifiedAs, PlannedCorrection, RuleChange, classified_as, outcome_from, rule_from_view,
+    ClassifiedAs, PlannedCorrection, PlannedCorrectionRefusal, RecomputePlan, RuleChange,
+    classified_as, outcome_from, rule_from_view,
 };
 use iaam_app::scenarios::correction::{
     CorrectionOutcome, CorrectionRequest, ImportCorrectionOutcome, StandingRule,
@@ -1154,6 +1155,14 @@ pub enum CorrectionDto {
         /// carries an identifier, a replacement carries a whole operation.
         operation: Box<OperationDto>,
     },
+    /// Re-read the target through the server's classifier and supersede it with
+    /// the named classification. The server owns any far-side account and legs.
+    Reclassification {
+        /// Identifier of the event being superseded.
+        target: Uuid,
+        /// The classification already named by a recomputation plan.
+        classified_as: ClassifiedAsDto,
+    },
 }
 
 /// Correct events the owner names.
@@ -1279,6 +1288,17 @@ impl CorrectionDto {
             Self::Replacement { target, operation } => CorrectionRequest::Replacement {
                 target: EventId(*target),
                 operation: Box::new(operation.to_domain(directory)?),
+            },
+            Self::Reclassification {
+                target,
+                classified_as,
+            } => CorrectionRequest::Reclassification {
+                target: EventId(*target),
+                classification: classified_as.to_domain().map_err(|error| Rejection {
+                    field: "classified_as".to_owned(),
+                    expected: "a classification accepted by the classifier".to_owned(),
+                    actual: error.to_string(),
+                })?,
             },
         })
     }
@@ -8497,12 +8517,34 @@ impl ClassifiedAsDto {
     }
 }
 
+/// Why one planned correction cannot be constructed yet.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PlannedCorrectionRefusalDto {
+    pub field: String,
+    pub expected: String,
+    pub actual: String,
+}
+
+impl PlannedCorrectionRefusalDto {
+    fn from_domain(refusal: PlannedCorrectionRefusal) -> Self {
+        Self {
+            field: refusal.field,
+            expected: refusal.expected,
+            actual: refusal.actual,
+        }
+    }
+}
+
 /// One event a rule change requires correcting.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PlannedCorrectionDto {
     pub event: Uuid,
     pub was: ClassifiedAsDto,
     pub becomes: ClassifiedAsDto,
+    /// Present when the plan can name the desired classification but cannot
+    /// construct the append-only facts for this historical row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<PlannedCorrectionRefusalDto>,
 }
 
 impl PlannedCorrectionDto {
@@ -8511,6 +8553,9 @@ impl PlannedCorrectionDto {
             event: correction.event.inner(),
             was: ClassifiedAsDto::from_domain(correction.was),
             becomes: ClassifiedAsDto::from_domain(correction.becomes),
+            refusal: correction
+                .refusal
+                .map(PlannedCorrectionRefusalDto::from_domain),
         }
     }
 }
@@ -8524,17 +8569,42 @@ impl PlannedCorrectionDto {
 pub struct RecomputePlanDto {
     pub applied: bool,
     pub corrections: Vec<PlannedCorrectionDto>,
+    /// The accounts and figures the acknowledged correction will affect.
+    pub preview: ImportCorrectionPreviewDto,
 }
 
 impl RecomputePlanDto {
     #[must_use]
-    pub fn from_domain(plan: Vec<PlannedCorrection>) -> Self {
+    pub fn from_domain(plan: RecomputePlan) -> Self {
+        let preview = plan.preview;
         Self {
             applied: false,
             corrections: plan
+                .corrections
                 .into_iter()
                 .map(PlannedCorrectionDto::from_domain)
                 .collect(),
+            preview: ImportCorrectionPreviewDto {
+                from: preview.from,
+                to: preview.to,
+                accounts: preview
+                    .accounts
+                    .into_iter()
+                    .map(|account| ImportCorrectionAccountDto {
+                        account: account.account.inner(),
+                        facts: account.facts,
+                        figures: account
+                            .figures
+                            .into_iter()
+                            .map(|figure| ImportCorrectionFigureDto {
+                                currency: CurrencyDto::from_domain(figure.currency),
+                                before: decimal_amount(figure.before),
+                                after: decimal_amount(figure.after),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            },
         }
     }
 }

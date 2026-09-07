@@ -25,8 +25,10 @@ use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, ImportId, Princip
 use iaam_core::money::{CurrencyCode, Money};
 use iaam_core::projection::ProjectionError;
 use iaam_core::projection::balances::Balances;
+use iaam_ingest::classification::{Classification, Movement};
 use iaam_ingest::dedup::IdentityScope;
-use iaam_ingest::operation::NormalizationContext;
+use iaam_ingest::observation::{ObservedCounterparty, ObservedDirection, ObservedRow, RowIdentity};
+use iaam_ingest::operation::{NormalizationContext, OperationDates};
 use iaam_ingest::{SubmittedOperation, Verdict, normalize};
 use sha2::{Digest, Sha256};
 
@@ -51,7 +53,7 @@ pub const CORRECTION_CHANNEL: &str = "correction";
 
 /// What the owner asks a correction to do to one event.
 ///
-/// The replacement carries the operation that supersedes the target rather than
+/// The replacement carries the operation submitted beside the target rather than
 /// a patch of it: a fact is submitted whole, and a partial correction would make
 /// the journal hold a value nobody ever stated.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,14 +68,26 @@ pub enum CorrectionRequest {
         target: EventId,
         operation: Box<SubmittedOperation>,
     },
+    /// Reclassify the target using the server's classification vocabulary.
+    ///
+    /// This expands to a reversal and a replacement. The replacement operation
+    /// is derived from the target's recorded observation and this classification,
+    /// so a received transfer is filed from its sending account without asking
+    /// the caller to assemble a second fact.
+    Reclassification {
+        target: EventId,
+        classification: Classification,
+    },
 }
 
 impl CorrectionRequest {
-    /// The event this correction is about. Both shapes name one.
+    /// The event this correction is about. Every shape names one.
     #[must_use]
     pub const fn target(&self) -> EventId {
         match self {
-            Self::Reversal { target } | Self::Replacement { target, .. } => *target,
+            Self::Reversal { target }
+            | Self::Replacement { target, .. }
+            | Self::Reclassification { target, .. } => *target,
         }
     }
 }
@@ -232,14 +246,18 @@ pub struct ImportCorrectionOutcome {
     pub dry_run: bool,
 }
 
-/// Build the impact of removing `targets` from the effective journal.
+/// Build the impact of removing `targets` and adding `additions` to the
+/// effective journal.
 ///
 /// The before and after figures are folded from the exact effective set used
-/// for target selection. This is deliberately the scenario's preview, rather
-/// than a transport-side second read or a guessed delta.
-fn preview_for(
+/// for target selection and the exact candidate facts the correction will write.
+/// This is deliberately the scenario's preview, rather than a transport-side
+/// second read or a guessed delta.
+fn preview_with(
     effective: &[&Event],
-    targets: &[Event],
+    targets: &[&Event],
+    facts: &[&Event],
+    additions: &[&Event],
 ) -> Result<ImportCorrectionPreview, AppError> {
     let target_ids: BTreeSet<EventId> = targets.iter().map(|event| event.id).collect();
     let mut fact_counts: BTreeMap<AccountId, usize> = BTreeMap::new();
@@ -251,6 +269,8 @@ fn preview_for(
         let date = event.order.date();
         from = Some(from.map_or(date, |current| current.min(date)));
         to = Some(to.map_or(date, |current| current.max(date)));
+    }
+    for event in facts {
         for account in touched(event) {
             *fact_counts.entry(account).or_default() += 1;
         }
@@ -271,13 +291,18 @@ fn preview_for(
         }
         Ok(balances)
     };
-    let effective_refs = effective.to_vec();
-    let after_refs: Vec<&Event> = effective
+    let before = fold(effective)?;
+    let mut after_refs: Vec<&Event> = effective
         .iter()
         .copied()
         .filter(|event| !target_ids.contains(&event.id))
         .collect();
-    let before = fold(&effective_refs)?;
+    after_refs.extend(
+        additions
+            .iter()
+            .copied()
+            .filter(|event| !matches!(event.relation, Relation::Reversal { .. })),
+    );
     let after = fold(&after_refs)?;
 
     let mut figures_by_account: BTreeMap<AccountId, Vec<ImportCorrectionFigure>> = BTreeMap::new();
@@ -307,6 +332,14 @@ fn preview_for(
     })
 }
 
+fn preview_for(
+    effective: &[&Event],
+    targets: &[Event],
+) -> Result<ImportCorrectionPreview, AppError> {
+    let target_refs: Vec<&Event> = targets.iter().collect();
+    preview_with(effective, &target_refs, &target_refs, &[])
+}
+
 /// Correct the events the owner names, one correction fact each.
 ///
 /// All or nothing: unlike an import, whose rows are unknown to the caller and
@@ -332,14 +365,15 @@ pub async fn correct_events(
 
     let events = load_journal(services, principal).await?;
 
-    let mut candidates = Vec::with_capacity(corrections.len());
+    let mut candidate_sets = Vec::with_capacity(corrections.len());
     {
         let by_id: BTreeMap<EventId, &Event> =
             events.iter().map(|event| (event.id, event)).collect();
         for (index, correction) in corrections.iter().enumerate() {
-            candidates.push(candidate_for(principal, &by_id, index, correction)?);
+            candidate_sets.push(candidate_for(principal, &by_id, index, correction)?);
         }
     }
+    let candidates: Vec<Event> = candidate_sets.iter().flatten().cloned().collect();
 
     // Read off the journal as it stands, before the candidates join it: the
     // question is what the owner's rules have already decided, and a reversal
@@ -350,15 +384,29 @@ pub async fn correct_events(
     let recorded =
         crate::scenarios::ingest::append_checked(services, candidates, IdentityScope::Source)
             .await?;
-    Ok(recorded
+    let mut offset = 0;
+    Ok(standing
         .into_iter()
-        .zip(standing)
-        .map(|(outcome, standing_rule)| CorrectionOutcome {
-            verdict: match outcome {
-                Recorded::Inserted { id } => Verdict::Provisional { event: id },
-                Recorded::Duplicate { existing } => Verdict::Duplicate { existing },
-            },
-            standing_rule,
+        .zip(candidate_sets)
+        .map(|(standing_rule, candidate_set)| {
+            let count = candidate_set.len();
+            let outcomes = &recorded[offset..offset + count];
+            offset += count;
+            let outcome = outcomes
+                .last()
+                .expect("every correction request produces at least one candidate");
+            CorrectionOutcome {
+                // Reclassification writes a reversal plus a replacement. The
+                // replacement is the fact that now stands, so it is the
+                // acknowledgement's representative event.
+                verdict: match outcome {
+                    Recorded::Inserted { id } => Verdict::Provisional { event: *id },
+                    Recorded::Duplicate { existing } => Verdict::Duplicate {
+                        existing: *existing,
+                    },
+                },
+                standing_rule,
+            }
         })
         .collect())
 }
@@ -905,13 +953,13 @@ pub(crate) fn removal_disposition(journal: &[Event], event: EventId) -> Option<&
     }
 }
 
-/// Build the event one correction writes.
+/// Build the append-only facts one correction writes.
 fn candidate_for(
     principal: &Principal,
     by_id: &BTreeMap<EventId, &Event>,
     index: usize,
     correction: &CorrectionRequest,
-) -> Result<Event, AppError> {
+) -> Result<Vec<Event>, AppError> {
     match correction {
         CorrectionRequest::Reversal { target } => {
             let original = by_id
@@ -926,44 +974,211 @@ fn candidate_for(
                     actual: target.inner().to_string(),
                 });
             }
-            Ok(reversal_for(original, PrincipalId(principal.token_id)))
+            Ok(vec![reversal_for(
+                original,
+                PrincipalId(principal.token_id),
+            )])
         }
         CorrectionRequest::Replacement { target, operation } => {
-            // Looked up here rather than left to `resolve`, so a replacement of
-            // an event that does not exist is refused before the submitted
-            // operation is parsed: a rejection naming a field of the
-            // replacement would send the caller to fix the wrong thing.
-            if !by_id.contains_key(target) {
-                return Err(unknown_target(index, *target));
+            let original = by_id
+                .get(target)
+                .ok_or_else(|| unknown_target(index, *target))?;
+            Ok(vec![replacement_for(
+                principal, *target, operation, index, original,
+            )?])
+        }
+        CorrectionRequest::Reclassification {
+            target,
+            classification,
+        } => {
+            let original = by_id
+                .get(target)
+                .ok_or_else(|| unknown_target(index, *target))?;
+            if matches!(original.relation, Relation::Reversal { .. }) {
+                return Err(AppError::Invalid {
+                    field: format!("corrections[{index}].target"),
+                    expected: "an event carrying a fact: a reversal is never part of the \
+                               effective set, so it cannot be reclassified"
+                        .to_owned(),
+                    actual: target.inner().to_string(),
+                });
             }
-            let source = SourceId::declared(principal.owner, operation.account, CORRECTION_CHANNEL);
-            let normalized = normalize(
-                operation,
-                &NormalizationContext {
-                    owner: principal.owner,
-                    source,
-                    // A replacement is written by this code, exactly as the
-                    // reversal beside it is, and [`CORRECTION_PARSER_VERSION`]
-                    // already says it is stamped on *every* correction fact.
-                    // It was not: `normalize` stamped `ingest/manual/1`, so the
-                    // two halves of one channel named two different writers
-                    // (`iaam-h69n`).
-                    parser_version: ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
-                },
-            )
-            .map_err(|rejection| AppError::Invalid {
-                field: format!("corrections[{index}].operation.{}", rejection.field),
-                expected: rejection.expected,
-                actual: rejection.actual,
-            })?;
-            let mut event = normalized.event;
-            event.provenance = event
-                .provenance
-                .with_declared_by(PrincipalId(principal.token_id));
-            event.relation = Relation::Replacement { target: *target };
-            Ok(event)
+            let mut candidates = vec![reversal_for(original, PrincipalId(principal.token_id))];
+            candidates.push(reclassification_for(
+                principal.owner,
+                original,
+                *classification,
+                Some(PrincipalId(principal.token_id)),
+                index,
+            )?);
+            Ok(candidates)
         }
     }
+}
+
+fn replacement_for(
+    principal: &Principal,
+    target: EventId,
+    operation: &SubmittedOperation,
+    index: usize,
+    _original: &Event,
+) -> Result<Event, AppError> {
+    let source = SourceId::declared(principal.owner, operation.account, CORRECTION_CHANNEL);
+    let normalized = normalize(
+        operation,
+        &NormalizationContext {
+            owner: principal.owner,
+            source,
+            // A replacement is written by this code, exactly as the
+            // reversal beside it is, and [`CORRECTION_PARSER_VERSION`]
+            // already says it is stamped on *every* correction fact.
+            parser_version: ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
+        },
+    )
+    .map_err(|rejection| AppError::Invalid {
+        field: format!("corrections[{index}].operation.{}", rejection.field),
+        expected: rejection.expected,
+        actual: rejection.actual,
+    })?;
+    let mut event = normalized.event;
+    event.provenance = event
+        .provenance
+        .with_declared_by(PrincipalId(principal.token_id));
+    event.relation = Relation::Replacement { target };
+    Ok(event)
+}
+
+/// Build the replacement fact for a reclassification.
+///
+/// The target event is read back into the observation shape and resolved through
+/// the same classifier seam used by intake. In particular, an incoming row
+/// becomes an operation filed on the sending account when the classification
+/// names the far side.
+fn reclassification_for(
+    owner: iaam_core::ids::OwnerId,
+    original: &Event,
+    classification: Classification,
+    declared_by: Option<PrincipalId>,
+    index: usize,
+) -> Result<Event, AppError> {
+    let observed = observed_for(original, index)?;
+    let mut operation = observed
+        .resolve(classification, observed.movement())
+        .map_err(|rejection| AppError::Invalid {
+            field: format!("corrections[{index}].classified_as.{}", rejection.field),
+            expected: rejection.expected,
+            actual: rejection.actual,
+        })?;
+    operation.idempotency_key = Some(format!(
+        "correction/reclassification/{}",
+        original.id.inner()
+    ));
+    let source = SourceId::declared(owner, operation.account, CORRECTION_CHANNEL);
+    let normalized = normalize(
+        &operation,
+        &NormalizationContext {
+            owner,
+            source,
+            parser_version: ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
+        },
+    )
+    .map_err(|rejection| AppError::Invalid {
+        field: format!("corrections[{index}].classified_as.{}", rejection.field),
+        expected: rejection.expected,
+        actual: rejection.actual,
+    })?;
+    let mut event = normalized.event;
+    if let Some(declared_by) = declared_by {
+        event.provenance = event.provenance.with_declared_by(declared_by);
+    }
+    event.relation = Relation::Replacement {
+        target: original.id,
+    };
+    Ok(event)
+}
+
+/// Build the two facts a recomputation plan would append, without a caller
+/// principal. The plan needs their shape and balances, not an attribution.
+pub(crate) fn reclassification_candidates_for_plan(
+    owner: iaam_core::ids::OwnerId,
+    original: &Event,
+    classification: Classification,
+    index: usize,
+) -> Result<Vec<Event>, AppError> {
+    Ok(vec![
+        reversal_for_with(original, None),
+        reclassification_for(owner, original, classification, None, index)?,
+    ])
+}
+
+/// Preview a complete recomputation plan in one fold.
+pub(crate) fn preview_for_reclassification_batch(
+    effective: &[&Event],
+    targets: &[&Event],
+    candidates: &[Event],
+) -> Result<ImportCorrectionPreview, AppError> {
+    let facts: Vec<&Event> = candidates.iter().collect();
+    preview_with(effective, targets, &facts, &facts)
+}
+
+fn observed_for(original: &Event, index: usize) -> Result<ObservedRow, AppError> {
+    let subject =
+        crate::scenarios::classification::subject(original).ok_or_else(|| AppError::Invalid {
+            field: format!("corrections[{index}].target"),
+            expected: "a cash statement fact that can be reclassified".to_owned(),
+            actual: format!("{:?}", original.kind),
+        })?;
+    let direction = match subject.movement {
+        Some(Movement::In) => ObservedDirection::In,
+        Some(Movement::Out) => ObservedDirection::Out,
+        None => ObservedDirection::Unknown,
+    };
+    let counterparty = match subject.counterparty {
+        iaam_ingest::classification::Counterparty::Named(name) => ObservedCounterparty::Named(name),
+        iaam_ingest::classification::Counterparty::OwnAccount(account) => {
+            ObservedCounterparty::Named(account.inner().to_string())
+        }
+        iaam_ingest::classification::Counterparty::Unknown => ObservedCounterparty::Unknown,
+    };
+    let far_side = subject.far_side;
+    let cash = original
+        .legs
+        .iter()
+        .find_map(|leg| leg.cash_effect())
+        .or(match &original.kind {
+            EventKind::UnresolvedOwnAccountMovement { amount } => Some(*amount),
+            _ => None,
+        })
+        .ok_or_else(|| AppError::Invalid {
+            field: format!("corrections[{index}].target"),
+            expected: "a cash statement fact with a cash leg".to_owned(),
+            actual: "no cash leg".to_owned(),
+        })?;
+    Ok(ObservedRow {
+        account: original.account,
+        direction,
+        amount_minor: cash.amount().raw(),
+        currency: cash.currency(),
+        counterparty,
+        far_side,
+        source_kind: original.provenance.source_kind().map(str::to_owned),
+        source_category: original.provenance.source_category().map(str::to_owned),
+        owner_category: original.provenance.owner_category().map(str::to_owned),
+        source_code: original.provenance.source_code().map(str::to_owned),
+        description: original.provenance.description().map(str::to_owned),
+        dates: OperationDates {
+            trade: original.dates.trade.map(|date| date.inner()),
+            settled: original.dates.settled.map(|date| date.inner()),
+            cash_posted: original.dates.cash_posted.map(|date| date.inner()),
+            paid: original.dates.paid.map(|date| date.inner()),
+        },
+        source_time: original.order.source_time(),
+        identity: RowIdentity {
+            document: None,
+            row: original.provenance.source_operation_id().map(str::to_owned),
+            idempotency_key: None,
+        },
+    })
 }
 
 fn unknown_target(index: usize, target: EventId) -> AppError {
@@ -981,6 +1196,10 @@ fn unknown_target(index: usize, target: EventId) -> AppError {
 /// malformed event in an append-only journal. They never post: `resolve` drops
 /// every reversal from the effective set.
 fn reversal_for(original: &Event, declared_by: PrincipalId) -> Event {
+    reversal_for_with(original, Some(declared_by))
+}
+
+fn reversal_for_with(original: &Event, declared_by: Option<PrincipalId>) -> Event {
     let idempotency_key = format!("correction/reversal/{}", original.id.inner());
     let raw_hash = hash_of(&idempotency_key);
     // Sequence zero, like custody repair: the store assigns the real one within
@@ -990,11 +1209,16 @@ fn reversal_for(original: &Event, declared_by: PrincipalId) -> Event {
         |source_time| EffectiveOrder::with_source_time(original.order.date(), source_time, 0),
     );
 
+    let mut provenance = Provenance::new(
+        SourceId::declared(original.owner, original.account, CORRECTION_CHANNEL),
+        raw_hash,
+        ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
+    );
+    if let Some(declared_by) = declared_by {
+        provenance = provenance.with_declared_by(declared_by);
+    }
     Event {
         id: EventId::new_random(),
-        // The version describes the software that wrote the fact, and this fact
-        // is written now. Copying the original's would claim the reversal was
-        // recorded by whatever understood the journal back then.
         schema_version: SCHEMA_VERSION,
         owner: original.owner,
         account: original.account,
@@ -1002,12 +1226,7 @@ fn reversal_for(original: &Event, declared_by: PrincipalId) -> Event {
         dates: original.dates,
         order,
         legs: original.legs.clone(),
-        provenance: Provenance::new(
-            SourceId::declared(original.owner, original.account, CORRECTION_CHANNEL),
-            raw_hash,
-            ParserVersion(CORRECTION_PARSER_VERSION.to_owned()),
-        )
-        .with_declared_by(declared_by),
+        provenance,
         relation: Relation::Reversal {
             target: original.id,
         },
@@ -1191,8 +1410,11 @@ mod tests {
             }),
         };
 
-        let event =
-            candidate_for(&principal, &by_id, 0, &replacement).expect("a valid replacement");
+        let event = candidate_for(&principal, &by_id, 0, &replacement)
+            .expect("a valid replacement")
+            .into_iter()
+            .next()
+            .expect("replacement candidate");
 
         assert_eq!(
             event.provenance.parser_version(),
@@ -1229,6 +1451,116 @@ mod tests {
         settled_by(id, RuleSettlement::Rule { rule, version })
     }
 
+    #[test]
+    fn reclassifying_a_received_row_files_the_transfer_on_the_sender() {
+        let sender = AccountId(uuid::Uuid::from_u128(3));
+        let amount = Money::new(PostedMinor::new(1_000), CurrencyCode::Rub);
+        let received = deposit(7, SourceId::new_random());
+
+        let replacement = reclassification_for(
+            owner(),
+            &received,
+            Classification::InternalTransfer { to: sender },
+            None,
+            0,
+        )
+        .expect("a received row has a direction for a transfer");
+
+        assert_eq!(replacement.account, sender);
+        match replacement.kind {
+            EventKind::CashTransfer {
+                from,
+                to,
+                amount: moved,
+                ..
+            } => {
+                assert_eq!(from, sender);
+                assert_eq!(to, account());
+                assert_eq!(moved, amount);
+            }
+            other => panic!("expected a transfer replacement, got {other:?}"),
+        }
+        assert!(
+            replacement.legs.iter().any(|leg| leg.account == sender
+                // Stated, not derived: the architecture guard refuses monetary
+                // arithmetic in this crate, tests included, and a test that
+                // computes its own expectation would agree with the code by
+                // sharing its mistake.
+                && leg.money == Some(Money::new(PostedMinor::new(-1_000), CurrencyCode::Rub))),
+            "the sender leg is an outflow"
+        );
+        assert!(
+            replacement
+                .legs
+                .iter()
+                .any(|leg| leg.account == account() && leg.money == Some(amount)),
+            "the receiving leg remains an inflow"
+        );
+    }
+
+    #[test]
+    fn reclassifying_a_directionless_own_account_row_preserves_its_unresolved_amount() {
+        let amount = Money::new(PostedMinor::new(1_000), CurrencyCode::Rub);
+        let mut unresolved = deposit(8, SourceId::new_random());
+        unresolved.kind = EventKind::UnresolvedOwnAccountMovement { amount };
+        unresolved.legs.clear();
+
+        let replacement = reclassification_for(
+            owner(),
+            &unresolved,
+            Classification::OwnAccountMovement,
+            None,
+            0,
+        )
+        .expect("the unresolved own-account amount is enough for this classification");
+
+        assert_eq!(replacement.account, account());
+        assert_eq!(
+            replacement.kind,
+            EventKind::UnresolvedOwnAccountMovement { amount }
+        );
+        assert!(replacement.legs.is_empty());
+    }
+
+    #[test]
+    fn reclassification_preview_includes_both_written_facts_and_the_far_account() {
+        let sender = AccountId(uuid::Uuid::from_u128(3));
+        let received = deposit(9, SourceId::new_random());
+        let replacement = reclassification_for(
+            owner(),
+            &received,
+            Classification::InternalTransfer { to: sender },
+            None,
+            0,
+        )
+        .expect("the transfer replacement");
+        let candidates = vec![reversal_for_with(&received, None), replacement];
+        let effective = vec![&received];
+        let targets = vec![&received];
+
+        let preview = preview_for_reclassification_batch(&effective, &targets, &candidates)
+            .expect("the plan preview");
+
+        let receiver = preview
+            .accounts
+            .iter()
+            .find(|entry| entry.account == account())
+            .expect("the receiving account");
+        let sender_side = preview
+            .accounts
+            .iter()
+            .find(|entry| entry.account == sender)
+            .expect("the sending account");
+        assert_eq!(receiver.facts, 2, "reversal and replacement touch receiver");
+        assert_eq!(
+            sender_side.facts, 1,
+            "replacement adds the sender-side fact"
+        );
+        assert_eq!(
+            sender_side.figures[0].after,
+            Money::new(PostedMinor::new(-1_000), CurrencyCode::Rub)
+        );
+    }
     /// The owner's own case: a rule filed a group and one row of it is wrong.
     ///
     /// Correcting that row does nothing to the rule, so the answer names the

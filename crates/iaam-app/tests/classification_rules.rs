@@ -191,10 +191,11 @@ async fn an_ordinary_rule_is_still_written_and_still_answers_with_its_plan() {
         .expect("a readable set admits a readable rule");
 
     assert!(
-        change.plan.is_empty(),
+        change.plan.corrections.is_empty(),
         "an empty journal has nothing to correct: {:?}",
         change.plan
     );
+    assert!(change.plan.preview.accounts.is_empty());
     let rules = list_rules(&ctx.services, &ctx.principal)
         .await
         .expect("the rule history is readable");

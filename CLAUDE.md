@@ -125,11 +125,26 @@ counterparty map, a database path — it is **an input supplied at run time**,
 living outside the repository, and the code reads it from a file or the API.
 This is why the import skills take `--account-map` rather than knowing anything.
 
-**The agent does not hold the operator's data at all.** Not his statements, not
-his budget export, not his database. He runs the import skills himself against
-his own files; the agent writes the tools and reads only what he chooses to
-paste. This is the founding design's "ИИ — внешний клиент", and it is the only
-control that does not depend on anyone remembering a rule.
+**This paragraph used to say the agent holds none of the operator's data — not
+his statements, not his exports, not his database — because he ran the import
+tools himself and the agent read only what he chose to paste. That is no longer
+how this system is used, and saying it here protected nothing while making a
+reader believe it did.**
+
+The design is agent-first: the operator hands over a statement and the agent
+converts it, runs the import, and reads the result. So the agent does hold his
+data, in the moment, and the control that survives is a different one — the one
+`docs/import-boundary.md` §4 already describes. **A row an agent converted
+arrives marked `ingest/manual/1`, a row the engine read arrives marked
+`profile/<id>/<version>`, and which reader read a row is recorded on the fact for
+as long as the fact exists.** That is enforcement by attribution rather than by
+prohibition: it does not stop a second reader, it makes every row one produced
+findable and retractable as a set.
+
+What did not change, and is the rule this section is actually about: **none of it
+enters the repository.** Not a statement, not a value out of one, not a fixture
+derived from one. `make privacy` enforces the shape of that below, and it is
+independent of who is holding the file.
 
 `make privacy` enforces the part a rule cannot: no data file outside the
 synthetic-fixture directories, and no statement-shaped amount in a line the

@@ -115,6 +115,7 @@ use time::{Date, OffsetDateTime};
 use utoipa::openapi::RefOr;
 use utoipa::openapi::schema::Schema;
 use utoipa::{IntoParams, PartialSchema, ToSchema};
+
 use uuid::Uuid;
 
 use crate::vocabulary::{
@@ -3674,6 +3675,10 @@ impl MoneyFlowReportDto {
 /// wrappers are objects: `negative_cash` is one fact about the whole answer, and
 /// a copy of it on every row would invite a client to believe it could differ
 /// between them.
+///
+/// For the same fold regrouped with totals, read `/v1/reports/assets`: its
+/// `accounts` are these rows grouped by the owner's declared cash class, and
+/// its `cash.totals` states each figure kind separately.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BalancesReportDto {
     /// What would have to be true for these figures to be a complete statement

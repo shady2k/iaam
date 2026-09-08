@@ -5501,6 +5501,13 @@ pub struct JournalParams {
     /// carries `rule_settlement`, which says which of those it is.
     #[serde(default)]
     pub settled_by_rule: Option<Uuid>,
+    /// Whether to include only rows in the effective set (`true`) or only
+    /// withdrawn rows and correction markers (`false`). Omitted returns every
+    /// row. Filtering happens after resolution, so a filtered page may contain
+    /// fewer rows or none while `next` is present; callers must follow `next`
+    /// until it is absent.
+    #[serde(default)]
+    pub stands: Option<bool>,
     /// Inclusive start of the effective-date interval, YYYY-MM-DD.
     #[serde(default)]
     #[param(value_type = Option<String>, format = Date)]
@@ -5592,6 +5599,7 @@ pub async fn list_journal_events(
             import: params.import.map(ImportId).or(declared_import),
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
+            stands: params.stands,
             from,
             to,
             after: params.after,

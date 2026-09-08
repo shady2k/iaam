@@ -94,6 +94,11 @@ pub struct JournalReadQuery {
     /// It composes with the rest rather than replacing them: «what this rule did
     /// in March, on that account» is one query.
     pub settled_by_rule: Option<ClassificationRuleId>,
+    /// Whether to include only events that belong to the effective set (`true`)
+    /// or only withdrawn and correction-marker events (`false`). Omitted keeps
+    /// every event. The page cursor still advances over store rows, so a
+    /// filtered page may be short or empty while `next` is present.
+    pub stands: Option<bool>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -299,17 +304,22 @@ pub async fn read_journal(
     }
 
     let has_more = events.len() > limit as usize;
+    let next = events
+        .iter()
+        .take(limit as usize)
+        .next_back()
+        .map(|event| format_cursor(event.order.date(), event.order.sequence()));
     let rows: Vec<JournalEventView> = events
         .iter()
         .take(limit as usize)
+        .filter(|event| {
+            query
+                .stands
+                .is_none_or(|stands| resolution.stands(event.id) == stands)
+        })
         .map(|event| journal_event_view(event, &resolution))
         .collect();
-    let next = has_more
-        .then(|| {
-            rows.last()
-                .map(|row| format_cursor(row.effective_date, row.sequence))
-        })
-        .flatten();
+    let next = has_more.then_some(next).flatten();
     Ok(JournalPage { rows, next })
 }
 

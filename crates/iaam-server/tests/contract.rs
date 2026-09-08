@@ -12597,6 +12597,146 @@ async fn the_journal_marks_only_effective_correction_rows_as_standing() {
     drop(harness);
     let _ = std::fs::remove_file(path);
 }
+#[tokio::test]
+async fn the_journal_filters_by_standing_membership_without_changing_store_paging() {
+    let harness = harness();
+    let plain = seed_correctable_deposit(&harness, "stands-filter", "filter-plain", "1.01").await;
+    let reversed =
+        seed_correctable_deposit(&harness, "stands-filter", "filter-reversed", "2.02").await;
+    let replaced =
+        seed_correctable_deposit(&harness, "stands-filter", "filter-replaced", "3.03").await;
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": reversed }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reversal = body[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("reversal event");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{
+                    "relation": "replacement",
+                    "target": replaced,
+                    "operation": {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "4.04",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "filter-replacement"
+                    }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let replacement = body[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("replacement event");
+
+    let row_ids = |page: &Value| {
+        page["rows"]
+            .as_array()
+            .expect("journal rows")
+            .iter()
+            .map(|row| Uuid::parse_str(row["event"].as_str().expect("event")).expect("event uuid"))
+            .collect::<Vec<_>>()
+    };
+    let row_set = |page: &Value| row_ids(page).into_iter().collect::<BTreeSet<_>>();
+
+    let (status, page) = call(
+        &harness.router,
+        get("/v1/journal/events?stands=true", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        row_set(&page),
+        BTreeSet::from([plain, replacement]),
+        "{page}"
+    );
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?stands=false",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        row_set(&page),
+        BTreeSet::from([reversed, reversal, replaced]),
+        "{page}"
+    );
+
+    let mut seen = Vec::new();
+    let mut saw_empty_page_with_next = false;
+    let mut path = "/v1/journal/events?limit=1&stands=true".to_owned();
+    for _ in 0..10 {
+        let (status, page) = call(&harness.router, get(&path, Some(&harness.agent_token))).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let rows = row_ids(&page);
+        if rows.is_empty() && page["next"].as_str().is_some() {
+            saw_empty_page_with_next = true;
+        }
+        seen.extend(rows);
+        let Some(next) = page["next"].as_str() else {
+            break;
+        };
+        path = format!("/v1/journal/events?limit=1&stands=true&after={next}");
+    }
+    assert!(
+        saw_empty_page_with_next,
+        "a filtered page can be empty while the store has more rows"
+    );
+    assert_eq!(seen, vec![plain, replacement]);
+}
+
+#[tokio::test]
+async fn the_journal_openapi_describes_an_optional_stands_filter() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let parameters = spec["paths"]["/v1/journal/events"]["get"]["parameters"]
+        .as_array()
+        .expect("journal query parameters");
+    let stands = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "stands")
+        .expect("stands parameter");
+    assert_eq!(stands["in"], "query");
+    assert_eq!(stands["schema"]["type"], "boolean");
+    assert_ne!(stands["required"], json!(true));
+    assert!(
+        stands["description"]
+            .as_str()
+            .expect("stands description")
+            .contains("effective set"),
+        "{stands}"
+    );
+}
 
 #[tokio::test]
 async fn an_idempotency_key_that_addresses_nothing_is_a_clean_not_found() {

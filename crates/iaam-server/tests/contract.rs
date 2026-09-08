@@ -1921,6 +1921,23 @@ async fn the_journal_openapi_does_not_advertise_rule_version_filter() {
 }
 
 #[tokio::test]
+async fn the_journal_limit_bounds_are_published_in_openapi() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let parameters = spec["paths"]["/v1/journal/events"]["get"]["parameters"]
+        .as_array()
+        .expect("journal query parameters");
+    let limit = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "limit")
+        .expect("limit parameter");
+    assert_eq!(limit["schema"]["minimum"], 1);
+    assert_eq!(limit["schema"]["maximum"], 1_000);
+}
+
+#[tokio::test]
 async fn the_journal_openapi_requires_and_describes_stands() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
@@ -13259,12 +13276,25 @@ async fn paging_the_journal_neither_skips_nor_repeats_a_row() {
 #[tokio::test]
 async fn a_page_size_outside_the_permitted_range_is_refused_by_name() {
     let harness = harness();
-    for limit in ["0", "201"] {
+    let (status, body) = call(
+        &harness.router,
+        get("/v1/journal/events?limit=1000", Some(&harness.agent_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for limit in ["0", "1001"] {
         let path = format!("/v1/journal/events?limit={limit}");
         let (status, body) = call(&harness.router, get(&path, Some(&harness.agent_token))).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["code"], "invalid_request");
         assert_eq!(body["field"], "limit");
+        assert!(
+            body["expected"]
+                .as_str()
+                .is_some_and(|expected| expected.contains("between 1 and 1000")),
+            "the refusal must publish the real bounds: {body}"
+        );
     }
 }
 #[tokio::test]

@@ -43,29 +43,20 @@ pub enum SupersededBy {
     Replacement(EventId),
 }
 
-/// The result of resolving corrections, including the facts needed to explain
-/// why an event is absent from the effective set.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Resolution<'a> {
-    effective: Vec<&'a Event>,
+/// The correction facts derived from event identifiers and their relations.
+///
+/// This owns no events, so it can be used to annotate a page from a
+/// relation-only store projection while still resolving corrections outside
+/// that page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Supersession {
     reversed: BTreeSet<EventId>,
     replaced_by: BTreeMap<EventId, EventId>,
     stands: BTreeSet<EventId>,
 }
 
-impl<'a> Resolution<'a> {
-    /// Events that still stand after applying corrections.
-    #[must_use]
-    pub fn effective(&self) -> &[&'a Event] {
-        &self.effective
-    }
-
+impl Supersession {
     /// Whether an event belongs to the effective set.
-    ///
-    /// It is false for reversed targets, replaced targets, and reversal events
-    /// themselves—the same rule used to build the effective set. Membership is
-    /// indexed once when the resolution is built, so this lookup does not
-    /// rescan the effective events.
     #[must_use]
     pub fn stands(&self, event: EventId) -> bool {
         self.stands.contains(&event)
@@ -84,6 +75,44 @@ impl<'a> Resolution<'a> {
                     .then_some(SupersededBy::Reversal)
             })
     }
+}
+
+/// The result of resolving corrections, including the events that still stand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolution<'a> {
+    effective: Vec<&'a Event>,
+    supersession: Supersession,
+}
+
+impl<'a> Resolution<'a> {
+    /// Events that still stand after applying corrections.
+    #[must_use]
+    pub fn effective(&self) -> &[&'a Event] {
+        &self.effective
+    }
+
+    /// Whether an event belongs to the effective set.
+    ///
+    /// It is false for reversed targets, replaced targets, and reversal events
+    /// themselves—the same rule used to build the effective set. Membership is
+    /// indexed once when the resolution is built, so this lookup does not
+    /// rescan the effective events.
+    #[must_use]
+    pub fn stands(&self, event: EventId) -> bool {
+        self.supersession.stands(event)
+    }
+
+    /// Explain whether an event was reversed or replaced.
+    #[must_use]
+    pub fn superseded_by(&self, event: EventId) -> Option<SupersededBy> {
+        self.supersession.superseded_by(event)
+    }
+
+    /// The relation-only facts used to build this resolution.
+    #[must_use]
+    pub fn supersession(&self) -> &Supersession {
+        &self.supersession
+    }
 
     /// Consume the resolution and return its effective events.
     #[must_use]
@@ -99,7 +128,20 @@ impl<'a> Resolution<'a> {
 /// determine the effective set. Callers publishing journal rows must use this
 /// result rather than reconstructing correction state from the raw relations.
 pub fn resolve_with_supersession(events: &[Event]) -> Result<Resolution<'_>, CorrectionError> {
-    resolve_with_supersession_inner(events, false)
+    let relations = events
+        .iter()
+        .map(|event| (event.id, event.relation))
+        .collect::<Vec<_>>();
+    let supersession = resolve_supersession(&relations)?;
+    resolution_from_events(events, supersession)
+}
+
+/// Resolve only event identifiers and relations, without borrowing event
+/// payloads.
+pub fn resolve_supersession(
+    relations: &[(EventId, Relation)],
+) -> Result<Supersession, CorrectionError> {
+    resolve_supersession_inner(relations, false, None)
 }
 
 /// Resolve a correction chain whose first event may name a target outside the
@@ -110,18 +152,25 @@ pub fn resolve_with_supersession(events: &[Event]) -> Result<Resolution<'_>, Cor
 /// on the event, but it does not make the chain unreadable or remove its head
 /// from the effective set.
 pub fn resolve_with_unheld_targets(events: &[Event]) -> Result<Resolution<'_>, CorrectionError> {
-    resolve_with_supersession_inner(events, true)
+    let relations = events
+        .iter()
+        .map(|event| (event.id, event.relation))
+        .collect::<Vec<_>>();
+    let first = events.first().map(|event| event.id);
+    let supersession = resolve_supersession_inner(&relations, true, first)?;
+    resolution_from_events(events, supersession)
 }
 
-fn resolve_with_supersession_inner(
-    events: &[Event],
+fn resolve_supersession_inner(
+    relations: &[(EventId, Relation)],
     allow_unheld_targets: bool,
-) -> Result<Resolution<'_>, CorrectionError> {
+    unheld_head: Option<EventId>,
+) -> Result<Supersession, CorrectionError> {
     // 1. Index by identifier, checking for duplicates.
-    let mut by_id: BTreeMap<EventId, &Event> = BTreeMap::new();
-    for e in events {
-        if by_id.insert(e.id, e).is_some() {
-            return Err(CorrectionError::DuplicateEvent { id: e.id });
+    let mut ids = BTreeSet::new();
+    for (id, _) in relations {
+        if !ids.insert(*id) {
+            return Err(CorrectionError::DuplicateEvent { id: *id });
         }
     }
 
@@ -129,33 +178,29 @@ fn resolve_with_supersession_inner(
     let mut reversed: BTreeSet<EventId> = BTreeSet::new();
     let mut replaced_by: BTreeMap<EventId, EventId> = BTreeMap::new();
 
-    for e in events {
-        match e.relation {
+    for (id, relation) in relations {
+        match *relation {
             Relation::None => {}
             Relation::Reversal { target } => {
-                if !by_id.contains_key(&target)
-                    && !(allow_unheld_targets && events.first().is_some_and(|head| head.id == e.id))
-                {
+                if !ids.contains(&target) && !(allow_unheld_targets && unheld_head == Some(*id)) {
                     return Err(CorrectionError::DanglingTarget {
-                        correction: e.id,
+                        correction: *id,
                         target,
                     });
                 }
                 reversed.insert(target);
             }
             Relation::Replacement { target } => {
-                if !by_id.contains_key(&target)
-                    && !(allow_unheld_targets && events.first().is_some_and(|head| head.id == e.id))
-                {
+                if !ids.contains(&target) && !(allow_unheld_targets && unheld_head == Some(*id)) {
                     return Err(CorrectionError::DanglingTarget {
-                        correction: e.id,
+                        correction: *id,
                         target,
                     });
                 }
-                if let Some(existing) = replaced_by.insert(target, e.id) {
+                if let Some(existing) = replaced_by.insert(target, *id) {
                     // Deterministic message order: lower identifier first, so
                     // the error text does not depend on import order.
-                    let (first, second) = (existing.min(e.id), existing.max(e.id));
+                    let (first, second) = (existing.min(*id), existing.max(*id));
                     return Err(CorrectionError::ConflictingReplacements {
                         target,
                         first,
@@ -168,22 +213,38 @@ fn resolve_with_supersession_inner(
 
     // 3. An effective event is neither reversed nor replaced, and is not itself
     //    a reversal event.
+    let stands = relations
+        .iter()
+        .filter(|(id, relation)| {
+            !reversed.contains(id)
+                && !replaced_by.contains_key(id)
+                && !matches!(relation, Relation::Reversal { .. })
+        })
+        .map(|(id, _)| *id)
+        .collect();
+
+    Ok(Supersession {
+        reversed,
+        replaced_by,
+        stands,
+    })
+}
+
+fn resolution_from_events(
+    events: &[Event],
+    supersession: Supersession,
+) -> Result<Resolution<'_>, CorrectionError> {
     let mut effective: Vec<&Event> = events
         .iter()
-        .filter(|e| !reversed.contains(&e.id))
-        .filter(|e| !replaced_by.contains_key(&e.id))
-        .filter(|e| !matches!(e.relation, Relation::Reversal { .. }))
+        .filter(|event| supersession.stands(event.id))
         .collect();
 
     // Source times order known moments first; raw hashes reproduce equal-time ties.
     effective.sort_by(|left, right| crate::event::compare_for_replay(left, right));
-    let stands = effective.iter().map(|event| event.id).collect();
 
     Ok(Resolution {
         effective,
-        reversed,
-        replaced_by,
-        stands,
+        supersession,
     })
 }
 
@@ -343,6 +404,44 @@ mod tests {
                 in_effective,
                 "stands must match effective membership for {:?}",
                 event.id
+            );
+        }
+    }
+    #[test]
+    fn relation_only_supersession_matches_event_resolution() {
+        let plain = event_at(1, 1, 0, Relation::None);
+        let reversed = event_at(2, 1, 1, Relation::None);
+        let reversal = event_at(
+            3,
+            1,
+            2,
+            Relation::Reversal {
+                target: reversed.id,
+            },
+        );
+        let replaced = event_at(4, 1, 3, Relation::None);
+        let replacement = event_at(
+            5,
+            1,
+            4,
+            Relation::Replacement {
+                target: replaced.id,
+            },
+        );
+        let journal = [plain, reversed, reversal, replaced, replacement];
+        let relations = journal
+            .iter()
+            .map(|event| (event.id, event.relation))
+            .collect::<Vec<_>>();
+
+        let resolution = resolve_with_supersession(&journal).unwrap();
+        let supersession = resolve_supersession(&relations).unwrap();
+
+        for event in &journal {
+            assert_eq!(supersession.stands(event.id), resolution.stands(event.id));
+            assert_eq!(
+                supersession.superseded_by(event.id),
+                resolution.superseded_by(event.id)
             );
         }
     }

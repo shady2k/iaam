@@ -17,7 +17,7 @@
 use iaam_core::category::row_key;
 use iaam_core::dates::EventDates;
 use iaam_core::event::correction::{
-    Resolution, SupersededBy, resolve_with_supersession, resolve_with_unheld_targets,
+    SupersededBy, Supersession, resolve_supersession, resolve_with_unheld_targets,
 };
 use iaam_core::event::kind::{
     EventKind, FeeOrigin, IncomeKind, OpeningAssertions, TaxOrigin, TradeSide,
@@ -39,17 +39,19 @@ use iaam_core::valuation::PriceQuality;
 use time::{Date, Time};
 
 use crate::error::AppError;
-use crate::ports::{JournalCursor, JournalQuery, JournalSourceCategoryQuery, RecordedEvent, Store};
+use crate::ports::{
+    JournalCursor, JournalQuery, JournalSourceCategoryQuery, JournalStore, RecordedEvent, Store,
+};
 
 /// Rows returned when the caller names no size.
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
 
 /// The largest page the route will assemble.
 ///
-/// A ceiling rather than a silent clamp: a caller that asked for a thousand
-/// rows and received two hundred cannot tell a truncated page from the end of
-/// the journal, and would stop reading one page early.
-pub const MAX_PAGE_SIZE: u32 = 200;
+/// A ceiling rather than a silent clamp: a caller that asks for more than the
+/// 1,000-row ceiling cannot tell a truncated page from the end of the journal,
+/// and would stop reading one page early.
+pub const MAX_PAGE_SIZE: u32 = 1_000;
 
 /// The source a caller declared when it submitted, named the same way.
 ///
@@ -284,8 +286,8 @@ pub struct JournalEventView {
 /// database index, so a key that matches nothing is a missing resource rather
 /// than an empty answer, and is reported as one. Every other filter narrows a
 /// listing, and a listing that matches nothing is legitimately empty.
-pub async fn read_journal(
-    store: &dyn Store,
+pub async fn read_journal<S: JournalStore + ?Sized>(
+    store: &S,
     owner: OwnerId,
     query: JournalReadQuery,
 ) -> Result<JournalPage, AppError> {
@@ -318,16 +320,8 @@ pub async fn read_journal(
             },
         )
         .await?;
-    let all_events = store
-        .list_journal_events(
-            owner,
-            JournalQuery {
-                limit: u32::MAX,
-                ..JournalQuery::default()
-            },
-        )
-        .await?;
-    let resolution = resolve_with_supersession(&all_events).map_err(AppError::Correction)?;
+    let relations = store.list_journal_event_relations(owner).await?;
+    let supersession = resolve_supersession(&relations).map_err(AppError::Correction)?;
 
     if events.is_empty() {
         if let Some(key) = query.idempotency_key {
@@ -350,9 +344,9 @@ pub async fn read_journal(
         .filter(|event| {
             query
                 .stands
-                .is_none_or(|stands| resolution.stands(event.id) == stands)
+                .is_none_or(|stands| supersession.stands(event.id) == stands)
         })
-        .map(|event| journal_event_view(event, &resolution))
+        .map(|event| journal_event_view(event, &supersession))
         .collect();
     let next = has_more.then_some(next).flatten();
     Ok(JournalPage { rows, next })
@@ -379,8 +373,8 @@ pub const MAX_AGGREGATE_GROUPS: usize = 1_000;
 /// report that turns movement plus an opening assertion into a balance.
 /// With no grouping, an empty selection still returns one all-None group with
 /// zero events, so the ungrouped answer has one stable shape.
-pub async fn aggregate_journal(
-    store: &dyn Store,
+pub async fn aggregate_journal<S: JournalStore + ?Sized>(
+    store: &S,
     owner: OwnerId,
     query: JournalAggregateQuery,
 ) -> Result<JournalAggregate, AppError> {
@@ -411,20 +405,12 @@ pub async fn aggregate_journal(
             },
         )
         .await?;
-    let all_events = store
-        .list_journal_events(
-            owner,
-            JournalQuery {
-                limit: u32::MAX,
-                ..JournalQuery::default()
-            },
-        )
-        .await?;
-    let resolution = resolve_with_supersession(&all_events).map_err(AppError::Correction)?;
+    let relations = store.list_journal_event_relations(owner).await?;
+    let supersession = resolve_supersession(&relations).map_err(AppError::Correction)?;
     let selected_events = events.iter().filter(|event| {
         query
             .stands
-            .is_none_or(|stands| resolution.stands(event.id) == stands)
+            .is_none_or(|stands| supersession.stands(event.id) == stands)
     });
     journal_aggregate::aggregate_journal(selected_events, &query.group_by, MAX_AGGREGATE_GROUPS)
         .map_err(|error| match error {
@@ -467,7 +453,7 @@ pub async fn list_journal_source_categories(
 
 fn journal_event_view(
     event: &iaam_core::event::Event,
-    resolution: &Resolution<'_>,
+    supersession: &Supersession,
 ) -> JournalEventView {
     JournalEventView {
         event: event.id,
@@ -481,8 +467,8 @@ fn journal_event_view(
         amount: stated_amount(event),
         basis_fee: stated_basis_fee(event),
         relation: event.relation,
-        superseded_by: resolution.superseded_by(event.id),
-        stands: resolution.stands(event.id),
+        superseded_by: supersession.superseded_by(event.id),
+        stands: supersession.stands(event.id),
         confidence: event.confidence,
         idempotency_key: event.idempotency_key.clone(),
         row_key: row_key(event).map(str::to_owned),
@@ -702,7 +688,7 @@ pub async fn read_operation_history(
     // `stands` is resolved over this operation's own chain, which holds every
     // correction of that operation, rather than over the whole journal.
     let resolution = resolve_with_unheld_targets(&events).map_err(AppError::Correction)?;
-    Ok(acts_of(head, &chain, &resolution))
+    Ok(acts_of(head, &chain, resolution.supersession()))
 }
 
 /// Fold a chain of facts into the acts that wrote it.
@@ -712,12 +698,12 @@ pub async fn read_operation_history(
 fn acts_of<'a>(
     head: &'a RecordedEvent,
     chain: &'a [RecordedEvent],
-    resolution: &Resolution<'_>,
+    supersession: &Supersession,
 ) -> OperationHistory {
     let mut steps = vec![HistoryStep {
         act: HistoryAct::Arrived,
         at: head.recorded_at.clone(),
-        state: Some(journal_event_view(&head.event, resolution)),
+        state: Some(journal_event_view(&head.event, supersession)),
         changed: Vec::new(),
         reversal: None,
         replacement: None,
@@ -755,7 +741,7 @@ fn acts_of<'a>(
                     changed: state_for_target(chain, target).map_or_else(Vec::new, |before| {
                         changed_aspects(before, &replacement.event)
                     }),
-                    state: Some(journal_event_view(&replacement.event, resolution)),
+                    state: Some(journal_event_view(&replacement.event, supersession)),
                     reversal: Some(reversal.event.id),
                     replacement: Some(replacement.event.id),
                 });
@@ -767,7 +753,7 @@ fn acts_of<'a>(
                     at: recorded.recorded_at.clone(),
                     changed: state_for_target(chain, target)
                         .map_or_else(Vec::new, |before| changed_aspects(before, &recorded.event)),
-                    state: Some(journal_event_view(&recorded.event, resolution)),
+                    state: Some(journal_event_view(&recorded.event, supersession)),
                     reversal: reversal_of(chain, target).map(|reversal| reversal.event.id),
                     replacement: Some(recorded.event.id),
                 });
@@ -1250,7 +1236,10 @@ fn parse_cursor(value: &str) -> Result<JournalCursor, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use iaam_core::dates::{CashPostedDate, EffectiveOrder};
     use iaam_core::event::kind::{EventKind, TradeSide};
@@ -1263,10 +1252,40 @@ mod tests {
     use super::*;
     use crate::AppServices;
     use crate::adapters::sqlite::SqliteAdapter;
-    use crate::ports::{Clock, Principal, Scope};
+    use crate::ports::{Clock, JournalStore, Principal, Scope};
     use crate::scenarios::correction::{
         CorrectionRequest, ImportTarget, correct_events, correct_import,
     };
+    use iaam_core::event::correction::resolve_with_supersession;
+
+    struct CountingJournalStore<'a> {
+        inner: &'a dyn Store,
+        event_limits: Arc<Mutex<Vec<u32>>>,
+        relation_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl JournalStore for CountingJournalStore<'_> {
+        async fn list_journal_events(
+            &self,
+            owner: OwnerId,
+            query: JournalQuery,
+        ) -> Result<Vec<Event>, AppError> {
+            self.event_limits
+                .lock()
+                .expect("event limit recorder")
+                .push(query.limit);
+            self.inner.list_journal_events(owner, query).await
+        }
+
+        async fn list_journal_event_relations(
+            &self,
+            owner: OwnerId,
+        ) -> Result<Vec<(EventId, Relation)>, AppError> {
+            self.relation_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_journal_event_relations(owner).await
+        }
+    }
 
     #[test]
     fn an_absent_page_size_is_the_default_and_zero_is_refused() {
@@ -1275,8 +1294,46 @@ mod tests {
         assert_eq!(page_size(None).expect("default"), DEFAULT_PAGE_SIZE);
         assert_eq!(page_size(Some(1)).expect("one row"), 1);
         assert!(page_size(Some(0)).is_err());
+        assert_eq!(MAX_PAGE_SIZE, 1_000);
         assert!(page_size(Some(MAX_PAGE_SIZE)).is_ok());
         assert!(page_size(Some(MAX_PAGE_SIZE + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn reading_a_page_uses_payloads_once_and_relations_without_payloads() {
+        let ctx = Ctx::new();
+        let event_limits = Arc::new(Mutex::new(Vec::new()));
+        let relation_calls = Arc::new(AtomicUsize::new(0));
+        let store = CountingJournalStore {
+            inner: ctx.store(),
+            event_limits: Arc::clone(&event_limits),
+            relation_calls: Arc::clone(&relation_calls),
+        };
+
+        read_journal(
+            &store,
+            ctx.owner,
+            JournalReadQuery {
+                limit: Some(MAX_PAGE_SIZE),
+                ..JournalReadQuery::default()
+            },
+        )
+        .await
+        .expect("page");
+
+        assert_eq!(
+            *event_limits.lock().expect("event limit recorder"),
+            vec![MAX_PAGE_SIZE + 1]
+        );
+        assert_eq!(relation_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            event_limits
+                .lock()
+                .expect("event limit recorder")
+                .iter()
+                .all(|limit| *limit != u32::MAX),
+            "reading a page must not issue an unbounded payload read"
+        );
     }
 
     #[test]
@@ -1988,9 +2045,9 @@ mod tests {
     async fn a_fact_that_posts_its_money_does_not_state_it_twice() {
         let ctx = Ctx::new();
         let posted = ctx.deposit(1, 4_500, ctx.main);
-
         let resolution = resolve_with_supersession(std::slice::from_ref(&posted)).unwrap();
-        let view = journal_event_view(&posted, &resolution);
+
+        let view = journal_event_view(&posted, resolution.supersession());
         assert_eq!(view.legs.len(), 1, "the deposit posts its money");
         assert_eq!(view.amount, None, "and states it nowhere else");
     }

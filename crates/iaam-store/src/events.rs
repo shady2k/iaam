@@ -604,6 +604,63 @@ impl SqliteStore {
         Ok(events)
     }
 
+    /// Read the owner's correction graph without decoding event payloads.
+    ///
+    /// The relation columns are the complete input to supersession resolution,
+    /// so this projection keeps a page read from materialising the whole
+    /// journal just to annotate its rows.
+    pub fn list_journal_event_relations(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<(EventId, Relation)>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, relation_kind, relation_target
+             FROM events
+             WHERE owner = ?1
+             ORDER BY effective_date, sequence",
+        )?;
+        let rows = statement.query_map(params![owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, kind, target) = row?;
+            let id = EventId(parse_uuid(&id, "event")?);
+            let relation = match kind.as_str() {
+                "none" => Relation::None,
+                "reversal" => Relation::Reversal {
+                    target: EventId(parse_uuid(
+                        target.as_deref().ok_or_else(|| StoreError::InvalidValue {
+                            field: "relation_target",
+                            value: "NULL for reversal".to_owned(),
+                        })?,
+                        "event relation target",
+                    )?),
+                },
+                "replacement" => Relation::Replacement {
+                    target: EventId(parse_uuid(
+                        target.as_deref().ok_or_else(|| StoreError::InvalidValue {
+                            field: "relation_target",
+                            value: "NULL for replacement".to_owned(),
+                        })?,
+                        "event relation target",
+                    )?),
+                },
+                _ => {
+                    return Err(StoreError::InvalidValue {
+                        field: "relation_kind",
+                        value: kind,
+                    });
+                }
+            };
+            Ok((id, relation))
+        })
+        .collect()
+    }
+
     /// Distinct source-category evidence for the owner's journal scope.
     ///
     /// Facts written before schema version 14 used this storage slot for the

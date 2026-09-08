@@ -162,6 +162,10 @@ pub struct HoldingValue {
 pub struct PositionsSide {
     /// One entry per instrument held, ascending by instrument.
     pub holdings: Vec<HoldingValue>,
+    /// Accounts with no declared cash class and no position fact in the
+    /// journal. Such an account may be a securities account whose holdings
+    /// were never imported; cash-only classes are not candidates.
+    pub accounts_without_position_facts: Vec<AccountId>,
     /// The earliest date any price behind these figures was for — the oldest
     /// link in the total, and the honest summary of «as of when». `None` when
     /// nothing was priced.
@@ -220,6 +224,12 @@ impl AssetSnapshot {
         // The population first: an account left out of a total is the silence
         // no row can break.
         let mut caveats = self.population.caveats();
+        for account in &self.positions.accounts_without_position_facts {
+            caveats.push(Caveat::new(
+                CaveatKind::PositionFactsMissing,
+                CaveatSubject::Account(*account),
+            ));
+        }
         for row in &self.accounts {
             for cash in &row.cash {
                 if cash.opening == OpeningIncorporation::Unincorporated {
@@ -611,6 +621,11 @@ fn fold_positions(
 
     Ok(PositionsSide {
         holdings,
+        accounts_without_position_facts: accounts
+            .iter()
+            .filter(|row| row.cash_class.is_none() && row.positions.is_empty())
+            .map(|row| row.account)
+            .collect(),
         oldest_price_date,
         totals: totals.into_values().collect(),
     })

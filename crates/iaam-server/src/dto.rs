@@ -2935,6 +2935,7 @@ pub struct CaveatDto {
     /// `account_in_another_scope`, `account_ruled_outside`, `running_cash_sum`,
     /// `period_reports_refused`, `undecomposed_movements`,
     /// `unexplained_cash_change`, `unpriced_position`, `holding_not_valued`,
+    /// `position_facts_missing`, `retired_account_not_empty`,
     /// `terminal_value_not_computed`, `return_not_computed`.
     ///
     /// A closed set. Every one of them is read off a computation the report
@@ -4113,6 +4114,11 @@ pub struct CashClassTotalDto {
 pub struct PositionsSideDto {
     /// One entry per instrument held across the scope. Always present.
     pub holdings: Vec<HoldingValueDto>,
+    /// Accounts in this report's scope with no declared cash class and no
+    /// position fact in the journal. This names the securities-capable accounts
+    /// whose empty holdings could mean securities were never imported; cash-only
+    /// classes are not candidates.
+    pub accounts_without_position_facts: Vec<Uuid>,
     /// The earliest date any price behind `totals` was for — the oldest link,
     /// and the honest summary of «as of when». Null when nothing was priced.
     ///
@@ -4278,6 +4284,12 @@ impl AssetSnapshotDto {
                         price: HoldingPriceDto::from_domain(&holding.price),
                         value: holding.value.as_ref().map(CalcMoneyDto::from_domain),
                     })
+                    .collect(),
+                accounts_without_position_facts: snapshot
+                    .positions
+                    .accounts_without_position_facts
+                    .iter()
+                    .map(|account| account.inner())
                     .collect(),
                 oldest_price_date: snapshot.positions.oldest_price_date,
                 totals: snapshot
@@ -6020,7 +6032,6 @@ pub struct ContourDto {
     pub version: u32,
     /// The accounts this version covers. Empty is a real answer: a version can
     /// be recorded with no members, and it covers nothing.
-    ///
     /// **This is the set the owner considers his portfolio, and the boundary is
     /// his rather than an institution's.** Accounts at one bank sit on one side
     /// of it only because he put them there, and two of his products at the
@@ -6032,6 +6043,12 @@ pub struct ContourDto {
     /// arriving from an account not named here is a **contribution**, and money
     /// leaving to one is a withdrawal.
     pub accounts: Vec<Uuid>,
+    /// Other current contours with the same title. These are unrelated
+    /// perimeters, not a version of this contour; `version` is not a relation
+    /// between them. The identifier is the only thing that distinguishes what
+    /// a report answers about; use these identifiers to compare compositions
+    /// or reports.
+    pub same_title_contours: Vec<Uuid>,
 }
 
 /// Exchange rate for a date specified by the owner (§6.1).

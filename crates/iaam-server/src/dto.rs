@@ -10696,6 +10696,93 @@ impl ImportQuestionDto {
     }
 }
 
+/// One result for one answer in an import-session answer batch.
+///
+/// The flattened verdict keeps this response in the family of the other
+/// per-element batch responses. The full question is carried beside it because
+/// an applied answer's single-route response says whether it minted a standing
+/// rule or left that decision for the separate reversible operation; a bare
+/// `VerdictDto` would lose that distinction.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ImportAnswerVerdictDto {
+    #[serde(flatten)]
+    pub verdict: VerdictDto,
+    /// The exact single-question success body for an applied answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<ImportQuestionDto>,
+    /// The exact single-question error body for a refused answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiError>,
+}
+
+impl ImportAnswerVerdictDto {
+    #[must_use]
+    pub fn accepted(row: usize, question: ImportQuestionDto) -> Self {
+        Self {
+            verdict: VerdictDto {
+                row,
+                verdict: VerdictCodeDto::Provisional,
+                event_id: None,
+                of_event_id: None,
+                level: None,
+                field: None,
+                expected: None,
+                actual: None,
+                detail: Some(format!(
+                    "import question {} was answered",
+                    question.question
+                )),
+                account_id: None,
+                dimension: None,
+                session_id: None,
+                question_id: None,
+                alternatives: None,
+            },
+            question: Some(question),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn rejected(row: usize, error: ApiError) -> Self {
+        Self {
+            verdict: VerdictDto {
+                row,
+                verdict: VerdictCodeDto::Rejected,
+                event_id: None,
+                of_event_id: None,
+                level: None,
+                field: None,
+                expected: None,
+                actual: None,
+                detail: Some(error.message.clone()),
+                account_id: None,
+                dimension: None,
+                session_id: None,
+                question_id: None,
+                alternatives: None,
+            },
+            question: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// One question answer in a batch, with the question identifier that the
+/// single-question route takes in its path.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AnswerImportQuestionBatchItem {
+    pub question: Uuid,
+    #[serde(flatten)]
+    pub answer: AnswerImportQuestionRequest,
+}
+
+/// Answers for one import session.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct AnswerImportQuestionsBatchRequest {
+    pub answers: Vec<AnswerImportQuestionBatchItem>,
+}
+
 /// Everything a session holds.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ImportSessionContentsDto {

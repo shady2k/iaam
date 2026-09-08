@@ -111,10 +111,11 @@ use crate::dto::{
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
-    CommitImportSessionRequest, ConfirmTransferPairingRequest, ConfirmedPairingDto,
-    ControlSectionDto, CrossSourceMatchingDto, ImportCommitDto, ImportPlanDto, ImportQuestionDto,
-    ImportRowDto, ImportSessionContentsDto, ImportSessionDto, ImportSessionSummaryDto,
-    OpenImportSessionRequest, RecordedEventDto, StateImportControlFiguresRequest,
+    AnswerImportQuestionsBatchRequest, CommitImportSessionRequest, ConfirmTransferPairingRequest,
+    ConfirmedPairingDto, ControlSectionDto, CrossSourceMatchingDto, ImportAnswerVerdictDto,
+    ImportCommitDto, ImportPlanDto, ImportQuestionDto, ImportRowDto, ImportSessionContentsDto,
+    ImportSessionDto, ImportSessionSummaryDto, OpenImportSessionRequest, RecordedEventDto,
+    StateImportControlFiguresRequest,
 };
 // What one answer's standing decision would settle before it stands
 // (`iaam-uibl`), in a block of its own for the reason the block above gives.
@@ -170,6 +171,7 @@ pub const RECORD_OWNER_BALANCE_OPERATION_ID: &str = "record_owner_balance";
 pub const CREATE_CATEGORY_GROUP_OPERATION_ID: &str = "create_category_group";
 pub const CREATE_CATEGORY_OPERATION_ID: &str = "create_category";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
+pub const ANSWER_IMPORT_QUESTIONS_BATCH_OPERATION_ID: &str = "answer_import_questions_batch";
 pub const CREATE_CATEGORY_RULE_BATCH_OPERATION_ID: &str = "create_category_rule_batch";
 
 /// The computed actions currently blocking or advancing owner setup, and which
@@ -4256,6 +4258,84 @@ pub async fn answer_import_question(
     .await?;
     Ok(Json(ImportQuestionDto::from_answered(&answered)))
 }
+
+/// Answer several questions in one import session.
+///
+/// Every element produces its own outcome, in the order the caller supplied it.
+/// Answers are applied sequentially, and each one sees the session state left by
+/// the preceding element; an element whose question was already closed by an
+/// earlier element is a normal refusal for that element and does not stop the
+/// rest of the batch. Nothing is rolled back after a later refusal, so this
+/// route is not atomic despite its batch shape.
+#[utoipa::path(
+    post,
+    path = "/v1/import-sessions/{session}/answers",
+    operation_id = ANSWER_IMPORT_QUESTIONS_BATCH_OPERATION_ID,
+    params(("session" = Uuid, Path, description = "Import session identifier")),
+    request_body = AnswerImportQuestionsBatchRequest,
+    responses(
+        (status = 200, description = "One outcome per answer, in request order", body = Vec<ImportAnswerVerdictDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn answer_import_questions(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiPath(session): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<AnswerImportQuestionsBatchRequest>,
+) -> Result<Json<Vec<ImportAnswerVerdictDto>>, ApiFailure> {
+    require(&principal, OperationKey::AnswerImportQuestion)?;
+    let mut outcomes = Vec::with_capacity(request.answers.len());
+    for (index, item) in request.answers.into_iter().enumerate() {
+        let row = index + 1;
+        let answer = match item.answer.to_domain() {
+            Ok(answer) => answer,
+            Err(rejection) => {
+                outcomes.push(ImportAnswerVerdictDto::rejected(
+                    row,
+                    invalid_rejection_body(rejection),
+                ));
+                continue;
+            }
+        };
+        let reach = match item.answer.to_reach() {
+            Ok(reach) => reach,
+            Err(rejection) => {
+                outcomes.push(ImportAnswerVerdictDto::rejected(
+                    row,
+                    invalid_rejection_body(rejection),
+                ));
+                continue;
+            }
+        };
+        let outcome = iaam_app::scenarios::import_session::answer_question(
+            &state.services,
+            &principal,
+            ImportSessionId(session),
+            ImportQuestionId(item.question),
+            answer,
+            reach,
+        )
+        .await;
+        match outcome {
+            Ok(answered) => outcomes.push(ImportAnswerVerdictDto::accepted(
+                row,
+                ImportQuestionDto::from_answered(&answered),
+            )),
+            Err(error) => outcomes.push(ImportAnswerVerdictDto::rejected(
+                row,
+                ApiFailure::body_from_app(error, &catalog),
+            )),
+        }
+    }
+    Ok(Json(outcomes))
+}
+
 /// Withdraw an answer whose standing rule has been retired.
 ///
 /// This is the reversible pre-commit half of correcting a mistaken answer.
@@ -6138,6 +6218,14 @@ fn invalid_field(field: impl Into<String>, expected: &str, actual: String) -> Ap
             .receiving(actual),
     )
 }
+
+fn invalid_rejection_body(rejection: Rejection) -> ApiError {
+    let field = rejection.field;
+    ApiError::simple("invalid_request", format!("invalid field {field}"))
+        .about(field)
+        .expecting(rejection.expected)
+        .receiving(rejection.actual)
+}
 fn invalid_rejection(rejection: Rejection) -> ApiFailure {
     invalid_field(rejection.field, &rejection.expected, rejection.actual)
 }
@@ -6400,7 +6488,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// [`require_admin`] states: the queue and the caveat register are about the
 /// owner's money and these are about the shape of the instance, so there is no
 /// second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 27] = [
     (
         "rename_account",
         "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
@@ -6468,6 +6556,10 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 26] = [
     (
         "create_category_rule_batch",
         "A bulk write of standing decisions is a caller convenience, not a computed remedy: no queue item can know the particular set of rules to write. It therefore stays outside the operation-key vocabulary, while each row uses the reversible create_category_rule floor.",
+    ),
+    (
+        "answer_import_questions_batch",
+        "Not a key. This batch performs answer_import_question repeatedly, and each element is applied under that route's own floor, which the handler already requires, so it grants no authority beyond that route. A key would exist so an item or caveat could offer this call, but whether the owner's queue should offer a batch beside the per-row action is a live question that turns on how the question put to the owner is pointed at a field; this route does not settle it. Until that question is decided, a key here would publish a second spelling of one act.",
     ),
     (
         "preview_category_rules_batch_route",

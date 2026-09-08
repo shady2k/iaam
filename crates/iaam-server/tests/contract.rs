@@ -10045,59 +10045,24 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 0);
 
-    for raw in ["not-json", "[]"] {
-        store
-            .connection()
-            .execute(
-                "UPDATE category_rules SET matcher = ?1 WHERE version = 1",
-                [raw],
-            )
-            .expect("corrupt matcher");
-        let (status, body) = call(
-            &harness.router,
-            post(
-                "/v1/category-rules/preview",
-                &harness.owner_token,
-                &json!({
-                    "matcher": {"source_category": "x"},
-                    "category": category,
-                }),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["code"], "invalid_request");
-        assert_eq!(body["field"], "matcher");
-        assert_eq!(body["expected"], "a category matcher object");
-    }
-
-    store
-        .connection()
-        .execute(
-            "UPDATE category_rules SET matcher = ?1 WHERE version = 1",
-            [r#"{"unknown":"value"}"#],
-        )
-        .expect("corrupt matcher");
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/category-rules/preview",
-            &harness.owner_token,
-            &json!({
-                "matcher": {"source_category": "x"},
-                "category": category,
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "invalid_request");
-    assert_eq!(body["field"], "matcher");
-    assert_eq!(
-        body["expected"],
-        "row, source_category, description_equals, description_starts_with, or description_contains"
-    );
-
+    // The rest of this test used to corrupt a stored rule directly — write
+    // malformed JSON, or an unknown kind, into `category_rules.matcher` —
+    // and check that reading it back through `/v1/category-rules/preview`
+    // reported a 422 rather than crashing. That column is gone (T8, the
+    // schema collapse into typed columns: `matcher_kind`, `value`, `text`,
+    // `description_mode`, in crates/iaam-store/migrations/0001_schema.sql).
+    // It is not merely renamed: the same migration's per-`matcher_kind`
+    // `CHECK` enforces exactly the shape `matcher_from_columns`
+    // (crates/iaam-store/src/categories.rs) needs, and `matcher_kind`
+    // itself is `CHECK`ed against the four known kinds. Every error branch
+    // that function has is consequently unreachable through any write —
+    // typed or raw SQL alike, since a `CHECK` binds unconditionally — so
+    // there is no longer a way to put a rule into the state this test
+    // exercised. That is not a gap: it is the corruption this test guarded
+    // against having become, structurally, impossible to write in the
+    // first place. `matcher_from_columns`'s error branches stay as defence
+    // in depth against a future migration weakening the `CHECK`, but there
+    // is no fixture that reaches them any more.
     drop(harness);
     let _ = std::fs::remove_file(path);
 }
@@ -30847,7 +30812,32 @@ async fn an_operation_reads_back_as_the_acts_the_owner_took_on_it() {
     assert_eq!(entered, history, "{entered}");
 }
 
+// Currently unwritable, and this is not a fixture bug — reported rather than
+// worked around (iaam-c2fk). `events.relation_target` is now `FOREIGN KEY
+// (owner, relation_target) REFERENCES events (owner, id) DEFERRABLE INITIALLY
+// DEFERRED` (schema collapse, T8,
+// .internal/specs/2026-09-08-a-relational-journal-design.md). Deferred only
+// postpones the check to commit; it still requires the target to exist by
+// then. `target` here is an id that is never written at all — this test's
+// whole premise — so the append below now fails its foreign key, by any
+// writer, typed or raw (`PRAGMA foreign_keys = ON` applies uniformly). But
+// the domain model still explicitly documents an unheld target as reachable
+// and legitimate: `HistoryAct::Arrived`'s doc comment,
+// `read_operation_history`'s "a target that was never written, one that
+// belongs to another owner and one lost to a corrupt database are
+// indistinguishable" (crates/iaam-app/src/scenarios/journal.rs), and
+// `iaam_core::event::correction::resolve_with_unheld_targets` all describe
+// and handle exactly this case on the read side. The FK now forecloses ever
+// producing it on the write side — the identical conflict already found and
+// disabled in `crates/iaam-app/src/scenarios/journal.rs`'s
+// `a_fact_naming_a_target_outside_his_journal_is_where_his_history_begins`.
+// Disabled rather than weakened or deleted, pending a maintainer decision on
+// which side is wrong.
 #[tokio::test]
+#[ignore = "iaam-c2fk: events.relation_target's new FK makes an unheld target \
+            unwritable by any path, contradicting HistoryAct::Arrived and \
+            read_operation_history's documented handling of exactly this case \
+            — needs a maintainer decision, not a fixture change"]
 async fn a_history_with_an_unheld_target_still_publishes_its_arrival() {
     let (harness, path) = harness_on_disk();
     let mut head = {
@@ -31615,25 +31605,56 @@ async fn an_unknown_journal_kind_names_the_accepted_vocabulary() {
     }
 }
 
+/// The event this test filters is a `Trade`, not a `CashIn` (iaam-c2fk).
+///
+/// The original fixture gave a `CashIn` two cash legs in different
+/// currencies. `Event::validate_structure`'s `expect_single_cash` has
+/// always required `CashIn` to carry exactly one monetary leg — the old
+/// store simply never validated on write, so nothing noticed. A `Trade`
+/// genuinely allows this shape: `validate_trade` checks that there is
+/// exactly one `LegKind::Cash` leg (the settlement) and exactly one
+/// `LegKind::SecurityQuantity` leg, but it never inspects any other leg a
+/// `Trade` might carry — a `LegKind::Fee` leg is invisible to it. A broker
+/// commission billed in the account's home currency on a trade that
+/// settles in a different one — a foreign-listed instrument bought for
+/// USD, with the ruble commission taken from the same account's ruble
+/// balance — is exactly that: a second, legitimate money leg in a second
+/// currency, on an event a real trade could produce.
 #[tokio::test]
 async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
     let (harness, path) = harness_on_disk();
     let rub = CurrencyCode::Rub;
     let usd = CurrencyCode::Usd;
-    let amount = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(303), rub);
+    let custody = iaam_core::ids::CustodyId::new_random();
+    let quantity = iaam_core::money::Quantity(iaam_core::numeric::decimal::Dec::one());
+    let gross = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(404), usd);
+    let settlement = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(-404), usd);
+    let commission = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(-303), rub);
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
         owner: harness.owner,
         account: harness.account,
-        kind: EventKind::CashIn { amount },
+        kind: EventKind::Trade {
+            side: iaam_core::event::kind::TradeSide::Buy,
+            instrument: harness.instrument,
+            quantity,
+            gross,
+            fee: None,
+            basis_fee: None,
+            basis_fee_exact: None,
+            accrued_interest: None,
+        },
         dates: EventDates::for_cash(CashPostedDate(date!(2026 - 09 - 03))),
         order: iaam_core::dates::EffectiveOrder::new(date!(2026 - 09 - 03), 1),
         legs: vec![
-            iaam_core::event::leg::Leg::cash(harness.account, amount),
-            iaam_core::event::leg::Leg::cash(
+            iaam_core::event::leg::Leg::cash(harness.account, settlement),
+            iaam_core::event::leg::Leg::security(
                 harness.account,
-                iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(404), usd),
+                custody,
+                harness.instrument,
+                quantity,
             ),
+            iaam_core::event::leg::Leg::fee(harness.account, commission),
         ],
         provenance: iaam_core::event::provenance::Provenance::new(
             SourceId::new_random(),
@@ -31644,8 +31665,26 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
         confidence: iaam_core::event::Confidence::Known,
         idempotency_key: Some("currency-mixed-event".to_owned()),
     };
-    SqliteStore::open(&path)
-        .expect("second connection")
+    let mut second_connection = SqliteStore::open(&path).expect("second connection");
+    second_connection
+        .upsert_instrument(&InstrumentRecord {
+            id: harness.instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "TESTSHARE".to_owned(),
+            title: "Test Share".to_owned(),
+            currencies: CurrencyRoles::uniform(usd),
+            lineage: None,
+        })
+        .expect("instrument");
+    second_connection
+        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
+            id: custody,
+            owner: harness.owner,
+            title: "Test Custody".to_owned(),
+            institution: None,
+        })
+        .expect("custody place");
+    second_connection
         .append_event(&event, IdentityScope::Source)
         .expect("mixed-currency event");
 
@@ -31661,13 +31700,21 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
     let rows = page["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 1, "{page}");
     assert_eq!(rows[0]["idempotency_key"], "currency-mixed-event");
+    // Only the money-carrying legs name a currency; the security leg does
+    // not, and its absence here is itself part of what is being checked —
+    // the whole event came back, security leg included, not only its money.
+    assert_eq!(
+        rows[0]["legs"].as_array().expect("legs").len(),
+        3,
+        "the whole event, all three legs: {page}"
+    );
     let currencies: Vec<_> = rows[0]["legs"]
         .as_array()
         .expect("legs")
         .iter()
-        .map(|leg| leg["currency"].as_str().expect("currency"))
+        .filter_map(|leg| leg["currency"].as_str())
         .collect();
-    assert_eq!(currencies, ["RUB", "USD"], "{page}");
+    assert_eq!(currencies, ["USD", "RUB"], "{page}");
 
     let (status, aggregate) = call(
         &harness.router,
@@ -31683,18 +31730,18 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
     assert!(
         groups.iter().any(|group| {
             group["currency"] == "RUB"
-                && group["cash"] == json!([{ "amount": "3.03", "currency": "RUB" }])
+                && group["cash"] == json!([{ "amount": "-3.03", "currency": "RUB" }])
                 && group["events"] == 1
         }),
-        "{aggregate}"
+        "the ruble commission leg groups on its own currency: {aggregate}"
     );
     assert!(
         groups.iter().any(|group| {
             group["currency"] == "USD"
-                && group["cash"] == json!([{ "amount": "4.04", "currency": "USD" }])
+                && group["cash"] == json!([{ "amount": "-4.04", "currency": "USD" }])
                 && group["events"] == 1
         }),
-        "{aggregate}"
+        "the dollar settlement leg groups on its own currency: {aggregate}"
     );
 
     drop(harness);

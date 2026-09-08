@@ -31,19 +31,33 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{ApiError, ApiFailure};
 
+/// Required query keys in the order they are declared by a route.
+///
+/// The extractor uses this metadata only on the refusal path. Deserialisation
+/// still owns accepted requests, while this list lets a route report every
+/// required key the request did not carry instead of stopping at serde's first
+/// missing field.
+pub trait QueryRequirements {
+    const REQUIRED: &'static [&'static str];
+}
+
 /// Query parameters, refused as `ApiError`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApiQuery<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for ApiQuery<T>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + QueryRequirements,
     S: Send + Sync,
 {
     type Rejection = ApiFailure;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let query = parts.uri.query().unwrap_or_default();
+        let missing = missing_query_fields(query, T::REQUIRED);
+        if !missing.is_empty() {
+            return Err(missing_required_query(&missing));
+        }
         // The same deserialiser axum uses, so accepted requests are accepted
         // exactly as before; only the failure path differs.
         let deserializer =
@@ -200,6 +214,31 @@ fn invalid_request(field: Option<String>, expected: Option<String>, message: Str
     }
     if let Some(expected) = expected {
         body = body.expecting(expected);
+    }
+    ApiFailure::new(StatusCode::UNPROCESSABLE_ENTITY, body)
+}
+
+fn missing_query_fields(query: &str, required: &[&str]) -> Vec<String> {
+    let present: Vec<String> = form_urlencoded::parse(query.as_bytes())
+        .map(|(key, _)| key.into_owned())
+        .collect();
+    required
+        .iter()
+        .filter(|name| !present.iter().any(|key| key == **name))
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+fn missing_required_query(missing: &[String]) -> ApiFailure {
+    let field = missing[0].clone();
+    let mut body = ApiError::simple(
+        "invalid_request",
+        format!("required query parameter {field} is missing"),
+    )
+    .about(field)
+    .expecting("a value");
+    if missing.len() > 1 {
+        body = body.missing_fields(missing.to_owned());
     }
     ApiFailure::new(StatusCode::UNPROCESSABLE_ENTITY, body)
 }
@@ -402,6 +441,20 @@ mod tests {
     fn a_missing_field_is_named() {
         assert_eq!(missing_field("missing field `contour`"), Some("contour"));
         assert_eq!(missing_field("invalid digit found in string"), None);
+    }
+    #[test]
+    fn missing_query_fields_preserve_declared_order_and_singletons() {
+        assert_eq!(
+            missing_query_fields("", &["account", "from", "to"]),
+            vec!["account", "from", "to"]
+        );
+        assert_eq!(
+            missing_query_fields("account=123&to=2026-01-01", &["account", "from", "to"]),
+            vec!["from"]
+        );
+        assert!(
+            missing_query_fields("account=123&from=x&to=y", &["account", "from", "to"]).is_empty()
+        );
     }
 
     #[test]

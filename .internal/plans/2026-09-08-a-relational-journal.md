@@ -15,7 +15,8 @@
 - **English only.** Identifiers, test names, doc comments, `#[error(...)]` texts and any new document. Values that come from an external source stay verbatim (`CLAUDE.md` § Language).
 - **No owner data anywhere.** Fixtures are invented from scratch — `Main`, `Savings`, `Shop One` — never trimmed from a real export. `make privacy` runs as a pre-commit hook and must stay green.
 - **Greenfield.** No migration of existing data, no backwards compatibility, no `#[serde(default)]` added for an older shape. `dev.db` is deleted and recreated.
-- **`make check` is the gate**: `fmt lint arch privacy skill-doc fixtures deps test doc-test`. A task is not done until it is green.
+- **`make check` is the gate**: `fmt lint arch privacy skill-doc fixtures deps test doc-test`. A task is not done until it is green — **with one structural exception, Task 3.** Removing `events.payload` and the JSON `matcher` column breaks every reader of them, and those readers are rewritten by Tasks 4, 5, 6 and 7. So Task 3 lands with `test` red, and the tasks after it are measured by the failure count falling, not by it being zero. Every other gate — `fmt lint arch privacy skill-doc fixtures deps doc-test` — is green for Task 3 like any other task.
+- **Two branches.** `wave-ai/relational-journal` stays green and holds only work that leaves the tree green. Tasks 3 through 7 land on `wave-ai/relational-journal-schema`, which is red from Task 3 until Task 7 closes it, and is merged back once `make check` is green again. A worker is told which branch is its base; without this, a worker cannot tell its own breakage from the breakage it inherited.
 - **TDD.** The failing test is written and *run* before the implementation.
 - **One commit per task**, message ending with the bead id and the `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` trailer.
 - **Do not use TodoWrite.** Task tracking is beads only.
@@ -131,6 +132,7 @@ fn a_transfer_with_its_legs_reversed_is_refused() {
 - The out-of-scope tables (§3) are carried over unchanged from the migrations being deleted, **including their triggers** — reference data, contour versions and source documents keep theirs. Only the two journal immutability triggers are dropped.
 - A fresh database applies the schema and reports `user_version = 1`.
 - A vocabulary test asserts each `CHECK (x IN (...))` list equals the Rust enum it mirrors.
+- `test` is red **only** for `no such column: payload` and `no such column: matcher` and their cascades. A `CHECK` violation, a missing table or a foreign-key failure is a defect in this task and must be fixed here.
 
 - [ ] **Step 1: Write the failing test** in `crates/iaam-store/tests/schema.rs`:
 

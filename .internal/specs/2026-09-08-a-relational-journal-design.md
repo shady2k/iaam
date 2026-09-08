@@ -432,6 +432,14 @@ conditional `to_account`, `fee_origin`, `income_kind`.
 `CategoryMatcher` is a genuine enum of four: `matcher_kind`, `value`, `text`,
 `description_mode`, with a conditional `CHECK` per kind.
 
+**The wire strings are fixed here, because this section describes shapes and a
+reader would otherwise have to guess them.** They are the snake_case of the Rust
+variant names, and the schema's `CHECK` lists already spell them:
+`classification_rules.outcome_kind` is one of `internal_transfer`,
+`external_flow`, `fee`, `refund`, `income`, `own_account_movement`;
+`category_rules.matcher_kind` is one of `row`, `source_category`,
+`description_contains`, `description`.
+
 No table hierarchy for rules.
 
 ### 4.7 `event_category_assignments` — a projection, not a fact
@@ -577,7 +585,15 @@ event_cash_transfer (from_account, event)
 event_cash_transfer (to_account, event)
 
 event_category_assignments (owner, category, event)
+
+events (owner, id)                                         -- UNIQUE; see below
 ```
+
+The last one is not a query index. SQLite refuses a foreign key whose parent
+columns are not the primary key or a unique index, so the self-reference
+`(owner, relation_target) REFERENCES events (owner, id)` is not valid SQL
+without it — even though `id` alone is already the primary key. Found while
+implementing Task 3.
 
 `event_legs(account, event)` answers `touching` and does **not** answer "far
 side" — that is what the two `event_cash_transfer` indexes are for. (codex)

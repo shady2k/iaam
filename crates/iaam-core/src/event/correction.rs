@@ -50,6 +50,7 @@ pub struct Resolution<'a> {
     effective: Vec<&'a Event>,
     reversed: BTreeSet<EventId>,
     replaced_by: BTreeMap<EventId, EventId>,
+    stands: BTreeSet<EventId>,
 }
 
 impl<'a> Resolution<'a> {
@@ -57,6 +58,17 @@ impl<'a> Resolution<'a> {
     #[must_use]
     pub fn effective(&self) -> &[&'a Event] {
         &self.effective
+    }
+
+    /// Whether an event belongs to the effective set.
+    ///
+    /// It is false for reversed targets, replaced targets, and reversal events
+    /// themselves—the same rule used to build the effective set. Membership is
+    /// indexed once when the resolution is built, so this lookup does not
+    /// rescan the effective events.
+    #[must_use]
+    pub fn stands(&self, event: EventId) -> bool {
+        self.stands.contains(&event)
     }
 
     /// Explain whether an event was reversed or replaced.
@@ -87,6 +99,24 @@ impl<'a> Resolution<'a> {
 /// determine the effective set. Callers publishing journal rows must use this
 /// result rather than reconstructing correction state from the raw relations.
 pub fn resolve_with_supersession(events: &[Event]) -> Result<Resolution<'_>, CorrectionError> {
+    resolve_with_supersession_inner(events, false)
+}
+
+/// Resolve a correction chain whose first event may name a target outside the
+/// chain.
+///
+/// A chain is a deliberately bounded view of the journal: its first event can
+/// carry a relation to an event the owner does not hold. That relation remains
+/// on the event, but it does not make the chain unreadable or remove its head
+/// from the effective set.
+pub fn resolve_with_unheld_targets(events: &[Event]) -> Result<Resolution<'_>, CorrectionError> {
+    resolve_with_supersession_inner(events, true)
+}
+
+fn resolve_with_supersession_inner(
+    events: &[Event],
+    allow_unheld_targets: bool,
+) -> Result<Resolution<'_>, CorrectionError> {
     // 1. Index by identifier, checking for duplicates.
     let mut by_id: BTreeMap<EventId, &Event> = BTreeMap::new();
     for e in events {
@@ -103,7 +133,9 @@ pub fn resolve_with_supersession(events: &[Event]) -> Result<Resolution<'_>, Cor
         match e.relation {
             Relation::None => {}
             Relation::Reversal { target } => {
-                if !by_id.contains_key(&target) {
+                if !by_id.contains_key(&target)
+                    && !(allow_unheld_targets && events.first().is_some_and(|head| head.id == e.id))
+                {
                     return Err(CorrectionError::DanglingTarget {
                         correction: e.id,
                         target,
@@ -112,7 +144,9 @@ pub fn resolve_with_supersession(events: &[Event]) -> Result<Resolution<'_>, Cor
                 reversed.insert(target);
             }
             Relation::Replacement { target } => {
-                if !by_id.contains_key(&target) {
+                if !by_id.contains_key(&target)
+                    && !(allow_unheld_targets && events.first().is_some_and(|head| head.id == e.id))
+                {
                     return Err(CorrectionError::DanglingTarget {
                         correction: e.id,
                         target,
@@ -143,11 +177,13 @@ pub fn resolve_with_supersession(events: &[Event]) -> Result<Resolution<'_>, Cor
 
     // Source times order known moments first; raw hashes reproduce equal-time ties.
     effective.sort_by(|left, right| crate::event::compare_for_replay(left, right));
+    let stands = effective.iter().map(|event| event.id).collect();
 
     Ok(Resolution {
         effective,
         reversed,
         replaced_by,
+        stands,
     })
 }
 
@@ -271,6 +307,44 @@ mod tests {
         let journal = [original, middle, last.clone()];
         let out = resolve(&journal).unwrap();
         assert_eq!(ids(&out), vec![last.id.inner()]);
+    }
+
+    #[test]
+    fn stands_agrees_with_effective_membership_for_both_correction_kinds() {
+        let plain = event_at(1, 1, 0, Relation::None);
+        let reversed = event_at(2, 1, 1, Relation::None);
+        let reversal = event_at(
+            3,
+            1,
+            2,
+            Relation::Reversal {
+                target: reversed.id,
+            },
+        );
+        let replaced = event_at(4, 1, 3, Relation::None);
+        let replacement = event_at(
+            5,
+            1,
+            4,
+            Relation::Replacement {
+                target: replaced.id,
+            },
+        );
+        let journal = [plain, reversed, reversal, replaced, replacement];
+        let resolution = resolve_with_supersession(&journal).unwrap();
+
+        for event in &journal {
+            let in_effective = resolution
+                .effective()
+                .iter()
+                .any(|candidate| candidate.id == event.id);
+            assert_eq!(
+                resolution.stands(event.id),
+                in_effective,
+                "stands must match effective membership for {:?}",
+                event.id
+            );
+        }
     }
 
     #[test]

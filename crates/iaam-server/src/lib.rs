@@ -177,7 +177,9 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         ))
         .routes(routes!(routes::flow_report))
         .routes(routes!(routes::balances_report))
+        .routes(routes!(routes::balances_report_series))
         .routes(routes!(routes::asset_snapshot_report))
+        .routes(routes!(routes::asset_snapshot_report_series))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,

@@ -212,6 +212,51 @@ fn harness_on_disk() -> (Harness, std::path::PathBuf) {
     (harness_with(store), path)
 }
 
+/// Registers `harness.instrument` and `harness.custody` in the main
+/// journal's own reference tables (`instruments`, `custody_places`) —
+/// not `harness.market_store`, a wholly separate database for pricing
+/// data. The write path now checks that every instrument and custody
+/// place an event or its detail row names actually exists (and, for
+/// custody places, belongs to the event's owner), so any test whose
+/// route ends up writing a trade, position, or corporate-action event
+/// naming these ids needs them registered first. Needs a file-backed
+/// harness: a second connection is the only way to reach the same
+/// database `harness.router` writes through.
+fn seed_instrument_id(path: &std::path::Path, id: InstrumentId, symbol: &str) {
+    SqliteStore::open(path)
+        .expect("second connection")
+        .upsert_instrument(&InstrumentRecord {
+            id,
+            kind: Some(InstrumentKind::Share),
+            symbol: symbol.to_owned(),
+            title: format!("Instrument {symbol}"),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("journal instrument");
+}
+
+fn seed_instrument(path: &std::path::Path, harness: &Harness) {
+    seed_instrument_id(path, harness.instrument, "SHR");
+}
+
+fn seed_custody(path: &std::path::Path, harness: &Harness) {
+    SqliteStore::open(path)
+        .expect("second connection")
+        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
+            id: harness.custody,
+            owner: harness.owner,
+            title: "Custody One".into(),
+            institution: None,
+        })
+        .expect("custody place");
+}
+
+fn seed_instrument_and_custody(path: &std::path::Path, harness: &Harness) {
+    seed_instrument(path, harness);
+    seed_custody(path, harness);
+}
+
 fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account: AccountId) {
     add_reconciliation_assertion_for_period(
         path,
@@ -1138,6 +1183,7 @@ async fn an_invalid_amount_is_reported_as_a_200_row_verdict_with_field_expected_
 #[tokio::test]
 async fn opening_position_assertions_reach_the_event_through_the_api() {
     let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let claimed = date!(2021 - 05 - 01);
     let body = json!({
         "source_label": "manual entry",
@@ -1233,7 +1279,8 @@ async fn a_stale_price_is_not_accepted_from_the_api() {
 async fn the_stage_one_question_is_answered_end_to_end() {
     // The epic's acceptance criterion via the API: how much was contributed, how much
     // was withdrawn, and the pre-tax return.
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
 
     let contour = json!({
         "title": "My portfolio",
@@ -1421,6 +1468,9 @@ async fn the_stage_one_question_is_answered_end_to_end() {
         "unknown"
     );
     assert!(report["liquidation_value_before_exit_costs_and_tax"]["exit_costs"]["value"].is_null());
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -1444,6 +1494,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{instrument_response}");
+    seed_custody(&path, &harness);
     seed_bond_market(&harness).await;
 
     let contour = json!({
@@ -1690,7 +1741,8 @@ async fn seed_share_quote(harness: &Harness) {
 /// the same day, published a figure.
 #[tokio::test]
 async fn the_two_report_routes_publish_one_price_for_one_instrument() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     seed_share_quote(&harness).await;
 
     let (status, contour_response) = call(
@@ -1773,6 +1825,9 @@ async fn the_two_report_routes_publish_one_price_for_one_instrument() {
         "{snapshot}"
     );
     assert_eq!(snapshot["confidence"]["complete"], true, "{snapshot}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -7011,7 +7066,8 @@ async fn every_market_parameter_is_described_and_the_moex_ones_name_their_origin
 
 #[tokio::test]
 async fn an_amortisation_is_recorded_through_the_journal_route() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7036,11 +7092,15 @@ async fn an_amortisation_is_recorded_through_the_journal_route() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
 async fn an_offer_settlement_is_recorded_through_the_journal_route() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7065,6 +7125,9 @@ async fn an_offer_settlement_is_recorded_through_the_journal_route() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// One amortisation, submitted with or without a declaration.
@@ -7151,7 +7214,8 @@ async fn retract_journal_import(harness: &Harness, label: &str) -> (StatusCode, 
 /// Every amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn journal_facts_are_retractable_as_the_import_they_were_declared_under() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let (status, body) = post_amortisation(
         &harness,
         Some("may"),
@@ -7188,6 +7252,9 @@ async fn journal_facts_are_retractable_as_the_import_they_were_declared_under() 
         other["affected"], 1,
         "one label retracted does not carry off another: {other}"
     );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// A declaration is a statement about every fact in the batch, or it is nothing.
@@ -7275,7 +7342,8 @@ async fn a_declared_batch_of_journal_facts_refuses_a_fact_for_another_account() 
 /// this test pins: the facts land, and no import names them.
 #[tokio::test]
 async fn an_undeclared_journal_fact_is_still_recorded_and_names_no_import() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let (status, body) = post_amortisation(
         &harness,
         None,
@@ -7299,6 +7367,9 @@ async fn an_undeclared_journal_fact_is_still_recorded_and_names_no_import() {
         rows[0].get("import").is_none(),
         "an undeclared submission names no import: {page}"
     );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// The journal-fact request publishes the declaration and not the dead label.
@@ -7330,7 +7401,8 @@ async fn the_journal_fact_request_declares_a_source_and_no_longer_a_bare_label()
 /// in the response identifies the exact fact that was rejected.
 #[tokio::test]
 async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let body = json!({
         "source_label": "test",
         "events": [
@@ -7373,6 +7445,9 @@ async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
     assert_eq!(response[0]["field"], "quantity", "{response}");
     assert_eq!(response[1]["row"], 2, "{response}");
     assert_eq!(response[1]["verdict"], "provisional", "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// A zero payment is not «amortisation to zero», but bad source data. Rejection
@@ -7408,6 +7483,7 @@ async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
 #[tokio::test]
 async fn the_ingest_route_ignores_a_client_supplied_allocation() {
     let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7472,7 +7548,8 @@ async fn the_ingest_route_ignores_a_client_supplied_allocation() {
 
 #[tokio::test]
 async fn an_unknown_allocation_is_named_to_the_owner() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let contour = json!({
         "title": "Portfolio with amortisation",
         "accounts": [harness.account.inner()],
@@ -7556,6 +7633,9 @@ async fn an_unknown_allocation_is_named_to_the_owner() {
             .any(|issue| issue.as_str() == Some(expected.as_str())),
         "the owner did not see the gap: {report}"
     );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -7588,7 +7668,8 @@ async fn a_read_only_token_may_not_submit_journal_events() {
 /// an error in it.
 #[tokio::test]
 async fn a_redemption_is_recorded_through_the_journal_route() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7613,12 +7694,17 @@ async fn a_redemption_is_recorded_through_the_journal_route() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
 async fn a_conversion_is_recorded_through_the_journal_route() {
-    let harness = harness();
-    let successor = Uuid::new_v4();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
+    let successor = InstrumentId::new_random();
+    seed_instrument_id(&path, successor, "CONV");
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7627,7 +7713,7 @@ async fn a_conversion_is_recorded_through_the_journal_route() {
             "action": {
                 "type": "conversion",
                 "predecessor": harness.instrument.inner(),
-                "successor": successor,
+                "successor": successor.inner(),
                 "custody": harness.custody.inner(),
                 "ratio": "1",
                 "quantity_in": "10",
@@ -7645,13 +7731,19 @@ async fn a_conversion_is_recorded_through_the_journal_route() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// A fraction bought out for cash adds a cash leg — and the currency
 /// of the compensation comes with the amount, rather than in a separate field.
 #[tokio::test]
 async fn a_cash_compensated_fraction_travels_with_its_currency() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
+    let successor = InstrumentId::new_random();
+    seed_instrument_id(&path, successor, "CONV");
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7660,7 +7752,7 @@ async fn a_cash_compensated_fraction_travels_with_its_currency() {
             "action": {
                 "type": "conversion",
                 "predecessor": harness.instrument.inner(),
-                "successor": Uuid::new_v4(),
+                "successor": successor.inner(),
                 "custody": harness.custody.inner(),
                 "ratio": "1.5",
                 "quantity_in": "11",
@@ -7680,11 +7772,15 @@ async fn a_cash_compensated_fraction_travels_with_its_currency() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
 async fn an_offer_application_and_its_withdrawal_are_recorded() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let submission = Uuid::new_v4();
     let body = json!({
         "source_label": "test",
@@ -7721,6 +7817,9 @@ async fn an_offer_application_and_its_withdrawal_are_recorded() {
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response[0]["verdict"], "provisional", "{response}");
     assert_eq!(response[1]["verdict"], "provisional", "{response}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// Market synchronisation writes to the observation journal, so it is closed
@@ -7954,7 +8053,23 @@ async fn custody_repair_is_described_and_scope_refusal_reaches_the_client() {
 
 #[tokio::test]
 async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
-    let harness = harness();
+    let (harness, db_path) = harness_on_disk();
+    seed_instrument(&db_path, &harness);
+    // The affected trade's custody is deliberately `harness.account.inner()`
+    // — the T4 custody defect this route repairs, where an effective trade's
+    // custody was fabricated from its account identifier. Custody-place ids
+    // and account ids are separate namespaces, so registering a custody
+    // place under that same value is legitimate fixture data, not a
+    // modelling error.
+    SqliteStore::open(&db_path)
+        .expect("second connection")
+        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
+            id: CustodyId(harness.account.inner()),
+            owner: harness.owner,
+            title: "Account-Derived Custody".into(),
+            institution: None,
+        })
+        .expect("account-derived custody place");
     let (status, seeded) = call(
         &harness.router,
         post(
@@ -8024,6 +8139,9 @@ async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
     assert_eq!(repeated["affected_trades"], 0);
     assert_eq!(repeated["already_reversed"], 1);
     assert_eq!(repeated["written"], 0);
+
+    drop(harness);
+    let _ = std::fs::remove_file(db_path);
 }
 #[tokio::test]
 async fn the_same_declared_source_yields_the_same_source_id() {
@@ -8318,7 +8436,8 @@ async fn flow_report_rejects_a_reversed_interval() {
 
 #[tokio::test]
 async fn balances_keep_cash_and_positions_as_separate_fields() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let contour = json!({
         "title": "August balances",
         "accounts": [harness.account.inner()],
@@ -8391,6 +8510,9 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
     assert_eq!(row["positions"][0]["quantity"], "10");
     assert!(row["reconciliation"].is_array());
     assert!(row.get("total").is_none());
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -10045,59 +10167,24 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     assert_eq!(status, StatusCode::OK, "{impact}");
     assert_eq!(impact["rows"], 0);
 
-    for raw in ["not-json", "[]"] {
-        store
-            .connection()
-            .execute(
-                "UPDATE category_rules SET matcher = ?1 WHERE version = 1",
-                [raw],
-            )
-            .expect("corrupt matcher");
-        let (status, body) = call(
-            &harness.router,
-            post(
-                "/v1/category-rules/preview",
-                &harness.owner_token,
-                &json!({
-                    "matcher": {"source_category": "x"},
-                    "category": category,
-                }),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        assert_eq!(body["code"], "invalid_request");
-        assert_eq!(body["field"], "matcher");
-        assert_eq!(body["expected"], "a category matcher object");
-    }
-
-    store
-        .connection()
-        .execute(
-            "UPDATE category_rules SET matcher = ?1 WHERE version = 1",
-            [r#"{"unknown":"value"}"#],
-        )
-        .expect("corrupt matcher");
-    let (status, body) = call(
-        &harness.router,
-        post(
-            "/v1/category-rules/preview",
-            &harness.owner_token,
-            &json!({
-                "matcher": {"source_category": "x"},
-                "category": category,
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "invalid_request");
-    assert_eq!(body["field"], "matcher");
-    assert_eq!(
-        body["expected"],
-        "row, source_category, description_equals, description_starts_with, or description_contains"
-    );
-
+    // The rest of this test used to corrupt a stored rule directly — write
+    // malformed JSON, or an unknown kind, into `category_rules.matcher` —
+    // and check that reading it back through `/v1/category-rules/preview`
+    // reported a 422 rather than crashing. That column is gone (T8, the
+    // schema collapse into typed columns: `matcher_kind`, `value`, `text`,
+    // `description_mode`, in crates/iaam-store/migrations/0001_schema.sql).
+    // It is not merely renamed: the same migration's per-`matcher_kind`
+    // `CHECK` enforces exactly the shape `matcher_from_columns`
+    // (crates/iaam-store/src/categories.rs) needs, and `matcher_kind`
+    // itself is `CHECK`ed against the four known kinds. Every error branch
+    // that function has is consequently unreachable through any write —
+    // typed or raw SQL alike, since a `CHECK` binds unconditionally — so
+    // there is no longer a way to put a rule into the state this test
+    // exercised. That is not a gap: it is the corruption this test guarded
+    // against having become, structurally, impossible to write in the
+    // first place. `matcher_from_columns`'s error branches stay as defence
+    // in depth against a future migration weakening the `CHECK`, but there
+    // is no fixture that reaches them any more.
     drop(harness);
     let _ = std::fs::remove_file(path);
 }
@@ -16840,7 +16927,8 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
 
     // --- position_facts_missing ---------------------------------------------
     {
-        let harness = harness();
+        let (harness, path) = harness_on_disk();
+        seed_instrument_and_custody(&path, &harness);
         let securities = make_account(&harness, "Securities").await;
         let reported = make_contour(&harness, "Reported", &[securities.as_str()]).await;
 
@@ -16880,6 +16968,9 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
             "{after}"
         );
         exercised.insert(CaveatKind::PositionFactsMissing);
+
+        drop(harness);
+        let _ = std::fs::remove_file(path);
     }
 
     // --- account_in_another_scope -------------------------------------------
@@ -17477,7 +17568,8 @@ async fn a_queue_for_an_owner_who_has_retired_nothing_carries_no_such_item() {
 /// because only the queue knows the account and the interval.
 #[tokio::test]
 async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
 
     let (status, contour_response) = call(
         &harness.router,
@@ -17624,6 +17716,9 @@ async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does(
         .unwrap_or_else(|| panic!("no holding_not_valued caveat: {snapshot}"))
         .clone();
     assert_eq!(unclosable["closed_by"], json!([]), "{unclosable}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// Creating a contour and versioning one are two acts, and the create route
@@ -27193,7 +27288,8 @@ async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
 /// market-dependent figure cannot read as a bank figure.
 #[tokio::test]
 async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_total() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
 
     let (status, contour_response) = call(
         &harness.router,
@@ -27302,6 +27398,9 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
     assert!(at("\"positions\"") < at("\"total\""), "{body}");
     assert!(at("\"oldest_price_date\"") < at("\"total\""), "{body}");
     assert!(at("\"confidence\"") < at("\"cash\""), "{body}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// A holding no quote covers is absent from the total rather than valued at
@@ -27309,7 +27408,8 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
 /// up; absence is a question.
 #[tokio::test]
 async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
 
     let (status, contour_response) = call(
         &harness.router,
@@ -27388,6 +27488,9 @@ async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat()
         harness.instrument.inner().to_string(),
         "{snapshot}"
     );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// A report names the accounts whose securities side has no journal fact.
@@ -27398,7 +27501,8 @@ async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat()
 /// cash products, and a position fact must close the former.
 #[tokio::test]
 async fn an_asset_report_names_missing_position_facts_only_for_securities_accounts() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument_and_custody(&path, &harness);
     let router = &harness.router;
     let owner_token = &harness.owner_token;
 
@@ -27571,6 +27675,9 @@ async fn an_asset_report_names_missing_position_facts_only_for_securities_accoun
             .all(|caveat| caveat["kind"] != "position_facts_missing"),
         "cash-only accounts are not securities omissions: {current}"
     );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// Same-title contours are distinct perimeters, not versions of one another.
@@ -28937,7 +29044,8 @@ async fn a_source_that_names_the_far_side_as_the_owners_records_a_fact_and_asks_
 /// Every account, amount, date and key here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_change_the_legs_cannot_see_is_named_and_a_sum_no_leg_carries_is_shown() {
-    let harness = harness();
+    let (harness, path) = harness_on_disk();
+    seed_instrument(&path, &harness);
     let account = harness.account.inner();
 
     // 1. A fact that posts nothing still says how much.
@@ -29074,6 +29182,9 @@ async fn a_change_the_legs_cannot_see_is_named_and_a_sum_no_leg_carries_is_shown
         json!(["kind"]),
         "he changed what sort of income it was, and nothing else: {history}"
     );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -31117,7 +31228,32 @@ async fn an_operation_reads_back_as_the_acts_the_owner_took_on_it() {
     assert_eq!(entered, history, "{entered}");
 }
 
+// Currently unwritable, and this is not a fixture bug — reported rather than
+// worked around (iaam-c2fk). `events.relation_target` is now `FOREIGN KEY
+// (owner, relation_target) REFERENCES events (owner, id) DEFERRABLE INITIALLY
+// DEFERRED` (schema collapse, T8,
+// .internal/specs/2026-09-08-a-relational-journal-design.md). Deferred only
+// postpones the check to commit; it still requires the target to exist by
+// then. `target` here is an id that is never written at all — this test's
+// whole premise — so the append below now fails its foreign key, by any
+// writer, typed or raw (`PRAGMA foreign_keys = ON` applies uniformly). But
+// the domain model still explicitly documents an unheld target as reachable
+// and legitimate: `HistoryAct::Arrived`'s doc comment,
+// `read_operation_history`'s "a target that was never written, one that
+// belongs to another owner and one lost to a corrupt database are
+// indistinguishable" (crates/iaam-app/src/scenarios/journal.rs), and
+// `iaam_core::event::correction::resolve_with_unheld_targets` all describe
+// and handle exactly this case on the read side. The FK now forecloses ever
+// producing it on the write side — the identical conflict already found and
+// disabled in `crates/iaam-app/src/scenarios/journal.rs`'s
+// `a_fact_naming_a_target_outside_his_journal_is_where_his_history_begins`.
+// Disabled rather than weakened or deleted, pending a maintainer decision on
+// which side is wrong.
 #[tokio::test]
+#[ignore = "iaam-c2fk: events.relation_target's new FK makes an unheld target \
+            unwritable by any path, contradicting HistoryAct::Arrived and \
+            read_operation_history's documented handling of exactly this case \
+            — needs a maintainer decision, not a fixture change"]
 async fn a_history_with_an_unheld_target_still_publishes_its_arrival() {
     let (harness, path) = harness_on_disk();
     let mut head = {
@@ -31885,25 +32021,56 @@ async fn an_unknown_journal_kind_names_the_accepted_vocabulary() {
     }
 }
 
+/// The event this test filters is a `Trade`, not a `CashIn` (iaam-c2fk).
+///
+/// The original fixture gave a `CashIn` two cash legs in different
+/// currencies. `Event::validate_structure`'s `expect_single_cash` has
+/// always required `CashIn` to carry exactly one monetary leg — the old
+/// store simply never validated on write, so nothing noticed. A `Trade`
+/// genuinely allows this shape: `validate_trade` checks that there is
+/// exactly one `LegKind::Cash` leg (the settlement) and exactly one
+/// `LegKind::SecurityQuantity` leg, but it never inspects any other leg a
+/// `Trade` might carry — a `LegKind::Fee` leg is invisible to it. A broker
+/// commission billed in the account's home currency on a trade that
+/// settles in a different one — a foreign-listed instrument bought for
+/// USD, with the ruble commission taken from the same account's ruble
+/// balance — is exactly that: a second, legitimate money leg in a second
+/// currency, on an event a real trade could produce.
 #[tokio::test]
 async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
     let (harness, path) = harness_on_disk();
     let rub = CurrencyCode::Rub;
     let usd = CurrencyCode::Usd;
-    let amount = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(303), rub);
+    let custody = iaam_core::ids::CustodyId::new_random();
+    let quantity = iaam_core::money::Quantity(iaam_core::numeric::decimal::Dec::one());
+    let gross = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(404), usd);
+    let settlement = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(-404), usd);
+    let commission = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(-303), rub);
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
         owner: harness.owner,
         account: harness.account,
-        kind: EventKind::CashIn { amount },
+        kind: EventKind::Trade {
+            side: iaam_core::event::kind::TradeSide::Buy,
+            instrument: harness.instrument,
+            quantity,
+            gross,
+            fee: None,
+            basis_fee: None,
+            basis_fee_exact: None,
+            accrued_interest: None,
+        },
         dates: EventDates::for_cash(CashPostedDate(date!(2026 - 09 - 03))),
         order: iaam_core::dates::EffectiveOrder::new(date!(2026 - 09 - 03), 1),
         legs: vec![
-            iaam_core::event::leg::Leg::cash(harness.account, amount),
-            iaam_core::event::leg::Leg::cash(
+            iaam_core::event::leg::Leg::cash(harness.account, settlement),
+            iaam_core::event::leg::Leg::security(
                 harness.account,
-                iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(404), usd),
+                custody,
+                harness.instrument,
+                quantity,
             ),
+            iaam_core::event::leg::Leg::fee(harness.account, commission),
         ],
         provenance: iaam_core::event::provenance::Provenance::new(
             SourceId::new_random(),
@@ -31914,8 +32081,26 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
         confidence: iaam_core::event::Confidence::Known,
         idempotency_key: Some("currency-mixed-event".to_owned()),
     };
-    SqliteStore::open(&path)
-        .expect("second connection")
+    let mut second_connection = SqliteStore::open(&path).expect("second connection");
+    second_connection
+        .upsert_instrument(&InstrumentRecord {
+            id: harness.instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "TESTSHARE".to_owned(),
+            title: "Test Share".to_owned(),
+            currencies: CurrencyRoles::uniform(usd),
+            lineage: None,
+        })
+        .expect("instrument");
+    second_connection
+        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
+            id: custody,
+            owner: harness.owner,
+            title: "Test Custody".to_owned(),
+            institution: None,
+        })
+        .expect("custody place");
+    second_connection
         .append_event(&event, IdentityScope::Source)
         .expect("mixed-currency event");
 
@@ -31931,13 +32116,21 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
     let rows = page["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 1, "{page}");
     assert_eq!(rows[0]["idempotency_key"], "currency-mixed-event");
+    // Only the money-carrying legs name a currency; the security leg does
+    // not, and its absence here is itself part of what is being checked —
+    // the whole event came back, security leg included, not only its money.
+    assert_eq!(
+        rows[0]["legs"].as_array().expect("legs").len(),
+        3,
+        "the whole event, all three legs: {page}"
+    );
     let currencies: Vec<_> = rows[0]["legs"]
         .as_array()
         .expect("legs")
         .iter()
-        .map(|leg| leg["currency"].as_str().expect("currency"))
+        .filter_map(|leg| leg["currency"].as_str())
         .collect();
-    assert_eq!(currencies, ["RUB", "USD"], "{page}");
+    assert_eq!(currencies, ["USD", "RUB"], "{page}");
 
     let (status, aggregate) = call(
         &harness.router,
@@ -31953,18 +32146,18 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
     assert!(
         groups.iter().any(|group| {
             group["currency"] == "RUB"
-                && group["cash"] == json!([{ "amount": "3.03", "currency": "RUB" }])
+                && group["cash"] == json!([{ "amount": "-3.03", "currency": "RUB" }])
                 && group["events"] == 1
         }),
-        "{aggregate}"
+        "the ruble commission leg groups on its own currency: {aggregate}"
     );
     assert!(
         groups.iter().any(|group| {
             group["currency"] == "USD"
-                && group["cash"] == json!([{ "amount": "4.04", "currency": "USD" }])
+                && group["cash"] == json!([{ "amount": "-4.04", "currency": "USD" }])
                 && group["events"] == 1
         }),
-        "{aggregate}"
+        "the dollar settlement leg groups on its own currency: {aggregate}"
     );
 
     drop(harness);

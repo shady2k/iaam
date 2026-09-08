@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
-use iaam_app::ports::{AccountView, Clock, OutboundHttp, OutboundResponse, Principal, Scope};
+use iaam_app::ports::{
+    AccountView, Clock, InstrumentUpsert, OutboundHttp, OutboundResponse, Principal, Scope,
+};
 use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_app::scenarios::schedule::{SOURCE_ID, ScheduleSyncRequest, sync_schedule};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::provenance::ParserVersion;
-use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
@@ -23,7 +25,7 @@ use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
 use iaam_store::market_source_codes::SourceCodeEntry;
-use iaam_store::reference::InstrumentRecord;
+use iaam_store::reference::{CustodyRecord, InstrumentRecord};
 use time::Duration;
 use time::macros::date;
 use uuid::Uuid;
@@ -115,11 +117,26 @@ fn fixture_services() -> (
     OwnerId,
     AccountId,
     InstrumentId,
+    CustodyId,
     ContourDefinition,
 ) {
-    let adapter = Arc::new(SqliteAdapter::new(
-        SqliteStore::open_in_memory().expect("application database"),
-    ));
+    let owner = OwnerId::new_random();
+    let custody = CustodyId::new_random();
+    // The custody place a leg names has no port-level way to be created
+    // (`SqliteAdapter` exposes no `upsert_custody_place`; only reads reach
+    // through `Store`), so it is registered directly on the raw store before
+    // the store is handed to the adapter — the same thing
+    // `iaam-store`'s own write-path fixtures do with `upsert_custody_place`.
+    let store = SqliteStore::open_in_memory().expect("application database");
+    store
+        .upsert_custody_place(&CustodyRecord {
+            id: custody,
+            owner,
+            title: "Main Custody".to_owned(),
+            institution: None,
+        })
+        .expect("custody place created");
+    let adapter = Arc::new(SqliteAdapter::new(store));
     let services = AppServices::new(
         adapter.clone(),
         adapter.clone(),
@@ -127,11 +144,10 @@ fn fixture_services() -> (
         adapter,
         Arc::new(FixedClock(date!(2026 - 08 - 26))),
     );
-    let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
-    (services, owner, account, instrument, contour)
+    (services, owner, account, instrument, custody, contour)
 }
 
 async fn seed_report_position(
@@ -139,6 +155,7 @@ async fn seed_report_position(
     owner: OwnerId,
     account: AccountId,
     instrument: InstrumentId,
+    custody: CustodyId,
     contour: &ContourDefinition,
 ) {
     services
@@ -158,11 +175,23 @@ async fn seed_report_position(
         .insert_contour_version(owner, contour.clone(), "bond".to_owned(), vec![account])
         .await
         .expect("scope");
+    services
+        .directory
+        .record_instrument(InstrumentUpsert {
+            id: instrument,
+            kind: Some(InstrumentKind::Bond),
+            symbol: "SU46020RMFS2".to_owned(),
+            title: "OFZ 46020".to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .await
+        .expect("instrument");
     let operation = SubmittedOperation {
         account,
         kind: OperationKind::OpeningPosition {
             instrument,
-            custody: iaam_core::ids::CustodyId::new_random(),
+            custody,
             quantity: Dec::one(),
             cost_basis_minor: None,
             currency: CurrencyCode::Rub,
@@ -332,8 +361,8 @@ async fn a_second_sync_of_an_unchanged_schedule_changes_nothing() {
 
 #[tokio::test]
 async fn resyncing_changes_no_bond_attribute_at_a_fixed_coordinate() {
-    let (services, owner, account, instrument, contour) = fixture_services();
-    seed_report_position(&services, owner, account, instrument, &contour).await;
+    let (services, owner, account, instrument, custody, contour) = fixture_services();
+    seed_report_position(&services, owner, account, instrument, custody, &contour).await;
     seed_market_price(&services, instrument).await;
 
     sync_fixture_schedule(&services, instrument).await;

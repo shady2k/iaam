@@ -11,6 +11,7 @@ use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
+use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -20,6 +21,7 @@ use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
+use iaam_store::reference::{AccountRecord, CustodyRecord, InstrumentRecord};
 use time::Date;
 use time::macros::date;
 use uuid::Uuid;
@@ -71,9 +73,23 @@ fn principal(owner: OwnerId) -> Principal {
 }
 
 fn services(accesses: Vec<BrokerAccessView>) -> AppServices {
-    let adapter = Arc::new(SqliteAdapter::new(
+    services_with_store(
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}")),
-    ));
+        accesses,
+    )
+}
+
+/// Builds the services around a store the caller has already seeded.
+///
+/// The write path now checks that every account and custody place a leg
+/// names belongs to the event's owner, and that every instrument a leg
+/// names exists — real foreign keys, where the old JSON-payload journal had
+/// none. The app-level `Store` port has no write method for a custody place
+/// or an instrument (only reads reach through `Store`/`InstrumentDirectory`),
+/// so seeding has to happen on the raw `SqliteStore`, before it is wrapped —
+/// the wrapped adapter gives no way back to it.
+fn services_with_store(store: SqliteStore, accesses: Vec<BrokerAccessView>) -> AppServices {
+    let adapter = Arc::new(SqliteAdapter::new(store));
     AppServices::new(
         adapter.clone(),
         adapter.clone(),
@@ -81,6 +97,41 @@ fn services(accesses: Vec<BrokerAccessView>) -> AppServices {
         adapter.clone(),
         Arc::new(FixedClock),
     )
+}
+
+fn register_account(store: &SqliteStore, owner: OwnerId, account: AccountId) {
+    store
+        .upsert_account(&AccountRecord {
+            id: account,
+            owner,
+            title: "Main".into(),
+            institution: Some("Savings".into()),
+        })
+        .unwrap_or_else(|error| panic!("insert account: {error}"));
+}
+
+fn register_custody(store: &SqliteStore, owner: OwnerId, custody: CustodyId) {
+    store
+        .upsert_custody_place(&CustodyRecord {
+            id: custody,
+            owner,
+            title: "Main".into(),
+            institution: None,
+        })
+        .unwrap_or_else(|error| panic!("insert custody place: {error}"));
+}
+
+fn register_instrument(store: &SqliteStore, instrument: InstrumentId) {
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: "SHOP1".into(),
+            title: "Shop One".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .unwrap_or_else(|error| panic!("insert instrument: {error}"));
 }
 
 fn live_access() -> BrokerAccessView {
@@ -227,10 +278,17 @@ fn position_assertion(claim: PositionClaim<'_>) -> Event {
 
 #[tokio::test]
 async fn repair_then_reimport_reconciles_without_doubling_the_position() {
-    let services = services(vec![live_access()]);
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
+    let real_custody = CustodyId::new_random();
+    let store =
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
+    register_account(&store, owner, account);
+    register_custody(&store, owner, CustodyId(account.inner()));
+    register_custody(&store, owner, real_custody);
+    register_instrument(&store, instrument);
+    let services = services_with_store(store, vec![live_access()]);
     let original = affected_trade(owner, account, instrument);
     append(&services, vec![original.clone()]).await;
 
@@ -239,7 +297,6 @@ async fn repair_then_reimport_reconciles_without_doubling_the_position() {
         .unwrap_or_else(|error| panic!("repair: {error}"));
     assert_eq!(repaired.written, 1);
 
-    let real_custody = CustodyId::new_random();
     let corrected = corrected_trade(&original, real_custody);
     iaam_app::scenarios::ingest::append_checked(&services, vec![corrected], IdentityScope::Source)
         .await
@@ -299,11 +356,19 @@ async fn repair_then_reimport_reconciles_without_doubling_the_position() {
 
 #[tokio::test]
 async fn repair_writes_reversals_with_fresh_provenance_and_is_idempotent() {
-    let services = services(vec![live_access()]);
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
-    let first = affected_trade(owner, account, InstrumentId::new_random());
-    let second = affected_trade(owner, account, InstrumentId::new_random());
+    let store =
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
+    register_account(&store, owner, account);
+    register_custody(&store, owner, CustodyId(account.inner()));
+    let first_instrument = InstrumentId::new_random();
+    let second_instrument = InstrumentId::new_random();
+    register_instrument(&store, first_instrument);
+    register_instrument(&store, second_instrument);
+    let services = services_with_store(store, vec![live_access()]);
+    let first = affected_trade(owner, account, first_instrument);
+    let second = affected_trade(owner, account, second_instrument);
     append(&services, vec![first.clone(), second.clone()]).await;
 
     let outcome = repair_custody(&services, &principal(owner), account, false)
@@ -357,11 +422,17 @@ async fn repair_writes_reversals_with_fresh_provenance_and_is_idempotent() {
 
 #[tokio::test]
 async fn unaffected_account_writes_nothing() {
-    let services = services(Vec::new());
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
-    let mut event = affected_trade(owner, account, InstrumentId::new_random());
     let real_custody = CustodyId::new_random();
+    let store =
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
+    register_account(&store, owner, account);
+    register_custody(&store, owner, real_custody);
+    let instrument = InstrumentId::new_random();
+    register_instrument(&store, instrument);
+    let services = services_with_store(store, Vec::new());
+    let mut event = affected_trade(owner, account, instrument);
     for leg in &mut event.legs {
         if leg.quantity.is_some() {
             leg.custody = Some(real_custody);
@@ -380,14 +451,16 @@ async fn unaffected_account_writes_nothing() {
 
 #[tokio::test]
 async fn no_live_access_requires_acknowledgement_before_writing() {
-    let services = services(vec![revoked_access()]);
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
-    append(
-        &services,
-        vec![affected_trade(owner, account, InstrumentId::new_random())],
-    )
-    .await;
+    let store =
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
+    register_account(&store, owner, account);
+    register_custody(&store, owner, CustodyId(account.inner()));
+    let instrument = InstrumentId::new_random();
+    register_instrument(&store, instrument);
+    let services = services_with_store(store, vec![revoked_access()]);
+    append(&services, vec![affected_trade(owner, account, instrument)]).await;
 
     let refused = repair_custody(&services, &principal(owner), account, false)
         .await

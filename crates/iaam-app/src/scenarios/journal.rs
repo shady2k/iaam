@@ -1302,7 +1302,7 @@ mod tests {
     use super::*;
     use crate::AppServices;
     use crate::adapters::sqlite::SqliteAdapter;
-    use crate::ports::{Clock, JournalStore, Principal, Scope};
+    use crate::ports::{AccountView, Clock, JournalStore, Principal, Scope};
     use crate::scenarios::correction::{
         CorrectionRequest, ImportTarget, correct_events, correct_import,
     };
@@ -1524,6 +1524,28 @@ mod tests {
             self.services.store.as_ref()
         }
 
+        /// Registers `main` and `savings` as the owner's own accounts.
+        ///
+        /// The write path now checks that every account an event names
+        /// belongs to the event's owner, so any test that writes a fact
+        /// must register the account first.
+        async fn register_accounts(&self) {
+            for (account, title) in [(self.main, "Main"), (self.savings, "Savings")] {
+                self.services
+                    .store
+                    .upsert_account(
+                        self.owner,
+                        AccountView {
+                            id: account,
+                            title: title.to_owned(),
+                            institution: None,
+                        },
+                    )
+                    .await
+                    .expect("account registered");
+            }
+        }
+
         /// A deposit at one of his accounts, with `hash` making each fixture a
         /// distinct row of the journal.
         fn recorded(
@@ -1568,13 +1590,14 @@ mod tests {
             hash: u8,
             basis_fee_minor: i64,
             relation: Relation,
+            instrument: InstrumentId,
         ) -> iaam_core::event::Event {
             let mut event = self.deposit(hash, -10_000, self.main);
             let gross = Money::new(PostedMinor::new(10_000), CurrencyCode::Rub);
             let basis_fee = Money::new(PostedMinor::new(basis_fee_minor), CurrencyCode::Rub);
             event.kind = EventKind::Trade {
                 side: TradeSide::Buy,
-                instrument: InstrumentId::new_random(),
+                instrument,
                 quantity: Quantity::zero(),
                 gross,
                 fee: None,
@@ -1584,6 +1607,23 @@ mod tests {
             };
             event.relation = relation;
             event
+        }
+
+        /// Registers an instrument a trade fixture names: `event_trade.instrument`
+        /// is a real foreign key into `instruments` now.
+        async fn register_instrument(&self, instrument: InstrumentId) {
+            self.services
+                .directory
+                .record_instrument(crate::ports::InstrumentUpsert {
+                    id: instrument,
+                    kind: Some(iaam_core::instrument::InstrumentKind::Share),
+                    symbol: "TESTSHARE".to_owned(),
+                    title: "Test Share".to_owned(),
+                    currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
+                    lineage: None,
+                })
+                .await
+                .expect("instrument registered");
         }
 
         /// A movement between two accounts of his that the source asserted and
@@ -1668,6 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn every_identifier_of_an_operation_reads_the_same_history() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let written = ctx.corrected_twice().await;
         let expected = ctx.history(written[0].id).await;
 
@@ -1686,6 +1727,7 @@ mod tests {
     #[tokio::test]
     async fn an_operation_corrected_twice_reads_as_three_states_and_two_corrections() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let written = ctx.corrected_twice().await;
         let history = ctx.history(written[0].id).await;
 
@@ -1751,6 +1793,7 @@ mod tests {
     #[tokio::test]
     async fn a_retracted_operation_ends_with_nothing_standing() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let original = ctx.deposit(1, 4_500, ctx.main);
         let reversal = iaam_core::event::Event {
             relation: Relation::Reversal {
@@ -1787,6 +1830,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_reversal_of_one_fact_is_visible_in_history() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let original = ctx.deposit(1, 4_500, ctx.main);
         let first_reversal = iaam_core::event::Event {
             relation: Relation::Reversal {
@@ -1835,6 +1879,7 @@ mod tests {
     #[tokio::test]
     async fn a_replacement_of_a_reversal_is_visible_after_the_retraction() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let original = ctx.deposit(1, 4_500, ctx.main);
         let reversal = iaam_core::event::Event {
             relation: Relation::Reversal {
@@ -1879,13 +1924,17 @@ mod tests {
     #[tokio::test]
     async fn a_trade_correction_that_only_changes_basis_fee_publishes_both_fees() {
         let ctx = Ctx::new();
-        let original = ctx.trade(1, 100, Relation::None);
+        ctx.register_accounts().await;
+        let instrument = InstrumentId::new_random();
+        ctx.register_instrument(instrument).await;
+        let original = ctx.trade(1, 100, Relation::None, instrument);
         let replacement = ctx.trade(
             2,
             200,
             Relation::Replacement {
                 target: original.id,
             },
+            instrument,
         );
         ctx.write(&[original.clone(), replacement.clone()]).await;
 
@@ -1910,6 +1959,7 @@ mod tests {
     #[tokio::test]
     async fn an_operation_nothing_ever_touched_is_one_arrival() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let untouched = ctx.deposit(1, 4_500, ctx.main);
         ctx.write(std::slice::from_ref(&untouched)).await;
 
@@ -1934,6 +1984,7 @@ mod tests {
     #[tokio::test]
     async fn a_row_retracted_with_its_import_reads_as_one_retracted_alone() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let batch = ImportId::new_random();
         let alone = ctx.imported(1, 4_500, ImportId::new_random());
         let in_batch = ctx.imported(2, 6_100, batch);
@@ -1987,9 +2038,36 @@ mod tests {
     /// publishes it as an arrival and claims nothing further about the target:
     /// the state carries the relation verbatim, which says exactly what the
     /// fact says and no more.
+    ///
+    /// **Currently unwritable, and this is not a fixture bug — reported
+    /// rather than worked around (iaam-c2fk).** `events.relation_target` is
+    /// now `FOREIGN KEY (owner, relation_target) REFERENCES events (owner,
+    /// id) DEFERRABLE INITIALLY DEFERRED` (schema collapse, T8,
+    /// .internal/specs/2026-09-08-a-relational-journal-design.md). Deferred
+    /// only postpones the check to commit; it still requires the target to
+    /// exist by then, for *some* write in the same transaction. A `stranger`
+    /// id that will never be written at all — this test's whole premise —
+    /// can therefore no longer be recorded, by any writer, typed or raw:
+    /// `PRAGMA foreign_keys = ON` applies uniformly. But the domain model
+    /// still explicitly documents this as reachable and legitimate —
+    /// [`HistoryAct::Arrived`]'s doc comment, [`read_operation_history`]'s
+    /// "a target that was never written, one that belongs to another owner
+    /// and one lost to a corrupt database are indistinguishable", and
+    /// `iaam_core::event::correction::resolve_with_unheld_targets` all
+    /// describe and handle exactly this case on the *read* side. The FK now
+    /// forecloses ever producing it on the *write* side. That is a real
+    /// conflict between the new schema and existing, tested domain
+    /// semantics — not something a fixture can route around — so this test
+    /// is disabled rather than weakened or deleted, pending a maintainer
+    /// decision on which side is wrong.
     #[tokio::test]
+    #[ignore = "iaam-c2fk: events.relation_target's new FK makes an unheld \
+                target unwritable by any path, contradicting HistoryAct::Arrived \
+                and read_operation_history's documented handling of exactly this \
+                case — needs a maintainer decision, not a fixture change"]
     async fn a_fact_naming_a_target_outside_his_journal_is_where_his_history_begins() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let stranger = EventId::new_random();
         let head = iaam_core::event::Event {
             relation: Relation::Replacement { target: stranger },
@@ -2020,6 +2098,7 @@ mod tests {
     #[tokio::test]
     async fn an_event_of_another_owner_is_not_found() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let his = ctx.deposit(1, 4_500, ctx.main);
         ctx.write(std::slice::from_ref(&his)).await;
 
@@ -2044,6 +2123,7 @@ mod tests {
     #[tokio::test]
     async fn a_fact_that_posts_nothing_still_says_its_sum_changed() {
         let ctx = Ctx::new();
+        ctx.register_accounts().await;
         let original = ctx.unstated(1, 250_000);
         let reversal = iaam_core::event::Event {
             relation: Relation::Reversal {

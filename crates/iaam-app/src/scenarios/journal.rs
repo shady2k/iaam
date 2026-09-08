@@ -30,8 +30,11 @@ use iaam_core::ids::{
     OwnerId, SourceId,
 };
 use iaam_core::money::{CalcMoney, Money, PerUnitAmount, Quantity};
+pub use iaam_core::report::journal::{
+    JournalAggregate, JournalAggregateGroup, JournalAggregateGroupBy,
+};
+use iaam_core::report::journal::{self as journal_aggregate, JournalAggregateError};
 use iaam_core::valuation::PriceQuality;
-use std::collections::{BTreeMap, BTreeSet};
 use time::{Date, Time};
 
 use crate::error::AppError;
@@ -119,16 +122,6 @@ pub struct JournalPage {
     /// beginning", which would loop forever.
     pub next: Option<String>,
 }
-
-/// The closed grouping vocabulary for journal movement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum JournalAggregateGroupBy {
-    Account,
-    Currency,
-    Kind,
-    Month,
-}
-
 /// A journal movement query without row-pagination controls.
 #[derive(Debug, Clone, Default)]
 pub struct JournalAggregateQuery {
@@ -144,25 +137,6 @@ pub struct JournalAggregateQuery {
     pub group_by: Vec<JournalAggregateGroupBy>,
 }
 
-/// The complete answer to a journal movement query.
-#[derive(Debug, Clone, PartialEq)]
-pub struct JournalAggregate {
-    pub groups: Vec<JournalAggregateGroup>,
-}
-
-/// One aggregate group. Account and currency grouping keys describe the legs
-/// that contributed to the group, never the event's filing account.
-#[derive(Debug, Clone, PartialEq)]
-pub struct JournalAggregateGroup {
-    pub account: Option<AccountId>,
-    pub currency: Option<iaam_core::money::CurrencyCode>,
-    pub kind: Option<String>,
-    pub month: Option<String>,
-    pub events: u64,
-    pub cash: Vec<Money>,
-    pub first_effective_date: Option<Date>,
-    pub last_effective_date: Option<Date>,
-}
 
 /// One recorded event, as much of it as answers who, when, what and where from.
 ///
@@ -429,99 +403,22 @@ pub async fn aggregate_journal(
         )
         .await?;
     let resolution = resolve_with_supersession(&all_events).map_err(AppError::Correction)?;
-    let has_leg_dimension = query.group_by.iter().any(|dimension| {
-        matches!(
-            dimension,
-            JournalAggregateGroupBy::Account | JournalAggregateGroupBy::Currency
-        )
-    });
-    let has_kind = query.group_by.contains(&JournalAggregateGroupBy::Kind);
-    let has_month = query.group_by.contains(&JournalAggregateGroupBy::Month);
-    let mut groups = BTreeMap::<AggregateKey, AggregateGroupBuilder>::new();
-
-    for event in events.iter().filter(|event| {
+    let selected_events = events.iter().filter(|event| {
         query
             .stands
             .is_none_or(|stands| resolution.stands(event.id) == stands)
-    }) {
-        let legs: Vec<_> = event
-            .legs
-            .iter()
-            .filter_map(|leg| leg.cash_effect().map(|money| (leg, money)))
-            .collect();
-        let keys: BTreeSet<_> = if has_leg_dimension {
-            legs.iter()
-                .map(|(leg, money)| AggregateKey {
-                    account: query
-                        .group_by
-                        .contains(&JournalAggregateGroupBy::Account)
-                        .then_some(leg.account),
-                    currency: query
-                        .group_by
-                        .contains(&JournalAggregateGroupBy::Currency)
-                        .then_some(money.currency()),
-                    kind: has_kind.then(|| event.kind.discriminant().to_owned()),
-                    month: has_month.then(|| month_key(event.order.date())),
-                })
-                .collect()
-        } else {
-            [AggregateKey {
-                account: None,
-                currency: None,
-                kind: has_kind.then(|| event.kind.discriminant().to_owned()),
-                month: has_month.then(|| month_key(event.order.date())),
-            }]
-            .into_iter()
-            .collect()
-        };
-
-        for key in keys {
-            let group = groups.entry(key.clone()).or_default();
-            group.events += 1;
-            group.first_effective_date = Some(
-                group
-                    .first_effective_date
-                    .map_or(event.order.date(), |date| date.min(event.order.date())),
-            );
-            group.last_effective_date = Some(
-                group
-                    .last_effective_date
-                    .map_or(event.order.date(), |date| date.max(event.order.date())),
-            );
-            for (leg, money) in &legs {
-                if !has_leg_dimension
-                    || (key.account.is_none_or(|account| account == leg.account)
-                        && key
-                            .currency
-                            .is_none_or(|currency| currency == money.currency()))
-                {
-                    let total = group
-                        .cash
-                        .entry(money.currency())
-                        .or_insert_with(|| Money::zero(money.currency()));
-                    *total = total.try_add(*money).map_err(AppError::BatchTotal)?;
-                }
-            }
-        }
-    }
-
-    if query.group_by.is_empty() && groups.is_empty() {
-        groups.insert(
-            AggregateKey {
-                account: None,
-                currency: None,
-                kind: None,
-                month: None,
-            },
-            AggregateGroupBuilder::default(),
-        );
-    }
-    let group_count = groups.len();
-    if group_count > MAX_AGGREGATE_GROUPS {
-        return Err(AppError::Invalid {
+    });
+    journal_aggregate::aggregate_journal(
+        selected_events,
+        &query.group_by,
+        MAX_AGGREGATE_GROUPS,
+    )
+    .map_err(|error| match error {
+        JournalAggregateError::Money(error) => AppError::BatchTotal(error),
+        JournalAggregateError::GroupCeiling { ceiling, actual } => AppError::Invalid {
             field: "group_by".to_owned(),
             expected: format!(
-                "at most {MAX_AGGREGATE_GROUPS} groups; request would produce {group_count}; \
+                "at most {ceiling} groups; request would produce {actual}; \
                  narrow filters: account, touching, source_account, source_channel, \
                  source_label, import, import_session, settled_by_rule, from, to, stands"
             ),
@@ -531,45 +428,10 @@ pub async fn aggregate_journal(
                 .map(|dimension| format!("{dimension:?}"))
                 .collect::<Vec<_>>()
                 .join(","),
-        });
-    }
-
-    Ok(JournalAggregate {
-        groups: groups
-            .into_iter()
-            .map(|(key, group)| JournalAggregateGroup {
-                account: key.account,
-                currency: key.currency,
-                kind: key.kind,
-                month: key.month,
-                events: group.events,
-                cash: group.cash.into_values().collect(),
-                first_effective_date: group.first_effective_date,
-                last_effective_date: group.last_effective_date,
-            })
-            .collect(),
+        },
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct AggregateKey {
-    account: Option<AccountId>,
-    currency: Option<iaam_core::money::CurrencyCode>,
-    kind: Option<String>,
-    month: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct AggregateGroupBuilder {
-    events: u64,
-    cash: BTreeMap<iaam_core::money::CurrencyCode, Money>,
-    first_effective_date: Option<Date>,
-    last_effective_date: Option<Date>,
-}
-
-fn month_key(date: Date) -> String {
-    format!("{:04}-{:02}", date.year(), u8::from(date.month()))
-}
 
 /// List the exact source-category vocabulary in a journal scope.
 ///

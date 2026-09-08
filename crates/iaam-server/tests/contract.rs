@@ -18982,6 +18982,309 @@ async fn a_question_that_needs_an_account_offers_the_accounts_it_may_name() {
     );
 }
 
+#[tokio::test]
+async fn import_session_answers_route_publishes_its_batch_contract() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK, "{spec}");
+
+    let route = &spec["paths"]["/v1/import-sessions/{session}/answers"]["post"];
+    assert!(route.is_object(), "{spec}");
+    assert_eq!(
+        route["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/AnswerImportQuestionsBatchRequest",
+        "{route}"
+    );
+    let request = &spec["components"]["schemas"]["AnswerImportQuestionsBatchRequest"];
+    assert_eq!(
+        request["properties"]["answers"]["type"], "array",
+        "{request}"
+    );
+    assert_eq!(
+        request["properties"]["answers"]["items"]["$ref"],
+        "#/components/schemas/AnswerImportQuestionBatchItem",
+        "{request}"
+    );
+
+    let response = &route["responses"]["200"]["content"]["application/json"]["schema"];
+    assert_eq!(response["type"], "array", "{route}");
+    assert_eq!(
+        response["items"]["$ref"], "#/components/schemas/ImportAnswerVerdictDto",
+        "{route}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_answers_several_distinct_questions_in_request_order() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let (status, raised) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "batch-order" },
+                "operations": [
+                    unresolved_row(account, "batch-order-one"),
+                    unresolved_row_dated(account, "batch-order-two", "2025-03-19", "2600.00"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raised}");
+    let session = raised[0]["session_id"].as_str().expect("session");
+    let first = raised[0]["question_id"].as_str().expect("first question");
+    let second = raised[1]["question_id"].as_str().expect("second question");
+
+    let (status, outcomes) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/answers"),
+            &harness.agent_token,
+            &json!({
+                "answers": [
+                    { "question": first, "answer": "paid" },
+                    { "question": second, "answer": "received" },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{outcomes}");
+    assert_eq!(
+        outcomes.as_array().expect("outcomes").len(),
+        2,
+        "{outcomes}"
+    );
+    assert_eq!(outcomes[0]["row"], 1, "{outcomes}");
+    assert_eq!(outcomes[1]["row"], 2, "{outcomes}");
+    assert_eq!(
+        outcomes[0]["question"]["question"],
+        json!(first),
+        "{outcomes}"
+    );
+    assert_eq!(
+        outcomes[1]["question"]["question"],
+        json!(second),
+        "{outcomes}"
+    );
+    for field in ["session_id", "question_id", "alternatives"] {
+        assert!(
+            outcomes[0].get(field).is_none(),
+            "accepted outcome duplicated question.{field}: {outcomes}"
+        );
+    }
+    assert!(
+        outcomes[0]["question"]["answered_at"].is_string(),
+        "{outcomes}"
+    );
+    assert!(
+        outcomes[1]["question"]["answered_at"].is_string(),
+        "{outcomes}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_keeps_valid_and_refused_answers_as_independent_outcomes() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let (status, raised) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "batch-refusals" },
+                "operations": [
+                    unresolved_row(account, "batch-refusal-valid"),
+                    directed_row(account, "batch-refusal-word", "out"),
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raised}");
+    let session = raised[0]["session_id"].as_str().expect("session");
+    let valid_question = raised[0]["question_id"].as_str().expect("valid question");
+    let invalid_question = raised[1]["question_id"].as_str().expect("invalid question");
+    let missing_question = Uuid::new_v4();
+
+    let (status, unknown_body) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{missing_question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "paid" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{unknown_body}");
+
+    let (status, invalid_body) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/questions/{invalid_question}/answer"),
+            &harness.agent_token,
+            &json!({ "answer": "received" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid_body}");
+    assert!(
+        invalid_body["alternatives"]
+            .as_array()
+            .is_some_and(|alternatives| !alternatives.is_empty()),
+        "{invalid_body}"
+    );
+
+    let (status, outcomes) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/answers"),
+            &harness.agent_token,
+            &json!({
+                "answers": [
+                    { "question": valid_question, "answer": "paid" },
+                    { "question": missing_question, "answer": "paid" },
+                    { "question": invalid_question, "answer": "received" },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{outcomes}");
+    assert_eq!(
+        outcomes.as_array().expect("outcomes").len(),
+        3,
+        "{outcomes}"
+    );
+    assert_eq!(outcomes[0]["verdict"], "provisional", "{outcomes}");
+    assert!(
+        outcomes[0]["question"]["answered_at"].is_string(),
+        "{outcomes}"
+    );
+    for field in ["field", "expected", "actual"] {
+        assert!(
+            outcomes[2].get(field).is_none(),
+            "rejected outcome duplicated error.{field}: {outcomes}"
+        );
+    }
+    assert_eq!(outcomes[1]["error"], unknown_body, "{outcomes}");
+    assert_eq!(outcomes[2]["error"], invalid_body, "{outcomes}");
+}
+
+#[tokio::test]
+async fn a_closed_question_is_refused_and_later_batch_answers_still_run() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let mut distinct = unresolved_row(account, "batch-closed-distinct");
+    distinct["source_kind"] = json!("OUTER");
+    let (status, raised) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "batch-closed" },
+                "operations": [
+                    unresolved_row(account, "batch-closed-first"),
+                    unresolved_row_dated(account, "batch-closed-second", "2025-03-19", "2600.00"),
+                    distinct,
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raised}");
+    let session = raised[0]["session_id"].as_str().expect("session");
+    let first = raised[0]["question_id"].as_str().expect("first question");
+    let closed = raised[1]["question_id"].as_str().expect("closed question");
+    let later = raised[2]["question_id"].as_str().expect("later question");
+
+    let (status, outcomes) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/answers"),
+            &harness.agent_token,
+            &json!({
+                "answers": [
+                    {
+                        "question": first,
+                        "answer": "paid",
+                        "settles": "every_like_row_in_this_session",
+                    },
+                    { "question": closed, "answer": "paid" },
+                    { "question": later, "answer": "paid" },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{outcomes}");
+    assert_eq!(outcomes[0]["verdict"], "provisional", "{outcomes}");
+    assert_eq!(outcomes[1]["verdict"], "rejected", "{outcomes}");
+    assert!(
+        outcomes[1]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("an unanswered import question")),
+        "{outcomes}"
+    );
+    assert_eq!(outcomes[2]["verdict"], "provisional", "{outcomes}");
+    assert!(
+        outcomes[2]["question"]["answered_at"].is_string(),
+        "{outcomes}"
+    );
+}
+
+#[tokio::test]
+async fn a_principal_without_answer_permission_is_refused_before_batch_application() {
+    let harness = harness();
+    let account = harness.account.inner();
+    let (status, raised) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "batch-permission" },
+                "operations": [unresolved_row(account, "batch-permission-question")],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{raised}");
+    let session = raised[0]["session_id"].as_str().expect("session");
+    let question = raised[0]["question_id"].as_str().expect("question");
+
+    let (status, refusal) = call(
+        &harness.router,
+        post(
+            &format!("/v1/import-sessions/{session}/answers"),
+            &harness.readonly_token,
+            &json!({ "answers": [{ "question": question, "answer": "paid" }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+    assert_eq!(refusal["code"], "forbidden", "{refusal}");
+
+    let (status, contents) = call(
+        &harness.router,
+        get(
+            &format!("/v1/import-sessions/{session}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{contents}");
+    assert!(
+        contents["questions"][0]["answered_at"].is_null(),
+        "{contents}"
+    );
+}
+
 /// The question and the queue offer one list, because one function builds it.
 ///
 /// The queue's item for the same question publishes the candidates under

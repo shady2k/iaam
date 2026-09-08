@@ -198,11 +198,7 @@ fn month_key(date: Date) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{
-        kind::EventKind,
-        leg::Leg,
-        test_support::event_with,
-    };
+    use crate::event::{kind::EventKind, leg::Leg, test_support::event_with};
     use crate::ids::{AccountId, TransferId};
     use crate::money::{CurrencyCode, PostedMinor};
     use time::macros::date;
@@ -242,8 +238,8 @@ mod tests {
                 amount,
             },
             vec![
-                Leg::cash(filing_account, amount),
-                Leg::cash(receiving_account, money(-1_250, CurrencyCode::Rub)),
+                Leg::cash(filing_account, money(-1_250, CurrencyCode::Rub)),
+                Leg::cash(receiving_account, amount),
             ],
         );
 
@@ -258,7 +254,7 @@ mod tests {
                 .find(|group| group.account == Some(filing_account))
                 .unwrap()
                 .cash,
-            vec![amount]
+            vec![money(-1_250, CurrencyCode::Rub)]
         );
         assert_eq!(
             aggregate
@@ -267,7 +263,7 @@ mod tests {
                 .find(|group| group.account == Some(receiving_account))
                 .unwrap()
                 .cash,
-            vec![money(-1_250, CurrencyCode::Rub)]
+            vec![amount]
         );
     }
 
@@ -298,9 +294,8 @@ mod tests {
             money(450, CurrencyCode::Rub),
         );
 
-        let error =
-            aggregate_journal([&first, &second], &[JournalAggregateGroupBy::Account], 1)
-                .unwrap_err();
+        let error = aggregate_journal([&first, &second], &[JournalAggregateGroupBy::Account], 1)
+            .unwrap_err();
 
         assert_eq!(
             error,
@@ -313,12 +308,7 @@ mod tests {
 
     #[test]
     fn an_empty_ungrouped_selection_has_one_zero_event_group() {
-        let aggregate = aggregate_journal(
-            std::iter::empty::<&Event>(),
-            &[],
-            1,
-        )
-        .unwrap();
+        let aggregate = aggregate_journal(std::iter::empty::<&Event>(), &[], 1).unwrap();
 
         assert_eq!(
             aggregate.groups,

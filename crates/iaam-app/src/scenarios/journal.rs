@@ -30,10 +30,10 @@ use iaam_core::ids::{
     OwnerId, SourceId,
 };
 use iaam_core::money::{CalcMoney, Money, PerUnitAmount, Quantity};
+use iaam_core::report::journal::{self as journal_aggregate, JournalAggregateError};
 pub use iaam_core::report::journal::{
     JournalAggregate, JournalAggregateGroup, JournalAggregateGroupBy,
 };
-use iaam_core::report::journal::{self as journal_aggregate, JournalAggregateError};
 use iaam_core::valuation::PriceQuality;
 use time::{Date, Time};
 
@@ -136,7 +136,6 @@ pub struct JournalAggregateQuery {
     pub to: Option<Date>,
     pub group_by: Vec<JournalAggregateGroupBy>,
 }
-
 
 /// One recorded event, as much of it as answers who, when, what and where from.
 ///
@@ -408,30 +407,25 @@ pub async fn aggregate_journal(
             .stands
             .is_none_or(|stands| resolution.stands(event.id) == stands)
     });
-    journal_aggregate::aggregate_journal(
-        selected_events,
-        &query.group_by,
-        MAX_AGGREGATE_GROUPS,
-    )
-    .map_err(|error| match error {
-        JournalAggregateError::Money(error) => AppError::BatchTotal(error),
-        JournalAggregateError::GroupCeiling { ceiling, actual } => AppError::Invalid {
-            field: "group_by".to_owned(),
-            expected: format!(
-                "at most {ceiling} groups; request would produce {actual}; \
+    journal_aggregate::aggregate_journal(selected_events, &query.group_by, MAX_AGGREGATE_GROUPS)
+        .map_err(|error| match error {
+            JournalAggregateError::Money(error) => AppError::BatchTotal(error),
+            JournalAggregateError::GroupCeiling { ceiling, actual } => AppError::Invalid {
+                field: "group_by".to_owned(),
+                expected: format!(
+                    "at most {ceiling} groups; request would produce {actual}; \
                  narrow filters: account, touching, source_account, source_channel, \
                  source_label, import, import_session, settled_by_rule, from, to, stands"
-            ),
-            actual: query
-                .group_by
-                .iter()
-                .map(|dimension| format!("{dimension:?}"))
-                .collect::<Vec<_>>()
-                .join(","),
-        },
-    })
+                ),
+                actual: query
+                    .group_by
+                    .iter()
+                    .map(|dimension| format!("{dimension:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            },
+        })
 }
-
 
 /// List the exact source-category vocabulary in a journal scope.
 ///

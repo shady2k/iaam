@@ -459,7 +459,7 @@ fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
 fn a_bundle_round_trip_keeps_the_new_facts() {
     // An archive that has lost a new fact looks intact—and will be detected
     // only during restoration, when the original database is no longer available.
-    let (source, owner, account, _) = populated();
+    let (mut source, owner, account, _) = populated();
     let facts = every_new_fact(owner, account);
     for event in &facts {
         source.append_event(event, IdentityScope::Source).unwrap();

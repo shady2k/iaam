@@ -68,7 +68,7 @@ impl Ctx {
     }
 }
 
-fn write(store: &SqliteStore, event: &Event) {
+fn write(store: &mut SqliteStore, event: &Event) {
     store
         .append_event(event, IdentityScope::Source)
         .expect("the journal accepts the fact");
@@ -81,7 +81,7 @@ fn ids(chain: &[RecordedEvent]) -> Vec<EventId> {
 /// One correction is a reversal and a replacement of the same target, so a
 /// chain corrected twice holds five facts. Returns them in the order the walk
 /// must produce: the original, then each act's reversal before its replacement.
-fn corrected_twice(store: &SqliteStore, ctx: &Ctx) -> Vec<Event> {
+fn corrected_twice(store: &mut SqliteStore, ctx: &Ctx) -> Vec<Event> {
     let original = ctx.deposit(1);
     let first_reversal = ctx.reversal_of(&original, 2);
     let first_replacement = ctx.replacement_of(&original, 3);
@@ -114,9 +114,9 @@ fn corrected_twice(store: &SqliteStore, ctx: &Ctx) -> Vec<Event> {
 /// have decides which question he is allowed to ask.
 #[test]
 fn every_identifier_in_a_chain_returns_the_same_chain() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
-    let written = corrected_twice(&store, &ctx);
+    let written = corrected_twice(&mut store, &ctx);
     let expected: Vec<EventId> = written.iter().map(|event| event.id).collect();
 
     for entered in &written {
@@ -137,10 +137,10 @@ fn every_identifier_in_a_chain_returns_the_same_chain() {
 /// answering about an event that is not his.
 #[test]
 fn a_fact_nothing_ever_touched_is_a_chain_of_one() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
     let untouched = ctx.deposit(1);
-    write(&store, &untouched);
+    write(&mut store, &untouched);
 
     let chain = store
         .event_chain(ctx.owner, untouched.id)
@@ -157,9 +157,9 @@ fn a_fact_nothing_ever_touched_is_a_chain_of_one() {
 /// while the walk turned into a full scan of the journal.
 #[test]
 fn a_chain_costs_index_lookups_and_never_scans_the_journal() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
-    let written = corrected_twice(&store, &ctx);
+    let written = corrected_twice(&mut store, &ctx);
 
     let forward: String = store
         .connection()
@@ -214,15 +214,15 @@ fn a_chain_costs_index_lookups_and_never_scans_the_journal() {
 /// the whole of it, and he has no way to tell.
 #[test]
 fn a_chain_that_closes_on_itself_is_refused_rather_than_walked_forever() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
 
     let mut first = ctx.deposit(1);
     let mut second = ctx.deposit(2);
     first.relation = Relation::Replacement { target: second.id };
     second.relation = Relation::Replacement { target: first.id };
-    write(&store, &first);
-    write(&store, &second);
+    write(&mut store, &first);
+    write(&mut store, &second);
 
     let refusal = store
         .event_chain(ctx.owner, first.id)
@@ -241,10 +241,10 @@ fn a_chain_that_closes_on_itself_is_refused_rather_than_walked_forever() {
 /// an identifier of nothing at all.
 #[test]
 fn an_event_of_another_owner_is_not_found() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let mine = Ctx::new();
     let theirs = Ctx::new();
-    let written = corrected_twice(&store, &theirs);
+    let written = corrected_twice(&mut store, &theirs);
 
     for entered in &written {
         let chain = store

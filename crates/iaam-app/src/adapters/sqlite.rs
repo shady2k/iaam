@@ -2165,35 +2165,6 @@ impl MintedToken {
     }
 }
 
-/// Runs `work` inside one `BEGIN IMMEDIATE` write transaction.
-///
-/// `IMMEDIATE`, not the default deferred begin: a deferred transaction takes
-/// its write lock at the first write, which is after the read that decided to
-/// write, and that gap is the race. `rusqlite::Transaction` is not used because
-/// it borrows the connection, and `work` needs the store itself.
-fn in_immediate_transaction<T>(
-    store: &mut SqliteStore,
-    work: impl FnOnce(&mut SqliteStore) -> Result<T, AppError>,
-) -> Result<T, AppError> {
-    store
-        .connection_mut()
-        .execute_batch("BEGIN IMMEDIATE")
-        .map_err(sqlite_error)?;
-    match work(store) {
-        Ok(value) => match store.connection_mut().execute_batch("COMMIT") {
-            Ok(()) => Ok(value),
-            Err(error) => {
-                let _ = store.connection_mut().execute_batch("ROLLBACK");
-                Err(sqlite_error(error))
-            }
-        },
-        Err(error) => {
-            let _ = store.connection_mut().execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
-}
-
 /// The driver's own error, reported as a store failure. Generic over `Into`
 /// so that the driver type is not named here: `iaam-app` depends on
 /// `iaam-store`, not on `rusqlite`.
@@ -2233,10 +2204,9 @@ impl TokenAdmin for SqliteAdapter {
             // The loser of the race must wait for the winner's transaction
             // rather than fail at once as «database is locked».
             store
-                .connection_mut()
-                .busy_timeout(std::time::Duration::from_secs(5))
+                .set_busy_timeout(std::time::Duration::from_secs(5))
                 .map_err(sqlite_error)?;
-            in_immediate_transaction(store, |store| {
+            store.with_immediate_transaction(sqlite_error, |store| {
                 if !matches!(
                     store.sole_token_owner().map_err(store_error)?,
                     StoredSoleOwner::None

@@ -30,6 +30,10 @@ use iaam_core::ids::{
     OwnerId, SourceId,
 };
 use iaam_core::money::{CalcMoney, Money, PerUnitAmount, Quantity};
+use iaam_core::report::journal::{self as journal_aggregate, JournalAggregateError};
+pub use iaam_core::report::journal::{
+    JournalAggregate, JournalAggregateGroup, JournalAggregateGroupBy,
+};
 use iaam_core::valuation::PriceQuality;
 use time::{Date, Time};
 
@@ -117,6 +121,20 @@ pub struct JournalPage {
     /// one; an empty string would be indistinguishable from "resume at the
     /// beginning", which would loop forever.
     pub next: Option<String>,
+}
+/// A journal movement query without row-pagination controls.
+#[derive(Debug, Clone, Default)]
+pub struct JournalAggregateQuery {
+    pub account: Option<AccountId>,
+    pub touching: Option<AccountId>,
+    pub source: Option<DeclaredSource>,
+    pub import: Option<ImportId>,
+    pub import_session: Option<ImportSessionId>,
+    pub settled_by_rule: Option<ClassificationRuleId>,
+    pub stands: Option<bool>,
+    pub from: Option<Date>,
+    pub to: Option<Date>,
+    pub group_by: Vec<JournalAggregateGroupBy>,
 }
 
 /// One recorded event, as much of it as answers who, when, what and where from.
@@ -321,6 +339,92 @@ pub async fn read_journal(
         .collect();
     let next = has_more.then_some(next).flatten();
     Ok(JournalPage { rows, next })
+}
+
+/// Maximum number of groups returned by one aggregate request.
+///
+/// Aggregates are deliberately not paginated: a partial set of groups is
+/// indistinguishable from a complete answer. Requests over this ceiling are
+/// refused instead, and the caller can narrow the event filters.
+pub const MAX_AGGREGATE_GROUPS: usize = 1_000;
+
+/// Compute movement over the filtered events, folding their cash-bearing legs.
+///
+/// The filters select events, but grouping by `account` and `currency` selects
+/// each leg's own account and currency. An event filed against one account can
+/// therefore contribute to another account's group; using the filing account
+/// here would not match the reports. `events` counts selected events in each
+/// group, while `cash` sums every cash-bearing leg (`Cash`, fee, tax and
+/// principal legs) without converting currencies.
+///
+/// This is movement over the selected window, not a balance. It does not read
+/// opening assertions; [`crate::scenarios::reports::account_balances`] is the
+/// report that turns movement plus an opening assertion into a balance.
+/// With no grouping, an empty selection still returns one all-None group with
+/// zero events, so the ungrouped answer has one stable shape.
+pub async fn aggregate_journal(
+    store: &dyn Store,
+    owner: OwnerId,
+    query: JournalAggregateQuery,
+) -> Result<JournalAggregate, AppError> {
+    let range = date_range(query.from, query.to)?;
+    let source = query
+        .source
+        .as_ref()
+        .map(|declared| declared_source(owner, declared))
+        .transpose()?;
+    let events = store
+        .list_journal_events(
+            owner,
+            JournalQuery {
+                event: None,
+                idempotency_key: None,
+                account: query.account,
+                touching: query.touching,
+                source,
+                import: query.import,
+                import_session: query.import_session,
+                settled_by_rule: query.settled_by_rule,
+                from: range.0,
+                to: range.1,
+                after: None,
+                limit: u32::MAX,
+            },
+        )
+        .await?;
+    let all_events = store
+        .list_journal_events(
+            owner,
+            JournalQuery {
+                limit: u32::MAX,
+                ..JournalQuery::default()
+            },
+        )
+        .await?;
+    let resolution = resolve_with_supersession(&all_events).map_err(AppError::Correction)?;
+    let selected_events = events.iter().filter(|event| {
+        query
+            .stands
+            .is_none_or(|stands| resolution.stands(event.id) == stands)
+    });
+    journal_aggregate::aggregate_journal(selected_events, &query.group_by, MAX_AGGREGATE_GROUPS)
+        .map_err(|error| match error {
+            JournalAggregateError::Money(error) => AppError::BatchTotal(error),
+            JournalAggregateError::GroupCeiling { ceiling, actual } => AppError::Invalid {
+                field: "group_by".to_owned(),
+                expected: format!(
+                    "at most {ceiling} groups; request would produce {actual}; \
+                 narrow filters: account, touching, source_account, source_channel, \
+                 source_label, import, import_session, settled_by_rule, from, to, stands"
+                ),
+                actual: query
+                    .group_by
+                    .iter()
+                    .map(|dimension| format!("{dimension:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            },
+        })
 }
 
 /// List the exact source-category vocabulary in a journal scope.

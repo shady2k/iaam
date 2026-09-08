@@ -9363,6 +9363,66 @@ pub struct JournalPageDto {
     pub next: Option<String>,
 }
 
+/// Movement aggregates over the owner's journal.
+///
+/// This is not a balance: the groups fold movement in the selected window and
+/// do not read opening assertions. The balances report is the answer that
+/// combines movement with an opening assertion.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct JournalAggregateDto {
+    pub groups: Vec<JournalAggregateGroupDto>,
+}
+
+/// One journal movement aggregate.
+///
+/// `account` and `currency` are the leg grouping keys. They are not copied from
+/// the event's filing account, because one event can post cash to another
+/// account and one event can carry more than one currency.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct JournalAggregateGroupDto {
+    pub account: Option<Uuid>,
+    pub currency: Option<CurrencyDto>,
+    pub kind: Option<String>,
+    /// Calendar month in `YYYY-MM` form when `group_by=month`.
+    pub month: Option<String>,
+    pub events: u64,
+    /// Cash-bearing legs, one sum per currency. Currencies are never converted.
+    pub cash: Vec<AmountDto>,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub first_effective_date: Option<Date>,
+    #[serde(with = "iso_date::option")]
+    #[schema(value_type = Option<String>, format = Date)]
+    pub last_effective_date: Option<Date>,
+}
+
+impl JournalAggregateDto {
+    #[must_use]
+    pub fn from_domain(value: &iaam_app::scenarios::journal::JournalAggregate) -> Self {
+        Self {
+            groups: value
+                .groups
+                .iter()
+                .map(|group| JournalAggregateGroupDto {
+                    account: group.account.map(|account| account.inner()),
+                    currency: group.currency.map(CurrencyDto::from_domain),
+                    kind: group.kind.clone(),
+                    month: group.month.clone(),
+                    events: group.events,
+                    cash: group
+                        .cash
+                        .iter()
+                        .copied()
+                        .map(AmountDto::from_money)
+                        .collect(),
+                    first_effective_date: group.first_effective_date,
+                    last_effective_date: group.last_effective_date,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Why a journal event no longer belongs to the effective set.
 ///
 /// Reversal and replacement remain separate states: a reversal has no

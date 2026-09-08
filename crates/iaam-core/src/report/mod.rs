@@ -15,4 +15,5 @@
 pub mod assets;
 pub mod balances;
 pub mod confidence;
+pub mod journal;
 pub mod population;

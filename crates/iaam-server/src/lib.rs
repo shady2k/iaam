@@ -131,6 +131,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::ingest_journal_events))
         .routes(routes!(routes::ingest_csv))
         .routes(routes!(routes::list_journal_events))
+        .routes(routes!(routes::aggregate_journal_route))
         .routes(routes!(routes::list_journal_source_categories_route))
         .routes(routes!(routes::list_decisions))
         .routes(routes!(routes::read_journal_event_history))

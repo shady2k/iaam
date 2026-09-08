@@ -18,12 +18,20 @@
 //! the event back, inside the same transaction, and compares it to what it
 //! was given; unequal or missing is [`StoreError::IncompleteWrite`], which
 //! rolls the whole write back just as a genuine SQL error would.
+//!
+//! Once the read-back confirms the write is whole, [`insert_event_in`] also
+//! gives the event its `event_category_assignments` row through
+//! [`category_index::assign_for`] (spec §4.7), inside the same transaction:
+//! every writer reaches the journal only through this primitive, so this is
+//! the one place that can guarantee no appended event is ever missing from
+//! the projection.
 
 use rusqlite::{Transaction, params};
 
 use iaam_core::event::Event;
 use iaam_core::ids::OwnerId;
 
+use super::category_index;
 use super::kind::to_rows;
 use super::read::hydrate_one;
 use super::rows::{
@@ -59,14 +67,22 @@ pub(crate) fn insert_event_in(tx: &Transaction<'_>, event: &Event) -> Result<(),
     insert_detail(tx, &detail)?;
 
     match hydrate_one(tx, event.id) {
-        Ok(Some(reconstructed)) if &reconstructed == event => Ok(()),
+        Ok(Some(reconstructed)) if &reconstructed == event => {}
         // Missing, mismatched, or not even decodable — all three are the
         // write coming back incomplete, and the caller does not need to
         // distinguish them: the transaction rolls back either way (spec §D6).
-        Ok(Some(_) | None) | Err(_) => Err(StoreError::IncompleteWrite {
-            event: event.id.inner().to_string(),
-        }),
+        Ok(Some(_) | None) | Err(_) => {
+            return Err(StoreError::IncompleteWrite {
+                event: event.id.inner().to_string(),
+            });
+        }
     }
+
+    // The category-assignment projection (spec §4.7) is kept current for
+    // every writer through this one primitive, rather than each caller
+    // remembering to call it: the ordinary append path and the bundle
+    // importer both reach the journal only through here.
+    category_index::assign_for(tx, event.owner, std::slice::from_ref(event))
 }
 
 /// Checks that every account and custody place a leg names belongs to the

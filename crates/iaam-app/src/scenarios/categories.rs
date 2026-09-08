@@ -153,10 +153,19 @@ pub async fn create_category_rule(
         valid_from: input.interval.from,
         valid_to: input.interval.to,
     };
-    services
+    let created = services
         .categories
         .create_category_rule(principal.owner, rule, input.replaces)
-        .await
+        .await?;
+    // A create or an edit (a replacement carries `replaces`) can change what
+    // any past event in the journal decomposes to, not only a future one, so
+    // the projection is rebuilt from here rather than left to go stale
+    // (spec §4.7).
+    services
+        .categories
+        .rebuild_category_index(principal.owner)
+        .await?;
+    Ok(created)
 }
 
 pub async fn list_category_rules(
@@ -306,7 +315,15 @@ pub async fn retire_category_rule(
     services
         .categories
         .retire_category_rule(principal.owner, rule)
-        .await
+        .await?;
+    // A retired rule can leave events it used to decompose with no rule left
+    // that matches them, which must surface as an absent row rather than a
+    // stale one (spec §4.7).
+    services
+        .categories
+        .rebuild_category_index(principal.owner)
+        .await?;
+    Ok(())
 }
 
 pub(crate) struct LoadedCategoryIndex {

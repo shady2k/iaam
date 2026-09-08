@@ -451,7 +451,12 @@ fn matcher_to_columns(
 }
 
 /// The inverse of [`matcher_to_columns`].
-fn matcher_from_columns(
+///
+/// `pub(crate)`: the category-assignment projection (`journal::category_index`)
+/// loads active rules straight from `category_rules` inside its own
+/// transaction and decodes the same four columns — reusing this keeps the
+/// column layout in exactly one place.
+pub(crate) fn matcher_from_columns(
     matcher_kind: &str,
     value: Option<String>,
     text: Option<String>,
@@ -526,14 +531,14 @@ fn date_to_text(value: Date) -> String {
         .expect("date is formatted as ISO-8601")
 }
 
-fn text_to_date(value: &str, field: &'static str) -> Result<Date, StoreError> {
+pub(crate) fn text_to_date(value: &str, field: &'static str) -> Result<Date, StoreError> {
     Date::parse(value, &Iso8601::DATE).map_err(|_| StoreError::InvalidValue {
         field,
         value: value.to_owned(),
     })
 }
 
-fn parse_uuid(value: &str, what: &'static str) -> Result<Uuid, StoreError> {
+pub(crate) fn parse_uuid(value: &str, what: &'static str) -> Result<Uuid, StoreError> {
     Uuid::parse_str(value).map_err(|_| StoreError::NotFound {
         what,
         id: value.to_owned(),

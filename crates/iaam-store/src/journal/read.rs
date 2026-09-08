@@ -41,10 +41,11 @@ use crate::StoreError;
 /// `ids.len()` (see the module doc); an empty page short-circuits to no
 /// statements at all.
 ///
-/// No production caller yet: Task 8's query builder is phase 1, the
-/// selection this function's `ids` are meant to come from, and it has not
-/// landed. Exercised today by this file's own tests.
-#[allow(dead_code)]
+/// Task 8's query builder — phase 1, the selection this function's `ids`
+/// are meant to come from — has not landed yet, so the only production
+/// caller today is [`super::category_index::rebuild`], which hydrates every
+/// one of an owner's events to recompute their categories; this file's own
+/// tests exercise the rest.
 pub(crate) fn hydrate(conn: &Connection, ids: &[EventId]) -> Result<Vec<Event>, StoreError> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -70,8 +71,8 @@ pub(crate) fn hydrate(conn: &Connection, ids: &[EventId]) -> Result<Vec<Event>, 
 
 /// [`hydrate`] narrowed to one id: `None` when it names no `events` row.
 ///
-/// No production caller yet, for the same reason as [`hydrate`].
-#[allow(dead_code)]
+/// Called from [`super::write::insert_event_in`] for the write path's own
+/// read-back postcondition (spec §D6).
 pub(crate) fn hydrate_one(conn: &Connection, id: EventId) -> Result<Option<Event>, StoreError> {
     Ok(hydrate(conn, std::slice::from_ref(&id))?.into_iter().next())
 }

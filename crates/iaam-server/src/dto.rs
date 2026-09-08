@@ -9354,8 +9354,11 @@ pub struct SubmitJournalEventsRequest {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct JournalPageDto {
     pub rows: Vec<JournalEventReadDto>,
-    /// Pass back as `after` to read the next page. Absent means this was the
-    /// last page; it is not an empty string, which would read as "start again".
+    /// Pass back as `after` to read the next page. For a filtered read, this
+    /// advances over rows the filter dropped, so the page may contain fewer
+    /// rows than `limit` or be empty while `next` is still present. Absent
+    /// means this was the last page and is the only thing that ends a walk; it
+    /// is not an empty string, which would read as "start again".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
 }

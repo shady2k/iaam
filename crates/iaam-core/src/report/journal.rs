@@ -194,3 +194,144 @@ struct AggregateGroupBuilder {
 fn month_key(date: Date) -> String {
     format!("{:04}-{:02}", date.year(), u8::from(date.month()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{
+        kind::EventKind,
+        leg::Leg,
+        test_support::event_with,
+    };
+    use crate::ids::{AccountId, TransferId};
+    use crate::money::{CurrencyCode, PostedMinor};
+    use time::macros::date;
+    use uuid::Uuid;
+
+    fn account(index: u128) -> AccountId {
+        AccountId(Uuid::from_u128(index))
+    }
+
+    fn money(minor: i64, currency: CurrencyCode) -> Money {
+        Money::new(PostedMinor::new(minor), currency)
+    }
+
+    fn cash_event(account: AccountId, day: Date, amount: Money) -> Event {
+        event_with(
+            account,
+            day,
+            1,
+            EventKind::CashIn { amount },
+            vec![Leg::cash(account, amount)],
+        )
+    }
+
+    #[test]
+    fn grouping_by_account_uses_each_leg_account_not_the_filing_account() {
+        let filing_account = account(1);
+        let receiving_account = account(2);
+        let amount = money(1_250, CurrencyCode::Rub);
+        let event = event_with(
+            filing_account,
+            date!(2026 - 08 - 04),
+            1,
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from: filing_account,
+                to: receiving_account,
+                amount,
+            },
+            vec![
+                Leg::cash(filing_account, amount),
+                Leg::cash(receiving_account, money(-1_250, CurrencyCode::Rub)),
+            ],
+        );
+
+        let aggregate =
+            aggregate_journal([&event], &[JournalAggregateGroupBy::Account], 10).unwrap();
+
+        assert_eq!(aggregate.groups.len(), 2);
+        assert_eq!(
+            aggregate
+                .groups
+                .iter()
+                .find(|group| group.account == Some(filing_account))
+                .unwrap()
+                .cash,
+            vec![amount]
+        );
+        assert_eq!(
+            aggregate
+                .groups
+                .iter()
+                .find(|group| group.account == Some(receiving_account))
+                .unwrap()
+                .cash,
+            vec![money(-1_250, CurrencyCode::Rub)]
+        );
+    }
+
+    #[test]
+    fn a_group_keeps_cash_entries_in_distinct_currencies() {
+        let account = account(3);
+        let rub = money(2_750, CurrencyCode::Rub);
+        let usd = money(-125, CurrencyCode::Usd);
+        let rub_event = cash_event(account, date!(2026 - 08 - 05), rub);
+        let usd_event = cash_event(account, date!(2026 - 08 - 06), usd);
+
+        let aggregate = aggregate_journal([&rub_event, &usd_event], &[], 10).unwrap();
+
+        assert_eq!(aggregate.groups.len(), 1);
+        assert_eq!(aggregate.groups[0].cash, vec![rub, usd]);
+    }
+
+    #[test]
+    fn exceeding_the_group_ceiling_is_refused_with_actual_count() {
+        let first = cash_event(
+            account(4),
+            date!(2026 - 08 - 07),
+            money(300, CurrencyCode::Rub),
+        );
+        let second = cash_event(
+            account(5),
+            date!(2026 - 08 - 08),
+            money(450, CurrencyCode::Rub),
+        );
+
+        let error =
+            aggregate_journal([&first, &second], &[JournalAggregateGroupBy::Account], 1)
+                .unwrap_err();
+
+        assert_eq!(
+            error,
+            JournalAggregateError::GroupCeiling {
+                ceiling: 1,
+                actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_ungrouped_selection_has_one_zero_event_group() {
+        let aggregate = aggregate_journal(
+            std::iter::empty::<&Event>(),
+            &[],
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            aggregate.groups,
+            vec![JournalAggregateGroup {
+                account: None,
+                currency: None,
+                kind: None,
+                month: None,
+                events: 0,
+                cash: Vec::new(),
+                first_effective_date: None,
+                last_effective_date: None,
+            }]
+        );
+    }
+}

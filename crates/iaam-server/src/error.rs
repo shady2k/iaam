@@ -323,6 +323,21 @@ impl ApiFailure {
         failure.retry_after = Some(seconds);
         failure
     }
+
+    /// Take the structured error body out of a failure for a per-element result.
+    ///
+    /// Authenticated account batches only use JSON failures here; the static
+    /// body fallback keeps this accessor total for callers that handle a
+    /// failure without first checking its status.
+    #[must_use]
+    pub fn into_error(self) -> ApiError {
+        match self.body {
+            ApiFailureBody::Json(body) => *body,
+            ApiFailureBody::Static(_) => {
+                ApiError::simple("unauthorized", "the request is not authenticated")
+            }
+        }
+    }
 }
 
 impl IntoResponse for ApiFailure {

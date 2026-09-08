@@ -1774,15 +1774,96 @@ impl BrokerChannelFactory for SqliteAdapter {
     }
 }
 
-fn classification_rule_view(rule: iaam_store::rules::StoredRule) -> ClassificationRuleView {
-    ClassificationRuleView {
+/// The stored rule's typed columns, read back into the classifier's own
+/// `Movement`.
+///
+/// The database's `CHECK` already limits the column to `"in"`, `"out"` or
+/// `NULL` (spec §4.6): a third value here means a row this store did not
+/// write, and it is reported rather than guessed at.
+fn movement_from_store(
+    value: Option<&str>,
+) -> Result<Option<iaam_ingest::classification::Movement>, AppError> {
+    match value {
+        None => Ok(None),
+        Some("in") => Ok(Some(iaam_ingest::classification::Movement::In)),
+        Some("out") => Ok(Some(iaam_ingest::classification::Movement::Out)),
+        Some(other) => Err(AppError::Store(format!(
+            "stored classification rule has an unreadable movement: {other}"
+        ))),
+    }
+}
+
+/// `iaam-store`'s typed columns, read back into the classifier's own
+/// [`RuleMatcher`](iaam_ingest::classification::RuleMatcher) and
+/// [`Classification`](iaam_ingest::classification::Classification) and
+/// re-encoded through the scenario's own [`matcher_json`] and
+/// [`outcome_json`](crate::scenarios::classification::outcome_json) — the same
+/// functions [`create_rule`] uses to write them, so the store and the port
+/// agree on one shape rather than keeping two.
+///
+/// [`matcher_json`]: crate::scenarios::classification::matcher_json
+fn classification_rule_view(
+    rule: iaam_store::rules::StoredRule,
+) -> Result<ClassificationRuleView, AppError> {
+    let matcher = iaam_ingest::classification::RuleMatcher {
+        counterparty_account: rule.counterparty_account,
+        description_contains: rule.description_contains,
+        kind: rule.source_kind,
+        source_category: rule.source_category,
+        owner_category: rule.owner_category,
+        source_code: rule.source_code,
+        movement: movement_from_store(rule.movement.as_deref())?,
+    };
+    let outcome = crate::scenarios::classification::outcome_from(
+        &rule.outcome_kind,
+        rule.to_account
+            .map(|account| account.inner().to_string())
+            .as_deref(),
+        rule.fee_origin.as_deref(),
+        rule.income_kind.as_deref(),
+    )?;
+    let matcher = serde_json::to_string(&crate::scenarios::classification::matcher_json(&matcher))
+        .map_err(|error| AppError::Store(format!("matcher could not be written: {error}")))?;
+    let outcome =
+        serde_json::to_string(&crate::scenarios::classification::outcome_json(outcome))
+            .map_err(|error| AppError::Store(format!("outcome could not be written: {error}")))?;
+    Ok(ClassificationRuleView {
         id: rule.id.inner(),
         version: rule.version,
-        matcher: rule.matcher,
-        outcome: rule.outcome,
+        matcher,
+        outcome,
         created_at: rule.created_at,
         retired_at: rule.retired_at,
         replaces: rule.replaces.map(|id| id.inner()),
+    })
+}
+
+/// The classifier's own [`RuleMatcher`](iaam_ingest::classification::RuleMatcher)
+/// and [`Classification`](iaam_ingest::classification::Classification), spelled
+/// as `iaam-store`'s typed columns.
+fn new_rule_from_domain(
+    matcher: &iaam_ingest::classification::RuleMatcher,
+    outcome: iaam_ingest::classification::Classification,
+) -> iaam_store::rules::NewRule {
+    let named = crate::scenarios::classification::classified_as(outcome);
+    iaam_store::rules::NewRule {
+        counterparty_account: matcher.counterparty_account.clone(),
+        description_contains: matcher.description_contains.clone(),
+        source_kind: matcher.kind.clone(),
+        source_category: matcher.source_category.clone(),
+        owner_category: matcher.owner_category.clone(),
+        source_code: matcher.source_code.clone(),
+        movement: matcher.movement.map(|movement| {
+            match movement {
+                iaam_ingest::classification::Movement::In => "in",
+                iaam_ingest::classification::Movement::Out => "out",
+            }
+            .to_owned()
+        }),
+        outcome_kind: named.kind.to_owned(),
+        to_account: named.to,
+        fee_origin: named.origin.map(str::to_owned),
+        income_kind: named.income_kind.map(str::to_owned),
     }
 }
 
@@ -1790,10 +1871,8 @@ fn classification_rule_view(rule: iaam_store::rules::StoredRule) -> Classificati
 impl ClassificationRuleStore for SqliteAdapter {
     async fn list_rules(&self, owner: OwnerId) -> Result<Vec<ClassificationRuleView>, AppError> {
         self.blocking(move |store| {
-            store
-                .rule_history(owner)
-                .map(|rules| rules.into_iter().map(classification_rule_view).collect())
-                .map_err(store_error)
+            let rules = store.rule_history(owner).map_err(store_error)?;
+            rules.into_iter().map(classification_rule_view).collect()
         })
         .await
     }
@@ -1806,11 +1885,12 @@ impl ClassificationRuleStore for SqliteAdapter {
         replaces: Option<Uuid>,
     ) -> Result<ClassificationRuleView, AppError> {
         self.blocking(move |store| {
-            let rule = match replaces {
-                Some(previous) => {
-                    store.amend_rule(owner, ClassificationRuleId(previous), &matcher, &outcome)
-                }
-                None => store.insert_rule(owner, &matcher, &outcome),
+            let (matcher, outcome) =
+                crate::scenarios::classification::matcher_and_outcome(&matcher, &outcome)?;
+            let rule = new_rule_from_domain(&matcher, outcome);
+            let stored = match replaces {
+                Some(previous) => store.amend_rule(owner, ClassificationRuleId(previous), rule),
+                None => store.insert_rule(owner, rule),
             }
             .map_err(|error| match error {
                 iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
@@ -1822,7 +1902,7 @@ impl ClassificationRuleStore for SqliteAdapter {
                 },
                 other => store_error(other),
             })?;
-            Ok(classification_rule_view(rule))
+            classification_rule_view(stored)
         })
         .await
     }
@@ -1879,18 +1959,25 @@ fn category_view(row: iaam_store::categories::CategoryRow) -> CategoryView {
     }
 }
 
-fn category_rule_view(row: iaam_store::categories::CategoryRuleRow) -> CategoryRuleView {
-    CategoryRuleView {
+/// `iaam-store`'s typed `matcher` is re-encoded through the scenario's own
+/// [`matcher_json`](crate::scenarios::categories::matcher_json) — the same
+/// encoder [`CategoryStore::create_category_rule`] uses on the way in, so the
+/// store and the port agree on one shape rather than keeping two.
+fn category_rule_view(
+    row: iaam_store::categories::CategoryRuleRow,
+) -> Result<CategoryRuleView, AppError> {
+    let matcher = crate::scenarios::categories::matcher_json(&row.matcher)?;
+    Ok(CategoryRuleView {
         id: row.id,
         version: row.version,
-        matcher: row.matcher_json,
+        matcher,
         category: row.category,
         valid_from: row.valid_from,
         valid_to: row.valid_to,
         created_at: row.created_at,
         retired_at: row.retired_at,
         replaces: row.replaces,
-    }
+    })
 }
 
 #[async_trait]
@@ -1975,10 +2062,10 @@ impl CategoryStore for SqliteAdapter {
 
     async fn list_category_rules(&self, owner: OwnerId) -> Result<Vec<CategoryRuleView>, AppError> {
         self.blocking(move |store| {
-            store
+            let rows = store
                 .list_category_rules(owner)
-                .map(|rows| rows.into_iter().map(category_rule_view).collect())
-                .map_err(category_store_error)
+                .map_err(category_store_error)?;
+            rows.into_iter().map(category_rule_view).collect()
         })
         .await
     }
@@ -1990,8 +2077,9 @@ impl CategoryStore for SqliteAdapter {
         replaces: Option<CategoryRuleId>,
     ) -> Result<CategoryRuleView, AppError> {
         self.blocking(move |store| {
+            let matcher = crate::scenarios::categories::parse_matcher(&rule.matcher)?;
             let store_rule = NewCategoryRule {
-                matcher_json: rule.matcher,
+                matcher,
                 category: rule.category.inner(),
                 valid_from: rule.valid_from,
                 valid_to: rule.valid_to,
@@ -2001,7 +2089,7 @@ impl CategoryStore for SqliteAdapter {
                 None => store.insert_category_rule(owner, store_rule, None),
             }
             .map_err(category_store_error)?;
-            Ok(category_rule_view(row))
+            category_rule_view(row)
         })
         .await
     }

@@ -517,7 +517,11 @@ pub fn rule_from_view(rule: ClassificationRuleView) -> Result<ClassificationRule
 /// build a view out of. A second parser there would eventually accept text the
 /// classifier refuses, which is the failure the one-reader rule exists to
 /// prevent.
-fn matcher_and_outcome(
+///
+/// `pub(crate)` so the storage adapter can decode the same stored JSON shape
+/// into `iaam-store`'s typed columns without a second, drifting parser
+/// (`crate::adapters::sqlite`).
+pub(crate) fn matcher_and_outcome(
     matcher: &str,
     outcome: &str,
 ) -> Result<(RuleMatcher, Classification), AppError> {

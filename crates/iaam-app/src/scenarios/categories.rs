@@ -398,7 +398,10 @@ fn domain_rule(rule: CategoryRuleView) -> Result<CategoryRule, AppError> {
     })
 }
 
-fn matcher_json(matcher: &CategoryMatcher) -> Result<String, AppError> {
+/// `pub(crate)` so the storage adapter can encode the same shape into and out
+/// of `iaam-store`'s typed columns without a second, drifting encoder
+/// (`crate::adapters::sqlite`).
+pub(crate) fn matcher_json(matcher: &CategoryMatcher) -> Result<String, AppError> {
     let value = match matcher {
         CategoryMatcher::Row { key } => json!({ "row": key }),
         CategoryMatcher::SourceCategory { value } => json!({ "source_category": value }),
@@ -420,7 +423,8 @@ fn matcher_json(matcher: &CategoryMatcher) -> Result<String, AppError> {
         .map_err(|error| AppError::Store(format!("serialize category matcher: {error}")))
 }
 
-fn parse_matcher(raw: &str) -> Result<CategoryMatcher, AppError> {
+/// The inverse of [`matcher_json`], and `pub(crate)` for the same reason.
+pub(crate) fn parse_matcher(raw: &str) -> Result<CategoryMatcher, AppError> {
     let value = serde_json::from_str::<Value>(raw).map_err(|error| AppError::Invalid {
         field: "matcher".to_owned(),
         expected: "a category matcher object".to_owned(),

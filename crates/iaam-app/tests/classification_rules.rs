@@ -62,14 +62,21 @@ fn harness() -> Ctx {
     }
 }
 
-/// A rule the classifier cannot read, written the only way one can be.
+/// An attempt to write a rule the classifier cannot read, made the only way
+/// one still can be attempted.
 ///
-/// The store keeps a matcher and an outcome as opaque text on purpose — it must
-/// not know the classifier's vocabulary — so it accepts this, and the scenario's
-/// own encoder can never produce it. That is exactly the state a journal reaches
-/// by holding a rule written before the route was typed, and it is the state in
-/// which every later rule creation refused *and wrote*.
-async fn store_an_unreadable_rule(ctx: &Ctx) {
+/// Before the rule tables were typed (spec §4.6), the store kept a matcher and
+/// an outcome as opaque text and validated only that it was JSON: it accepted
+/// this, and the scenario's own encoder could never produce it — which is how
+/// a journal could hold a rule written before the route was typed, or by
+/// something other than it, and every later rule creation refused *and wrote*.
+///
+/// The typed columns close that gap: `outcome_kind` is a database `CHECK`
+/// against the same six-word vocabulary the classifier itself accepts, so an
+/// unknown word like `"reimbursement"` below is refused at the write, not
+/// merely unreadable afterwards. The attempt is kept, and asserted to fail and
+/// leave nothing behind, because that is now the guarantee in its place.
+async fn attempt_an_unreadable_rule(ctx: &Ctx) -> AppError {
     ctx.services
         .rules
         .create_rule(
@@ -79,7 +86,7 @@ async fn store_an_unreadable_rule(ctx: &Ctx) {
             None,
         )
         .await
-        .expect("the store keeps rule text opaque and writes what it is given");
+        .expect_err("an outcome kind outside the classifier's six is refused, not stored")
 }
 
 fn proposal() -> (RuleMatcher, Classification) {
@@ -97,18 +104,18 @@ fn proposal() -> (RuleMatcher, Classification) {
     )
 }
 
+/// The database's `CHECK` refuses the write outright — the caller-facing
+/// shape the transport still publishes as 422 — and leaves nothing behind to
+/// explain later, unlike the write-then-refuse ordering `iaam-y6kt` was filed
+/// about.
 #[tokio::test]
-async fn a_refused_rule_is_not_written() {
+async fn an_unreadable_rule_is_refused_and_leaves_nothing_behind() {
     let ctx = harness();
-    store_an_unreadable_rule(&ctx).await;
     let before = list_rules(&ctx.services, &ctx.principal)
         .await
-        .expect("the rule history is readable even when a rule in it is not");
+        .expect("an empty rule history is readable");
 
-    let (matcher, outcome) = proposal();
-    let error = create_rule(&ctx.services, &ctx.principal, &matcher, outcome, None)
-        .await
-        .expect_err("the recomputation cannot read the stored set, so the call is refused");
+    let error = attempt_an_unreadable_rule(&ctx).await;
     assert!(
         matches!(error, AppError::Invalid { .. } | AppError::InvalidField(_)),
         "the refusal is the caller-facing one the transport publishes as 422: {error:?}"
@@ -120,61 +127,62 @@ async fn a_refused_rule_is_not_written() {
     assert_eq!(
         after.len(),
         before.len(),
-        "a refused rule left something behind: {after:?}"
+        "a refused write left something behind: {after:?}"
     );
 }
 
-/// The retry is the part that made it a defect rather than an untidiness.
-///
-/// A caller that is told 422 sends the corrected request again. With the write
-/// happening first, each attempt added another copy of a rule the caller
-/// believed had never been stored — and a standing rule decides rows nobody has
-/// looked at, so the duplicates are not inert.
+/// Retrying an attempt that was never written cannot accumulate copies of it:
+/// there is nothing partial for a repeat to add to.
 #[tokio::test]
-async fn retrying_a_refused_rule_does_not_accumulate_copies() {
+async fn retrying_an_unreadable_rule_never_accumulates_copies() {
     let ctx = harness();
-    store_an_unreadable_rule(&ctx).await;
 
     for _ in 0..3 {
-        let (matcher, outcome) = proposal();
-        create_rule(&ctx.services, &ctx.principal, &matcher, outcome, None)
-            .await
-            .expect_err("every attempt is refused for the same reason");
+        attempt_an_unreadable_rule(&ctx).await;
     }
 
     let rules = list_rules(&ctx.services, &ctx.principal)
         .await
         .expect("the rule history is readable");
-    assert_eq!(rules.len(), 1, "only the unreadable rule stands: {rules:?}");
+    assert_eq!(rules.len(), 0, "no attempt left a row behind: {rules:?}");
 }
 
-/// Retirement had the same shape, and its second call was more confusing still:
-/// the rule was retired by the refused attempt, so retrying answered `404`, and
-/// a caller reading the two responses would conclude it had never retired
-/// anything.
+/// A refused write must not disturb an unrelated existing rule, and a
+/// retirement afterwards must still take effect on it normally: the refused
+/// attempt left nothing behind for the retirement to trip over.
 #[tokio::test]
-async fn a_refused_retirement_leaves_the_rule_active() {
+async fn a_refused_write_does_not_disturb_an_existing_rule() {
     let ctx = harness();
     let (matcher, outcome) = proposal();
     let created = create_rule(&ctx.services, &ctx.principal, &matcher, outcome, None)
         .await
         .expect("the first rule is written against an empty, readable set");
-    store_an_unreadable_rule(&ctx).await;
-
-    retire_rule(&ctx.services, &ctx.principal, created.rule.id)
-        .await
-        .expect_err("the recomputation cannot read the stored set, so the call is refused");
+    attempt_an_unreadable_rule(&ctx).await;
 
     let rules = list_rules(&ctx.services, &ctx.principal)
         .await
         .expect("the rule history is readable");
-    let target = rules
-        .iter()
-        .find(|rule| rule.id == created.rule.id)
-        .expect("the rule the retirement named is still in the history");
+    assert_eq!(
+        rules.len(),
+        1,
+        "the refused write left a row behind: {rules:?}"
+    );
     assert!(
-        target.retired_at.is_none(),
-        "a refused retirement retired the rule anyway: {target:?}"
+        rules[0].retired_at.is_none(),
+        "a refused write retired an unrelated rule: {:?}",
+        rules[0]
+    );
+
+    retire_rule(&ctx.services, &ctx.principal, created.rule.id)
+        .await
+        .expect("retiring an existing rule does not depend on an attempt that wrote nothing");
+    let rules = list_rules(&ctx.services, &ctx.principal)
+        .await
+        .expect("the rule history is readable");
+    assert!(
+        rules[0].retired_at.is_some(),
+        "the retirement did not take effect: {:?}",
+        rules[0]
     );
 }
 

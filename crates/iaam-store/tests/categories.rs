@@ -3,6 +3,7 @@
 //! Categories are never deleted: history has already been decomposed by them,
 //! and after deletion there would be nothing to explain it.
 
+use iaam_core::category::CategoryMatcher;
 use iaam_core::ids::{CategoryRuleId, OwnerId};
 use iaam_store::SqliteStore;
 use iaam_store::categories::NewCategoryRule;
@@ -163,7 +164,9 @@ fn two_rules_cannot_share_a_version_number() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"SourceCategory":{"value":"Супермаркеты"}}"#.to_owned(),
+                matcher: CategoryMatcher::SourceCategory {
+                    value: "Супермаркеты".to_owned(),
+                },
                 category: food,
                 valid_from: None,
                 valid_to: None,
@@ -175,7 +178,9 @@ fn two_rules_cannot_share_a_version_number() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"DescriptionContains":{"text":"ЛАВКА"}}"#.to_owned(),
+                matcher: CategoryMatcher::DescriptionContains {
+                    text: "ЛАВКА".to_owned(),
+                },
                 category: food,
                 valid_from: None,
                 valid_to: None,
@@ -203,7 +208,9 @@ fn an_amended_rule_retires_the_old_row_and_points_at_it() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"SourceCategory":{"value":"Супермаркеты"}}"#.to_owned(),
+                matcher: CategoryMatcher::SourceCategory {
+                    value: "Супермаркеты".to_owned(),
+                },
                 category: food,
                 valid_from: None,
                 valid_to: None,
@@ -217,7 +224,9 @@ fn an_amended_rule_retires_the_old_row_and_points_at_it() {
             owner,
             first.id,
             NewCategoryRule {
-                matcher_json: r#"{"SourceCategory":{"value":"Супермаркет"}}"#.to_owned(),
+                matcher: CategoryMatcher::SourceCategory {
+                    value: "Супермаркет".to_owned(),
+                },
                 category: food,
                 valid_from: Some(date!(2026 - 01 - 01)),
                 valid_to: None,
@@ -246,7 +255,9 @@ fn an_amendment_rolls_back_retirement_if_the_new_rule_cannot_be_written() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"Row":{"key":"row-1"}}"#.to_owned(),
+                matcher: CategoryMatcher::Row {
+                    key: "row-1".to_owned(),
+                },
                 category: food,
                 valid_from: None,
                 valid_to: None,
@@ -255,14 +266,20 @@ fn an_amendment_rolls_back_retirement_if_the_new_rule_cannot_be_written() {
         )
         .expect("first");
 
+    // The write that must fail: a category the owner does not hold. It fails
+    // after the retirement of `first` would already have run inside the same
+    // transaction, so the rollback is what is under test, not the failure
+    // itself.
     assert!(
         store
             .amend_category_rule(
                 owner,
                 first.id,
                 NewCategoryRule {
-                    matcher_json: "{not-json".to_owned(),
-                    category: food,
+                    matcher: CategoryMatcher::Row {
+                        key: "row-1".to_owned(),
+                    },
+                    category: uuid::Uuid::new_v4(),
                     valid_from: None,
                     valid_to: None,
                 },
@@ -290,7 +307,9 @@ fn category_rule_intervals_and_open_ends_round_trip() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"DescriptionContains": {"text": "ЛАВКА"}}"#.to_owned(),
+                matcher: CategoryMatcher::DescriptionContains {
+                    text: "ЛАВКА".to_owned(),
+                },
                 category: food,
                 valid_from: Some(date!(2024 - 01 - 01)),
                 valid_to: None,
@@ -302,7 +321,9 @@ fn category_rule_intervals_and_open_ends_round_trip() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"Row":{"key":"row-2"}}"#.to_owned(),
+                matcher: CategoryMatcher::Row {
+                    key: "row-2".to_owned(),
+                },
                 category: food,
                 valid_from: None,
                 valid_to: Some(date!(2025 - 12 - 31)),
@@ -314,8 +335,10 @@ fn category_rule_intervals_and_open_ends_round_trip() {
     let listed = store.list_category_rules(owner).expect("rules");
     assert_eq!(listed.len(), 2);
     assert_eq!(
-        listed[0].matcher_json,
-        r#"{"DescriptionContains": {"text": "ЛАВКА"}}"#
+        listed[0].matcher,
+        CategoryMatcher::DescriptionContains {
+            text: "ЛАВКА".to_owned()
+        }
     );
     assert_eq!(listed[0].valid_from, Some(date!(2024 - 01 - 01)));
     assert_eq!(listed[0].valid_to, None);
@@ -337,7 +360,9 @@ fn a_retired_category_rule_is_still_listed_and_flagged() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"Row":{"key":"row-3"}}"#.to_owned(),
+                matcher: CategoryMatcher::Row {
+                    key: "row-3".to_owned(),
+                },
                 category: food,
                 valid_from: None,
                 valid_to: None,
@@ -413,7 +438,9 @@ fn a_rule_must_reference_an_owned_category_and_retirement_is_owner_scoped() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"Row":{"key":"row-1"}}"#.to_owned(),
+                matcher: CategoryMatcher::Row {
+                    key: "row-1".to_owned(),
+                },
                 category: missing_category,
                 valid_from: None,
                 valid_to: None,
@@ -436,7 +463,9 @@ fn a_rule_must_reference_an_owned_category_and_retirement_is_owner_scoped() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"Row":{"key":"row-2"}}"#.to_owned(),
+                matcher: CategoryMatcher::Row {
+                    key: "row-2".to_owned(),
+                },
                 category,
                 valid_from: None,
                 valid_to: None,
@@ -482,7 +511,9 @@ fn malformed_category_rule_storage_is_rejected_with_the_bad_field() {
         .insert_category_rule(
             owner,
             NewCategoryRule {
-                matcher_json: r#"{"Row":{"key":"row-3"}}"#.to_owned(),
+                matcher: CategoryMatcher::Row {
+                    key: "row-3".to_owned(),
+                },
                 category,
                 valid_from: None,
                 valid_to: None,

@@ -30,7 +30,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::openapi::{ApiDoc, FrequencyRefusal};
+use crate::openapi::{ApiDoc, FrequencyRefusal, hoist_optional_reference_descriptions};
 use crate::rate_limit::RateLimiter;
 
 /// Server state.
@@ -190,6 +190,7 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
     // routers merge, on the lines above, so a modifier that walks operations
     // has to run after this point or walk nothing.
     FrequencyRefusal.modify(&mut api);
+    hoist_optional_reference_descriptions(&mut api);
     let catalog = ActionCatalog::from_openapi(&api)?;
     // The discovery document is resolved against the same completed document,
     // so an entry point advertising a route that no longer exists refuses the

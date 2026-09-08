@@ -5,11 +5,12 @@
 //! serialisation of custom types remain outside generation. Therefore,
 //! black-box contract tests exist (task 15).
 
+use serde_json::Value;
 use utoipa::Modify;
 use utoipa::OpenApi;
 use utoipa::openapi::path::Operation;
 use utoipa::openapi::response::{Response, ResponseBuilder};
-use utoipa::openapi::schema::{Object, Type};
+use utoipa::openapi::schema::{ArrayItems, Object, Schema, SchemaType, Type};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::openapi::{ContentBuilder, HeaderBuilder, Ref, RefOr};
 
@@ -135,6 +136,107 @@ impl Modify for BearerSecurity {
             );
         }
     }
+}
+
+/// Move field descriptions out of `$ref` branches where OpenAPI 3.0 readers
+/// may ignore them and onto the nullable property schema that owns the field.
+///
+/// The match is deliberately narrow: only a two-branch `oneOf` containing one
+/// null schema and one described reference is a nullable referenced property.
+/// Tagged unions and other `oneOf` schemas remain untouched.
+pub(crate) fn hoist_optional_reference_descriptions(openapi: &mut utoipa::openapi::OpenApi) {
+    let Some(components) = openapi.components.as_mut() else {
+        return;
+    };
+
+    for schema in components.schemas.values_mut() {
+        hoist_ref_or(schema);
+    }
+}
+
+fn hoist_ref_or(schema: &mut RefOr<Schema>) {
+    if let RefOr::T(schema) = schema {
+        hoist_schema(schema);
+    }
+}
+
+fn hoist_schema(schema: &mut Schema) {
+    match schema {
+        Schema::Array(array) => {
+            if let ArrayItems::RefOrSchema(items) = &mut array.items {
+                hoist_ref_or(items);
+            }
+            for item in &mut array.prefix_items {
+                hoist_schema(item);
+            }
+        }
+        Schema::Object(object) => {
+            for property in object.properties.values_mut() {
+                hoist_property(property);
+                hoist_ref_or(property);
+            }
+        }
+        Schema::OneOf(one_of) => {
+            for item in &mut one_of.items {
+                hoist_ref_or(item);
+            }
+        }
+        Schema::AllOf(all_of) => {
+            for item in &mut all_of.items {
+                hoist_ref_or(item);
+            }
+        }
+        Schema::AnyOf(any_of) => {
+            for item in &mut any_of.items {
+                hoist_ref_or(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn hoist_property(property: &mut RefOr<Schema>) {
+    let RefOr::T(Schema::OneOf(one_of)) = property else {
+        return;
+    };
+    if one_of.items.len() != 2 {
+        return;
+    }
+
+    let Some(null_index) = one_of.items.iter().position(is_null_schema) else {
+        return;
+    };
+    let Some(reference_index) = one_of.items.iter().position(|item| {
+        matches!(
+            item,
+            RefOr::Ref(reference) if !reference.description.is_empty()
+        )
+    }) else {
+        return;
+    };
+    if null_index == reference_index {
+        return;
+    }
+
+    let description = match &mut one_of.items[reference_index] {
+        RefOr::Ref(reference) => std::mem::take(&mut reference.description),
+        RefOr::T(_) => return,
+    };
+    one_of.description = Some(description);
+}
+
+fn is_null_schema(schema: &RefOr<Schema>) -> bool {
+    matches!(
+        schema,
+        RefOr::T(Schema::Object(Object {
+            schema_type: SchemaType::Type(Type::Null),
+            ..
+        }))
+    ) || matches!(
+        schema,
+        RefOr::T(Schema::Object(object))
+            if object.default.as_ref().is_some_and(Value::is_null)
+    )
 }
 
 /// The refusal for request frequency, on every operation that can give it.

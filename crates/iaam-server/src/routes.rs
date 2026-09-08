@@ -5161,7 +5161,6 @@ pub async fn flow_report(
     Ok(Json(dto))
 }
 
-/// Account balances at a date.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 #[into_params(parameter_in = Query)]
@@ -5187,7 +5186,13 @@ pub struct BalancesParams {
     pub held: Option<String>,
 }
 
+/// Account balances at a date.
+///
 /// Cash and positions by contour account.
+///
+/// This answer has one figure per account and currency, not a total. For the
+/// same fold regrouped with the totals a caller can read, follow
+/// `/v1/reports/assets`.
 #[utoipa::path(
     get,
     path = "/v1/reports/balances",

@@ -1959,6 +1959,105 @@ async fn the_journal_openapi_requires_and_describes_stands() {
 }
 
 #[tokio::test]
+async fn the_journal_openapi_describes_superseded_by_at_the_property() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let schema = &spec["components"]["schemas"]["JournalEventReadDto"];
+    let property = &schema["properties"]["superseded_by"];
+    let description = property["description"]
+        .as_str()
+        .expect("superseded_by property description");
+    assert!(
+        description.contains("withdrawn without a replacement"),
+        "superseded_by description must be on the property: {property}"
+    );
+
+    let alternatives = property["oneOf"]
+        .as_array()
+        .expect("optional superseded_by oneOf");
+    assert!(
+        alternatives
+            .iter()
+            .any(|branch| branch["$ref"] == "#/components/schemas/JournalSupersededByDto"),
+        "superseded_by must retain its schema reference: {property}"
+    );
+    assert!(
+        alternatives
+            .iter()
+            .any(|branch| branch["type"] == "null" || branch["default"].is_null()),
+        "superseded_by must retain nullability: {property}"
+    );
+    assert!(
+        alternatives
+            .iter()
+            .all(|branch| branch["description"].is_null()),
+        "superseded_by description must be removed from oneOf branches: {property}"
+    );
+    assert!(
+        !schema["required"]
+            .as_array()
+            .expect("journal event required fields")
+            .iter()
+            .any(|field| field == "superseded_by"),
+        "superseded_by must remain optional: {schema}"
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_hoisting_applies_to_another_optional_reference() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let property = &spec["components"]["schemas"]["ControlComparisonDto"]["properties"]["stated"];
+    let description = property["description"]
+        .as_str()
+        .expect("stated property description");
+    assert!(
+        description.contains("difference between «it agreed» and «it was never checked»"),
+        "stated description must be on the property: {property}"
+    );
+
+    let alternatives = property["oneOf"].as_array().expect("optional stated oneOf");
+    assert!(
+        alternatives
+            .iter()
+            .any(|branch| branch["$ref"] == "#/components/schemas/ControlSectionDto"),
+        "stated must retain its schema reference: {property}"
+    );
+    assert!(
+        alternatives
+            .iter()
+            .all(|branch| branch["description"].is_null()),
+        "stated description must be removed from oneOf branches: {property}"
+    );
+}
+
+#[tokio::test]
+async fn the_balances_route_names_the_report_that_totals() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let description = spec["paths"]["/v1/reports/balances"]["get"]["description"]
+        .as_str()
+        .expect("balances route description");
+    assert!(
+        description.contains("/v1/reports/assets"),
+        "balances documentation must name the totals report: {description}"
+    );
+    let response_description = spec["components"]["schemas"]["BalancesReportDto"]["description"]
+        .as_str()
+        .expect("balances response description");
+    assert!(
+        response_description.contains("/v1/reports/assets"),
+        "balances response documentation must name the totals report: {response_description}"
+    );
+}
+
+#[tokio::test]
 async fn the_journal_openapi_distinguishes_account_and_touching_filters() {
     let harness = harness();
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;

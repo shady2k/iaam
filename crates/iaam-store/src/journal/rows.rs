@@ -10,15 +10,16 @@
 //! variants, and the rest of §4.5's list. Adding one back "for symmetry"
 //! reopens the two-places-that-can-disagree problem D5 closes.
 //!
-//! `event_corporate_action.compensation_amount` and `.compensation_currency`
-//! exist as columns in `migrations/0001_schema.sql`, but `compensation` is
-//! not a field of [`CorporateActionRow`]: the value is reconstructed from the
-//! `Principal` leg (or the optional `Cash` leg, for a conversion), and the
-//! write path fills those two columns from the leg directly rather than from
-//! this struct. The schema column and the domain rule disagree about whether
-//! this value is stored twice; this module follows the domain rule, per the
-//! task that introduced it, and the discrepancy is noted for whoever revisits
-//! the schema.
+//! A corporate action's `compensation` is the sharpest case, so it is worth
+//! saying why it has no field on [`CorporateActionRow`] rather than leaving a
+//! reader to wonder. `validate_corporate_action` builds the leg it expects
+//! **out of** the compensation — `principal_leg` for either redemption, the
+//! optional `cash_leg` for a conversion — and `expect_legs` admits exactly the
+//! legs it lists, so the leg is unique and the two determine each other in
+//! both directions, absence included. The schema briefly carried
+//! `compensation_amount` and `compensation_currency` anyway; they were removed
+//! once that was checked, because a column holding what a leg already holds is
+//! the duplication D5 exists to refuse.
 
 /// One row of `events`: the envelope, the six optional dates, and
 /// provenance (spec §4.1).

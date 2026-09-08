@@ -598,6 +598,20 @@ implementing Task 3.
 `event_legs(account, event)` answers `touching` and does **not** answer "far
 side" — that is what the two `event_cash_transfer` indexes are for. (codex)
 
+**Declaring those two indexes is not enough to have them used, and this took
+finding out.** Written as a correlated `EXISTS` on `t.event = events.id`, or as
+an ordinary join, SQLite is free to reorder and always drives from `events`
+instead: `events_by_order` already satisfies `owner = ?` and the keyset
+`ORDER BY` at no cost, so the far-account seek is never considered however
+selective it is. The counterparty filter therefore leads with
+`event_cash_transfer` under a `CROSS JOIN`, which is SQLite's documented way to
+pin join order left to right. Two things make that safe and worthwhile: the
+table holds strictly one row per event — `event` is its whole primary key — so
+the join can only narrow the result and never multiply a row, which is the
+hazard `EXISTS` guards against on `event_legs`; and the sort the `ORDER BY` now
+costs is over the few transfers that match a far account, against scanning every
+event the owner has to find which are transfers at all.
+
 A `Description` `contains` search is not answerable by a B-tree and this spec
 does not pretend otherwise: it stays a scan, reached only when a caller filters
 on `source_description` directly. Rule-driven description matching never reaches

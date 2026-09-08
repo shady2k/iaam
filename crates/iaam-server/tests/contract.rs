@@ -23,7 +23,7 @@ use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    ParsedOperations, PortfolioAsOf, PortfolioSnapshot, TokenAdmin, UnavailableOutboundHttp,
+    ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Store, TokenAdmin, UnavailableOutboundHttp,
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
@@ -64,7 +64,7 @@ use iaam_store::schedule::{
 use serde_json::{Value, json};
 use std::time::Duration;
 use time::macros::date;
-use time::{Date, Duration as TimeDuration, OffsetDateTime};
+use time::{Date, Duration as TimeDuration, Month, OffsetDateTime};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -30156,4 +30156,329 @@ async fn the_published_matcher_names_are_the_ones_the_route_accepts() {
             "{identifier} is published and refused: {published}"
         );
     }
+}
+/// The aggregate folds the effective events, then their money-bearing legs.
+///
+/// The transfer is deliberately filed against `harness.account` while one leg
+/// posts to `savings`, so grouping by leg account cannot accidentally pass by
+/// grouping the event's filing account.
+#[tokio::test]
+async fn the_journal_aggregate_answers_effective_leg_movement() {
+    let (harness, path) = harness_on_disk();
+    let plain = seed_correctable_deposit(&harness, "aggregate", "aggregate-plain", "1.01").await;
+    let reversed =
+        seed_correctable_deposit(&harness, "aggregate", "aggregate-reversed", "2.02").await;
+    let replaced =
+        seed_correctable_deposit(&harness, "aggregate", "aggregate-replaced", "3.03").await;
+    let savings = create_account(&harness, "Aggregate Savings").await;
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": reversed }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reversal = body[0]["event_id"].as_str().expect("reversal").to_owned();
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{
+                    "relation": "replacement",
+                    "target": replaced,
+                    "operation": {
+                        "account": harness.account.inner(),
+                        "type": "deposit",
+                        "amount": "4.04",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-08-05" },
+                        "idempotency_key": "aggregate-replacement"
+                    }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "aggregate transfer",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "transfer",
+                    "to_account": savings.inner(),
+                    "amount": "12.50",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-08-06" },
+                    "idempotency_key": "aggregate-transfer"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "6.06",
+        "2026-07-31",
+        "aggregate-july",
+        None,
+    )
+    .await;
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "7.07",
+        "2026-09-01",
+        "aggregate-september",
+        None,
+    )
+    .await;
+
+    let (status, aggregate) = call(
+        &harness.router,
+        get(
+            "/v1/journal/aggregate?stands=true",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{aggregate}");
+    assert_eq!(aggregate["groups"][0]["events"], 5, "{aggregate}");
+    assert_eq!(
+        aggregate["groups"][0]["cash"],
+        json!([{ "amount": "18.18", "currency": "RUB" }]),
+        "{aggregate}"
+    );
+    assert_eq!(aggregate["groups"][0]["first_effective_date"], "2026-07-31");
+    assert_eq!(aggregate["groups"][0]["last_effective_date"], "2026-09-01");
+    assert_ne!(plain.to_string(), reversal, "fixtures remain distinct");
+
+    let (status, grouped) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/journal/aggregate?stands=true&touching={}&group_by=account,currency",
+                savings.inner()
+            ),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{grouped}");
+    let groups = grouped["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2, "{grouped}");
+    assert!(
+        groups.iter().any(|group| {
+            group["account"] == json!(harness.account.inner().to_string())
+                && group["cash"] == json!([{ "amount": "-12.50", "currency": "RUB" }])
+        }),
+        "the filing account's leg is its own group: {grouped}"
+    );
+    assert!(
+        groups.iter().any(|group| {
+            group["account"] == json!(savings.inner().to_string())
+                && group["cash"] == json!([{ "amount": "12.50", "currency": "RUB" }])
+        }),
+        "the receiving leg is its own group: {grouped}"
+    );
+
+    let (status, monthly) = call(
+        &harness.router,
+        get(
+            "/v1/journal/aggregate?stands=true&group_by=month",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{monthly}");
+    let month_groups = monthly["groups"].as_array().expect("month groups");
+    assert_eq!(month_groups.len(), 3, "{monthly}");
+    for group in month_groups {
+        let month = group["month"].as_str().expect("month");
+        assert!(
+            group["first_effective_date"]
+                .as_str()
+                .expect("first date")
+                .starts_with(month),
+            "{monthly}"
+        );
+        assert!(
+            group["last_effective_date"]
+                .as_str()
+                .expect("last date")
+                .starts_with(month),
+            "{monthly}"
+        );
+    }
+
+    let (status, rows) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/journal/events?stands=true&touching={}&from=2026-08-06&to=2026-08-06",
+                savings.inner()
+            ),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows["rows"].as_array().expect("rows").len(), 1, "{rows}");
+    let (status, filtered) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/journal/aggregate?stands=true&touching={}&from=2026-08-06&to=2026-08-06",
+                savings.inner()
+            ),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filtered}");
+    assert_eq!(filtered["groups"][0]["events"], 1, "{filtered}");
+    assert_eq!(
+        filtered["groups"][0]["cash"],
+        json!([{ "amount": "0.00", "currency": "RUB" }]),
+        "un-grouped movement includes both legs: {filtered}"
+    );
+
+    let (status, by_kind) = call(
+        &harness.router,
+        get(
+            "/v1/journal/aggregate?stands=true&group_by=kind",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{by_kind}");
+    assert!(
+        by_kind["groups"]
+            .as_array()
+            .expect("kind groups")
+            .iter()
+            .any(|group| group["kind"] == "cash_in"),
+        "cash_in is a published kind group: {by_kind}"
+    );
+
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(spec["paths"]["/v1/journal/aggregate"].is_object(), "{spec}");
+    assert!(
+        spec["paths"]["/v1/journal/aggregate"]["get"]["parameters"]
+            .as_array()
+            .expect("aggregate parameters")
+            .iter()
+            .any(|parameter| parameter["name"] == "group_by"),
+        "group_by is published: {spec}"
+    );
+    let aggregate_parameters = spec["paths"]["/v1/journal/aggregate"]["get"]["parameters"]
+        .as_array()
+        .expect("aggregate parameters");
+    for forbidden in ["after", "limit", "idempotency_key"] {
+        assert!(
+            !aggregate_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == forbidden),
+            "{forbidden} is not an aggregate parameter: {spec}"
+        );
+    }
+    let row_parameters = spec["paths"]["/v1/journal/events"]["get"]["parameters"]
+        .as_array()
+        .expect("row parameters");
+    let stands_description = row_parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "stands")
+        .and_then(|parameter| parameter["description"].as_str())
+        .expect("row stands description");
+    assert!(
+        stands_description.contains("Filtering happens after resolution")
+            && stands_description.contains("follow")
+            && stands_description.contains("next"),
+        "stands keeps its paging warning: {spec}"
+    );
+    for date_parameter in ["from", "to"] {
+        let parameter = aggregate_parameters
+            .iter()
+            .find(|parameter| parameter["name"] == date_parameter)
+            .expect("date parameter");
+        assert_eq!(parameter["schema"]["format"], "date", "{spec}");
+    }
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+/// A non-paginated aggregate refuses an answer whose group set is too large.
+#[tokio::test]
+async fn the_journal_aggregate_refuses_more_than_its_group_ceiling() {
+    let (harness, path) = harness_on_disk();
+    let mut events = Vec::with_capacity(1_001);
+    for index in 0..1_001_i32 {
+        let year = 2000 + index / 12;
+        let month = Month::try_from((index % 12 + 1) as u8).expect("month");
+        let day = Date::from_calendar_date(year, month, 1).expect("date");
+        let amount =
+            iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(1), CurrencyCode::Rub);
+        events.push(iaam_core::event::Event {
+            id: iaam_core::ids::EventId::new_random(),
+            schema_version: iaam_core::event::SCHEMA_VERSION,
+            owner: harness.owner,
+            account: harness.account,
+            kind: EventKind::CashIn { amount },
+            dates: EventDates::for_cash(CashPostedDate(day)),
+            order: EffectiveOrder::new(day, 1),
+            legs: vec![iaam_core::event::leg::Leg::cash(harness.account, amount)],
+            provenance: iaam_core::event::provenance::Provenance::new(
+                SourceId::new_random(),
+                iaam_core::event::provenance::RawHash::parse(&format!("{index:064x}"))
+                    .expect("raw hash"),
+                ParserVersion("aggregate-ceiling-test".to_owned()),
+            ),
+            relation: iaam_core::event::Relation::None,
+            confidence: iaam_core::event::Confidence::Known,
+            idempotency_key: Some(format!("aggregate-ceiling-{index}")),
+        });
+    }
+
+    let store = SqliteAdapter::new(SqliteStore::open(&path).expect("second connection"));
+    store
+        .append_events(events, IdentityScope::Source)
+        .await
+        .expect("one transaction for ceiling fixtures");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            "/v1/journal/aggregate?stands=true&group_by=month",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("1000"), "{body}");
+    assert!(message.contains("1001"), "{body}");
+    assert!(message.contains("narrow filters"), "{body}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }

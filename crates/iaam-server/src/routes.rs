@@ -39,8 +39,8 @@ use iaam_app::scenarios::import_session::{HeldRow, IntakeOutcome, SessionContent
 use iaam_app::scenarios::ingest::RowOrigin;
 use iaam_app::scenarios::ingest::{submit_journal_events, submit_operations};
 use iaam_app::scenarios::journal::{
-    DeclaredSource, JournalReadQuery, list_journal_source_categories, read_journal,
-    read_operation_history,
+    DeclaredSource, JournalAggregateGroupBy, JournalAggregateQuery, JournalReadQuery,
+    aggregate_journal, list_journal_source_categories, read_journal, read_operation_history,
 };
 use iaam_app::scenarios::market_reference::{
     MarketFxQuery, MarketKeyRateQuery, MarketPricesQuery, list_market_fx as read_market_fx,
@@ -95,9 +95,9 @@ use crate::dto::{
     CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
     CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto,
     DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
-    IssuedTokenDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
-    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
-    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    IssuedTokenDto, JournalAggregateDto, JournalEventReadDto, JournalPageDto, MarketFxDto,
+    MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
+    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
     NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
     PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
     RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
@@ -5441,89 +5441,135 @@ fn parse_category_matcher(value: CategoryMatcherDto) -> CategoryMatcher {
         }
     }
 }
-/// Journal read parameters. Every filter is optional and they combine.
-#[derive(Debug, Clone, Deserialize, IntoParams)]
-#[serde(deny_unknown_fields)]
-#[into_params(parameter_in = Query)]
-pub struct JournalParams {
-    /// The client key supplied at ingest. It addresses at most one event, so a
-    /// key that matches nothing is reported as a missing resource rather than
-    /// as an empty page.
-    #[serde(default)]
-    pub idempotency_key: Option<String>,
-    /// Only events whose own `account` column is this account. It does not
-    /// include an event recorded against another account whose leg posts here;
-    /// use `touching` for that question.
-    #[serde(default)]
-    pub account: Option<Uuid>,
-    /// Only events that touched this account: the event's own account or any
-    /// account carried by one of its legs. This is the event set a report fold
-    /// uses for an account, while `account` asks only where the event is filed.
-    #[serde(default)]
-    pub touching: Option<Uuid>,
-    /// Account of the source the caller declared when it submitted. Supplied
-    /// together with `source_channel`; the pair is how a caller asks what one
-    /// import put in.
-    #[serde(default)]
-    pub source_account: Option<Uuid>,
-    /// Channel of the declared source: `file`, `paste`, `manual`.
-    #[serde(default)]
-    pub source_channel: Option<String>,
-    /// Label of the declared import. Supplied together with `source_account`
-    /// and `source_channel`; this is the declaration a caller that submitted
-    /// the import already holds, and the route derives the same import identity
-    /// that retraction takes. The UUID form in `import` remains available.
-    #[serde(default)]
-    pub source_label: Option<String>,
-    /// The declared import that carried the rows. This is the identity a
-    /// retraction takes; it is not the session that happened to commit them.
-    #[serde(default)]
-    pub import: Option<Uuid>,
-    /// The import session whose commit wrote the rows. Narrower than the
-    /// declared source, which covers every import that came through one
-    /// channel: this names one act of importing, and it is the identifier
-    /// `POST /v1/import-sessions` returned and every row here carries back.
-    #[serde(default)]
-    pub import_session: Option<Uuid>,
-    /// The standing classification rule that filed the rows.
-    ///
-    /// One decision of yours becomes a rule, and the rule then files rows
-    /// automatically — rows you never see one by one. This returns that group,
-    /// so a row that turns out wrong can be found among the others the same
-    /// decision reached instead of by reading a whole import.
-    ///
-    /// It narrows alongside the other filters rather than replacing them: an
-    /// account, a date interval and a rule together ask what that rule did on
-    /// that account in that month.
-    ///
-    /// Rows the rule did not file are outside every value of it, including rows
-    /// nothing recorded a settlement for at all. Each row returned by this route
-    /// carries `rule_settlement`, which says which of those it is.
-    #[serde(default)]
-    pub settled_by_rule: Option<Uuid>,
-    /// Whether to include only rows in the effective set (`true`) or only
-    /// withdrawn rows and correction markers (`false`). Omitted returns every
-    /// row. Filtering happens after resolution, so a filtered page may contain
-    /// fewer rows or none while `next` is present; callers must follow `next`
-    /// until it is absent.
-    #[serde(default)]
-    pub stands: Option<bool>,
-    /// Inclusive start of the effective-date interval, YYYY-MM-DD.
-    #[serde(default)]
-    #[param(value_type = Option<String>, format = Date)]
-    pub from: Option<String>,
-    /// Inclusive end of the effective-date interval, YYYY-MM-DD.
-    #[serde(default)]
-    #[param(value_type = Option<String>, format = Date)]
-    pub to: Option<String>,
-    /// Position returned as `next` by an earlier page. Absent reads from the
-    /// start of the journal.
-    #[serde(default)]
-    pub after: Option<String>,
-    /// Rows per page, 1 to 200. Absent means 50.
-    #[serde(default)]
-    pub limit: Option<u32>,
+/// The event-selecting fields shared by the row and aggregate journal routes.
+macro_rules! journal_params {
+    ($(#[$attrs:meta])* ; $name:ident { $($extra:tt)* }) => {
+        $(#[$attrs])*
+        pub struct $name {
+            /// Only events whose own `account` column is this account. It does not
+            /// include an event recorded against another account whose leg posts here;
+            /// use `touching` for that question.
+            #[serde(default)]
+            pub account: Option<Uuid>,
+            /// Only events that touched this account: the event's own account or any
+            /// account carried by one of its legs. This is the event set a report fold
+            /// uses for an account, while `account` asks only where the event is filed.
+            #[serde(default)]
+            pub touching: Option<Uuid>,
+            /// Account of the source the caller declared when it submitted. Supplied
+            /// together with `source_channel`; the pair is how a caller asks what one
+            /// import put in.
+            #[serde(default)]
+            pub source_account: Option<Uuid>,
+            /// Channel of the declared source: `file`, `paste`, `manual`.
+            #[serde(default)]
+            pub source_channel: Option<String>,
+            /// Label of the declared import. Supplied together with `source_account`
+            /// and `source_channel`; this is the declaration a caller that submitted
+            /// the import already holds, and the route derives the same import identity
+            /// that retraction takes. The UUID form in `import` remains available.
+            #[serde(default)]
+            pub source_label: Option<String>,
+            /// The declared import that carried the rows. This is the identity a
+            /// retraction takes; it is not the session that happened to commit them.
+            #[serde(default)]
+            pub import: Option<Uuid>,
+            /// The import session whose commit wrote the rows. Narrower than the
+            /// declared source, which covers every import that came through one
+            /// channel: this names one act of importing, and it is the identifier
+            /// `POST /v1/import-sessions` returned; every journal row carries it back.
+            #[serde(default)]
+            pub import_session: Option<Uuid>,
+            /// The standing classification rule that filed the rows.
+            ///
+            /// One decision of yours becomes a rule, and the rule then files rows
+            /// automatically — rows you never see one by one. This returns that group,
+            /// so a row that turns out wrong can be found among the others the same
+            /// decision reached instead of by reading a whole import.
+            ///
+            /// It narrows alongside the other filters rather than replacing them: an
+            /// account, a date interval and a rule together ask what that rule did on
+            /// that account in that month.
+            ///
+            /// Rows the rule did not file are outside every value of it, including rows
+            /// nothing recorded a settlement for at all.
+            #[serde(default)]
+            pub settled_by_rule: Option<Uuid>,
+            /// Inclusive start of the effective-date interval, YYYY-MM-DD.
+            #[serde(default)]
+            #[param(value_type = Option<String>, format = Date)]
+            pub from: Option<String>,
+            /// Inclusive end of the effective-date interval, YYYY-MM-DD.
+            #[serde(default)]
+            #[param(value_type = Option<String>, format = Date)]
+            pub to: Option<String>,
+            $($extra)*
+        }
+    };
 }
+journal_params!(
+/// Journal read parameters. Every filter is optional and they combine.
+    #[derive(Debug, Clone, Deserialize, IntoParams)]
+    #[serde(deny_unknown_fields)]
+    #[into_params(parameter_in = Query)]
+    ; JournalParams {
+        /// Whether to include only rows in the effective set (`true`) or only
+        /// withdrawn rows and correction markers (`false`). Omitted returns every
+        /// row. Filtering happens after resolution, so a filtered page may contain
+        /// fewer rows or none while `next` is present; callers must follow `next`
+        /// until it is absent.
+        #[serde(default)]
+        pub stands: Option<bool>,
+        /// The client key supplied at ingest. It addresses at most one event, so a
+        /// key that matches nothing is reported as a missing resource rather than
+        /// as an empty page.
+        #[serde(default)]
+        pub idempotency_key: Option<String>,
+        /// Position returned as `next` by an earlier page. Absent reads from the
+        /// start of the journal.
+        #[serde(default)]
+        pub after: Option<String>,
+        /// Rows per page, 1 to 200. Absent means 50.
+        #[serde(default)]
+        pub limit: Option<u32>,
+    }
+);
+
+journal_params!(
+    #[derive(Debug, Clone, Deserialize, IntoParams)]
+    #[serde(deny_unknown_fields)]
+    #[into_params(parameter_in = Query)]
+    ; JournalAggregateParams {
+        /// Comma-separated closed vocabulary: account, currency, kind, month.
+        #[serde(default)]
+        #[param(value_type = Option<String>, example = "account,currency")]
+        pub group_by: Option<String>,
+        /// Whether to include only rows in the effective set (`true`) or only
+        /// withdrawn rows and correction markers (`false`). Omitted includes every
+        /// event in the selected set. Filtering happens after resolution, before
+        /// the aggregate fold; aggregate answers are never paginated.
+        #[serde(default)]
+        pub stands: Option<bool>,
+        /// Position returned as `next` by an earlier page. Aggregate answers are
+        /// never paginated; this exists only so a caller that sends it receives a
+        /// named refusal rather than a generic unknown-field error.
+        #[serde(default)]
+        #[param(ignore = true)]
+        pub after: Option<String>,
+        /// Rows per page. Aggregate answers are never paginated; this exists only
+        /// so a caller that sends it receives a named refusal rather than a generic
+        /// unknown-field error.
+        #[serde(default)]
+        #[param(ignore = true)]
+        pub limit: Option<u32>,
+        /// The client key supplied at ingest. Aggregate answers do not resolve an
+        /// idempotency key; this exists only so a caller that sends it receives a
+        /// named refusal rather than a generic unknown-field error.
+        #[serde(default)]
+        #[param(ignore = true)]
+        pub idempotency_key: Option<String>,
+    }
+);
 
 /// Filters for the exact source-category vocabulary in the journal.
 #[derive(Debug, Deserialize, IntoParams)]
@@ -5556,6 +5602,10 @@ pub struct JournalSourceCategoryParams {
 /// at a time, oldest first, ordered by effective date and then by the order
 /// within that date — the pair the journal's own uniqueness is built on, so a
 /// page can neither skip nor repeat a row.
+///
+/// Rows the rule did not file are outside every value of it, including rows
+/// nothing recorded a settlement for at all. Each row returned by this route
+/// carries `rule_settlement`, which says which of those it is.
 ///
 /// No number here is computed: legs are returned exactly as recorded and
 /// nothing is summed.
@@ -5615,6 +5665,103 @@ pub async fn list_journal_events(
             .collect(),
         next: page.next,
     }))
+}
+
+/// Aggregate journal movement over the selected event set.
+///
+/// Filters select events first. The fold then runs over every cash-bearing leg
+/// of those events, and `group_by=account` or `currency` uses each leg's own
+/// account or currency, not the event's filing account. This is the same
+/// event-then-leg basis used by the reports.
+///
+/// The answer is movement over the filtered window, not a balance. It does not
+/// read opening assertions; the balances report is the route that answers what
+/// is held at a date. Group results are never paginated. More than
+/// [`iaam_app::scenarios::journal::MAX_AGGREGATE_GROUPS`] groups is refused with
+/// the count and the narrowing filters needed to make the answer bounded.
+#[utoipa::path(
+    get,
+    path = "/v1/journal/aggregate",
+    params(JournalAggregateParams),
+    responses(
+        (status = 200, description = "Journal movement aggregates", body = JournalAggregateDto),
+        (status = 422, description = "A parameter or aggregate group ceiling was refused", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn aggregate_journal_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<JournalAggregateParams>,
+) -> Result<Json<JournalAggregateDto>, ApiFailure> {
+    if params.after.is_some() || params.limit.is_some() || params.idempotency_key.is_some() {
+        return Err(invalid_field(
+            "paging",
+            "aggregate requests do not accept after, limit, or idempotency_key",
+            "present".to_owned(),
+        ));
+    }
+    let from = params
+        .from
+        .as_deref()
+        .map(|value| parse_query_date("from", value))
+        .transpose()?;
+    let to = params
+        .to
+        .as_deref()
+        .map(|value| parse_query_date("to", value))
+        .transpose()?;
+    let source = declared_source_filter(params.source_account, params.source_channel)?;
+    let declared_import =
+        declared_import_filter(principal.owner, source.as_ref(), params.source_label)?;
+    let group_by = parse_aggregate_group_by(params.group_by.as_deref())?;
+    let aggregate = aggregate_journal(
+        state.services.store.as_ref(),
+        principal.owner,
+        JournalAggregateQuery {
+            account: params.account.map(AccountId),
+            touching: params.touching.map(AccountId),
+            source,
+            import: params.import.map(ImportId).or(declared_import),
+            import_session: params.import_session.map(ImportSessionId),
+            settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
+            stands: params.stands,
+            from,
+            to,
+            group_by,
+        },
+    )
+    .await?;
+    Ok(Json(JournalAggregateDto::from_domain(&aggregate)))
+}
+
+fn parse_aggregate_group_by(
+    value: Option<&str>,
+) -> Result<Vec<JournalAggregateGroupBy>, ApiFailure> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_empty() {
+        return Err(invalid_field(
+            "group_by",
+            "a comma-separated list of account, currency, kind, or month",
+            value.to_owned(),
+        ));
+    }
+    value
+        .split(',')
+        .map(|part| match part {
+            "account" => Ok(JournalAggregateGroupBy::Account),
+            "currency" => Ok(JournalAggregateGroupBy::Currency),
+            "kind" => Ok(JournalAggregateGroupBy::Kind),
+            "month" => Ok(JournalAggregateGroupBy::Month),
+            _ => Err(invalid_field(
+                "group_by",
+                "a comma-separated list of account, currency, kind, or month",
+                value.to_owned(),
+            )),
+        })
+        .collect()
 }
 
 /// The exact source-category words recorded in the owner's journal.

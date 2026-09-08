@@ -57,6 +57,15 @@ pub struct ApiError {
     /// no further.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pointer: Option<String>,
+    /// Every required request field absent from the input, in published
+    /// declaration order.
+    ///
+    /// `field` remains the first item in this list so a client that only reads
+    /// `field` remains correct. This list appears only when more than one
+    /// required field is missing; a single-field refusal keeps its existing
+    /// shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_fields: Option<Vec<String>>,
     /// What the field admits, in prose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
@@ -102,6 +111,7 @@ impl ApiError {
             message: message.into(),
             field: None,
             pointer: None,
+            missing_fields: None,
             expected: None,
             actual: None,
             alternatives: Vec::new(),
@@ -120,6 +130,14 @@ impl ApiError {
         let field = field.into();
         self.pointer = Some(json_pointer(&field));
         self.field = Some(field);
+        self
+    }
+
+    /// All required request fields absent from the input when more than one is
+    /// missing. The first item must be the field named by [`Self::about`].
+    #[must_use]
+    pub fn missing_fields(mut self, fields: Vec<String>) -> Self {
+        self.missing_fields = Some(fields);
         self
     }
 

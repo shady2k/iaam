@@ -5959,6 +5959,58 @@ pub struct DecisionParams {
     pub to: Option<String>,
 }
 
+impl crate::extract::QueryRequirements for ActionsParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
+impl crate::extract::QueryRequirements for MarketPricesParams {
+    const REQUIRED: &'static [&'static str] = &["instrument", "board", "session", "from", "to"];
+}
+
+impl crate::extract::QueryRequirements for MarketFxParams {
+    const REQUIRED: &'static [&'static str] = &["base", "quote", "from", "to"];
+}
+
+impl crate::extract::QueryRequirements for MarketKeyRateParams {
+    const REQUIRED: &'static [&'static str] = &["from", "to"];
+}
+
+impl crate::extract::QueryRequirements for IngestCsvParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
+impl crate::extract::QueryRequirements for MoneyFlowParams {
+    const REQUIRED: &'static [&'static str] = &["contour", "from", "to"];
+}
+
+impl crate::extract::QueryRequirements for BalancesParams {
+    const REQUIRED: &'static [&'static str] = &["contour", "as_of"];
+}
+
+impl crate::extract::QueryRequirements for AssetSnapshotParams {
+    const REQUIRED: &'static [&'static str] = &["contour", "as_of"];
+}
+
+impl crate::extract::QueryRequirements for ReturnsParams {
+    const REQUIRED: &'static [&'static str] = &["contour", "currency"];
+}
+
+impl crate::extract::QueryRequirements for JournalParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
+impl crate::extract::QueryRequirements for JournalAggregateParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
+impl crate::extract::QueryRequirements for JournalSourceCategoryParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
+impl crate::extract::QueryRequirements for DecisionParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
 #[utoipa::path(
     get,
     path = "/v1/decisions",

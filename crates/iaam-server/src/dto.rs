@@ -13614,6 +13614,18 @@ pub struct SourceDocumentParams {
     pub document: Option<String>,
 }
 
+impl crate::extract::QueryRequirements for DocumentParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
+impl crate::extract::QueryRequirements for ReconciliationParams {
+    const REQUIRED: &'static [&'static str] = &["account", "from", "to"];
+}
+
+impl crate::extract::QueryRequirements for SourceDocumentParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
 /// The catalogue, as the transport publishes it.
 #[must_use]
 pub fn source_profile_catalogue_dto(catalogue: &ProfileCatalogue) -> SourceProfileCatalogueDto {

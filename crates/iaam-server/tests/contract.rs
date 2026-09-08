@@ -11512,6 +11512,106 @@ async fn a_missing_query_parameter_is_refused_in_the_documented_shape() {
 }
 
 #[tokio::test]
+async fn every_get_route_reports_all_required_query_parameters() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut covered = 0;
+    let mut uncovered = Vec::new();
+    let paths = spec["paths"].as_object().expect("OpenAPI paths");
+    for (path, item) in paths {
+        let Some(operation) = item.get("get") else {
+            continue;
+        };
+        let Some(parameters) = operation["parameters"].as_array() else {
+            continue;
+        };
+        let required: Vec<&str> = parameters
+            .iter()
+            .filter(|parameter| parameter["in"] == "query" && parameter["required"] == true)
+            .map(|parameter| {
+                parameter["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{path} has an unnamed query parameter"))
+            })
+            .collect();
+        if required.len() < 2 {
+            continue;
+        }
+        if path.contains('{') {
+            uncovered.push(format!("{path} needs a path parameter"));
+            continue;
+        }
+
+        let (status, body) = refusal(&harness.router, get(path, Some(&harness.owner_token))).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {body}");
+        assert_eq!(body["code"], "invalid_request", "{path}: {body}");
+        let actual: BTreeSet<&str> = body["missing_fields"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path} did not publish missing_fields: {body}"))
+            .iter()
+            .map(|field| {
+                field
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{path} published a non-string missing field"))
+            })
+            .collect();
+        let expected: BTreeSet<&str> = required.into_iter().collect();
+        assert_eq!(actual, expected, "{path}: {body}");
+        assert!(
+            expected.contains(body["field"].as_str().unwrap_or_default()),
+            "{path} field is not one of its missing query parameters: {body}"
+        );
+        covered += 1;
+    }
+
+    assert!(
+        uncovered.is_empty(),
+        "required-query GET paths could not be called without path parameters: {uncovered:?}"
+    );
+    assert!(
+        covered > 0,
+        "OpenAPI published no GET path with two required query parameters"
+    );
+    println!("covered {covered} GET paths with multiple required query parameters");
+}
+
+#[tokio::test]
+async fn one_missing_query_parameter_keeps_the_existing_refusal_shape() {
+    let harness = harness();
+    let (status, body) = refusal(
+        &harness.router,
+        get(
+            "/v1/reports/flow?contour=00000000-0000-0000-0000-000000000000&from=2026-01-01",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "to", "{body}");
+    assert!(body.get("missing_fields").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn api_error_openapi_documents_the_complete_missing_field_set() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let property = &spec["components"]["schemas"]["ApiError"]["properties"]["missing_fields"];
+    assert!(
+        property.is_object(),
+        "missing_fields is absent from ApiError: {spec}"
+    );
+    assert!(
+        property["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("Every required request field")),
+        "missing_fields must document the complete set semantics: {property}"
+    );
+}
+
+#[tokio::test]
 async fn a_body_missing_a_required_field_is_refused_in_the_documented_shape() {
     let harness = harness();
     let (status, body) = refusal(

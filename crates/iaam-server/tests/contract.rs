@@ -6116,8 +6116,9 @@ async fn listing_instruments_returns_the_global_directory() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.as_array()
-            .expect("list")
+        body["instruments"]
+            .as_array()
+            .expect("instruments")
             .iter()
             .any(|item| item["id"] == instrument.inner().to_string())
     );
@@ -31574,4 +31575,297 @@ async fn an_unknown_journal_currency_names_the_accepted_vocabulary() {
             "{currency} missing from {body}"
         );
     }
+}
+#[tokio::test]
+async fn account_create_batch_applies_valid_rows_and_reports_invalid_rows() {
+    let harness = empty_owner_harness();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/accounts/batch",
+            &harness.owner_token,
+            &json!({
+                "accounts": [
+                    {"title": "Batch Main"},
+                    {"title": "Batch External", "provider": "bank"}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["outcome"], "created", "{body}");
+    assert_eq!(body[1]["outcome"], "rejected", "{body}");
+    assert_eq!(body[1]["error"]["field"], "provider_account_id", "{body}");
+
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert_eq!(
+        accounts.as_array().expect("accounts").len(),
+        1,
+        "{accounts}"
+    );
+}
+
+#[tokio::test]
+async fn account_create_batch_requires_the_single_route_permission() {
+    let harness = empty_owner_harness();
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/accounts/batch",
+            &harness.readonly_token,
+            &json!({"accounts": [{"title": "Not written"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert!(
+        accounts.as_array().expect("accounts").is_empty(),
+        "{accounts}"
+    );
+}
+
+#[tokio::test]
+async fn account_alias_batch_applies_valid_rows_without_writing_invalid_rows() {
+    let harness = harness();
+    let second = create_account(&harness, "Second account").await.inner();
+    let (status, body) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/aliases",
+            &harness.owner_token,
+            &json!({
+                "accounts": [
+                    {
+                        "account": harness.account.inner(),
+                        "aliases": [{"value": "card-main", "valid_from": "2025-01-01"}]
+                    },
+                    {
+                        "account": second,
+                        "aliases": [{"value": "card-bad", "valid_from": "2025-01-02", "valid_to": "2025-01-01"}]
+                    }
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["outcome"], "applied", "{body}");
+    assert_eq!(body[1]["outcome"], "rejected", "{body}");
+
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    let main = accounts
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|account| account["id"] == harness.account.inner().to_string())
+        .expect("main");
+    let other = accounts
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|account| account["id"] == second.to_string())
+        .expect("second");
+    assert_eq!(main["aliases"][0]["value"], "card-main", "{accounts}");
+    assert!(other.get("aliases").is_none(), "{accounts}");
+}
+
+#[tokio::test]
+async fn account_alias_batch_requires_owner_administration_before_writing() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/aliases",
+            &harness.agent_token,
+            &json!({
+                "accounts": [{
+                    "account": harness.account.inner(),
+                    "aliases": [{"value": "not-written", "valid_from": "2025-01-01"}]
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert!(accounts[0].get("aliases").is_none(), "{accounts}");
+}
+
+#[tokio::test]
+async fn account_title_batch_applies_valid_rows_without_writing_blank_rows() {
+    let harness = harness();
+    let second = create_account(&harness, "Second title").await.inner();
+    let (status, body) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/title",
+            &harness.owner_token,
+            &json!({
+                "accounts": [
+                    {"account": harness.account.inner(), "title": "Renamed main"},
+                    {"account": second, "title": "   "}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["outcome"], "applied", "{body}");
+    assert_eq!(body[1]["outcome"], "rejected", "{body}");
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert_eq!(accounts[0]["title"], "Renamed main", "{accounts}");
+    assert_eq!(accounts[1]["title"], "Second title", "{accounts}");
+}
+
+#[tokio::test]
+async fn account_title_batch_requires_the_single_route_permission() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/title",
+            &harness.readonly_token,
+            &json!({
+                "accounts": [{"account": harness.account.inner(), "title": "not-written"}]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert_eq!(accounts[0]["title"], "Brokerage", "{accounts}");
+}
+
+#[tokio::test]
+async fn account_declarations_batch_applies_valid_rows_without_writing_invalid_rows() {
+    let harness = harness();
+    let second = create_account(&harness, "Second declaration").await.inner();
+    let (status, body) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/declarations",
+            &harness.owner_token,
+            &json!({
+                "accounts": [
+                    {"account": harness.account.inner(), "cash_class": {"stated": true, "class": "savings"}},
+                    {"account": second, "cash_class": {"stated": true}}
+                ]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["outcome"], "applied", "{body}");
+    assert_eq!(body[1]["outcome"], "rejected", "{body}");
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert_eq!(accounts[0]["cash_class"], "savings", "{accounts}");
+    assert!(accounts[1]["cash_class"].is_null(), "{accounts}");
+}
+
+#[tokio::test]
+async fn account_declarations_batch_requires_owner_administration_before_writing() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        put(
+            "/v1/accounts/declarations",
+            &harness.agent_token,
+            &json!({
+                "accounts": [{
+                    "account": harness.account.inner(),
+                    "cash_class": {"stated": true, "class": "savings"}
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, accounts) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accounts}");
+    assert!(accounts[0]["cash_class"].is_null(), "{accounts}");
+}
+
+#[tokio::test]
+async fn instrument_filter_returns_requested_instruments_and_missing_identifiers() {
+    let harness = seeded_harness();
+    let missing = Uuid::new_v4();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/instruments?ids={},{}",
+                harness.instrument.inner(),
+                missing
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["instruments"].as_array().expect("instruments").len(),
+        1,
+        "{body}"
+    );
+    assert_eq!(
+        body["instruments"][0]["id"],
+        harness.instrument.inner().to_string(),
+        "{body}"
+    );
+    assert_eq!(body["missing"], json!([missing.to_string()]), "{body}");
+}
+
+#[tokio::test]
+async fn instrument_filter_rejects_unknown_query_keys() {
+    let harness = seeded_harness();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            "/v1/instruments?instrument_ids=unknown",
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }

@@ -5628,6 +5628,111 @@ pub struct CreateAccountRequest {
     pub aliases: Vec<AccountAliasDto>,
 }
 
+/// One account result in a per-element account batch.
+///
+/// Account setup rows are independent statements about independent accounts.
+/// A malformed or refused row is reported here and does not roll back rows that
+/// were already applied; the owner can therefore correct one account without
+/// repeating the other eleven. `outcome` is `created`, `existing`, `applied` or
+/// `rejected`, and exactly one of `account`, `declarations` and `error` is set
+/// according to that outcome.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AccountBatchResultDto {
+    /// One-based position in the request batch.
+    pub row: usize,
+    /// `created`, `existing`, `applied` or `rejected`.
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declarations: Option<AccountDeclarationsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiError>,
+}
+
+impl AccountBatchResultDto {
+    #[must_use]
+    pub fn accepted(row: usize, outcome: &str, account: AccountDto) -> Self {
+        Self {
+            row,
+            outcome: outcome.to_owned(),
+            account: Some(account),
+            declarations: None,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn declarations(row: usize, value: AccountDeclarationsDto) -> Self {
+        Self {
+            row,
+            outcome: "applied".to_owned(),
+            account: None,
+            declarations: Some(value),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn rejected(row: usize, error: ApiError) -> Self {
+        Self {
+            row,
+            outcome: "rejected".to_owned(),
+            account: None,
+            declarations: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Several account creation requests, answered one row at a time.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateAccountsBatchRequest {
+    pub accounts: Vec<CreateAccountRequest>,
+}
+
+/// One account's alias replacement inside a batch.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ReplaceAccountAliasesBatchItem {
+    pub account: Uuid,
+    #[serde(flatten)]
+    pub request: ReplaceAccountAliasesRequest,
+}
+
+/// Several account alias replacements, answered one row at a time.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ReplaceAccountAliasesBatchRequest {
+    pub accounts: Vec<ReplaceAccountAliasesBatchItem>,
+}
+
+/// One account title replacement inside a batch.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RenameAccountBatchItem {
+    pub account: Uuid,
+    #[serde(flatten)]
+    pub request: RenameAccountRequest,
+}
+
+/// Several account title replacements, answered one row at a time.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RenameAccountsBatchRequest {
+    pub accounts: Vec<RenameAccountBatchItem>,
+}
+
+/// One account declaration replacement inside a batch.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ReplaceAccountDeclarationsBatchItem {
+    pub account: Uuid,
+    #[serde(flatten)]
+    pub request: ReplaceAccountDeclarationsRequest,
+}
+
+/// Several account declaration replacements, answered one row at a time.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ReplaceAccountDeclarationsBatchRequest {
+    pub accounts: Vec<ReplaceAccountDeclarationsBatchItem>,
+}
+
 /// The aliases an account carries, as the owner now states them.
 ///
 /// The whole set, not a change to it. An empty list is a real statement —
@@ -8772,6 +8877,19 @@ pub struct InstrumentDto {
     /// A quotation read as though it stood in either sibling states the
     /// position in money nobody quoted it in.
     pub quote_currency: String,
+}
+
+/// The instrument catalogue response.
+///
+/// `instruments` contains exactly the requested identifiers when `ids` is
+/// supplied; `missing` names the requested identifiers that were not in the
+/// catalogue. Missing identifiers are disclosed rather than turning a set
+/// lookup into a 404, because one absent holding must not hide the instruments
+/// whose pages can still be resolved.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InstrumentListDto {
+    pub instruments: Vec<InstrumentDto>,
+    pub missing: Vec<Uuid>,
 }
 
 /// Data for recording an instrument by an administrator or synchronisation.

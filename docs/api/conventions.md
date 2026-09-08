@@ -199,7 +199,7 @@ things. Read it as the lookup table for §1.
 | Route | Response | Shape | Why |
 |---|---|---|---|
 | `GET /v1/accounts` | `[AccountDto]` | bare array | whole list, nothing about the set |
-| `GET /v1/instruments` | `[InstrumentDto]` | bare array | whole catalogue |
+| `GET /v1/instruments` | `InstrumentListDto` | object, `instruments`, `missing` | requested instruments plus identifiers not found; the wrapper is required because a bare array cannot say which requested identifiers were missing |
 | `GET /v1/categories` | `[CategoryDto]` | bare array | whole history; each item carries its own retirement |
 | `GET /v1/category-groups` | `[CategoryGroupDto]` | bare array | whole list |
 | `GET /v1/category-rules` | `[CategoryRuleDto]` | bare array | whole history; the version is per rule, not per list |

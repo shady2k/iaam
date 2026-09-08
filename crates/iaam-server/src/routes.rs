@@ -4,7 +4,7 @@
 //! the result. There are no arithmetic operations on money here —
 //! this is enforced by the architecture guard (§3.1, §13).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -82,9 +82,9 @@ use crate::ServerState;
 use crate::action_catalog::ActionCatalog;
 use crate::api_catalog::ApiCatalog;
 use crate::dto::{
-    AccountAliasDto, AccountCandidateDto, AccountCashClassStatementDto, AccountDeclarationsDto,
-    AccountDto, AccountIdentityNotDoneDto, AccountIdentityRepointedDto, AccountIdentityStatedDto,
-    AccountIdentityStatementDto, AccountNameDispositionDto,
+    AccountAliasDto, AccountBatchResultDto, AccountCandidateDto, AccountCashClassStatementDto,
+    AccountDeclarationsDto, AccountDto, AccountIdentityNotDoneDto, AccountIdentityRepointedDto,
+    AccountIdentityStatedDto, AccountIdentityStatementDto, AccountNameDispositionDto,
     AccountNegativeBalanceExpectationStatementDto, AccountScopeDispositionDto, AccountScopeDto,
     AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
     ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto,
@@ -92,22 +92,25 @@ use crate::dto::{
     CategoryGroupRequest, CategoryMatcherDto, CategoryRequest, CategoryRuleBatchRequest,
     CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
     ClassificationRuleDto, ClassificationRuleRequest, ContourDto, ContourVersionDto,
-    CorrectImportRequest, CorrectionVerdictDto, CreateAccountRequest, CreateContourVersionRequest,
-    CreateInstrumentRequest, CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto,
-    CustodyRepairRequest, DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto,
-    DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto,
-    IssuedTokenDto, JournalAggregateDto, JournalEventReadDto, JournalPageDto, MarketFxDto,
-    MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
-    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
-    PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    CorrectImportRequest, CorrectionVerdictDto, CreateAccountRequest, CreateAccountsBatchRequest,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    CustodyRepairOutcomeDto, CustodyRepairRequest, DecisionDto, DeclaredAccountDto,
+    DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto,
+    InputAlternativeDto, InstrumentDto, InstrumentListDto, IssuedTokenDto, JournalAggregateDto,
+    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
+    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
+    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
+    OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
+    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
+    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
     RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
-    RenameAccountRequest, ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsRequest,
-    RequestPlanDto, RequiredInputDto, ResolutionOptionDto, ResolveInstrumentRequest,
-    ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest, SubmitJournalEventsRequest,
-    SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto, VerdictDto,
+    RenameAccountRequest, RenameAccountsBatchRequest, ReplaceAccountAliasesBatchRequest,
+    ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsBatchRequest,
+    ReplaceAccountDeclarationsRequest, RequestPlanDto, RequiredInputDto, ResolutionOptionDto,
+    ResolveInstrumentRequest, ResolvedInstrumentDto, ReturnsAnswerDto, SubmitCorrectionsRequest,
+    SubmitJournalEventsRequest, SubmitOperationsRequest, SyncOutcomeDto, TokenDto, TokenScopeDto,
+    VerdictDto,
 };
 use crate::dto::{
     AddImportRowsRequest, AnswerAlternativeDto, AnswerImportQuestionRequest,
@@ -161,6 +164,13 @@ pub const RECORD_ACCOUNT_NAME_DISPOSITION_OPERATION_ID: &str = "record_account_n
 pub const REPLACE_ACCOUNT_ALIASES_OPERATION_ID: &str = "replace_account_aliases";
 pub const RENAME_ACCOUNT_OPERATION_ID: &str = "rename_account";
 pub const REPLACE_ACCOUNT_DECLARATIONS_OPERATION_ID: &str = "replace_account_declarations";
+/// Batch forms are transport conveniences, not additional queue decisions:
+/// each row keeps the single-account operation's authority and outcome.
+pub const CREATE_ACCOUNTS_BATCH_OPERATION_ID: &str = "create_accounts_batch";
+pub const REPLACE_ACCOUNT_ALIASES_BATCH_OPERATION_ID: &str = "replace_account_aliases_batch";
+pub const RENAME_ACCOUNTS_BATCH_OPERATION_ID: &str = "rename_accounts_batch";
+pub const REPLACE_ACCOUNT_DECLARATIONS_BATCH_OPERATION_ID: &str =
+    "replace_account_declarations_batch";
 pub const RECORD_ACCOUNT_TRANSFER_PARTNERS_OPERATION_ID: &str = "record_account_transfer_partners";
 /// The batch form. Deliberately absent from [`OperationKey`]: the action queue
 /// names the per-account operation, one item per account, and this is the
@@ -411,19 +421,90 @@ fn account_candidate_dtos(candidates: &[AccountCandidate]) -> Vec<AccountCandida
         .collect()
 }
 
-/// List of instruments in the global reference catalogue.
+/// Set filter for the global instrument catalogue.
+///
+/// `ids` is a comma-separated set of UUIDs. The response always carries both
+/// the instruments found and the identifiers missing from the catalogue, so a
+/// page of holdings can continue with the rows that resolved instead of
+/// treating one unknown identifier as a failure of the whole request.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct InstrumentListParams {
+    /// Comma-separated instrument identifiers. Omit it to list the catalogue.
+    #[serde(default)]
+    pub ids: Option<String>,
+}
+impl crate::extract::QueryRequirements for InstrumentListParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
+/// List the global instrument catalogue, optionally by a set of identifiers.
 #[utoipa::path(
     get,
     path = "/v1/instruments",
-    responses((status = 200, description = "Reference catalogue instruments", body = [InstrumentDto])),
+    params(InstrumentListParams),
+    responses(
+        (status = 200, description = "Requested reference catalogue instruments and identifiers not found", body = InstrumentListDto),
+        (status = 422, description = "An instrument identifier could not be parsed", body = ApiError)
+    ),
     security(("bearer" = []))
 )]
 pub async fn list_instruments(
     State(state): State<ServerState>,
     Extension(_principal): Extension<Principal>,
-) -> Result<Json<Vec<InstrumentDto>>, ApiFailure> {
+    ApiQuery(params): ApiQuery<InstrumentListParams>,
+) -> Result<Json<InstrumentListDto>, ApiFailure> {
+    let requested = parse_instrument_ids(params.ids.as_deref())?;
     let instruments = state.services.directory.list_instruments().await?;
-    Ok(Json(instruments.into_iter().map(instrument_dto).collect()))
+    let mut found = BTreeSet::new();
+    let selected = instruments
+        .into_iter()
+        .filter(|instrument| {
+            requested
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&instrument.id.inner()))
+        })
+        .map(|instrument| {
+            found.insert(instrument.id.inner());
+            instrument_dto(instrument)
+        })
+        .collect();
+    let missing = requested
+        .map(|ids| ids.into_iter().filter(|id| !found.contains(id)).collect())
+        .unwrap_or_default();
+    Ok(Json(InstrumentListDto {
+        instruments: selected,
+        missing,
+    }))
+}
+
+fn parse_instrument_ids(value: Option<&str>) -> Result<Option<BTreeSet<Uuid>>, ApiFailure> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Err(unprocessable(
+            "ids",
+            "a comma-separated set of instrument UUIDs",
+            value,
+            "an empty identifier set is not a catalogue filter",
+        ));
+    }
+    value
+        .split(',')
+        .map(|part| {
+            Uuid::parse_str(part.trim()).map_err(|_| {
+                unprocessable(
+                    "ids",
+                    "a comma-separated set of instrument UUIDs",
+                    value,
+                    "every requested instrument identifier must be a UUID",
+                )
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(Some)
 }
 
 /// One instrument from the global reference catalogue.
@@ -1867,30 +1948,8 @@ pub async fn create_account(
     // stored as no identity at all. This is a check on the shape of the pair and
     // never on the value: `provider_account_id` stays opaque, and the refusal
     // does not echo it back.
-    let (provider, provider_account_id) = match (request.provider, request.provider_account_id) {
-        (Some(provider), Some(provider_account_id)) => (Some(provider), Some(provider_account_id)),
-        (None, None) => (None, None),
-        (Some(_), None) => {
-            return Err(unprocessable(
-                "provider_account_id",
-                "both halves of the external identity, or neither",
-                "provider alone",
-                "an account identified at a source is identified by the pair: a \
-                 request naming only the source would be stored as naming no \
-                 identity, and the next import would mint a second account",
-            ));
-        }
-        (None, Some(_)) => {
-            return Err(unprocessable(
-                "provider",
-                "both halves of the external identity, or neither",
-                "provider_account_id alone",
-                "an identifier without the source that printed it has no scope: \
-                 two sources printing short sequential identifiers would collide \
-                 on values neither of them controls",
-            ));
-        }
-    };
+    let (provider, provider_account_id) =
+        external_identity_pair(request.provider, request.provider_account_id)?;
 
     let aliases = alias_views(request.aliases)?;
 
@@ -1932,6 +1991,450 @@ pub async fn create_account(
     )
     .await?;
     Ok((status, Json(account_dto(account))))
+}
+
+/// Validate the external identity pair used by account creation and declaration
+/// replacement. The pair is opaque; only its two-halves shape is checked.
+fn external_identity_pair(
+    provider: Option<String>,
+    provider_account_id: Option<String>,
+) -> Result<(Option<String>, Option<String>), ApiFailure> {
+    match (provider, provider_account_id) {
+        (Some(provider), Some(provider_account_id)) => {
+            Ok((Some(provider), Some(provider_account_id)))
+        }
+        (None, None) => Ok((None, None)),
+        (Some(_), None) => Err(unprocessable(
+            "provider_account_id",
+            "both halves of the external identity, or neither",
+            "provider alone",
+            "an account identified at a source is identified by the pair: a \
+             request naming only the source would be stored as naming no \
+             identity, and the next import would mint a second account",
+        )),
+        (None, Some(_)) => Err(unprocessable(
+            "provider",
+            "both halves of the external identity, or neither",
+            "provider_account_id alone",
+            "an identifier without the source that printed it has no scope: \
+             two sources printing short sequential identifiers would collide \
+             on values neither of them controls",
+        )),
+    }
+}
+
+/// Create several accounts, returning one outcome per request row.
+///
+/// Account creation is per-element: each row is an independent account or an
+/// idempotent upsert, so a malformed identity on one row is not something the
+/// owner meant to apply to the other accounts in the batch. The response keeps
+/// the distinction between `created` and `existing` from the single route.
+///
+/// `/v1/accounts/batch` is deliberate rather than `/v1/accounts`: the latter
+/// already names the single-account create operation, and changing its body
+/// shape would make an existing caller's one account ambiguous.
+#[utoipa::path(
+    post,
+    path = "/v1/accounts/batch",
+    operation_id = CREATE_ACCOUNTS_BATCH_OPERATION_ID,
+    request_body = CreateAccountsBatchRequest,
+    responses(
+        (status = 200, description = "One account outcome per request row", body = Vec<AccountBatchResultDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_accounts_batch(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiJson(request): ApiJson<CreateAccountsBatchRequest>,
+) -> Result<Json<Vec<AccountBatchResultDto>>, ApiFailure> {
+    require(&principal, OperationKey::CreateAccount)?;
+    let mut outcomes = Vec::with_capacity(request.accounts.len());
+    for (index, request) in request.accounts.into_iter().enumerate() {
+        let row = index + 1;
+        let (provider, provider_account_id) =
+            match external_identity_pair(request.provider, request.provider_account_id) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    outcomes.push(AccountBatchResultDto::rejected(row, error.into_error()));
+                    continue;
+                }
+            };
+        let aliases = match alias_views(request.aliases) {
+            Ok(aliases) => aliases,
+            Err(error) => {
+                outcomes.push(AccountBatchResultDto::rejected(row, error.into_error()));
+                continue;
+            }
+        };
+        let account = AccountDetailView {
+            id: AccountId::new_random(),
+            title: request.title,
+            institution: request.institution,
+            provider,
+            provider_account_id,
+            cash_class: request.cash_class.map(CashAssetClassDto::to_domain),
+            negative_balance_expectation: request
+                .negative_balance_expectation
+                .map(NegativeBalanceExpectationDto::to_domain),
+            aliases,
+        };
+        let created = match state
+            .services
+            .store
+            .create_account(principal.owner, account)
+            .await
+        {
+            Ok(created) => created,
+            Err(error) => {
+                outcomes.push(AccountBatchResultDto::rejected(
+                    row,
+                    ApiFailure::body_from_app(error, &catalog),
+                ));
+                continue;
+            }
+        };
+        let (outcome, account) = match created {
+            AccountCreated::Created(account) => ("created", account),
+            AccountCreated::Existing(account) => ("existing", account),
+        };
+        record_decision(
+            &state,
+            &principal,
+            OperationKey::CreateAccount,
+            account.id.inner().to_string(),
+            serde_json::json!({"account": account.id.inner()}),
+            "retire the account; an account carrying no facts is inert",
+        )
+        .await?;
+        outcomes.push(AccountBatchResultDto::accepted(
+            row,
+            outcome,
+            account_dto(account),
+        ));
+    }
+    Ok(Json(outcomes))
+}
+
+/// Replace several accounts' alias sets, returning one outcome per row.
+///
+/// Alias sets are independent statements about independent accounts. A bad
+/// interval or unknown account therefore rejects only that row; applying the
+/// other rows is a state the owner could have meant, unlike a batch that
+/// pretended one account's source vocabulary completed another's.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/aliases",
+    operation_id = REPLACE_ACCOUNT_ALIASES_BATCH_OPERATION_ID,
+    request_body = ReplaceAccountAliasesBatchRequest,
+    responses(
+        (status = 200, description = "One alias replacement outcome per request row", body = Vec<AccountBatchResultDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn replace_account_aliases_batch(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiJson(request): ApiJson<ReplaceAccountAliasesBatchRequest>,
+) -> Result<Json<Vec<AccountBatchResultDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let mut outcomes = Vec::with_capacity(request.accounts.len());
+    let mut seen = BTreeMap::new();
+    let mut accounts: BTreeMap<_, _> = state
+        .services
+        .store
+        .list_account_details(principal.owner)
+        .await?
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect();
+    for (index, item) in request.accounts.into_iter().enumerate() {
+        let row = index + 1;
+        if let Some(first) = seen.insert(AccountId(item.account), row) {
+            outcomes.push(AccountBatchResultDto::rejected(
+                row,
+                duplicate_batch_account_error(row, first),
+            ));
+            continue;
+        }
+        if !accounts.contains_key(&AccountId(item.account)) {
+            outcomes.push(AccountBatchResultDto::rejected(
+                row,
+                ApiError::simple("not_found", format!("not found: account {}", item.account)),
+            ));
+            continue;
+        }
+        let aliases = match alias_views(item.request.aliases) {
+            Ok(aliases) => aliases,
+            Err(error) => {
+                outcomes.push(AccountBatchResultDto::rejected(row, error.into_error()));
+                continue;
+            }
+        };
+        let aliases_for_account = aliases.clone();
+        if let Err(error) = state
+            .services
+            .store
+            .replace_account_aliases(principal.owner, AccountId(item.account), aliases)
+            .await
+        {
+            outcomes.push(AccountBatchResultDto::rejected(
+                row,
+                ApiFailure::body_from_app(error, &catalog),
+            ));
+            continue;
+        }
+        let account = match accounts.get_mut(&AccountId(item.account)) {
+            Some(account) => {
+                account.aliases = aliases_for_account;
+                account.clone()
+            }
+            None => {
+                outcomes.push(AccountBatchResultDto::rejected(
+                    row,
+                    ApiError::simple("not_found", format!("not found: account {}", item.account)),
+                ));
+                continue;
+            }
+        };
+        outcomes.push(AccountBatchResultDto::accepted(
+            row,
+            "applied",
+            account_dto(account),
+        ));
+    }
+    Ok(Json(outcomes))
+}
+
+/// Rename several accounts, returning one outcome per row.
+///
+/// A title is the owner's independent word for one account. A blank title is
+/// refused for that row, while a valid rename for another account remains a
+/// meaningful partial result rather than an accidental rollback.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/title",
+    operation_id = RENAME_ACCOUNTS_BATCH_OPERATION_ID,
+    request_body = RenameAccountsBatchRequest,
+    responses(
+        (status = 200, description = "One account title outcome per request row", body = Vec<AccountBatchResultDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "A title is blank", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn rename_accounts_batch(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiJson(request): ApiJson<RenameAccountsBatchRequest>,
+) -> Result<Json<Vec<AccountBatchResultDto>>, ApiFailure> {
+    require_submit(&principal)?;
+    let mut outcomes = Vec::with_capacity(request.accounts.len());
+    let mut seen = BTreeMap::new();
+    let mut accounts: BTreeMap<_, _> = state
+        .services
+        .store
+        .list_account_details(principal.owner)
+        .await?
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect();
+    for (index, item) in request.accounts.into_iter().enumerate() {
+        let row = index + 1;
+        if let Some(first) = seen.insert(AccountId(item.account), row) {
+            outcomes.push(AccountBatchResultDto::rejected(
+                row,
+                duplicate_batch_account_error(row, first),
+            ));
+            continue;
+        }
+        let institution = match accounts.get(&AccountId(item.account)) {
+            Some(account) => account.institution.clone(),
+            None => {
+                outcomes.push(AccountBatchResultDto::rejected(
+                    row,
+                    ApiError::simple("not_found", format!("not found: account {}", item.account)),
+                ));
+                continue;
+            }
+        };
+        let title = match validated_account_title(item.request.title) {
+            Ok(title) => title,
+            Err(error) => {
+                outcomes.push(AccountBatchResultDto::rejected(row, error.into_error()));
+                continue;
+            }
+        };
+        if let Err(error) = state
+            .services
+            .store
+            .upsert_account(
+                principal.owner,
+                AccountView {
+                    id: AccountId(item.account),
+                    title: title.to_owned(),
+                    institution,
+                },
+            )
+            .await
+        {
+            outcomes.push(AccountBatchResultDto::rejected(
+                row,
+                ApiFailure::body_from_app(error, &catalog),
+            ));
+            continue;
+        }
+        let account = match accounts.get_mut(&AccountId(item.account)) {
+            Some(account) => {
+                account.title = title;
+                account.clone()
+            }
+            None => {
+                outcomes.push(AccountBatchResultDto::rejected(
+                    row,
+                    ApiError::simple("not_found", format!("not found: account {}", item.account)),
+                ));
+                continue;
+            }
+        };
+        outcomes.push(AccountBatchResultDto::accepted(
+            row,
+            "applied",
+            account_dto(account),
+        ));
+    }
+    Ok(Json(outcomes))
+}
+
+/// Replace several accounts' declarations, returning one outcome per row.
+///
+/// Each row is the owner's statement about one account's identity and
+/// declarations. The statements are independent, so a malformed declaration
+/// or an identity conflict rejects only its row; other accounts remain exactly
+/// as the owner stated them.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/declarations",
+    operation_id = REPLACE_ACCOUNT_DECLARATIONS_BATCH_OPERATION_ID,
+    request_body = ReplaceAccountDeclarationsBatchRequest,
+    responses(
+        (status = 200, description = "One declaration replacement outcome per request row", body = Vec<AccountBatchResultDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+    ),
+    security(("bearer" = []))
+)]
+pub async fn replace_account_declarations_batch(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiJson(request): ApiJson<ReplaceAccountDeclarationsBatchRequest>,
+) -> Result<Json<Vec<AccountBatchResultDto>>, ApiFailure> {
+    require_admin(&principal)?;
+    let mut outcomes = Vec::with_capacity(request.accounts.len());
+    let accounts: BTreeMap<_, _> = state
+        .services
+        .store
+        .list_accounts(principal.owner)
+        .await?
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect();
+    let mut seen = BTreeMap::new();
+    for (index, item) in request.accounts.into_iter().enumerate() {
+        let row = index + 1;
+        if let Some(first) = seen.insert(AccountId(item.account), row) {
+            outcomes.push(AccountBatchResultDto::rejected(
+                row,
+                duplicate_batch_account_error(row, first),
+            ));
+            continue;
+        }
+        if !accounts.contains_key(&AccountId(item.account)) {
+            outcomes.push(AccountBatchResultDto::rejected(
+                row,
+                ApiError::simple("not_found", format!("not found: account {}", item.account)),
+            ));
+            continue;
+        }
+        let request = item.request;
+        let declarations = match (
+            identity_statement(request.identity),
+            statement(
+                request.cash_class,
+                |stated| stated.class,
+                "cash_class.class",
+            ),
+            statement(
+                request.negative_balance_expectation,
+                |stated| stated.expectation,
+                "negative_balance_expectation.expectation",
+            ),
+        ) {
+            (Ok(identity), Ok(cash_class), Ok(negative_balance_expectation)) => {
+                AccountDeclarations {
+                    identity,
+                    cash_class: cash_class.map_stated(CashAssetClassDto::to_domain),
+                    negative_balance_expectation: negative_balance_expectation
+                        .map_stated(NegativeBalanceExpectationDto::to_domain),
+                }
+            }
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                outcomes.push(AccountBatchResultDto::rejected(row, error.into_error()));
+                continue;
+            }
+        };
+        let recorded = match state
+            .services
+            .store
+            .replace_account_declarations(principal.owner, AccountId(item.account), declarations)
+            .await
+        {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                outcomes.push(AccountBatchResultDto::rejected(
+                    row,
+                    ApiFailure::body_from_app(error, &catalog),
+                ));
+                continue;
+            }
+        };
+        let identity_repointed = match recorded.previous_identity {
+            None => None,
+            Some(previous) => Some(AccountIdentityRepointedDto {
+                previous: AccountIdentityStatedDto {
+                    provider: previous.provider,
+                    provider_account_id: previous.provider_account_id,
+                },
+                facts_recorded: false,
+                not_done: identity_repointed_not_done(),
+            }),
+        };
+        outcomes.push(AccountBatchResultDto::declarations(
+            row,
+            AccountDeclarationsDto {
+                account: account_dto(recorded.account),
+                identity_repointed,
+            },
+        ));
+    }
+    Ok(Json(outcomes))
 }
 
 /// State an account's aliases.
@@ -2055,16 +2558,7 @@ pub async fn rename_account(
     // Trimmed and refused when nothing is left, exactly as a category group's
     // title is: a name of spaces is not a name, and storing one would leave a
     // heading the owner cannot tell from a missing one.
-    let title = request.title.trim();
-    if title.is_empty() {
-        return Err(unprocessable(
-            "title",
-            "a title with something in it",
-            "blank",
-            "a name of spaces reads as a missing name in every report heading it \
-             appears in, and the owner cannot tell the two apart",
-        ));
-    }
+    let title = validated_account_title(request.title)?;
 
     state
         .services
@@ -2093,6 +2587,33 @@ pub async fn rename_account(
             )
         })?;
     Ok(Json(account_dto(stored)))
+}
+
+/// Trim and validate the owner's new account title.
+fn validated_account_title(title: String) -> Result<String, ApiFailure> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(unprocessable(
+            "title",
+            "a title with something in it",
+            "blank",
+            "a name of spaces reads as a missing name in every report heading it \
+             appears in, and the owner cannot tell the two apart",
+        ));
+    }
+    Ok(title.to_owned())
+}
+
+/// Explain a repeated account entry without making the later row look like a
+/// successful last-write-wins update.
+fn duplicate_batch_account_error(row: usize, first: usize) -> ApiError {
+    ApiError::simple(
+        "invalid_request",
+        format!("account is already named by batch row {first}"),
+    )
+    .about(format!("accounts[{}].account", row - 1))
+    .expecting("an account named at most once in the batch")
+    .receiving(format!("a second entry for the account from row {first}"))
 }
 
 /// State an account's declarations: its external identity, its cash class, and
@@ -6558,7 +7079,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// [`require_admin`] states: the queue and the caveat register are about the
 /// owner's money and these are about the shape of the instance, so there is no
 /// second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 27] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 31] = [
     (
         "rename_account",
         "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
@@ -6666,6 +7187,22 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 27] = [
     (
         "revoke_token",
         "Owner-only administration: who may call at all.",
+    ),
+    (
+        "create_accounts_batch",
+        "A batch spelling of create_account: each row is independently created under that single-account operation's floor, so no item or caveat needs a second authority for the transport convenience.",
+    ),
+    (
+        "replace_account_aliases_batch",
+        "A batch spelling of replace_account_aliases: each row is independently validated and written under the single-account administration floor, so the batch adds no new authority.",
+    ),
+    (
+        "rename_accounts_batch",
+        "A batch spelling of rename_account: each row is independently validated and written under the owner's submit floor, so the batch adds no new authority.",
+    ),
+    (
+        "replace_account_declarations_batch",
+        "A batch spelling of replace_account_declarations: each row is independently validated and written under the owner's administration floor, so the batch adds no new authority.",
     ),
 ];
 

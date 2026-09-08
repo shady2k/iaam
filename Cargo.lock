@@ -1170,6 +1170,7 @@ dependencies = [
  "iaam-broker",
  "iaam-core",
  "rusqlite",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2",

@@ -30482,3 +30482,228 @@ async fn the_journal_aggregate_refuses_more_than_its_group_ceiling() {
     drop(harness);
     let _ = std::fs::remove_file(path);
 }
+#[tokio::test]
+async fn the_journal_filters_by_a_list_of_kinds_on_rows_and_aggregate() {
+    let harness = harness();
+    ingest_deposit(
+        &harness,
+        harness.account,
+        "1.01",
+        "2026-09-01",
+        "kind-income",
+        None,
+    )
+    .await;
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "kind filter fixture",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "withdrawal",
+                    "amount": "2.02",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-09-02" },
+                    "idempotency_key": "kind-cash-out"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?kind=cash_in,cash_out",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let keys: Vec<_> = page["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["idempotency_key"].as_str().expect("key"))
+        .collect();
+    assert_eq!(keys, ["kind-income", "kind-cash-out"], "{page}");
+
+    let (status, aggregate) = call(
+        &harness.router,
+        get(
+            "/v1/journal/aggregate?kind=cash_in,cash_out&group_by=kind",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{aggregate}");
+    let groups = aggregate["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2, "{aggregate}");
+    assert!(
+        groups
+            .iter()
+            .any(|group| group["kind"] == "cash_in" && group["events"] == 1),
+        "{aggregate}"
+    );
+    assert!(
+        groups
+            .iter()
+            .any(|group| group["kind"] == "cash_out" && group["events"] == 1),
+        "{aggregate}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_journal_kind_names_the_accepted_vocabulary() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?kind=not_a_kind",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "kind", "{body}");
+    let expected = body["expected"].as_str().unwrap_or_default();
+    for kind in EventKind::discriminants() {
+        assert!(expected.contains(kind), "{kind} missing from {body}");
+    }
+}
+
+#[tokio::test]
+async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
+    let (harness, path) = harness_on_disk();
+    let rub = CurrencyCode::Rub;
+    let usd = CurrencyCode::Usd;
+    let amount = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(303), rub);
+    let event = iaam_core::event::Event {
+        id: iaam_core::ids::EventId::new_random(),
+        schema_version: iaam_core::event::SCHEMA_VERSION,
+        owner: harness.owner,
+        account: harness.account,
+        kind: EventKind::CashIn { amount },
+        dates: EventDates::for_cash(CashPostedDate(date!(2026 - 09 - 03))),
+        order: iaam_core::dates::EffectiveOrder::new(date!(2026 - 09 - 03), 1),
+        legs: vec![
+            iaam_core::event::leg::Leg::cash(harness.account, amount),
+            iaam_core::event::leg::Leg::cash(
+                harness.account,
+                iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(404), usd),
+            ),
+        ],
+        provenance: iaam_core::event::provenance::Provenance::new(
+            SourceId::new_random(),
+            iaam_core::event::provenance::RawHash::parse(&"c".repeat(64)).expect("hash"),
+            ParserVersion("journal-currency-filter".to_owned()),
+        ),
+        relation: iaam_core::event::Relation::None,
+        confidence: iaam_core::event::Confidence::Known,
+        idempotency_key: Some("currency-mixed-event".to_owned()),
+    };
+    SqliteStore::open(&path)
+        .expect("second connection")
+        .append_event(&event, IdentityScope::Source)
+        .expect("mixed-currency event");
+
+    let (status, page) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?currency=USD",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let rows = page["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{page}");
+    assert_eq!(rows[0]["idempotency_key"], "currency-mixed-event");
+    let currencies: Vec<_> = rows[0]["legs"]
+        .as_array()
+        .expect("legs")
+        .iter()
+        .map(|leg| leg["currency"].as_str().expect("currency"))
+        .collect();
+    assert_eq!(currencies, ["RUB", "USD"], "{page}");
+
+    let (status, aggregate) = call(
+        &harness.router,
+        get(
+            "/v1/journal/aggregate?currency=USD&group_by=currency",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{aggregate}");
+    let groups = aggregate["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 2, "{aggregate}");
+    assert!(
+        groups.iter().any(|group| {
+            group["currency"] == "RUB"
+                && group["cash"] == json!([{ "amount": "3.03", "currency": "RUB" }])
+                && group["events"] == 1
+        }),
+        "{aggregate}"
+    );
+    assert!(
+        groups.iter().any(|group| {
+            group["currency"] == "USD"
+                && group["cash"] == json!([{ "amount": "4.04", "currency": "USD" }])
+                && group["events"] == 1
+        }),
+        "{aggregate}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn journal_content_filters_are_published_on_both_routes() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    for route in ["/v1/journal/events", "/v1/journal/aggregate"] {
+        let parameters = spec["paths"][route]["get"]["parameters"]
+            .as_array()
+            .expect("journal parameters");
+        for name in ["kind", "currency"] {
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from {route}: {spec}"));
+            assert!(
+                parameter["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "{name} has no published description on {route}: {spec}"
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn an_unknown_journal_currency_names_the_accepted_vocabulary() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?currency=CHF",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "currency", "{body}");
+    let expected = body["expected"].as_str().unwrap_or_default();
+    for currency in ["RUB", "USD", "EUR", "CNY", "XAU"] {
+        assert!(
+            expected.contains(currency),
+            "{currency} missing from {body}"
+        );
+    }
+}

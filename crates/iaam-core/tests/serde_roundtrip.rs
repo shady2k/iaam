@@ -315,34 +315,13 @@ fn every_kind() -> Vec<Event> {
     ]
 }
 
-/// All event kinds that the JSON round trip must cover.
-///
-/// The list is pinned manually and checked against the samples: without this check, the test
-/// would still call itself «every kind» without covering every kind. This has already
-/// happened — `control_assertion` was missing from the samples.
-const EVERY_DISCRIMINANT: [&str; 17] = [
-    "trade",
-    "cash_in",
-    "cash_out",
-    "refund",
-    "cash_transfer",
-    "own_account_movement",
-    "unresolved_own_account_movement",
-    "income",
-    "fee",
-    "tax",
-    "opening_position",
-    "opening_cash",
-    "valuation",
-    "control_assertion",
-    "import_coverage_gap",
-    "corporate_action",
-    "offer_exercise",
-];
+// The core vocabulary is published by `EventKind::discriminants()` beside
+// `discriminant()`. The set equality below ties that list to `every_kind()`;
+// this has already caught a missing `control_assertion` sample.
 
-/// Exhaustiveness guard for the list above: a new variant must break the build
+/// Exhaustiveness guard for the fixture: a new variant must break the build
 /// here. There is intentionally no `_` arm — it is exactly the hole that
-/// this guard exists to prevent (§15.1).
+/// forces every variant into `every_kind()`.
 fn is_known(kind: &EventKind) -> bool {
     match kind {
         EventKind::Trade { .. }
@@ -372,7 +351,7 @@ fn the_round_trip_covers_every_event_kind() {
         .inspect(|event| assert!(is_known(&event.kind)))
         .map(|event| event.kind.discriminant())
         .collect();
-    let expected: BTreeSet<&str> = EVERY_DISCRIMINANT.into_iter().collect();
+    let expected: BTreeSet<&str> = EventKind::discriminants().iter().copied().collect();
     assert_eq!(
         covered, expected,
         "the event kind has no sample: the JSON round trip does not test it"

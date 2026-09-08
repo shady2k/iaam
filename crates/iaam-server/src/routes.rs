@@ -58,6 +58,7 @@ use iaam_core::category::{
     CategoryInterval, CategoryMatcher, CategoryRuleProposal, DescriptionMatchMode,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
     AccountId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId, EventId, ImportId,
@@ -5456,6 +5457,16 @@ macro_rules! journal_params {
             /// uses for an account, while `account` asks only where the event is filed.
             #[serde(default)]
             pub touching: Option<Uuid>,
+            /// Comma-separated closed vocabulary of event kinds. It selects an
+            /// event when its own kind matches any value; it does not narrow the
+            /// event's legs.
+            #[serde(default)]
+            pub kind: Option<String>,
+            /// Comma-separated ISO currency codes. It selects an event when any
+            /// leg carries a matching money currency; the whole event returns,
+            /// including legs in other currencies.
+            #[serde(default)]
+            pub currency: Option<String>,
             /// Account of the source the caller declared when it submitted. Supplied
             /// together with `source_channel`; the pair is how a caller asks what one
             /// import put in.
@@ -5635,6 +5646,17 @@ pub async fn list_journal_events(
         .as_deref()
         .map(|value| parse_query_date("to", value))
         .transpose()?;
+    let kinds = params
+        .kind
+        .as_deref()
+        .map(parse_journal_kinds)
+        .transpose()?;
+    let currencies = params
+        .currency
+        .as_deref()
+        .map(parse_journal_currencies)
+        .transpose()?
+        .unwrap_or_default();
     let source = declared_source_filter(params.source_account, params.source_channel)?;
     let declared_import =
         declared_import_filter(principal.owner, source.as_ref(), params.source_label)?;
@@ -5645,6 +5667,8 @@ pub async fn list_journal_events(
             idempotency_key: params.idempotency_key,
             account: params.account.map(AccountId),
             touching: params.touching.map(AccountId),
+            kinds: kinds.unwrap_or_default(),
+            currencies,
             source,
             import: params.import.map(ImportId).or(declared_import),
             import_session: params.import_session.map(ImportSessionId),
@@ -5711,6 +5735,17 @@ pub async fn aggregate_journal_route(
         .as_deref()
         .map(|value| parse_query_date("to", value))
         .transpose()?;
+    let kinds = params
+        .kind
+        .as_deref()
+        .map(parse_journal_kinds)
+        .transpose()?;
+    let currencies = params
+        .currency
+        .as_deref()
+        .map(parse_journal_currencies)
+        .transpose()?
+        .unwrap_or_default();
     let source = declared_source_filter(params.source_account, params.source_channel)?;
     let declared_import =
         declared_import_filter(principal.owner, source.as_ref(), params.source_label)?;
@@ -5721,6 +5756,8 @@ pub async fn aggregate_journal_route(
         JournalAggregateQuery {
             account: params.account.map(AccountId),
             touching: params.touching.map(AccountId),
+            kinds: kinds.unwrap_or_default(),
+            currencies,
             source,
             import: params.import.map(ImportId).or(declared_import),
             import_session: params.import_session.map(ImportSessionId),
@@ -6027,6 +6064,33 @@ fn parse_held_scope(value: Option<&str>) -> Result<HeldScope, ApiFailure> {
         sessions.push(ImportSessionId(parsed));
     }
     Ok(HeldScope::Named(sessions))
+}
+
+fn parse_journal_kinds(value: &str) -> Result<Vec<String>, ApiFailure> {
+    let expected = format!(
+        "a comma-separated list of one or more of: {}",
+        EventKind::discriminants().join(", ")
+    );
+    if value.is_empty() {
+        return Err(invalid_field("kind", &expected, value.to_owned()));
+    }
+    value
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            EventKind::discriminants()
+                .contains(&part)
+                .then(|| part.to_owned())
+                .ok_or_else(|| invalid_field("kind", &expected, part.to_owned()))
+        })
+        .collect()
+}
+
+fn parse_journal_currencies(value: &str) -> Result<Vec<CurrencyCode>, ApiFailure> {
+    value
+        .split(',')
+        .map(|part| parse_currency("currency", part.trim()))
+        .collect()
 }
 
 fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure> {

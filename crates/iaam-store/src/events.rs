@@ -8,6 +8,7 @@ use iaam_core::event::{Event, Relation};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
 };
+use iaam_core::money::CurrencyCode;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::IdentityScope;
@@ -541,6 +542,11 @@ pub struct JournalQuery {
     pub account: Option<AccountId>,
     /// Only facts whose event account or one of their legs is this account.
     pub touching: Option<AccountId>,
+    /// Only facts of one of these event-family discriminants.
+    pub kinds: Vec<String>,
+    /// Only facts with at least one leg whose money has one of these currencies.
+    /// The whole event remains selected, including legs in other currencies.
+    pub currencies: Vec<CurrencyCode>,
     pub source: Option<SourceId>,
     /// Only facts committed out of this import session.
     pub import_session: Option<ImportSessionId>,
@@ -583,7 +589,7 @@ impl SqliteStore {
         owner: OwnerId,
         query: &JournalQuery,
     ) -> Result<Vec<Event>, StoreError> {
-        let (sql, parameters) = journal_sql(owner, query);
+        let (sql, parameters) = journal_sql(owner, query)?;
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -648,16 +654,55 @@ fn source_categories_sql(
     (sql, parameters)
 }
 
+fn currency_storage_name(currency: CurrencyCode) -> Result<String, StoreError> {
+    let value = serde_json::to_value(currency).map_err(StoreError::CurrencyEncode)?;
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| StoreError::InvalidValue {
+            field: "journal currency serialization",
+            value: value.to_string(),
+        })
+}
+
 ///
 /// The SQL is built rather than written out because the handles are
 /// independent: spelling every combination would be sixteen statements that
 /// must agree on the ordering, and one of them would eventually not.
 /// Nothing from the caller is interpolated — only placeholder numbers are —
 /// so a value can never become SQL.
-fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+fn journal_sql(
+    owner: OwnerId,
+    query: &JournalQuery,
+) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>), StoreError> {
     let mut sql = String::from("SELECT id, payload FROM events WHERE owner = ?1");
     let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(owner.inner().to_string())];
 
+    if !query.kinds.is_empty() {
+        sql.push_str(" AND kind IN (");
+        for (index, kind) in query.kinds.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            parameters.push(Box::new(kind.clone()));
+            sql.push_str(&format!("?{}", parameters.len()));
+        }
+        sql.push(')');
+    }
+    if !query.currencies.is_empty() {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM json_each(events.payload, '$.legs') AS leg \
+             WHERE json_extract(leg.value, '$.money.currency') IN (",
+        );
+        for (index, currency) in query.currencies.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            parameters.push(Box::new(currency_storage_name(*currency)?));
+            sql.push_str(&format!("?{}", parameters.len()));
+        }
+        sql.push_str("))");
+    }
     let mut bind = |sql: &mut String, clause: &str, value: Box<dyn rusqlite::ToSql>| {
         parameters.push(value);
         sql.push_str(&clause.replace('?', &format!("?{}", parameters.len())));
@@ -753,7 +798,7 @@ fn journal_sql(owner: OwnerId, query: &JournalQuery) -> (String, Vec<Box<dyn rus
 
     sql.push_str(" ORDER BY effective_date, sequence");
     bind(&mut sql, " LIMIT ?", Box::new(i64::from(query.limit)));
-    (sql, parameters)
+    Ok((sql, parameters))
 }
 
 /// One fact of a chain, with the moment this instance wrote it down.

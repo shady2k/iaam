@@ -6,15 +6,19 @@ use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, Fra
 use iaam_core::event::kind::{EventKind, IncomeKind};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
-use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
+use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::{Confidence, Event, Relation};
-use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
+use iaam_core::ids::{
+    AccountId, ClassificationRuleId, CustodyId, EventId, ImportSessionId, InstrumentId, OwnerId,
+    SourceId,
+};
+use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
 use iaam_store::bundle::ImportOutcome;
-use iaam_store::reference::AccountRecord;
+use iaam_store::reference::{AccountRecord, CustodyRecord, InstrumentRecord};
 use time::macros::date;
 
 fn deposit(owner: OwnerId, account: AccountId, sequence: u32, minor: i64) -> Event {
@@ -314,12 +318,71 @@ fn bond_event(
     }
 }
 
+/// The instrument and custody place `every_new_fact`'s events name.
+///
+/// `event_legs.instrument` and `.custody` are real, undeferred foreign keys
+/// (relational journal design §4.2) — unlike `import_session` or
+/// `settled_by_rule`, they are not exempted because the bundle carries no
+/// reference-data section at all (design §4.1: "events, accounts and
+/// contours and nothing else"). So a fact naming an instrument or custody
+/// place is only writable where that reference data already exists — on
+/// export, because it was registered before the fact was; on import, the
+/// same way an independent market-data sync would have populated it before
+/// a real restore. Both stores this test writes to must register this data
+/// themselves; the bundle does not carry it for them.
+struct BondReferenceData {
+    instrument: InstrumentId,
+    successor: InstrumentId,
+    custody: CustodyId,
+}
+
+impl BondReferenceData {
+    fn new() -> Self {
+        Self {
+            instrument: InstrumentId::new_random(),
+            successor: InstrumentId::new_random(),
+            custody: CustodyId::new_random(),
+        }
+    }
+
+    fn register_in(&self, store: &SqliteStore, owner: OwnerId) {
+        store
+            .upsert_instrument(&InstrumentRecord {
+                id: self.instrument,
+                kind: None,
+                symbol: "TESTBOND".to_owned(),
+                title: "Test Bond".to_owned(),
+                currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+                lineage: None,
+            })
+            .unwrap();
+        store
+            .upsert_instrument(&InstrumentRecord {
+                id: self.successor,
+                kind: None,
+                symbol: "TESTBOND2".to_owned(),
+                title: "Test Bond, Successor".to_owned(),
+                currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+                lineage: None,
+            })
+            .unwrap();
+        store
+            .upsert_custody_place(&CustodyRecord {
+                id: self.custody,
+                owner,
+                title: "Shop One Custody".to_owned(),
+                institution: None,
+            })
+            .unwrap();
+    }
+}
+
 /// One event of each new kind. The test must fail when
 /// a member is added to the family: an archive that has lost a fact looks intact.
-fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
-    let instrument = InstrumentId::new_random();
-    let successor = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
+fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) -> Vec<Event> {
+    let instrument = refs.instrument;
+    let successor = refs.successor;
+    let custody = refs.custody;
     let submission = OfferSubmissionId::new_random();
     let money = |minor| Money::new(PostedMinor::new(minor), CurrencyCode::Rub);
     // `rust_decimal` is not a dependency of this crate, and adding it
@@ -459,14 +522,21 @@ fn every_new_fact(owner: OwnerId, account: AccountId) -> Vec<Event> {
 fn a_bundle_round_trip_keeps_the_new_facts() {
     // An archive that has lost a new fact looks intact—and will be detected
     // only during restoration, when the original database is no longer available.
-    let (source, owner, account, _) = populated();
-    let facts = every_new_fact(owner, account);
+    let (mut source, owner, account, _) = populated();
+    let refs = BondReferenceData::new();
+    refs.register_in(&source, owner);
+    let facts = every_new_fact(owner, account, &refs);
     for event in &facts {
         source.append_event(event, IdentityScope::Source).unwrap();
     }
 
     let bundle = source.export_bundle(owner).unwrap();
     let mut restored = SqliteStore::open_in_memory().unwrap();
+    // The bundle carries events, accounts and contours and nothing else
+    // (design §4.1) — the target of a restore must already hold the
+    // instrument and custody reference data its events' legs point to, the
+    // way an independent market-data sync would have populated it.
+    refs.register_in(&restored, owner);
     restored.import_bundle(&bundle).unwrap();
 
     assert_eq!(
@@ -481,4 +551,122 @@ fn a_bundle_round_trip_keeps_the_new_facts() {
             event.kind.discriminant()
         );
     }
+}
+
+// --- Task 10: relation_target carries no key, deferred or otherwise -------
+
+#[test]
+fn a_bundle_whose_replacement_precedes_its_target_imports_cleanly() {
+    // An earlier draft of the design gave `relation_target` a deferred
+    // `(owner, relation_target)` key so a bundle could import a graph whose
+    // replacement precedes its target. That key was removed: `events` has no
+    // key on `relation_target` at all, deferred or not, so there is nothing
+    // left to order around — a replacement ahead of its target in the
+    // bundle's event list must import exactly as cleanly as one behind it.
+    let (source, owner, account, _) = populated();
+    let target = deposit(owner, account, 3, 100_000);
+    let replacement = Event {
+        relation: Relation::Replacement { target: target.id },
+        ..deposit(owner, account, 4, 100_000)
+    };
+
+    let mut bundle = source.export_bundle(owner).unwrap();
+    bundle.events = vec![replacement.clone(), target.clone()];
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let outcome = restored
+        .import_bundle(&bundle)
+        .expect("a replacement ahead of its target must not be refused");
+    assert_eq!(
+        outcome,
+        ImportOutcome::Applied {
+            inserted: 2,
+            duplicates: 0
+        }
+    );
+}
+
+#[test]
+fn a_bundle_import_of_a_replacement_naming_a_target_it_never_held_succeeds() {
+    // The journal has a named state for a correction whose target it does
+    // not hold: `resolve_with_unheld_targets` resolves such a chain and
+    // `HistoryAct::Arrived` publishes it — a fact naming a target outside the
+    // journal is where its history begins. A key on `relation_target` would
+    // make that state unwritable by any path, including a bundle import, so
+    // this must succeed rather than merely survive.
+    let (source, owner, account, _) = populated();
+    let unheld_target = EventId::new_random();
+    let replacement = Event {
+        relation: Relation::Replacement {
+            target: unheld_target,
+        },
+        ..deposit(owner, account, 3, 100_000)
+    };
+
+    let mut bundle = source.export_bundle(owner).unwrap();
+    bundle.events.push(replacement.clone());
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let outcome = restored
+        .import_bundle(&bundle)
+        .expect("an unheld target must not be a reason to refuse the import");
+    assert_eq!(
+        outcome,
+        ImportOutcome::Applied {
+            inserted: 3,
+            duplicates: 0
+        }
+    );
+    let stored = restored.load_events(owner).unwrap();
+    assert!(stored.iter().any(|kept| kept.id == replacement.id));
+}
+
+#[test]
+fn an_import_of_an_event_carrying_import_session_and_rule_identifiers_the_bundle_does_not_hold_succeeds()
+ {
+    // `import_session` and `settled_by_rule` look like foreign keys and are
+    // deliberately not: the bundle carries events, accounts and contours and
+    // nothing else (design §4.1), so an archive restore must not depend on
+    // an import session or a classification rule existing anywhere.
+    let (source, owner, account, _) = populated();
+    let session = ImportSessionId::new_random();
+    let rule = ClassificationRuleId::new_random();
+    let event = Event {
+        provenance: Provenance::new(
+            SourceId::new_random(),
+            RawHash::parse(&"5".repeat(64)).unwrap(),
+            ParserVersion("manual/1".into()),
+        )
+        .with_import_session(session)
+        .with_rule_settlement(RuleSettlement::Rule { rule, version: 1 }),
+        ..deposit(owner, account, 3, 50_000)
+    };
+
+    let mut bundle = source.export_bundle(owner).unwrap();
+    bundle.events.push(event.clone());
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let outcome = restored
+        .import_bundle(&bundle)
+        .expect("neither import_session nor settled_by_rule is a foreign key");
+    assert_eq!(
+        outcome,
+        ImportOutcome::Applied {
+            inserted: 3,
+            duplicates: 0
+        }
+    );
+    let stored = restored.load_events(owner).unwrap();
+    let kept = stored
+        .iter()
+        .find(|kept| kept.id == event.id)
+        .expect("the event carrying the dangling identifiers was imported");
+    assert_eq!(kept.provenance.import_session(), Some(session));
+    assert_eq!(
+        kept.provenance.rule_settlement(),
+        Some(&RuleSettlement::Rule { rule, version: 1 })
+    );
 }

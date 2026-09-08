@@ -78,6 +78,7 @@ use iaam_app::scenarios::source_profile::{DocumentImport, DocumentRow};
 use iaam_app::scenarios::transfer_pairing::{CashLeg, ConfirmedPairing, LegOrigin, Proposals};
 use iaam_core::batch::{BatchTotal, ControlCheck, ControlComparison, ControlSection, IntervalFit};
 use iaam_core::bond::offer::OfferChoice;
+use iaam_core::category::{CategoryMatcher, DescriptionMatchMode};
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::correction::SupersededBy;
 use iaam_core::event::kind::{FeeOrigin, IncomeKind, TaxOrigin};
@@ -8156,9 +8157,35 @@ impl<'de> Deserialize<'de> for CategoryMatcherDto {
 }
 
 impl CategoryMatcherDto {
+    /// The store's [`CategoryMatcher`] (spec §4.6 typed columns), in the
+    /// wire's own externally tagged shape.
+    ///
+    /// `Description` collapses to `DescriptionContains` under
+    /// [`DescriptionMatchMode::Contains`], matching [`CategoryMatcher`]'s own
+    /// note that `DescriptionContains` is the legacy stored form of exactly
+    /// that mode: the two variants mean the same thing, so the wire publishes
+    /// one shape for both rather than a distinction nothing acts on.
     #[must_use]
-    pub fn from_stored(raw: &str) -> Self {
-        serde_json::from_str(raw).expect("stored category matcher must match its contract")
+    pub fn from_domain(matcher: &CategoryMatcher) -> Self {
+        match matcher {
+            CategoryMatcher::Row { key } => Self::Row(key.clone()),
+            CategoryMatcher::SourceCategory { value } => Self::SourceCategory(value.clone()),
+            CategoryMatcher::DescriptionContains { text } => {
+                Self::DescriptionContains(text.clone())
+            }
+            CategoryMatcher::Description {
+                text,
+                mode: DescriptionMatchMode::Equals,
+            } => Self::DescriptionEquals(text.clone()),
+            CategoryMatcher::Description {
+                text,
+                mode: DescriptionMatchMode::StartsWith,
+            } => Self::DescriptionStartsWith(text.clone()),
+            CategoryMatcher::Description {
+                text,
+                mode: DescriptionMatchMode::Contains,
+            } => Self::DescriptionContains(text.clone()),
+        }
     }
 }
 
@@ -8186,7 +8213,7 @@ impl CategoryRuleDto {
         Self {
             id: rule.id.inner(),
             version: rule.version,
-            matcher: CategoryMatcherDto::from_stored(&rule.matcher),
+            matcher: CategoryMatcherDto::from_domain(&rule.matcher),
             category: rule.category.inner(),
             valid_from: rule.valid_from,
             valid_to: rule.valid_to,
@@ -8597,14 +8624,12 @@ pub struct ClassificationRuleDto {
 impl ClassificationRuleDto {
     /// A stored rule, rendered in the two shapes it may be written in.
     ///
-    /// Fallible, and the failure is real: the store keeps the matcher and the
-    /// outcome as opaque JSON, so a rule written before this route was typed —
-    /// or by anything other than this route — can hold JSON the classifier
-    /// cannot read. It is read here by [`rule_from_view`], the same function the
-    /// classifier reads it with, rather than by a second parser of the same
-    /// text. Two readings of one stored rule would eventually disagree about
-    /// what the owner decided, and the listing is the surface on which he would
-    /// see the wrong one.
+    /// The port already carries `RuleMatcher` and `Classification` (spec §4.6
+    /// typed columns, not JSON), so this can no longer fail on the rule's own
+    /// content — the `Result` stays because [`rule_from_view`] is the one
+    /// reader shared with the classifier, and this route uses it rather than a
+    /// second one of its own, so a listing and a recomputation can never read
+    /// one stored rule two different ways.
     pub fn from_port(rule: ClassificationRuleView) -> Result<Self, AppError> {
         let id = rule.id;
         let created_at = rule.created_at.clone();

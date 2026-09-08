@@ -17,7 +17,7 @@ use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
-use iaam_store::reference::InstrumentRecord;
+use iaam_store::reference::{CustodyRecord, InstrumentRecord};
 use time::macros::date;
 use time::{Date, Duration};
 use uuid::Uuid;
@@ -30,10 +30,20 @@ impl Clock for FixedClock {
     }
 }
 
-fn services() -> AppServices {
-    let adapter = Arc::new(SqliteAdapter::new(
-        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}")),
-    ));
+/// `custody_places` — like `accounts` — is checked against on every event
+/// write (spec §D6), and the port `Store` trait exposes no way to create one;
+/// only `SqliteStore` itself does. So the custody places these tests need
+/// are seeded on the raw store before it is handed to `SqliteAdapter`, which
+/// takes ownership and offers no way back to it afterwards.
+fn services(custody_places: &[CustodyRecord]) -> AppServices {
+    let store =
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
+    for place in custody_places {
+        store
+            .upsert_custody_place(place)
+            .unwrap_or_else(|error| panic!("insert custody place: {error}"));
+    }
+    let adapter = Arc::new(SqliteAdapter::new(store));
     AppServices::new(
         adapter.clone(),
         adapter.clone(),
@@ -170,11 +180,16 @@ async fn seed_market_price_with(
 
 #[tokio::test]
 async fn report_values_position_from_market_observation() {
-    let services = services();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
     let custody = CustodyId::new_random();
+    let services = services(&[CustodyRecord {
+        id: custody,
+        owner,
+        title: "Main Custody".to_owned(),
+        institution: None,
+    }]);
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
     services
         .store
@@ -246,12 +261,17 @@ async fn report_values_position_from_market_observation() {
 
 #[tokio::test]
 async fn contradictory_price_leaves_only_its_position_uncovered() {
-    let services = services();
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let healthy = InstrumentId::new_random();
     let contradictory = InstrumentId::new_random();
     let custody = CustodyId::new_random();
+    let services = services(&[CustodyRecord {
+        id: custody,
+        owner,
+        title: "Main Custody".to_owned(),
+        institution: None,
+    }]);
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
     services
         .store

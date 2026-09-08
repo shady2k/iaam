@@ -9,98 +9,14 @@ use rusqlite::Connection;
 use crate::StoreError;
 
 /// Schema version understood by this build.
-pub const SCHEMA_VERSION: u32 = 31;
+///
+/// The 31 migrations that built up the schema incrementally collapsed into
+/// one file (iaam-05gi): the database was greenfield when this happened —
+/// `dev.db` carried no rows in any table — so there was nothing to migrate,
+/// and the whole schema starts fresh at version 1.
+pub const SCHEMA_VERSION: u32 = 1;
 
-const MIGRATIONS: [(u32, &str); 31] = [
-    (1, include_str!("../migrations/0001_initial.sql")),
-    (2, include_str!("../migrations/0002_sources_and_rules.sql")),
-    (3, include_str!("../migrations/0003_broker_access.sql")),
-    (4, include_str!("../migrations/0004_broker_environment.sql")),
-    (
-        5,
-        include_str!("../migrations/0005_instrument_reference.sql"),
-    ),
-    (
-        6,
-        include_str!("../migrations/0006_market_observations.sql"),
-    ),
-    (
-        7,
-        include_str!("../migrations/0007_executability_without_stale.sql"),
-    ),
-    (8, include_str!("../migrations/0008_quotation_basis.sql")),
-    (
-        9,
-        include_str!("../migrations/0009_broker_operation_kinds.sql"),
-    ),
-    (10, include_str!("../migrations/0010_bond_schedule.sql")),
-    (11, include_str!("../migrations/0011_accrued_interest.sql")),
-    (
-        12,
-        include_str!("../migrations/0012_account_scoped_source_operation.sql"),
-    ),
-    (13, include_str!("../migrations/0013_event_source_time.sql")),
-    (
-        14,
-        include_str!("../migrations/0014_securities_transfer_kinds.sql"),
-    ),
-    (15, include_str!("../migrations/0015_categories.sql")),
-    (
-        16,
-        include_str!("../migrations/0016_category_group_is_income.sql"),
-    ),
-    (
-        17,
-        include_str!("../migrations/0017_account_scope_dispositions.sql"),
-    ),
-    (
-        18,
-        include_str!("../migrations/0018_account_transfer_partners.sql"),
-    ),
-    (19, include_str!("../migrations/0019_import_sessions.sql")),
-    (
-        20,
-        include_str!("../migrations/0020_account_external_identity.sql"),
-    ),
-    (
-        21,
-        include_str!("../migrations/0021_account_negative_balance_expectation.sql"),
-    ),
-    (
-        22,
-        include_str!("../migrations/0022_import_control_figures.sql"),
-    ),
-    (
-        23,
-        include_str!("../migrations/0023_event_import_session.sql"),
-    ),
-    (
-        24,
-        include_str!("../migrations/0024_import_session_account.sql"),
-    ),
-    (
-        25,
-        include_str!("../migrations/0025_account_retirements.sql"),
-    ),
-    (
-        26,
-        include_str!("../migrations/0026_document_unresolved_accounts.sql"),
-    ),
-    (
-        27,
-        include_str!("../migrations/0027_declined_account_names.sql"),
-    ),
-    (
-        28,
-        include_str!("../migrations/0028_source_profile_versions.sql"),
-    ),
-    (
-        29,
-        include_str!("../migrations/0029_event_settled_by_rule.sql"),
-    ),
-    (30, include_str!("../migrations/0030_operation_history.sql")),
-    (31, include_str!("../migrations/0031_decision_history.sql")),
-];
+const MIGRATIONS: [(u32, &str); 1] = [(1, include_str!("../migrations/0001_schema.sql"))];
 
 /// Apply missing migrations.
 ///

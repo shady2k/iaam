@@ -9,7 +9,12 @@ rust-version.workspace = true
 # Версия рядом с путём обязательна: `cargo deny` считает path-зависимость
 # без версии wildcard-зависимостью, а wildcards = "deny" в deny.toml.
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `trace` is needed only by `journal::read`'s statement-counting test
+# (`Connection::trace_v2`), but rusqlite features are resolved once per
+# build graph, so it is declared on the main dependency rather than
+# duplicated under `[dev-dependencies]`.
+rusqlite = { version = "0.40", features = ["bundled", "trace"] }
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Снимок проекции содержит карты с составными ключами, которые JSON
@@ -21,11 +26,26 @@ thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["std", "macros", "parsing", "formatting"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
+[features]
+# Exposes `SqliteStore::connection()`/`connection_mut()`, the raw connection
+# escape hatch (spec §D6). Gated because in-process production code has no
+# legitimate use for a raw-SQL path around the typed API — every caller that
+# still needs transaction control without one gets a typed method instead
+# (`with_immediate_transaction`, `set_busy_timeout`). Tests, in this crate and
+# outside it, need the raw connection to set up fixtures and to probe
+# invariants the public API does not expose (row counts, fault injection).
+test-support = []
+
 [dev-dependencies]
 # Только для тестов: хранилище держит шифротекст непрозрачным и о
 # криптографии соседнего адаптера ничего не знает. Тесту же нужно
 # зашифровать настоящий токен, чтобы искать его в байтах файла базы.
 iaam-broker = { path = "../iaam-broker", version = "0.1.0" }
+# Self dependency so this crate's own integration tests (`tests/*.rs`, which
+# link against the library like any other crate would) see `test-support`
+# enabled. Unit tests inside `src/` need no such thing: `cfg(test)` is already
+# true for them when this crate itself is under test.
+iaam-store = { path = ".", version = "0.1.0", features = ["test-support"] }
 
 [lints]
 workspace = true

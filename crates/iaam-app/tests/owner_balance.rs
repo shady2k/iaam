@@ -10,16 +10,18 @@ use std::sync::Arc;
 
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ports::{Clock, Principal, Recorded, Scope};
+use iaam_app::ports::{AccountView, Clock, Principal, Recorded, Scope};
 use iaam_app::scenarios::reconciliation::{
     OWNER_STATED_CHANNEL, OwnerBalance, record_owner_balance,
 };
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
+use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_store::SqliteStore;
+use iaam_store::reference::{CustodyRecord, InstrumentRecord};
 use rust_decimal::Decimal;
 use time::Date;
 use time::macros::date;
@@ -39,23 +41,52 @@ struct Ctx {
 }
 
 fn harness() -> Ctx {
-    let adapter = Arc::new(SqliteAdapter::new(
-        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}")),
-    ));
+    harness_with(|_store, _owner| {})
+}
+
+/// A harness whose caller gets to seed reference data on the raw store before
+/// it is wrapped: `SqliteAdapter` has no port-level way to create a custody
+/// place or an instrument (only reads reach through `Store`/
+/// `InstrumentDirectory`), so a claim naming a position has to register both
+/// directly on the store, the same way `iaam-store`'s own write-path fixtures
+/// do with `upsert_custody_place`/`upsert_instrument`.
+fn harness_with(seed: impl FnOnce(&mut SqliteStore, OwnerId)) -> Ctx {
+    let owner = OwnerId::new_random();
+    let mut store =
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
+    seed(&mut store, owner);
+    let adapter = Arc::new(SqliteAdapter::new(store));
     Ctx {
         services: AppServices::new(
             adapter.clone(),
             adapter.clone(),
             adapter.clone(),
-            adapter.clone(),
+            adapter,
             Arc::new(FixedClock),
         ),
         principal: Principal {
             token_id: Uuid::new_v4(),
-            owner: OwnerId::new_random(),
+            owner,
             scope: Scope::Owner,
         },
     }
+}
+
+async fn account(ctx: &Ctx, title: &str) -> AccountId {
+    let id = AccountId::new_random();
+    ctx.services
+        .store
+        .upsert_account(
+            ctx.principal.owner,
+            AccountView {
+                id,
+                title: title.to_owned(),
+                institution: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("insert account: {error}"));
+    id
 }
 
 fn march() -> AssertionPeriod {
@@ -84,6 +115,30 @@ fn inserted(recorded: &[Recorded]) -> Vec<EventId> {
         .collect()
 }
 
+fn seed_custody(store: &mut SqliteStore, owner: OwnerId, custody: CustodyId, title: &str) {
+    store
+        .upsert_custody_place(&CustodyRecord {
+            id: custody,
+            owner,
+            title: title.to_owned(),
+            institution: None,
+        })
+        .unwrap_or_else(|error| panic!("insert custody place: {error}"));
+}
+
+fn seed_instrument(store: &mut SqliteStore, instrument: InstrumentId, symbol: &str) {
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: instrument,
+            kind: Some(InstrumentKind::Share),
+            symbol: symbol.to_owned(),
+            title: symbol.to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .unwrap_or_else(|error| panic!("insert instrument: {error}"));
+}
+
 fn cash_balance(account: AccountId, at: BalancePoint, minor: i64) -> OwnerBalance {
     OwnerBalance {
         account,
@@ -103,7 +158,7 @@ async fn an_opening_and_a_closing_claim_are_two_facts() {
     // the closing figure never reached the journal and the scoped query that
     // asked for it found the opening one.
     let ctx = harness();
-    let account = AccountId::new_random();
+    let account = account(&ctx, "Main").await;
 
     let opening = record_owner_balance(
         &ctx.services,
@@ -149,11 +204,16 @@ async fn every_claim_of_one_call_is_recorded() {
     // One call states four facts: how much cash, and how much of each of three
     // holdings. Under a key that named only the account and the interval they
     // shared one, so the first won and the rest were silently answered with it.
-    let ctx = harness();
-    let account = AccountId::new_random();
     let positions: Vec<(InstrumentId, CustodyId)> = (0..3)
         .map(|_| (InstrumentId::new_random(), CustodyId::new_random()))
         .collect();
+    let ctx = harness_with(|store, owner| {
+        for (index, (instrument, custody)) in positions.iter().enumerate() {
+            seed_instrument(store, *instrument, &format!("HOLD{index}"));
+            seed_custody(store, owner, *custody, &format!("Shop {index}"));
+        }
+    });
+    let account = account(&ctx, "Main").await;
 
     let recorded = record_owner_balance(
         &ctx.services,
@@ -197,9 +257,15 @@ async fn two_positions_in_one_call_are_not_one_position() {
     // The narrowest form of the same defect: same account, same interval, same
     // balance point, same kind of claim. Only the instrument and the custody
     // separate them, so only a key that names both keeps them apart.
-    let ctx = harness();
-    let account = AccountId::new_random();
     let custody = CustodyId::new_random();
+    let first_instrument = InstrumentId::new_random();
+    let second_instrument = InstrumentId::new_random();
+    let ctx = harness_with(|store, owner| {
+        seed_custody(store, owner, custody, "Shop One");
+        seed_instrument(store, first_instrument, "HOLD1");
+        seed_instrument(store, second_instrument, "HOLD2");
+    });
+    let account = account(&ctx, "Main").await;
 
     let recorded = record_owner_balance(
         &ctx.services,
@@ -211,12 +277,12 @@ async fn two_positions_in_one_call_are_not_one_position() {
             cash: None,
             positions: vec![
                 (
-                    InstrumentId::new_random(),
+                    first_instrument,
                     custody,
                     Quantity(Dec::new(Decimal::from(5))),
                 ),
                 (
-                    InstrumentId::new_random(),
+                    second_instrument,
                     custody,
                     Quantity(Dec::new(Decimal::from(7))),
                 ),
@@ -237,7 +303,7 @@ async fn restating_one_claim_is_still_one_fact() {
     // statement twice. Splitting the key by balance point and by dimension must
     // not turn a retry into a second event.
     let ctx = harness();
-    let account = AccountId::new_random();
+    let account = account(&ctx, "Main").await;
 
     let first = record_owner_balance(
         &ctx.services,
@@ -268,7 +334,7 @@ async fn one_period_does_not_answer_for_another() {
     // The part of the key that was already right, kept under test so that
     // narrowing it later is a failure rather than a silent regression.
     let ctx = harness();
-    let account = AccountId::new_random();
+    let account = account(&ctx, "Main").await;
 
     let march_claim = record_owner_balance(
         &ctx.services,
@@ -302,7 +368,7 @@ async fn every_claim_about_one_account_arrives_under_one_source() {
     // holds the source, so one statement about one month became two
     // `StatementGroup`s.
     let ctx = harness();
-    let account = AccountId::new_random();
+    let account = account(&ctx, "Main").await;
 
     for at in [BalancePoint::Opening, BalancePoint::Closing] {
         record_owner_balance(
@@ -340,8 +406,8 @@ async fn two_accounts_are_two_sources() {
     // owner-stated fact would put two accounts' statements in one source, and
     // deduplication is scoped by the source.
     let ctx = harness();
-    let main = AccountId::new_random();
-    let savings = AccountId::new_random();
+    let main = account(&ctx, "Main").await;
+    let savings = account(&ctx, "Savings").await;
 
     assert_ne!(
         SourceId::declared(ctx.principal.owner, main, OWNER_STATED_CHANNEL),
@@ -377,7 +443,7 @@ async fn a_restated_month_does_not_become_a_second_statement() {
     // channel confirming the first. The period is deliberately not in the source
     // key — it is carried by the assertion, and grouping separates by it.
     let ctx = harness();
-    let account = AccountId::new_random();
+    let account = account(&ctx, "Main").await;
 
     record_owner_balance(
         &ctx.services,

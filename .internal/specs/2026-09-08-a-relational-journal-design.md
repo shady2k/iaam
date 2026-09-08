@@ -214,25 +214,36 @@ CHECK (row_number IS NULL OR row_number >= 0)
 `RowNumberOutOfRange` rejection stays; this schema does not promise to
 round-trip the whole `u64` range. (codex)
 
-**Foreign keys.** Declared:
+**Foreign keys.** One is declared:
 
 ```sql
-FOREIGN KEY (owner, account)         REFERENCES accounts (owner, id)
-FOREIGN KEY (owner, relation_target) REFERENCES events (owner, id) DEFERRABLE INITIALLY DEFERRED
+FOREIGN KEY (owner, account) REFERENCES accounts (owner, id)
 ```
 
-The relation key is owner-scoped, and deferred — not for sealing, which D6
-removed, but because a bundle import inserts a graph and a replacement event can
-precede its target. Deferring one key is simpler than topologically sorting the
-import. (codex)
+**Three columns look like foreign keys and are deliberately not.**
+`import_session` and `settled_by_rule`, because `Bundle` carries events,
+accounts and contours and nothing else (`bundle.rs:46`), so restoring an archive
+into an empty database would fail on both. They are archival provenance handles;
+a table holding a similar-looking identifier does not make a reference valid.
+(codex) There is likewise no registry for `SourceId`, `ImportId` or
+`PrincipalId`, and none is invented to give a column the word `REFERENCES`.
 
-**Not declared, and why:** `import_session` and `settled_by_rule` look like
-foreign keys and must not be. `Bundle` carries events, accounts and contours and
-nothing else (`bundle.rs:46`), so restoring an archive into an empty database
-would fail on both. They are archival provenance handles; a table holding a
-similar-looking identifier does not make a reference valid. (codex) There is
-likewise no registry for `SourceId`, `ImportId` or `PrincipalId`, and none is
-invented to give a column the word `REFERENCES`.
+**And `relation_target`, for a sharper reason, found while repairing the test
+fixtures.** An earlier draft of this section declared it — owner-scoped and
+`DEFERRABLE INITIALLY DEFERRED`, so a bundle could import a graph whose
+replacement precedes its target. That was wrong, and deferral does not rescue
+it: deferral moves the check to `COMMIT`, it does not excuse a target that never
+arrives.
+
+The journal has a **named state** for a correction whose target it does not
+hold. `resolve_with_unheld_targets` resolves such a chain, `HistoryAct::Arrived`
+publishes it, and the behaviour has its own tests — *a fact naming a target
+outside his journal is where his history begins*. A key here makes that state
+unwritable by any path, so the database would forbid a fact the domain has a
+word for. The column keeps its index for walking chains; it carries no key.
+
+The `UNIQUE (owner, id)` index that existed only so the composite self-reference
+would be valid SQL goes with it.
 
 ### 4.2 `event_legs`
 
@@ -597,6 +608,20 @@ implementing Task 3.
 
 `event_legs(account, event)` answers `touching` and does **not** answer "far
 side" — that is what the two `event_cash_transfer` indexes are for. (codex)
+
+**Declaring those two indexes is not enough to have them used, and this took
+finding out.** Written as a correlated `EXISTS` on `t.event = events.id`, or as
+an ordinary join, SQLite is free to reorder and always drives from `events`
+instead: `events_by_order` already satisfies `owner = ?` and the keyset
+`ORDER BY` at no cost, so the far-account seek is never considered however
+selective it is. The counterparty filter therefore leads with
+`event_cash_transfer` under a `CROSS JOIN`, which is SQLite's documented way to
+pin join order left to right. Two things make that safe and worthwhile: the
+table holds strictly one row per event — `event` is its whole primary key — so
+the join can only narrow the result and never multiply a row, which is the
+hazard `EXISTS` guards against on `event_legs`; and the sort the `ORDER BY` now
+costs is over the few transfers that match a far account, against scanning every
+event the owner has to find which are transfers at all.
 
 A `Description` `contains` search is not answerable by a B-tree and this spec
 does not pretend otherwise: it stays a scan, reached only when a caller filters

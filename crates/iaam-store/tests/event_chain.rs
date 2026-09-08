@@ -9,7 +9,8 @@ use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
-use iaam_store::events::{CHAIN_STEP_BACK_SQL, CHAIN_STEP_FORWARD_SQL, RecordedEvent};
+use iaam_store::journal::{CHAIN_STEP_BACK_SQL, CHAIN_STEP_FORWARD_SQL, RecordedEvent};
+use iaam_store::reference::AccountRecord;
 use rusqlite::params;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -68,10 +69,95 @@ impl Ctx {
     }
 }
 
-fn write(store: &SqliteStore, event: &Event) {
+fn insert_account(store: &SqliteStore, ctx: &Ctx) {
+    store
+        .upsert_account(&AccountRecord {
+            id: ctx.account,
+            owner: ctx.owner,
+            title: "Main".into(),
+            institution: Some("Savings".into()),
+        })
+        .unwrap();
+}
+
+fn write(store: &mut SqliteStore, event: &Event) {
     store
         .append_event(event, IdentityScope::Source)
         .expect("the journal accepts the fact");
+}
+
+/// Write a raw event row (and its cash leg) around the normal write path.
+///
+/// `relation_target` is a deferred foreign key (spec §D6): a single-event
+/// `append_event` commits its own transaction immediately, so it can never
+/// write a forward reference to a target that does not exist yet, and two
+/// mutually-referencing corrections can no longer be built one call at a
+/// time. That is exactly why this helper exists — the row it writes is
+/// meant to be the corrupt database the test's own name describes, the kind
+/// a bundle restore's multi-row transaction could produce, not something the
+/// public single-event API would ever normally write.
+fn insert_raw_cyclical_pair(store: &SqliteStore, first: &Event, second: &Event) {
+    let conn = store.connection();
+    conn.execute_batch("BEGIN").unwrap();
+    for event in [first, second] {
+        conn.execute(
+            "INSERT INTO events (
+                 id, owner, account, kind, effective_date, sequence, source_time,
+                 confidence, relation_kind, relation_target, source, source_operation_id,
+                 idempotency_key, raw_hash, parser_version, recorded_at, import_session,
+                 settled_by_rule, settled_by_rule_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                       ?17, ?18, ?19)",
+            params![
+                event.id.inner().to_string(),
+                event.owner.inner().to_string(),
+                event.account.inner().to_string(),
+                event.kind.discriminant(),
+                event.order.date().to_string(),
+                event.order.sequence(),
+                None::<String>,
+                "known",
+                match event.relation {
+                    Relation::None => "none",
+                    Relation::Reversal { .. } => "reversal",
+                    Relation::Replacement { .. } => "replacement",
+                },
+                match event.relation {
+                    Relation::None => None,
+                    Relation::Reversal { target } | Relation::Replacement { target } => {
+                        Some(target.inner().to_string())
+                    }
+                },
+                event.provenance.source().inner().to_string(),
+                event.provenance.source_operation_id(),
+                event.idempotency_key.as_deref(),
+                event.provenance.raw_hash().as_str(),
+                event.provenance.parser_version().0.as_str(),
+                "2026-09-08T00:00:00Z",
+                None::<String>,
+                None::<String>,
+                None::<u32>,
+            ],
+        )
+        .unwrap();
+        for (ordinal, leg) in event.legs.iter().enumerate() {
+            let money = leg.money.expect("a cash leg carries money");
+            conn.execute(
+                "INSERT INTO event_legs
+                     (event, ordinal, kind, account, custody, instrument, amount, currency, quantity)
+                 VALUES (?1, ?2, 'cash', ?3, NULL, NULL, ?4, ?5, NULL)",
+                params![
+                    event.id.inner().to_string(),
+                    ordinal as i64,
+                    leg.account.inner().to_string(),
+                    money.amount().raw(),
+                    money.currency().code(),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
 }
 
 fn ids(chain: &[RecordedEvent]) -> Vec<EventId> {
@@ -81,7 +167,7 @@ fn ids(chain: &[RecordedEvent]) -> Vec<EventId> {
 /// One correction is a reversal and a replacement of the same target, so a
 /// chain corrected twice holds five facts. Returns them in the order the walk
 /// must produce: the original, then each act's reversal before its replacement.
-fn corrected_twice(store: &SqliteStore, ctx: &Ctx) -> Vec<Event> {
+fn corrected_twice(store: &mut SqliteStore, ctx: &Ctx) -> Vec<Event> {
     let original = ctx.deposit(1);
     let first_reversal = ctx.reversal_of(&original, 2);
     let first_replacement = ctx.replacement_of(&original, 3);
@@ -114,9 +200,10 @@ fn corrected_twice(store: &SqliteStore, ctx: &Ctx) -> Vec<Event> {
 /// have decides which question he is allowed to ask.
 #[test]
 fn every_identifier_in_a_chain_returns_the_same_chain() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
-    let written = corrected_twice(&store, &ctx);
+    insert_account(&store, &ctx);
+    let written = corrected_twice(&mut store, &ctx);
     let expected: Vec<EventId> = written.iter().map(|event| event.id).collect();
 
     for entered in &written {
@@ -137,10 +224,11 @@ fn every_identifier_in_a_chain_returns_the_same_chain() {
 /// answering about an event that is not his.
 #[test]
 fn a_fact_nothing_ever_touched_is_a_chain_of_one() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let untouched = ctx.deposit(1);
-    write(&store, &untouched);
+    write(&mut store, &untouched);
 
     let chain = store
         .event_chain(ctx.owner, untouched.id)
@@ -157,9 +245,10 @@ fn a_fact_nothing_ever_touched_is_a_chain_of_one() {
 /// while the walk turned into a full scan of the journal.
 #[test]
 fn a_chain_costs_index_lookups_and_never_scans_the_journal() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
-    let written = corrected_twice(&store, &ctx);
+    insert_account(&store, &ctx);
+    let written = corrected_twice(&mut store, &ctx);
 
     let forward: String = store
         .connection()
@@ -216,13 +305,13 @@ fn a_chain_costs_index_lookups_and_never_scans_the_journal() {
 fn a_chain_that_closes_on_itself_is_refused_rather_than_walked_forever() {
     let store = SqliteStore::open_in_memory().expect("a store");
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
 
     let mut first = ctx.deposit(1);
     let mut second = ctx.deposit(2);
     first.relation = Relation::Replacement { target: second.id };
     second.relation = Relation::Replacement { target: first.id };
-    write(&store, &first);
-    write(&store, &second);
+    insert_raw_cyclical_pair(&store, &first, &second);
 
     let refusal = store
         .event_chain(ctx.owner, first.id)
@@ -241,10 +330,11 @@ fn a_chain_that_closes_on_itself_is_refused_rather_than_walked_forever() {
 /// an identifier of nothing at all.
 #[test]
 fn an_event_of_another_owner_is_not_found() {
-    let store = SqliteStore::open_in_memory().expect("a store");
+    let mut store = SqliteStore::open_in_memory().expect("a store");
     let mine = Ctx::new();
     let theirs = Ctx::new();
-    let written = corrected_twice(&store, &theirs);
+    insert_account(&store, &theirs);
+    let written = corrected_twice(&mut store, &theirs);
 
     for entered in &written {
         let chain = store

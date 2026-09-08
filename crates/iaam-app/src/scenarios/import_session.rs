@@ -57,9 +57,7 @@ use crate::ports::{
     ImportSessionSummaryView, ImportSessionView, NewImportQuestion, Principal, Recorded,
     UnresolvedAccountView,
 };
-use crate::scenarios::classification::{
-    ClassifiedAs, classified_as, matcher_json, outcome_json, subject,
-};
+use crate::scenarios::classification::{ClassifiedAs, classified_as, subject};
 use crate::scenarios::coverage_gap;
 use crate::scenarios::ingest::{RowOrigin, submit_candidates};
 use crate::scenarios::transfer_pairing::{self, CashLeg, LegOrigin, Proposals};
@@ -1788,12 +1786,7 @@ pub async fn answer_question(
         Some(matcher) => {
             let rule = services
                 .rules
-                .create_rule(
-                    principal.owner,
-                    json(&matcher_json(&matcher), "matcher")?,
-                    json(&outcome_json(answer.classification()), "outcome")?,
-                    None,
-                )
+                .create_rule(principal.owner, matcher, answer.classification(), None)
                 .await?;
             let named = services
                 .store

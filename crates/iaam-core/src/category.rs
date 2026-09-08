@@ -64,6 +64,32 @@ pub struct CategorySubject<'a> {
     pub on: Date,
 }
 
+impl<'a> CategorySubject<'a> {
+    /// The attributes of one recorded fact, as the classifier asks about them.
+    ///
+    /// **One construction, called from everywhere.** The projection in the
+    /// store and the preview in the application both need it, and a subject
+    /// built twice is two answers to «what is this filed under» waiting to
+    /// disagree — the defect this whole design exists to avoid, one level down
+    /// from the priority ladder itself.
+    ///
+    /// `counterparty` and `description` are filled from the same field on
+    /// purpose: the source states one string, and it fills both roles until a
+    /// source that separates them arrives. Both were once hard-wired to
+    /// `None`, which made every description rule dead on arrival — a rule the
+    /// owner wrote, saw accepted, and never saw fire.
+    #[must_use]
+    pub fn of(event: &'a Event) -> Self {
+        Self {
+            row_key: row_key(event),
+            source_category: event.provenance.source_category(),
+            counterparty: event.provenance.description(),
+            description: event.provenance.description(),
+            on: event.order.date(),
+        }
+    }
+}
+
 /// Why a rule assigned the category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CategoryBasis {

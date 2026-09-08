@@ -39,6 +39,10 @@ thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+# `test-support` unlocks `SqliteStore::connection()`/`connection_mut()`
+# (iaam-store spec §D6): this crate's own unit tests use it to set up
+# fixtures and probe the database directly.
+iaam-store = { path = "../iaam-store", version = "0.1.0", features = ["test-support"] }
 
 [lints]
 workspace = true

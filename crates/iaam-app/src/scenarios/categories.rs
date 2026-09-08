@@ -2,15 +2,14 @@
 
 use iaam_core::category::{
     CategoryAssignment, CategoryImpactRow, CategoryInterval, CategoryMatcher, CategoryRule,
-    CategoryRuleProposal, CategorySubject, DescriptionMatchMode, assign_with_proposed,
-    group_category_impacts, row_key as category_row_key,
+    CategoryRuleProposal, CategorySubject, assign_with_proposed, group_category_impacts,
+    row_key as category_row_key,
 };
 use iaam_core::event::Event;
 use iaam_core::event::kind::EventKind;
 use iaam_core::ids::{CategoryGroupId, CategoryId, CategoryRuleId};
 use iaam_core::money::Money;
 use iaam_core::projection::money_flow::CategoryIndex;
-use serde_json::{Value, json};
 
 use crate::AppServices;
 use crate::error::AppError;
@@ -149,15 +148,24 @@ pub async fn create_category_rule(
     }
 
     let rule = CategoryRuleUpsert {
-        matcher: matcher_json(&input.matcher)?,
+        matcher: input.matcher,
         category: input.category,
         valid_from: input.interval.from,
         valid_to: input.interval.to,
     };
-    services
+    let created = services
         .categories
         .create_category_rule(principal.owner, rule, input.replaces)
-        .await
+        .await?;
+    // A create or an edit (a replacement carries `replaces`) can change what
+    // any past event in the journal decomposes to, not only a future one, so
+    // the projection is rebuilt from here rather than left to go stale
+    // (spec §4.7).
+    services
+        .categories
+        .rebuild_category_index(principal.owner)
+        .await?;
+    Ok(created)
 }
 
 pub async fn list_category_rules(
@@ -307,7 +315,15 @@ pub async fn retire_category_rule(
     services
         .categories
         .retire_category_rule(principal.owner, rule)
-        .await
+        .await?;
+    // A retired rule can leave events it used to decompose with no rule left
+    // that matches them, which must surface as an absent row rather than a
+    // stale one (spec §4.7).
+    services
+        .categories
+        .rebuild_category_index(principal.owner)
+        .await?;
+    Ok(())
 }
 
 pub(crate) struct LoadedCategoryIndex {
@@ -337,18 +353,7 @@ impl CategoryIndex for LoadedCategoryIndex {
         // records that the source named nothing.
         // The same helper is published on journal and preview rows, so a Row
         // matcher always receives the identity the API tells the caller to use.
-        let row_key = category_row_key(event);
-        let subject = CategorySubject {
-            row_key,
-            source_category: event.provenance.source_category(),
-            // The two were hard-wired to None, which made every
-            // DescriptionContains rule dead on arrival. The source states one
-            // string; it fills both roles until a source that separates them
-            // arrives.
-            counterparty: event.provenance.description(),
-            description: event.provenance.description(),
-            on: event.order.date(),
-        };
+        let subject = CategorySubject::of(event);
         match self.proposed.as_ref() {
             Some(proposed) => assign_with_proposed(&subject, &self.rules, proposed),
             None => iaam_core::category::assign(&subject, &self.rules),
@@ -393,77 +398,7 @@ fn domain_rule(rule: CategoryRuleView) -> Result<CategoryRule, AppError> {
             from: rule.valid_from,
             to: rule.valid_to,
         },
-        matcher: parse_matcher(&rule.matcher)?,
+        matcher: rule.matcher,
         category: rule.category,
-    })
-}
-
-fn matcher_json(matcher: &CategoryMatcher) -> Result<String, AppError> {
-    let value = match matcher {
-        CategoryMatcher::Row { key } => json!({ "row": key }),
-        CategoryMatcher::SourceCategory { value } => json!({ "source_category": value }),
-        CategoryMatcher::DescriptionContains { text } => json!({ "description_contains": text }),
-        CategoryMatcher::Description {
-            text,
-            mode: DescriptionMatchMode::Equals,
-        } => json!({ "description_equals": text }),
-        CategoryMatcher::Description {
-            text,
-            mode: DescriptionMatchMode::StartsWith,
-        } => json!({ "description_starts_with": text }),
-        CategoryMatcher::Description {
-            text,
-            mode: DescriptionMatchMode::Contains,
-        } => json!({ "description_contains": text }),
-    };
-    serde_json::to_string(&value)
-        .map_err(|error| AppError::Store(format!("serialize category matcher: {error}")))
-}
-
-fn parse_matcher(raw: &str) -> Result<CategoryMatcher, AppError> {
-    let value = serde_json::from_str::<Value>(raw).map_err(|error| AppError::Invalid {
-        field: "matcher".to_owned(),
-        expected: "a category matcher object".to_owned(),
-        actual: error.to_string(),
-    })?;
-    let object = value.as_object().ok_or_else(|| AppError::Invalid {
-        field: "matcher".to_owned(),
-        expected: "a category matcher object".to_owned(),
-        actual: raw.to_owned(),
-    })?;
-    if let Some(key) = object.get("row").and_then(Value::as_str) {
-        return Ok(CategoryMatcher::Row {
-            key: key.to_owned(),
-        });
-    }
-    if let Some(value) = object.get("source_category").and_then(Value::as_str) {
-        return Ok(CategoryMatcher::SourceCategory {
-            value: value.to_owned(),
-        });
-    }
-    if let Some(text) = object.get("description_equals").and_then(Value::as_str) {
-        return Ok(CategoryMatcher::Description {
-            text: text.to_owned(),
-            mode: DescriptionMatchMode::Equals,
-        });
-    }
-    if let Some(text) = object
-        .get("description_starts_with")
-        .and_then(Value::as_str)
-    {
-        return Ok(CategoryMatcher::Description {
-            text: text.to_owned(),
-            mode: DescriptionMatchMode::StartsWith,
-        });
-    }
-    if let Some(text) = object.get("description_contains").and_then(Value::as_str) {
-        return Ok(CategoryMatcher::DescriptionContains {
-            text: text.to_owned(),
-        });
-    }
-    Err(AppError::Invalid {
-        field: "matcher".to_owned(),
-        expected: "row, source_category, description_equals, description_starts_with, or description_contains".to_owned(),
-        actual: raw.to_owned(),
     })
 }

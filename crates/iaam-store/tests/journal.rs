@@ -14,7 +14,7 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
-use iaam_store::events::{AccountActivityRecord, Appended, JournalQuery};
+use iaam_store::journal::{AccountActivityRecord, Appended, JournalQuery};
 use iaam_store::reference::AccountRecord;
 use rusqlite::params;
 use std::collections::BTreeSet;
@@ -113,8 +113,9 @@ fn bookkeeping_event(ctx: &Ctx, sequence: u32, kind: EventKind) -> Event {
 
 #[test]
 fn an_event_survives_a_write_and_a_read() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let event = ctx.deposit(1, 100_000);
     assert_eq!(
         store.append_event(&event, IdentityScope::Source).unwrap(),
@@ -126,8 +127,9 @@ fn an_event_survives_a_write_and_a_read() {
 
 #[test]
 fn journal_relation_projection_does_not_decode_event_payloads() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let original = ctx.deposit(1, 100_000);
     store
         .append_event(&original, IdentityScope::Source)
@@ -137,35 +139,39 @@ fn journal_relation_projection_does_not_decode_event_payloads() {
     correction.relation = Relation::Reversal {
         target: original.id,
     };
+    // The journal has no payload column any more (T8, iaam-1j5u): a `CashIn`
+    // row's amount is carried entirely by its `event_legs` rows, not by any
+    // blob on `events`. This row is inserted with no legs at all, which
+    // would make a full hydration of the event fail — that stands in for
+    // the old "garbage payload" probe. What is asserted is that
+    // `list_journal_event_relations` never needs the legs: it is a
+    // projection over `events.relation_kind` / `relation_target` alone.
     store
         .connection()
         .execute(
             "INSERT INTO events (
-                 id, schema_version, owner, account, kind, effective_date, sequence, source_time,
-                 relation_kind, relation_target, source, source_operation_id,
-                 idempotency_key, raw_hash, payload, recorded_at, import_session,
+                 id, owner, account, kind, effective_date, sequence, source_time,
+                 confidence, relation_kind, relation_target, source, source_operation_id,
+                 idempotency_key, raw_hash, parser_version, recorded_at, import_session,
                  settled_by_rule, settled_by_rule_version
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                        ?17, ?18, ?19)",
             params![
                 correction.id.inner().to_string(),
-                // The `events.schema_version` column no longer mirrors a
-                // domain field (`Event::schema_version` is gone, iaam-7q0z);
-                // any value satisfies the still-`NOT NULL` column.
-                1_u32,
                 correction.owner.inner().to_string(),
                 correction.account.inner().to_string(),
                 correction.kind.discriminant(),
                 correction.order.date().to_string(),
                 correction.order.sequence(),
                 None::<String>,
+                "known",
                 "reversal",
                 original.id.inner().to_string(),
                 correction.provenance.source().inner().to_string(),
                 correction.provenance.source_operation_id(),
                 correction.idempotency_key.as_deref(),
                 correction.provenance.raw_hash().as_str(),
-                "not-an-event-payload",
+                correction.provenance.parser_version().0.as_str(),
                 "2026-09-08T00:00:00Z",
                 None::<String>,
                 None::<String>,
@@ -182,6 +188,12 @@ fn journal_relation_projection_does_not_decode_event_payloads() {
             (correction.id, correction.relation)
         ]
     );
+    // A full read, in contrast, does need the legs the relation projection
+    // skipped, and fails on this deliberately leg-less row.
+    assert!(
+        store.load_events(ctx.owner).is_err(),
+        "a full hydration should need what the relation projection does not"
+    );
 }
 
 /// A page of the journal can be narrowed to the one import session that wrote
@@ -195,8 +207,9 @@ fn journal_relation_projection_does_not_decode_event_payloads() {
 /// stamped with none is not swept in beside it.
 #[test]
 fn the_journal_narrows_to_the_import_session_that_wrote_it() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let session = ImportSessionId::new_random();
 
     let committed = {
@@ -259,8 +272,9 @@ fn the_journal_narrows_to_the_import_session_that_wrote_it() {
 
 #[test]
 fn the_journal_narrows_to_the_declared_import() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let import = ImportId::new_random();
 
     let carried = {
@@ -307,8 +321,9 @@ fn the_journal_narrows_to_the_declared_import() {
 /// nor one recorded before rules were recorded at all is swept in beside it.
 #[test]
 fn the_journal_narrows_to_the_rule_that_settled_the_row() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let rule = ClassificationRuleId::new_random();
     let other = ClassificationRuleId::new_random();
 
@@ -370,8 +385,9 @@ fn the_journal_narrows_to_the_rule_that_settled_the_row() {
 /// on the fact itself, so it is asserted where it lives.
 #[test]
 fn a_row_no_rule_settled_reads_apart_from_one_recorded_before_rules_were() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
 
     let without_a_rule = ctx.settled_by(1, RuleSettlement::NoRule);
     let never_recorded = ctx.deposit(2, 200_000);
@@ -394,28 +410,42 @@ fn a_row_no_rule_settled_reads_apart_from_one_recorded_before_rules_were() {
 
 #[test]
 fn the_journal_is_append_only_at_the_database_level() {
-    // Code discipline does not survive the very first data-repair script,
-    // so the prohibition lives in the database (§4.8).
-    let store = SqliteStore::open_in_memory().unwrap();
+    // The two triggers that used to forbid UPDATE and DELETE on `events` were
+    // deliberately dropped in the schema collapse (D6,
+    // .internal/specs/2026-09-08-a-relational-journal-design.md): guarding
+    // sixteen tables against UPDATE and DELETE is not enough on its own — a
+    // late INSERT of one more leg into a year-old event mutates it just as
+    // surely — so append-only became a property of what `SqliteStore`
+    // publishes (there is no update or delete method) rather than of the
+    // database file. What still enforces it, in the write path itself: an
+    // event's identity cannot be reused. `find_duplicate` treats a
+    // repeated id as it treats any other duplicate key — the write is
+    // refused in favour of the row already standing, not layered on top of
+    // it as a silent replacement.
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let event = ctx.deposit(1, 100_000);
     store.append_event(&event, IdentityScope::Source).unwrap();
 
-    let update = store
-        .connection()
-        .execute("UPDATE events SET kind = 'cash_out'", []);
-    assert!(update.is_err(), "UPDATE must be rejected by the database");
+    let mut reused_id = ctx.deposit(2, 999_000);
+    reused_id.id = event.id;
+    assert_eq!(
+        store
+            .append_event(&reused_id, IdentityScope::Source)
+            .unwrap(),
+        Appended::Duplicate { existing: event.id },
+        "reusing an id already on the journal must not write a second row over it"
+    );
 
-    let delete = store.connection().execute("DELETE FROM events", []);
-    assert!(delete.is_err(), "DELETE must be rejected by the database");
-
-    assert_eq!(store.load_events(ctx.owner).unwrap().len(), 1);
+    assert_eq!(store.load_events(ctx.owner).unwrap(), vec![event]);
 }
 
 #[test]
 fn the_same_idempotency_key_returns_the_first_event() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let mut first = ctx.deposit(1, 100_000);
     first.idempotency_key = Some("import-42".into());
     let mut second = ctx.deposit(2, 555_000);
@@ -441,8 +471,9 @@ fn the_same_idempotency_key_returns_the_first_event() {
 
 #[test]
 fn account_scope_allows_reused_source_operation_across_accounts() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let mut first = ctx.deposit(1, 100_000);
     first.provenance = Provenance::new(
         ctx.source,
@@ -453,6 +484,14 @@ fn account_scope_allows_reused_source_operation_across_accounts() {
     let mut second = ctx.deposit(2, 100_000);
     second.account = AccountId::new_random();
     second.provenance = first.provenance.clone();
+    store
+        .upsert_account(&AccountRecord {
+            id: second.account,
+            owner: ctx.owner,
+            title: "Secondary".into(),
+            institution: Some("Savings".into()),
+        })
+        .unwrap();
 
     assert_eq!(
         store.append_event(&first, IdentityScope::Account).unwrap(),
@@ -485,8 +524,9 @@ fn account_scope_allows_reused_source_operation_across_accounts() {
 
 #[test]
 fn the_same_source_operation_is_not_recorded_twice() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let mut first = ctx.deposit(1, 100_000);
     first.provenance = Provenance::new(
         ctx.source,
@@ -508,8 +548,9 @@ fn the_same_source_operation_is_not_recorded_twice() {
 fn two_identical_purchases_on_the_same_day_are_both_recorded() {
     // The natural key “account + date + amount” is too weak: two identical
     // operations on the same day are a valid situation (§10.6, §15.9).
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     store
         .append_event(&ctx.deposit(1, 100_000), IdentityScope::Source)
         .unwrap();
@@ -521,8 +562,9 @@ fn two_identical_purchases_on_the_same_day_are_both_recorded() {
 
 #[test]
 fn a_slice_through_a_date_excludes_later_events() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let early = ctx.deposit(1, 100_000);
     let mut late = ctx.deposit(2, 200_000);
     late.order = EffectiveOrder::new(date!(2026 - 03 - 01), 2);
@@ -537,8 +579,9 @@ fn a_slice_through_a_date_excludes_later_events() {
 
 #[test]
 fn source_time_orders_events_before_sequence_and_untimed_events() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let day = date!(2026 - 02 - 01);
 
     let mut untimed = ctx.deposit(1, 100_000);
@@ -560,8 +603,9 @@ fn source_time_orders_events_before_sequence_and_untimed_events() {
 
 #[test]
 fn equal_source_times_use_the_raw_hash_before_sequence() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
     let day = date!(2026 - 02 - 01);
     let mut first = ctx.deposit(1, 100_000);
     first.order = EffectiveOrder::with_source_time(day, time!(09:00:00), 2);
@@ -605,6 +649,7 @@ fn the_store_assigns_the_sequence_and_does_not_take_it_from_the_caller() {
     // identifier instead of the declared semantics (§4.8).
     let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
+    insert_account(&store, &ctx);
 
     let first = store
         .append_event_in_order(&ctx.deposit(1, 100_000), IdentityScope::Source)
@@ -630,6 +675,7 @@ fn concurrent_writers_assign_distinct_sequences_or_report_an_error() {
     let ctx = Arc::new(Ctx::new());
     let database = concurrent_database(&ctx);
     let initial_store = SqliteStore::open(&database.path).unwrap();
+    insert_account(&initial_store, &ctx);
     drop(initial_store);
 
     let first_store = SqliteStore::open(&database.path).unwrap();
@@ -742,7 +788,7 @@ fn account_activity_keeps_an_empty_owned_account() {
 
 #[test]
 fn account_activity_excludes_both_bookkeeping_kinds() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let period = AssertionPeriod::between(date!(2026 - 02 - 01), date!(2026 - 02 - 28)).unwrap();
@@ -765,6 +811,17 @@ fn account_activity_excludes_both_bookkeeping_kinds() {
         .unwrap();
     let mut dimensions = BTreeSet::new();
     dimensions.insert(Dimension::Cash);
+    // `dimensions` and `refused` are reconstructed from `rows` on read-back
+    // (spec §4.4: the union of the rows' own dimension sets, and
+    // `rows.len()`), so a row must actually be given to name — an empty
+    // `rows` with a nonzero `refused` cannot round-trip.
+    let refused_row = iaam_core::event::source_row::RefusedRow {
+        key: iaam_core::event::source_row::SourceRowKey {
+            source: ctx.source,
+            row: iaam_core::event::source_row::RowName::Given("OP-1".to_owned()),
+        },
+        dimensions: dimensions.clone(),
+    };
     store
         .append_event(
             &bookkeeping_event(
@@ -774,7 +831,7 @@ fn account_activity_excludes_both_bookkeeping_kinds() {
                     period,
                     dimensions,
                     refused: 1,
-                    rows: Vec::new(),
+                    rows: vec![refused_row],
                 },
             ),
             IdentityScope::Source,
@@ -795,7 +852,7 @@ fn account_activity_excludes_both_bookkeeping_kinds() {
 
 #[test]
 fn account_activity_reports_bounds_for_business_facts() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let first = ctx.deposit(1, 100_000);
@@ -825,7 +882,7 @@ fn account_activity_reports_bounds_for_business_facts() {
 /// while it held money at the end of the month.
 #[test]
 fn account_activity_counts_both_accounts_a_transfer_touched() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let savings = AccountId::new_random();
@@ -849,6 +906,16 @@ fn account_activity_counts_both_accounts_a_transfer_touched() {
         to: savings,
         amount,
     };
+    // A transfer's stored amount is reconstructed from the positive `to`
+    // leg (spec §4.5), so both endpoints need a leg — the sending side
+    // negative, the receiving side positive.
+    transfer.legs = vec![
+        Leg::cash(
+            ctx.account,
+            Money::new(PostedMinor::new(-500_000), CurrencyCode::Rub),
+        ),
+        Leg::cash(savings, amount),
+    ];
     transfer.order = EffectiveOrder::new(day, 1);
     transfer.dates = EventDates::for_cash(CashPostedDate(day));
     store
@@ -883,7 +950,7 @@ fn account_activity_counts_both_accounts_a_transfer_touched() {
 /// A transfer widens the receiving account's bounds without narrowing them.
 #[test]
 fn a_transfer_widens_the_coverage_it_reaches_beyond() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let savings = AccountId::new_random();
@@ -915,6 +982,16 @@ fn a_transfer_widens_the_coverage_it_reaches_beyond() {
         to: savings,
         amount,
     };
+    // A transfer's stored amount is reconstructed from the positive `to`
+    // leg (spec §4.5), so both endpoints need a leg — the sending side
+    // negative, the receiving side positive.
+    transfer.legs = vec![
+        Leg::cash(
+            ctx.account,
+            Money::new(PostedMinor::new(-500_000), CurrencyCode::Rub),
+        ),
+        Leg::cash(savings, amount),
+    ];
     transfer.order = EffectiveOrder::new(day, 1);
     transfer.dates = EventDates::for_cash(CashPostedDate(day));
     store

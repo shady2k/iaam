@@ -29,6 +29,7 @@ use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId, InstrumentId,
     OwnerId, SourceId,
 };
+use iaam_core::money::CurrencyCode;
 use iaam_core::money::{CalcMoney, Money, PerUnitAmount, Quantity};
 use iaam_core::report::journal::{self as journal_aggregate, JournalAggregateError};
 pub use iaam_core::report::journal::{
@@ -71,6 +72,13 @@ pub struct JournalReadQuery {
     /// different from [`Self::touching`], which also includes an event whose
     /// leg posts to the account.
     pub touching: Option<AccountId>,
+    /// Only events of one of these event-family discriminants. An event kind
+    /// filter selects the event as a whole; it does not narrow the legs.
+    pub kinds: Vec<String>,
+    /// Only events with at least one leg whose money has one of these currencies.
+    /// The selected event is returned as a whole, including legs in other
+    /// currencies.
+    pub currencies: Vec<CurrencyCode>,
     pub source: Option<DeclaredSource>,
     /// The declared import that carried these rows. Unlike `import_session`,
     /// this survives across multiple sessions for the same statement and is the
@@ -131,6 +139,13 @@ pub struct JournalAggregateQuery {
     pub import: Option<ImportId>,
     pub import_session: Option<ImportSessionId>,
     pub settled_by_rule: Option<ClassificationRuleId>,
+    /// Only events of one of these event-family discriminants. An event kind
+    /// filter selects the event as a whole; it does not narrow the legs.
+    pub kinds: Vec<String>,
+    /// Only events with at least one leg whose money has one of these currencies.
+    /// The selected event is returned as a whole, including legs in other
+    /// currencies.
+    pub currencies: Vec<CurrencyCode>,
     pub stands: Option<bool>,
     pub from: Option<Date>,
     pub to: Option<Date>,
@@ -290,6 +305,8 @@ pub async fn read_journal(
                 idempotency_key: query.idempotency_key.clone(),
                 account: query.account,
                 touching: query.touching,
+                kinds: query.kinds.clone(),
+                currencies: query.currencies.clone(),
                 source,
                 import: query.import,
                 import_session: query.import_session,
@@ -384,6 +401,8 @@ pub async fn aggregate_journal(
                 source,
                 import: query.import,
                 import_session: query.import_session,
+                kinds: query.kinds.clone(),
+                currencies: query.currencies.clone(),
                 settled_by_rule: query.settled_by_rule,
                 from: range.0,
                 to: range.1,
@@ -415,7 +434,8 @@ pub async fn aggregate_journal(
                 expected: format!(
                     "at most {ceiling} groups; request would produce {actual}; \
                  narrow filters: account, touching, source_account, source_channel, \
-                 source_label, import, import_session, settled_by_rule, from, to, stands"
+                 source_label, import, import_session, settled_by_rule, kind, currency, \
+                 from, to, stands"
                 ),
                 actual: query
                     .group_by

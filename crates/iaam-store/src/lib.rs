@@ -61,6 +61,8 @@ pub enum StoreError {
     },
     #[error("failed to serialize event: {0}")]
     EventEncode(#[source] serde_json::Error),
+    #[error("failed to serialize journal currency: {0}")]
+    CurrencyEncode(#[source] serde_json::Error),
     #[error("failed to parse snapshot: {0}")]
     SnapshotDecode(String),
     #[error("failed to serialize snapshot: {0}")]

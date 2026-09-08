@@ -355,6 +355,33 @@ pub enum TaxOrigin {
 }
 
 impl EventKind {
+    /// The closed event-family vocabulary used by the API and storage.
+    ///
+    /// This is kept beside [`Self::discriminant`] so a route cannot accept a
+    /// name the event model does not publish.
+    #[must_use]
+    pub const fn discriminants() -> &'static [&'static str; 17] {
+        &[
+            "trade",
+            "cash_in",
+            "cash_out",
+            "refund",
+            CASH_TRANSFER_KIND,
+            "own_account_movement",
+            "unresolved_own_account_movement",
+            "income",
+            "fee",
+            "tax",
+            "opening_position",
+            "opening_cash",
+            "valuation",
+            CONTROL_ASSERTION_KIND,
+            IMPORT_COVERAGE_GAP_KIND,
+            "corporate_action",
+            "offer_exercise",
+        ]
+    }
+
     /// Short machine-readable name. Used in the API and storage.
     ///
     /// Implemented with an exhaustive `match` and no `_` arm: adding

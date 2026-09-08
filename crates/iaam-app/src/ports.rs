@@ -9,6 +9,7 @@ use iaam_core::ids::{
     AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId,
     ImportId, ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, PrincipalId, SourceId,
 };
+use iaam_core::money::CurrencyCode;
 use iaam_core::operation::OperationKey;
 use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::Dimension;
@@ -619,6 +620,11 @@ pub struct JournalQuery {
     /// This is the set of events that touched an account, which is distinct
     /// from the event-account filter exposed by the journal route.
     pub touching: Option<AccountId>,
+    /// Only facts of one of these event-family discriminants.
+    pub kinds: Vec<String>,
+    /// Only facts with at least one leg whose money has one of these currencies.
+    /// The whole event remains selected, including legs in other currencies.
+    pub currencies: Vec<CurrencyCode>,
     pub source: Option<iaam_core::ids::SourceId>,
     /// Only facts carrying this declared import, the identity a retraction
     /// takes. This is distinct from the import session that committed them.

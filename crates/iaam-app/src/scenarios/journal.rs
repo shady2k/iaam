@@ -2061,10 +2061,6 @@ mod tests {
     /// is disabled rather than weakened or deleted, pending a maintainer
     /// decision on which side is wrong.
     #[tokio::test]
-    #[ignore = "iaam-c2fk: events.relation_target's new FK makes an unheld \
-                target unwritable by any path, contradicting HistoryAct::Arrived \
-                and read_operation_history's documented handling of exactly this \
-                case — needs a maintainer decision, not a fixture change"]
     async fn a_fact_naming_a_target_outside_his_journal_is_where_his_history_begins() {
         let ctx = Ctx::new();
         ctx.register_accounts().await;

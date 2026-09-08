@@ -1793,10 +1793,6 @@ async fn sync_refusal_counts_only_unreversed_affected_trades() {
 /// exercise what it names. Disabled rather than weakened or deleted, for the
 /// same maintainer decision the twin finding already asks for.
 #[tokio::test]
-#[ignore = "iaam-c2fk: events.relation_target's new FK makes a dangling \
-            correction target unwritable, so this fixture can no longer be \
-            seeded — same finding as scenarios/journal.rs's \
-            a_fact_naming_a_target_outside_his_journal_is_where_his_history_begins"]
 async fn sync_returns_an_error_when_corrections_do_not_resolve() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();

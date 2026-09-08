@@ -928,16 +928,21 @@ mod tests {
     }
 
     #[test]
-    fn a_deferred_foreign_key_failure_just_before_commit_leaves_no_rows() {
+    fn a_correction_naming_a_target_this_journal_does_not_hold_is_written() {
         let mut store = open_store();
         let fixture = Fixture::new(&store);
-        // `events.relation_target` is DEFERRABLE INITIALLY DEFERRED (spec
-        // §4.1): a target naming no real event is not caught at INSERT, only
-        // at COMMIT — which is the point this test induces the failure at.
-        let dangling_target = EventId::new_random();
+        // `events.relation_target` carries no foreign key, and that is a
+        // decision rather than an omission: the journal has a named state for
+        // a correction whose target it does not hold. `HistoryAct::Arrived`
+        // publishes it and `resolve_with_unheld_targets` reads it — «a fact
+        // naming a target outside his journal is where his history begins».
+        // A key here, deferred or not, would make that state unwritable by
+        // any path, so the database would forbid a fact the domain has a word
+        // for. This test is what keeps the key from being added back.
+        let unheld_target = EventId::new_random();
         let event = Event {
             relation: Relation::Reversal {
-                target: dangling_target,
+                target: unheld_target,
             },
             ..fixture.base_event(
                 1,
@@ -947,15 +952,11 @@ mod tests {
         };
 
         let tx = store.connection_mut().transaction().expect("open tx");
-        // The insert itself succeeds: the FK is deferred, and the read-back
-        // does not check it either.
-        insert_event_in(&tx, &event).expect("insert succeeds; the FK is deferred");
-        let commit_outcome = tx.commit();
-        assert!(
-            commit_outcome.is_err(),
-            "commit must fail on the still-dangling deferred relation_target"
-        );
-        assert_eq!(total_rows_for_event(store.connection(), event.id), 0);
+        insert_event_in(&tx, &event).expect("an unheld target is not a reason to refuse the fact");
+        tx.commit().expect("commit");
+        // Two rows: the header and the one cash leg a `CashIn` posts. The
+        // helper counts rows across all sixteen tables, not events.
+        assert_eq!(total_rows_for_event(store.connection(), event.id), 2);
     }
 
     // --- Fault injection: a panic mid-transaction ------------------------

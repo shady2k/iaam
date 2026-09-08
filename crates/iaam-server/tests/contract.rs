@@ -31250,10 +31250,6 @@ async fn an_operation_reads_back_as_the_acts_the_owner_took_on_it() {
 // Disabled rather than weakened or deleted, pending a maintainer decision on
 // which side is wrong.
 #[tokio::test]
-#[ignore = "iaam-c2fk: events.relation_target's new FK makes an unheld target \
-            unwritable by any path, contradicting HistoryAct::Arrived and \
-            read_operation_history's documented handling of exactly this case \
-            — needs a maintainer decision, not a fixture change"]
 async fn a_history_with_an_unheld_target_still_publishes_its_arrival() {
     let (harness, path) = harness_on_disk();
     let mut head = {

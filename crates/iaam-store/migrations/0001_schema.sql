@@ -1121,28 +1121,26 @@ CREATE TABLE events (
     -- schema does not promise to round-trip the whole `u64` range.
     CHECK (row_number IS NULL OR row_number >= 0),
 
-    FOREIGN KEY (owner, account) REFERENCES accounts (owner, id),
-    -- Owner-scoped and deferred — not for sealing, which D6 removed, but
-    -- because a bundle import inserts a graph and a replacement event can
-    -- precede its target. Deferring one key is simpler than topologically
-    -- sorting the import.
-    FOREIGN KEY (owner, relation_target) REFERENCES events (owner, id)
-        DEFERRABLE INITIALLY DEFERRED
+    FOREIGN KEY (owner, account) REFERENCES accounts (owner, id)
 
-    -- Not declared, and deliberately: `import_session` and `settled_by_rule`
-    -- look like foreign keys and must not be. `Bundle` carries events,
-    -- accounts and contours and nothing else, so restoring an archive into
-    -- an empty database would fail on both — they are archival provenance
-    -- handles, not references into a registry this database keeps.
+    -- Three columns look like foreign keys and are deliberately not:
+    -- `import_session`, `settled_by_rule` and `relation_target`.
+    --
+    -- The first two because `Bundle` carries events, accounts and contours
+    -- and nothing else, so restoring an archive into an empty database would
+    -- fail on both — they are archival provenance handles, not references
+    -- into a registry this database keeps.
+    --
+    -- `relation_target` for a sharper reason: the journal has a **named
+    -- state** for a correction whose target it does not hold.
+    -- `resolve_with_unheld_targets` exists for it, `HistoryAct::Arrived`
+    -- publishes it, and `read_operation_history` documents it — «a fact
+    -- naming a target outside his journal is where his history begins». A
+    -- foreign key here would make that state unwritable by any path, so the
+    -- database would forbid a fact the domain has a word for. Deferring it
+    -- would not help: deferral moves the check to COMMIT, it does not
+    -- excuse a target that never arrives.
 ) STRICT;
-
--- A composite foreign key needs a unique index matching exactly its
--- columns; `id` alone is already the primary key, so (owner, id) is unique
--- a fortiori, but SQLite still requires the index to exist by that name.
--- Needed for `events`' own self-referencing `relation_target` key above,
--- the same way `accounts_by_owner` serves `contour_accounts`' key into
--- `accounts`.
-CREATE UNIQUE INDEX events_by_owner_id ON events (owner, id);
 
 -- Порядок проекции: дата, затем sequence, затем идентификатор. Уникальность
 -- (owner, дата, sequence) обязательна: без неё два одновременных запроса

@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use iaam_core::batch::ControlSection;
+use iaam_core::category::CategoryMatcher;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::event::{Event, Relation};
@@ -20,6 +21,7 @@ use iaam_core::retirement::{AccountRetirement, RetirementRevision};
 use iaam_core::rules::LotRuleVersion;
 use iaam_http::HttpRequest;
 use iaam_ingest::SubmittedOperation;
+use iaam_ingest::classification::{Classification, RuleMatcher};
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::profile::UnresolvedAccountName;
 use iaam_store::documents::BrokerCode;
@@ -1674,7 +1676,7 @@ pub struct CategoryView {
 pub struct CategoryRuleView {
     pub id: CategoryRuleId,
     pub version: u32,
-    pub matcher: String,
+    pub matcher: CategoryMatcher,
     pub category: CategoryId,
     pub valid_from: Option<Date>,
     pub valid_to: Option<Date>,
@@ -1685,7 +1687,7 @@ pub struct CategoryRuleView {
 /// A category rule to create or amend through the category port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryRuleUpsert {
-    pub matcher: String,
+    pub matcher: CategoryMatcher,
     pub category: CategoryId,
     pub valid_from: Option<Date>,
     pub valid_to: Option<Date>,
@@ -1726,14 +1728,19 @@ pub trait CategoryStore: Send + Sync {
 
 /// A stored rule in a form the transport can return.
 ///
-/// The JSON matcher/outcome values remain opaque to the store and
-/// are returned without reinterpretation.
+/// `matcher` and `outcome` are the classifier's own domain values, not their
+/// serialisation: the store holds `RuleMatcher`'s seven conditions and
+/// `Classification`'s tagged outcome as typed columns (spec §4.6), and
+/// nothing about them is opaque any more. A caller that needs a wire form —
+/// the server's DTO layer — converts at that boundary; this port stops one
+/// layer short of it on purpose, so the domain vocabulary is not pushed into
+/// the wire contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationRuleView {
     pub id: uuid::Uuid,
     pub version: u32,
-    pub matcher: String,
-    pub outcome: String,
+    pub matcher: RuleMatcher,
+    pub outcome: Classification,
     pub created_at: String,
     pub retired_at: Option<String>,
     pub replaces: Option<uuid::Uuid>,
@@ -1746,8 +1753,8 @@ pub trait ClassificationRuleStore: Send + Sync {
     async fn create_rule(
         &self,
         owner: OwnerId,
-        matcher: String,
-        outcome: String,
+        matcher: RuleMatcher,
+        outcome: Classification,
         replaces: Option<uuid::Uuid>,
     ) -> Result<ClassificationRuleView, AppError>;
     async fn retire_rule(&self, owner: OwnerId, id: uuid::Uuid) -> Result<(), AppError>;
@@ -2065,8 +2072,8 @@ impl ClassificationRuleStore for UnavailableClassificationRuleStore {
     async fn create_rule(
         &self,
         _owner: OwnerId,
-        _matcher: String,
-        _outcome: String,
+        _matcher: RuleMatcher,
+        _outcome: Classification,
         _replaces: Option<uuid::Uuid>,
     ) -> Result<ClassificationRuleView, AppError> {
         Err(AppError::NotConfigured {

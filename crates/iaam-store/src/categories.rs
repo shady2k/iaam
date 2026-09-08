@@ -4,6 +4,7 @@
 //! reorganized without rewriting the append-only journal, while retirement
 //! keeps the records needed to explain historical reports.
 
+use iaam_core::category::{CategoryMatcher, DescriptionMatchMode};
 use iaam_core::ids::{CategoryId, CategoryRuleId, OwnerId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use time::Date;
@@ -39,7 +40,9 @@ pub struct CategoryRuleRow {
     pub id: CategoryRuleId,
     pub owner: OwnerId,
     pub version: u32,
-    pub matcher_json: String,
+    /// `CategoryMatcher`'s four variants, spelled as the `matcher_kind`,
+    /// `value`, `text` and `description_mode` columns (spec §4.6).
+    pub matcher: CategoryMatcher,
     pub category: CategoryId,
     pub valid_from: Option<Date>,
     pub valid_to: Option<Date>,
@@ -50,7 +53,7 @@ pub struct CategoryRuleRow {
 /// A category rule to write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewCategoryRule {
-    pub matcher_json: String,
+    pub matcher: CategoryMatcher,
     pub category: Uuid,
     pub valid_from: Option<Date>,
     pub valid_to: Option<Date>,
@@ -207,7 +210,8 @@ impl SqliteStore {
     /// rows, in version order.
     pub fn list_category_rules(&self, owner: OwnerId) -> Result<Vec<CategoryRuleRow>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, version, matcher, category, valid_from, valid_to,
+            "SELECT id, version, matcher_kind, value, text, description_mode,
+                    category, valid_from, valid_to,
                     created_at, retired_at, replaces
              FROM category_rules
              WHERE owner = ?1
@@ -218,12 +222,15 @@ impl SqliteStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, u32>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         })?;
         let mut rules = Vec::new();
@@ -231,7 +238,10 @@ impl SqliteStore {
             let (
                 id,
                 version,
-                matcher_json,
+                matcher_kind,
+                value,
+                text,
+                description_mode,
                 category,
                 valid_from,
                 valid_to,
@@ -243,7 +253,7 @@ impl SqliteStore {
                 id: CategoryRuleId(parse_uuid(&id, "category rule")?),
                 owner,
                 version,
-                matcher_json,
+                matcher: matcher_from_columns(&matcher_kind, value, text, description_mode)?,
                 category: CategoryId(parse_uuid(&category, "category")?),
                 valid_from: valid_from
                     .as_deref()
@@ -360,7 +370,6 @@ fn write_category_rule(
     rule: NewCategoryRule,
     replaces: Option<CategoryRuleId>,
 ) -> Result<CategoryRuleRow, StoreError> {
-    check_json(&rule.matcher_json)?;
     let category_exists: Option<()> = conn
         .query_row(
             "SELECT 1 FROM categories WHERE id = ?1 AND owner = ?2",
@@ -384,7 +393,7 @@ fn write_category_rule(
         id: CategoryRuleId::new_random(),
         owner,
         version: used.map_or(1, |value| value.saturating_add(1)),
-        matcher_json: rule.matcher_json,
+        matcher: rule.matcher,
         category: CategoryId(rule.category),
         valid_from: rule.valid_from,
         valid_to: rule.valid_to,
@@ -392,16 +401,21 @@ fn write_category_rule(
         retired_at: None,
         replaces,
     };
+    let (matcher_kind, value, text, description_mode) = matcher_to_columns(&stored.matcher);
     conn.execute(
         "INSERT INTO category_rules (
-             id, owner, version, matcher, category, valid_from, valid_to,
+             id, owner, version, matcher_kind, value, text, description_mode,
+             category, valid_from, valid_to,
              created_at, retired_at, replaces
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12)",
         params![
             stored.id.inner().to_string(),
             owner.inner().to_string(),
             stored.version,
-            &stored.matcher_json,
+            matcher_kind,
+            value,
+            text,
+            description_mode,
             stored.category.inner().to_string(),
             stored.valid_from.map(date_to_text),
             stored.valid_to.map(date_to_text),
@@ -410,6 +424,81 @@ fn write_category_rule(
         ],
     )?;
     Ok(stored)
+}
+
+/// [`CategoryMatcher`]'s four variants, spelled as the columns the schema's
+/// `CHECK` requires for each `matcher_kind` (spec §4.6).
+fn matcher_to_columns(
+    matcher: &CategoryMatcher,
+) -> (
+    &'static str,
+    Option<&str>,
+    Option<&str>,
+    Option<&'static str>,
+) {
+    match matcher {
+        CategoryMatcher::Row { key } => ("row", Some(key.as_str()), None, None),
+        CategoryMatcher::SourceCategory { value } => {
+            ("source_category", Some(value.as_str()), None, None)
+        }
+        CategoryMatcher::DescriptionContains { text } => {
+            ("description_contains", None, Some(text.as_str()), None)
+        }
+        CategoryMatcher::Description { text, mode } => {
+            ("description", None, Some(text.as_str()), Some(mode.code()))
+        }
+    }
+}
+
+/// The inverse of [`matcher_to_columns`].
+fn matcher_from_columns(
+    matcher_kind: &str,
+    value: Option<String>,
+    text: Option<String>,
+    description_mode: Option<String>,
+) -> Result<CategoryMatcher, StoreError> {
+    match matcher_kind {
+        "row" => Ok(CategoryMatcher::Row {
+            key: value.ok_or(StoreError::InvalidValue {
+                field: "value",
+                value: String::new(),
+            })?,
+        }),
+        "source_category" => Ok(CategoryMatcher::SourceCategory {
+            value: value.ok_or(StoreError::InvalidValue {
+                field: "value",
+                value: String::new(),
+            })?,
+        }),
+        "description_contains" => Ok(CategoryMatcher::DescriptionContains {
+            text: text.ok_or(StoreError::InvalidValue {
+                field: "text",
+                value: String::new(),
+            })?,
+        }),
+        "description" => {
+            let text = text.ok_or(StoreError::InvalidValue {
+                field: "text",
+                value: String::new(),
+            })?;
+            let mode = match description_mode.as_deref() {
+                Some("equals") => DescriptionMatchMode::Equals,
+                Some("starts_with") => DescriptionMatchMode::StartsWith,
+                Some("contains") => DescriptionMatchMode::Contains,
+                other => {
+                    return Err(StoreError::InvalidValue {
+                        field: "description_mode",
+                        value: other.unwrap_or_default().to_owned(),
+                    });
+                }
+            };
+            Ok(CategoryMatcher::Description { text, mode })
+        }
+        other => Err(StoreError::InvalidValue {
+            field: "matcher_kind",
+            value: other.to_owned(),
+        }),
+    }
 }
 
 fn retire_category_rule_row(
@@ -429,15 +518,6 @@ fn retire_category_rule_row(
         });
     }
     Ok(())
-}
-
-fn check_json(value: &str) -> Result<(), StoreError> {
-    serde_json::from_str::<serde_json::Value>(value)
-        .map(|_| ())
-        .map_err(|source| StoreError::RuleNotJson {
-            field: "matcher",
-            source,
-        })
 }
 
 fn date_to_text(value: Date) -> String {

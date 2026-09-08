@@ -13,7 +13,7 @@ use iaam_ingest::classification::{
     Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, FarSide,
     Movement, RuleMatcher, recompute_plan,
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 use time::Date;
 use uuid::Uuid;
 
@@ -93,12 +93,9 @@ pub struct RuleChange {
 /// Store a rule stated in the classifier's own types, and say what it corrects.
 ///
 /// The condition and the outcome arrive as [`RuleMatcher`] and
-/// [`Classification`] rather than as the JSON the store keeps, and that is the
-/// point: the encoding lives in [`matcher_json`] and [`outcome_json`] here,
-/// beside [`rule_from_view`], which is the only thing that reads it back. A
-/// transport that assembled the stored JSON itself would be a second writer of
-/// a format with one reader, and the two would drift silently — the rule would
-/// go in, and the owner's decision would be unreadable afterwards.
+/// [`Classification`] and are handed to the store port as exactly that: the
+/// store's typed columns (spec §4.6) carry them without a serialisation step,
+/// so there is no format for a second writer to drift from.
 pub async fn create_rule(
     services: &AppServices,
     principal: &Principal,
@@ -106,12 +103,10 @@ pub async fn create_rule(
     outcome: Classification,
     replaces: Option<Uuid>,
 ) -> Result<RuleChange, AppError> {
-    let matcher = encoded(&matcher_json(matcher), "matcher")?;
-    let outcome = encoded(&outcome_json(outcome), "outcome")?;
-    refuse_unreadable_rules(services, principal.owner, &matcher, &outcome).await?;
+    refuse_unreadable_rules(services, principal.owner).await?;
     let rule = services
         .rules
-        .create_rule(principal.owner, matcher, outcome, replaces)
+        .create_rule(principal.owner, matcher.clone(), outcome, replaces)
         .await?;
     let plan = recompute_history(services, principal.owner).await?;
     Ok(RuleChange { rule, plan })
@@ -120,7 +115,7 @@ pub async fn create_rule(
 /// Read every rule the recomputation will read, before anything is written.
 ///
 /// **This is the ordering, and it is the whole of iaam-y6kt.**
-/// [`recompute_history`] parses the owner's entire active rule set with
+/// [`recompute_history`] reads the owner's entire active rule set with
 /// [`rule_from_view`], and a rule it cannot read is an
 /// [`AppError::Invalid`] — a 422 at the transport. Run after the write, that
 /// refusal reached the caller while the store already held the rule it had just
@@ -129,20 +124,17 @@ pub async fn create_rule(
 /// so, and `GET /v1/classification-rules` refuses for the same reason, so the
 /// caller could not even look.
 ///
-/// Two things this is deliberately not.
+/// The proposal itself cannot be unreadable any more: it arrives as
+/// [`RuleMatcher`] and [`Classification`], and the store's columns carry them
+/// with no serialisation step to fail (spec §4.6) — the database's own `CHECK`
+/// refuses anything outside the closed vocabulary at the write, before this
+/// function is ever reached. What this still guards against is a rule already
+/// in the set that this build's [`outcome_from`] does not recognise — written
+/// by a different build, or by something other than this application
+/// entirely — and the ordering fix stands regardless of why a rule turns out
+/// unreadable: the check runs before the write, not after it.
 ///
-/// It is **not** a check of the proposal alone. The proposal is composed here
-/// out of typed values by [`matcher_json`] and [`outcome_json`], so it
-/// round-trips by construction; what actually fails is one of the rules already
-/// stored. The store keeps every matcher and outcome as opaque text — on
-/// purpose, so that it need not know the classifier's vocabulary — so it can
-/// hold JSON written before this route was typed or by something other than it,
-/// and one such rule made *every* later rule creation refuse. The proposal is
-/// read back all the same, through the same function and not a second parser of
-/// the same text, because "round-trips by construction" is an invariant worth
-/// holding rather than assuming.
-///
-/// It is **not** a recomputation moved before the write. The plan is still
+/// This is **not** a recomputation moved before the write. The plan is still
 /// computed afterwards, from the rule set the store actually holds, for the
 /// reason [`recompute_history`] gives in its third point: there is exactly one
 /// write, so nothing can half-happen. Computing the plan first would mean
@@ -155,13 +147,7 @@ pub async fn create_rule(
 /// journal it cannot resolve. That is a fact about the journal and not about the
 /// rule, it is reported as a 5xx and not as a refusal, and the rule it leaves
 /// stored is a valid standing decision whose plan any later call recomputes.
-async fn refuse_unreadable_rules(
-    services: &AppServices,
-    owner: OwnerId,
-    matcher: &str,
-    outcome: &str,
-) -> Result<(), AppError> {
-    matcher_and_outcome(matcher, outcome)?;
+async fn refuse_unreadable_rules(services: &AppServices, owner: OwnerId) -> Result<(), AppError> {
     for rule in services.rules.list_rules(owner).await? {
         if rule.retired_at.is_none() {
             rule_from_view(rule)?;
@@ -170,38 +156,15 @@ async fn refuse_unreadable_rules(
     Ok(())
 }
 
-/// The condition, in the form the rule store keeps it in.
+/// A rule matcher, in the shape a request body carries it — the shape
+/// `RuleMatcherDto` publishes, which omits an absent field rather than
+/// stating it as `null`.
 ///
-/// Every key [`rule_from_view`] reads is written, `null` included, so that a
-/// stored rule states what it does not ask about instead of leaving a reader to
-/// infer it from an absence.
-#[must_use]
-pub fn matcher_json(matcher: &RuleMatcher) -> Value {
-    serde_json::json!({
-        "counterparty_account": matcher.counterparty_account,
-        "description_contains": matcher.description_contains,
-        "kind": matcher.kind,
-        "source_category": matcher.source_category,
-        "owner_category": matcher.owner_category,
-        "source_code": matcher.source_code,
-        "movement": matcher.movement,
-    })
-}
-
-/// The condition, in the form a request body carries it.
-///
-/// The same seven fields as [`matcher_json`] and deliberately not the same
-/// shape: what a rule is **stored** as states every key, so a reader of the
-/// store sees what the rule does not ask about; what a rule is **sent** as is
-/// the shape `RuleMatcherDto` publishes, which omits an absent field, and that
-/// is what the schema a caller validates against describes.
-///
-/// Both exist because the action queue presets a body. A preset that carried
-/// the storage shape would publish one rule twice in two shapes — once as the
-/// proposal on the question it came from and once as the body to send — and
-/// nothing would ever compare them, which is how they come to disagree.
-/// `optional_string` reads a missing key and an explicit `null` identically, so
-/// the two forms mean the same thing to everything that parses them.
+/// Exists because the action queue presets a body from a domain [`RuleMatcher`]
+/// it is not itself sending: a preset built by any other encoding would
+/// publish one rule in two shapes — once as the proposal on the question it
+/// came from and once as the body to send — with nothing to keep them
+/// agreeing.
 #[must_use]
 pub fn matcher_request_json(matcher: &RuleMatcher) -> Value {
     let mut object = serde_json::Map::new();
@@ -235,10 +198,11 @@ pub fn matcher_request_json(matcher: &RuleMatcher) -> Value {
     Value::Object(object)
 }
 
-/// A classification, in the form the rule store keeps it in.
+/// A classification, in the wire shape `ClassifiedAsDto` publishes.
 ///
-/// The inverse of [`parse_outcome`], and it must stay so: a rule written in
-/// words that parser cannot read is a decision the owner can never see again.
+/// Used to build an action-queue preset body from a domain [`Classification`]
+/// — the wire contract's own concern, kept separate from how the store holds
+/// the value (spec §4.6 typed columns, no serialisation).
 #[must_use]
 pub fn outcome_json(classification: Classification) -> Value {
     let named = classified_as(classification);
@@ -264,11 +228,6 @@ pub fn outcome_json(classification: Classification) -> Value {
     Value::Object(object)
 }
 
-fn encoded(value: &Value, field: &'static str) -> Result<String, AppError> {
-    serde_json::to_string(value)
-        .map_err(|error| AppError::Store(format!("{field} could not be written: {error}")))
-}
-
 /// Retire a rule and say what the remaining set corrects.
 ///
 /// The readability check runs first for the reason
@@ -287,11 +246,7 @@ pub async fn retire_rule(
     principal: &Principal,
     id: Uuid,
 ) -> Result<RecomputePlan, AppError> {
-    for rule in services.rules.list_rules(principal.owner).await? {
-        if rule.retired_at.is_none() {
-            rule_from_view(rule)?;
-        }
-    }
+    refuse_unreadable_rules(services, principal.owner).await?;
     services.rules.retire_rule(principal.owner, id).await?;
     recompute_history(services, principal.owner).await
 }
@@ -495,134 +450,33 @@ pub const fn classified_as(classification: Classification) -> ClassifiedAs {
 
 /// A stored rule in the classifier's own vocabulary.
 ///
+/// A field move now, not a parse: [`ClassificationRuleView`] already carries
+/// `RuleMatcher` and `Classification` (spec §4.6), so there is no format left
+/// for this and a second reader to disagree about. Kept as its own function,
+/// with a `Result` it now always fulfils, because every external caller of it
+/// already goes through the `?` this signature invites — changing it would
+/// touch every one of them for no remaining reason.
+///
 /// Shared with the import session on purpose: the session classifies an incoming
 /// row against the same rules the recomputation replays history with, and two
 /// readings of one stored matcher would eventually disagree about what the owner
 /// decided.
 pub fn rule_from_view(rule: ClassificationRuleView) -> Result<ClassificationRule, AppError> {
-    let (matcher, outcome) = matcher_and_outcome(&rule.matcher, &rule.outcome)?;
     Ok(ClassificationRule {
         id: ClassificationRuleId(rule.id),
         version: rule.version,
-        matcher,
-        outcome,
+        matcher: rule.matcher,
+        outcome: rule.outcome,
     })
 }
 
-/// The stored condition and outcome, in the classifier's own vocabulary.
+/// The outcome vocabulary, read from three fields.
 ///
-/// Split out of [`rule_from_view`] so that a rule which is not stored yet can be
-/// read by exactly the code that reads one which is: [`create_rule`] reads its
-/// own proposal back before writing it, and it has no identity or version to
-/// build a view out of. A second parser there would eventually accept text the
-/// classifier refuses, which is the failure the one-reader rule exists to
-/// prevent.
-fn matcher_and_outcome(
-    matcher: &str,
-    outcome: &str,
-) -> Result<(RuleMatcher, Classification), AppError> {
-    let matcher = json_object(matcher, "matcher")?;
-    let outcome = json_object(outcome, "outcome")?;
-    Ok((
-        RuleMatcher {
-            counterparty_account: optional_string(&matcher, "counterparty_account", "matcher")?,
-            description_contains: optional_string(&matcher, "description_contains", "matcher")?,
-            kind: optional_string(&matcher, "kind", "matcher")?,
-            movement: optional_movement(&matcher, "movement", "matcher")?,
-            // Absent from every rule stored before `iaam-93lz`, and `None` is
-            // what those rules meant: the condition could not be written, so no
-            // rule that predates the field is silently widened by reading it.
-            source_category: optional_string(&matcher, "source_category", "matcher")?,
-            // Absent from every rule stored before the profile could read the
-            // columns, and `None` is what those rules meant, exactly as above:
-            // a condition that could not be written is not read into a rule
-            // that never asked it.
-            owner_category: optional_string(&matcher, "owner_category", "matcher")?,
-            source_code: optional_string(&matcher, "source_code", "matcher")?,
-        },
-        parse_outcome(outcome)?,
-    ))
-}
-
-fn json_object(raw: &str, field: &str) -> Result<Map<String, Value>, AppError> {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(Value::Object(object)) => Ok(object),
-        Ok(_) => Err(AppError::Invalid {
-            field: field.to_owned(),
-            expected: "classification rule JSON object".to_owned(),
-            actual: "JSON is not an object".to_owned(),
-        }),
-        Err(error) => Err(AppError::Invalid {
-            field: field.to_owned(),
-            expected: "classification rule JSON object".to_owned(),
-            actual: error.to_string(),
-        }),
-    }
-}
-
-fn optional_string(
-    object: &Map<String, Value>,
-    field: &str,
-    group: &str,
-) -> Result<Option<String>, AppError> {
-    match object.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(actual) => Err(AppError::Invalid {
-            field: group.to_owned(),
-            expected: format!("field {field} is a string"),
-            actual: actual.to_string(),
-        }),
-    }
-}
-fn optional_movement(
-    object: &Map<String, Value>,
-    field: &str,
-    group: &str,
-) -> Result<Option<Movement>, AppError> {
-    let Some(value) = object.get(field) else {
-        return Ok(None);
-    };
-    match value {
-        Value::Null => Ok(None),
-        Value::String(value) => match value.as_str() {
-            "in" => Ok(Some(Movement::In)),
-            "out" => Ok(Some(Movement::Out)),
-            _ => Err(AppError::Invalid {
-                field: group.to_owned(),
-                expected: format!("field {field} is \"in\" or \"out\""),
-                actual: value.clone(),
-            }),
-        },
-        actual => Err(AppError::Invalid {
-            field: group.to_owned(),
-            expected: format!("field {field} is \"in\" or \"out\""),
-            actual: actual.to_string(),
-        }),
-    }
-}
-
-fn parse_outcome(outcome: Map<String, Value>) -> Result<Classification, AppError> {
-    let kind = outcome
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid_outcome("field kind"))?;
-    outcome_from(
-        kind,
-        outcome.get("to").and_then(Value::as_str),
-        outcome.get("origin").and_then(Value::as_str),
-        outcome.get("income_kind").and_then(Value::as_str),
-    )
-}
-
-/// The outcome vocabulary, read from three fields rather than from JSON.
-///
-/// The stored rule and the request body carry the same three words in different
-/// containers — an object in the store, named members of a request DTO on the
-/// wire — and both must be read by one function. Two readers would eventually
-/// admit a word on one side that the other refuses, and a rule accepted at the
-/// door that the classifier cannot read is a decision written and lost in the
-/// same call.
+/// The request body carries these as named DTO members on the wire, and this
+/// is the one place that turns them into [`Classification`] — a second reader
+/// would eventually admit a word this one refuses, and a rule accepted at the
+/// door that the classifier cannot construct is a decision lost in the same
+/// call.
 pub fn outcome_from(
     kind: &str,
     to: Option<&str>,
@@ -1023,12 +877,13 @@ mod tests {
     }
 
     #[test]
-    fn a_category_condition_survives_the_shape_the_store_keeps_it_in() {
-        // The encoder and the one reader of the stored format are a pair, and a
-        // condition the encoder writes that the reader drops is a decision the
-        // owner made and can never see again. Both request and storage shapes
-        // are checked, because the action queue presets the first and the
-        // classifier reads the second.
+    fn the_request_shape_omits_what_the_rule_does_not_ask_about() {
+        // The store no longer holds a serialisation to round-trip through
+        // (spec §4.6 typed columns): `matcher_request_json` has exactly one
+        // remaining job, building the action queue's preset request body from
+        // a domain `RuleMatcher`, and this is the shape that body must have —
+        // an absent condition is an absent key, not an explicit `null`, which
+        // is what the schema a caller validates against describes.
         let matcher = RuleMatcher {
             movement: None,
             counterparty_account: None,
@@ -1038,42 +893,12 @@ mod tests {
             owner_category: None,
             source_code: None,
         };
-        let stored = serde_json::to_string(&matcher_json(&matcher)).expect("matcher json");
-        let outcome = serde_json::to_string(&outcome_json(Classification::Income {
-            kind: Some(IncomeKind::DepositInterest),
-        }))
-        .expect("outcome json");
 
-        let (read_back, decided) = matcher_and_outcome(&stored, &outcome)
-            .expect("the encoder writes what the reader reads");
-
-        assert_eq!(read_back, matcher);
-        assert_eq!(
-            decided,
-            Classification::Income {
-                kind: Some(IncomeKind::DepositInterest)
-            }
-        );
         assert_eq!(
             matcher_request_json(&matcher),
             serde_json::json!({ "source_category": "Bank interest" }),
             "the request shape omits what the rule does not ask about"
         );
-    }
-
-    #[test]
-    fn a_rule_stored_before_the_category_condition_existed_still_asks_what_it_asked() {
-        // Every rule already in the store was written without the key. A reader
-        // that treated the absence as anything but «this rule does not ask about
-        // the category» would widen or narrow a standing decision of the
-        // owner's on a deployment rather than on a decision of his.
-        let stored = r#"{"counterparty_account":null,"description_contains":null,"kind":"INNER"}"#;
-        let outcome = r#"{"kind":"own_account_movement"}"#;
-
-        let (matcher, _) = matcher_and_outcome(stored, outcome).expect("an older stored rule");
-
-        assert_eq!(matcher.source_category, None);
-        assert_eq!(matcher.kind.as_deref(), Some("INNER"));
     }
 
     #[test]

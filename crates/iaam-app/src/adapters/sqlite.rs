@@ -1774,15 +1774,87 @@ impl BrokerChannelFactory for SqliteAdapter {
     }
 }
 
-fn classification_rule_view(rule: iaam_store::rules::StoredRule) -> ClassificationRuleView {
-    ClassificationRuleView {
+/// The stored rule's typed columns, read back into the classifier's own
+/// `Movement`.
+///
+/// The database's `CHECK` already limits the column to `"in"`, `"out"` or
+/// `NULL` (spec §4.6): a third value here means a row this store did not
+/// write, and it is reported rather than guessed at.
+fn movement_from_store(
+    value: Option<&str>,
+) -> Result<Option<iaam_ingest::classification::Movement>, AppError> {
+    match value {
+        None => Ok(None),
+        Some("in") => Ok(Some(iaam_ingest::classification::Movement::In)),
+        Some("out") => Ok(Some(iaam_ingest::classification::Movement::Out)),
+        Some(other) => Err(AppError::Store(format!(
+            "stored classification rule has an unreadable movement: {other}"
+        ))),
+    }
+}
+
+/// `iaam-store`'s typed columns, read back into the classifier's own
+/// [`RuleMatcher`](iaam_ingest::classification::RuleMatcher) and
+/// [`Classification`](iaam_ingest::classification::Classification). The port
+/// carries these domain values directly — nothing here is opaque text any
+/// more, so there is no encoding step, only a mapping from columns to fields.
+fn classification_rule_view(
+    rule: iaam_store::rules::StoredRule,
+) -> Result<ClassificationRuleView, AppError> {
+    let matcher = iaam_ingest::classification::RuleMatcher {
+        counterparty_account: rule.counterparty_account,
+        description_contains: rule.description_contains,
+        kind: rule.source_kind,
+        source_category: rule.source_category,
+        owner_category: rule.owner_category,
+        source_code: rule.source_code,
+        movement: movement_from_store(rule.movement.as_deref())?,
+    };
+    let outcome = crate::scenarios::classification::outcome_from(
+        &rule.outcome_kind,
+        rule.to_account
+            .map(|account| account.inner().to_string())
+            .as_deref(),
+        rule.fee_origin.as_deref(),
+        rule.income_kind.as_deref(),
+    )?;
+    Ok(ClassificationRuleView {
         id: rule.id.inner(),
         version: rule.version,
-        matcher: rule.matcher,
-        outcome: rule.outcome,
+        matcher,
+        outcome,
         created_at: rule.created_at,
         retired_at: rule.retired_at,
         replaces: rule.replaces.map(|id| id.inner()),
+    })
+}
+
+/// The classifier's own [`RuleMatcher`](iaam_ingest::classification::RuleMatcher)
+/// and [`Classification`](iaam_ingest::classification::Classification), spelled
+/// as `iaam-store`'s typed columns.
+fn new_rule_from_domain(
+    matcher: &iaam_ingest::classification::RuleMatcher,
+    outcome: iaam_ingest::classification::Classification,
+) -> iaam_store::rules::NewRule {
+    let named = crate::scenarios::classification::classified_as(outcome);
+    iaam_store::rules::NewRule {
+        counterparty_account: matcher.counterparty_account.clone(),
+        description_contains: matcher.description_contains.clone(),
+        source_kind: matcher.kind.clone(),
+        source_category: matcher.source_category.clone(),
+        owner_category: matcher.owner_category.clone(),
+        source_code: matcher.source_code.clone(),
+        movement: matcher.movement.map(|movement| {
+            match movement {
+                iaam_ingest::classification::Movement::In => "in",
+                iaam_ingest::classification::Movement::Out => "out",
+            }
+            .to_owned()
+        }),
+        outcome_kind: named.kind.to_owned(),
+        to_account: named.to,
+        fee_origin: named.origin.map(str::to_owned),
+        income_kind: named.income_kind.map(str::to_owned),
     }
 }
 
@@ -1790,10 +1862,8 @@ fn classification_rule_view(rule: iaam_store::rules::StoredRule) -> Classificati
 impl ClassificationRuleStore for SqliteAdapter {
     async fn list_rules(&self, owner: OwnerId) -> Result<Vec<ClassificationRuleView>, AppError> {
         self.blocking(move |store| {
-            store
-                .rule_history(owner)
-                .map(|rules| rules.into_iter().map(classification_rule_view).collect())
-                .map_err(store_error)
+            let rules = store.rule_history(owner).map_err(store_error)?;
+            rules.into_iter().map(classification_rule_view).collect()
         })
         .await
     }
@@ -1801,16 +1871,15 @@ impl ClassificationRuleStore for SqliteAdapter {
     async fn create_rule(
         &self,
         owner: OwnerId,
-        matcher: String,
-        outcome: String,
+        matcher: iaam_ingest::classification::RuleMatcher,
+        outcome: iaam_ingest::classification::Classification,
         replaces: Option<Uuid>,
     ) -> Result<ClassificationRuleView, AppError> {
         self.blocking(move |store| {
-            let rule = match replaces {
-                Some(previous) => {
-                    store.amend_rule(owner, ClassificationRuleId(previous), &matcher, &outcome)
-                }
-                None => store.insert_rule(owner, &matcher, &outcome),
+            let rule = new_rule_from_domain(&matcher, outcome);
+            let stored = match replaces {
+                Some(previous) => store.amend_rule(owner, ClassificationRuleId(previous), rule),
+                None => store.insert_rule(owner, rule),
             }
             .map_err(|error| match error {
                 iaam_store::StoreError::NotFound { .. } => AppError::NotFound {
@@ -1822,7 +1891,7 @@ impl ClassificationRuleStore for SqliteAdapter {
                 },
                 other => store_error(other),
             })?;
-            Ok(classification_rule_view(rule))
+            classification_rule_view(stored)
         })
         .await
     }
@@ -1879,11 +1948,14 @@ fn category_view(row: iaam_store::categories::CategoryRow) -> CategoryView {
     }
 }
 
+/// `iaam-store`'s typed `matcher` is the port's `CategoryMatcher` directly:
+/// nothing here is opaque text, so there is no encoding step, only a field
+/// move.
 fn category_rule_view(row: iaam_store::categories::CategoryRuleRow) -> CategoryRuleView {
     CategoryRuleView {
         id: row.id,
         version: row.version,
-        matcher: row.matcher_json,
+        matcher: row.matcher,
         category: row.category,
         valid_from: row.valid_from,
         valid_to: row.valid_to,
@@ -1991,7 +2063,7 @@ impl CategoryStore for SqliteAdapter {
     ) -> Result<CategoryRuleView, AppError> {
         self.blocking(move |store| {
             let store_rule = NewCategoryRule {
-                matcher_json: rule.matcher,
+                matcher: rule.matcher,
                 category: rule.category.inner(),
                 valid_from: rule.valid_from,
                 valid_to: rule.valid_to,

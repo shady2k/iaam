@@ -10,6 +10,7 @@ rust-version.workspace = true
 # без версии wildcard-зависимостью, а wildcards = "deny" в deny.toml.
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
 rusqlite = { version = "0.40", features = ["bundled"] }
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Снимок проекции содержит карты с составными ключами, которые JSON

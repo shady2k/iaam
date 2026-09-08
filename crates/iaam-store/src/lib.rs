@@ -16,6 +16,7 @@ pub mod decisions;
 pub mod documents;
 pub mod events;
 pub mod import_session;
+mod journal;
 pub mod reference;
 pub mod rules;
 pub mod schedule;

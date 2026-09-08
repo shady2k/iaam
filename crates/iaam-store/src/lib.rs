@@ -14,9 +14,8 @@ pub mod bundle;
 pub mod categories;
 pub mod decisions;
 pub mod documents;
-pub mod events;
 pub mod import_session;
-mod journal;
+pub mod journal;
 pub mod reference;
 pub mod rules;
 pub mod schedule;
@@ -54,16 +53,8 @@ pub(crate) fn now() -> String {
 pub enum StoreError {
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("failed to parse saved event {id}: {source}")]
-    EventDecode {
-        id: String,
-        #[source]
-        source: serde_json::Error,
-    },
     #[error("failed to serialize event: {0}")]
     EventEncode(#[source] serde_json::Error),
-    #[error("failed to serialize journal currency: {0}")]
-    CurrencyEncode(#[source] serde_json::Error),
     #[error("failed to parse snapshot: {0}")]
     SnapshotDecode(String),
     #[error("failed to serialize snapshot: {0}")]

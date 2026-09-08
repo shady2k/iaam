@@ -31,7 +31,7 @@ use iaam_store::documents::BrokerCode;
 // The store mints `recorded_at` from its own clock, so a port copy of the pair
 // would be the same two fields written twice — and the retyping is where the
 // two could come to disagree about which moment the stamp names.
-pub use iaam_store::events::RecordedEvent;
+pub use iaam_store::journal::RecordedEvent;
 // The grouping label deliberately does not live in `iaam-core`: the core is
 // where rules live, and nothing may branch on it.
 pub use iaam_core::report::balances::NegativeBalanceExpectation;

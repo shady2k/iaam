@@ -9,7 +9,7 @@ use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
-use iaam_store::events::{CHAIN_STEP_BACK_SQL, CHAIN_STEP_FORWARD_SQL, RecordedEvent};
+use iaam_store::journal::{CHAIN_STEP_BACK_SQL, CHAIN_STEP_FORWARD_SQL, RecordedEvent};
 use rusqlite::params;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;

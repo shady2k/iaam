@@ -4830,6 +4830,208 @@ async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
 }
 
 #[tokio::test]
+async fn report_series_entries_match_single_date_routes_in_requested_order() {
+    let harness = harness();
+    let (status, contour) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Series portfolio", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour}");
+    let contour_id = contour["contour"].as_str().expect("contour").to_owned();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "series fixture",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "deposit",
+                    "amount": "1234.56",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-06-01" },
+                    "idempotency_key": "series-fixture-1",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let dates = ["2025-01-01", "2025-06-01", "2025-12-31"];
+    let joined = dates.join(",");
+
+    let (status, balance_series) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances/series?contour={contour_id}&as_of={joined}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{balance_series}");
+    let balance_entries = balance_series["reports"]
+        .as_array()
+        .expect("balance series reports");
+    assert_eq!(balance_entries.len(), dates.len(), "{balance_series}");
+
+    let (status, asset_series) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets/series?contour={contour_id}&as_of={joined}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{asset_series}");
+    let asset_entries = asset_series["reports"]
+        .as_array()
+        .expect("asset series reports");
+    assert_eq!(asset_entries.len(), dates.len(), "{asset_series}");
+
+    for (index, date) in dates.iter().enumerate() {
+        assert_eq!(balance_entries[index]["as_of"], *date, "{balance_series}");
+        assert_eq!(asset_entries[index]["as_of"], *date, "{asset_series}");
+
+        let (status, single_balance) = call(
+            &harness.router,
+            get(
+                &format!("/v1/reports/balances?contour={contour_id}&as_of={date}"),
+                Some(&harness.owner_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{single_balance}");
+        assert_eq!(balance_entries[index]["report"], single_balance, "{date}");
+
+        let (status, single_assets) = call(
+            &harness.router,
+            get(
+                &format!("/v1/reports/assets?contour={contour_id}&as_of={date}"),
+                Some(&harness.owner_token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{single_assets}");
+        assert_eq!(asset_entries[index]["report"], single_assets, "{date}");
+    }
+}
+
+#[tokio::test]
+async fn report_series_refuses_over_cap_duplicates_and_partial_failures() {
+    let harness = harness();
+    let over_cap = (0..32)
+        .map(|offset| (date!(2025 - 01 - 01) + TimeDuration::days(offset)).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/balances/series?contour={}&as_of={over_cap}",
+                Uuid::new_v4()
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["expected"].as_str().is_some_and(
+            |expected| expected.contains("at most 31 dates") && expected.contains("32")
+        ),
+        "the refusal must name the ceiling and requested count: {body}"
+    );
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/assets/series?contour={}&as_of=2025-01-01,2025-06-01,2025-01-01",
+                Uuid::new_v4()
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "as_of", "{body}");
+    assert_eq!(body["expected"], "each date named at most once", "{body}");
+    assert_eq!(body["actual"], "2025-01-01", "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/balances/series?contour={}&as_of=2025-01-01,2025-06-01",
+                Uuid::new_v4()
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.get("reports").is_none(),
+        "a computation failure must not produce a partial series: {body}"
+    );
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/reports/balances/series?contour={}&as_of=2025-01-01,not-a-date,2025-06-01",
+                Uuid::new_v4()
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "as_of", "{body}");
+    assert!(
+        body.get("reports").is_none(),
+        "an invalid date must not produce a partial series: {body}"
+    );
+}
+
+#[tokio::test]
+async fn report_series_routes_publish_parameters_and_responses_in_openapi() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK, "{spec}");
+
+    for (path, response) in [
+        ("/v1/reports/balances/series", "BalancesReportSeriesDto"),
+        ("/v1/reports/assets/series", "AssetSnapshotSeriesDto"),
+    ] {
+        let operation = &spec["paths"][path]["get"];
+        assert!(operation.is_object(), "missing OpenAPI operation: {path}");
+        let parameters = operation["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing parameters: {path}"));
+        for name in ["contour", "contour_version", "as_of", "held"] {
+            assert!(
+                parameters.iter().any(|parameter| parameter["name"] == name),
+                "{path} does not publish query parameter {name}: {parameters:?}"
+            );
+        }
+        assert_eq!(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{response}"),
+            "{path} response schema"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_not() {
     // The snapshot key comprises the contour, its version and the rule version; the date is
     // absent. A snapshot built from a slice at a past date would be stored under the

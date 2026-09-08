@@ -220,6 +220,8 @@ things. Read it as the lookup table for §1.
 | `GET /v1/accounts/{id}/transfer-partners` | `AccountTransferPartnersDto` | object, `partners` | `stated` — whether the owner has ruled at all, which an empty array cannot say |
 | `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, `row_count`, and how many questions are unanswered |
 | `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population`, `held_rows` |
+| `GET /v1/reports/balances/series` | `BalancesReportSeriesDto` | object, `reports` | one complete `BalancesReportDto` per requested date, beside its date, in request order |
+| `GET /v1/reports/assets/series` | `AssetSnapshotSeriesDto` | object, `reports` | one complete `AssetSnapshotDto` per requested date, beside its date, in request order |
 | `GET /v1/reports/returns` | `ReturnsAnswerDto` | object | not a list at the top level; `population` and `held_rows` sit beside the report's own figures |
 | `GET /v1/reports/flow` | `MoneyFlowReportDto` | object, `currencies` | the interval, the scope version, `population`, `held_rows`, `actions` |
 | `POST /v1/ingest/operations` | `[VerdictDto]` | bare array | one verdict per submitted row, in the caller's own order |

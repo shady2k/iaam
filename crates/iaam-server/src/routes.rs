@@ -87,22 +87,23 @@ use crate::dto::{
     AccountIdentityStatedDto, AccountIdentityStatementDto, AccountNameDispositionDto,
     AccountNegativeBalanceExpectationStatementDto, AccountScopeDispositionDto, AccountScopeDto,
     AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
-    ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, BalancesReportDto,
-    BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto, CategoryDto, CategoryGroupDto,
-    CategoryGroupRequest, CategoryMatcherDto, CategoryRequest, CategoryRuleBatchRequest,
-    CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest, ClassificationRuleChangeDto,
-    ClassificationRuleDto, ClassificationRuleRequest, ContourDto, ContourVersionDto,
-    CorrectImportRequest, CorrectionVerdictDto, CreateAccountRequest, CreateAccountsBatchRequest,
-    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
-    CustodyRepairOutcomeDto, CustodyRepairRequest, DecisionDto, DeclaredAccountDto,
-    DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto,
-    InputAlternativeDto, InstrumentDto, InstrumentListDto, IssuedTokenDto, JournalAggregateDto,
-    JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto,
-    MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto,
-    MarketSyncRequest, MissingInputDto, MoneyFlowReportDto, NegativeBalanceExpectationDto,
-    OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto, PrintedAccountNameDto,
-    ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto, RecomputePlanDto,
-    ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, AssetSnapshotSeriesDto,
+    AssetSnapshotSeriesEntryDto, BalancesReportDto, BalancesReportSeriesDto,
+    BalancesReportSeriesEntryDto, BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto,
+    CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryMatcherDto, CategoryRequest,
+    CategoryRuleBatchRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest,
+    ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
+    ContourVersionDto, CorrectImportRequest, CorrectionVerdictDto, CreateAccountRequest,
+    CreateAccountsBatchRequest, CreateContourVersionRequest, CreateInstrumentRequest,
+    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DecisionDto,
+    DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
+    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, InstrumentListDto, IssuedTokenDto,
+    JournalAggregateDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
+    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
+    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
+    PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
     RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
     RenameAccountRequest, RenameAccountsBatchRequest, ReplaceAccountAliasesBatchRequest,
@@ -5787,6 +5788,29 @@ pub struct AssetSnapshotParams {
     pub held: Option<String>,
 }
 
+/// Maximum number of report dates one series request may contain.
+///
+/// Report bodies include confidence, population, held rows and one row per
+/// account, so a series is bounded before any per-date report is built.
+pub const MAX_REPORT_SERIES_DATES: usize = 31;
+
+/// Shared query parameters for the balances and assets report series.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct ReportSeriesParams {
+    /// Scope identifier.
+    pub contour: Uuid,
+    /// Scope composition version. By default — the latest.
+    #[serde(default)]
+    pub contour_version: Option<u32>,
+    /// Report dates in YYYY-MM-DD format, comma-separated and in response order.
+    pub as_of: String,
+    /// Held-row selection, as on the single-date report routes.
+    #[serde(default)]
+    pub held: Option<String>,
+}
+
 /// What the owner holds at a date, grouped by the class of cash he declared.
 ///
 /// The same fold as `/v1/reports/balances`, regrouped: the rows in `accounts`
@@ -5826,6 +5850,94 @@ pub async fn asset_snapshot_report(
         &outcome.held_rows,
         &catalog,
     )))
+}
+
+/// Account balances for several dates in the order requested.
+///
+/// The route is all-or-nothing: a failed date aborts the request because a
+/// partial perimeter history is not actionable as the comparison the caller
+/// asked for, while each successful entry is the complete single-date answer.
+#[utoipa::path(
+    get,
+    path = "/v1/reports/balances/series",
+    params(ReportSeriesParams),
+    responses(
+        (status = 200, description = "Complete balances report for each requested date, in request order", body = BalancesReportSeriesDto),
+        (status = 404, description = "Scope or import session not found", body = ApiError),
+        (status = 422, description = "Invalid report date, duplicate date, too many dates, or an unreadable held-row scope", body = ApiError),
+        (status = 500, description = "Balances could not be built", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn balances_report_series(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiQuery(params): ApiQuery<ReportSeriesParams>,
+) -> Result<Json<BalancesReportSeriesDto>, ApiFailure> {
+    let dates = parse_report_series_dates(&params.as_of)?;
+    let held = parse_held_scope(params.held.as_deref())?;
+    let mut reports = Vec::with_capacity(dates.len());
+    for as_of in dates {
+        let outcome = account_balances(
+            &state.services,
+            &principal,
+            ContourId(params.contour),
+            params.contour_version.map(ContourVersion),
+            as_of,
+            &held,
+        )
+        .await?;
+        reports.push(BalancesReportSeriesEntryDto {
+            as_of,
+            report: BalancesReportDto::from_domain(&outcome.report, &outcome.held_rows, &catalog),
+        });
+    }
+    Ok(Json(BalancesReportSeriesDto { reports }))
+}
+
+/// Asset snapshots for several dates in the order requested.
+///
+/// The route is all-or-nothing: a failed date aborts the request because a
+/// partial perimeter history is not actionable as the comparison the caller
+/// asked for, while each successful entry is the complete single-date answer.
+#[utoipa::path(
+    get,
+    path = "/v1/reports/assets/series",
+    params(ReportSeriesParams),
+    responses(
+        (status = 200, description = "Complete asset snapshot for each requested date, in request order", body = AssetSnapshotSeriesDto),
+        (status = 404, description = "Scope or import session not found", body = ApiError),
+        (status = 422, description = "Invalid report date, duplicate date, too many dates, or an unreadable held-row scope", body = ApiError),
+        (status = 500, description = "Snapshot could not be built", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn asset_snapshot_report_series(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiQuery(params): ApiQuery<ReportSeriesParams>,
+) -> Result<Json<AssetSnapshotSeriesDto>, ApiFailure> {
+    let dates = parse_report_series_dates(&params.as_of)?;
+    let held = parse_held_scope(params.held.as_deref())?;
+    let mut reports = Vec::with_capacity(dates.len());
+    for as_of in dates {
+        let outcome = asset_snapshot(
+            &state.services,
+            &principal,
+            ContourId(params.contour),
+            params.contour_version.map(ContourVersion),
+            as_of,
+            &held,
+        )
+        .await?;
+        reports.push(AssetSnapshotSeriesEntryDto {
+            as_of,
+            report: AssetSnapshotDto::from_domain(&outcome.snapshot, &outcome.held_rows, &catalog),
+        });
+    }
+    Ok(Json(AssetSnapshotSeriesDto { reports }))
 }
 
 /// Returns report parameters.
@@ -6504,6 +6616,9 @@ impl crate::extract::QueryRequirements for MoneyFlowParams {
     const REQUIRED: &'static [&'static str] = &["contour", "from", "to"];
 }
 
+impl crate::extract::QueryRequirements for ReportSeriesParams {
+    const REQUIRED: &'static [&'static str] = &["contour", "as_of"];
+}
 impl crate::extract::QueryRequirements for BalancesParams {
     const REQUIRED: &'static [&'static str] = &["contour", "as_of"];
 }
@@ -6770,6 +6885,32 @@ fn parse_query_date(field: &'static str, value: &str) -> Result<Date, ApiFailure
         time::macros::format_description!("[year]-[month]-[day]"),
     )
     .map_err(|_| invalid_field(field, "YYYY-MM-DD", value.to_owned()))
+}
+
+fn parse_report_series_dates(value: &str) -> Result<Vec<Date>, ApiFailure> {
+    let requested = value.split(',').count();
+    if requested > MAX_REPORT_SERIES_DATES {
+        return Err(invalid_field(
+            "as_of",
+            &format!("at most {MAX_REPORT_SERIES_DATES} dates; request asked for {requested}"),
+            value.to_owned(),
+        ));
+    }
+
+    let mut dates = Vec::with_capacity(requested);
+    let mut seen = BTreeSet::new();
+    for part in value.split(',') {
+        let date = parse_query_date("as_of", part.trim())?;
+        if !seen.insert(date) {
+            return Err(invalid_field(
+                "as_of",
+                "each date named at most once",
+                date.to_string(),
+            ));
+        }
+        dates.push(date);
+    }
+    Ok(dates)
 }
 
 /// The currency vocabulary is closed and short, so the refusal publishes it.

@@ -3716,6 +3716,24 @@ pub struct BalancesReportDto {
     /// journal and nothing else.
     pub held_rows: HeldRowsDto,
 }
+/// A balances report for each requested date, in request order.
+///
+/// Each `report` is the complete body returned by `/v1/reports/balances` for
+/// that `as_of`; the date sits beside it so a caller can identify the entry
+/// without inspecting account rows.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BalancesReportSeriesDto {
+    pub reports: Vec<BalancesReportSeriesEntryDto>,
+}
+
+/// One complete balances report and the date it answers.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BalancesReportSeriesEntryDto {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+    pub report: BalancesReportDto,
+}
 
 /// One account-and-currency carrying a negative cash balance at the report
 /// date, and the §11 span it is the tail of.
@@ -4055,6 +4073,25 @@ pub struct AssetSnapshotDto {
     /// include. Always present: the empty block says the figures are the
     /// journal and nothing else.
     pub held_rows: HeldRowsDto,
+}
+
+/// An asset snapshot for each requested date, in request order.
+///
+/// Each `report` is the complete body returned by `/v1/reports/assets` for
+/// that `as_of`; the date is repeated beside it to give every entry one
+/// uniform series envelope.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AssetSnapshotSeriesDto {
+    pub reports: Vec<AssetSnapshotSeriesEntryDto>,
+}
+
+/// One complete asset snapshot and the date it answers.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AssetSnapshotSeriesEntryDto {
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+    pub report: AssetSnapshotDto,
 }
 
 /// Cash, as the journal recorded it, grouped by the class the owner declared.

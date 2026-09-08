@@ -2090,6 +2090,15 @@ impl CategoryStore for SqliteAdapter {
         })
         .await
     }
+
+    async fn rebuild_category_index(&self, owner: OwnerId) -> Result<u32, AppError> {
+        self.blocking(move |store| {
+            store
+                .rebuild_category_index(owner)
+                .map_err(category_store_error)
+        })
+        .await
+    }
 }
 
 /// Convert the port environment to the broker environment.

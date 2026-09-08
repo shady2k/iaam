@@ -1724,6 +1724,18 @@ pub trait CategoryStore: Send + Sync {
         owner: OwnerId,
         id: CategoryRuleId,
     ) -> Result<(), AppError>;
+
+    /// Recomputes the owner's `event_category_assignments` projection from
+    /// the journal and the currently active rules, and returns how many
+    /// events came out decomposed.
+    ///
+    /// A rule create, edit or retirement can change what any past event in
+    /// the journal decomposes to, not only a newly appended one, so the
+    /// scenario that changed the rule set calls this once the change is
+    /// stored (spec §4.7). This is the only rebuild trigger the application
+    /// layer owns: an appended event gets its own row without a rebuild,
+    /// through the store's write path.
+    async fn rebuild_category_index(&self, owner: OwnerId) -> Result<u32, AppError>;
 }
 
 /// A stored rule in a form the transport can return.
@@ -2149,6 +2161,12 @@ impl CategoryStore for UnavailableCategoryStore {
         _owner: OwnerId,
         _id: CategoryRuleId,
     ) -> Result<(), AppError> {
+        Err(AppError::NotConfigured {
+            what: "category rules",
+        })
+    }
+
+    async fn rebuild_category_index(&self, _owner: OwnerId) -> Result<u32, AppError> {
         Err(AppError::NotConfigured {
             what: "category rules",
         })

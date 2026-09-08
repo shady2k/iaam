@@ -120,6 +120,22 @@ pub enum StoreError {
          and no whole history can be read out of it"
     )]
     CorrectionChainCycle { event: String },
+    /// The insert primitive's own postcondition (spec §D6, §5): reading the
+    /// event back inside the same transaction, right before commit, found it
+    /// missing or found it reconstructed unequal to what was given to write.
+    ///
+    /// Not a tamper check and not a hash. A foreign key proves a child row
+    /// has its parent; nothing in SQLite proves a parent has all its required
+    /// children, and there is no cross-table `ASSERTION`. This is the runtime
+    /// postcondition standing in for that: the one thing that catches a
+    /// mapper that returned `Ok` having simply forgotten a leg, a detail row,
+    /// or an optional field. The transaction rolls back, so no row of the
+    /// event survives in any table.
+    #[error(
+        "event {event} could not be read back as written inside its own write transaction: \
+         the write was incomplete"
+    )]
+    IncompleteWrite { event: String },
 }
 /// Why the instrument could not be resolved by external code.
 ///
@@ -239,14 +255,82 @@ impl SqliteStore {
         Ok(store)
     }
 
+    /// The raw connection, unmediated by any typed method.
+    ///
+    /// Behind a test-only surface on purpose (spec §D6): append-only is a
+    /// property of what this crate's API publishes, not of the file, and a
+    /// production caller with the raw connection can write, update or delete
+    /// any row this type's methods would otherwise refuse to. No in-process
+    /// production code needs that — the one caller that used to reach for
+    /// `connection_mut()` for transaction control (`iaam-app`'s owner-claim
+    /// race guard) now uses [`Self::with_immediate_transaction`] instead,
+    /// which cannot be used to bypass a write method's own checks. What
+    /// remains is tests: setting up fixtures the public API has no
+    /// constructor for, and probing invariants (row counts, fault injection)
+    /// the public API does not report.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
     pub const fn connection(&self) -> &Connection {
         &self.conn
     }
 
+    /// See [`Self::connection`]: same reasoning, mutable access.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
     pub const fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+
+    /// Runs `work` inside one `BEGIN IMMEDIATE` transaction, committing on
+    /// success and rolling back otherwise.
+    ///
+    /// For a caller outside this crate that needs to demarcate a transaction
+    /// around several of this store's own typed calls — `iaam-app`'s
+    /// owner-claim race guard is the one today (ADR-0003) — without reaching
+    /// for the raw connection. `work` receives `&mut Self` rather than a
+    /// borrowed `rusqlite::Transaction`: the guard's own work is itself a
+    /// sequence of calls back into typed `SqliteStore` methods, and a
+    /// `Transaction<'_>` borrows the connection in a way that would make that
+    /// impossible. The transaction is therefore demarcated with explicit
+    /// `BEGIN`/`COMMIT`/`ROLLBACK` statements rather than the `Transaction`
+    /// type — the same trade `in_immediate_transaction` made before this
+    /// method existed to replace it.
+    ///
+    /// `convert` turns this call's own transaction-control failure (opening,
+    /// committing) into the caller's error type: this crate does not know
+    /// `iaam-app`'s `AppError`, or any other caller's error type, so it
+    /// cannot implement `From<StoreError>` for it.
+    pub fn with_immediate_transaction<T, E>(
+        &mut self,
+        convert: impl Fn(StoreError) -> E,
+        work: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| convert(error.into()))?;
+        match work(self) {
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(convert(error.into()))
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Sets the connection's busy-wait budget.
+    ///
+    /// Exists for the same caller as [`Self::with_immediate_transaction`]:
+    /// the owner-claim race guard raises the wait budget just before entering
+    /// the transaction, so the loser of the race waits for the winner rather
+    /// than failing at once with `SQLITE_BUSY`.
+    pub fn set_busy_timeout(&mut self, timeout: Duration) -> Result<(), StoreError> {
+        self.conn.busy_timeout(timeout).map_err(Into::into)
     }
 }
 

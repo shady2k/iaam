@@ -1,6 +1,5 @@
 //! Fact log: recording and reading.
 
-use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::kind::{
     CASH_TRANSFER_KIND, CONTROL_ASSERTION_KIND, EventKind, FlowEndpoints, IMPORT_COVERAGE_GAP_KIND,
 };
@@ -12,10 +11,10 @@ use iaam_core::money::CurrencyCode;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::IdentityScope;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeSet;
-use time::format_description::well_known::{Iso8601, Rfc3339};
-use time::{Date, OffsetDateTime};
+use time::Date;
+use time::format_description::well_known::Iso8601;
 
 use crate::{SqliteStore, StoreError};
 
@@ -68,67 +67,6 @@ pub struct ControlAssertionRecord {
 }
 
 impl SqliteStore {
-    /// Record an event with an already assigned sequence.
-    ///
-    /// Used where the sequence is defined externally and cannot be changed:
-    /// importing an archived bundle and restoring from an archive.
-    pub fn append_event(
-        &self,
-        event: &Event,
-        identity_scope: IdentityScope,
-    ) -> Result<Appended, StoreError> {
-        if let Some(existing) = find_duplicate(&self.conn, event, identity_scope)? {
-            return Ok(Appended::Duplicate { existing });
-        }
-        insert_event(&self.conn, event)?;
-        Ok(Appended::Inserted { id: event.id })
-    }
-
-    /// Record an event while assigning its sequence number **in the same
-    /// transaction**.
-    ///
-    /// Separating “get `MAX(sequence) + 1`” and “insert” is a race:
-    /// two concurrent requests receive the same number, and the order
-    /// within the day starts being determined by a random identifier instead of
-    /// the declared semantics (§4.8). A transaction with immediate lock acquisition
-    /// closes the race between processes as well, while the unique index
-    /// `(owner, effective_date, sequence)` turns any remaining gap
-    /// into an error instead of silently reordering entries.
-    pub fn append_event_in_order(
-        &mut self,
-        event: &Event,
-        identity_scope: IdentityScope,
-    ) -> Result<Appended, StoreError> {
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = find_duplicate(&transaction, event, identity_scope)? {
-            return Ok(Appended::Duplicate { existing });
-        }
-        let day = event.order.date();
-        let used: Option<u32> = transaction.query_row(
-            "SELECT MAX(sequence) FROM events WHERE owner = ?1 AND effective_date = ?2",
-            params![event.owner.inner().to_string(), day.to_string()],
-            |row| row.get(0),
-        )?;
-        let stamped = Event {
-            order: event.order.source_time().map_or_else(
-                || EffectiveOrder::new(day, used.map_or(1, |value| value.saturating_add(1))),
-                |source_time| {
-                    EffectiveOrder::with_source_time(
-                        day,
-                        source_time,
-                        used.map_or(1, |value| value.saturating_add(1)),
-                    )
-                },
-            ),
-            ..event.clone()
-        };
-        insert_event(&transaction, &stamped)?;
-        transaction.commit()?;
-        Ok(Appended::Inserted { id: stamped.id })
-    }
-
     /// The owner's entire log in `EffectiveOrder`.
     ///
     /// The database defines the order, but the projection still sorts the slice itself:
@@ -376,82 +314,6 @@ fn parse_date(value: &str) -> Result<Date, StoreError> {
         field: "effective_date",
         value: value.to_owned(),
     })
-}
-
-/// Insert an event. The body is factored out of the public methods: both write paths
-/// must insert the same data into the database, and a second copy of this SQL
-/// would eventually drift from the first.
-pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), StoreError> {
-    let payload = serde_json::to_string(event).map_err(StoreError::EventEncode)?;
-    let (relation_kind, relation_target) = match event.relation {
-        Relation::None => ("none", None),
-        Relation::Reversal { target } => ("reversal", Some(target.inner().to_string())),
-        Relation::Replacement { target } => ("replacement", Some(target.inner().to_string())),
-    };
-    let recorded_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z"));
-    let source_time = event.order.source_time().map(format_source_time);
-
-    conn.execute(
-        "INSERT INTO events (
-             id, owner, account, kind, effective_date, sequence, source_time,
-             relation_kind, relation_target, source, source_operation_id,
-             idempotency_key, raw_hash, payload, recorded_at, import_session,
-             settled_by_rule, settled_by_rule_version
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?18)",
-        params![
-            event.id.inner().to_string(),
-            // `Event::schema_version` no longer exists (iaam-7q0z), and the
-            // relational journal schema (iaam-05gi) drops the column this
-            // placeholder used to satisfy: `events` carries no
-            // `schema_version` at all any more.
-            event.owner.inner().to_string(),
-            event.account.inner().to_string(),
-            event.kind.discriminant(),
-            event.order.date().to_string(),
-            event.order.sequence(),
-            source_time,
-            relation_kind,
-            relation_target,
-            event.provenance.source().inner().to_string(),
-            event.provenance.source_operation_id(),
-            event.idempotency_key.as_deref(),
-            event.provenance.raw_hash().as_str(),
-            payload,
-            recorded_at,
-            // Lifted out of the payload it is already in, so the journal can be
-            // narrowed by it. Written from the event rather than from an
-            // argument: a caller that could pass a different session than the
-            // one the fact carries is a caller that can make the column
-            // disagree with the provenance.
-            event
-                .provenance
-                .import_session()
-                .map(|session| session.inner().to_string()),
-            // Lifted out of the payload for the same reason and written from
-            // the event for the same one: a caller that could pass a rule other
-            // than the one the fact carries is a caller that can make the
-            // column disagree with the provenance. The version column is kept
-            // as recorded provenance for compatibility with the schema, but it
-            // is not a second journal filter: a rule identifier has one version.
-            // Both columns stay NULL where the fact names no rule — including
-            // where it says a reading found none, which the payload records and
-            // the columns deliberately do not.
-            event
-                .provenance
-                .settling_rule()
-                .map(|(rule, _)| rule.inner().to_string()),
-            event.provenance.settling_rule().map(|(_, version)| version),
-        ],
-    )?;
-    Ok(())
-}
-
-fn format_source_time(time: time::Time) -> String {
-    let (hour, minute, second, nanosecond) = time.as_hms_nano();
-    format!("{hour:02}:{minute:02}:{second:02}.{nanosecond:09}")
 }
 
 /// Find a duplicate by keys from strongest to weakest (§10.6).

@@ -113,7 +113,7 @@ fn bookkeeping_event(ctx: &Ctx, sequence: u32, kind: EventKind) -> Event {
 
 #[test]
 fn an_event_survives_a_write_and_a_read() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let event = ctx.deposit(1, 100_000);
     assert_eq!(
@@ -126,7 +126,7 @@ fn an_event_survives_a_write_and_a_read() {
 
 #[test]
 fn journal_relation_projection_does_not_decode_event_payloads() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let original = ctx.deposit(1, 100_000);
     store
@@ -195,7 +195,7 @@ fn journal_relation_projection_does_not_decode_event_payloads() {
 /// stamped with none is not swept in beside it.
 #[test]
 fn the_journal_narrows_to_the_import_session_that_wrote_it() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let session = ImportSessionId::new_random();
 
@@ -259,7 +259,7 @@ fn the_journal_narrows_to_the_import_session_that_wrote_it() {
 
 #[test]
 fn the_journal_narrows_to_the_declared_import() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let import = ImportId::new_random();
 
@@ -307,7 +307,7 @@ fn the_journal_narrows_to_the_declared_import() {
 /// nor one recorded before rules were recorded at all is swept in beside it.
 #[test]
 fn the_journal_narrows_to_the_rule_that_settled_the_row() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let rule = ClassificationRuleId::new_random();
     let other = ClassificationRuleId::new_random();
@@ -370,7 +370,7 @@ fn the_journal_narrows_to_the_rule_that_settled_the_row() {
 /// on the fact itself, so it is asserted where it lives.
 #[test]
 fn a_row_no_rule_settled_reads_apart_from_one_recorded_before_rules_were() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
 
     let without_a_rule = ctx.settled_by(1, RuleSettlement::NoRule);
@@ -396,7 +396,7 @@ fn a_row_no_rule_settled_reads_apart_from_one_recorded_before_rules_were() {
 fn the_journal_is_append_only_at_the_database_level() {
     // Code discipline does not survive the very first data-repair script,
     // so the prohibition lives in the database (§4.8).
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let event = ctx.deposit(1, 100_000);
     store.append_event(&event, IdentityScope::Source).unwrap();
@@ -414,7 +414,7 @@ fn the_journal_is_append_only_at_the_database_level() {
 
 #[test]
 fn the_same_idempotency_key_returns_the_first_event() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let mut first = ctx.deposit(1, 100_000);
     first.idempotency_key = Some("import-42".into());
@@ -441,7 +441,7 @@ fn the_same_idempotency_key_returns_the_first_event() {
 
 #[test]
 fn account_scope_allows_reused_source_operation_across_accounts() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let mut first = ctx.deposit(1, 100_000);
     first.provenance = Provenance::new(
@@ -485,7 +485,7 @@ fn account_scope_allows_reused_source_operation_across_accounts() {
 
 #[test]
 fn the_same_source_operation_is_not_recorded_twice() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let mut first = ctx.deposit(1, 100_000);
     first.provenance = Provenance::new(
@@ -508,7 +508,7 @@ fn the_same_source_operation_is_not_recorded_twice() {
 fn two_identical_purchases_on_the_same_day_are_both_recorded() {
     // The natural key “account + date + amount” is too weak: two identical
     // operations on the same day are a valid situation (§10.6, §15.9).
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     store
         .append_event(&ctx.deposit(1, 100_000), IdentityScope::Source)
@@ -521,7 +521,7 @@ fn two_identical_purchases_on_the_same_day_are_both_recorded() {
 
 #[test]
 fn a_slice_through_a_date_excludes_later_events() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let early = ctx.deposit(1, 100_000);
     let mut late = ctx.deposit(2, 200_000);
@@ -537,7 +537,7 @@ fn a_slice_through_a_date_excludes_later_events() {
 
 #[test]
 fn source_time_orders_events_before_sequence_and_untimed_events() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let day = date!(2026 - 02 - 01);
 
@@ -560,7 +560,7 @@ fn source_time_orders_events_before_sequence_and_untimed_events() {
 
 #[test]
 fn equal_source_times_use_the_raw_hash_before_sequence() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     let day = date!(2026 - 02 - 01);
     let mut first = ctx.deposit(1, 100_000);
@@ -742,7 +742,7 @@ fn account_activity_keeps_an_empty_owned_account() {
 
 #[test]
 fn account_activity_excludes_both_bookkeeping_kinds() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let period = AssertionPeriod::between(date!(2026 - 02 - 01), date!(2026 - 02 - 28)).unwrap();
@@ -795,7 +795,7 @@ fn account_activity_excludes_both_bookkeeping_kinds() {
 
 #[test]
 fn account_activity_reports_bounds_for_business_facts() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let first = ctx.deposit(1, 100_000);
@@ -825,7 +825,7 @@ fn account_activity_reports_bounds_for_business_facts() {
 /// while it held money at the end of the month.
 #[test]
 fn account_activity_counts_both_accounts_a_transfer_touched() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let savings = AccountId::new_random();
@@ -883,7 +883,7 @@ fn account_activity_counts_both_accounts_a_transfer_touched() {
 /// A transfer widens the receiving account's bounds without narrowing them.
 #[test]
 fn a_transfer_widens_the_coverage_it_reaches_beyond() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let mut store = SqliteStore::open_in_memory().unwrap();
     let ctx = Ctx::new();
     insert_account(&store, &ctx);
     let savings = AccountId::new_random();

@@ -19,7 +19,8 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::events::{find_duplicate, insert_event};
+use crate::events::find_duplicate;
+use crate::journal::write::insert_event_in;
 use crate::{SqliteStore, StoreError};
 
 /// Bundle format version. A bundle with a newer version is not read:
@@ -291,7 +292,7 @@ impl SqliteStore {
                 duplicates += 1;
                 continue;
             }
-            insert_event(&transaction, event)?;
+            insert_event_in(&transaction, event)?;
             inserted += 1;
         }
 

@@ -1897,7 +1897,6 @@ pub async fn api_catalog(Extension(catalog): Extension<Arc<ApiCatalog>>) -> Resp
 pub async fn health() -> Json<HealthDto> {
     Json(HealthDto {
         status: "ok".into(),
-        schema_version: iaam_core::event::SCHEMA_VERSION,
         projection_version: PROJECTION_VERSION,
     })
 }

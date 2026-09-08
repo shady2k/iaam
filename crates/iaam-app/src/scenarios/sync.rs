@@ -12,7 +12,7 @@ use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::InstrumentId;
 use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId, PrincipalId};
 use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
@@ -547,7 +547,6 @@ fn assertion_event(
         .unwrap_or_else(|| unreachable!("hexadecimal SHA-256 is always a valid RawHash"));
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: iaam_core::event::kind::EventKind::ControlAssertion {

@@ -1496,7 +1496,6 @@ mod tests {
             }
             iaam_core::event::Event {
                 id: EventId::new_random(),
-                schema_version: iaam_core::event::SCHEMA_VERSION,
                 owner: self.owner,
                 account,
                 kind: EventKind::CashIn { amount },

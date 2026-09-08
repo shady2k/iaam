@@ -32,7 +32,7 @@ pub struct ApiError {
     /// Human-readable explanation.
     pub message: String,
     /// Request field that caused the rejection, in the dotted-and-indexed form
-    /// a person reads: `event[3].schema_version`.
+    /// a person reads: `event[3].idempotency_key`.
     ///
     /// Kept beside `pointer` rather than replaced by it, for two reasons. It is
     /// the string `message` quotes, so dropping it would leave the sentence
@@ -43,11 +43,11 @@ pub struct ApiError {
     /// derived from one string at one place and cannot disagree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
-    /// The same field as an RFC 6901 JSON pointer: `/event/3/schema_version`.
+    /// The same field as an RFC 6901 JSON pointer: `/event/3/idempotency_key`.
     ///
     /// What makes a rejection actionable without reading documentation. A client
     /// holds the body it just sent; a pointer applies to that body directly,
-    /// while `event[3].schema_version` first has to be parsed into a path, and
+    /// while `event[3].idempotency_key` first has to be parsed into a path, and
     /// the parsing is a place to be wrong about — whether `[3]` is an index or a
     /// member so named, whether a dot separates members or belongs to one.
     ///

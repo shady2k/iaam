@@ -22,9 +22,7 @@ use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
-use iaam_core::event::{
-    Confidence, Event, Relation, SCHEMA_VERSION, SOURCE_CATEGORY_IS_A_CATEGORY_FROM,
-};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, EventId, ImportId, ImportQuestionId, ImportSessionId, OwnerId,
     PrincipalId, SourceId,
@@ -5279,7 +5277,6 @@ fn control_assertions(
         for claim in claims {
             events.push(iaam_core::event::Event {
                 id: EventId::new_random(),
-                schema_version: SCHEMA_VERSION,
                 owner,
                 account: section.account,
                 kind: EventKind::ControlAssertion {
@@ -8937,19 +8934,6 @@ pub enum Undecided {
     /// A line of this import whose stored text this build cannot read, so
     /// nothing can be tested against it.
     UnreadableRow { row: u32 },
-    /// A movement recorded before the journal kept the source's two words
-    /// apart (decision 0020 §3), against a condition that asks about one of
-    /// them.
-    ///
-    /// The word is not in the field the condition asks about and may be sitting
-    /// in the other one, so «it does not match» would be a false negative and
-    /// «it matches» would be a guess.
-    FactWithoutTheWord {
-        event: EventId,
-        account: AccountId,
-        title: Option<String>,
-        date: Option<time::Date>,
-    },
     /// Everything already recorded, because the whole of it could not be folded
     /// into what is currently in force.
     ///
@@ -8968,7 +8952,6 @@ impl Undecided {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::UnreadableRow { .. } => "unreadable_row",
-            Self::FactWithoutTheWord { .. } => "fact_without_the_word",
             Self::RecordedMovementsWouldNotFold => "recorded_movements_would_not_fold",
         }
     }
@@ -8981,12 +8964,6 @@ impl Undecided {
             Self::UnreadableRow { .. } => {
                 "This line of your statement cannot be read here at all, so nothing can be said \
                  about whether this standing decision would cover it."
-            }
-            Self::FactWithoutTheWord { .. } => {
-                "This movement was recorded before what your institution called an operation and \
-                 what it filed the operation under were kept in separate places, so the word this \
-                 standing decision asks about cannot be told from the other one. It is neither \
-                 included nor excluded."
             }
             Self::RecordedMovementsWouldNotFold => {
                 "What you have already recorded could not be read here as a whole, because \
@@ -9138,7 +9115,6 @@ fn reach_over_journal(
     directory: &AccountDirectory,
 ) -> (Vec<ReachedFact>, Vec<Undecided>) {
     let mut reached = Vec::new();
-    let mut undecided = Vec::new();
     // What is in force, which is what the recomputation reads — a fact a
     // correction reversed or replaced is not something a standing decision would
     // settle, and counting it would name a movement he has already put right as
@@ -9157,15 +9133,6 @@ fn reach_over_journal(
         let title = directory
             .held(event.account)
             .map(|account| account.title.clone());
-        if unvouched_word(matcher, event, &read) {
-            undecided.push(Undecided::FactWithoutTheWord {
-                event: event.id,
-                account: event.account,
-                title,
-                date: event.dates.effective_date(),
-            });
-            continue;
-        }
         if !matcher.matches(&read) {
             continue;
         }
@@ -9182,42 +9149,7 @@ fn reach_over_journal(
             now: classification_of(event).map(classified_as),
         });
     }
-    (reached, undecided)
-}
-
-/// Whether this condition asks about a word this fact's journal entry cannot
-/// vouch for.
-///
-/// **Decision 0020 §3, read forwards.** A fact below
-/// [`SOURCE_CATEGORY_IS_A_CATEGORY_FROM`] carries no operation word at all and
-/// may carry one in the category's slot, and the two cannot be told apart
-/// afterwards — so `subject` blanks the category and the operation word is
-/// absent, and a condition asking about either gets a **false negative** off it.
-/// The recomputation takes that false negative deliberately, because a rule that
-/// does not fire leaves a fact exactly as the owner already accepted it. A
-/// forecast cannot: the same silence there reads as «nothing else is affected»,
-/// which is the one thing it must not say.
-///
-/// The other clauses are asked first, and that is what keeps the declaration
-/// small and true. A condition's fields join with «and», so one clause the fact
-/// plainly fails settles it as a non-match whatever the unreadable word says;
-/// only a fact the rest of the condition holds for is genuinely undecided. A
-/// condition made of nothing **but** the doubtful words has no rest, and every
-/// other clause is then vacuously true.
-fn unvouched_word(matcher: &RuleMatcher, event: &Event, read: &ClassificationSubject) -> bool {
-    if event.schema_version >= SOURCE_CATEGORY_IS_A_CATEGORY_FROM {
-        return false;
-    }
-    if matcher.kind.is_none() && matcher.source_category.is_none() {
-        return false;
-    }
-    let rest = RuleMatcher {
-        movement: None,
-        kind: None,
-        source_category: None,
-        ..matcher.clone()
-    };
-    rest.asks_nothing() || rest.matches(read)
+    (reached, Vec::new())
 }
 
 /// The cash a fact moved, for the seven kinds a standing decision classifies.
@@ -9397,8 +9329,7 @@ fn forecast(
     };
     undecided.sort_by_key(|entry| match entry {
         Undecided::UnreadableRow { row } => (0, u64::from(*row), EventId(Uuid::nil())),
-        Undecided::FactWithoutTheWord { event, .. } => (1, 0, *event),
-        Undecided::RecordedMovementsWouldNotFold => (2, 0, EventId(Uuid::nil())),
+        Undecided::RecordedMovementsWouldNotFold => (1, 0, EventId(Uuid::nil())),
     });
     let notice = forecast_notice(
         &stands,
@@ -14095,57 +14026,6 @@ mod tests {
         );
     }
 
-    /// A movement recorded before the source's two words were kept apart is
-    /// declared rather than dropped.
-    ///
-    /// This is the falsification, and it is the specimen that matters: such a
-    /// fact answers «no» to a condition asking about the operation word, because
-    /// the word it carries is in the other slot and the reader blanks it below
-    /// schema version 14. Counted as a non-match it disappears — and a forecast
-    /// that drops it tells him nothing else is affected, which is the one false
-    /// thing it must not say.
-    #[test]
-    fn a_movement_recorded_before_the_two_words_were_kept_apart_is_declared() {
-        let main = account(1);
-        let asked = inner_line(main, 1_000);
-        let mut older = movement(main, None, Some("INNER"), 6_000);
-        older.schema_version = SOURCE_CATEGORY_IS_A_CATEGORY_FROM - 1;
-        let elsewhere = movement(main, Some("OUTER"), None, 7_000);
-
-        let forecast = forecast(
-            would_stand(&asked, Answer::Paid, true),
-            1,
-            &SessionAsRead {
-                observations: &[stored_row(1, &asked)],
-                questions: &[asked_about(1, &asked, main)],
-                settlements: &QuestionSettlements::default(),
-            },
-            &[older.clone(), elsewhere],
-            &held(vec![detail(main, "Main")]),
-        );
-
-        assert!(
-            forecast.already_recorded.is_empty(),
-            "nothing is claimed about a word the journal cannot vouch for"
-        );
-        assert_eq!(
-            forecast.undecided,
-            vec![Undecided::FactWithoutTheWord {
-                event: older.id,
-                account: main,
-                title: Some("Main".to_owned()),
-                date: Some(date!(2026 - 02 - 04)),
-            }],
-            "and the movement it could not judge is named, with the one it \
-             could judge left out"
-        );
-        assert!(
-            forecast.notice.contains('1'),
-            "and what could not be judged is in the sentence he is read: {}",
-            forecast.notice
-        );
-    }
-
     /// A movement he has already put right is not one the decision still
     /// settles.
     ///
@@ -14308,12 +14188,6 @@ mod tests {
             .chain(
                 [
                     Undecided::UnreadableRow { row: 1 },
-                    Undecided::FactWithoutTheWord {
-                        event: EventId::new_random(),
-                        account: main,
-                        title: None,
-                        date: None,
-                    },
                     Undecided::RecordedMovementsWouldNotFold,
                 ]
                 .iter()

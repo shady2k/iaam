@@ -9,7 +9,7 @@ use iaam_app::scenarios::custody_repair::{CustodyRepairCase, repair_custody};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -200,7 +200,6 @@ fn position_assertion(claim: PositionClaim<'_>) -> Event {
         .unwrap_or_else(|| panic!("March period"));
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::ControlAssertion {

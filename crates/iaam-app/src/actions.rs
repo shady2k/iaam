@@ -5954,7 +5954,7 @@ mod tests {
     use iaam_core::event::leg::Leg;
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
     use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
-    use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+    use iaam_core::event::{Confidence, Event, Relation};
     use iaam_core::ids::{EventId, ImportQuestionId, ImportSessionId, SourceId};
     use iaam_core::money::{CurrencyCode, Money, PostedMinor};
     use iaam_core::projection::money_flow::{DateWindow, MoneyFlow, NoCategories};
@@ -9709,7 +9709,6 @@ mod tests {
         let source = SourceId::new_random();
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind,

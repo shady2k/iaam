@@ -144,7 +144,7 @@ pub enum AppError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldRejection {
     /// The field, in the dotted-and-indexed form a person reads:
-    /// `event[3].schema_version`.
+    /// `event[3].idempotency_key`.
     pub field: String,
     /// What the field admits, in prose. Kept even where `alternatives` says the
     /// same thing in values: the sentence is what the error message quotes.
@@ -230,7 +230,7 @@ impl From<FieldRejection> for AppError {
 
 /// Transcribe a field path into an RFC 6901 JSON pointer.
 ///
-/// `event[3].schema_version` becomes `/event/3/schema_version`. The dotted form
+/// `event[3].idempotency_key` becomes `/event/3/idempotency_key`. The dotted form
 /// is what a person reads and what the error message quotes; the pointer is what
 /// a client applies to the body it just sent, with no parsing of its own and no
 /// guessing about whether `[3]` addresses an index or a key called `[3]`.
@@ -347,12 +347,12 @@ mod tests {
 
     #[test]
     fn a_nested_indexed_field_transcribes_into_a_valid_json_pointer() {
-        // The form the ingest scenario rejects a row of a batch with. A client
-        // that wants to retry has the body it sent and no way to look
-        // `event[3].schema_version` up in it; `/event/3/schema_version` it can
-        // apply directly.
-        let pointer = json_pointer("event[3].schema_version");
-        assert_eq!(pointer, "/event/3/schema_version");
+        // A dotted-and-indexed field naming one member of one element of a
+        // batch. A client that wants to retry has the body it sent and no way
+        // to look `event[3].idempotency_key` up in it; `/event/3/idempotency_key`
+        // it can apply directly.
+        let pointer = json_pointer("event[3].idempotency_key");
+        assert_eq!(pointer, "/event/3/idempotency_key");
         assert!(
             is_rfc6901_pointer(&pointer),
             "a rejected field must transcribe into a pointer a client can apply: {pointer}"

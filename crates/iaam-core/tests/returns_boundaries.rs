@@ -9,7 +9,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::numeric::approx::SolverPolicy;
@@ -31,7 +31,6 @@ fn deposit(owner: OwnerId, account: AccountId, day: Date, sequence: u32, minor: 
     let amount = rub(minor);
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::CashIn { amount },

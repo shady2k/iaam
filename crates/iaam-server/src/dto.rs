@@ -6359,7 +6359,6 @@ pub struct MarketKeyRateDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthDto {
     pub status: String,
-    pub schema_version: u32,
     pub projection_version: u32,
 }
 
@@ -14101,12 +14100,7 @@ pub struct ForecastedMovementDto {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct UndecidedDto {
     /// `unreadable_row` — a line of this import whose stored text this build
-    /// cannot read at all; or `fact_without_the_word` — a movement recorded
-    /// before the source's word for what an operation **was** and its word for
-    /// what the operation was **for** were kept in separate fields, against a
-    /// condition asking about one of them. The word is absent from the field
-    /// the condition asks about and may be sitting in the other, so neither
-    /// answer would be true; or `recorded_movements_would_not_fold` — nothing
+    /// cannot read at all; or `recorded_movements_would_not_fold` — nothing
     /// already recorded could be judged at all, because the whole of it could
     /// not be folded into what is currently in force. That last word carries no
     /// identifier, because it is about all of them at once, and where it appears
@@ -14116,23 +14110,6 @@ pub struct UndecidedDto {
     /// The line of this import, for `unreadable_row`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<u32>,
-    /// The recorded fact, for `fact_without_the_word`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event: Option<Uuid>,
-    /// The account that fact is on, for `fact_without_the_word`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account: Option<Uuid>,
-    /// What the owner calls that account, where his directory holds it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// The day that fact is effective on.
-    #[serde(
-        default,
-        with = "iso_date::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[schema(value_type = Option<String>, format = Date)]
-    pub date: Option<Date>,
     /// Why it could not be judged, in one sentence to read out to him.
     pub explanation: String,
 }
@@ -14140,29 +14117,13 @@ pub struct UndecidedDto {
 impl UndecidedDto {
     #[must_use]
     pub fn from_domain(undecided: &Undecided) -> Self {
-        let (row, event, account, date, title) = match undecided {
-            Undecided::UnreadableRow { row } => (Some(*row), None, None, None, None),
-            Undecided::RecordedMovementsWouldNotFold => (None, None, None, None, None),
-            Undecided::FactWithoutTheWord {
-                event,
-                account,
-                title,
-                date,
-            } => (
-                None,
-                Some(event.0),
-                Some(account.inner()),
-                *date,
-                title.clone(),
-            ),
+        let row = match undecided {
+            Undecided::UnreadableRow { row } => Some(*row),
+            Undecided::RecordedMovementsWouldNotFold => None,
         };
         Self {
             state: undecided.code().to_owned(),
             row,
-            event,
-            account,
-            title,
-            date,
             explanation: undecided.why().to_owned(),
         }
     }

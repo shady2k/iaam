@@ -14,7 +14,7 @@ use iaam_app::sync::{AssertionsWithheld, sync_broker};
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
@@ -192,7 +192,6 @@ fn report_opening_assertions(
         .enumerate()
         .map(|(index, claim)| Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner,
             account,
             kind: EventKind::ControlAssertion { period, claim },
@@ -217,7 +216,6 @@ fn report_cash_assertion(owner: OwnerId, account: AccountId, source: SourceId) -
         .unwrap_or_else(|| panic!("March period"));
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::ControlAssertion {
@@ -253,7 +251,6 @@ fn report_position_assertion(
         .unwrap_or_else(|| panic!("March period"));
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::ControlAssertion {
@@ -1275,41 +1272,6 @@ async fn a_structural_rejection_stops_one_operation_and_records_its_dimensions()
             .count(),
         0
     );
-}
-
-#[tokio::test]
-async fn an_event_claiming_an_older_schema_version_is_refused_on_write() {
-    let services = services();
-    let owner = OwnerId::new_random();
-    let account = AccountId::new_random();
-    let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
-    let mut event = iaam_ingest::normalize(
-        &trade(account, instrument, custody),
-        &iaam_ingest::operation::NormalizationContext {
-            owner,
-            source: SourceId::new_random(),
-            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
-        },
-    )
-    .unwrap_or_else(|error| panic!("valid fixture normalisation: {error:?}"))
-    .event;
-    event.schema_version = 7;
-
-    let error = append_checked(&services, vec![event], IdentityScope::Source)
-        .await
-        .expect_err("older schema version must be refused");
-    assert!(matches!(
-        error,
-        AppError::Invalid {
-            field,
-            expected,
-            actual,
-        } if field == "event[0].schema_version"
-            && expected == SCHEMA_VERSION.to_string()
-            && actual == "7"
-    ));
-    assert!(load_all(&services, owner).await.is_empty());
 }
 
 #[tokio::test]

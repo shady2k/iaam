@@ -5,7 +5,7 @@
 
 use iaam_core::dates::{EffectiveOrder, EventDates};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, EventId, OwnerId, PrincipalId, SourceId};
 use iaam_ingest::Verdict;
 use iaam_ingest::csv_source::{Directory, ParsedRow};
@@ -337,7 +337,6 @@ async fn append_control_assertions(
         .enumerate()
         .map(|(sequence, claim)| Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner,
             account,
             kind: iaam_core::event::kind::EventKind::ControlAssertion { period, claim },

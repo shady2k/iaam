@@ -251,7 +251,7 @@ impl LedgerState {
 #[must_use]
 pub fn prefix_digest(events: &[&Event]) -> StateHash {
     let mut hasher = Sha256::new();
-    hasher.update(b"iaam/journal-prefix/v2");
+    hasher.update(b"iaam/journal-prefix/v3");
     hasher.update(
         u64::try_from(events.len())
             .unwrap_or(u64::MAX)

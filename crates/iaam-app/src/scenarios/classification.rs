@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use iaam_core::event::Event;
 use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind};
-use iaam_core::event::{Event, SOURCE_CATEGORY_IS_A_CATEGORY_FROM};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, OwnerId};
 use iaam_ingest::classification::{
     Classification, ClassificationRule, ClassificationSubject, Correction, Counterparty, FarSide,
@@ -799,59 +799,24 @@ pub(crate) fn subject(event: &Event) -> Option<ClassificationSubject> {
         // `income` — is the answer a rule is meant to revise, not the question
         // the rule was written about.
         description: event.provenance.description().map(str::to_owned),
-        // The source's operation word, from the field that holds it. This read
-        // `source_category`, and the observation path wrote the operation word
-        // there, so the pair round-tripped and nothing failed — while the
-        // owner's category rules, which really do match `source_category`,
-        // matched an operation word instead of a category (`iaam-p683`).
-        //
-        // `None` for a fact recorded before schema version 14, including one
-        // whose operation word is sitting in `source_category`. Nothing
-        // rewrites those: recomputation reconsiders such a row on the evidence
-        // the journal holds, which for that row is a description and a
-        // counterparty and no operation word.
+        // The source's operation word, from the field that holds it. `None`
+        // is a source that printed no such word, or a fact recorded before
+        // the field existed.
         source_kind: event.provenance.source_kind().map(str::to_owned),
-        source_category: source_category_evidence(event),
-        // Straight off provenance, and with no version boundary of the kind
-        // `source_category_evidence` needs: neither field ever held another
-        // word, so there is no fact in the journal whose value has to be read
-        // as something else. `None` is a fact recorded before the profile read
-        // the columns, or a source that printed nothing — and both mean the
+        // The source's own category, straight off provenance: nothing rewrites
+        // it, and nothing needs to be read around it — every fact in the
+        // journal was written by a path that keeps this word and the operation
+        // word (`source_kind`, above) in their own fields.
+        source_category: event.provenance.source_category().map(str::to_owned),
+        // Straight off provenance, for the same reason as `source_category`
+        // above. `None` is a fact recorded before the profile read the
+        // columns, or a source that printed nothing — and both mean the
         // journal holds no such evidence about this row.
         owner_category: event.provenance.owner_category().map(str::to_owned),
         source_code: event.provenance.source_code().map(str::to_owned),
         movement,
         far_side,
     })
-}
-
-/// The source's own category, where the journal itself says the field holds one.
-///
-/// **Read through the version and not straight off provenance**, which is the
-/// one place this differs from every field beside it. Decision 0020 §3 fixed
-/// that a fact below [`SOURCE_CATEGORY_IS_A_CATEGORY_FROM`] may carry the
-/// source's *operation word* in `source_category`: one slot held both facts on
-/// the observation path, both paths stamped the same parser version, and the
-/// two cannot be told apart afterwards. §3 refused a migration for that reason
-/// and gave the reader this boundary instead.
-///
-/// So a rule the owner wrote about a category is not tested against a fact whose
-/// category field may not hold one. Nothing is rewritten and nothing is guessed:
-/// the older row is reconsidered on the evidence the journal holds for it, which
-/// is what §3 already says happens to its operation word — `source_kind` is
-/// `None` on every fact below 14, and this is the same sentence one field over.
-///
-/// The cost is a false negative: a pre-14 fact whose source really did print a
-/// category stops being reachable by a category condition. That is the direction
-/// this program takes every such choice in — a rule that fires on evidence that
-/// may not be what it claims writes a wrong fact into a correction plan, while a
-/// rule that does not fire leaves the row exactly as the owner already accepted
-/// it.
-fn source_category_evidence(event: &Event) -> Option<String> {
-    if event.schema_version < SOURCE_CATEGORY_IS_A_CATEGORY_FROM {
-        return None;
-    }
-    event.provenance.source_category().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -862,7 +827,7 @@ mod tests {
     use iaam_core::event::leg::Leg;
     use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId};
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-    use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
+    use iaam_core::event::{Confidence, Relation};
     use iaam_core::ids::{CustodyId, InstrumentId, SourceId};
     use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
     use iaam_core::numeric::decimal::Dec;
@@ -877,7 +842,6 @@ mod tests {
         let day = date!(2026 - 06 - 15);
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind,
@@ -1055,38 +1019,6 @@ mod tests {
             .matcher
             .matches(&subject),
             "a rule naming the source's own category must match on recompute"
-        );
-    }
-
-    #[test]
-    fn a_fact_recorded_before_the_two_words_were_split_offers_no_category() {
-        // The boundary decision 0020 §3 promised a reader. Below schema version
-        // 14 the observation path wrote the source's *operation word* into
-        // `source_category`, and the two cannot be told apart afterwards — so
-        // the field is not offered as evidence of a category, and the row is
-        // reconsidered on what the journal does hold. Reading it anyway would
-        // put an operation word into a correction plan as the owner's category
-        // decision.
-        let account = AccountId::new_random();
-        let mut event = cash_out_of(account, provenance_of().with_source_category("INNER"));
-        event.schema_version = SOURCE_CATEGORY_IS_A_CATEGORY_FROM - 1;
-
-        let subject = subject(&event).expect("a cash outflow is a classification subject");
-
-        assert_eq!(subject.source_category, None);
-        assert!(
-            !rule_matching(RuleMatcher {
-                counterparty_account: None,
-                description_contains: None,
-                kind: None,
-                source_category: Some("INNER".to_owned()),
-                owner_category: None,
-                source_code: None,
-                movement: None,
-            })
-            .matcher
-            .matches(&subject),
-            "a category rule must not fire on a field that may hold an operation word"
         );
     }
 

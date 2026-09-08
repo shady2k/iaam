@@ -25,7 +25,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::Provenance;
 use iaam_core::event::source_row::RefusedRow;
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, EventId, OwnerId};
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::AssertionPeriod;
@@ -124,7 +124,6 @@ pub(crate) fn gap_event(
     } = target;
     Some(Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::ImportCoverageGap {

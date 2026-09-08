@@ -10,7 +10,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::{EventKind, TradeSide};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::approx::SolverPolicy;
@@ -44,7 +44,6 @@ impl Ledger {
         self.sequence += 1;
         self.events.push(Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: self.owner,
             account,
             kind,

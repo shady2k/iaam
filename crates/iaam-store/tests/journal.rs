@@ -4,7 +4,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
     TransferId,
@@ -65,7 +65,6 @@ impl Ctx {
         let day = date!(2026 - 02 - 01);
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: self.owner,
             account: self.account,
             kind: EventKind::CashIn { amount },
@@ -150,7 +149,10 @@ fn journal_relation_projection_does_not_decode_event_payloads() {
                        ?17, ?18, ?19)",
             params![
                 correction.id.inner().to_string(),
-                correction.schema_version,
+                // The `events.schema_version` column no longer mirrors a
+                // domain field (`Event::schema_version` is gone, iaam-7q0z);
+                // any value satisfies the still-`NOT NULL` column.
+                1_u32,
                 correction.owner.inner().to_string(),
                 correction.account.inner().to_string(),
                 correction.kind.discriminant(),

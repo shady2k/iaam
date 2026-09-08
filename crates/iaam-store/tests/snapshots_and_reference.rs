@@ -5,7 +5,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::CustodyId;
 use iaam_core::ids::{AccountId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -27,7 +27,6 @@ fn deposit(owner: OwnerId, account: AccountId, sequence: u32, minor: i64) -> Eve
     let day = date!(2026 - 02 - 01);
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::CashIn { amount },

@@ -7,7 +7,7 @@ use iaam_core::event::kind::{EventKind, IncomeKind};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -22,7 +22,6 @@ fn deposit(owner: OwnerId, account: AccountId, sequence: u32, minor: i64) -> Eve
     let day = date!(2026 - 05 - 05);
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::CashIn { amount },
@@ -298,7 +297,6 @@ fn bond_event(
     let day = date!(2026 - 06 - 15);
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner,
         account,
         kind,

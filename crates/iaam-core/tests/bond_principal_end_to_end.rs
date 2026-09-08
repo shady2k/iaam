@@ -16,7 +16,7 @@ use iaam_core::event::corporate_action::CorporateAction;
 use iaam_core::event::kind::{EventKind, TradeSide};
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
@@ -57,7 +57,6 @@ fn per_unit(text: &str) -> PerUnitAmount {
 fn event(day: time::Date, sequence: u32, kind: EventKind, legs: Vec<Leg>) -> Event {
     Event {
         id: EventId(Uuid::from_u128(u128::from(sequence))),
-        schema_version: SCHEMA_VERSION,
         owner: OWNER,
         account: ACCOUNT,
         kind,

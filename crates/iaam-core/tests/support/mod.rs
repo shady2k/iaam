@@ -8,7 +8,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
 use time::Date;
 
@@ -73,7 +73,6 @@ pub struct Posting {
 pub fn event_on(channel: &TestChannel, posting: Posting, kind: EventKind, legs: Vec<Leg>) -> Event {
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner: posting.owner,
         account: posting.account,
         kind,

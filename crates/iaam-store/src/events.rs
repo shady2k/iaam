@@ -403,7 +403,13 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
                    ?18, ?19)",
         params![
             event.id.inner().to_string(),
-            event.schema_version,
+            // `Event::schema_version` no longer exists (iaam-7q0z): the domain
+            // carries no such field any more. This lifted column is never read
+            // back — the read path decodes `Event` from `payload` alone — and
+            // it disappears along with the rest of this table's shape when the
+            // relational journal schema replaces it. A fixed placeholder keeps
+            // the still-`NOT NULL` column satisfied until then.
+            1_u32,
             event.owner.inner().to_string(),
             event.account.inner().to_string(),
             event.kind.discriminant(),
@@ -662,9 +668,6 @@ impl SqliteStore {
     }
 
     /// Distinct source-category evidence for the owner's journal scope.
-    ///
-    /// Facts written before schema version 14 used this storage slot for the
-    /// source's operation word, so those rows are intentionally excluded.
     pub fn list_journal_source_categories(
         &self,
         owner: OwnerId,
@@ -688,7 +691,6 @@ fn source_categories_sql(
         "SELECT DISTINCT json_extract(payload, '$.provenance.source_category')
          FROM events
          WHERE owner = ?1
-           AND json_extract(payload, '$.schema_version') >= 14
            AND json_extract(payload, '$.provenance.source_category') IS NOT NULL",
     );
     let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(owner.inner().to_string())];

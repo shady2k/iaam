@@ -6,7 +6,7 @@
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, PrincipalId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::perimeter::{PerimeterPolicy, assess};
@@ -277,7 +277,6 @@ pub async fn record_owner_balance(
         .enumerate()
         .map(|(sequence, claim)| Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: principal.owner,
             account: balance.account,
             kind: EventKind::ControlAssertion {

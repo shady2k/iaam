@@ -190,7 +190,7 @@ mod projection_properties {
     use iaam_core::event::kind::EventKind;
     use iaam_core::event::leg::Leg;
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-    use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+    use iaam_core::event::{Confidence, Event, Relation};
     use iaam_core::ids::{AccountId, EventId, OwnerId, SourceId};
     use iaam_core::money::{CurrencyCode, Money, PostedMinor};
     use iaam_core::projection::{ProjectionContext, project};
@@ -203,7 +203,6 @@ mod projection_properties {
         let day = date!(2025 - 01 - 01) + time::Duration::days(i64::from(sequence));
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind: EventKind::CashIn { amount },

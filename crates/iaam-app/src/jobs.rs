@@ -422,7 +422,7 @@ mod tests {
     use iaam_core::event::leg::Leg;
     use iaam_core::event::offer::OfferExerciseAction;
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-    use iaam_core::event::{Confidence, Relation, SCHEMA_VERSION};
+    use iaam_core::event::{Confidence, Relation};
     use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId, SourceId};
     use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
     use iaam_core::numeric::decimal::Dec;
@@ -441,7 +441,6 @@ mod tests {
         let day = date!(2026 - 06 - 15);
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind,

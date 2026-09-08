@@ -128,7 +128,7 @@ mod tests {
     use crate::dates::{CashPostedDate, EffectiveOrder, EventDates};
     use crate::event::kind::OpeningAssertions;
     use crate::event::provenance::{ParserVersion, Provenance, RawHash};
-    use crate::event::{Confidence, Relation, SCHEMA_VERSION};
+    use crate::event::{Confidence, Relation};
     use crate::ids::{AccountId, EventId, OwnerId, SourceId};
     use crate::money::Quantity;
     use crate::numeric::NumericError;
@@ -165,7 +165,6 @@ mod tests {
     fn opening(instrument: InstrumentId, quantity: Dec) -> Event {
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account: AccountId::new_random(),
             kind: EventKind::OpeningPosition {

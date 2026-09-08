@@ -15,7 +15,7 @@ use iaam_core::event::leg::Leg;
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RowLocator};
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
-use iaam_core::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId, TransferId};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
@@ -45,7 +45,6 @@ fn envelope(kind: EventKind, legs: Vec<Leg>) -> Event {
     let account = AccountId::new_random();
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner: OwnerId::new_random(),
         account,
         kind,

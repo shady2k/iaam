@@ -20,7 +20,7 @@ use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::correction::{CorrectionError, resolve};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Event, Relation};
 use iaam_core::ids::{AccountId, ClassificationRuleId, EventId, ImportId, PrincipalId, SourceId};
 use iaam_core::money::{CurrencyCode, Money};
 use iaam_core::projection::ProjectionError;
@@ -1219,7 +1219,6 @@ fn reversal_for_with(original: &Event, declared_by: Option<PrincipalId>) -> Even
     }
     Event {
         id: EventId::new_random(),
-        schema_version: SCHEMA_VERSION,
         owner: original.owner,
         account: original.account,
         kind: original.kind.clone(),
@@ -1271,7 +1270,6 @@ mod tests {
         let amount = Money::new(PostedMinor::new(1_000), CurrencyCode::Rub);
         Event {
             id: EventId(uuid::Uuid::from_u128(id)),
-            schema_version: SCHEMA_VERSION,
             owner: owner(),
             account: account(),
             kind: EventKind::CashIn { amount },
@@ -1351,7 +1349,6 @@ mod tests {
         assert_eq!(reversal.kind, original.kind);
         assert_eq!(reversal.legs, original.legs);
         assert_eq!(reversal.account, original.account);
-        assert_eq!(reversal.schema_version, SCHEMA_VERSION);
         assert_eq!(
             reversal.provenance.parser_version(),
             &ParserVersion(CORRECTION_PARSER_VERSION.to_owned())

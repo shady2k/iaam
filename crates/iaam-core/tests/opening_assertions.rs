@@ -21,7 +21,6 @@ use iaam_core::event::kind::{
 /// from the previous version rather than fresh output from the current code.
 const RECORDED_AT_VERSION_TWO: &str = r#"{
   "id": "6f1a2b3c-4d5e-4f60-8112-233445566778",
-  "schema_version": 2,
   "owner": "11111111-2222-4333-8444-555555555555",
   "account": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
   "kind": {
@@ -61,7 +60,6 @@ fn an_event_recorded_before_the_field_existed_still_reads() {
     // documented something that nobody had seen.
     let event: Event = serde_json::from_str(RECORDED_AT_VERSION_TWO)
         .expect("version 2 event must be readable without migration");
-    assert_eq!(event.schema_version, 2);
 
     let EventKind::OpeningPosition { assertions, .. } = event.kind else {
         panic!("expected a reconstructed opening");

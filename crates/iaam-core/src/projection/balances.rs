@@ -137,7 +137,7 @@ mod tests {
     use crate::event::kind::EventKind;
     use crate::event::leg::Leg;
     use crate::event::provenance::{ParserVersion, Provenance, RawHash};
-    use crate::event::{Confidence, Event, Relation, SCHEMA_VERSION};
+    use crate::event::{Confidence, Event, Relation};
     use crate::ids::{CustodyId, EventId, OwnerId, SourceId};
     use crate::money::PostedMinor;
     use time::macros::date;
@@ -149,7 +149,6 @@ mod tests {
     fn cash_event(account: AccountId, amount: Money) -> Event {
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind: EventKind::CashIn { amount },

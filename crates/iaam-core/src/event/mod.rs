@@ -152,7 +152,6 @@ enum Sign {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: EventId,
-    pub schema_version: u32,
     pub owner: OwnerId,
     pub account: AccountId,
     pub kind: EventKind,
@@ -165,91 +164,6 @@ pub struct Event {
     /// Client idempotency key (§10.6).
     pub idempotency_key: Option<String>,
 }
-
-/// Current event schema version.
-///
-/// Version 2 differed from version 1 by the added variant
-/// [`EventKind::Valuation`]; version 3 differs from version 2
-/// by the added variant [`EventKind::ControlAssertion`]; version 4 —
-/// by variants [`EventKind::CorporateAction`] and
-/// [`EventKind::OfferExercise`], and by the income kind in `Income`.
-/// Version 5 adds the optional source time inside [`EffectiveOrder`].
-/// Version 6 adds optional basis-only trade fee fields; both default to absent
-/// so older journal facts remain readable, while the schema number still
-/// distinguishes software that understands the new fact.
-/// Version 7 adds [`EventKind::ImportCoverageGap`].
-/// Version 8 adds the refused rows inside that variant and the variant
-/// [`EventKind::ImportRowResolution`]: a coverage gap now says WHICH rows are
-/// missing, and a row is disposed of by an explicit fact rather than inferred
-/// from the presence of an event.
-/// Version 9 adds the variant [`EventKind::Tax`]: a self-paid tax is a fact of
-/// its own rather than an unnamed outflow.
-/// Version 10 adds the optional source description inside [`Provenance`]. It
-/// defaults to absent, so facts already in the journal stay readable, while
-/// the number still distinguishes software that understands the new field.
-/// Version 11 adds the variant [`EventKind::Refund`]: money a counterparty
-/// returns reverses spending, and reading it as an arrival reports income
-/// nobody earned.
-/// Version 12 adds the optional declaring principal inside [`Provenance`]. It
-/// defaults to absent, so facts already in the journal stay readable — and the
-/// absence is load-bearing rather than incidental: a retraction that may only
-/// take back what its own caller declared must refuse a fact that names no
-/// declarer, so the number is what tells a reader that «no principal» means
-/// «written before anyone was recorded» rather than «written by nobody».
-/// Version 13 adds [`EventKind::OwnAccountMovement`] and
-/// [`EventKind::UnresolvedOwnAccountMovement`]: a movement whose far side the
-/// source asserted to be the owner's and did not name is neither an external
-/// flow nor a complete transfer, and until now it could be recorded only as one
-/// of those two lies.
-/// Version 14 adds the optional source operation word inside [`Provenance`],
-/// beside the source category it used to be written through. The two are
-/// different facts — what the operation *was* against what it was *for* — and
-/// one slot could hold only one of them, so a category rule written on a
-/// source's category never matched a row that came in as an observation. It
-/// defaults to absent, so facts already in the journal stay readable, and
-/// nothing rewrites them: a fact below this version whose `source_category`
-/// holds an operation word keeps it, because provenance records what a path
-/// meant at the time and a repair would be this software guessing what a
-/// source said.
-/// Version 15 adds the optional rule settlement inside [`Provenance`]: which of
-/// the owner's standing classification rules filed the row, at which version of
-/// that rule, or that a reading ran and none did. It defaults to absent, so
-/// facts already in the journal stay readable — and the absence is load-bearing
-/// for the reason version 12's is, one step further: «no rule» is a statement a
-/// reading made, «nothing recorded» is a fact written before the field existed
-/// or by a path that never read the row against any rule, and the number is
-/// what tells the two apart. Nothing is back-filled, because nothing could be:
-/// the rule that settled a row was never recorded, so inventing one would name
-/// a decision the owner never made.
-/// Version 16 adds [`crate::event::provenance::RuleSettlement::AnsweredMintingRule`]:
-/// the owner answered, and that same answer also minted the rule the answer's
-/// own group is filed by. This is neither version 15's «a standing rule filed
-/// it» nor its «a reading ran and none did» — it is a third thing a rule can
-/// have done to a row, and a build that does not know the variant cannot parse
-/// a fact carrying it. Nothing is back-filled: a row settled before this
-/// version by an answer that minted a rule keeps recording plain
-/// [`crate::event::provenance::RuleSettlement::NoRule`], because that is what
-/// was actually written down at the time.
-pub const SCHEMA_VERSION: u32 = 16;
-
-/// The version from which [`provenance::Provenance::source_category`] holds a
-/// source's **category** on every path, and nothing else.
-///
-/// This is the boundary decision 0020 §3 promised a reader, named so that the
-/// readers who need it do not each spell the number themselves. Below it, on the
-/// observation path, that field may hold the source's *operation word*: one slot
-/// carried both facts, both paths stamped the same parser version, and §3
-/// refused a migration because telling the two apart afterwards is not possible
-/// and guessing would write, as the source's own category, a word the source
-/// never used there.
-///
-/// So a rule the owner writes about a source's **category** must not be tested
-/// against a fact below this version. That is not the same as rewriting the
-/// fact: what the fact carries is what the path meant at the time, and this
-/// merely declines to read it as evidence of something it may not be — exactly
-/// as §3 already has recomputation reconsider such a row with no operation word
-/// at all, `Provenance::source_kind` being `None` on every one of them.
-pub const SOURCE_CATEGORY_IS_A_CATEGORY_FROM: u32 = 14;
 
 /// Compare events for replay, preserving source-time semantics and making
 /// equal-time imports independent of their insertion order.
@@ -984,15 +898,6 @@ impl Event {
             });
         }
 
-        // Schema-aware on purpose. `validate_structure` runs on the READ path
-        // too: the projection re-checks every effective event because the core
-        // does not trust storage it did not write (crates/iaam-core/src/
-        // projection/invariants.rs). Refusing an empty `rows` outright would
-        // make every report fail on a journal that holds a gap written before
-        // schema 8.
-        if self.schema_version < 8 {
-            return Ok(());
-        }
         if rows.is_empty() {
             return Err(EventValidationError::EmptySet {
                 kind: name,
@@ -1305,7 +1210,6 @@ pub(crate) mod test_support {
         let dates = EventDates::for_cash(CashPostedDate(day));
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind,
@@ -1335,7 +1239,6 @@ pub(crate) mod test_support {
         let amount = Money::new(PostedMinor::new(1_000_000), CurrencyCode::Rub);
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind: EventKind::CashIn { amount },
@@ -1380,7 +1283,6 @@ mod tests {
     fn event(kind: EventKind, legs: Vec<Leg>, account: AccountId) -> Event {
         Event {
             id: EventId::new_random(),
-            schema_version: SCHEMA_VERSION,
             owner: OwnerId::new_random(),
             account,
             kind,
@@ -3057,9 +2959,8 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_eight_gap_whose_rows_do_not_cover_its_dimensions_is_rejected() {
+    fn a_gap_whose_rows_do_not_cover_its_dimensions_is_rejected() {
         let mut event = test_support::sample_event(1);
-        event.schema_version = 8;
         event.legs = Vec::new();
         event.kind = EventKind::ImportCoverageGap {
             period: march_period(),
@@ -3076,9 +2977,8 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_eight_gap_whose_row_count_disagrees_with_refused_is_rejected() {
+    fn a_gap_whose_row_count_disagrees_with_refused_is_rejected() {
         let mut event = test_support::sample_event(1);
-        event.schema_version = 8;
         event.legs = Vec::new();
         event.kind = EventKind::ImportCoverageGap {
             period: march_period(),
@@ -3093,59 +2993,26 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_gap_without_rows_still_validates() {
-        let mut event = test_support::sample_event(1);
-        event.schema_version = 7;
-        event.legs = Vec::new();
-        event.kind = EventKind::ImportCoverageGap {
-            period: march_period(),
-            dimensions: [Dimension::Cash].into_iter().collect(),
-            refused: 1,
-            rows: Vec::new(),
-        };
-        assert!(event.validate_structure().is_ok());
-    }
-
-    #[test]
-    fn a_schema_eight_gap_without_rows_is_rejected() {
-        let mut event = test_support::sample_event(1);
-        event.schema_version = 8;
-        event.legs = Vec::new();
-        event.kind = EventKind::ImportCoverageGap {
-            period: march_period(),
-            dimensions: [Dimension::Cash].into_iter().collect(),
-            refused: 1,
-            rows: Vec::new(),
-        };
-        assert!(event.validate_structure().is_err());
-    }
-
-    #[test]
-    fn a_legacy_gap_without_rows_still_deserialises() {
-        let mut event = test_support::sample_event(1);
-        event.schema_version = 7;
-        event.legs = Vec::new();
-        event.kind = EventKind::ImportCoverageGap {
-            period: march_period(),
-            dimensions: [Dimension::Cash].into_iter().collect(),
-            refused: 1,
-            rows: vec![RefusedRow {
-                key: row_key("OP-1"),
-                dimensions: [Dimension::Cash].into_iter().collect(),
-            }],
-        };
-        let mut value = serde_json::to_value(event).unwrap();
-        value["kind"]["ImportCoverageGap"]
-            .as_object_mut()
-            .unwrap()
-            .remove("rows");
-
-        let deserialised: Event = serde_json::from_value(value).unwrap();
+    fn a_coverage_gap_with_no_rows_is_refused_unconditionally() {
+        let event = coverage_gap_without_rows();
         assert!(matches!(
-            deserialised.kind,
-            EventKind::ImportCoverageGap { ref rows, .. } if rows.is_empty()
+            event.validate_structure(),
+            Err(EventValidationError::EmptySet { field: "rows", .. })
         ));
-        assert!(deserialised.validate_structure().is_ok());
+    }
+
+    fn coverage_gap_without_rows() -> Event {
+        let account = AccountId::new_random();
+        event(
+            EventKind::ImportCoverageGap {
+                period: march_period(),
+                dimensions: [Dimension::Cash].into_iter().collect(),
+                refused: 1,
+                rows: Vec::new(),
+            },
+            Vec::new(),
+            account,
+        )
     }
 
     #[test]
@@ -3349,83 +3216,6 @@ mod tests {
         assert_ne!(Confidence::Unknown, Confidence::Known);
         // Event shape does not depend on confidence.
         assert!(ev.validate_structure().is_ok());
-    }
-
-    #[test]
-    fn an_event_carries_the_current_schema_version() {
-        let acc = AccountId::new_random();
-        let ev = event(
-            EventKind::CashIn {
-                amount: rub(5_000_000),
-            },
-            vec![Leg::cash(acc, rub(5_000_000))],
-            acc,
-        );
-        assert_eq!(ev.schema_version, SCHEMA_VERSION);
-        // The literal is fixed intentionally: raising the schema version must be
-        // a conscious decision, not a side effect of an edit. Every
-        // change to this line requires answering whether previously recorded
-        // facts from older versions remain readable (§4.1).
-        //
-        // 1 → 2: added `EventKind::Valuation`.
-        // 2 → 3: added `EventKind::ControlAssertion` (§10.3).
-        // 3 → 4: added `EventKind::CorporateAction` and
-        //        `EventKind::OfferExercise`, and `Income` gained a kind (§4.7).
-        // 4 → 5: `EffectiveOrder` gained an optional source time.
-        // 5 → 6: `Trade` gained optional basis-only fee fields.
-        // 6 → 7: added `EventKind::ImportCoverageGap` (§10.3).
-        // 7 → 8: `ImportCoverageGap` gained `rows`; added
-        //        `EventKind::ImportRowResolution` (§10.3).
-        // 8 → 9: added `EventKind::Tax`, so that a tax stops being
-        //        indistinguishable from ordinary spending in the flow report.
-        //        Older facts stay readable: the version guard in
-        //        `iaam-app/src/scenarios/ingest.rs` refuses a mismatched
-        //        version only on the WRITE path, and nothing on the read path
-        //        compares against the current version. The `< 8` allowance in
-        //        `validate_import_coverage_gap` above is a historical threshold
-        //        and is deliberately left alone.
-        // 9 → 10: added the optional source description in `Provenance`.
-        //        Older facts stay readable because the field defaults to absent.
-        // 10 → 11: added the variant `EventKind::Refund`. Older facts stay
-        //        readable — no existing variant changed shape — and the number
-        //        tells software that does not know the variant that it cannot
-        //        interpret every fact it may now meet.
-        // 11 → 12: added the optional declaring principal in `Provenance`
-        //        (iaam-rond). Older facts stay readable because the field
-        //        defaults to absent — and here that absence is not merely
-        //        tolerated, it is the answer: an agent may retract only an
-        //        import it declared, so a fact naming no declarer must refuse
-        //        rather than be claimed. The number is what tells a reader that
-        //        «no principal» means «written before anyone was recorded».
-        // 12 → 13: added the variants `EventKind::OwnAccountMovement` and
-        //        `EventKind::UnresolvedOwnAccountMovement` (iaam-fmih). Older
-        //        facts stay readable — no existing variant changed shape — and
-        //        the number is what tells software that does not know them that
-        //        it may now meet a fact it cannot place: one whose far side is
-        //        an account of the owner's that no contour can prove it holds,
-        //        and one that posts no leg at all.
-        // 13 → 14: added the optional source operation word in `Provenance`,
-        //        beside the source category it used to be written through
-        //        (iaam-p683). Older facts stay readable because the field
-        //        defaults to absent, and nothing rewrites them: a fact below
-        //        this version whose `source_category` holds an operation word
-        //        keeps it, because a repair would be this software guessing
-        //        what a source said.
-        // 14 → 15: added the optional rule settlement in `Provenance`
-        //        (iaam-k4qu). Older facts stay readable because the field
-        //        defaults to absent, and the absence is the answer rather than
-        //        a gap: it says nothing was recorded about which rule filed the
-        //        row, which is a different claim from «no rule filed it». The
-        //        number is what tells a reader which of the two an absent field
-        //        means, and nothing is back-filled — the rule that settled an
-        //        older row was never recorded anywhere to back-fill it from.
-        // 15 → 16: `RuleSettlement` gained `AnsweredMintingRule` (iaam-vhr4): the
-        //        owner answered, and that same answer also minted the rule, which
-        //        is neither «a rule already standing filed this» nor «no rule
-        //        filed this». A build that does not know the value cannot parse
-        //        a fact carrying it, so the number moves rather than letting
-        //        such a build silently misread the settlement as absent.
-        assert_eq!(SCHEMA_VERSION, 16);
     }
 
     #[test]

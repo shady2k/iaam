@@ -234,7 +234,6 @@ fn add_reconciliation_assertion_for_period(
     let source = SourceId::new_random();
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
-        schema_version: iaam_core::event::SCHEMA_VERSION,
         owner,
         account,
         kind: iaam_core::event::kind::EventKind::ControlAssertion {
@@ -867,40 +866,11 @@ fn post_public(path: &str, body: &Value) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn health_is_public_and_reports_versions() {
+async fn health_is_public_and_reports_the_projection_version() {
     let harness = harness();
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Version 11: version 4 added CorporateAction, OfferExercise and the income
-    // type (§4.7); version 5 added the source time inside EffectiveOrder;
-    // version 6 added the basis-only trade fee; version 7 added
-    // ImportCoverageGap for refused import dimensions; version 8 made that gap
-    // carry the rows it refused; version 9 added Tax, so that a tax stops being
-    // indistinguishable from ordinary spending; version 10 added the source
-    // description inside Provenance, without which a rule on the description
-    // can match nothing; version 11 added Refund, so that money a counterparty
-    // returns reverses spending instead of being reported as income nobody
-    // earned. One version cannot denote two schemas (§4.1). An
-    // external agent reads this number to determine whether it can parse the
-    // response, so it is fixed here rather than derived from the code — a
-    // silent bump would tell that agent nothing had changed, and a silent
-    // omission would tell it nothing had changed when a new event kind
-    // appeared. Version 14 gave the source's own operation word a field of its
-    // own inside Provenance: it used to be written through the source
-    // category's slot, so a category rule could never match a row submitted as
-    // an observation. Version 15 gave Provenance the rule settlement: which
-    // standing rule of the owner's filed the row, at which version of that
-    // rule, or that a reading ran and none did — so an agent can ask the
-    // journal for the group one decision of his reached instead of reading a
-    // whole import. An agent that does not know the field reads every fact as
-    // though nothing were recorded about it, which is why the number moves.
-    // Version 16 added a fourth thing that settlement can say: the owner
-    // answered the row himself, and the same answer minted the rule. It is
-    // neither of the two an older build knows — a standing rule filed this, or
-    // a reading ran and none did — so a build without it reads the rows he
-    // decided as rows no rule was ever recorded about.
-    assert_eq!(body["schema_version"], 16);
     // Version 8: version 7 removed the face value from the lot and made the
     // prefix fingerprint cover the event contents; version 8 orders events
     // within a day by the source's time. Snapshots from either earlier version
@@ -5821,7 +5791,6 @@ fn add_coverage_gap(
     let source = SourceId::new_random();
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
-        schema_version: iaam_core::event::SCHEMA_VERSION,
         owner,
         account,
         kind: EventKind::ImportCoverageGap {
@@ -31511,7 +31480,6 @@ async fn the_journal_aggregate_refuses_more_than_its_group_ceiling() {
             iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(1), CurrencyCode::Rub);
         events.push(iaam_core::event::Event {
             id: iaam_core::ids::EventId::new_random(),
-            schema_version: iaam_core::event::SCHEMA_VERSION,
             owner: harness.owner,
             account: harness.account,
             kind: EventKind::CashIn { amount },
@@ -31655,7 +31623,6 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
     let amount = iaam_core::money::Money::new(iaam_core::money::PostedMinor::new(303), rub);
     let event = iaam_core::event::Event {
         id: iaam_core::ids::EventId::new_random(),
-        schema_version: iaam_core::event::SCHEMA_VERSION,
         owner: harness.owner,
         account: harness.account,
         kind: EventKind::CashIn { amount },

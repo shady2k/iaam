@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use iaam_core::dates::EffectiveOrder;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
-use iaam_core::event::{Event, Relation, SCHEMA_VERSION};
+use iaam_core::event::{Event, Relation};
 use iaam_core::ids::{AccountId, EventId, PrincipalId};
 use iaam_ingest::dedup::IdentityScope;
 use sha2::{Digest, Sha256};
@@ -183,7 +183,6 @@ fn reversal_for(original: &Event, declared_by: PrincipalId) -> Event {
         // The version describes the software that wrote the fact, and this fact is
         // written now. Copying the original's would claim the reversal was recorded
         // by whatever understood the journal back then.
-        schema_version: SCHEMA_VERSION,
         owner: original.owner,
         account: original.account,
         kind: original.kind.clone(),

@@ -6235,6 +6235,26 @@ macro_rules! journal_params {
             /// nothing recorded a settlement for at all.
             #[serde(default)]
             pub settled_by_rule: Option<Uuid>,
+            /// Only events the owner's category rules assign to this
+            /// category. The store rebuilds the projection first if it is
+            /// stale against his current rules, so this never quietly
+            /// answers from a rule set he has since changed. Mutually
+            /// exclusive with `uncategorised`.
+            #[serde(default)]
+            pub category: Option<Uuid>,
+            /// Only events with no category assignment at all — the honest
+            /// absence, never a sentinel category. Mutually exclusive with
+            /// `category`.
+            #[serde(default)]
+            pub uncategorised: Option<bool>,
+            /// Only events that are a movement whose far endpoint is this
+            /// account: a transfer read from one of its own two ends, naming
+            /// the other. Deliberately narrower than `touching`, which is
+            /// symmetric and also matches this account as the near side — a
+            /// transfer Main to Savings read from Main is matched by
+            /// `counterparty=Savings` and not by `counterparty=Main`.
+            #[serde(default)]
+            pub counterparty: Option<Uuid>,
             /// Inclusive start of the effective-date interval, YYYY-MM-DD.
             #[serde(default)]
             #[param(value_type = Option<String>, format = Date)]
@@ -6403,6 +6423,9 @@ pub async fn list_journal_events(
             import: params.import.map(ImportId).or(declared_import),
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
+            category: params.category.map(CategoryId),
+            uncategorised: params.uncategorised.unwrap_or(false),
+            counterparty: params.counterparty.map(AccountId),
             stands: params.stands,
             from,
             to,
@@ -6492,6 +6515,9 @@ pub async fn aggregate_journal_route(
             import: params.import.map(ImportId).or(declared_import),
             import_session: params.import_session.map(ImportSessionId),
             settled_by_rule: params.settled_by_rule.map(ClassificationRuleId),
+            category: params.category.map(CategoryId),
+            uncategorised: params.uncategorised.unwrap_or(false),
+            counterparty: params.counterparty.map(AccountId),
             stands: params.stands,
             from,
             to,

@@ -21,7 +21,8 @@
 //! [`super::hydrate`], phase 2.
 
 use iaam_core::ids::{
-    AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
+    AccountId, CategoryId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId,
+    SourceId,
 };
 use iaam_core::money::CurrencyCode;
 use time::Date;
@@ -72,6 +73,21 @@ pub struct JournalQuery {
     /// name no rule, and this selects by a named one. What tells those two
     /// apart is the fact's own provenance, not this handle.
     pub settled_by_rule: Option<ClassificationRuleId>,
+    /// Only facts `event_category_assignments` assigns to this category
+    /// (spec §4.7, §6.1). Mutually exclusive with [`Self::uncategorised`] —
+    /// the two ask opposite questions and the caller decides which.
+    pub category: Option<CategoryId>,
+    /// Only facts with no row in `event_category_assignments` at all —
+    /// `NotDecomposed`, the honest absence, never a sentinel category
+    /// (spec §4.7). Mutually exclusive with [`Self::category`].
+    pub uncategorised: bool,
+    /// Only facts that are a movement whose **far** endpoint is this account:
+    /// a transfer read from one of its own two ends, naming the other
+    /// (spec §6.1). Deliberately narrower than [`Self::touching`], which is
+    /// symmetric and also matches this account as the *near* side — a
+    /// transfer `Main -> Savings` read from `Main` is matched by
+    /// `counterparty = Savings` and not by `counterparty = Main`.
+    pub counterparty: Option<AccountId>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.
@@ -97,10 +113,23 @@ impl SqliteStore {
     /// caller supplied: an event identifier is a UUID, and a UUID confers no
     /// right to read someone else's journal (§14).
     pub fn list_journal_events(
-        &self,
+        &mut self,
         owner: OwnerId,
         query: &JournalQuery,
     ) -> Result<Vec<iaam_core::event::Event>, StoreError> {
+        // The staleness check is load-bearing (spec §4.7, §6.1): a category
+        // filter must never quietly answer from a rule set the owner has
+        // since changed. `assign_for` keeps a freshly appended event current
+        // as it lands, and the application layer rebuilds eagerly on every
+        // rule create/edit/retirement — but a caller that wrote rules or
+        // events straight through the store (a bundle import, a test) can
+        // leave the projection behind either path, so the read side checks
+        // for itself rather than trusting that everyone remembered.
+        if (query.category.is_some() || query.uncategorised)
+            && super::category_index::is_stale(&self.conn, owner)?
+        {
+            self.rebuild_category_index(owner)?;
+        }
         let (sql, parameters) = journal_sql(owner, query)?;
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
@@ -232,7 +261,32 @@ pub fn journal_sql(
     owner: OwnerId,
     query: &JournalQuery,
 ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>), StoreError> {
-    let mut sql = String::from("SELECT id FROM events WHERE owner = ?1");
+    // `counterparty` joins `event_cash_transfer` in the `FROM` clause,
+    // leading with `t` under `CROSS JOIN` rather than an ordinary join or an
+    // `EXISTS` correlated on `t.event = events.id`. Both of those let SQLite
+    // reorder the join, and it always chooses to drive from `events` instead
+    // — `events_by_order` already satisfies `WHERE owner = ?` and the
+    // `ORDER BY` for free, so the optimizer never even considers seeking
+    // `event_cash_transfer` by its own far-account columns, no matter how
+    // selective that seek is. `CROSS JOIN` is SQLite's documented way to
+    // pin join order left to right, which is what lets
+    // `event_cash_transfer_by_from`/`_by_to` answer the far-account equality
+    // first; the small join back to `events` by primary key, and the sort
+    // `ORDER BY` now costs, are cheap next to scanning every one of the
+    // owner's events to find the few that are transfers at all (spec §6.2).
+    // The join is safe regardless of order because the table is strictly one
+    // row per event (its primary key is `event` alone): it can only narrow
+    // the result, never multiply a row, which is the hazard `EXISTS` exists
+    // for against `event_legs`.
+    let mut sql = if query.counterparty.is_some() {
+        String::from(
+            "SELECT events.id FROM event_cash_transfer AS t \
+             CROSS JOIN events ON events.id = t.event \
+             WHERE events.owner = ?1",
+        )
+    } else {
+        String::from("SELECT id FROM events WHERE owner = ?1")
+    };
     let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(owner.inner().to_string())];
 
     if !query.kinds.is_empty() {
@@ -320,6 +374,41 @@ pub fn journal_sql(
             &mut sql,
             " AND settled_by_rule = ?",
             Box::new(rule.inner().to_string()),
+        );
+    }
+    if let Some(category) = query.category {
+        // Correlated on `events.owner` rather than a bound parameter: the
+        // assignment's owner is always the event's owner (§4.7), and reading
+        // it off the outer row lets the index (owner, category, event) answer
+        // the whole predicate without an extra bind.
+        bind(
+            &mut sql,
+            " AND EXISTS (SELECT 1 FROM event_category_assignments a \
+             WHERE a.owner = events.owner AND a.event = events.id AND a.category = ?)",
+            Box::new(category.inner().to_string()),
+        );
+    }
+    if query.uncategorised {
+        sql.push_str(
+            " AND NOT EXISTS (SELECT 1 FROM event_category_assignments a \
+             WHERE a.owner = events.owner AND a.event = events.id)",
+        );
+    }
+    if let Some(counterparty) = query.counterparty {
+        // Deliberately narrower than `touching` (spec §6.1): a transfer
+        // matches only when the named account is the *far* end from the
+        // event's own account, never the near one. `t` is already joined
+        // above, one row per event.
+        let far_account = counterparty.inner().to_string();
+        bind(
+            &mut sql,
+            " AND ((events.account = t.from_account AND t.to_account = ?)",
+            Box::new(far_account.clone()),
+        );
+        bind(
+            &mut sql,
+            " OR (events.account = t.to_account AND t.from_account = ?))",
+            Box::new(far_account),
         );
     }
     if let Some(from) = query.from {

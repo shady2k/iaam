@@ -16065,6 +16065,7 @@ fn remedy_coverage(kind: CaveatKind) -> RemedyCoverage {
         | CaveatKind::AccountInAnotherScope
         | CaveatKind::AccountRuledOutside
         | CaveatKind::RunningCashSum
+        | CaveatKind::PositionFactsMissing
         | CaveatKind::UndecomposedMovements
         | CaveatKind::RetiredAccountNotEmpty => RemedyCoverage::Invoked,
         // Nothing in this API closes these, and that is a decision rather than
@@ -16294,6 +16295,50 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
         );
     }
     exercised.insert(CaveatKind::AccountInNoScope);
+
+    // --- position_facts_missing ---------------------------------------------
+    {
+        let harness = harness();
+        let securities = make_account(&harness, "Securities").await;
+        let reported = make_contour(&harness, "Reported", &[securities.as_str()]).await;
+
+        let before = assets_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            caveat_kinds(&before).contains(&"position_facts_missing".to_owned()),
+            "{before}"
+        );
+
+        let (status, done) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "source_label": "manual position entry",
+                    "operations": [{
+                        "account": securities,
+                        "type": "opening_position",
+                        "instrument": harness.instrument.inner(),
+                        "custody": harness.custody.inner(),
+                        "quantity": "4",
+                        "cost_basis": "400.00",
+                        "currency": "RUB",
+                        "dates": { "trade": "2026-01-02" },
+                        "idempotency_key": "remedy-position-facts-missing"
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+
+        let after = assets_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"position_facts_missing".to_owned()),
+            "{after}"
+        );
+        exercised.insert(CaveatKind::PositionFactsMissing);
+    }
 
     // --- account_in_another_scope -------------------------------------------
     {
@@ -26800,6 +26845,297 @@ async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat()
         caveat["subject"]["id"],
         harness.instrument.inner().to_string(),
         "{snapshot}"
+    );
+}
+
+/// A report names the accounts whose securities side has no journal fact.
+///
+/// An unclassified account is the existing account shape that may carry
+/// securities; cash-classified accounts are current cash products. The report
+/// must distinguish an empty securities side from a scope that contains only
+/// cash products, and a position fact must close the former.
+#[tokio::test]
+async fn an_asset_report_names_missing_position_facts_only_for_securities_accounts() {
+    let harness = harness();
+    let router = &harness.router;
+    let owner_token = &harness.owner_token;
+
+    let create_account = |body: Value| async move {
+        let (status, account) = call(router, post("/v1/accounts", owner_token, &body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{account}");
+        account["id"].as_str().expect("account id").to_owned()
+    };
+    let securities = create_account(json!({ "title": "Brokerage cash" })).await;
+    let holding = create_account(json!({ "title": "Brokerage holding" })).await;
+    let current_one =
+        create_account(json!({ "title": "Current one", "cash_class": "card_account" })).await;
+    let current_two =
+        create_account(json!({ "title": "Current two", "cash_class": "card_account" })).await;
+
+    let create_contour = |title: &str, account: &str| {
+        let title = title.to_owned();
+        let account = account.to_owned();
+        async move {
+            let (status, contour) = call(
+                router,
+                post(
+                    "/v1/contours",
+                    owner_token,
+                    &json!({ "title": title, "accounts": [account] }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{contour}");
+            contour["contour"].as_str().expect("contour id").to_owned()
+        }
+    };
+    let securities_contour = create_contour("Securities", &securities).await;
+    let holding_contour = create_contour("Holding", &holding).await;
+    let cash_contour = {
+        let (status, contour) = call(
+            &harness.router,
+            post(
+                "/v1/contours",
+                &harness.owner_token,
+                &json!({
+                    "title": "Current accounts",
+                    "accounts": [current_one, current_two]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{contour}");
+        contour["contour"].as_str().expect("contour id").to_owned()
+    };
+
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "invented brokerage statement",
+                "operations": [{
+                    "account": securities,
+                    "type": "opening_cash",
+                    "amount": "1200.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-02" },
+                    "idempotency_key": "scope-silence-cash"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, recorded) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "invented brokerage statement",
+                "operations": [{
+                    "account": holding,
+                    "type": "opening_position",
+                    "instrument": harness.instrument,
+                    "custody": harness.custody,
+                    "quantity": "3",
+                    "cost_basis": "300.00",
+                    "currency": "RUB",
+                    "dates": { "trade": "2026-01-02" },
+                    "idempotency_key": "scope-silence-position"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recorded}");
+
+    let (status, missing) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={securities_contour}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{missing}");
+    assert_eq!(
+        missing["positions"]["accounts_without_position_facts"],
+        json!([securities]),
+        "{missing}"
+    );
+    assert_eq!(missing["confidence"]["complete"], false, "{missing}");
+    let caveat = missing["confidence"]["caveats"]
+        .as_array()
+        .expect("caveats")
+        .iter()
+        .find(|caveat| caveat["kind"] == "position_facts_missing")
+        .unwrap_or_else(|| panic!("missing position facts are named: {missing}"));
+    assert_eq!(caveat["subject"]["id"], securities, "{missing}");
+    assert_eq!(
+        caveat["see"], "positions.accounts_without_position_facts",
+        "{missing}"
+    );
+    assert_eq!(
+        caveat["closed_by"][0]["operationId"], "ingest_operations",
+        "{missing}"
+    );
+
+    let (status, held) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={holding_contour}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    assert_eq!(
+        held["positions"]["accounts_without_position_facts"],
+        json!([]),
+        "{held}"
+    );
+    assert!(
+        held["confidence"]["caveats"]
+            .as_array()
+            .expect("caveats")
+            .iter()
+            .all(|caveat| caveat["kind"] != "position_facts_missing"),
+        "a position fact closes the absence caveat: {held}"
+    );
+
+    let (status, current) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={cash_contour}&as_of=2026-01-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{current}");
+    assert_eq!(
+        current["positions"]["accounts_without_position_facts"],
+        json!([]),
+        "{current}"
+    );
+    assert!(
+        current["confidence"]["caveats"]
+            .as_array()
+            .expect("caveats")
+            .iter()
+            .all(|caveat| caveat["kind"] != "position_facts_missing"),
+        "cash-only accounts are not securities omissions: {current}"
+    );
+}
+
+/// Same-title contours are distinct perimeters, not versions of one another.
+#[tokio::test]
+async fn a_contour_listing_names_other_contours_with_the_same_title() {
+    let harness = harness();
+    let router = &harness.router;
+    let owner_token = &harness.owner_token;
+    let create_account = |title: &str| {
+        let title = title.to_owned();
+        async move {
+            let (status, account) = call(
+                router,
+                post("/v1/accounts", owner_token, &json!({ "title": title })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{account}");
+            account["id"].as_str().expect("account id").to_owned()
+        }
+    };
+    let first_account = create_account("First").await;
+    let second_account = create_account("Second").await;
+    let third_account = create_account("Third").await;
+
+    for (title, account) in [
+        ("Identical", &first_account),
+        ("Identical", &second_account),
+        ("Distinct", &third_account),
+    ] {
+        let (status, contour) = call(
+            &harness.router,
+            post(
+                "/v1/contours",
+                &harness.owner_token,
+                &json!({ "title": title, "accounts": [account] }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{contour}");
+    }
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let listed = listed.as_array().expect("contour list");
+    let first = listed
+        .iter()
+        .find(|contour| contour["accounts"] == json!([first_account]))
+        .expect("first contour");
+    let second = listed
+        .iter()
+        .find(|contour| contour["accounts"] == json!([second_account]))
+        .expect("second contour");
+    let third = listed
+        .iter()
+        .find(|contour| contour["accounts"] == json!([third_account]))
+        .expect("third contour");
+    assert_eq!(
+        first["same_title_contours"],
+        json!([second["contour"].as_str().expect("second id")]),
+        "{listed:?}"
+    );
+    assert_eq!(
+        second["same_title_contours"],
+        json!([first["contour"].as_str().expect("first id")]),
+        "{listed:?}"
+    );
+    assert_eq!(third["same_title_contours"], json!([]), "{listed:?}");
+
+    let (status, one) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/contours/{}",
+                first["contour"].as_str().expect("first id")
+            ),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["accounts"], first["accounts"], "{one}");
+}
+
+#[tokio::test]
+async fn new_scope_silence_fields_and_caveat_are_described_in_openapi() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let positions =
+        property_description(&spec, "PositionsSideDto", "accounts_without_position_facts");
+    assert!(positions.contains("position fact"), "{positions}");
+    assert!(positions.contains("scope"), "{positions}");
+
+    let contours = property_description(&spec, "ContourDto", "same_title_contours");
+    for owed in ["unrelated", "perimeters", "version", "identifier", "report"] {
+        assert!(contours.contains(owed), "{contours}");
+    }
+
+    let caveat_kind = property_description(&spec, "CaveatDto", "kind");
+    assert!(
+        caveat_kind.contains("position_facts_missing"),
+        "{caveat_kind}"
     );
 }
 

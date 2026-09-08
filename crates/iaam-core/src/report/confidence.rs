@@ -88,6 +88,9 @@ pub enum CaveatKind {
     /// the field it points at, and the two reports publish the same silence in
     /// two different places.
     HoldingNotValued,
+    /// An account that may hold securities has no position fact in the
+    /// journal, so the report cannot tell whether securities were not imported.
+    PositionFactsMissing,
     /// An account the owner has retired still shows something in the snapshot,
     /// so its row and its class membership stand.
     ///
@@ -117,7 +120,7 @@ impl CaveatKind {
     /// Iterated by the guard that resolves [`Self::closed_by`] against the
     /// published contract: a table checked for the kinds someone remembered to
     /// list is a table with a hole in it exactly where the mistake is.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::AccountInNoScope,
         Self::AccountInAnotherScope,
         Self::AccountRuledOutside,
@@ -127,6 +130,7 @@ impl CaveatKind {
         Self::UnexplainedCashChange,
         Self::UnpricedPosition,
         Self::HoldingNotValued,
+        Self::PositionFactsMissing,
         Self::RetiredAccountNotEmpty,
         Self::TerminalValueNotComputed,
         Self::ReturnNotComputed,
@@ -145,6 +149,7 @@ impl CaveatKind {
             Self::UnexplainedCashChange => "unexplained_cash_change",
             Self::UnpricedPosition => "unpriced_position",
             Self::HoldingNotValued => "holding_not_valued",
+            Self::PositionFactsMissing => "position_facts_missing",
             Self::RetiredAccountNotEmpty => "retired_account_not_empty",
             Self::TerminalValueNotComputed => "terminal_value_not_computed",
             Self::ReturnNotComputed => "return_not_computed",
@@ -170,6 +175,7 @@ impl CaveatKind {
             Self::UnexplainedCashChange => "unexplained[]",
             Self::UnpricedPosition => "data_quality.position_coverage.uncovered[]",
             Self::HoldingNotValued => "positions.holdings[].value",
+            Self::PositionFactsMissing => "positions.accounts_without_position_facts",
             Self::RetiredAccountNotEmpty => "accounts[]",
             Self::TerminalValueNotComputed => "terminal_value",
             Self::ReturnNotComputed => "xirr_pre_tax",
@@ -303,6 +309,7 @@ impl CaveatKind {
             | Self::HoldingNotValued
             | Self::TerminalValueNotComputed
             | Self::ReturnNotComputed => &[],
+            Self::PositionFactsMissing => &[OperationKey::SubmitOperations],
         }
     }
 
@@ -340,6 +347,9 @@ impl CaveatKind {
             }
             Self::HoldingNotValued => {
                 "The journal holds no quote for this instrument at or before the report date, so the holding is absent from the position half of the snapshot rather than valued at zero."
+            }
+            Self::PositionFactsMissing => {
+                "This account may hold securities, but the journal has no position fact for it, so the report cannot distinguish an empty holding from securities that were never imported. The candidate is an account whose cash class the owner has never declared, because a declared class is a cash-only class: stating that this one is a card account or a deposit answers the question as surely as importing the holdings does."
             }
             Self::RetiredAccountNotEmpty => {
                 "The owner has retired this account, and the snapshot still shows a figure for it, so its row and its class membership stand. A retirement never hides money: a retired account's row is dropped only where every one of its figures is zero."
@@ -716,6 +726,19 @@ mod tests {
                 .closed_by()
                 .contains(&OperationKey::RecordOwnerBalance),
             "a legless assertion does not close the running sum"
+        );
+    }
+    /// A possible securities account is closed by recording the missing
+    /// position fact, not by asserting a cash balance.
+    #[test]
+    fn missing_position_facts_names_position_ingestion() {
+        assert_eq!(
+            CaveatKind::PositionFactsMissing.see(),
+            "positions.accounts_without_position_facts"
+        );
+        assert_eq!(
+            CaveatKind::PositionFactsMissing.closed_by(),
+            &[OperationKey::SubmitOperations]
         );
     }
 }

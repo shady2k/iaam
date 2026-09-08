@@ -3465,7 +3465,7 @@ pub async fn add_contour_version(
     ApiJson(request): ApiJson<AddContourVersionRequest>,
 ) -> Result<(StatusCode, Json<ContourVersionDto>), ApiFailure> {
     require(&principal, OperationKey::AddContourVersion)?;
-    let current = owned_contour(&state, &principal, ContourId(id)).await?;
+    let (current, _) = owned_contour(&state, &principal, ContourId(id)).await?;
 
     // The precondition, checked before anything is read out of the body: a
     // caller that reasoned from a version someone has since replaced would not
@@ -3554,7 +3554,12 @@ pub async fn list_contours(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Vec<ContourDto>>, ApiFailure> {
     let contours = state.services.store.list_contours(principal.owner).await?;
-    Ok(Json(contours.iter().map(contour_dto).collect()))
+    Ok(Json(
+        contours
+            .iter()
+            .map(|contour| contour_dto(contour, &contours))
+            .collect(),
+    ))
 }
 
 /// One contour, with the composition its current version names.
@@ -3575,8 +3580,8 @@ pub async fn get_contour(
     Extension(principal): Extension<Principal>,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ContourDto>, ApiFailure> {
-    let contour = owned_contour(&state, &principal, ContourId(id)).await?;
-    Ok(Json(contour_dto(&contour)))
+    let (contour, all_contours) = owned_contour(&state, &principal, ContourId(id)).await?;
+    Ok(Json(contour_dto(&contour, &all_contours)))
 }
 
 /// Refuse a contour identifier the owner does not hold.
@@ -3588,17 +3593,19 @@ async fn owned_contour(
     state: &ServerState,
     principal: &Principal,
     contour: ContourId,
-) -> Result<ContourView, ApiFailure> {
+) -> Result<(ContourView, Vec<ContourView>), ApiFailure> {
     let contours = state.services.store.list_contours(principal.owner).await?;
-    contours
-        .into_iter()
+    let contour = contours
+        .iter()
         .find(|held| held.id == contour)
+        .cloned()
         .ok_or_else(|| {
             ApiFailure::new(
                 StatusCode::NOT_FOUND,
                 ApiError::simple("not_found", format!("not found: contour {}", contour.0)),
             )
-        })
+        })?;
+    Ok((contour, contours))
 }
 
 /// The membership a contour version may be given.
@@ -3631,12 +3638,17 @@ fn same_composition(contour: &ContourView, accounts: &[AccountId]) -> bool {
     held == asked
 }
 
-fn contour_dto(contour: &ContourView) -> ContourDto {
+fn contour_dto(contour: &ContourView, all_contours: &[ContourView]) -> ContourDto {
     ContourDto {
         contour: contour.id.0,
         title: contour.title.clone(),
         version: contour.version.0,
         accounts: contour.accounts.iter().map(|id| id.inner()).collect(),
+        same_title_contours: all_contours
+            .iter()
+            .filter(|other| other.id != contour.id && other.title == contour.title)
+            .map(|other| other.id.0)
+            .collect(),
     }
 }
 

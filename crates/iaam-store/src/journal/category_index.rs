@@ -34,22 +34,6 @@ use super::read::hydrate;
 use crate::StoreError;
 use crate::categories::{matcher_from_columns, parse_uuid, text_to_date};
 
-/// The `CategorySubject` this projection derives from `event`.
-///
-/// This must not diverge from `LoadedCategoryIndex::assignment`
-/// (`iaam-app/src/scenarios/categories.rs`), which builds the same subject
-/// for the preview path: two constructions of "what a rule sees" would give
-/// the owner two different answers for what looks like one question.
-fn subject_for(event: &Event) -> CategorySubject<'_> {
-    CategorySubject {
-        row_key: category::row_key(event),
-        source_category: event.provenance.source_category(),
-        counterparty: event.provenance.description(),
-        description: event.provenance.description(),
-        on: event.order.date(),
-    }
-}
-
 /// Every active (`retired_at IS NULL`) category rule the owner has, as the
 /// domain type `iaam_core::category::assign` reads.
 fn active_rules(tx: &Transaction<'_>, owner: OwnerId) -> Result<Vec<CategoryRule>, StoreError> {
@@ -144,7 +128,7 @@ fn store_assignment(
     rules: &[CategoryRule],
     rules_revision: i64,
 ) -> Result<bool, StoreError> {
-    match category::assign(&subject_for(event), rules) {
+    match category::assign(&CategorySubject::of(event), rules) {
         CategoryAssignment::NotDecomposed => {
             tx.execute(
                 "DELETE FROM event_category_assignments WHERE owner = ?1 AND event = ?2",
@@ -505,7 +489,7 @@ mod tests {
 
         for event in [&outranked, &outside_interval, &inside_interval, &unmatched] {
             let stored = stored_assignment(store.connection(), fixture.owner, event.id);
-            let computed = category::assign(&subject_for(event), &active_rules);
+            let computed = category::assign(&CategorySubject::of(event), &active_rules);
             assert_eq!(stored, computed, "event {}", event.id.inner());
         }
     }

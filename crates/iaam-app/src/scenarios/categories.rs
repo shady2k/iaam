@@ -353,18 +353,7 @@ impl CategoryIndex for LoadedCategoryIndex {
         // records that the source named nothing.
         // The same helper is published on journal and preview rows, so a Row
         // matcher always receives the identity the API tells the caller to use.
-        let row_key = category_row_key(event);
-        let subject = CategorySubject {
-            row_key,
-            source_category: event.provenance.source_category(),
-            // The two were hard-wired to None, which made every
-            // DescriptionContains rule dead on arrival. The source states one
-            // string; it fills both roles until a source that separates them
-            // arrives.
-            counterparty: event.provenance.description(),
-            description: event.provenance.description(),
-            on: event.order.date(),
-        };
+        let subject = CategorySubject::of(event);
         match self.proposed.as_ref() {
             Some(proposed) => assign_with_proposed(&subject, &self.rules, proposed),
             None => iaam_core::category::assign(&subject, &self.rules),

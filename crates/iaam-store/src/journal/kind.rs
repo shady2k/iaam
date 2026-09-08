@@ -65,6 +65,14 @@ const SOURCE_TIME_FORMAT: &[time::format_description::FormatItem<'_>] =
 /// Every field of `event` becomes a header row, a leg row per leg, and a
 /// family-specific detail row, or [`DetailRows::None`] for the five
 /// variants that carry nothing beyond the legs.
+///
+/// Not yet called by production code: Task 7's write primitive is this
+/// function's producer once it lands. Until then it is exercised by this
+/// module's own round-trip tests and by `journal::read`'s test fixtures,
+/// which need it to build rows to insert — both `#[cfg(test)]`, so a plain
+/// (non-test) build still sees no caller and would otherwise flag this as
+/// dead code.
+#[allow(dead_code)]
 pub(crate) fn to_rows(event: &Event) -> Result<(EventRow, Vec<LegRow>, DetailRows), StoreError> {
     let id = event.id.inner().to_string();
 

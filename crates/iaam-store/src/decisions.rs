@@ -1,5 +1,6 @@
+use crate::journal::{hydrate, parse_uuid};
 use crate::{SqliteStore, StoreError};
-use iaam_core::ids::{OwnerId, PrincipalId};
+use iaam_core::ids::{EventId, OwnerId, PrincipalId};
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
@@ -101,11 +102,10 @@ impl SqliteStore {
         }
 
         let mut statement = self.conn.prepare(
-            "SELECT id, payload, recorded_at,
-                    json_extract(payload, '$.provenance.declared_by')
+            "SELECT id, recorded_at, declared_by
              FROM events
              WHERE owner = ?1
-               AND json_extract(payload, '$.provenance.declared_by') IS NOT NULL
+               AND declared_by IS NOT NULL
                AND (?2 IS NULL OR substr(recorded_at, 1, 10) >= ?2)
                AND (?3 IS NULL OR substr(recorded_at, 1, 10) <= ?3)
              ORDER BY recorded_at, id",
@@ -114,20 +114,31 @@ impl SqliteStore {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(2)?,
             ))
         })?;
+        let mut declared_events = Vec::new();
         for row in events {
-            let (id, payload, recorded_at, declared_by) = row?;
+            let (id, recorded_at, declared_by) = row?;
+            declared_events.push((EventId(parse_uuid(&id, "event")?), recorded_at, declared_by));
+        }
+        let ids: Vec<EventId> = declared_events.iter().map(|(id, _, _)| *id).collect();
+        let mut by_id: std::collections::HashMap<EventId, iaam_core::event::Event> =
+            hydrate(&self.conn, &ids)?
+                .into_iter()
+                .map(|event| (event.id, event))
+                .collect();
+        for (id, recorded_at, declared_by) in declared_events {
+            let Some(event) = by_id.remove(&id) else {
+                continue;
+            };
             let actor = parse_principal(declared_by.as_deref())?;
             rows.push(StoredDecision {
                 operation: "journal_event".to_owned(),
                 declared_by: actor,
                 actor_scope: self.scope_for(owner, declared_by.as_deref())?,
-                subject: id.clone(),
-                decision: serde_json::from_str(&payload)
-                    .map_err(|source| StoreError::EventDecode { id, source })?,
+                subject: id.inner().to_string(),
+                decision: serde_json::to_value(&event).map_err(StoreError::EventEncode)?,
                 undo: "submit_corrections".to_owned(),
                 recorded_at,
             });

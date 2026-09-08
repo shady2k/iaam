@@ -52,13 +52,13 @@ use iaam_store::documents::{
     BrokerCode, DocumentStored, NewDocument as StoredNewDocument,
     ReportFormat as StoredReportFormat,
 };
-use iaam_store::events::{
-    AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
-    JournalQuery as StoredJournalQuery, SourceCategoryQuery as StoredSourceCategoryQuery,
-};
 use iaam_store::import_session::{
     NewQuestion as StoredNewQuestion, SessionState as StoredSessionState, StoredControlFigures,
     StoredObservation, StoredQuestion, StoredSession, StoredSessionSummary,
+};
+use iaam_store::journal::{
+    AccountActivityRecord, Appended, ControlAssertionRecord, JournalCursor as StoredJournalCursor,
+    JournalQuery as StoredJournalQuery, SourceCategoryQuery as StoredSourceCategoryQuery,
 };
 use iaam_store::reference::{
     AccountAliasRecord, AccountCreation, AccountDeclarations as StoredAccountDeclarations,

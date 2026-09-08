@@ -14,7 +14,7 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
-use iaam_store::events::{AccountActivityRecord, Appended, JournalQuery};
+use iaam_store::journal::{AccountActivityRecord, Appended, JournalQuery};
 use iaam_store::reference::AccountRecord;
 use rusqlite::params;
 use std::collections::BTreeSet;
@@ -765,6 +765,17 @@ fn account_activity_excludes_both_bookkeeping_kinds() {
         .unwrap();
     let mut dimensions = BTreeSet::new();
     dimensions.insert(Dimension::Cash);
+    // `dimensions` and `refused` are reconstructed from `rows` on read-back
+    // (spec §4.4: the union of the rows' own dimension sets, and
+    // `rows.len()`), so a row must actually be given to name — an empty
+    // `rows` with a nonzero `refused` cannot round-trip.
+    let refused_row = iaam_core::event::source_row::RefusedRow {
+        key: iaam_core::event::source_row::SourceRowKey {
+            source: ctx.source,
+            row: iaam_core::event::source_row::RowName::Given("OP-1".to_owned()),
+        },
+        dimensions: dimensions.clone(),
+    };
     store
         .append_event(
             &bookkeeping_event(
@@ -774,7 +785,7 @@ fn account_activity_excludes_both_bookkeeping_kinds() {
                     period,
                     dimensions,
                     refused: 1,
-                    rows: Vec::new(),
+                    rows: vec![refused_row],
                 },
             ),
             IdentityScope::Source,
@@ -849,6 +860,16 @@ fn account_activity_counts_both_accounts_a_transfer_touched() {
         to: savings,
         amount,
     };
+    // A transfer's stored amount is reconstructed from the positive `to`
+    // leg (spec §4.5), so both endpoints need a leg — the sending side
+    // negative, the receiving side positive.
+    transfer.legs = vec![
+        Leg::cash(
+            ctx.account,
+            Money::new(PostedMinor::new(-500_000), CurrencyCode::Rub),
+        ),
+        Leg::cash(savings, amount),
+    ];
     transfer.order = EffectiveOrder::new(day, 1);
     transfer.dates = EventDates::for_cash(CashPostedDate(day));
     store
@@ -915,6 +936,16 @@ fn a_transfer_widens_the_coverage_it_reaches_beyond() {
         to: savings,
         amount,
     };
+    // A transfer's stored amount is reconstructed from the positive `to`
+    // leg (spec §4.5), so both endpoints need a leg — the sending side
+    // negative, the receiving side positive.
+    transfer.legs = vec![
+        Leg::cash(
+            ctx.account,
+            Money::new(PostedMinor::new(-500_000), CurrencyCode::Rub),
+        ),
+        Leg::cash(savings, amount),
+    ];
     transfer.order = EffectiveOrder::new(day, 1);
     transfer.dates = EventDates::for_cash(CashPostedDate(day));
     store

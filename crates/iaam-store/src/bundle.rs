@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::events::find_duplicate;
+use crate::journal::find_duplicate;
 use crate::journal::write::insert_event_in;
 use crate::{SqliteStore, StoreError};
 

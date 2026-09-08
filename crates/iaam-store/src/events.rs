@@ -395,21 +395,18 @@ pub(crate) fn insert_event(conn: &Connection, event: &Event) -> Result<(), Store
 
     conn.execute(
         "INSERT INTO events (
-             id, schema_version, owner, account, kind, effective_date, sequence, source_time,
+             id, owner, account, kind, effective_date, sequence, source_time,
              relation_kind, relation_target, source, source_operation_id,
              idempotency_key, raw_hash, payload, recorded_at, import_session,
              settled_by_rule, settled_by_rule_version
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                   ?18, ?19)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                   ?17, ?18)",
         params![
             event.id.inner().to_string(),
-            // `Event::schema_version` no longer exists (iaam-7q0z): the domain
-            // carries no such field any more. This lifted column is never read
-            // back — the read path decodes `Event` from `payload` alone — and
-            // it disappears along with the rest of this table's shape when the
-            // relational journal schema replaces it. A fixed placeholder keeps
-            // the still-`NOT NULL` column satisfied until then.
-            1_u32,
+            // `Event::schema_version` no longer exists (iaam-7q0z), and the
+            // relational journal schema (iaam-05gi) drops the column this
+            // placeholder used to satisfy: `events` carries no
+            // `schema_version` at all any more.
             event.owner.inner().to_string(),
             event.account.inner().to_string(),
             event.kind.discriminant(),

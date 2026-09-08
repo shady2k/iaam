@@ -31,9 +31,24 @@ impl Clock for FixedClock {
 }
 
 fn services() -> AppServices {
-    let adapter = Arc::new(SqliteAdapter::new(
-        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}")),
-    ));
+    services_with(|_store| {})
+}
+
+/// Like [`services`], but lets the caller reach the raw store before it is
+/// wrapped in the adapter.
+///
+/// `Store` (the port `AppServices` exposes) has no method for registering a
+/// custody place — `InstrumentDirectory::record_instrument` has a write side,
+/// `Store::list_custody_places` does not (crates/iaam-app/src/ports.rs). A
+/// custody place a leg names must already exist for the same owner (the
+/// journal's write path checks it), so a fixture that needs one has nowhere
+/// to go through the port and reaches the store directly, the one time this
+/// file needs it.
+fn services_with(setup: impl FnOnce(&SqliteStore)) -> AppServices {
+    let store =
+        SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
+    setup(&store);
+    let adapter = Arc::new(SqliteAdapter::new(store));
     let mut services = AppServices::new(
         adapter.clone(),
         adapter.clone(),
@@ -314,12 +329,34 @@ async fn an_opening_assertion_without_principal_is_not_published_as_a_balance() 
 
 #[tokio::test]
 async fn an_account_with_no_movements_still_appears_without_combining_balances() {
-    let services = services();
     let owner = OwnerId::new_random();
+    let custody = iaam_core::ids::CustodyId::new_random();
+    let services = services_with(|store| {
+        store
+            .upsert_custody_place(&iaam_store::reference::CustodyRecord {
+                id: custody,
+                owner,
+                title: "Shop One Custody".to_owned(),
+                institution: None,
+            })
+            .unwrap_or_else(|error| panic!("insert custody place: {error}"));
+    });
     let card = account(&services, owner, "Card").await;
     let untouched = account(&services, owner, "Untouched").await;
     let contour = contour(&services, owner, &[card, untouched]).await;
     let instrument = InstrumentId::new_random();
+    services
+        .directory
+        .record_instrument(iaam_app::ports::InstrumentUpsert {
+            id: instrument,
+            kind: None,
+            symbol: "TESTBOND".to_owned(),
+            title: "Test Bond".to_owned(),
+            currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("insert instrument: {error}"));
 
     append_operation(
         &services,
@@ -341,7 +378,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
             account: card,
             kind: OperationKind::OpeningPosition {
                 instrument,
-                custody: iaam_core::ids::CustodyId::new_random(),
+                custody,
                 quantity: Dec::one(),
                 cost_basis_minor: None,
                 currency: CurrencyCode::Rub,

@@ -1410,8 +1410,6 @@ CREATE TABLE event_corporate_action (
     principal_returned_per_unit_value    TEXT,
     principal_returned_per_unit_currency TEXT,
     -- partial_redemption, redemption: required Money. conversion: optional.
-    compensation_amount   INTEGER,
-    compensation_currency TEXT,
     -- conversion only.
     fractional      TEXT,
     basis_transfer  TEXT,
@@ -1430,7 +1428,6 @@ CREATE TABLE event_corporate_action (
     allocation_algorithm   INTEGER,
 
     CHECK (action_kind IN ('partial_redemption', 'redemption', 'conversion')),
-    CHECK ((compensation_amount IS NULL) = (compensation_currency IS NULL)),
     CHECK ((principal_returned_per_unit_value IS NULL) = (principal_returned_per_unit_currency IS NULL)),
     CHECK (fractional IS NULL OR fractional IN ('cash_compensated', 'rounded_down', 'not_applicable')),
     CHECK (basis_transfer IS NULL OR basis_transfer IN ('carry_over', 'restart')),
@@ -1449,7 +1446,6 @@ CREATE TABLE event_corporate_action (
             WHEN 'partial_redemption' THEN
                 instrument IS NOT NULL AND quantity IS NOT NULL
                 AND principal_returned_per_unit_value IS NOT NULL
-                AND compensation_amount IS NOT NULL
                 AND allocation_kind IS NOT NULL
                 AND predecessor IS NULL AND successor IS NULL
                 AND quantity_in IS NULL AND quantity_out IS NULL AND ratio IS NULL
@@ -1457,7 +1453,6 @@ CREATE TABLE event_corporate_action (
             WHEN 'redemption' THEN
                 instrument IS NOT NULL AND quantity IS NOT NULL
                 AND principal_returned_per_unit_value IS NOT NULL
-                AND compensation_amount IS NOT NULL
                 AND allocation_kind IS NULL
                 AND predecessor IS NULL AND successor IS NULL
                 AND quantity_in IS NULL AND quantity_out IS NULL AND ratio IS NULL

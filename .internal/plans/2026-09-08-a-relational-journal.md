@@ -257,6 +257,7 @@ fn a_classification_rule_asking_nothing_is_refused_by_the_database() {
   `hydrate` returns events in the order `ids` gave, and issues a fixed number of statements regardless of `ids.len()`.
 
 **Acceptance Criteria:**
+- The module-wide `#![allow(dead_code, unused_imports)]` that Task 4 put on `journal/mod.rs` is narrowed or removed — Task 4 added it because nothing called its code yet, and this task is one of the callers that makes it unnecessary. Whatever remains unused after this task is named individually with a reason, never suppressed wholesale.
 - A page of N events costs a constant number of SQL statements — asserted by counting through a `trace` hook, not by inspection.
 - `hydrate` preserves the caller's order.
 - An id with no row is absent from the result rather than an error; `hydrate_one` returns `None`.

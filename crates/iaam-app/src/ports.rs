@@ -641,6 +641,18 @@ pub struct JournalQuery {
     /// by one, so this narrows to the group a single decision of his reached —
     /// which no other handle here can assemble.
     pub settled_by_rule: Option<ClassificationRuleId>,
+    /// Only facts `event_category_assignments` assigns to this category
+    /// (spec §4.7, §6.1). Mutually exclusive with [`Self::uncategorised`].
+    pub category: Option<CategoryId>,
+    /// Only facts with no row in `event_category_assignments` at all —
+    /// `NotDecomposed`, never a sentinel category. Mutually exclusive with
+    /// [`Self::category`].
+    pub uncategorised: bool,
+    /// Only facts that are a movement whose **far** endpoint is this
+    /// account — a transfer read from one of its own two ends, naming the
+    /// other (spec §6.1). Deliberately narrower than [`Self::touching`],
+    /// which also matches this account as the near side.
+    pub counterparty: Option<AccountId>,
     /// Inclusive lower bound on the effective date.
     pub from: Option<Date>,
     /// Inclusive upper bound on the effective date.

@@ -428,6 +428,9 @@ impl Store for SqliteAdapter {
             import: query.import,
             import_session: query.import_session,
             settled_by_rule: query.settled_by_rule,
+            category: query.category,
+            uncategorised: query.uncategorised,
+            counterparty: query.counterparty,
             from: query.from,
             to: query.to,
             after: query.after.map(|cursor| StoredJournalCursor {

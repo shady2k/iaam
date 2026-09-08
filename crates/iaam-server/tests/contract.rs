@@ -13260,6 +13260,276 @@ async fn the_journal_can_filter_events_touching_the_receiving_account() {
         "the touching result must expose the receiving leg: {touching_page}"
     );
 }
+
+/// `counterparty` (Task 11, spec §6.1) is deliberately narrower than
+/// `touching`: a transfer `Main -> Savings` read from `Main` is returned by
+/// `counterparty=Savings` and not by `counterparty=Main`, and both routes
+/// answer the same question (`iaam-9xku`).
+#[tokio::test]
+async fn the_journal_filters_by_counterparty_narrower_than_touching() {
+    let harness = harness();
+    let savings = create_account(&harness, "Savings").await;
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "counterparty-filter fixture",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "transfer",
+                    "to_account": savings.inner(),
+                    "amount": "1250.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-05-01" },
+                    "idempotency_key": "main-to-savings-counterparty",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, far_side) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?counterparty={}", savings.inner()),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{far_side}");
+    let rows = far_side["rows"].as_array().expect("far side rows");
+    assert_eq!(rows.len(), 1, "{far_side}");
+    assert_eq!(rows[0]["account"], harness.account.inner().to_string());
+
+    let (status, near_side) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/journal/events?counterparty={}",
+                harness.account.inner()
+            ),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{near_side}");
+    assert!(
+        near_side["rows"]
+            .as_array()
+            .expect("near side rows")
+            .is_empty(),
+        "counterparty must not match the near side — that is what distinguishes it from touching: {near_side}"
+    );
+
+    // The aggregate route answers the same question (`iaam-9xku`): a filter
+    // that worked on one route and not the other would make the aggregate
+    // answer a different question from the listing it claims to summarise.
+    let (status, far_aggregate) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/aggregate?counterparty={}", savings.inner()),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{far_aggregate}");
+    assert_eq!(far_aggregate["groups"][0]["events"], 1, "{far_aggregate}");
+
+    let (status, near_aggregate) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/journal/aggregate?counterparty={}",
+                harness.account.inner()
+            ),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{near_aggregate}");
+    assert_eq!(near_aggregate["groups"][0]["events"], 0, "{near_aggregate}");
+}
+
+/// `category` and `uncategorised` (Task 11, spec §4.7, §6.1) reach both
+/// routes identically. `uncategorised` is the absence of a projection row,
+/// never a sentinel category.
+#[tokio::test]
+async fn the_journal_filters_by_category_and_uncategorised() {
+    let harness = harness();
+    let (status, group) = call(
+        &harness.router,
+        post(
+            "/v1/category-groups",
+            &harness.owner_token,
+            &json!({"title": "Spending"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{group}");
+    let group_id = group["id"].as_str().expect("group id").to_owned();
+
+    let (status, category) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group_id, "title": "Groceries"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{category}");
+    let category_id = category["id"].as_str().expect("category id").to_owned();
+
+    let (status, rule) = call(
+        &harness.router,
+        post(
+            "/v1/category-rules",
+            &harness.owner_token,
+            &json!({
+                "matcher": {"description_contains": "Corner Shop"},
+                "category": category_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{rule}");
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "category-filter fixture",
+                "operations": [
+                    {
+                        "account": harness.account.inner(),
+                        "type": "withdrawal",
+                        "amount": "45.00",
+                        "currency": "RUB",
+                        "dates": {"cash_posted": "2026-05-02"},
+                        "description": "Corner Shop",
+                        "idempotency_key": "categorised-row",
+                    },
+                    {
+                        "account": harness.account.inner(),
+                        "type": "withdrawal",
+                        "amount": "12.00",
+                        "currency": "RUB",
+                        "dates": {"cash_posted": "2026-05-03"},
+                        "description": "Nothing Matches",
+                        "idempotency_key": "uncategorised-row",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    let (status, categorised) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/events?category={category_id}"),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{categorised}");
+    let rows = categorised["rows"].as_array().expect("categorised rows");
+    assert_eq!(rows.len(), 1, "{categorised}");
+    assert_eq!(rows[0]["idempotency_key"], "categorised-row");
+
+    let (status, uncategorised) = call(
+        &harness.router,
+        get(
+            "/v1/journal/events?uncategorised=true",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{uncategorised}");
+    let rows = uncategorised["rows"]
+        .as_array()
+        .expect("uncategorised rows");
+    assert_eq!(rows.len(), 1, "{uncategorised}");
+    assert_eq!(rows[0]["idempotency_key"], "uncategorised-row");
+
+    // The aggregate route answers the same question (`iaam-9xku`).
+    let (status, categorised_aggregate) = call(
+        &harness.router,
+        get(
+            &format!("/v1/journal/aggregate?category={category_id}"),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{categorised_aggregate}");
+    assert_eq!(
+        categorised_aggregate["groups"][0]["events"], 1,
+        "{categorised_aggregate}"
+    );
+
+    let (status, uncategorised_aggregate) = call(
+        &harness.router,
+        get(
+            "/v1/journal/aggregate?uncategorised=true",
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{uncategorised_aggregate}");
+    assert_eq!(
+        uncategorised_aggregate["groups"][0]["events"], 1,
+        "{uncategorised_aggregate}"
+    );
+}
+
+/// `category` and `uncategorised` ask opposite questions, and a request
+/// naming both is refused rather than silently answering one of them.
+#[tokio::test]
+async fn category_and_uncategorised_together_are_refused() {
+    let harness = harness();
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!(
+                "/v1/journal/events?category={}&uncategorised=true",
+                Uuid::new_v4()
+            ),
+            Some(&harness.agent_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "uncategorised", "{body}");
+}
+
+/// The OpenAPI document describes `category`, `uncategorised` and
+/// `counterparty` on both routes, and the contract test asserts the exact
+/// names (Task 11).
+#[tokio::test]
+async fn the_journal_openapi_describes_category_and_counterparty_filters() {
+    let harness = harness();
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for path in ["/v1/journal/events", "/v1/journal/aggregate"] {
+        let parameters = spec["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path} parameters: {spec}"));
+        for name in ["category", "uncategorised", "counterparty"] {
+            assert!(
+                parameters.iter().any(|parameter| parameter["name"] == name),
+                "{path} must publish {name}: {spec}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_journal_narrows_by_the_source_the_caller_declared() {
     // The identity of a declared source is derived, never handed out, so the

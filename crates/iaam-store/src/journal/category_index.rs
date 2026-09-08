@@ -235,6 +235,55 @@ pub(crate) fn revision(conn: &Connection, owner: OwnerId) -> Result<i64, StoreEr
     Ok(highest.unwrap_or(0))
 }
 
+/// Whether the owner's projection must be rebuilt before a `category` or
+/// `uncategorised` filter answers a query (Task 11, spec §4.7).
+///
+/// The application layer rebuilds eagerly on every rule create, edit or
+/// retirement (`scenarios/categories.rs`), and `assign_for` keeps a freshly
+/// appended event current as it lands (`write::insert_event_in`). Both of
+/// those are the ordinary path and, by the time a read reaches here, the
+/// projection is usually already right. This exists for the caller that
+/// wrote rules or events straight through the store instead — a bundle
+/// import, a test — and so cannot be trusted to have called either.
+///
+/// Two independent signs of staleness, because neither alone covers the
+/// other's blind spot:
+///
+/// - **Some stored row disagrees with the current revision.** A rule was
+///   edited or retired after that row was computed, and a full rebuild —
+///   never a per-row patch, since one rule's edit can change what a
+///   *different* category's rows decompose to via the priority ladder — is
+///   what fixes it.
+/// - **No stored row exists at all, despite an active rule.** A row's
+///   absence is `NotDecomposed`, and reading a bundle-imported rule set with
+///   zero rows this way is indistinguishable from "genuinely nothing
+///   matches" and "never built past this rule" — so the ambiguous case is
+///   treated as stale. A rebuild here is idempotent: if nothing actually
+///   matches, it recomputes the same empty answer.
+pub(crate) fn is_stale(conn: &Connection, owner: OwnerId) -> Result<bool, StoreError> {
+    let current = revision(conn, owner)?;
+    let mismatched: bool = conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM event_category_assignments
+             WHERE owner = ?1 AND rules_revision != ?2
+         )",
+        params![owner.inner().to_string(), current],
+        |row| row.get(0),
+    )?;
+    if mismatched {
+        return Ok(true);
+    }
+    if current == 0 {
+        return Ok(false);
+    }
+    let has_any_row: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM event_category_assignments WHERE owner = ?1)",
+        params![owner.inner().to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(!has_any_row)
+}
+
 #[cfg(test)]
 mod tests {
     use iaam_core::category::{CategoryMatcher, DescriptionMatchMode};
@@ -645,6 +694,74 @@ mod tests {
         assert_eq!(
             stored_assignment(store.connection(), fixture.owner, unmatched.id),
             CategoryAssignment::NotDecomposed
+        );
+    }
+
+    /// [`is_stale`] catches the two shapes of staleness Task 11's read-time
+    /// check exists for: a rule created straight through the store, bypassing
+    /// the application layer's eager rebuild, first with zero rows to show
+    /// for it and then, once rebuilt, with a stale row surviving a further
+    /// rule edit.
+    #[test]
+    fn is_stale_catches_a_missing_rebuild_and_a_row_left_behind_by_a_rule_edit() {
+        let mut store = SqliteStore::open_in_memory().expect("in-memory store");
+        let fixture = Fixture::new(&mut store);
+
+        assert!(
+            !is_stale(store.connection(), fixture.owner).expect("stale check"),
+            "no active rule and no row is not stale"
+        );
+
+        let event = fixture.event(1, date!(2026 - 03 - 10), Some("Corner Shop"), None);
+        fixture.insert_event(&mut store, &event);
+
+        // Insert the rule directly through the store, the way a bundle import
+        // or a test would — bypassing `scenarios/categories.rs`'s eager
+        // rebuild. The projection now has zero rows despite an active rule
+        // that matches an already-journalled event.
+        let rule = fixture.insert_rule(
+            &mut store,
+            CategoryMatcher::DescriptionContains {
+                text: "Corner Shop".to_owned(),
+            },
+            fixture.groceries,
+            None,
+            None,
+        );
+        assert!(
+            is_stale(store.connection(), fixture.owner).expect("stale check"),
+            "an active rule with zero assignment rows must be treated as stale"
+        );
+
+        {
+            let tx = store.connection_mut().transaction().expect("open tx");
+            rebuild(&tx, fixture.owner).expect("rebuild");
+            tx.commit().expect("commit");
+        }
+        assert!(
+            !is_stale(store.connection(), fixture.owner).expect("stale check"),
+            "freshly rebuilt is not stale"
+        );
+
+        // Edit the rule directly through the store again, leaving the old
+        // row's `rules_revision` behind.
+        store
+            .amend_category_rule(
+                fixture.owner,
+                rule,
+                NewCategoryRule {
+                    matcher: CategoryMatcher::DescriptionContains {
+                        text: "Unrelated Merchant".to_owned(),
+                    },
+                    category: fixture.transport.inner(),
+                    valid_from: None,
+                    valid_to: None,
+                },
+            )
+            .expect("amend rule");
+        assert!(
+            is_stale(store.connection(), fixture.owner).expect("stale check"),
+            "a stored row whose rules_revision disagrees with the current one is stale"
         );
     }
 }

@@ -11,17 +11,20 @@
 //! shares one `effective_date` across several events — the case the cursor
 //! exists for (spec §6, §4.8).
 
+use iaam_core::category::CategoryMatcher;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettlement};
 use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{
-    AccountId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId, SourceId,
+    AccountId, CategoryId, ClassificationRuleId, EventId, ImportId, ImportSessionId, OwnerId,
+    SourceId,
 };
 use iaam_core::money::{CurrencyCode, Money, PostedMinor};
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
+use iaam_store::categories::NewCategoryRule;
 use iaam_store::journal::query::journal_sql;
 use iaam_store::journal::{JournalCursor, JournalQuery};
 use iaam_store::reference::AccountRecord;
@@ -40,11 +43,12 @@ struct Fixture {
     import: ImportId,
     import_session: ImportSessionId,
     rule: ClassificationRuleId,
+    category: CategoryId,
 }
 
 impl Fixture {
     fn build() -> Self {
-        let store = SqliteStore::open_in_memory().expect("in-memory store");
+        let mut store = SqliteStore::open_in_memory().expect("in-memory store");
         let owner = OwnerId::new_random();
         let account = AccountId::new_random();
         let other_account = AccountId::new_random();
@@ -71,6 +75,29 @@ impl Fixture {
             })
             .expect("other account");
 
+        let category_group = store
+            .insert_category_group(owner, "Spending")
+            .expect("category group");
+        let category = CategoryId(
+            store
+                .insert_category(owner, category_group, "Groceries")
+                .expect("category"),
+        );
+        store
+            .insert_category_rule(
+                owner,
+                NewCategoryRule {
+                    matcher: CategoryMatcher::DescriptionContains {
+                        text: "Corner Shop".to_owned(),
+                    },
+                    category: category.inner(),
+                    valid_from: None,
+                    valid_to: None,
+                },
+                None,
+            )
+            .expect("category rule");
+
         let mut fixture = Self {
             store,
             owner,
@@ -81,6 +108,7 @@ impl Fixture {
             import,
             import_session,
             rule,
+            category,
         };
         fixture.populate();
         fixture
@@ -110,6 +138,14 @@ impl Fixture {
     /// A transfer to `other_account` — the only way this fixture's journal
     /// touches an account it did not record the event against.
     fn transfer(&self, sequence: u32, day: time::Date) -> Event {
+        self.transfer_to(self.other_account, sequence, day)
+    }
+
+    /// A transfer to an arbitrary far account, so `event_cash_transfer` holds
+    /// enough distinct account pairs that filtering by exactly one of them is
+    /// a choice worth indexing — a table with one row tells the planner
+    /// nothing about which access path pays off.
+    fn transfer_to(&self, to: AccountId, sequence: u32, day: time::Date) -> Event {
         let amount = Money::new(PostedMinor::new(2_000), CurrencyCode::Rub);
         Event {
             id: EventId::new_random(),
@@ -118,7 +154,7 @@ impl Fixture {
             kind: EventKind::CashTransfer {
                 transfer_id: iaam_core::ids::TransferId::new_random(),
                 from: self.account,
-                to: self.other_account,
+                to,
                 amount,
             },
             dates: EventDates::for_cash(CashPostedDate(day)),
@@ -128,7 +164,7 @@ impl Fixture {
                     self.account,
                     Money::new(PostedMinor::new(-2_000), CurrencyCode::Rub),
                 ),
-                Leg::cash(self.other_account, amount),
+                Leg::cash(to, amount),
             ],
             provenance: Provenance::new(
                 self.source,
@@ -166,6 +202,24 @@ impl Fixture {
         self.append(self.cash_in(9001, far_day, CurrencyCode::Usd));
         self.append(self.transfer(9002, far_day));
 
+        // Nine more transfers to nine other far accounts: one row in
+        // `event_cash_transfer` tells the planner nothing about whether
+        // indexing pays off, since any access path is free on a single row.
+        // With ten distinct far accounts, filtering to exactly one of them
+        // is a genuinely selective predicate.
+        for slot in 0..9u32 {
+            let far_account = AccountId::new_random();
+            self.store
+                .upsert_account(&AccountRecord {
+                    id: far_account,
+                    owner: self.owner,
+                    title: format!("Far {slot}"),
+                    institution: Some("Test Bank".to_owned()),
+                })
+                .expect("far account");
+            self.append(self.transfer_to(far_account, 9100 + slot, far_day));
+        }
+
         let mut other_source_event = self.cash_in(9003, far_day, CurrencyCode::Rub);
         other_source_event.provenance = Provenance::new(
             self.other_source,
@@ -202,6 +256,16 @@ impl Fixture {
             )];
             event
         });
+
+        // A description matching the fixture's own rule, so `assign_for`
+        // (called synchronously on append) gives it a row in `self.category`.
+        // Every plain deposit above carries no description, so it stays
+        // `NotDecomposed` — the background the `uncategorised` filter needs.
+        let mut categorised = self.cash_in(9008, far_day, CurrencyCode::Rub);
+        categorised.provenance = categorised
+            .provenance
+            .with_description("Corner Shop".to_owned());
+        self.append(categorised);
     }
 }
 
@@ -346,6 +410,68 @@ fn the_touching_filter_uses_an_index_and_not_a_scan() {
     let plan = explain(&fixture.store, &query, fixture.owner);
     assert!(plan.contains("event_legs_by_account"), "plan was: {plan}");
     assert!(no_full_scan(&plan), "plan was: {plan}");
+}
+
+/// `counterparty` (Task 11, spec §6.1) is deliberately narrower than
+/// `touching`: it matches only the far endpoint of a transfer, never the
+/// near one, and it is answered by the `event_cash_transfer` indexes rather
+/// than a scan of that table.
+#[test]
+fn the_counterparty_filter_uses_its_index_and_not_a_scan() {
+    let fixture = Fixture::build();
+    let query = JournalQuery {
+        counterparty: Some(fixture.other_account),
+        ..base_query()
+    };
+    let plan = explain(&fixture.store, &query, fixture.owner);
+    assert!(
+        plan.contains("event_cash_transfer_by_from") || plan.contains("event_cash_transfer_by_to"),
+        "plan was: {plan}"
+    );
+    assert!(no_full_scan(&plan), "plan was: {plan}");
+    assert!(
+        !plan.contains("SCAN event_cash_transfer"),
+        "plan was: {plan}"
+    );
+}
+
+/// `category` (Task 11, spec §4.7, §6.1) joins `event_category_assignments`,
+/// answered by `event_category_assignments_by_category`.
+#[test]
+fn the_category_filter_uses_its_index_and_not_a_scan() {
+    let fixture = Fixture::build();
+    let query = JournalQuery {
+        category: Some(fixture.category),
+        ..base_query()
+    };
+    let plan = explain(&fixture.store, &query, fixture.owner);
+    assert!(
+        plan.contains("event_category_assignments_by_category"),
+        "plan was: {plan}"
+    );
+    assert!(no_full_scan(&plan), "plan was: {plan}");
+    assert!(
+        !plan.contains("SCAN event_category_assignments"),
+        "plan was: {plan}"
+    );
+}
+
+/// `uncategorised` is `NOT EXISTS` against the projection's own primary key
+/// `(owner, event)` — never a sentinel category — and must not scan either
+/// table to answer it.
+#[test]
+fn the_uncategorised_filter_does_not_scan_either_table() {
+    let fixture = Fixture::build();
+    let query = JournalQuery {
+        uncategorised: true,
+        ..base_query()
+    };
+    let plan = explain(&fixture.store, &query, fixture.owner);
+    assert!(no_full_scan(&plan), "plan was: {plan}");
+    assert!(
+        !plan.contains("SCAN event_category_assignments"),
+        "plan was: {plan}"
+    );
 }
 
 /// The source-category projection used to be a path extraction of

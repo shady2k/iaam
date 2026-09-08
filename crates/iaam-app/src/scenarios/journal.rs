@@ -26,8 +26,8 @@ use iaam_core::event::leg::{Leg, LegKind};
 use iaam_core::event::provenance::RuleSettlement;
 use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{
-    AccountId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId, InstrumentId,
-    OwnerId, SourceId,
+    AccountId, CategoryId, ClassificationRuleId, CustodyId, EventId, ImportId, ImportSessionId,
+    InstrumentId, OwnerId, SourceId,
 };
 use iaam_core::money::CurrencyCode;
 use iaam_core::money::{CalcMoney, Money, PerUnitAmount, Quantity};
@@ -108,6 +108,23 @@ pub struct JournalReadQuery {
     /// It composes with the rest rather than replacing them: «what this rule did
     /// in March, on that account» is one query.
     pub settled_by_rule: Option<ClassificationRuleId>,
+    /// Only events `event_category_assignments` assigns to this category
+    /// (spec §4.7). The store rebuilds the projection first if it is stale
+    /// against the owner's current rules, so this never quietly answers from
+    /// a rule set he has since changed. Mutually exclusive with
+    /// [`Self::uncategorised`] — a request naming both is refused.
+    pub category: Option<CategoryId>,
+    /// Only events with no row in the category projection at all —
+    /// `NotDecomposed`, the honest absence, never a sentinel category.
+    /// Mutually exclusive with [`Self::category`].
+    pub uncategorised: bool,
+    /// Only events that are a movement whose **far** endpoint is this
+    /// account: a transfer read from one of its own two ends, naming the
+    /// other. Deliberately narrower than [`Self::touching`], which is
+    /// symmetric and also matches this account as the near side — a transfer
+    /// `Main -> Savings` read from `Main` is matched by
+    /// `counterparty = Savings` and not by `counterparty = Main`.
+    pub counterparty: Option<AccountId>,
     /// Whether to include only events that belong to the effective set (`true`)
     /// or only withdrawn and correction-marker events (`false`). Omitted keeps
     /// every event. The page cursor still advances over store rows, so a
@@ -141,6 +158,17 @@ pub struct JournalAggregateQuery {
     pub import: Option<ImportId>,
     pub import_session: Option<ImportSessionId>,
     pub settled_by_rule: Option<ClassificationRuleId>,
+    /// Only events `event_category_assignments` assigns to this category.
+    /// Mutually exclusive with [`Self::uncategorised`]. The same meaning as
+    /// on [`JournalReadQuery::category`] — that pairing is the design of the
+    /// two routes.
+    pub category: Option<CategoryId>,
+    /// Only events with no row in the category projection at all. Mutually
+    /// exclusive with [`Self::category`].
+    pub uncategorised: bool,
+    /// Only events that are a movement whose far endpoint is this account.
+    /// The same meaning as on [`JournalReadQuery::counterparty`].
+    pub counterparty: Option<AccountId>,
     /// Only events of one of these event-family discriminants. An event kind
     /// filter selects the event as a whole; it does not narrow the legs.
     pub kinds: Vec<String>,
@@ -294,6 +322,7 @@ pub async fn read_journal<S: JournalStore + ?Sized>(
     let limit = page_size(query.limit)?;
     let range = date_range(query.from, query.to)?;
     let after = query.after.as_deref().map(parse_cursor).transpose()?;
+    category_filter(query.category, query.uncategorised)?;
     let source = query
         .source
         .as_ref()
@@ -313,6 +342,9 @@ pub async fn read_journal<S: JournalStore + ?Sized>(
                 import: query.import,
                 import_session: query.import_session,
                 settled_by_rule: query.settled_by_rule,
+                category: query.category,
+                uncategorised: query.uncategorised,
+                counterparty: query.counterparty,
                 from: range.0,
                 to: range.1,
                 after,
@@ -379,6 +411,7 @@ pub async fn aggregate_journal<S: JournalStore + ?Sized>(
     query: JournalAggregateQuery,
 ) -> Result<JournalAggregate, AppError> {
     let range = date_range(query.from, query.to)?;
+    category_filter(query.category, query.uncategorised)?;
     let source = query
         .source
         .as_ref()
@@ -398,6 +431,9 @@ pub async fn aggregate_journal<S: JournalStore + ?Sized>(
                 kinds: query.kinds.clone(),
                 currencies: query.currencies.clone(),
                 settled_by_rule: query.settled_by_rule,
+                category: query.category,
+                uncategorised: query.uncategorised,
+                counterparty: query.counterparty,
                 from: range.0,
                 to: range.1,
                 after: None,
@@ -1194,6 +1230,20 @@ fn date_range(
         }
     }
     Ok((from, to))
+}
+
+/// `category` and `uncategorised` ask opposite questions — a category and the
+/// absence of one — and combining them is a request nobody could mean:
+/// naming a category to look for while also asking for rows with none.
+fn category_filter(category: Option<CategoryId>, uncategorised: bool) -> Result<(), AppError> {
+    if category.is_some() && uncategorised {
+        return Err(AppError::Invalid {
+            field: "uncategorised".to_owned(),
+            expected: "not combined with category".to_owned(),
+            actual: "true".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// The channel bound matches the one ingest applies when the same source is

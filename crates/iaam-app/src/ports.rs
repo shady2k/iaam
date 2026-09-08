@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use iaam_core::batch::ControlSection;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
-use iaam_core::event::Event;
 use iaam_core::event::provenance::{ParserVersion, RawHash};
+use iaam_core::event::{Event, Relation};
 use iaam_core::ids::{
     AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId,
     ImportId, ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, PrincipalId, SourceId,
@@ -802,6 +802,16 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         query: JournalQuery,
     ) -> Result<Vec<Event>, AppError>;
+
+    /// The owner's event identifiers and correction relations, without payloads.
+    ///
+    /// This is separate from [`Store::list_journal_events`]: journal rows need
+    /// their payloads, but supersession resolution needs only this projection
+    /// for facts outside the requested page.
+    async fn list_journal_event_relations(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<(iaam_core::ids::EventId, Relation)>, AppError>;
     /// Distinct source-category values recorded for the owner's journal scope.
     ///
     /// The store performs the distinct projection so this does not become a
@@ -1360,6 +1370,42 @@ pub trait Store: Send + Sync {
         session: ImportSessionId,
         state: ImportSessionState,
     ) -> Result<ImportSessionView, AppError>;
+}
+
+/// The journal-facing subset of [`Store`].
+///
+/// Keeping the read scenario on this narrow port makes its two data costs
+/// explicit: page payloads and the relation-only correction projection.
+#[async_trait]
+pub trait JournalStore: Send + Sync {
+    async fn list_journal_events(
+        &self,
+        owner: OwnerId,
+        query: JournalQuery,
+    ) -> Result<Vec<Event>, AppError>;
+
+    async fn list_journal_event_relations(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<(iaam_core::ids::EventId, Relation)>, AppError>;
+}
+
+#[async_trait]
+impl<T: Store + ?Sized> JournalStore for T {
+    async fn list_journal_events(
+        &self,
+        owner: OwnerId,
+        query: JournalQuery,
+    ) -> Result<Vec<Event>, AppError> {
+        Store::list_journal_events(self, owner, query).await
+    }
+
+    async fn list_journal_event_relations(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<(iaam_core::ids::EventId, Relation)>, AppError> {
+        Store::list_journal_event_relations(self, owner).await
+    }
 }
 
 /// Where a session is in its life, in the port's vocabulary.

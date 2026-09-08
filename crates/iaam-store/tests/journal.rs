@@ -16,6 +16,7 @@ use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
 use iaam_store::events::{AccountActivityRecord, Appended, JournalQuery};
 use iaam_store::reference::AccountRecord;
+use rusqlite::params;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -122,6 +123,63 @@ fn an_event_survives_a_write_and_a_read() {
     );
     let loaded = store.load_events(ctx.owner).unwrap();
     assert_eq!(loaded, vec![event]);
+}
+
+#[test]
+fn journal_relation_projection_does_not_decode_event_payloads() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    let ctx = Ctx::new();
+    let original = ctx.deposit(1, 100_000);
+    store
+        .append_event(&original, IdentityScope::Source)
+        .unwrap();
+
+    let mut correction = ctx.deposit(2, 200_000);
+    correction.relation = Relation::Reversal {
+        target: original.id,
+    };
+    store
+        .connection()
+        .execute(
+            "INSERT INTO events (
+                 id, schema_version, owner, account, kind, effective_date, sequence, source_time,
+                 relation_kind, relation_target, source, source_operation_id,
+                 idempotency_key, raw_hash, payload, recorded_at, import_session,
+                 settled_by_rule, settled_by_rule_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                       ?17, ?18, ?19)",
+            params![
+                correction.id.inner().to_string(),
+                correction.schema_version,
+                correction.owner.inner().to_string(),
+                correction.account.inner().to_string(),
+                correction.kind.discriminant(),
+                correction.order.date().to_string(),
+                correction.order.sequence(),
+                None::<String>,
+                "reversal",
+                original.id.inner().to_string(),
+                correction.provenance.source().inner().to_string(),
+                correction.provenance.source_operation_id(),
+                correction.idempotency_key.as_deref(),
+                correction.provenance.raw_hash().as_str(),
+                "not-an-event-payload",
+                "2026-09-08T00:00:00Z",
+                None::<String>,
+                None::<String>,
+                None::<u32>,
+            ],
+        )
+        .unwrap();
+
+    let relations = store.list_journal_event_relations(ctx.owner).unwrap();
+    assert_eq!(
+        relations,
+        vec![
+            (original.id, Relation::None),
+            (correction.id, correction.relation)
+        ]
+    );
 }
 
 /// A page of the journal can be narrowed to the one import session that wrote

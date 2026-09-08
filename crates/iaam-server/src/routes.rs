@@ -5620,8 +5620,9 @@ journal_params!(
         /// start of the journal.
         #[serde(default)]
         pub after: Option<String>,
-        /// Rows per page, 1 to 200. Absent means 50.
+        /// Rows per page, 1 to 1000. Absent means 50.
         #[serde(default)]
+        #[param(minimum = 1, maximum = 1000)]
         pub limit: Option<u32>,
     }
 );

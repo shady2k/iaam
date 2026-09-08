@@ -444,6 +444,18 @@ impl Store for SqliteAdapter {
         .await
     }
 
+    async fn list_journal_event_relations(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Vec<(iaam_core::ids::EventId, iaam_core::event::Relation)>, AppError> {
+        self.blocking(move |store| {
+            store
+                .list_journal_event_relations(owner)
+                .map_err(store_error)
+        })
+        .await
+    }
+
     async fn list_journal_source_categories(
         &self,
         owner: OwnerId,

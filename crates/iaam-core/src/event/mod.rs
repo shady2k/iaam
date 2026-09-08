@@ -77,6 +77,15 @@ pub enum EventValidationError {
     )]
     TransferToSelf { account: AccountId },
     #[error(
+        "event account {account:?} is neither the transfer source {from:?} \
+         nor the transfer destination {to:?}"
+    )]
+    TransferAccountMismatch {
+        account: AccountId,
+        from: AccountId,
+        to: AccountId,
+    },
+    #[error(
         "for {kind} leg does not match the event in field {field}: \
          the event says one thing, the leg another"
     )]
@@ -456,6 +465,15 @@ impl Event {
     }
 
     /// Transfer: two opposing monetary legs on the declared accounts.
+    ///
+    /// Direction, not only balance, is checked: a residual of zero and a
+    /// declared amount that matches the `to` leg are both satisfied by an
+    /// event whose legs run the wrong way — `from` credited, `to` debited,
+    /// the declared amount negative. Since §4.3 stores `from`/`to` as
+    /// semantic roles rather than as leg positions, a fact like that would
+    /// put a lie in the database that no downstream reader could detect.
+    /// So the `from` leg must be negative, the `to` leg positive, and the
+    /// declared amount positive.
     fn validate_transfer(
         &self,
         name: &'static str,
@@ -470,6 +488,16 @@ impl Event {
         // would pass validation.
         if from == to {
             return Err(EventValidationError::TransferToSelf { account: from });
+        }
+        // Also independent of the legs: the event's own account must be one
+        // of the two endpoints it names, or the fact would claim to record a
+        // movement that its own `account` field takes no part in.
+        if self.account != from && self.account != to {
+            return Err(EventValidationError::TransferAccountMismatch {
+                account: self.account,
+                from,
+                to,
+            });
         }
         let legs = self.cash_legs();
         if legs.len() != 2 {
@@ -489,6 +517,33 @@ impl Event {
             .ok_or(EventValidationError::WrongAccount { expected: to })?;
         let out_money = leg_money(name, out)?;
         let in_money = leg_money(name, inn)?;
+        if out_money.currency() != in_money.currency() {
+            return Err(EventValidationError::Money(MoneyError::CurrencyMismatch {
+                left: out_money.currency(),
+                right: in_money.currency(),
+            }));
+        }
+        if out_money.amount().raw() >= 0 {
+            return Err(EventValidationError::WrongSign {
+                kind: name,
+                amount: out_money.amount().raw(),
+                currency: out_money.currency(),
+            });
+        }
+        if in_money.amount().raw() <= 0 {
+            return Err(EventValidationError::WrongSign {
+                kind: name,
+                amount: in_money.amount().raw(),
+                currency: in_money.currency(),
+            });
+        }
+        if declared.amount().raw() <= 0 {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "amount",
+                value: declared.amount().raw().to_string(),
+            });
+        }
         let residual = out_money.try_add(in_money)?;
         if !residual.is_zero() {
             return Err(EventValidationError::TransferResidual {
@@ -2537,6 +2592,161 @@ mod tests {
             from,
         );
         assert!(ev.validate_structure().is_ok());
+    }
+
+    #[test]
+    fn a_transfer_with_its_legs_reversed_is_refused() {
+        // `from` credited, `to` debited, and the declared amount negative:
+        // the residual is zero and the declared amount does equal the `to`
+        // leg, so the loose rule let this through. The direction is inverted.
+        let from = AccountId::new_random();
+        let to = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from,
+                to,
+                amount: rub(-10_000_000),
+            },
+            vec![
+                Leg::cash(from, rub(10_000_000)),
+                Leg::cash(to, rub(-10_000_000)),
+            ],
+            from,
+        );
+        assert!(ev.validate_structure().is_err());
+    }
+
+    #[test]
+    fn the_from_leg_of_a_transfer_must_be_negative() {
+        let from = AccountId::new_random();
+        let to = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from,
+                to,
+                amount: rub(10_000_000),
+            },
+            vec![
+                Leg::cash(from, rub(10_000_000)),
+                Leg::cash(to, rub(10_000_000)),
+            ],
+            from,
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::WrongSign {
+                amount: 10_000_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_to_leg_of_a_transfer_must_be_positive() {
+        let from = AccountId::new_random();
+        let to = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from,
+                to,
+                amount: rub(10_000_000),
+            },
+            vec![
+                Leg::cash(from, rub(-10_000_000)),
+                Leg::cash(to, rub(-10_000_000)),
+            ],
+            from,
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::WrongSign {
+                amount: -10_000_000,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_transfer_amount_declared_negative_is_refused_before_the_residual_check() {
+        let from = AccountId::new_random();
+        let to = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from,
+                to,
+                amount: rub(-10_000_000),
+            },
+            vec![
+                Leg::cash(from, rub(-10_000_000)),
+                Leg::cash(to, rub(10_000_000)),
+            ],
+            from,
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::NonPositive {
+                kind: "cash_transfer",
+                field: "amount",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_two_transfer_legs_must_share_a_currency() {
+        let from = AccountId::new_random();
+        let to = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from,
+                to,
+                amount: rub(10_000_000),
+            },
+            vec![
+                Leg::cash(from, rub(-10_000_000)),
+                Leg::cash(to, usd(10_000_000)),
+            ],
+            from,
+        );
+        assert!(matches!(
+            ev.validate_structure(),
+            Err(EventValidationError::Money(
+                MoneyError::CurrencyMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn the_events_own_account_must_be_one_of_the_transfer_endpoints() {
+        let from = AccountId::new_random();
+        let to = AccountId::new_random();
+        let bystander = AccountId::new_random();
+        let ev = event(
+            EventKind::CashTransfer {
+                transfer_id: TransferId::new_random(),
+                from,
+                to,
+                amount: rub(10_000_000),
+            },
+            vec![
+                Leg::cash(from, rub(-10_000_000)),
+                Leg::cash(to, rub(10_000_000)),
+            ],
+            bystander,
+        );
+        assert_eq!(
+            ev.validate_structure(),
+            Err(EventValidationError::TransferAccountMismatch {
+                account: bystander,
+                from,
+                to,
+            })
+        );
     }
 
     // --- Trade ---

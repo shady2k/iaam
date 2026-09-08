@@ -9,7 +9,11 @@ rust-version.workspace = true
 # Версия рядом с путём обязательна: `cargo deny` считает path-зависимость
 # без версии wildcard-зависимостью, а wildcards = "deny" в deny.toml.
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `trace` is needed only by `journal::read`'s statement-counting test
+# (`Connection::trace_v2`), but rusqlite features are resolved once per
+# build graph, so it is declared on the main dependency rather than
+# duplicated under `[dev-dependencies]`.
+rusqlite = { version = "0.40", features = ["bundled", "trace"] }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

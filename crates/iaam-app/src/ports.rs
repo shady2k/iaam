@@ -529,6 +529,7 @@ pub struct CustodyView {
     pub id: CustodyId,
     pub title: String,
     pub institution: Option<String>,
+    pub origin: iaam_core::custody::CustodyOrigin,
 }
 
 /// Instrument data from an authorised write source.
@@ -544,6 +545,19 @@ pub struct InstrumentUpsert {
     pub title: String,
     pub currencies: iaam_core::instrument::CurrencyRoles,
     pub lineage: Option<iaam_core::instrument::Lineage>,
+}
+
+/// A place of custody from an authorised writer.
+///
+/// The caller assigns the identifier, as it does for an instrument: a broker
+/// channel already holds the handle it must register, and inventing a second
+/// identifier for it would defeat the registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyUpsert {
+    pub id: CustodyId,
+    pub title: String,
+    pub institution: Option<String>,
+    pub origin: iaam_core::custody::CustodyOrigin,
 }
 
 /// Instrument alias from an authorised write source.
@@ -591,6 +605,19 @@ pub trait InstrumentDirectory: Send + Sync {
     async fn record_alias(&self, alias: AliasUpsert) -> Result<(), AppError>;
 
     async fn list_custody_places(&self, owner: OwnerId) -> Result<Vec<CustodyView>, AppError>;
+
+    /// Create or rename a place of custody.
+    ///
+    /// Upsert by identifier and owner-scoped exactly as an account write is: a
+    /// request carrying someone else's identifier changes nothing (§14).
+    ///
+    /// This is the fallback path. The ordinary one is an account's institution
+    /// deriving a place, and a broker channel registering the handle it mints.
+    async fn record_custody_place(
+        &self,
+        owner: OwnerId,
+        place: CustodyUpsert,
+    ) -> Result<CustodyId, AppError>;
 }
 
 /// Position in the journal's total order.

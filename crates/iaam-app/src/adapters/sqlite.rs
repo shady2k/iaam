@@ -15,7 +15,7 @@ use crate::ports::{
     AnswerRule, BrokerAccessView, BrokerChannel, BrokerChannelFactory, BrokerEnvironment,
     BrokerVault, CategoryGroupView, CategoryRuleUpsert, CategoryRuleView, CategoryStore,
     CategoryView, ClassificationRuleStore, ClassificationRuleView, ContourView,
-    ControlAssertionView, CustodyView, DecisionQuery, DecisionRecord, Declared,
+    ControlAssertionView, CustodyUpsert, CustodyView, DecisionQuery, DecisionRecord, Declared,
     DeclinedAccountNameView, DocumentToKeep, ImportObservationView, ImportQuestionView,
     ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
     InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery,
@@ -33,8 +33,8 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{
-    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, ImportId,
-    ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, SourceId,
+    AccountId, CategoryGroupId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId,
+    ImportId, ImportQuestionId, ImportSessionId, InstrumentId, OwnerId, SourceId,
 };
 use iaam_core::instrument::{AliasInterval, AliasNamespace};
 use iaam_core::money::{CurrencyCode, PostedMinor};
@@ -352,6 +352,7 @@ fn custody_view(record: iaam_store::reference::CustodyRecord) -> CustodyView {
         id: record.id,
         title: record.title,
         institution: record.institution,
+        origin: record.origin,
     }
 }
 
@@ -1509,6 +1510,32 @@ impl InstrumentDirectory for SqliteAdapter {
                 .list_custody_places(owner)
                 .map(|rows| rows.into_iter().map(custody_view).collect())
                 .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn record_custody_place(
+        &self,
+        owner: OwnerId,
+        place: CustodyUpsert,
+    ) -> Result<CustodyId, AppError> {
+        let CustodyUpsert {
+            id,
+            title,
+            institution,
+            origin,
+        } = place;
+        self.blocking(move |store| {
+            store
+                .upsert_custody_place(&iaam_store::reference::CustodyRecord {
+                    id,
+                    owner,
+                    title,
+                    institution,
+                    origin,
+                })
+                .map_err(store_error)?;
+            Ok(id)
         })
         .await
     }

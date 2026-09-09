@@ -7,7 +7,8 @@ use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
 use iaam_app::ports::{
-    AccountView, Clock, InstrumentUpsert, OutboundHttp, OutboundResponse, Principal, Scope,
+    AccountView, Clock, CustodyUpsert, InstrumentUpsert, OutboundHttp, OutboundResponse, Principal,
+    Scope,
 };
 use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_app::scenarios::schedule::{SOURCE_ID, ScheduleSyncRequest, sync_schedule};
@@ -26,7 +27,7 @@ use iaam_ingest::{SubmittedOperation, normalize};
 use iaam_store::SqliteStore;
 use iaam_store::market::{Coverage, PriceRow, RunOutcome, SeriesKey};
 use iaam_store::market_source_codes::SourceCodeEntry;
-use iaam_store::reference::{CustodyRecord, InstrumentRecord};
+use iaam_store::reference::InstrumentRecord;
 use time::Duration;
 use time::macros::date;
 use uuid::Uuid;
@@ -113,7 +114,7 @@ impl Clock for FixedClock {
     }
 }
 
-fn fixture_services() -> (
+async fn fixture_services() -> (
     AppServices,
     OwnerId,
     AccountId,
@@ -123,21 +124,7 @@ fn fixture_services() -> (
 ) {
     let owner = OwnerId::new_random();
     let custody = CustodyId::new_random();
-    // The custody place a leg names has no port-level way to be created
-    // (`SqliteAdapter` exposes no `upsert_custody_place`; only reads reach
-    // through `Store`), so it is registered directly on the raw store before
-    // the store is handed to the adapter — the same thing
-    // `iaam-store`'s own write-path fixtures do with `upsert_custody_place`.
     let store = SqliteStore::open_in_memory().expect("application database");
-    store
-        .upsert_custody_place(&CustodyRecord {
-            id: custody,
-            owner,
-            title: "Main Custody".to_owned(),
-            institution: None,
-            origin: CustodyOrigin::Declared,
-        })
-        .expect("custody place created");
     let adapter = Arc::new(SqliteAdapter::new(store));
     let services = AppServices::new(
         adapter.clone(),
@@ -146,6 +133,19 @@ fn fixture_services() -> (
         adapter,
         Arc::new(FixedClock(date!(2026 - 08 - 26))),
     );
+    services
+        .directory
+        .record_custody_place(
+            owner,
+            CustodyUpsert {
+                id: custody,
+                title: "Main Custody".to_owned(),
+                institution: None,
+                origin: CustodyOrigin::Declared,
+            },
+        )
+        .await
+        .expect("custody place created");
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
@@ -363,7 +363,7 @@ async fn a_second_sync_of_an_unchanged_schedule_changes_nothing() {
 
 #[tokio::test]
 async fn resyncing_changes_no_bond_attribute_at_a_fixed_coordinate() {
-    let (services, owner, account, instrument, custody, contour) = fixture_services();
+    let (services, owner, account, instrument, custody, contour) = fixture_services().await;
     seed_report_position(&services, owner, account, instrument, custody, &contour).await;
     seed_market_price(&services, instrument).await;
 

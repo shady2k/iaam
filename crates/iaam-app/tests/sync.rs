@@ -6,8 +6,8 @@ use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
 use iaam_app::ports::{
-    BrokerChannel, BrokerError, Clock, ParsedOperations, PortfolioAsOf, PortfolioSnapshot,
-    Principal, Scope,
+    BrokerChannel, BrokerError, Clock, CustodyUpsert, ParsedOperations, PortfolioAsOf,
+    PortfolioSnapshot, Principal, Scope,
 };
 use iaam_app::scenarios::ingest::append_checked;
 use iaam_app::sync::{AssertionsWithheld, sync_broker};
@@ -95,11 +95,10 @@ fn services_at(today: Date) -> AppServices {
 /// The write path now checks that every account, custody place and
 /// instrument an event or its detail row names exists (and, for accounts and
 /// custody places, belongs to the event's owner) — real foreign keys in the
-/// relational journal. `Store::upsert_account` reaches that through the app
-/// port, but there is no port-level way to create a custody place or an
-/// instrument's directory row before wrapping (`SqliteAdapter` owns its
-/// `SqliteStore` privately once built), so tests that need one seed the raw
-/// store here, before the wrap.
+/// relational journal. Instruments are still seeded on the raw store here,
+/// before the wrap; custody places no longer are — `seed_custody` goes
+/// through `InstrumentDirectory::record_custody_place` on the returned
+/// `AppServices` instead.
 fn services_with(today: Date, setup: impl FnOnce(&SqliteStore)) -> AppServices {
     let store =
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
@@ -125,15 +124,19 @@ fn seed_account(store: &SqliteStore, owner: OwnerId, account: AccountId, title: 
         .unwrap_or_else(|error| panic!("seed account: {error}"));
 }
 
-fn seed_custody(store: &SqliteStore, owner: OwnerId, custody: CustodyId, title: &str) {
-    store
-        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
-            id: custody,
+async fn seed_custody(services: &AppServices, owner: OwnerId, custody: CustodyId, title: &str) {
+    services
+        .directory
+        .record_custody_place(
             owner,
-            title: title.to_owned(),
-            institution: None,
-            origin: CustodyOrigin::Declared,
-        })
+            CustodyUpsert {
+                id: custody,
+                title: title.to_owned(),
+                institution: None,
+                origin: CustodyOrigin::Declared,
+            },
+        )
+        .await
         .unwrap_or_else(|error| panic!("seed custody place: {error}"));
 }
 
@@ -431,9 +434,10 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, first_account, "Main");
         seed_account(store, owner, second_account, "Savings");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let first_operation = trade(first_account, instrument, custody);
     let second_operation = trade(second_account, instrument, custody);
     let make_broker = |operation| FakeBroker {
@@ -494,9 +498,10 @@ async fn api_and_report_trade_is_one_fact_and_independent_cash_is_accepted() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let operation = trade(account, instrument, custody);
     let report_source = SourceId::new_random();
     let existing = report_trade_event(owner, &operation, report_source);
@@ -582,9 +587,10 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let operation = trade(account, instrument, custody);
     let report_source = SourceId::new_random();
     let existing = report_trade_event(owner, &operation, report_source);
@@ -697,9 +703,10 @@ async fn repeating_refused_sync_appends_one_coverage_gap() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let operation = trade(account, instrument, custody);
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
@@ -757,9 +764,10 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let operation = trade(account, instrument, custody);
     let report_source = SourceId::new_random();
     services
@@ -891,9 +899,10 @@ async fn a_fingerprint_match_is_recorded_as_a_possible_duplicate() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let mut operation = trade(account, instrument, custody);
     operation.source_operation_id = None;
     let report_source = SourceId::new_random();
@@ -943,9 +952,10 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let mut operation = trade(account, instrument, custody);
     operation.source_operation_id = Some("REN_NUMBERED-2".to_owned());
     let report_source = SourceId::new_random();
@@ -1001,11 +1011,12 @@ async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
     let fresh_custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
-        seed_custody(store, owner, fresh_custody, "Fresh Custody");
         seed_instrument(store, fresh_instrument, "FRESHSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+    seed_custody(&services, owner, fresh_custody, "Fresh Custody").await;
+
     let duplicate = trade(account, instrument, custody);
     let existing = report_trade_event(owner, &duplicate, SourceId::new_random());
     services
@@ -1060,9 +1071,10 @@ async fn corrected_parser_records_new_assertion_while_document_hash_stays_parser
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let operation = trade(account, instrument, custody);
     let mut broker = api(account, SourceId::new_random(), operation);
 
@@ -1118,9 +1130,10 @@ async fn repeating_sync_is_idempotent_for_operations_and_assertions() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let operation = trade(account, instrument, custody);
     let broker = api(account, SourceId::new_random(), operation);
     let first = sync_broker(
@@ -1158,9 +1171,10 @@ async fn partial_operations_record_control_assertion_and_coverage_gap() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let operation = trade(account, instrument, custody);
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
@@ -1202,11 +1216,12 @@ async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_r
     let second_custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, first_custody, "Custody One");
         seed_instrument(store, first_instrument, "SHAREONE");
-        seed_custody(store, owner, second_custody, "Custody Two");
         seed_instrument(store, second_instrument, "SHARETWO");
     });
+    seed_custody(&services, owner, first_custody, "Custody One").await;
+    seed_custody(&services, owner, second_custody, "Custody Two").await;
+
     let first = trade(account, first_instrument, first_custody);
     let mut second = trade(account, second_instrument, second_custody);
     second.source_operation_id = Some("TRADE-MARCH-2".to_owned());
@@ -1257,9 +1272,10 @@ async fn bond_amortisation_and_unknown_rows_become_quarantined_verdicts() {
         let custody = CustodyId::new_random();
         let services = services_with(date!(2026 - 03 - 31), |store| {
             seed_account(store, owner, account, "Main");
-            seed_custody(store, owner, custody, "Test Custody");
             seed_instrument(store, instrument, "TESTSHARE");
         });
+        seed_custody(&services, owner, custody, "Test Custody").await;
+
         let broker_operation = trade(account, instrument, custody);
         let mut broker = api(account, SourceId::new_random(), broker_operation);
         broker.operations = Ok(ParsedOperations {
@@ -1306,9 +1322,10 @@ async fn a_normalisation_rejection_stops_one_row_and_records_the_other_rows() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let valid = trade(account, instrument, custody);
     let mut invalid = trade(account, InstrumentId::new_random(), CustodyId::new_random());
     invalid.dates = OperationDates::default();
@@ -1471,9 +1488,10 @@ async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let mut broker = api(
         account,
         SourceId::new_random(),
@@ -1543,9 +1561,10 @@ async fn one_broker_failure_does_not_poison_another_sync() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let failed = FakeBroker {
         source: SourceChannel {
             source: SourceId::new_random(),
@@ -1602,14 +1621,16 @@ async fn sync_refuses_account_with_account_derived_trade_custody() {
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
-        seed_custody(
-            store,
-            owner,
-            account_derived_custody,
-            "Account-Derived Custody",
-        );
-        seed_custody(store, owner, custody, "Test Custody");
     });
+    seed_custody(
+        &services,
+        owner,
+        account_derived_custody,
+        "Account-Derived Custody",
+    )
+    .await;
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let old = seeded_trade(
         owner,
         account,
@@ -1660,14 +1681,16 @@ async fn sync_allows_account_when_all_affected_trades_are_reversed() {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, first_instrument, "SHAREONE");
         seed_instrument(store, second_instrument, "SHARETWO");
-        seed_custody(
-            store,
-            owner,
-            account_derived_custody,
-            "Account-Derived Custody",
-        );
-        seed_custody(store, owner, custody, "Test Custody");
     });
+    seed_custody(
+        &services,
+        owner,
+        account_derived_custody,
+        "Account-Derived Custody",
+    )
+    .await;
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let first = seeded_trade(
         owner,
         account,
@@ -1724,14 +1747,16 @@ async fn sync_refusal_counts_only_unreversed_affected_trades() {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, first_instrument, "SHAREONE");
         seed_instrument(store, second_instrument, "SHARETWO");
-        seed_custody(
-            store,
-            owner,
-            account_derived_custody,
-            "Account-Derived Custody",
-        );
-        seed_custody(store, owner, custody, "Test Custody");
     });
+    seed_custody(
+        &services,
+        owner,
+        account_derived_custody,
+        "Account-Derived Custody",
+    )
+    .await;
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let first = seeded_trade(
         owner,
         account,
@@ -1804,14 +1829,16 @@ async fn sync_returns_an_error_when_corrections_do_not_resolve() {
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, affected_instrument, "SHAREONE");
-        seed_custody(
-            store,
-            owner,
-            account_derived_custody,
-            "Account-Derived Custody",
-        );
-        seed_custody(store, owner, custody, "Test Custody");
     });
+    seed_custody(
+        &services,
+        owner,
+        account_derived_custody,
+        "Account-Derived Custody",
+    )
+    .await;
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let affected = seeded_trade(
         owner,
         account,
@@ -1860,9 +1887,10 @@ async fn sync_allows_account_with_only_position_derived_trade_custody() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let broker = api(
         account,
         SourceId::new_random(),
@@ -1897,10 +1925,17 @@ async fn sync_refusal_is_scoped_to_the_affected_account() {
         seed_account(store, owner, affected, "Main");
         seed_account(store, owner, unaffected, "Savings");
         seed_instrument(store, affected_instrument, "SHAREONE");
-        seed_custody(store, owner, affected_custody, "Account-Derived Custody");
         seed_instrument(store, unaffected_instrument, "SHARETWO");
-        seed_custody(store, owner, unaffected_custody, "Test Custody");
     });
+    seed_custody(
+        &services,
+        owner,
+        affected_custody,
+        "Account-Derived Custody",
+    )
+    .await;
+    seed_custody(&services, owner, unaffected_custody, "Test Custody").await;
+
     let old = seeded_trade(
         owner,
         affected,
@@ -1942,14 +1977,16 @@ async fn sync_refuses_account_derived_trade_after_requested_interval() {
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, old_instrument, "SHAREONE");
-        seed_custody(
-            store,
-            owner,
-            account_derived_custody,
-            "Account-Derived Custody",
-        );
-        seed_custody(store, owner, custody, "Test Custody");
     });
+    seed_custody(
+        &services,
+        owner,
+        account_derived_custody,
+        "Account-Derived Custody",
+    )
+    .await;
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let old = seeded_trade(
         owner,
         account,
@@ -1991,9 +2028,10 @@ async fn out_of_interval_trade_fact_is_recorded_without_a_control_assertion() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let mut operation = trade(account, instrument, custody);
     operation.dates.trade = Some(date!(2026 - 04 - 02));
     let broker = api(account, SourceId::new_random(), operation);
@@ -2031,9 +2069,10 @@ async fn a_current_portfolio_is_withheld_when_interval_ends_before_clock_date() 
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 04 - 01), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let broker = api(
         account,
         SourceId::new_random(),
@@ -2085,9 +2124,10 @@ async fn a_current_portfolio_is_withheld_when_interval_contains_today_but_ends_l
     let custody = CustodyId::new_random();
     let services = services_with(today, |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let mut operation = trade(account, instrument, custody);
     operation.dates.trade = Some(today);
     let broker = api(account, SourceId::new_random(), operation);
@@ -2125,9 +2165,10 @@ async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {
     let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 04 - 01), |store| {
         seed_account(store, owner, account, "Main");
-        seed_custody(store, owner, custody, "Test Custody");
         seed_instrument(store, instrument, "TESTSHARE");
     });
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
     let mut broker = api(
         account,
         SourceId::new_random(),

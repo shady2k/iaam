@@ -38,13 +38,10 @@ fn services() -> AppServices {
 /// Like [`services`], but lets the caller reach the raw store before it is
 /// wrapped in the adapter.
 ///
-/// `Store` (the port `AppServices` exposes) has no method for registering a
-/// custody place — `InstrumentDirectory::record_instrument` has a write side,
-/// `Store::list_custody_places` does not (crates/iaam-app/src/ports.rs). A
-/// custody place a leg names must already exist for the same owner (the
-/// journal's write path checks it), so a fixture that needs one has nowhere
-/// to go through the port and reaches the store directly, the one time this
-/// file needs it.
+/// Nothing in this file needs it any more: a custody place a leg names is
+/// registered afterwards, through `InstrumentDirectory::record_custody_place`
+/// on the returned `AppServices`. The parameter stays for symmetry with the
+/// sibling test files that still seed accounts and instruments this way.
 fn services_with(setup: impl FnOnce(&SqliteStore)) -> AppServices {
     let store =
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
@@ -332,17 +329,20 @@ async fn an_opening_assertion_without_principal_is_not_published_as_a_balance() 
 async fn an_account_with_no_movements_still_appears_without_combining_balances() {
     let owner = OwnerId::new_random();
     let custody = iaam_core::ids::CustodyId::new_random();
-    let services = services_with(|store| {
-        store
-            .upsert_custody_place(&iaam_store::reference::CustodyRecord {
+    let services = services();
+    services
+        .directory
+        .record_custody_place(
+            owner,
+            iaam_app::ports::CustodyUpsert {
                 id: custody,
-                owner,
                 title: "Shop One Custody".to_owned(),
                 institution: None,
                 origin: CustodyOrigin::Declared,
-            })
-            .unwrap_or_else(|error| panic!("insert custody place: {error}"));
-    });
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("insert custody place: {error}"));
     let card = account(&services, owner, "Card").await;
     let untouched = account(&services, owner, "Untouched").await;
     let contour = contour(&services, owner, &[card, untouched]).await;

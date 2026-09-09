@@ -22,7 +22,7 @@ use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_store::SqliteStore;
-use iaam_store::reference::{CustodyRecord, InstrumentRecord};
+use iaam_store::reference::InstrumentRecord;
 use rust_decimal::Decimal;
 use time::Date;
 use time::macros::date;
@@ -46,11 +46,11 @@ fn harness() -> Ctx {
 }
 
 /// A harness whose caller gets to seed reference data on the raw store before
-/// it is wrapped: `SqliteAdapter` has no port-level way to create a custody
-/// place or an instrument (only reads reach through `Store`/
-/// `InstrumentDirectory`), so a claim naming a position has to register both
-/// directly on the store, the same way `iaam-store`'s own write-path fixtures
-/// do with `upsert_custody_place`/`upsert_instrument`.
+/// it is wrapped: `SqliteAdapter` has no port-level way to create an
+/// instrument's directory row before wrapping, so an instrument a claim
+/// names is registered directly on the store here. A custody place a claim
+/// names is registered afterwards, through
+/// `InstrumentDirectory::record_custody_place` on `ctx.services`.
 fn harness_with(seed: impl FnOnce(&mut SqliteStore, OwnerId)) -> Ctx {
     let owner = OwnerId::new_random();
     let mut store =
@@ -116,15 +116,19 @@ fn inserted(recorded: &[Recorded]) -> Vec<EventId> {
         .collect()
 }
 
-fn seed_custody(store: &mut SqliteStore, owner: OwnerId, custody: CustodyId, title: &str) {
-    store
-        .upsert_custody_place(&CustodyRecord {
-            id: custody,
-            owner,
-            title: title.to_owned(),
-            institution: None,
-            origin: CustodyOrigin::Declared,
-        })
+async fn seed_custody(ctx: &Ctx, custody: CustodyId, title: &str) {
+    ctx.services
+        .directory
+        .record_custody_place(
+            ctx.principal.owner,
+            iaam_app::ports::CustodyUpsert {
+                id: custody,
+                title: title.to_owned(),
+                institution: None,
+                origin: CustodyOrigin::Declared,
+            },
+        )
+        .await
         .unwrap_or_else(|error| panic!("insert custody place: {error}"));
 }
 
@@ -209,12 +213,14 @@ async fn every_claim_of_one_call_is_recorded() {
     let positions: Vec<(InstrumentId, CustodyId)> = (0..3)
         .map(|_| (InstrumentId::new_random(), CustodyId::new_random()))
         .collect();
-    let ctx = harness_with(|store, owner| {
-        for (index, (instrument, custody)) in positions.iter().enumerate() {
+    let ctx = harness_with(|store, _owner| {
+        for (index, (instrument, _custody)) in positions.iter().enumerate() {
             seed_instrument(store, *instrument, &format!("HOLD{index}"));
-            seed_custody(store, owner, *custody, &format!("Shop {index}"));
         }
     });
+    for (index, (_instrument, custody)) in positions.iter().enumerate() {
+        seed_custody(&ctx, *custody, &format!("Shop {index}")).await;
+    }
     let account = account(&ctx, "Main").await;
 
     let recorded = record_owner_balance(
@@ -262,11 +268,11 @@ async fn two_positions_in_one_call_are_not_one_position() {
     let custody = CustodyId::new_random();
     let first_instrument = InstrumentId::new_random();
     let second_instrument = InstrumentId::new_random();
-    let ctx = harness_with(|store, owner| {
-        seed_custody(store, owner, custody, "Shop One");
+    let ctx = harness_with(|store, _owner| {
         seed_instrument(store, first_instrument, "HOLD1");
         seed_instrument(store, second_instrument, "HOLD2");
     });
+    seed_custody(&ctx, custody, "Shop One").await;
     let account = account(&ctx, "Main").await;
 
     let recorded = record_owner_balance(

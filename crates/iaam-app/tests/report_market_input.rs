@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
-use iaam_app::ports::{AccountView, Clock, InstrumentUpsert, Principal, Scope};
+use iaam_app::ports::{AccountView, Clock, CustodyUpsert, InstrumentUpsert, Principal, Scope};
 use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::custody::CustodyOrigin;
@@ -32,26 +32,36 @@ impl Clock for FixedClock {
 }
 
 /// `custody_places` — like `accounts` — is checked against on every event
-/// write (spec §D6), and the port `Store` trait exposes no way to create one;
-/// only `SqliteStore` itself does. So the custody places these tests need
-/// are seeded on the raw store before it is handed to `SqliteAdapter`, which
-/// takes ownership and offers no way back to it afterwards.
-fn services(custody_places: &[CustodyRecord]) -> AppServices {
+/// write (spec §D6). Each one is registered through
+/// `InstrumentDirectory::record_custody_place`, so it exists before any test
+/// body appends an event naming it.
+async fn services(custody_places: &[CustodyRecord]) -> AppServices {
     let store =
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
-    for place in custody_places {
-        store
-            .upsert_custody_place(place)
-            .unwrap_or_else(|error| panic!("insert custody place: {error}"));
-    }
     let adapter = Arc::new(SqliteAdapter::new(store));
-    AppServices::new(
+    let services = AppServices::new(
         adapter.clone(),
         adapter.clone(),
         adapter.clone(),
         adapter,
         Arc::new(FixedClock(date!(2026 - 08 - 26))),
-    )
+    );
+    for place in custody_places {
+        services
+            .directory
+            .record_custody_place(
+                place.owner,
+                CustodyUpsert {
+                    id: place.id,
+                    title: place.title.clone(),
+                    institution: place.institution.clone(),
+                    origin: place.origin,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("insert custody place: {error}"));
+    }
+    services
 }
 
 fn principal(owner: OwnerId) -> Principal {
@@ -191,7 +201,8 @@ async fn report_values_position_from_market_observation() {
         title: "Main Custody".to_owned(),
         institution: None,
         origin: CustodyOrigin::Declared,
-    }]);
+    }])
+    .await;
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
     services
         .store
@@ -274,7 +285,8 @@ async fn contradictory_price_leaves_only_its_position_uncovered() {
         title: "Main Custody".to_owned(),
         institution: None,
         origin: CustodyOrigin::Declared,
-    }]);
+    }])
+    .await;
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
     services
         .store

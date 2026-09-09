@@ -13,12 +13,12 @@ use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportSessionId, InstrumentId, OwnerId,
     SourceId,
 };
-use iaam_core::instrument::CurrencyRoles;
+use iaam_core::instrument::{CurrencyRoles, Lineage, LineageReason};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_store::SqliteStore;
-use iaam_store::bundle::ImportOutcome;
+use iaam_store::bundle::{Bundle, ImportOutcome};
 use iaam_store::reference::{AccountRecord, CustodyRecord, InstrumentRecord};
 use time::macros::date;
 
@@ -322,15 +322,16 @@ fn bond_event(
 /// The instrument and custody place `every_new_fact`'s events name.
 ///
 /// `event_legs.instrument` and `.custody` are real, undeferred foreign keys
-/// (relational journal design §4.2) — unlike `import_session` or
-/// `settled_by_rule`, they are not exempted because the bundle carries no
-/// reference-data section at all (design §4.1: "events, accounts and
-/// contours and nothing else"). So a fact naming an instrument or custody
-/// place is only writable where that reference data already exists — on
-/// export, because it was registered before the fact was; on import, the
-/// same way an independent market-data sync would have populated it before
-/// a real restore. Both stores this test writes to must register this data
-/// themselves; the bundle does not carry it for them.
+/// (relational journal design §4.2), so a fact naming an instrument or
+/// custody place is only writable where that reference data already exists.
+/// On `source`, that means registering it here, before the fact is appended
+/// — nothing else would populate it. On `restored`, it no longer does: the
+/// bundle now carries a `custody_places` section (every `declared` row and
+/// the `minted` rows the exported events reach) and an `instruments` section
+/// (the closure those events reach, plus `lineage_parent` transitively), and
+/// `import_bundle` writes both before the events loop (design §7). A restore
+/// into a genuinely empty store is exactly what this is meant to prove, so
+/// `register_in` is called on `source` only — never on `restored`.
 struct BondReferenceData {
     instrument: InstrumentId,
     successor: InstrumentId,
@@ -534,11 +535,8 @@ fn a_bundle_round_trip_keeps_the_new_facts() {
 
     let bundle = source.export_bundle(owner).unwrap();
     let mut restored = SqliteStore::open_in_memory().unwrap();
-    // The bundle carries events, accounts and contours and nothing else
-    // (design §4.1) — the target of a restore must already hold the
-    // instrument and custody reference data its events' legs point to, the
-    // way an independent market-data sync would have populated it.
-    refs.register_in(&restored, owner);
+    // Genuinely empty: no pre-seeding. The bundle's own custody_places and
+    // instruments sections are what makes a security leg writable here.
     restored.import_bundle(&bundle).unwrap();
 
     assert_eq!(
@@ -553,6 +551,236 @@ fn a_bundle_round_trip_keeps_the_new_facts() {
             event.kind.discriminant()
         );
     }
+}
+
+// --- Task 7: reference data a restore into an empty database needs -------
+
+/// A store holding exactly one event that names an instrument and a custody
+/// place: `every_new_fact`'s first fact, `PartialRedemption`, references
+/// both through its `CorporateAction` variant regardless of what its legs
+/// carry (`Event::referenced_custodies` matches the variant, not the legs).
+fn a_store_holding_one_security_event() -> (SqliteStore, OwnerId, BondReferenceData) {
+    let (mut store, owner, account, _) = populated();
+    let refs = BondReferenceData::new();
+    refs.register_in(&store, owner);
+    let event = every_new_fact(owner, account, &refs)
+        .into_iter()
+        .next()
+        .expect("every_new_fact always yields at least one fact");
+    store.append_event(&event, IdentityScope::Source).unwrap();
+    (store, owner, refs)
+}
+
+/// A bundle as the previous build produced it: no `custody_places` key, no
+/// `instruments` key. Produced with the version-1 serialiser — `git stash`
+/// on this change, `cargo test -p iaam-store --test _tmp -- --nocapture`
+/// against a throwaway test exporting a store with one invented cash-in
+/// event, paste, `git stash pop`, delete the throwaway test — rather than by
+/// exporting with the current code and deleting the two keys: that would
+/// yield `bundle_version: 2` and a checksum that never matched anything
+/// real, proving only that a version-2 object with empty skipped fields
+/// works, which is not the claim. Every value below — the owner, the
+/// account, the event — is invented; none of it is derived from a real
+/// export.
+const ARCHIVE_WITHOUT_REFERENCE_SECTIONS: &str = r#"{"bundle_version":1,"schema_version":1,"exported_at":"2026-09-09T08:31:19.115697019Z","owner":"1a85610c-2e6f-4844-999a-cad3bf831ef8","events":[{"id":"072ca098-ea42-489e-b8ba-313e5d117b92","owner":"1a85610c-2e6f-4844-999a-cad3bf831ef8","account":"37a8b6c4-3d54-4e07-a9fa-fa9509a03cfd","kind":{"CashIn":{"amount":{"amount":150000,"currency":"Rub"}}},"dates":{"trade":null,"settled":null,"cash_posted":[2026,91],"entitlement":null,"paid":null,"tax_period_override":null},"order":{"date":[2026,91],"source_time":null,"sequence":1},"legs":[{"kind":"Cash","account":"37a8b6c4-3d54-4e07-a9fa-fa9509a03cfd","custody":null,"instrument":null,"money":{"amount":150000,"currency":"Rub"},"quantity":null}],"provenance":{"source":"4351072a-7e4e-44c9-bf5d-3462f8cf30ec","raw_hash":"3333333333333333333333333333333333333333333333333333333333333333","parser_version":"manual/1","source_operation_id":null,"row":null},"relation":"None","confidence":"Known","idempotency_key":null}],"accounts":[{"id":"37a8b6c4-3d54-4e07-a9fa-fa9509a03cfd","title":"Main","institution":"Broker One"}],"contours":[{"contour":"0cc213b0-cf7b-4d45-b6b8-b563ba04e078","version":1,"title":"My portfolio","accounts":["37a8b6c4-3d54-4e07-a9fa-fa9509a03cfd"]}],"checksum":"286f4c4daa9115c206e3dff80b2f6806d2cb7a39ecbc765f144363f0f1bcad5d"}"#;
+
+#[test]
+fn an_archive_written_before_the_reference_sections_still_verifies() {
+    // A bundle as the previous build produced it: no custody_places key, no
+    // instruments key. Deserialising it must yield empty sections, and its
+    // checksum must still match — a section nobody wrote contributes no bytes.
+    let bundle: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert!(bundle.custody_places.is_empty());
+    assert!(bundle.instruments.is_empty());
+    assert_eq!(bundle.checksum, bundle.compute_checksum());
+}
+
+#[test]
+fn a_tampered_custody_place_breaks_the_checksum() {
+    let (store, owner, _refs) = a_store_holding_one_security_event();
+    let mut bundle = store.export_bundle(owner).expect("export");
+    assert!(!bundle.custody_places.is_empty());
+    bundle.custody_places[0].title.push_str(" (substituted)");
+    assert_ne!(bundle.checksum, bundle.compute_checksum());
+}
+
+#[test]
+fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
+    // Instruments are global reference data shared with whatever else the
+    // target database holds. Unlike accounts and custody places, which are
+    // the owner's own and do update on conflict, an archive supplies what is
+    // missing and never overwrites what is there: `ON CONFLICT DO NOTHING`.
+    let (store, owner, refs) = a_store_holding_one_security_event();
+    let bundle = store.export_bundle(owner).expect("export");
+    assert!(
+        bundle
+            .instruments
+            .iter()
+            .any(|section| section.id == refs.instrument.inner())
+    );
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    // A live market sync already knows this instrument, under a title the
+    // archive does not carry.
+    restored
+        .upsert_instrument(&InstrumentRecord {
+            id: refs.instrument,
+            kind: None,
+            symbol: "TESTBOND".to_owned(),
+            title: "Already Known Title".to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .unwrap();
+
+    restored.import_bundle(&bundle).unwrap();
+
+    let after = restored
+        .instrument(refs.instrument)
+        .unwrap()
+        .expect("the instrument is still there");
+    assert_eq!(
+        after.title, "Already Known Title",
+        "the archive's own title for this instrument must not overwrite what \
+         the target already had"
+    );
+}
+
+#[test]
+fn a_security_event_restores_into_a_genuinely_empty_store() {
+    // The claim this task exists to prove: a bundle holding one security
+    // leg restores into a database with no custody place and no instrument
+    // in it at all — no pre-seeding, no market sync first.
+    let (store, owner, _refs) = a_store_holding_one_security_event();
+    let bundle = store.export_bundle(owner).expect("export");
+    assert!(!bundle.custody_places.is_empty());
+    assert!(!bundle.instruments.is_empty());
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let outcome = restored
+        .import_bundle(&bundle)
+        .expect("a bundle carrying its own reference data must restore into an empty store");
+    assert_eq!(
+        outcome,
+        ImportOutcome::Applied {
+            inserted: bundle.events.len(),
+            duplicates: 0
+        }
+    );
+}
+
+#[test]
+fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
+    // instruments.lineage_parent is a self-referencing foreign key: an
+    // instrument whose parent is also in the bundle's instruments section
+    // must be inserted after it. Symbols are chosen so ORDER BY symbol (the
+    // closure query's own order) lists the child before the parent before
+    // the grandparent — the worst order for a single insertion pass, and
+    // exactly the case a naive one-level-of-indirection fix would miss.
+    let (mut store, owner, account, _) = populated();
+    let grandparent = InstrumentId::new_random();
+    let parent = InstrumentId::new_random();
+    let child = InstrumentId::new_random();
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: grandparent,
+            kind: None,
+            symbol: "CCC-GRANDPARENT".to_owned(),
+            title: "Grandparent Bond".to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .unwrap();
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: parent,
+            kind: None,
+            symbol: "BBB-PARENT".to_owned(),
+            title: "Parent Bond".to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: Some(Lineage {
+                parent: grandparent,
+                reason: LineageReason::Replacement,
+            }),
+        })
+        .unwrap();
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: child,
+            kind: None,
+            symbol: "AAA-CHILD".to_owned(),
+            title: "Child Bond".to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: Some(Lineage {
+                parent,
+                reason: LineageReason::Replacement,
+            }),
+        })
+        .unwrap();
+
+    let event = Event {
+        id: EventId::new_random(),
+        owner,
+        account,
+        kind: EventKind::Income {
+            instrument: Some(child),
+            gross: Money::new(PostedMinor::new(1_000), CurrencyCode::Rub),
+            kind: Some(IncomeKind::Coupon),
+        },
+        dates: EventDates::for_cash(CashPostedDate(date!(2026 - 07 - 01))),
+        order: EffectiveOrder::new(date!(2026 - 07 - 01), 30),
+        legs: vec![Leg::cash(
+            account,
+            Money::new(PostedMinor::new(1_000), CurrencyCode::Rub),
+        )],
+        provenance: Provenance::new(
+            SourceId::new_random(),
+            RawHash::parse(&"6".repeat(64)).unwrap(),
+            ParserVersion("manual/1".into()),
+        ),
+        relation: Relation::None,
+        confidence: Confidence::Known,
+        idempotency_key: None,
+    };
+    store.append_event(&event, IdentityScope::Source).unwrap();
+
+    let bundle = store.export_bundle(owner).unwrap();
+    let ids: Vec<uuid::Uuid> = bundle
+        .instruments
+        .iter()
+        .map(|section| section.id)
+        .collect();
+    assert!(ids.contains(&child.inner()), "the named instrument travels");
+    assert!(
+        ids.contains(&parent.inner()),
+        "lineage_parent must be walked one level"
+    );
+    assert!(
+        ids.contains(&grandparent.inner()),
+        "lineage_parent must be walked transitively, not just one level"
+    );
+    assert_eq!(
+        bundle.instruments[0].id,
+        child.inner(),
+        "ORDER BY symbol must put the child ahead of its own parent, or this \
+         test is not exercising the ordering fix at all"
+    );
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("a lineage chain two deep must import regardless of the section's own order");
+    let restored_child = restored
+        .instrument(child)
+        .unwrap()
+        .expect("child instrument restored");
+    let restored_parent = restored
+        .instrument(parent)
+        .unwrap()
+        .expect("parent instrument restored");
+    assert_eq!(restored_child.lineage.map(|l| l.parent), Some(parent));
+    assert_eq!(restored_parent.lineage.map(|l| l.parent), Some(grandparent));
 }
 
 // --- Task 10: relation_target carries no key, deferred or otherwise -------

@@ -29,6 +29,21 @@ all = { level = "deny", priority = -1 }
 # Профиль назван `mutant`, а не `mutants`: cargo кладёт сборку
 # в target/<профиль>, а target/mutants занят отчётами прогона
 # (их выгружает CI как артефакт).
+# Debug information is the bulk of a build here, and nobody reads it.
+#
+# Measured on this workspace: `contract` weighs 363 MB, of which 260 MB is
+# debug sections — 73%. Across some fifty test binaries that is the difference
+# between a 15 GB `target/debug/deps` and roughly 4 GB, and it multiplies by
+# every worktree an agent opens.
+#
+# `line-tables-only` keeps the file and the line in a panic message, which is
+# what a failing test is actually read through. What is lost is stepping
+# through values in a debugger, which nothing in this project's workflow does
+# — the same trade the `mutant` profile below already made, for the same
+# reason.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.mutant]
 inherits = "dev"
 debug = "line-tables-only"

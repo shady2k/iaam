@@ -163,3 +163,6 @@ broker-access: require-database require-broker-key ## Provision a broker credent
 		exit 1; }
 	$(RUN) cargo run -p iaam-bootstrap --release -- broker access add \
 		--broker "$(BROKER)" --environment "$(ENVIRONMENT)"
+.PHONY: sweep
+sweep: ## Reclaim build space: retire merged agent worktrees and stale artifacts
+	@./scripts/sweep-build-space.sh

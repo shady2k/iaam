@@ -238,6 +238,61 @@ impl Event {
         Money::sum(&amounts, currency).map(Some)
     }
 
+    /// Every place of custody this fact names.
+    ///
+    /// One traversal, in the domain, because two readers need the same
+    /// answer and must not drift: the store's ownership check, and the
+    /// synchronisation that registers a handle before appending. The store
+    /// cannot compute this from the legs alone — a `PositionQuantity`
+    /// assertion has none, and a partial redemption's only leg is the cash.
+    ///
+    /// Every arm is spelled out, with no `..` and no `_ =>`. A wildcard here
+    /// would let a new custody field ship unchecked, which is exactly the
+    /// defect this method exists to close.
+    pub fn referenced_custodies(&self) -> impl Iterator<Item = CustodyId> + '_ {
+        use crate::reconciliation::claim::ControlClaim;
+
+        // Collect into a Vec rather than chaining lazily: the match arms
+        // below reach into different shapes, and a reader who has to hold
+        // several iterator adapters in mind to see the coverage cannot check
+        // the coverage.
+        let mut found: Vec<CustodyId> = self.legs.iter().filter_map(|leg| leg.custody).collect();
+        match &self.kind {
+            EventKind::ControlAssertion { claim, .. } => match claim {
+                ControlClaim::PositionQuantity { custody, .. } => found.push(*custody),
+                ControlClaim::CashBalance { .. }
+                | ControlClaim::CashTurnover { .. }
+                | ControlClaim::FeesTotal { .. }
+                | ControlClaim::IncomeTotal { .. }
+                | ControlClaim::TaxWithheldTotal { .. } => {}
+            },
+            EventKind::CorporateAction { action } => match action {
+                CorporateAction::PartialRedemption { custody, .. }
+                | CorporateAction::Redemption { custody, .. }
+                | CorporateAction::Conversion { custody, .. } => found.push(*custody),
+            },
+            EventKind::OfferExercise { action } => match action {
+                OfferExerciseAction::Settled { custody, .. } => found.push(*custody),
+                OfferExerciseAction::Submitted { .. } | OfferExerciseAction::Cancelled { .. } => {}
+            },
+            EventKind::Trade { .. }
+            | EventKind::CashIn { .. }
+            | EventKind::CashOut { .. }
+            | EventKind::Refund { .. }
+            | EventKind::CashTransfer { .. }
+            | EventKind::OwnAccountMovement { .. }
+            | EventKind::UnresolvedOwnAccountMovement { .. }
+            | EventKind::Income { .. }
+            | EventKind::Fee { .. }
+            | EventKind::Tax { .. }
+            | EventKind::OpeningPosition { .. }
+            | EventKind::OpeningCash { .. }
+            | EventKind::Valuation { .. }
+            | EventKind::ImportCoverageGap { .. } => {}
+        }
+        found.into_iter()
+    }
+
     fn legs_of_kind(&self, kind: LegKind) -> Vec<&Leg> {
         self.legs.iter().filter(|l| l.kind == kind).collect()
     }

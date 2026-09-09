@@ -41,6 +41,23 @@ use super::rows::{
 };
 use crate::StoreError;
 
+/// Every `(table, column)` pair in `0001_schema.sql` where a table whose
+/// name starts with `event` declares `REFERENCES custody_places`.
+///
+/// This is the ground truth [`Event::referenced_custodies`] promises to
+/// cover: `event_legs.custody` through the leg loop, the other three
+/// through the exhaustive `match` over the event's detail. Re-exported (via
+/// `crate::journal`) so that `schema_coverage.rs` — an integration test,
+/// outside this crate's own boundary — can hold the schema to it: growing
+/// this list without adding the matching arm is exactly the drift that test
+/// exists to catch.
+pub const CUSTODY_REFERENCE_COLUMNS: &[(&str, &str)] = &[
+    ("event_legs", "custody"),
+    ("event_control_assertion", "custody"),
+    ("event_corporate_action", "custody"),
+    ("event_offer_exercise", "custody"),
+];
+
 /// Inserts `event` as a whole fact: the header, its legs, its family detail
 /// row and any collection rows, inside `tx`.
 ///
@@ -53,7 +70,7 @@ use crate::StoreError;
 /// importer holds one transaction across many events and must not have this
 /// primitive commit or open one of its own.
 pub(crate) fn insert_event_in(tx: &Transaction<'_>, event: &Event) -> Result<(), StoreError> {
-    ensure_legs_are_owned(tx, event)?;
+    ensure_accounts_and_custodies_are_owned(tx, event)?;
 
     let (mut header, legs, detail) = to_rows(event)?;
     // `Event` carries no field for this: it is stamped from the clock at
@@ -85,33 +102,43 @@ pub(crate) fn insert_event_in(tx: &Transaction<'_>, event: &Event) -> Result<(),
     category_index::assign_for(tx, event.owner, std::slice::from_ref(event))
 }
 
-/// Checks that every account and custody place a leg names belongs to the
-/// event's owner (spec §4.2).
+/// Checks that every account a leg names, and every custody place the event
+/// names anywhere, belongs to the event's owner (spec §4.2).
 ///
 /// `events.account` needs no such check: the schema's own composite
 /// `FOREIGN KEY (owner, account) REFERENCES accounts (owner, id)` already
-/// refuses it. A leg's `account` and `custody` carry no `owner` column to
-/// declare that key against — duplicating `owner` onto every child table for
-/// tenant isolation in a single-owner system was not judged worth it — so
-/// this check exists in code or it does not exist at all.
+/// refuses it. A leg's `account` and a custody column carry no `owner`
+/// column to declare that key against — duplicating `owner` onto every
+/// child table for tenant isolation in a single-owner system was not judged
+/// worth it — so this check exists in code or it does not exist at all.
+///
+/// Accounts are still read off the legs: every account this journal moves
+/// money or securities through appears there. Custody places are not — a
+/// control assertion has no legs at all, and a partial redemption's only leg
+/// is the cash — so custody is checked over
+/// [`Event::referenced_custodies`], the one traversal that also reaches the
+/// detail rows.
 ///
 /// An account or custody place that exists but belongs to someone else is
 /// reported the same way as one that does not exist at all: an identifier is
 /// a globally unique UUID, and telling the two apart would tell the caller a
 /// stranger's record exists (the same choice `event_chain` makes for a
 /// correction target belonging to another owner, in `events.rs`).
-fn ensure_legs_are_owned(tx: &Transaction<'_>, event: &Event) -> Result<(), StoreError> {
+fn ensure_accounts_and_custodies_are_owned(
+    tx: &Transaction<'_>,
+    event: &Event,
+) -> Result<(), StoreError> {
     for leg in &event.legs {
         ensure_owned(tx, "accounts", "account", event.owner, leg.account.inner())?;
-        if let Some(custody) = leg.custody {
-            ensure_owned(
-                tx,
-                "custody_places",
-                "custody place",
-                event.owner,
-                custody.inner(),
-            )?;
-        }
+    }
+    for custody in event.referenced_custodies() {
+        ensure_owned(
+            tx,
+            "custody_places",
+            "custody place",
+            event.owner,
+            custody.inner(),
+        )?;
     }
     Ok(())
 }
@@ -488,13 +515,16 @@ mod tests {
 
     use iaam_core::custody::CustodyOrigin;
     use iaam_core::dates::{EffectiveOrder, EventDates};
+    use iaam_core::event::allocation::BasisAllocation;
+    use iaam_core::event::corporate_action::CorporateAction;
     use iaam_core::event::kind::{EventKind, TradeSide};
     use iaam_core::event::leg::Leg;
+    use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId};
     use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
     use iaam_core::event::{Confidence, Event, Relation};
     use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
     use iaam_core::instrument::CurrencyRoles;
-    use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
+    use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
     use iaam_core::numeric::decimal::Dec;
     use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
     use rust_decimal::Decimal;
@@ -840,6 +870,167 @@ mod tests {
         assert_eq!(total_rows_for_event(store.connection(), event.id), 0);
     }
 
+    /// A place of custody in a per-unit amount's currency does not exist —
+    /// this helper only ever needs rubles, so it is inlined rather than
+    /// pulled from the other event modules' own test helpers.
+    fn per_unit(text: &str) -> PerUnitAmount {
+        PerUnitAmount::new(
+            Dec::new(Decimal::from_str_exact(text).unwrap()),
+            CurrencyCode::Rub,
+        )
+    }
+
+    #[test]
+    fn a_control_assertion_naming_a_custody_place_of_another_owner_is_refused() {
+        let mut store = open_store();
+        let fixture = Fixture::new(&store);
+        let foreign_owner = OwnerId::new_random();
+        let foreign_custody = CustodyId::new_random();
+        store
+            .upsert_custody_place(&CustodyRecord {
+                id: foreign_custody,
+                owner: foreign_owner,
+                title: "Shop One Custody".to_owned(),
+                institution: None,
+            })
+            .expect("foreign custody place created");
+
+        // Legless: a `PositionQuantity` assertion carries no leg at all, so
+        // only the detail row names the custody place.
+        let event = fixture.position_assertion(1, fixture.instrument, foreign_custody);
+
+        let tx = store.connection_mut().transaction().expect("open tx");
+        let outcome = insert_event_in(&tx, &event);
+        assert!(
+            matches!(
+                outcome,
+                Err(StoreError::NotFound {
+                    what: "custody place",
+                    ..
+                })
+            ),
+            "expected NotFound, got {outcome:?}"
+        );
+        drop(tx);
+        assert_eq!(total_rows_for_event(store.connection(), event.id), 0);
+    }
+
+    #[test]
+    fn a_corporate_action_naming_a_custody_place_of_another_owner_is_refused() {
+        let mut store = open_store();
+        let fixture = Fixture::new(&store);
+        let foreign_owner = OwnerId::new_random();
+        let foreign_custody = CustodyId::new_random();
+        store
+            .upsert_custody_place(&CustodyRecord {
+                id: foreign_custody,
+                owner: foreign_owner,
+                title: "Shop One Custody".to_owned(),
+                institution: None,
+            })
+            .expect("foreign custody place created");
+
+        // A partial redemption's only leg is the principal, which carries no
+        // custody at all: the custody the fact names lives solely in the
+        // corporate-action detail row.
+        let compensation = rub(2_000_000);
+        let event = fixture.base_event(
+            1,
+            EventKind::CorporateAction {
+                action: CorporateAction::PartialRedemption {
+                    instrument: fixture.instrument,
+                    custody: foreign_custody,
+                    quantity: qty("100"),
+                    principal_returned_per_unit: per_unit("200.0000"),
+                    compensation,
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                    basis_allocation: BasisAllocation::default(),
+                },
+            },
+            vec![Leg::principal(
+                fixture.account,
+                fixture.instrument,
+                compensation,
+            )],
+        );
+
+        let tx = store.connection_mut().transaction().expect("open tx");
+        let outcome = insert_event_in(&tx, &event);
+        assert!(
+            matches!(
+                outcome,
+                Err(StoreError::NotFound {
+                    what: "custody place",
+                    ..
+                })
+            ),
+            "expected NotFound, got {outcome:?}"
+        );
+        drop(tx);
+        assert_eq!(total_rows_for_event(store.connection(), event.id), 0);
+    }
+
+    #[test]
+    fn a_settled_offer_exercise_naming_a_custody_place_of_another_owner_is_refused() {
+        let mut store = open_store();
+        let fixture = Fixture::new(&store);
+        let foreign_owner = OwnerId::new_random();
+        let foreign_custody = CustodyId::new_random();
+        store
+            .upsert_custody_place(&CustodyRecord {
+                id: foreign_custody,
+                owner: foreign_owner,
+                title: "Shop One Custody".to_owned(),
+                institution: None,
+            })
+            .expect("foreign custody place created");
+
+        // The security leg names the fixture's own, owned custody place: the
+        // stranger's place lives only in `OfferExerciseAction::Settled`
+        // itself, which is exactly the field this test exists to cover.
+        let gross = rub(6_000_000);
+        let event = fixture.base_event(
+            1,
+            EventKind::OfferExercise {
+                action: OfferExerciseAction::Settled {
+                    submission: OfferSubmissionId::new_random(),
+                    instrument: fixture.instrument,
+                    custody: foreign_custody,
+                    quantity: qty("6"),
+                    gross,
+                    fee: None,
+                    accrued_interest: None,
+                },
+            },
+            vec![
+                Leg::cash(fixture.account, gross),
+                Leg::security(
+                    fixture.account,
+                    fixture.custody,
+                    fixture.instrument,
+                    qty("-6"),
+                ),
+            ],
+        );
+
+        let tx = store.connection_mut().transaction().expect("open tx");
+        let outcome = insert_event_in(&tx, &event);
+        assert!(
+            matches!(
+                outcome,
+                Err(StoreError::NotFound {
+                    what: "custody place",
+                    ..
+                })
+            ),
+            "expected NotFound, got {outcome:?}"
+        );
+        drop(tx);
+        assert_eq!(total_rows_for_event(store.connection(), event.id), 0);
+    }
+
     // --- Fault injection (spec §5): a genuine SQL failure at each step ---
 
     #[test]
@@ -913,12 +1104,14 @@ mod tests {
     fn a_foreign_key_failure_inserting_the_detail_row_leaves_no_rows() {
         let mut store = open_store();
         let fixture = Fixture::new(&store);
-        // No legs at all for this kind, and the instrument is real — only
-        // the detail row's own custody reference is bad, so header and (the
-        // empty loop of) legs succeed and the failure is at the detail
-        // insert specifically.
-        let unregistered_custody = CustodyId::new_random();
-        let event = fixture.position_assertion(1, fixture.instrument, unregistered_custody);
+        // No legs at all for this kind, and the custody place is real and
+        // owned — the ownership check passes — only the detail row's own
+        // instrument reference is bad. Instruments carry no ownership check
+        // (they are global reference data), so this reaches genuine SQL at
+        // the detail insert specifically, unlike an unregistered custody
+        // place, which the ownership check now refuses before any SQL runs.
+        let unregistered_instrument = InstrumentId::new_random();
+        let event = fixture.position_assertion(1, unregistered_instrument, fixture.custody);
 
         let tx = store.connection_mut().transaction().expect("open tx");
         let outcome = insert_event_in(&tx, &event);

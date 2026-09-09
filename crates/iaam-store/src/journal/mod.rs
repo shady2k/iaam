@@ -44,6 +44,11 @@ pub use chain::{CHAIN_STEP_BACK_SQL, CHAIN_STEP_FORWARD_SQL, RecordedEvent};
 pub use query::{JournalCursor, JournalQuery, SourceCategoryQuery};
 pub(crate) use read::hydrate;
 pub use reads::{AccountActivityRecord, ControlAssertionRecord};
+// `CUSTODY_REFERENCE_COLUMNS` alone, not the rest of `write`'s API: the
+// schema-coverage test (`tests/schema_coverage.rs`) needs the ground-truth
+// list to check the schema against, and nothing else in `write` is meant to
+// be reachable from outside this crate (see the module doc above).
+pub use write::CUSTODY_REFERENCE_COLUMNS;
 
 use crate::{SqliteStore, StoreError};
 

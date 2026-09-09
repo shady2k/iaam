@@ -606,6 +606,48 @@ fn a_tampered_custody_place_breaks_the_checksum() {
 }
 
 #[test]
+fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
+    // Instruments are global reference data shared with whatever else the
+    // target database holds. Unlike accounts and custody places, which are
+    // the owner's own and do update on conflict, an archive supplies what is
+    // missing and never overwrites what is there: `ON CONFLICT DO NOTHING`.
+    let (store, owner, refs) = a_store_holding_one_security_event();
+    let bundle = store.export_bundle(owner).expect("export");
+    assert!(
+        bundle
+            .instruments
+            .iter()
+            .any(|section| section.id == refs.instrument.inner())
+    );
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    // A live market sync already knows this instrument, under a title the
+    // archive does not carry.
+    restored
+        .upsert_instrument(&InstrumentRecord {
+            id: refs.instrument,
+            kind: None,
+            symbol: "TESTBOND".to_owned(),
+            title: "Already Known Title".to_owned(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .unwrap();
+
+    restored.import_bundle(&bundle).unwrap();
+
+    let after = restored
+        .instrument(refs.instrument)
+        .unwrap()
+        .expect("the instrument is still there");
+    assert_eq!(
+        after.title, "Already Known Title",
+        "the archive's own title for this instrument must not overwrite what \
+         the target already had"
+    );
+}
+
+#[test]
 fn a_security_event_restores_into_a_genuinely_empty_store() {
     // The claim this task exists to prove: a bundle holding one security
     // leg restores into a database with no custody place and no instrument

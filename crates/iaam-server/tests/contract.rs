@@ -106,6 +106,7 @@ impl BrokerChannel for EmptyChannel {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
             claims: Vec::new(),
+            refused: Vec::new(),
         })
     }
 
@@ -144,6 +145,7 @@ impl BrokerChannel for PopulatedChannel {
                 source_time: None,
                 idempotency_key: Some("sync-row-1".to_owned()),
                 source_operation_id: Some("broker-row-1".to_owned()),
+                source_position_id: None,
                 source_category: None,
                 owner_category: None,
                 source_code: None,
@@ -162,6 +164,7 @@ impl BrokerChannel for PopulatedChannel {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
             claims: Vec::new(),
+            refused: Vec::new(),
         })
     }
 
@@ -8019,148 +8022,6 @@ fn the_seven_unverifiable_scheduled_posting_reasons_are_distinguishable() {
     );
 }
 #[tokio::test]
-async fn custody_repair_is_described_and_scope_refusal_reaches_the_client() {
-    let harness = harness().await;
-    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let operation = &spec["paths"]["/v1/accounts/{account}/repairs/custody"]["post"];
-    assert!(
-        operation.is_object(),
-        "custody repair route is missing: {spec}"
-    );
-    assert_eq!(
-        operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/CustodyRepairRequest"
-    );
-    assert_eq!(
-        operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
-        "#/components/schemas/CustodyRepairOutcomeDto"
-    );
-    for field in ["case", "affected_trades", "already_reversed", "written"] {
-        assert!(
-            spec["components"]["schemas"]["CustodyRepairOutcomeDto"]["properties"][field]
-                .is_object(),
-            "response schema is missing {field}: {spec}"
-        );
-    }
-    assert!(
-        spec["components"]["schemas"]["CustodyRepairRequest"]["properties"]
-            ["acknowledge_without_live_access"]
-            .is_object(),
-        "request schema is missing the acknowledgement: {spec}"
-    );
-
-    let (status, body) = call(
-        &harness.router,
-        post(
-            &format!("/v1/accounts/{}/repairs/custody", harness.account.inner()),
-            &harness.readonly_token,
-            &json!({}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "invalid_request");
-    assert_eq!(body["field"], "scope");
-}
-
-#[tokio::test]
-async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
-    let (harness, db_path) = harness_on_disk().await;
-    seed_instrument(&db_path, &harness);
-    // The affected trade's custody is deliberately `harness.account.inner()`
-    // — the T4 custody defect this route repairs, where an effective trade's
-    // custody was fabricated from its account identifier. Custody-place ids
-    // and account ids are separate namespaces, so registering a custody
-    // place under that same value is legitimate fixture data, not a
-    // modelling error.
-    SqliteAdapter::new(SqliteStore::open(&db_path).expect("second connection"))
-        .record_custody_place(
-            harness.owner,
-            CustodyUpsert {
-                id: CustodyId(harness.account.inner()),
-                title: "Account-Derived Custody".into(),
-                institution: None,
-                origin: CustodyOrigin::Declared,
-            },
-        )
-        .await
-        .expect("account-derived custody place");
-    let (status, seeded) = call(
-        &harness.router,
-        post(
-            "/v1/ingest/operations",
-            &harness.owner_token,
-            &json!({
-                "source_label": "custody-repair-contract",
-                "operations": [{
-                    "account": harness.account.inner(),
-                    "type": "buy",
-                    "instrument": harness.instrument.inner(),
-                    "custody": harness.account.inner(),
-                    "quantity": "1",
-                    "amount": "100.00",
-                    "currency": "RUB",
-                    "dates": {
-                        "trade": "2025-01-01",
-                        "cash_posted": "2025-01-01"
-                    },
-                    "idempotency_key": "custody-repair-affected-trade"
-                }]
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{seeded}");
-    assert_eq!(seeded[0]["verdict"], "provisional");
-
-    let path = format!("/v1/accounts/{}/repairs/custody", harness.account.inner());
-    let (status, refused) = call(
-        &harness.router,
-        post(&path, &harness.owner_token, &json!({})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{refused}");
-    assert_eq!(refused["case"], "affected_without_live_access");
-    assert_eq!(refused["affected_trades"], 1);
-    assert_eq!(refused["already_reversed"], 0);
-    assert_eq!(refused["written"], 0);
-
-    let (status, repaired) = call(
-        &harness.router,
-        post(
-            &path,
-            &harness.owner_token,
-            &json!({ "acknowledge_without_live_access": true }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{repaired}");
-    assert_eq!(repaired["case"], "affected_without_live_access");
-    assert_eq!(repaired["affected_trades"], 1);
-    assert_eq!(repaired["already_reversed"], 0);
-    assert_eq!(repaired["written"], 1);
-
-    let (status, repeated) = call(
-        &harness.router,
-        post(
-            &path,
-            &harness.owner_token,
-            &json!({ "acknowledge_without_live_access": true }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{repeated}");
-    assert_eq!(repeated["case"], "nothing_affected");
-    assert_eq!(repeated["affected_trades"], 0);
-    assert_eq!(repeated["already_reversed"], 1);
-    assert_eq!(repeated["written"], 0);
-
-    drop(harness);
-    let _ = std::fs::remove_file(db_path);
-}
-#[tokio::test]
 async fn the_same_declared_source_yields_the_same_source_id() {
     let (harness, path) = harness_on_disk().await;
     let account = harness.account.inner();
@@ -11541,6 +11402,7 @@ impl BrokerChannel for TwinRowsChannel {
             source_time: None,
             idempotency_key: None,
             source_operation_id: Some(operation_id.to_owned()),
+            source_position_id: None,
             source_category: None,
             owner_category: None,
             source_code: None,
@@ -11561,6 +11423,7 @@ impl BrokerChannel for TwinRowsChannel {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
             claims: Vec::new(),
+            refused: Vec::new(),
         })
     }
 

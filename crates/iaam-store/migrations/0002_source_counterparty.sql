@@ -1,0 +1,18 @@
+-- The counterparty the source printed on a row, kept as its own column
+-- (`iaam-k3gh.8`).
+--
+-- It is not folded into `source_description`, for the reason `source_kind` and
+-- `source_category` are not folded into it either: a classification rule
+-- matched on one of them must not fire on another. Without this column the
+-- evidence a counterparty rule is written about survives only until the fact is
+-- written, so the same rule that matches a row on the way in can never match it
+-- again on a recomputation.
+--
+-- A second migration rather than a line added to `0001_schema.sql`: that file
+-- is the collapse of the thirty-one migrations that preceded it, and it was
+-- collapsible only because the database was empty at the time. It is not empty
+-- now. A database already at `user_version = 1` skips `0001` entirely, so a
+-- column added there would exist in a database created after this change and in
+-- no database created before it -- and every statement naming the column would
+-- fail on the older file, at run time, on the owner's own journal.
+ALTER TABLE events ADD COLUMN source_counterparty TEXT;

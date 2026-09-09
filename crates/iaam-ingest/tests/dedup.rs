@@ -38,6 +38,7 @@ fn deposit(account: AccountId, minor: i64) -> SubmittedOperation {
         source_code: None,
         source_kind: None,
         description: None,
+        counterparty: None,
     }
 }
 

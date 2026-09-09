@@ -345,12 +345,26 @@ fn the_matcher_kind_check_matches_category_matcher() {
     assert_ddl_lists(&ddl, "category_rules", &values);
 }
 
+/// A database this build creates is at this build's version, whatever that
+/// number has reached.
+///
+/// It used to say «version 1», the number the collapse of the thirty-one
+/// earlier migrations landed on. Written that way the test asserted a constant
+/// rather than a property, and the day an ordinary migration was added
+/// (`iaam-k3gh.8` added the second) it failed for the one reason that is not a
+/// defect: the schema moved on. What must hold is that a fresh database and
+/// this build agree — a database created below this build's version would be
+/// migrated on the next open, and one above it refused.
 #[test]
-fn a_fresh_database_reports_schema_version_one() {
+fn a_fresh_database_reports_this_builds_schema_version() {
     let store = SqliteStore::open_in_memory().expect("open");
     let version: u32 = store
         .connection()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("reading the schema version");
-    assert_eq!(version, 1, "the collapsed schema starts at version 1");
+    assert_eq!(
+        version,
+        iaam_store::schema::SCHEMA_VERSION,
+        "a database this build created must be at this build's version"
+    );
 }

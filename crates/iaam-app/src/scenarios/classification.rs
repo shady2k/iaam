@@ -566,6 +566,25 @@ fn invalid_income_kind(actual: &str) -> AppError {
     .into()
 }
 
+/// The counterparty `Provenance` retained about the row, read back as the
+/// same value a rule condition is matched against.
+///
+/// `iaam-k3gh.8`: at ingestion the counterparty stood on the `ObservedRow` and
+/// a `counterparty_account` rule matched it there; `CashIn`, `CashOut`,
+/// `Refund`, `Fee` and `Income` all carry only an amount, so a `subject()`
+/// that read no further than the event kind rebuilt `Counterparty::Unknown`
+/// for every one of them and the same rule could never match again. `None` on
+/// `Provenance::counterparty` reads back as `Unknown` here for both of the
+/// reasons the field's own doc comment gives: a source that named nobody, and
+/// a fact recorded before this field existed — the two are not told apart,
+/// and neither is reachable by a counterparty rule.
+fn named_counterparty(event: &Event) -> Counterparty {
+    match event.provenance.counterparty() {
+        Some(name) => Counterparty::Named(name.to_owned()),
+        None => Counterparty::Unknown,
+    }
+}
+
 /// One recorded fact, as a standing rule is tested against it.
 ///
 /// `None` for a fact no rule classifies — a trade, a valuation, a corporate
@@ -584,10 +603,10 @@ fn invalid_income_kind(actual: &str) -> AppError {
 pub(crate) fn subject(event: &Event) -> Option<ClassificationSubject> {
     let (counterparty, movement, far_side) = match event.kind {
         EventKind::CashIn { .. } | EventKind::Income { .. } | EventKind::Refund { .. } => {
-            (Counterparty::Unknown, Some(Movement::In), FarSide::Unstated)
+            (named_counterparty(event), Some(Movement::In), FarSide::Unstated)
         }
         EventKind::CashOut { .. } | EventKind::Fee { .. } => (
-            Counterparty::Unknown,
+            named_counterparty(event),
             Some(Movement::Out),
             FarSide::Unstated,
         ),
@@ -612,6 +631,17 @@ pub(crate) fn subject(event: &Event) -> Option<ClassificationSubject> {
         // these events look, to `recompute_plan`, like a row whose source said
         // nothing — and a rule written for exactly such rows would then be
         // proposed against them as a correction.
+        //
+        // **Deliberately still `Unknown`, and not `named_counterparty(event)`.**
+        // The far side of a movement between the owner's own accounts is
+        // `FarSide::OwnAccount` — unnamed by construction, per `FarSide`'s own
+        // doc comment — which is a different claim from a named counterparty
+        // and is already carried into the subject below. A row can in
+        // principle state both, but `iaam-k3gh.8`'s evidence is about
+        // `CashIn`/`CashOut`/`Refund`/`Fee`/`Income`, whose `Counterparty` a
+        // rule condition can otherwise never reach at all; a rule reaching
+        // *back into* an already-settled `OwnAccountMovement` through a named
+        // counterparty is a different claim this fix does not make.
         EventKind::OwnAccountMovement { amount } => (
             Counterparty::Unknown,
             Some(if amount.amount().raw() < 0 {
@@ -768,6 +798,83 @@ mod tests {
             .matcher
             .matches(&subject),
             "a rule naming the description must match on recompute"
+        );
+    }
+
+    #[test]
+    fn the_rebuilt_subject_carries_the_counterparty_the_source_printed() {
+        // `iaam-k3gh.8`: at ingestion the counterparty stood on the
+        // `ObservedRow` and a `counterparty_account` rule matched it; on
+        // recompute `subject()` rebuilt from the recorded `Event` alone, and a
+        // `CashOut` carries no counterparty of its own — so the same rule
+        // could never match again, silently, however long it had stood.
+        let account = AccountId::new_random();
+        let event = cash_out_of(account, provenance_of().with_counterparty("Shop One"));
+
+        let subject = subject(&event).expect("a cash outflow is a classification subject");
+
+        assert_eq!(
+            subject.counterparty,
+            Counterparty::Named("Shop One".to_owned())
+        );
+        assert!(
+            rule_matching(RuleMatcher {
+                counterparty_account: Some("Shop One".to_owned()),
+                description_contains: None,
+                kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+                movement: None,
+            })
+            .matcher
+            .matches(&subject),
+            "a rule naming the counterparty must match on recompute"
+        );
+    }
+
+    /// Reproduces the defect end to end, through `recompute_plan` itself
+    /// rather than through `RuleMatcher::matches` alone: a `CashOut` recorded
+    /// from a source that named a counterparty, an active rule whose
+    /// condition names that same counterparty, and the plan the rule set
+    /// implies over the recorded journal.
+    ///
+    /// Before `Provenance` retained the counterparty, this returned an empty
+    /// plan — not a rejection, not a question, nothing at all — because
+    /// `subject()` rebuilt `Counterparty::Unknown` for the event, `classify`
+    /// therefore answered `Ambiguous`, and `recompute_plan`'s `let ... else`
+    /// dropped the row without a word.
+    #[test]
+    fn a_rule_written_after_the_fact_reaches_a_cash_out_naming_its_counterparty() {
+        let account = AccountId::new_random();
+        let event = cash_out_of(account, provenance_of().with_counterparty("Shop One"));
+        let events = vec![event.clone()];
+        let subjects: BTreeMap<EventId, ClassificationSubject> = events
+            .iter()
+            .filter_map(|event| subject(event).map(|subject| (event.id, subject)))
+            .collect();
+        let rules = vec![rule_matching(RuleMatcher {
+            counterparty_account: Some("Shop One".to_owned()),
+            description_contains: None,
+            kind: None,
+            source_category: None,
+            owner_category: None,
+            source_code: None,
+            movement: None,
+        })];
+
+        let plan = recompute_plan(&events, &subjects, &rules).expect("plan builds");
+
+        assert_eq!(
+            plan,
+            vec![Correction {
+                target: event.id,
+                was: Classification::ExternalFlow,
+                becomes: Classification::Fee {
+                    origin: FeeOrigin::AccountMaintenance
+                },
+            }],
+            "a rule written after the row was recorded must still reach it"
         );
     }
 

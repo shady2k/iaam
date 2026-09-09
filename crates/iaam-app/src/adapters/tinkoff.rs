@@ -563,6 +563,9 @@ fn operation_to_submitted(
         source_code: None,
         source_kind: None,
         description: None,
+        // The gateway names no counterparty on a broker/exchange operation:
+        // this channel has never had one to carry.
+        counterparty: None,
     })
 }
 
@@ -814,6 +817,9 @@ fn trade_operations(
                 source_code: None,
                 source_kind: None,
                 description: None,
+                // A trade fill, not a cash statement row: the gateway names
+                // no counterparty here either.
+                counterparty: None,
             })
         })
         .collect()

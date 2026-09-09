@@ -122,6 +122,7 @@ fn load_headers(
             owner_category: row.get("owner_category")?,
             source_code: row.get("source_code")?,
             source_description: row.get("source_description")?,
+            source_counterparty: row.get("source_counterparty")?,
             import: row.get("import")?,
             import_session: row.get("import_session")?,
             declared_by: row.get("declared_by")?,
@@ -746,13 +747,13 @@ mod tests {
                 source_kind, owner_category, source_code, source_description, import,
                 import_session, declared_by, rule_settlement, settled_by_rule,
                 settled_by_rule_version, row_document, row_sheet, row_number,
-                source_position_id
+                source_position_id, source_counterparty
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                 ?13, ?14, ?15, ?16, ?17, ?18,
                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
                 ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36,
-                ?37
+                ?37, ?38
             )",
             params![
                 header.id,
@@ -792,6 +793,7 @@ mod tests {
                 header.row_sheet,
                 header.row_number,
                 header.source_position_id,
+                header.source_counterparty,
             ],
         )
         .expect("insert event header");
@@ -1239,6 +1241,31 @@ mod tests {
         let found = hydrate_one(store.connection(), ids[1]).expect("hydrate_one");
 
         assert_eq!(found.map(|event| event.id), Some(ids[1]));
+    }
+
+    #[test]
+    fn hydrate_reads_back_the_counterparty_the_source_printed() {
+        // `iaam-k3gh.8`: a field that serialises through serde but was never
+        // added to the `INSERT`/`SELECT` text round-trips in a unit test and
+        // is silently dropped by every real write. This proves the column
+        // itself, not just `Provenance`'s own `Serialize`/`Deserialize`.
+        let store = SqliteStore::open_in_memory().expect("in-memory store");
+        let fixture = Fixture::new(&store);
+        let mut event = fixture.event(
+            1,
+            EventKind::CashOut {
+                amount: rub(-50_000),
+            },
+            vec![Leg::cash(fixture.account, rub(-50_000))],
+        );
+        event.provenance = event.provenance.with_counterparty("Shop One");
+
+        insert(store.connection(), &event);
+
+        let reconstructed = hydrate_one(store.connection(), event.id)
+            .expect("hydrate_one")
+            .expect("event exists");
+        assert_eq!(reconstructed.provenance.counterparty(), Some("Shop One"));
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub(crate) struct EventRow {
     pub owner_category: Option<String>,
     pub source_code: Option<String>,
     pub source_description: Option<String>,
+    pub source_counterparty: Option<String>,
     pub import: Option<String>,
     pub import_session: Option<String>,
     pub declared_by: Option<String>,

@@ -181,6 +181,7 @@ fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> Su
         source_code: None,
         source_kind: None,
         description: None,
+        counterparty: None,
     }
 }
 
@@ -215,6 +216,7 @@ fn trade_without_custody(account: AccountId, instrument: InstrumentId) -> Submit
         source_code: None,
         source_kind: None,
         description: None,
+        counterparty: None,
     }
 }
 

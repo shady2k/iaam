@@ -13800,6 +13800,7 @@ mod tests {
             source_code: None,
             source_kind: source_kind.map(str::to_owned),
             description: None,
+            counterparty: None,
         };
         normalize(
             &operation,
@@ -14271,6 +14272,7 @@ mod recorded_identities {
             source_code: None,
             source_kind: None,
             description: None,
+            counterparty: None,
         };
         normalize(
             &operation,

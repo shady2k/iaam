@@ -144,6 +144,7 @@ fn cash_operation(account: AccountId, kind: OperationKind, on: Date) -> Submitte
         source_code: None,
         source_kind: None,
         description: None,
+        counterparty: None,
     }
 }
 
@@ -402,6 +403,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
             source_code: None,
             source_kind: None,
             description: None,
+            counterparty: None,
         },
     )
     .await;

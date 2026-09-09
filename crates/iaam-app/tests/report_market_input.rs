@@ -104,6 +104,7 @@ async fn seed_position(
         source_code: None,
         source_kind: None,
         description: None,
+        counterparty: None,
     };
     let event = normalize(
         &operation,

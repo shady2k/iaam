@@ -237,6 +237,28 @@ pub struct Provenance {
     /// already recorded do not carry this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// The counterparty the source printed on the row, verbatim.
+    ///
+    /// Evidence about what the source said, exactly like [`Self::description`]
+    /// beside it, and never rewritten. It is what a `RuleMatcher::counterparty_account`
+    /// condition is matched against — a rule the owner writes about a named
+    /// party, not about the free text of a description — and it used to be the
+    /// one thing this type retained about a row and then dropped again: at
+    /// ingestion the counterparty stood on the `ObservedRow` and a rule of his
+    /// matched it; on recompute the same row was rebuilt from the recorded
+    /// `Event`, which carries no counterparty for a `CashOut` or a `CashIn`
+    /// (`iaam-k3gh.8`), and the same rule could never match again.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and events
+    /// already recorded do not carry this field. `None` therefore means «not
+    /// recorded», which covers both a source that named no counterparty and
+    /// every fact written before this field existed — a fact from before this
+    /// change is not retroactively fixed by it: it still carries no
+    /// counterparty, so a `counterparty_account` rule still cannot reach it,
+    /// exactly as it could not before. Only a fact recorded from now on carries
+    /// the evidence a rule like that needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    counterparty: Option<String>,
     /// The import this row arrived in, when the caller named one.
     ///
     /// Beside the source rather than inside it. The source is what
@@ -344,6 +366,7 @@ impl Provenance {
             owner_category: None,
             source_code: None,
             description: None,
+            counterparty: None,
             import: None,
             declared_by: None,
             import_session: None,
@@ -407,6 +430,17 @@ impl Provenance {
     #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// Retain the counterparty the source printed on the row.
+    ///
+    /// A statement about the row, applied the same way [`Self::with_description`]
+    /// beside it is: never rewritten, and read back by the same rebuilt subject
+    /// that reads the description back — see [`Self::counterparty`].
+    #[must_use]
+    pub fn with_counterparty(mut self, counterparty: impl Into<String>) -> Self {
+        self.counterparty = Some(counterparty.into());
         self
     }
 
@@ -575,6 +609,17 @@ impl Provenance {
     #[must_use]
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
+    }
+
+    /// The counterparty the source printed on the row, when it named one.
+    ///
+    /// `None` is «not recorded», not «the source named nobody» — see the
+    /// field's own doc comment for why the two cannot be told apart from this
+    /// alone, and why a fact recorded before this field existed reads the same
+    /// way a fact whose source truly said nothing does.
+    #[must_use]
+    pub fn counterparty(&self) -> Option<&str> {
+        self.counterparty.as_deref()
     }
 
     #[must_use]
@@ -888,5 +933,51 @@ mod tests {
         let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
 
         assert_eq!(provenance.description(), None);
+    }
+
+    #[test]
+    fn a_counterparty_is_kept_and_read_back() {
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_counterparty("Shop One");
+
+        assert_eq!(provenance.counterparty(), Some("Shop One"));
+    }
+
+    #[test]
+    fn provenance_recorded_before_the_counterparty_existed_still_reads() {
+        // The load-bearing half: a fact written before this field existed must
+        // read `None`, and that `None` must never be told apart from a source
+        // that truly named nobody — a rule written on the counterparty reaches
+        // neither, which is the honest answer for both.
+        let stored = r#"{"source":"00000000-0000-0000-0000-000000000000",
+        "raw_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "parser_version":"test"}"#;
+        let provenance: Provenance = serde_json::from_str(stored).expect("older provenance");
+
+        assert_eq!(provenance.counterparty(), None);
+    }
+
+    #[test]
+    fn a_counterparty_survives_the_wire_beside_the_description() {
+        // Two different facts in two different fields, exactly like
+        // `source_category` and `source_kind` beside them: a row can state
+        // both, and neither is folded into the other's slot.
+        let provenance = Provenance::new(
+            SourceId::new_random(),
+            hash("a"),
+            ParserVersion("test".to_owned()),
+        )
+        .with_description("Monthly subscription")
+        .with_counterparty("Shop One");
+
+        let stored = serde_json::to_string(&provenance).expect("provenance encodes");
+        let read: Provenance = serde_json::from_str(&stored).expect("provenance decodes");
+
+        assert_eq!(read.description(), Some("Monthly subscription"));
+        assert_eq!(read.counterparty(), Some("Shop One"));
     }
 }

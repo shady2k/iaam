@@ -151,6 +151,7 @@ impl BrokerChannel for PopulatedChannel {
                 source_code: None,
                 source_kind: None,
                 description: None,
+                counterparty: None,
             }],
             quarantined: Vec::new(),
         })
@@ -11408,6 +11409,7 @@ impl BrokerChannel for TwinRowsChannel {
             source_code: None,
             source_kind: None,
             description: None,
+            counterparty: None,
         };
         Ok(ParsedOperations {
             accepted: vec![row("twin-a"), row("twin-b")],
@@ -32381,4 +32383,136 @@ async fn instrument_filter_rejects_unknown_query_keys() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+/// The action queue's tagged unions carry a `discriminator` on `type` in the
+/// generated document, not only `type` as a per-variant required property.
+///
+/// A field agent's client took `target["request"]` unconditionally and died
+/// with `KeyError` on a `provide_control_assertion` item whose target was
+/// `options`, not `operation` (`iaam-k3gh.5`). At the Rust level the two
+/// shapes are already distinguished — both `ActionTargetDto` and
+/// `ActionSubjectDto` are `#[serde(tag = "type", ...)]` — but a client reads
+/// the published OpenAPI document, not the source, and a bare `oneOf` with no
+/// `discriminator` is a schema no generator can safely turn into a reader
+/// that branches before it indexes. This test pins the fix
+/// (`add_queue_discriminators` in `openapi.rs`) against a utoipa upgrade that
+/// might otherwise silently regenerate the bare form: utoipa 5.5.0 itself has
+/// no macro attribute that writes a discriminator for an internally tagged
+/// enum whose variants carry named fields, which both of these are.
+#[tokio::test]
+async fn the_action_queues_tagged_unions_publish_a_discriminator() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for schema_name in ["ActionTargetDto", "ActionSubjectDto"] {
+        let schema = &spec["components"]["schemas"][schema_name];
+        assert_eq!(
+            schema["discriminator"]["propertyName"], "type",
+            "{schema_name} must publish a discriminator on `type`: {schema}"
+        );
+
+        let variants = schema["oneOf"].as_array().unwrap_or_else(|| {
+            panic!("{schema_name} must be a `oneOf`: {schema}");
+        });
+        assert!(
+            !variants.is_empty(),
+            "{schema_name} has no variants: {schema}"
+        );
+        for variant in variants {
+            let required = variant["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{schema_name} variant has no `required`: {variant}"));
+            assert!(
+                required.iter().any(|field| field == "type"),
+                "{schema_name} variant must require `type`: {variant}"
+            );
+            let tag_values = variant["properties"]["type"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("{schema_name} variant's `type` must be a fixed enum: {variant}")
+                });
+            assert_eq!(
+                tag_values.len(),
+                1,
+                "{schema_name} variant's `type` must carry exactly one value: {variant}"
+            );
+        }
+    }
+}
+
+/// Each list-wrapper's own published schema names the field its rows sit in.
+///
+/// A field agent assumed `GET /v1/journal/events` answered `{"events": […]}`
+/// when it answers `{"rows": […], "next": …}` (`iaam-k3gh.12`): an absent key
+/// and an empty list are the same value in most client languages, so the wrong
+/// read looked exactly like "he has none of these" rather than "wrong key".
+/// `docs/api/conventions.md` §1-§2 states the rule; this pins its other half —
+/// that the field carrying the rows is named in the generated document a
+/// client actually reads, not only in prose a human might never open.
+#[tokio::test]
+async fn each_list_wrapper_names_its_row_field_in_the_schema() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let schemas = &spec["components"]["schemas"];
+
+    // Every field below is the one carrying the rows for its wrapper (§2 of
+    // conventions.md), and each must publish its own, non-empty description.
+    let row_fields: &[(&str, &str)] = &[
+        ("JournalPageDto", "rows"),
+        ("MarketPriceSeriesDto", "rows"),
+        ("MarketFxSeriesDto", "rows"),
+        ("MarketKeyRateSeriesDto", "rows"),
+        ("ReconciliationResponseDto", "statuses"),
+        ("ReconciliationResponseDto", "gaps"),
+        ("BalancesReportDto", "accounts"),
+        ("BalancesReportSeriesDto", "reports"),
+        ("AssetSnapshotSeriesDto", "reports"),
+        ("MoneyFlowReportDto", "currencies"),
+        ("SyncOutcomeDto", "recorded"),
+        ("DocumentDto", "rows"),
+        ("JournalAggregateDto", "groups"),
+        ("CategoryRuleImpactDto", "rows"),
+        ("RecomputePlanDto", "corrections"),
+    ];
+    for (schema_name, field) in row_fields {
+        let schema = &schemas[schema_name];
+        let description = schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("{schema_name}.{field} has no field-level description: {schema}")
+            });
+        assert!(
+            !description.is_empty(),
+            "{schema_name}.{field} description is empty"
+        );
+    }
+
+    // Wrappers whose struct-level description carries the naming instead,
+    // because it explains the field beside a fact that could not sit on a row.
+    for schema_name in [
+        "ActionsResponseDto",
+        "InstrumentListDto",
+        "JournalPageDto",
+        "MoneyFlowReportDto",
+        "BalancesReportDto",
+        "BalancesReportSeriesDto",
+        "AssetSnapshotSeriesDto",
+        "SyncOutcomeDto",
+        "DocumentDto",
+        "JournalAggregateDto",
+        "SourceProfileCatalogueDto",
+    ] {
+        let schema = &schemas[schema_name];
+        let description = schema["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{schema_name} has no schema-level description: {schema}"));
+        assert!(
+            !description.is_empty(),
+            "{schema_name} schema-level description is empty"
+        );
+    }
 }

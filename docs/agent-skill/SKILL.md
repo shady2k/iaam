@@ -142,6 +142,58 @@ If the API refused to compute a quantity, the answer says exactly that: the
 system cannot compute it, and here is why. Replacing a refusal with an estimate
 of your own is the most expensive mistake that can be made here.
 
+## The shape of a list answer, and the one way it fails silently
+
+A route that hands back many of one thing does not always hand them back as a
+bare array, and assuming it does is how this rule gets broken without you
+noticing: read a list's rows under a name the route does not use and you do not
+get an error, you get an absent key — which in most languages you would write
+this in is the same value as an empty list. What you see reads as «he has none
+of these», and it is not a fact about his money at all. It is a fact about which
+key you read. Check the schema before you trust a silence.
+
+Most lists are the array itself, nothing wrapping it: his accounts, his
+categories and their groups, his classification and category rule histories, the
+source-category words he has used, his tokens, his broker access entries, his
+contours, his import sessions, his recorded decisions, and every verdict a batch
+call hands back — one per row he submitted, in his own order.
+
+A list comes back wrapped in an object exactly where the answer has something
+true of the whole list that no single row can say — a page to resume from, how
+far a series reaches, which of several things it covers. The rows then sit in a
+named field beside that fact, never at the top level:
+
+- the journal, read a page at a time — `rows`, beside the point to resume the
+  next page from, which is absent only on the last one;
+- an operation's correction history — `steps`, beside the fact that counts now;
+- prices, exchange rates and key-rate intervals — `rows` on each, beside how far
+  that series is known;
+- the reconciliation answer — `statuses`, beside the coverage gaps and the
+  actions it proposes, neither of which is a property of a status;
+- candidate transfer pairings — `candidates`, beside the movements nothing was
+  proposed against;
+- an account's transfer partners — `partners`, beside whether the owner has
+  ruled at all, which an empty list cannot say on its own;
+- an import session's contents — `questions`, beside the session's own row
+  count;
+- the outstanding-work queue — `items`, beside which of the four reports each
+  one stands between him and;
+- the reference catalogue, read by identifier — `instruments`, beside the ones
+  not found;
+- the profile catalogue — `profiles`, beside the ones this instance would not
+  read and why;
+- the balances report, and the report series that repeats it per requested
+  date — `accounts` on the one report, `reports` on the series;
+- the asset-snapshot series — `reports`, one snapshot per requested date;
+- the money-flow report — `currencies`;
+- a document read into a session, and the outcome of committing one — `rows`
+  on both.
+
+Look the field up by name from the published schema every time — never assume
+`events`, `data`, or the word the route uses for what it lists in prose. Getting
+that one field right is the only check there is: nothing downstream notices when
+you read the wrong one, and the mistake looks exactly like the truth.
+
 ## The agent is an external client
 
 The agent is not part of the system and has no access to its storage. It does not

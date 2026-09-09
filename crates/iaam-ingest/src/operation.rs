@@ -389,6 +389,22 @@ pub struct SubmittedOperation {
     /// Description or counterparty printed by the source, retained verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The counterparty the source printed on the row, verbatim, when it
+    /// named one.
+    ///
+    /// A different fact from [`Self::description`] beside it, and never
+    /// folded into that slot: this is the field a `RuleMatcher::counterparty_account`
+    /// condition is matched against — see [`Provenance::counterparty`] — and
+    /// it used to have nowhere to go once an observation resolved into an
+    /// operation, which is `iaam-k3gh.8`: a rule the owner wrote about a named
+    /// party matched at intake and could never match again on recompute.
+    ///
+    /// `#[serde(default)]` because a row stored by an earlier build carries no
+    /// such field, and `None` is what such a row meant — it is also what a row
+    /// whose source truly named nobody means, and the two cannot be told
+    /// apart from here, which is [`Provenance::counterparty`]'s own point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterparty: Option<String>,
 }
 
 /// An event ready to be written plus a fingerprint of the raw record.
@@ -498,8 +514,15 @@ pub fn normalize(
                     Some(kind) => base.with_source_kind(kind),
                     None => base,
                 };
-                match operation.description.as_deref() {
+                let base = match operation.description.as_deref() {
                     Some(description) => base.with_description(description),
+                    None => base,
+                };
+                // Beside the description and never through it, for the reason
+                // `Provenance::counterparty` gives: a `RuleMatcher` asks the
+                // two different questions of two different fields.
+                match operation.counterparty.as_deref() {
+                    Some(counterparty) => base.with_counterparty(counterparty),
                     None => base,
                 }
             },

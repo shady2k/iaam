@@ -1101,7 +1101,12 @@ impl OwnerPrompt {
                 "Everything recorded since is movement, and movement alone says only how much \
                  the amount changed, never what it is. Give this and the account's balances \
                  come out right from that point on; leave it and every one of them is wrong by \
-                 exactly what was there at the start."
+                 exactly what was there at the start. This is added to whatever the account \
+                 already holds, not assigned as its balance: if this account already carries a \
+                 reconstructed opening, giving this figure again adds to it rather than \
+                 replacing it, and the two together overstate the start by the first one's \
+                 amount. A wrong opening is corrected by retracting it and recording the right \
+                 one, never by giving this a second time."
                     .to_owned(),
             ),
             Self::OpeningCurrency => (
@@ -3467,10 +3472,25 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
                 control_assertion_gap(assertions, account.account, period, *point, dimension)
             })
         {
+            // The closing point can be asked for twice: not because it was
+            // never answered, but because an opening dated earlier than any
+            // business fact then known widens the interval (`iaam-k3gh.4`),
+            // and a closing assertion satisfied for the old, narrower
+            // interval does not satisfy the wider one. When that is what is
+            // happening, the narrower period is already sitting in
+            // `assertions` — read once for this whole account, not fetched
+            // again here — so the item can say so instead of reading like the
+            // first ask.
+            let reopened_after = (point == BalancePoint::Closing)
+                .then(|| {
+                    previously_satisfied_closing(assertions, account.account, dimension, period)
+                })
+                .flatten();
             actions.push(provide_control_assertion_action(
                 names.get(account.account)?,
                 period,
                 point,
+                reopened_after,
             ));
         }
     }
@@ -3613,6 +3633,44 @@ fn control_assertion_completion(
                 assertion.period == period && assertion.point == Some(point)
             }
     })
+}
+
+/// The narrower period this account's closing assertion was already answered
+/// for, when `period` is wider than that answer covered.
+///
+/// Only the closing point is asked here: a widened period never reopens the
+/// opening point, because [`control_assertion_completion`]'s
+/// `reconstructed_opening` branch accepts any `OpeningCash` fact regardless of
+/// its own period, and only the closing branch compares `period` for equality.
+/// The account's history can in principle hold more than one such answer, one
+/// per widening; the one named is the widest of them, which is the one most
+/// recently given — a widening moves `from` earlier, so the latest answer is
+/// the one starting earliest among those the current period has outgrown.
+///
+/// **A recorded period that is not inside the one now being asked about is not
+/// an answer to this question and is not named.** The sentence built from this
+/// says a fact earlier than the named start has since been recorded, and that
+/// is only true of a period the current one contains and starts before; an
+/// assertion recorded for some unrelated interval — a month the owner
+/// reconciled on its own, say — would make that sentence a false statement
+/// about his own history.
+fn previously_satisfied_closing(
+    assertions: &[ControlAssertionView],
+    account: AccountId,
+    dimension: Dimension,
+    period: AssertionPeriod,
+) -> Option<AssertionPeriod> {
+    assertions
+        .iter()
+        .filter(|assertion| {
+            assertion.account == account
+                && assertion.dimension == dimension
+                && assertion.point == Some(BalancePoint::Closing)
+                && assertion.period.from > period.from
+                && assertion.period.to <= period.to
+        })
+        .map(|assertion| assertion.period)
+        .min_by_key(|recorded| recorded.from)
 }
 
 /// A question can be answered while the session holding it is open.
@@ -4886,10 +4944,18 @@ fn start_account_import_action(account: &AccountView) -> Action {
 /// between the interval and the dimension, so an opening request and a closing
 /// request for the same account and interval are two identities and an agent
 /// deduplicating by id never collapses them into one.
+///
+/// `reopened_after` is `Some` exactly when this closing request is asked again
+/// after already having been answered for a narrower period — see
+/// [`previously_satisfied_closing`], the one caller — and is folded into the
+/// reason rather than the id: the id already distinguishes this interval from
+/// every other, and what needs saying is that *this same account* answered a
+/// question that looked like this one before.
 fn provide_control_assertion_action(
     account: &AccountView,
     period: AssertionPeriod,
     point: BalancePoint,
+    reopened_after: Option<AssertionPeriod>,
 ) -> Action {
     let dimension = Dimension::Cash;
     let required_goals = match point {
@@ -4937,21 +5003,41 @@ fn provide_control_assertion_action(
                  at the beginning is missing. If it stays missing, the closing amount will be \
                  compared with an unrecorded opening and the difference will remain a \
                  discrepancy. Record how much cash the account held then. A separate statement \
-                 can still be used as reconciliation evidence; it does not change the amount.",
+                 can still be used as reconciliation evidence; it does not change the amount. \
+                 Recording this adds a movement to whatever the account already holds; it does \
+                 not set the balance to the figure given. If the account already carries a \
+                 reconstructed opening, sending a second one does not replace it — the two add, \
+                 and the account then holds the sum of both. To change a wrong opening, retract \
+                 it and record the right one in its place; there is no call that assigns a \
+                 balance.",
                 account.id.inner(),
                 account.title,
                 period.from,
                 period.to
             ),
-            BalancePoint::Closing => format!(
-                "Account {} ({}) has business facts from {} through {}; record its closing cash \
-                 balance. An assertion is evidence to reconcile, not proof of a match; a \
-                 discrepancy may remain.",
-                account.id.inner(),
-                account.title,
-                period.from,
-                period.to
-            ),
+            BalancePoint::Closing => {
+                let base = format!(
+                    "Account {} ({}) has business facts from {} through {}; record its \
+                     closing cash balance. An assertion is evidence to reconcile, not proof \
+                     of a match; a discrepancy may remain.",
+                    account.id.inner(),
+                    account.title,
+                    period.from,
+                    period.to
+                );
+                match reopened_after {
+                    Some(previous) => format!(
+                        "{base} This account's closing balance was already recorded, for {} \
+                         through {}; the period above is wider because a business fact \
+                         earlier than {} has since been recorded. That earlier answer still \
+                         stands for the period it was given for — it does not cover the wider \
+                         period now asked about, so answering again here is expected, not a \
+                         loop.",
+                        previous.from, previous.to, previous.from
+                    ),
+                    None => base,
+                }
+            }
         },
         match point {
             BalancePoint::Opening => {
@@ -5170,10 +5256,14 @@ fn retired_account_action(account: &AccountView, retired: &RetiredProduct) -> Ac
              figures is zero. The usual cause is that the product's opening predates the \
              months that were imported, so the recorded movements do not sum to zero — \
              record the reconstructed opening and the retirement then removes the row on its \
-             own. If instead a fact on this account should never have counted, rule on that \
-             event. If the product had not in fact ceased on that date, withdraw the \
-             statement. Do not rule the account outside the perimeter to tidy this up: that \
-             is the other axis, and it takes the interest and the closing movement with it.",
+             own. Recording it adds a movement to whatever this account already holds; it does \
+             not set the balance, and if this account already carries an opening, a second one \
+             adds to it rather than replacing it — retract a wrong opening and record the right \
+             one in its place instead of sending a second. If instead a fact on this account \
+             should never have counted, rule on that event. If the product had not in fact \
+             ceased on that date, withdraw the statement. Do not rule the account outside the \
+             perimeter to tidy this up: that is the other axis, and it takes the interest and \
+             the closing movement with it.",
             account.id.inner(),
             account.title,
             retired.effective_on,
@@ -9589,6 +9679,132 @@ mod tests {
         );
         let request = assertion_preset(the_only_assertion_action(&actions));
         assert_eq!(request.preset["at"], "opening");
+    }
+
+    /// The sequence `iaam-k3gh.4` traced end to end: a deposit gives the
+    /// account a narrow period, the opening point is answered with
+    /// `opening_cash`, the closing point is answered too, and the queue falls
+    /// quiet — then a second, *earlier* `opening_cash` widens the period (an
+    /// `OpeningCash` fact counts toward it though a `ControlAssertion` never
+    /// does), and the closing assertion recorded for the narrower period no
+    /// longer matches the wider one, so the closing item comes back.
+    ///
+    /// That reopening is not the bug (`iaam-k3gh.4` is explicit: the widened
+    /// period genuinely is a different question, and asking again is
+    /// correct). What this test is against is the reopened item reading like
+    /// the first ask, with nothing to tell an agent who already answered it
+    /// that this is not the same question a second time.
+    #[test]
+    fn a_widened_closing_reopens_saying_so() {
+        let account = account();
+        let narrow = AssertionPeriod::between(
+            time::macros::date!(2026 - 08 - 01),
+            time::macros::date!(2026 - 08 - 05),
+        )
+        .expect("period");
+        let wide = AssertionPeriod::between(
+            time::macros::date!(2026 - 07 - 01),
+            time::macros::date!(2026 - 08 - 05),
+        )
+        .expect("period");
+
+        // The deposit gave the account the narrow period; `opening_cash`
+        // answered the opening point (`reconstructed_opening` makes it
+        // satisfy the opening question whatever period it names, which is why
+        // its own period below is irrelevant and left equal to `narrow`); a
+        // second call recorded the closing point for that same narrow period.
+        let opening = ControlAssertionView {
+            account: account.id,
+            period: narrow,
+            point: Some(BalancePoint::Opening),
+            dimension: Dimension::Cash,
+            reconstructed_opening: true,
+        };
+        let closing = recorded_cash_assertion(account.id, narrow, BalancePoint::Closing);
+        assert!(
+            assertion_queue(&account, narrow, &[opening, closing])
+                .iter()
+                .all(|action| action.kind() != ActionKind::ProvideControlAssertion),
+            "both points are answered for the period asked; the queue must be quiet"
+        );
+
+        // A business fact earlier than 2026-08-01 is recorded — a second,
+        // earlier `opening_cash`, in the real journal — and the period widens
+        // to `wide`. The recorded closing assertion's period no longer equals
+        // it, so `control_assertion_completion` refuses it and the item is
+        // raised again, this time for `wide`.
+        let after = assertion_queue(&account, wide, &[opening, closing]);
+        let reopened = the_only_assertion_action(&after);
+        let request = assertion_preset(reopened);
+        assert_eq!(request.preset["at"], "closing");
+        assert_eq!(request.preset["from"], wide.from.to_string());
+        assert_eq!(request.preset["to"], wide.to.to_string());
+        assert_eq!(
+            reopened.id(),
+            format!(
+                "provide_control_assertion:{}:{}:{}:closing:cash",
+                account.id.inner(),
+                wide.from,
+                wide.to
+            ),
+            "the id the field report saw reopen"
+        );
+
+        let reason = reopened.reason();
+        assert!(
+            reason.contains("already recorded"),
+            "the reopened item must say it is a re-ask, not read like the first one: {reason}"
+        );
+        assert!(
+            reason.contains(&narrow.from.to_string()) && reason.contains(&narrow.to.to_string()),
+            "the item must name the narrower period the standing answer covered, without a \
+             second store read: {reason}"
+        );
+        assert!(
+            reason.contains("not a loop"),
+            "the item must say this is expected, not a loop: {reason}"
+        );
+    }
+
+    /// The other half of the same sentence: an assertion recorded for an
+    /// interval the asked-about one does not contain is not an answer this
+    /// question outgrew, and naming it would tell the owner a fact earlier
+    /// than its start has since been recorded — which is not what happened.
+    /// A month he reconciled on its own is the ordinary way this arises.
+    #[test]
+    fn an_unrelated_recorded_period_is_not_named_as_the_answer_outgrown() {
+        let account = account();
+        let asked = AssertionPeriod::between(
+            time::macros::date!(2026 - 07 - 01),
+            time::macros::date!(2026 - 08 - 05),
+        )
+        .expect("period");
+        let elsewhere = AssertionPeriod::between(
+            time::macros::date!(2026 - 09 - 01),
+            time::macros::date!(2026 - 09 - 30),
+        )
+        .expect("period");
+
+        let opening = ControlAssertionView {
+            account: account.id,
+            period: asked,
+            point: Some(BalancePoint::Opening),
+            dimension: Dimension::Cash,
+            reconstructed_opening: true,
+        };
+        let closing = recorded_cash_assertion(account.id, elsewhere, BalancePoint::Closing);
+        let queue = assertion_queue(&account, asked, &[opening, closing]);
+        let raised = the_only_assertion_action(&queue);
+        let reason = raised.reason();
+        assert!(
+            !reason.contains("already recorded"),
+            "a closing assertion for an interval outside the one asked about is not the \
+             answer this question outgrew, and the item must not claim it is: {reason}"
+        );
+        assert!(
+            !reason.contains(&elsewhere.from.to_string()),
+            "the unrelated period must not be named: {reason}"
+        );
     }
 
     #[test]

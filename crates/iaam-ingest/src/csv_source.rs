@@ -623,6 +623,11 @@ fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperati
         source_code: None,
         source_kind: None,
         description: None,
+        // Retained regardless of `row.kind`: a `transfer` row already resolves
+        // it into `to` above, and every other kind used to drop it on the
+        // floor, which is exactly `iaam-k3gh.8` — a rule the owner writes on
+        // this counterparty could match at ingestion and never again.
+        counterparty: row.counterparty_account.clone(),
     })
 }
 

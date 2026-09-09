@@ -815,6 +815,70 @@ fn both_words_survive_a_transfer_submitted_from_the_far_side() {
 }
 
 #[test]
+fn the_counterparty_the_source_printed_survives_resolution_into_the_operation() {
+    // `iaam-k3gh.8`: the envelope used to carry every other word the source
+    // printed — description, category, kind — and drop the counterparty on
+    // the floor. Without this, `Provenance` never gets to retain it, and a
+    // `counterparty_account` rule can never reach the fact recompute rebuilds.
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::Out,
+        counterparty: ObservedCounterparty::Named("Shop One".to_owned()),
+        ..inner_row(account)
+    };
+
+    let operation = row
+        .resolve(Classification::ExternalFlow, Some(Movement::Out))
+        .expect("a stated outflow resolves");
+
+    assert_eq!(operation.counterparty.as_deref(), Some("Shop One"));
+}
+
+#[test]
+fn a_row_naming_no_counterparty_carries_none_into_the_operation() {
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::Out,
+        counterparty: ObservedCounterparty::Unknown,
+        ..inner_row(account)
+    };
+
+    let operation = row
+        .resolve(Classification::ExternalFlow, Some(Movement::Out))
+        .expect("a stated outflow resolves");
+
+    assert_eq!(operation.counterparty, None);
+}
+
+#[test]
+fn the_counterparty_reaches_provenance_through_normalization() {
+    // The next link in the chain `envelope` starts: `normalize` is what turns
+    // the operation's `counterparty` field into evidence a rebuilt subject can
+    // read back (`crate::scenarios::classification::subject` in `iaam-app`).
+    let account = AccountId::new_random();
+    let row = ObservedRow {
+        direction: ObservedDirection::Out,
+        counterparty: ObservedCounterparty::Named("Shop One".to_owned()),
+        ..inner_row(account)
+    };
+    let operation = row
+        .resolve(Classification::ExternalFlow, Some(Movement::Out))
+        .expect("a stated outflow resolves");
+
+    let normalized = normalize(
+        &operation,
+        &NormalizationContext {
+            owner: OwnerId::new_random(),
+            source: SourceId::new_random(),
+            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
+        },
+    )
+    .expect("normalizes");
+
+    assert_eq!(normalized.event.provenance.counterparty(), Some("Shop One"));
+}
+
+#[test]
 fn a_stored_row_written_before_the_category_existed_reads_back_without_one() {
     // An import session parks its rows as JSON, and a session opened by an
     // earlier build holds rows with no `source_category` key at all. Such a row

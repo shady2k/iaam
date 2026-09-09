@@ -569,6 +569,11 @@ impl ObservedRow {
             source_code: self.source_code.clone(),
             source_kind: self.source_kind.clone(),
             description: self.description.clone(),
+            // The row's own counterparty, exactly as `description` above it:
+            // never rewritten, carried through to `Provenance` so a rule
+            // written on it goes on matching after the fact is recorded
+            // (`iaam-k3gh.8`).
+            counterparty: self.counterparty_name().map(str::to_owned),
         }
     }
 }

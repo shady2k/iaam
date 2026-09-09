@@ -178,13 +178,13 @@ fn insert_header(tx: &Transaction<'_>, header: &EventRow) -> Result<(), StoreErr
             source_kind, owner_category, source_code, source_description, import,
             import_session, declared_by, rule_settlement, settled_by_rule,
             settled_by_rule_version, row_document, row_sheet, row_number,
-            source_position_id
+            source_position_id, source_counterparty
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28,
             ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36,
-            ?37
+            ?37, ?38
         )",
         params![
             header.id,
@@ -224,6 +224,7 @@ fn insert_header(tx: &Transaction<'_>, header: &EventRow) -> Result<(), StoreErr
             header.row_sheet,
             header.row_number,
             header.source_position_id,
+            header.source_counterparty,
         ],
     )?;
     Ok(())

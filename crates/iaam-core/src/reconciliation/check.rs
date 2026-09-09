@@ -1020,6 +1020,65 @@ mod tests {
     }
 
     #[test]
+    fn an_opening_recorded_the_same_day_as_the_assertion_does_not_enter_it() {
+        // `iaam-k3gh.2`: the exact shape a field agent lost a round trip on. A
+        // reconstructed opening dated the assertion's own start day is not
+        // «before the interval» — [`observe`]'s cut is `date < period.from`, and
+        // an event dated `period.from` itself falls on the wrong side of that,
+        // into the interval rather than before it. So this account's opening
+        // fold sees nothing at all: not the reconstruction, not anything else,
+        // because the reconstruction is the account's only event.
+        //
+        // The anchor and the figure disagree, and that disagreement is the
+        // point. `OpeningAnchors` marks this account's cash as `Asserted` —
+        // the reconstruction's date does reach back to (equal) the account's
+        // first movement — so the claim is compared as a level rather than
+        // refused as `OpeningNotAsserted`. What it is compared against is an
+        // opening fold with nothing folded into it, which reads as zero. A
+        // source who states the reconstructed figure back to the system,
+        // believing an «opening» assertion must see the opening it just
+        // recorded, is told it is short by the whole of that figure — the
+        // discrepancy this test pins down.
+        let account = AccountId::new_random();
+        let events = vec![event_with(
+            account,
+            date!(2026 - 03 - 01),
+            1,
+            EventKind::OpeningCash {
+                amount: rub(200_000),
+            },
+            vec![Leg::cash(account, rub(200_000))],
+        )];
+        let observed = observe(&events, account, march()).unwrap();
+        let opening = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(200_000),
+            at: BalancePoint::Opening,
+        };
+        assert_eq!(
+            check_claim(&opening, &observed),
+            ClaimOutcome::Discrepant(Discrepancy {
+                field: "amount",
+                claimed: ClaimValue::Money {
+                    amount: PostedMinor::new(200_000),
+                    currency: CurrencyCode::Rub,
+                },
+                observed: ClaimValue::Money {
+                    amount: PostedMinor::new(0),
+                    currency: CurrencyCode::Rub,
+                },
+                delta: ClaimValue::Money {
+                    amount: PostedMinor::new(200_000),
+                    currency: CurrencyCode::Rub,
+                },
+            }),
+            "an opening dated the assertion's own start day is excluded from the opening fold, \
+             so the reconstructed figure the source just recorded reads back as a discrepancy \
+             of exactly that figure rather than as a match"
+        );
+    }
+
+    #[test]
     fn a_position_summed_from_an_unasserted_start_is_not_compared() {
         // The same rule for a holding, keyed by instrument. A quantity summed
         // from the trades that happen to have been imported is not the

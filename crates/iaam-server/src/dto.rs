@@ -574,10 +574,51 @@ pub enum OperationKindDto {
         currency: CurrencyDto,
         origin: TaxOriginDto,
     },
+    /// A reconstructed opening (§10.7): the cash the account is stated to have
+    /// held before the journal began, recorded as **one more movement**, not
+    /// as a balance the account is set to.
+    ///
+    /// This is the field a caller most often misreads, and the name is why:
+    /// "opening" reads as *the balance at the start*, and the natural
+    /// correction for a wrong one reads as sending it again with the right
+    /// figure. It is not a correction — recording a second `opening_cash` on
+    /// an account that already holds one does not replace it, it **adds** to
+    /// it, because every movement here, this one included, is folded by
+    /// addition and nothing overwrites anything else. An account already
+    /// carrying a reconstructed opening that gets a second one holds the sum
+    /// of both, silently.
+    ///
+    /// **There is no call that assigns a balance — none of this API's
+    /// operations does.** To change a wrong opening, retract it with
+    /// `submit_corrections` and record the right one in its place; do not send
+    /// a second `opening_cash` meaning "no, actually it was X". A control
+    /// assertion (`record_owner_balance`) is not that call either: it posts no
+    /// movement of its own, so it is evidence to reconcile the fold against,
+    /// never a way to change it.
     OpeningCash {
+        /// Signed, and the sign is the only place the direction is stated:
+        /// positive is cash the account is stated to have held, negative is a
+        /// stated opening debit — an overdraft or a margin balance carried
+        /// forward from before the journal began. Unlike `deposit` and
+        /// `withdrawal`, which are always positive because the kind itself
+        /// carries the direction, `opening_cash` is one kind for both
+        /// directions. See the variant's own documentation for why a second
+        /// reading of the balance is not how a wrong one is corrected.
         amount: String,
         currency: CurrencyDto,
     },
+    /// A reconstructed opening (§10.7) for one instrument, on the same terms as
+    /// [`Self::OpeningCash`]: `quantity` is added to whatever the account
+    /// already holds of this instrument, not assigned as the position. Two
+    /// `opening_position` operations for the same account and instrument do
+    /// not disagree with each other — the second does not replace the first —
+    /// they **combine**, and the account then shows the sum of both.
+    ///
+    /// **There is no call that assigns a holding.** To change a wrong opening,
+    /// retract it with `submit_corrections` and record the right one; a
+    /// control assertion over positions is not a substitute, for the same
+    /// reason it is not one for cash — it posts no leg and changes nothing
+    /// here.
     OpeningPosition {
         instrument: Uuid,
         /// Where the security is kept, when the source states one. A bank
@@ -585,7 +626,15 @@ pub enum OperationKindDto {
         /// one: custody is description here, not a position's identity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         custody: Option<Uuid>,
+        /// Added to whatever quantity of this instrument the account already
+        /// holds — see the variant's own documentation for why a second
+        /// opening is not how a wrong one is corrected. Always positive: a
+        /// negative holding has no meaning here.
         quantity: String,
+        /// This lot's own cost, not a re-statement of the average cost across
+        /// everything the account already holds of this instrument. A second
+        /// `opening_position` opens a second lot; it does not revise the first
+        /// one's cost basis.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_basis: Option<String>,
         currency: CurrencyDto,
@@ -940,6 +989,11 @@ impl OperationDto {
             source_code: self.source_code.clone(),
             source_kind: self.source_kind.clone(),
             description: self.description.clone(),
+            // This route takes an already-resolved operation kind, and
+            // `OperationDto` carries no separate counterparty text for one:
+            // the field exists to carry a counterparty forward from an
+            // observation's own resolution, which does not pass through here.
+            counterparty: None,
         })
     }
 
@@ -3351,6 +3405,15 @@ impl HeldSessionDto {
 }
 
 /// Cash movement report over an inclusive interval.
+///
+/// `currencies` carries the rows, one per currency the covered accounts moved
+/// cash in. Everything else on this object is a fact about the interval as a
+/// whole rather than about any one currency: the contour and its version say
+/// whose money and under what membership, `from`/`to` and
+/// `category_rule_versions` say when and under which rule history, and
+/// `population` and `held_rows` say which accounts and rows the fold covers —
+/// none of it varies row to row, and none of it could be reconstructed by
+/// reading the currencies alone.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MoneyFlowReportDto {
     /// What would have to be true for these figures to be a complete account of
@@ -3366,6 +3429,9 @@ pub struct MoneyFlowReportDto {
     #[schema(value_type = String, format = Date)]
     pub to: Date,
     pub category_rule_versions: Vec<u32>,
+    /// One row per currency the covered accounts moved cash in over the
+    /// interval, with each of this report's quantities stated for that
+    /// currency alone — currencies are never converted or summed together.
     pub currencies: Vec<MoneyFlowCurrencyDto>,
     /// Accounts whose own cash change the six quantities do not explain.
     pub unexplained: Vec<AccountResidualDto>,
@@ -3618,13 +3684,16 @@ impl MoneyFlowReportDto {
     }
 }
 
-/// The balances answer: a row per contour account, and the negative cash the
-/// answer as a whole carries.
+/// The balances answer: a row per contour account, in `accounts`, and the
+/// negative cash the answer as a whole carries.
 ///
 /// An object rather than a bare array of rows, for the reason the market series
 /// wrappers are objects: `negative_cash` is one fact about the whole answer, and
 /// a copy of it on every row would invite a client to believe it could differ
-/// between them.
+/// between them. `confidence`, `population` and `held_rows` are the same kind
+/// of fact — what would have to hold for these rows to be complete, which
+/// accounts they cover, and what they were folded over — and none of the three
+/// can be read off any one account's row either.
 ///
 /// For the same fold regrouped with totals, read `/v1/reports/assets`: its
 /// `accounts` are these rows grouped by the owner's declared cash class, and
@@ -3642,6 +3711,8 @@ pub struct BalancesReportDto {
     /// be reached without the distinction; this block still says which rows are
     /// affected, in one place, without reading every row.
     pub confidence: ConfidenceDto,
+    /// One row per contour account: its cash and positions as the journal
+    /// states them.
     pub accounts: Vec<AccountBalanceDto>,
     /// Every account-and-currency in the scope whose cash balance is negative.
     /// Always present; empty when none is.
@@ -3667,11 +3738,15 @@ pub struct BalancesReportDto {
 }
 /// A balances report for each requested date, in request order.
 ///
-/// Each `report` is the complete body returned by `/v1/reports/balances` for
-/// that `as_of`; the date sits beside it so a caller can identify the entry
-/// without inspecting account rows.
+/// `reports` carries the rows: each `report` is the complete body returned by
+/// `/v1/reports/balances` for that `as_of`; the date sits beside it so a
+/// caller can identify the entry without inspecting account rows. There is
+/// nothing true of the series as a whole beyond the dates requested, so the
+/// object holds nothing beside this one field.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BalancesReportSeriesDto {
+    /// One complete balances report per requested date, in the order the
+    /// dates were requested in.
     pub reports: Vec<BalancesReportSeriesEntryDto>,
 }
 
@@ -4024,11 +4099,15 @@ pub struct AssetSnapshotDto {
 
 /// An asset snapshot for each requested date, in request order.
 ///
-/// Each `report` is the complete body returned by `/v1/reports/assets` for
-/// that `as_of`; the date is repeated beside it to give every entry one
-/// uniform series envelope.
+/// `reports` carries the rows: each `report` is the complete body returned by
+/// `/v1/reports/assets` for that `as_of`; the date is repeated beside it to
+/// give every entry one uniform series envelope. As with the balances series,
+/// there is nothing true of the whole series that is not already true of one
+/// entry, so the object holds nothing beside this one field.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AssetSnapshotSeriesDto {
+    /// One complete asset snapshot per requested date, in the order the dates
+    /// were requested in.
     pub reports: Vec<AssetSnapshotSeriesEntryDto>,
 }
 
@@ -6165,6 +6244,8 @@ pub struct FxRateDto {
 /// holds no value in this interval".
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketPriceSeriesDto {
+    /// One priced observation per row: the requested instrument on one date,
+    /// with the provenance behind that value.
     pub rows: Vec<MarketPriceDto>,
     /// The date the series is known to be complete through, or `null` when this
     /// instance has published nothing for the series at all. Always present:
@@ -6178,6 +6259,8 @@ pub struct MarketPriceSeriesDto {
 /// through. Same shape and same reading as [`MarketPriceSeriesDto`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketFxSeriesDto {
+    /// One exchange-rate observation per row, for the requested pair on one
+    /// date, with the provenance behind that value.
     pub rows: Vec<MarketFxDto>,
     /// The date the series is known to be complete through, or `null` when this
     /// instance has published nothing for the series at all. Always present:
@@ -6191,6 +6274,8 @@ pub struct MarketFxSeriesDto {
 /// through. Same shape and same reading as [`MarketPriceSeriesDto`].
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MarketKeyRateSeriesDto {
+    /// One interval per row: a rate that held from one date to the next, as
+    /// derived from daily observations.
     pub rows: Vec<MarketKeyRateDto>,
     /// The date the series is known to be complete through, or `null` when this
     /// instance has published nothing for the series at all. Always present:
@@ -7454,6 +7539,11 @@ pub struct DocumentParams {
 }
 
 /// Report upload response.
+///
+/// `rows` carries a verdict per parsed row; `document_hash`, `source`,
+/// `broker`, `format`, `parser_version` and the period are facts about the
+/// document as a whole — one run over one file — and none of them varies row
+/// to row, so none of them belongs on a `VerdictDto`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DocumentDto {
     pub document_hash: String,
@@ -7467,6 +7557,8 @@ pub struct DocumentDto {
     #[serde(with = "iso_date::option")]
     #[schema(value_type = Option<String>, format = Date)]
     pub period_to: Option<Date>,
+    /// One verdict per row the document was parsed into, in the order the
+    /// parser produced them.
     pub rows: Vec<VerdictDto>,
 }
 
@@ -7558,11 +7650,19 @@ pub enum ClaimValueDto {
 pub enum ClaimDto {
     CashBalance {
         currency: CurrencyDto,
+        /// `opening` or `closing`, as sent — see [`BalancePointDto`] for what
+        /// each one includes and excludes, in particular the day boundary an
+        /// opening figure draws around a reconstructed opening dated the same
+        /// day.
         at: String,
         claimed: ClaimValueDto,
     },
     PositionQuantity {
         instrument: Uuid,
+        /// `opening` or `closing`, as sent — see [`BalancePointDto`] for what
+        /// each one includes and excludes, in particular the day boundary an
+        /// opening figure draws around a reconstructed opening dated the same
+        /// day.
         at: String,
         claimed: ClaimValueDto,
     },
@@ -7973,9 +8073,18 @@ pub struct OwnerBalanceOutcomeDto {
 }
 
 /// Reconciliation statuses and every effective coverage gap in the requested range.
+///
+/// Three lists, in `statuses`, `gaps` and `actions`, and none of them is a
+/// property of another's rows: a status is one dimension over one period, a
+/// gap is a stretch of the same period this instance could not read at all,
+/// and an action is outstanding work — none can be folded into either of the
+/// other two without asserting something about it that is not true.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ReconciliationResponseDto {
+    /// One status per account, dimension and period covered by the request.
     pub statuses: Vec<ReconciliationStatusDto>,
+    /// One entry per coverage gap this instance could not evaluate — refused
+    /// rows and what would have to be resolved before they could be read.
     pub gaps: Vec<TaintDto>,
     /// What these statuses and gaps leave outstanding, bound to the account and
     /// range that were asked for. Always present, empty included.
@@ -8217,6 +8326,10 @@ pub struct CategoryRuleBatchRequest {
 /// The rows and monthly movements caused by a proposed category rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleImpactDto {
+    /// How many events the rule affects — a count, not a list.
+    ///
+    /// Named `rows` beside `preview_rows`, which is the field that actually
+    /// carries them: read this one for how many, and `preview_rows` for which.
     pub rows: u64,
     /// Each affected event before the monthly aggregates below.
     pub preview_rows: Vec<CategoryPreviewRowDto>,
@@ -8369,7 +8482,7 @@ impl BalancePointDto {
     const VOCABULARY: &'static [(&'static str, &'static str)] = &[
         (
             BalancePoint::Opening.code(),
-            "The opening balance: the state before the first event in the interval. Without it the figure a report shows for the interval is a movement over the interval and not a balance at all, because the sum starts from zero rather than from what was there.",
+            "The opening balance: the state before the interval's start date. The cut is a day, not an event order — an operation dated the same day the interval starts, including a reconstructed opening (`opening_cash` or `opening_position`) recorded that day, falls within the interval and is excluded from this figure; only an event dated strictly earlier than the start date is counted in it. This is why a reconstructed opening recorded on the same date as an opening assertion still leaves the assertion short by exactly that amount. Without it, the figure a report shows for the interval is a movement over the interval and not a balance at all, because the sum starts from zero rather than from what was there.",
         ),
         (
             BalancePoint::Closing.code(),
@@ -8695,6 +8808,8 @@ impl PlannedCorrectionDto {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RecomputePlanDto {
     pub applied: bool,
+    /// One entry per event the rule change requires correcting, each naming
+    /// what it was classified as and what it becomes.
     pub corrections: Vec<PlannedCorrectionDto>,
     /// The accounts and figures the acknowledged correction will affect.
     pub preview: ImportCorrectionPreviewDto,
@@ -8797,8 +8912,17 @@ pub struct AssertionsWithheldDto {
 }
 
 /// Broker channel synchronisation result.
+///
+/// `recorded` carries the rows, one verdict per operation the sync attempted
+/// to write. `duplicates`, `possible_duplicates` and `assertions` are counts
+/// over that same list rather than a second list, because a client holding
+/// `recorded` can already count them by verdict code; they are published only
+/// as a convenience and never disagree with it. `assertions_withheld` and
+/// `actions` are facts about the run as a whole that no one verdict states.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SyncOutcomeDto {
+    /// One verdict per operation this synchronisation attempted to record, in
+    /// the order the broker channel returned them.
     pub recorded: Vec<VerdictDto>,
     pub duplicates: usize,
     pub possible_duplicates: usize,
@@ -9488,11 +9612,15 @@ pub struct SubmitJournalEventsRequest {
 
 /// One page of the owner's journal.
 ///
-/// The page carries `next` rather than a total count: counting the whole
-/// journal to answer "how many more" is work nobody asked for, while the
-/// position to resume from is what the caller actually needs.
+/// Its own rows sit in `rows`, one recorded event per entry. The page carries
+/// `next` beside them rather than a total count: counting the whole journal to
+/// answer "how many more" is work nobody asked for, and the position to resume
+/// from could not be read off a row either way — an absent `next` means this
+/// was the last page, which no row states.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct JournalPageDto {
+    /// The events on this page, in the order the underlying read produced
+    /// them.
     pub rows: Vec<JournalEventReadDto>,
     /// Pass back as `after` to read the next page. For a filtered read, this
     /// advances over rows the filter dropped, so the page may contain fewer
@@ -9505,11 +9633,17 @@ pub struct JournalPageDto {
 
 /// Movement aggregates over the owner's journal.
 ///
+/// `groups` carries every aggregate this call folded rows into, one per
+/// distinct combination of the dimensions the caller grouped by. There is
+/// nothing yet published about the answer as a whole that a group could not
+/// state on its own, which is why this object holds nothing beside it.
+///
 /// This is not a balance: the groups fold movement in the selected window and
 /// do not read opening assertions. The balances report is the answer that
 /// combines movement with an opening assertion.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct JournalAggregateDto {
+    /// One aggregate per distinct combination of the dimensions grouped by.
     pub groups: Vec<JournalAggregateGroupDto>,
 }
 
@@ -13469,12 +13603,15 @@ pub struct RefusedProfileDto {
 /// The format catalogue of this deployment.
 ///
 /// An object rather than a bare array because the answer carries two lists and
-/// neither is a property of the other: what this instance reads, and what it
-/// refused to read. A caller that saw only the first could not tell a profile
-/// nobody wrote from one that failed to load.
+/// neither is a property of the other: `profiles` — what this instance reads —
+/// and `refused` — what it refused to read, and why. A caller that saw only
+/// the first could not tell a profile nobody wrote from one that failed to
+/// load.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SourceProfileCatalogueDto {
+    /// One entry per document format this instance can read.
     pub profiles: Vec<SourceProfileDto>,
+    /// One entry per file this instance would not read, and why.
     pub refused: Vec<RefusedProfileDto>,
 }
 

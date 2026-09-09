@@ -10,7 +10,7 @@ use utoipa::Modify;
 use utoipa::OpenApi;
 use utoipa::openapi::path::Operation;
 use utoipa::openapi::response::{Response, ResponseBuilder};
-use utoipa::openapi::schema::{ArrayItems, Object, Schema, SchemaType, Type};
+use utoipa::openapi::schema::{ArrayItems, Discriminator, Object, Schema, SchemaType, Type};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::openapi::{ContentBuilder, HeaderBuilder, Ref, RefOr};
 
@@ -240,6 +240,49 @@ fn is_null_schema(schema: &RefOr<Schema>) -> bool {
         RefOr::T(Schema::Object(object))
             if object.default.as_ref().is_some_and(Value::is_null)
     )
+}
+
+/// The tagged unions the action queue publishes as a discriminated `oneOf`,
+/// paired with the wire name of the tag each one carries.
+///
+/// `#[serde(tag = "type", ...)]` on the Rust side already makes every variant
+/// carry `type` as a required, single-valued property, and `utoipa` writes
+/// that part of each variant correctly on its own. What it does not write is
+/// the OpenAPI `discriminator` object: in the version this project pins
+/// (utoipa 5.5.0), `#[schema(discriminator = ...)]` is accepted only on an
+/// untagged enum of single-field reference variants — `utoipa-gen`'s
+/// `MixedEnum::new` raises a compile error for anything else — and neither
+/// `ActionTargetDto` nor `ActionSubjectDto` is that shape: both are internally
+/// tagged enums whose variants carry named fields. Left as utoipa emits it,
+/// the published schema is a bare `oneOf` with nothing in it saying which
+/// property a reader is meant to switch on, and a generated client that reads
+/// a field of the first variant without checking `type` first is the failure
+/// this list exists to close (`iaam-k3gh.5`).
+///
+/// Patched after generation rather than at the macro, for the reason just
+/// given: there is no macro-level spelling of this fix in the pinned utoipa.
+/// [`add_queue_discriminators`] applies it the same way
+/// [`hoist_optional_reference_descriptions`] applies a different post-hoc fix
+/// above, to `oneOf` schemas this document already publishes correctly in
+/// every other respect.
+const DISCRIMINATED_QUEUE_UNIONS: &[(&str, &str)] =
+    &[("ActionTargetDto", "type"), ("ActionSubjectDto", "type")];
+
+/// Add the `discriminator` object utoipa omits for an internally tagged enum
+/// whose variants carry named fields — see [`DISCRIMINATED_QUEUE_UNIONS`] for
+/// which schemas need it and why. Each entry there names a `oneOf` schema
+/// already published under `components.schemas`, with a correct tag property
+/// and per-variant `enum: [<value>]` already in place; only the discriminator
+/// object itself is missing, so only that is added.
+pub(crate) fn add_queue_discriminators(openapi: &mut utoipa::openapi::OpenApi) {
+    let Some(components) = openapi.components.as_mut() else {
+        return;
+    };
+    for (schema_name, property_name) in DISCRIMINATED_QUEUE_UNIONS {
+        if let Some(RefOr::T(Schema::OneOf(one_of))) = components.schemas.get_mut(*schema_name) {
+            one_of.discriminator = Some(Discriminator::new(*property_name));
+        }
+    }
 }
 
 /// The refusal for request frequency, on every operation that can give it.

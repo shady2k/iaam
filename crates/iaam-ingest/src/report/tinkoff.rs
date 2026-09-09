@@ -686,6 +686,10 @@ fn operation(
         source_code: None,
         source_kind: None,
         description: None,
+        // This channel is a trade/dividend report, not a cash statement: it
+        // names no counterparty for `RuleMatcher::counterparty_account` to
+        // read.
+        counterparty: None,
     }
 }
 

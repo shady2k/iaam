@@ -43,6 +43,7 @@ fn submit(kind: OperationKind) -> SubmittedOperation {
         source_code: None,
         source_kind: None,
         description: None,
+        counterparty: None,
     }
 }
 

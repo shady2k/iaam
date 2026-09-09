@@ -14,9 +14,22 @@ use crate::StoreError;
 /// one file (iaam-05gi): the database was greenfield when this happened —
 /// `dev.db` carried no rows in any table — so there was nothing to migrate,
 /// and the whole schema starts fresh at version 1.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// **The collapse was a one-off and version 2 is where ordinary numbering
+/// resumes** (iaam-k3gh.8). A database holding rows cannot have a column added
+/// to `0001_schema.sql`, because it is already at version 1 and skips that file
+/// altogether; the column would then exist in every database created after the
+/// change and in none created before it, and the failure would arrive at run
+/// time, on a statement naming a column that is not there.
+pub const SCHEMA_VERSION: u32 = 2;
 
-const MIGRATIONS: [(u32, &str); 1] = [(1, include_str!("../migrations/0001_schema.sql"))];
+const MIGRATIONS: [(u32, &str); 2] = [
+    (1, include_str!("../migrations/0001_schema.sql")),
+    (
+        2,
+        include_str!("../migrations/0002_source_counterparty.sql"),
+    ),
+];
 
 /// Apply missing migrations.
 ///

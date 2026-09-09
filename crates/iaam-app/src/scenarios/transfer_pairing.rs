@@ -446,6 +446,13 @@ fn transfer_for(
         // the transfer's own description, and picking one would state that the
         // sending bank's words describe both sides.
         description: None,
+        // A confirmed `CashTransfer` already names both accounts on the event
+        // itself, which is a stronger fact than a printed counterparty string
+        // (`Counterparty::Named` is derived from `to`/`from`, not from
+        // provenance, for this kind — see `subject()`). Picking one bank's
+        // string for the other's evidence would be the same error `description`
+        // above refuses.
+        counterparty: None,
     }
 }
 
@@ -485,6 +492,7 @@ mod tests {
                 source_code: None,
                 source_kind: None,
                 description: None,
+                counterparty: None,
             },
             &NormalizationContext {
                 owner: OwnerId::new_random(),

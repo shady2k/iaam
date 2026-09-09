@@ -127,6 +127,7 @@ pub(crate) fn to_rows(event: &Event) -> Result<(EventRow, Vec<LegRow>, DetailRow
         owner_category: event.provenance.owner_category().map(str::to_owned),
         source_code: event.provenance.source_code().map(str::to_owned),
         source_description: event.provenance.description().map(str::to_owned),
+        source_counterparty: event.provenance.counterparty().map(str::to_owned),
         import: event.provenance.import().map(|i| i.inner().to_string()),
         import_session: event
             .provenance
@@ -1213,6 +1214,9 @@ fn decode_provenance(header: &EventRow) -> Result<Provenance, StoreError> {
     }
     if let Some(value) = header.source_description.clone() {
         provenance = provenance.with_description(value);
+    }
+    if let Some(value) = header.source_counterparty.clone() {
+        provenance = provenance.with_counterparty(value);
     }
     if let Some(ref value) = header.import {
         provenance = provenance.with_import(ImportId(parse_uuid("import", value)?));
@@ -2595,7 +2599,8 @@ mod tests {
         .with_source_kind("card_payment")
         .with_owner_category("food")
         .with_source_code("5411")
-        .with_description("Shop One")
+        .with_description("Monthly subscription")
+        .with_counterparty("Shop One")
         .with_import(ImportId::declared(
             fully_dated.owner,
             fully_dated.account,

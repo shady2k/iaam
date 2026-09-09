@@ -180,6 +180,19 @@ build must refuse a new archive rather than restore a partial one.
   travel: nothing in the journal's foreign keys reaches `instrument_aliases`,
   because the bundle carries resolved `InstrumentId`s rather than codes.
 
+  The closure is taken rather than the whole directory because a market sync
+  fills that directory with an exchange's entire universe, and an archive of one
+  owner's affairs has no business carrying it.
+
+  **A closure query is a list that goes stale, so it is guarded rather than
+  trusted.** Eight event tables carry a column referencing `instruments` today,
+  and the relational journal created all eight in one change; a ninth added
+  later would silently export an incomplete closure and produce an archive that
+  fails on restore — the exact failure this section exists to remove. A test
+  reads `0001_schema.sql`, collects every `event*` column declared
+  `REFERENCES instruments`, and fails if one is absent from the export query.
+  The same guard covers `REFERENCES custody_places`.
+
 **Import order** is a hard requirement, not a nicety: `PRAGMA foreign_keys` is
 on (`store/src/lib.rs:239`) and no constraint in the schema is deferred, so
 SQLite checks at the offending statement. Custody places and instruments insert
@@ -241,6 +254,10 @@ Each of these fails before the change and passes after.
    registers the place itself.
 8. **A leg naming another owner's place is still refused.** The existing test
    (`journal/write.rs:787`) keeps its meaning under the new column.
+9. **The export closure covers the schema.** The guard of §7: every `event*`
+   column declared `REFERENCES instruments` or `REFERENCES custody_places` in
+   `0001_schema.sql` appears in the export query, and adding a ninth such column
+   without extending the query fails the build.
 
 ## 10. Order of work
 

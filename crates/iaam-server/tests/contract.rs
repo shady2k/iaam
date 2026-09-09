@@ -23,7 +23,8 @@ use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Store, TokenAdmin, UnavailableOutboundHttp,
+    CustodyUpsert, InstrumentDirectory, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Store,
+    TokenAdmin, UnavailableOutboundHttp,
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
@@ -200,17 +201,17 @@ struct Harness {
     market_store: Arc<tokio::sync::Mutex<SqliteStore>>,
 }
 
-fn harness() -> Harness {
-    harness_with(SqliteStore::open_in_memory().expect("in-memory database"))
+async fn harness() -> Harness {
+    harness_with(SqliteStore::open_in_memory().expect("in-memory database")).await
 }
 
 /// The same harness, but with a file-backed database: tests verifying that a record
 /// was actually written to the table must use a second connection
 /// to the same database. There is no second connection with `open_in_memory`.
-fn harness_on_disk() -> (Harness, std::path::PathBuf) {
+async fn harness_on_disk() -> (Harness, std::path::PathBuf) {
     let path = std::env::temp_dir().join(format!("iaam-contract-{}.db", Uuid::new_v4()));
     let store = SqliteStore::open(&path).expect("file-backed database");
-    (harness_with(store), path)
+    (harness_with(store).await, path)
 }
 
 /// Registers `harness.instrument` and `harness.custody` in the main
@@ -241,22 +242,24 @@ fn seed_instrument(path: &std::path::Path, harness: &Harness) {
     seed_instrument_id(path, harness.instrument, "SHR");
 }
 
-fn seed_custody(path: &std::path::Path, harness: &Harness) {
-    SqliteStore::open(path)
-        .expect("second connection")
-        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
-            id: harness.custody,
-            owner: harness.owner,
-            title: "Custody One".into(),
-            institution: None,
-            origin: CustodyOrigin::Declared,
-        })
+async fn seed_custody(path: &std::path::Path, harness: &Harness) {
+    SqliteAdapter::new(SqliteStore::open(path).expect("second connection"))
+        .record_custody_place(
+            harness.owner,
+            CustodyUpsert {
+                id: harness.custody,
+                title: "Custody One".into(),
+                institution: None,
+                origin: CustodyOrigin::Declared,
+            },
+        )
+        .await
         .expect("custody place");
 }
 
-fn seed_instrument_and_custody(path: &std::path::Path, harness: &Harness) {
+async fn seed_instrument_and_custody(path: &std::path::Path, harness: &Harness) {
     seed_instrument(path, harness);
-    seed_custody(path, harness);
+    seed_custody(path, harness).await;
 }
 
 fn add_reconciliation_assertion(path: &std::path::Path, owner: OwnerId, account: AccountId) {
@@ -317,11 +320,11 @@ fn add_reconciliation_assertion_for_period(
         .expect("reconciliation assertion");
 }
 
-fn harness_with(store: SqliteStore) -> Harness {
-    harness_with_factory(store, None)
+async fn harness_with(store: SqliteStore) -> Harness {
+    harness_with_factory(store, None).await
 }
 
-fn unprovisioned_harness() -> Harness {
+async fn unprovisioned_harness() -> Harness {
     harness_with_factory_and_provisioning(
         SqliteStore::open_in_memory().expect("in-memory database"),
         None,
@@ -330,6 +333,7 @@ fn unprovisioned_harness() -> Harness {
         false,
         GENEROUS_RATE_LIMIT,
     )
+    .await
 }
 
 /// A harness that refuses after `limit` calls with one token.
@@ -338,7 +342,7 @@ fn unprovisioned_harness() -> Harness {
 /// tripped the limiter by accident would fail somewhere unrelated to what it
 /// checks. A test *about* the refusal has to reach it, and earning it a
 /// thousand calls at a time would spend a second proving arithmetic.
-fn rate_limited_harness(limit: u32) -> Harness {
+async fn rate_limited_harness(limit: u32) -> Harness {
     harness_with_factory_and_provisioning(
         SqliteStore::open_in_memory().expect("in-memory database"),
         None,
@@ -347,9 +351,10 @@ fn rate_limited_harness(limit: u32) -> Harness {
         false,
         limit,
     )
+    .await
 }
 
-fn empty_owner_harness() -> Harness {
+async fn empty_owner_harness() -> Harness {
     harness_with_factory_and_provisioning(
         SqliteStore::open_in_memory().expect("in-memory database"),
         None,
@@ -358,9 +363,10 @@ fn empty_owner_harness() -> Harness {
         false,
         GENEROUS_RATE_LIMIT,
     )
+    .await
 }
 
-fn broker_access_harness() -> Harness {
+async fn broker_access_harness() -> Harness {
     harness_with_factory_and_provisioning(
         SqliteStore::open_in_memory().expect("in-memory database"),
         None,
@@ -369,9 +375,10 @@ fn broker_access_harness() -> Harness {
         true,
         GENEROUS_RATE_LIMIT,
     )
+    .await
 }
 
-fn harness_with_factory(
+async fn harness_with_factory(
     store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
 ) -> Harness {
@@ -383,13 +390,14 @@ fn harness_with_factory(
         false,
         GENEROUS_RATE_LIMIT,
     )
+    .await
 }
 
 /// More calls than any test makes, so that no test meets the limiter unless it
 /// asked to.
 const GENEROUS_RATE_LIMIT: u32 = 1_000;
 
-fn harness_with_factory_and_provisioning(
+async fn harness_with_factory_and_provisioning(
     mut store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
     provisioned: bool,
@@ -914,7 +922,7 @@ fn post_public(path: &str, body: &Value) -> Request<Body> {
 
 #[tokio::test]
 async fn health_is_public_and_reports_the_projection_version() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
@@ -927,8 +935,8 @@ async fn health_is_public_and_reports_the_projection_version() {
 
 #[tokio::test]
 async fn api_catalog_is_public_state_independent_and_route_complete() {
-    let provisioned = harness();
-    let unprovisioned = unprovisioned_harness();
+    let provisioned = harness().await;
+    let unprovisioned = unprovisioned_harness().await;
     assert!(
         provisioned
             .api
@@ -999,7 +1007,7 @@ async fn the_catalog_names_the_four_goals_in_the_vocabulary_the_reports_use() {
     // runtime. This is the guard against the change that would make them able to:
     // a `goal` spelled into the catalog by hand, which reads identically today and
     // drifts the first time the vocabulary moves.
-    let harness = harness();
+    let harness = harness().await;
     let (_, _, body) = call_raw(&harness.router, get("/.well-known/api-catalog", None)).await;
     let catalog: Value = serde_json::from_slice(&body).expect("catalog JSON");
 
@@ -1035,7 +1043,7 @@ async fn the_catalog_names_the_four_goals_in_the_vocabulary_the_reports_use() {
 async fn every_documented_path_answers_something_other_than_404() {
     // A spec describing a non-existent route is an instruction
     // for the external agent to correct itself based on false guidance.
-    let harness = harness();
+    let harness = harness().await;
     for (path, item) in harness.api.paths.paths.clone() {
         // `PathItem` in utoipa 5 stores operations in separate fields
         // rather than a map: enumerate exactly the methods used by the API.
@@ -1082,7 +1090,7 @@ async fn every_documented_path_answers_something_other_than_404() {
 #[tokio::test]
 async fn a_request_without_a_token_is_rejected_with_bare_bearer_challenge() {
     // Authentication from day one (§14).
-    let harness = harness();
+    let harness = harness().await;
     let (status, headers, bytes) = call_raw(&harness.router, get("/v1/accounts", None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -1109,7 +1117,7 @@ async fn a_request_without_a_token_is_rejected_with_bare_bearer_challenge() {
 
 #[tokio::test]
 async fn an_unknown_token_is_rejected_with_invalid_token_challenge() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, headers, bytes) =
         call_raw(&harness.router, get("/v1/accounts", Some("unknown-token"))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1137,7 +1145,7 @@ async fn an_unknown_token_is_rejected_with_invalid_token_challenge() {
 
 #[tokio::test]
 async fn a_read_only_token_may_not_submit_operations() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "test",
         "operations": [{
@@ -1159,7 +1167,7 @@ async fn a_read_only_token_may_not_submit_operations() {
 
 #[tokio::test]
 async fn an_invalid_amount_is_reported_as_a_200_row_verdict_with_field_expected_actual() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "test",
         "operations": [{
@@ -1184,8 +1192,8 @@ async fn an_invalid_amount_is_reported_as_a_200_row_verdict_with_field_expected_
 
 #[tokio::test]
 async fn opening_position_assertions_reach_the_event_through_the_api() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let claimed = date!(2021 - 05 - 01);
     let body = json!({
         "source_label": "manual entry",
@@ -1233,7 +1241,7 @@ async fn opening_position_assertions_reach_the_event_through_the_api() {
 
 #[tokio::test]
 async fn a_carried_forward_price_is_not_accepted_from_the_api() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "manual entry",
         "operations": [{
@@ -1256,7 +1264,7 @@ async fn a_carried_forward_price_is_not_accepted_from_the_api() {
 
 #[tokio::test]
 async fn a_stale_price_is_not_accepted_from_the_api() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "manual entry",
         "operations": [{
@@ -1281,8 +1289,8 @@ async fn a_stale_price_is_not_accepted_from_the_api() {
 async fn the_stage_one_question_is_answered_end_to_end() {
     // The epic's acceptance criterion via the API: how much was contributed, how much
     // was withdrawn, and the pre-tax return.
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
 
     let contour = json!({
         "title": "My portfolio",
@@ -1477,7 +1485,7 @@ async fn the_stage_one_question_is_answered_end_to_end() {
 
 #[tokio::test]
 async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let (status, instrument_response) = call(
         &harness.router,
         post(
@@ -1496,7 +1504,7 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{instrument_response}");
-    seed_custody(&path, &harness);
+    seed_custody(&path, &harness).await;
     seed_bond_market(&harness).await;
 
     let contour = json!({
@@ -1743,8 +1751,8 @@ async fn seed_share_quote(harness: &Harness) {
 /// the same day, published a figure.
 #[tokio::test]
 async fn the_two_report_routes_publish_one_price_for_one_instrument() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     seed_share_quote(&harness).await;
 
     let (status, contour_response) = call(
@@ -1834,7 +1842,7 @@ async fn the_two_report_routes_publish_one_price_for_one_instrument() {
 
 #[tokio::test]
 async fn returns_report_loads_official_fx_from_market_store() {
-    let harness = harness();
+    let harness = harness().await;
     seed_market(&harness).await;
 
     let contour = json!({
@@ -1886,7 +1894,7 @@ async fn returns_report_loads_official_fx_from_market_store() {
 
 #[tokio::test]
 async fn repeating_an_idempotent_operation_returns_the_same_event() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "test",
         "operations": [{
@@ -1916,7 +1924,7 @@ async fn repeating_an_idempotent_operation_returns_the_same_event() {
 
 #[tokio::test]
 async fn the_openapi_document_declares_bearer_security() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -1932,7 +1940,7 @@ async fn the_openapi_document_declares_bearer_security() {
 
 #[tokio::test]
 async fn the_journal_openapi_does_not_advertise_rule_version_filter() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -1949,7 +1957,7 @@ async fn the_journal_openapi_does_not_advertise_rule_version_filter() {
 
 #[tokio::test]
 async fn the_journal_limit_bounds_are_published_in_openapi() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -1966,7 +1974,7 @@ async fn the_journal_limit_bounds_are_published_in_openapi() {
 
 #[tokio::test]
 async fn the_journal_openapi_requires_and_describes_stands() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -1987,7 +1995,7 @@ async fn the_journal_openapi_requires_and_describes_stands() {
 
 #[tokio::test]
 async fn the_journal_openapi_describes_superseded_by_at_the_property() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2034,7 +2042,7 @@ async fn the_journal_openapi_describes_superseded_by_at_the_property() {
 
 #[tokio::test]
 async fn the_openapi_hoisting_applies_to_another_optional_reference() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2064,7 +2072,7 @@ async fn the_openapi_hoisting_applies_to_another_optional_reference() {
 
 #[tokio::test]
 async fn the_balances_route_names_the_report_that_totals() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2086,7 +2094,7 @@ async fn the_balances_route_names_the_report_that_totals() {
 
 #[tokio::test]
 async fn the_journal_openapi_distinguishes_account_and_touching_filters() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2126,7 +2134,7 @@ async fn the_journal_openapi_distinguishes_account_and_touching_filters() {
 
 #[tokio::test]
 async fn no_openapi_request_body_accepts_credential_fields() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2223,7 +2231,7 @@ fn schema_contains_credential(
 
 #[tokio::test]
 async fn the_openapi_document_exposes_only_source_price_qualities() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -2303,7 +2311,7 @@ async fn the_openapi_document_enumerates_and_explains_every_verdict() {
     // look up somewhere else, and every hand-written list drifts: the one in
     // the agent skill listed eight of the then ten and omitted
     // `possible_duplicate` and `quarantined`, both of which production emits.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2336,7 +2344,7 @@ async fn the_openapi_document_enumerates_and_explains_every_verdict() {
 
 #[tokio::test]
 async fn import_reconciliation_codes_are_typed_and_explained() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2378,7 +2386,7 @@ async fn the_verdict_vocabulary_admits_which_codes_nothing_emits() {
     // Each sentence must also send the reader somewhere real, because "nothing
     // emits this" alone converts a false promise into a dead end. Decisions
     // 0009 and 0011 are the argument; these are the destinations they name.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2424,7 +2432,7 @@ async fn the_openapi_document_enumerates_and_explains_every_refusal() {
     // `not_computable` is a refusal the owner is told about. A bare code says
     // nothing without a document beside it; the vocabulary carries the sentence
     // itself, and the same list types every value that may be refused.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2477,7 +2485,7 @@ async fn the_openapi_document_enumerates_and_explains_every_refusal() {
 
 #[tokio::test]
 async fn the_openapi_document_enumerates_and_explains_the_data_quality_status() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2500,7 +2508,7 @@ async fn the_openapi_document_enumerates_and_explains_where_a_missing_input_come
     // names the holder of a value rather than the work of obtaining one
     // concluded a fourth code was missing (`iaam-k6l7`). The list and the
     // sentences are what close that, so both are checked here.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2539,7 +2547,7 @@ async fn the_openapi_document_enumerates_and_explains_where_a_missing_input_come
 /// is not a question. An agent that lacked it read one out to the owner.
 #[tokio::test]
 async fn the_openapi_document_says_which_fields_are_put_to_the_owner() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2725,7 +2733,7 @@ fn variant<'a>(spec: &'a serde_json::Value, schema: &str, tag: &str) -> &'a serd
 /// never asked about again.
 #[tokio::test]
 async fn a_question_says_how_the_row_is_named_to_the_owner() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2751,7 +2759,7 @@ async fn a_question_says_how_the_row_is_named_to_the_owner() {
 /// journal that never moved. Neither is corrected by the word it was read from.
 #[tokio::test]
 async fn a_session_says_what_ending_it_does_to_the_journal() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2773,7 +2781,7 @@ async fn a_session_says_what_ending_it_does_to_the_journal() {
 /// Both are refusals of the request schema and neither was stated on it.
 #[tokio::test]
 async fn an_amount_is_positive_and_a_surplus_digit_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2797,7 +2805,7 @@ async fn an_amount_is_positive_and_a_surplus_digit_is_refused() {
 /// receiving account and said nothing about the row it must not be paired with.
 #[tokio::test]
 async fn a_transfer_is_one_row_submitted_from_the_sending_side() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2820,7 +2828,7 @@ async fn a_transfer_is_one_row_submitted_from_the_sending_side() {
 /// easy to read as spending, which is the one thing it is not.
 #[tokio::test]
 async fn a_stated_far_side_never_sends_money_out_of_the_perimeter() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2849,7 +2857,7 @@ async fn a_stated_far_side_never_sends_money_out_of_the_perimeter() {
 /// decision without the thing being decided.
 #[tokio::test]
 async fn a_proposed_rule_says_what_its_condition_asks_about() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2876,7 +2884,7 @@ async fn a_proposed_rule_says_what_its_condition_asks_about() {
 /// boundary nobody asserted.
 #[tokio::test]
 async fn a_reconstructed_opening_says_what_a_missing_acquisition_date_costs() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2898,7 +2906,7 @@ async fn a_reconstructed_opening_says_what_a_missing_acquisition_date_costs() {
 /// reading, so the same error, reproduced and reported as corroboration.
 #[tokio::test]
 async fn a_confirmation_is_independent_only_where_two_channels_agree() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2926,7 +2934,7 @@ async fn a_confirmation_is_independent_only_where_two_channels_agree() {
 /// dates are.
 #[tokio::test]
 async fn a_return_is_reported_over_the_whole_history_and_never_a_sub_interval() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2954,7 +2962,7 @@ async fn a_return_is_reported_over_the_whole_history_and_never_a_sub_interval() 
 /// figure that arrived after it.
 #[tokio::test]
 async fn a_change_that_does_not_join_is_a_discrepancy_and_not_a_correction() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -2980,7 +2988,7 @@ async fn a_change_that_does_not_join_is_a_discrepancy_and_not_a_correction() {
 /// client meets it.
 #[tokio::test]
 async fn an_unasserted_opening_is_never_reported_as_an_error_the_owner_made() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3010,7 +3018,7 @@ async fn an_unasserted_opening_is_never_reported_as_an_error_the_owner_made() {
 /// that would have corrected the reading is the one such a client never opens.
 #[tokio::test]
 async fn only_one_verdict_sends_the_owner_looking_for_an_error() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3038,7 +3046,7 @@ async fn only_one_verdict_sends_the_owner_looking_for_an_error() {
 /// warns against on itself.
 #[tokio::test]
 async fn two_figures_over_different_contour_versions_are_not_comparable() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3070,7 +3078,7 @@ async fn two_figures_over_different_contour_versions_are_not_comparable() {
 /// with a word it can mistake for the whole answer.
 #[tokio::test]
 async fn a_price_says_its_three_statements_of_the_basis_need_not_agree() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3119,7 +3127,7 @@ async fn a_price_says_its_three_statements_of_the_basis_need_not_agree() {
 /// invented a publication that never happened.
 #[tokio::test]
 async fn an_interval_says_whether_its_start_was_observed_or_inferred() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3147,7 +3155,7 @@ async fn an_interval_says_whether_its_start_was_observed_or_inferred() {
 /// nothing at all is wrong.
 #[tokio::test]
 async fn an_unconfirmed_payment_and_absent_evidence_are_not_reported_alike() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3176,7 +3184,7 @@ async fn an_unconfirmed_payment_and_absent_evidence_are_not_reported_alike() {
 /// tells him a figure went away when only a boundary moved.
 #[tokio::test]
 async fn a_retirement_says_what_it_leaves_untouched() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3205,7 +3213,7 @@ async fn a_retirement_says_what_it_leaves_untouched() {
 /// arriving from an account not on it is a contribution.
 #[tokio::test]
 async fn a_contour_says_what_its_boundary_does_to_a_movement() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3233,7 +3241,7 @@ async fn a_contour_says_what_its_boundary_does_to_a_movement() {
 /// standing.
 #[tokio::test]
 async fn a_caveats_remedies_are_not_the_remedies_of_its_neighbour() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3258,7 +3266,7 @@ async fn a_caveats_remedies_are_not_the_remedies_of_its_neighbour() {
 /// when an account changed hands, or the reverse.
 #[tokio::test]
 async fn a_category_answers_a_different_question_from_the_perimeter() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3284,7 +3292,7 @@ async fn a_category_answers_a_different_question_from_the_perimeter() {
 /// meaning to change a fact does not reach for a rule to do it.
 #[tokio::test]
 async fn an_impact_says_which_figures_a_rule_cannot_move() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3312,7 +3320,7 @@ async fn an_impact_says_which_figures_a_rule_cannot_move() {
 /// renames something.
 #[tokio::test]
 async fn an_account_says_which_of_its_names_to_send() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3334,7 +3342,7 @@ async fn an_account_says_which_of_its_names_to_send() {
 /// every other owner.
 #[tokio::test]
 async fn a_dated_resolution_keeps_its_two_refusals_apart() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3368,7 +3376,7 @@ async fn a_dated_resolution_keeps_its_two_refusals_apart() {
 /// first learns the same thing rather than nothing.
 #[tokio::test]
 async fn an_instrument_keeps_its_three_currencies_apart() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3419,7 +3427,7 @@ async fn an_instrument_keeps_its_three_currencies_apart() {
 /// the caller's to undo.
 #[tokio::test]
 async fn retracting_an_import_is_checked_against_a_bound_not_trusted() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3449,7 +3457,7 @@ async fn retracting_an_import_is_checked_against_a_bound_not_trusted() {
 /// journal is guessing which facts to retract.
 #[tokio::test]
 async fn corrections_are_diagnosed_from_the_journal_not_guessed_from_a_total() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3470,7 +3478,7 @@ async fn corrections_are_diagnosed_from_the_journal_not_guessed_from_a_total() {
 /// own recollection of the same figure the statement gave him.
 #[tokio::test]
 async fn an_owners_balance_is_not_an_independent_confirmation() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3496,7 +3504,7 @@ async fn an_owners_balance_is_not_an_independent_confirmation() {
 /// where no client reads anything.
 #[tokio::test]
 async fn a_settled_item_says_it_wants_nothing() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3517,7 +3525,7 @@ async fn a_settled_item_says_it_wants_nothing() {
 /// published reason to prefer this field over the one a person reads.
 #[tokio::test]
 async fn the_printed_string_is_the_accounts_identity_and_not_its_title() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3543,7 +3551,7 @@ async fn the_printed_string_is_the_accounts_identity_and_not_its_title() {
 /// invites.
 #[tokio::test]
 async fn a_title_is_asked_for_and_never_guessed() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3566,7 +3574,7 @@ async fn a_title_is_asked_for_and_never_guessed() {
 /// that sounds like the place does not exist.
 #[tokio::test]
 async fn a_custody_cell_is_named_by_the_owners_own_title_and_nothing_else() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3594,7 +3602,7 @@ async fn a_custody_cell_is_named_by_the_owners_own_title_and_nothing_else() {
 /// and a transport-level refusal has no schema of its own to say it on.
 #[tokio::test]
 async fn the_market_series_say_a_refusal_for_frequency_is_answered_by_lowering_it() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3638,7 +3646,7 @@ async fn every_operation_that_needs_a_token_publishes_the_refusal_for_frequency(
     const METHODS: [&str; 8] = [
         "get", "put", "post", "delete", "options", "head", "patch", "trace",
     ];
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3712,7 +3720,7 @@ async fn every_operation_that_needs_a_token_publishes_the_refusal_for_frequency(
 /// guess it makes is «now».
 #[tokio::test]
 async fn a_refusal_for_frequency_says_how_many_seconds_are_left() {
-    let harness = rate_limited_harness(1);
+    let harness = rate_limited_harness(1).await;
     let (status, _headers, _body) = call_raw(
         &harness.router,
         get("/v1/accounts", Some(&harness.owner_token)),
@@ -3756,7 +3764,7 @@ async fn a_published_code_is_the_code_the_response_carries() {
     // The vocabularies enumerate; they must enumerate what actually arrives.
     // A schema that lists ten plausible codes while the server sends an
     // eleventh is worse than no schema, because it is believed.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
     let verdicts = published_vocabulary(&spec, "VerdictCodeDto");
@@ -3819,7 +3827,7 @@ async fn a_published_code_is_the_code_the_response_carries() {
 
 #[tokio::test]
 async fn the_openapi_document_declares_report_quality_and_liquidation_fields() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3847,7 +3855,7 @@ async fn the_openapi_document_declares_report_quality_and_liquidation_fields() {
 
 #[tokio::test]
 async fn the_openapi_document_declares_quotation_basis_provenance_fields() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -3865,7 +3873,7 @@ async fn the_report_shape_is_frozen_by_a_snapshot() {
     // Field-by-field checks catch an incorrect value, but do not catch
     // a missing field or the appearance of an extra one. A snapshot captures
     // the whole shape (§15.8).
-    let harness = harness();
+    let harness = harness().await;
     let contour = json!({
         "title": "Snapshot",
         "accounts": [harness.account.inner()],
@@ -3928,7 +3936,7 @@ async fn an_agent_may_submit_and_make_reversible_reference_decisions() {
     // Scope is a barrier for credentials and read-only access, not a second
     // authority grade for reversible decisions. The agent submits transactions
     // and may create reference decisions whose undo is named by the contract.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, body) = call(
         &harness.router,
@@ -4042,7 +4050,7 @@ async fn an_agent_may_submit_and_make_reversible_reference_decisions() {
 async fn a_created_account_appears_in_the_list_and_a_readonly_token_can_read_it() {
     // A newly created account must be retrievable: an empty list
     // looks like «there are no accounts», not «the list is broken».
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -4081,7 +4089,7 @@ async fn each_verdict_names_the_row_it_belongs_to() {
     // Verdicts arrive one row per transaction, and the agent fixes exactly the one
     // it was told about. Incorrect numbering sends it to fix
     // a valid row, while leaving the invalid one unchanged.
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         post(
@@ -4171,7 +4179,7 @@ async fn each_verdict_names_the_row_it_belongs_to() {
 /// parser wrote» was not a set anybody could ask the journal for (`iaam-h69n`).
 #[tokio::test]
 async fn a_csv_row_records_the_parser_that_read_it_and_not_a_hand_entry() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
         2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,parser-version-csv\n";
     let request = Request::builder()
@@ -4209,7 +4217,7 @@ async fn a_csv_row_records_the_parser_that_read_it_and_not_a_hand_entry() {
 async fn a_row_an_agent_typed_records_that_nothing_here_read_it() {
     // The other half of the pair: `ingest/manual/1` still means what it says,
     // and it must stay the value for a row a caller stated itself.
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let body = json!({
         "operations": [{
             "account": harness.account.inner(),
@@ -4244,7 +4252,7 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
     // The directory is built from the owner's accounts. An empty one
     // would reject the entire document on the account field, and «no account was set up»
     // would become indistinguishable from «the lookup failed».
-    let harness = harness();
+    let harness = harness().await;
     let before = journal_rows(&harness).await;
     let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
         2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,csv-1\n\
@@ -4335,7 +4343,7 @@ async fn a_csv_document_resolves_account_names_and_numbers_its_rows() {
 /// the journal is read back per row to state that they did not.
 #[tokio::test]
 async fn a_document_names_an_account_by_the_identifier_its_source_prints() {
-    let harness = harness();
+    let harness = harness().await;
     let created = account_with(
         &harness,
         &json!({
@@ -4395,7 +4403,7 @@ async fn a_document_names_an_account_by_the_identifier_its_source_prints() {
 /// even if both wordings are individually good.
 #[tokio::test]
 async fn a_document_and_a_batch_refuse_an_unknown_account_in_the_same_words() {
-    let harness = harness();
+    let harness = harness().await;
     let stranger = "an-account-he-never-declared";
 
     let document = format!(
@@ -4512,7 +4520,7 @@ async fn preview_csv_import(harness: &Harness, label: &str) -> (StatusCode, Valu
 
 #[tokio::test]
 async fn import_preview_describes_the_swap_without_writing_it() {
-    let harness = harness();
+    let harness = harness().await;
     let document = format!(
         "{CSV_HEADER}\n\
          2025-01-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
@@ -4556,7 +4564,7 @@ async fn rows_submitted_as_csv_are_retractable_as_an_import() {
     // declaration the caller can re-derive — could never reach these rows.
     // Every other channel's rows were retractable as a group; this one's were
     // not, and the caller was left reversing them one event at a time.
-    let harness = harness();
+    let harness = harness().await;
     let document = format!(
         "{CSV_HEADER}\n\
          2025-01-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
@@ -4585,7 +4593,7 @@ async fn re_sending_one_csv_document_writes_nothing_the_second_time() {
     // The digest of the document plus the row's own line number is what §10.6
     // calls a level-4 identity, and the broker-report path already states it the
     // same way.
-    let harness = harness();
+    let harness = harness().await;
     let document = format!(
         "{CSV_HEADER}\n\
          2025-02-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
@@ -4620,7 +4628,7 @@ async fn two_identical_csv_rows_stay_two_operations() {
     // one. The document is the evidence that there were two, because the parser
     // saw two rows — which is why the key is the document plus the locator and
     // never the row's contents.
-    let harness = harness();
+    let harness = harness().await;
     let document = format!(
         "{CSV_HEADER}\n\
          2025-03-01,deposit,Brokerage,,,,,100.00,,,RUB\n\
@@ -4645,7 +4653,7 @@ async fn one_csv_label_is_retracted_without_touching_another() {
     // What the label is worth here, and it is what it is worth on the
     // conclusive route: two months of one account through one channel are one
     // source and two imports, and retracting one must leave the other counting.
-    let harness = harness();
+    let harness = harness().await;
     let january = format!(
         "{CSV_HEADER}\n\
          2025-01-05,deposit,Brokerage,,,,,100.00,,,RUB\n"
@@ -4685,7 +4693,7 @@ async fn unlabelled_csv_rows_are_retracted_as_the_unnamed_group() {
     // belong to no named import and are retracted together with every other
     // unlabelled row of the same account and channel. Before the fix they
     // belonged to a source nobody could name, which is not the same thing.
-    let harness = harness();
+    let harness = harness().await;
     let document = format!(
         "{CSV_HEADER}\n\
          2025-04-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
@@ -4710,7 +4718,7 @@ async fn a_csv_label_the_derivation_cannot_mean_is_refused() {
     // The same bound the conclusive route puts on `source.label`, reported
     // against the field the caller actually wrote — `label`, because a request
     // with no `source` object has nothing called `source.label` in it.
-    let harness = harness();
+    let harness = harness().await;
     let document = format!(
         "{CSV_HEADER}\n\
          2025-05-01,deposit,Brokerage,,,,,100.00,,,RUB\n"
@@ -4723,7 +4731,7 @@ async fn a_csv_label_the_derivation_cannot_mean_is_refused() {
 
 #[tokio::test]
 async fn ambiguous_account_name_is_rejected_when_resolving_row() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     {
         let store = SqliteStore::open(&path).expect("second connection");
         store
@@ -4782,7 +4790,7 @@ async fn ambiguous_account_name_is_rejected_when_resolving_row() {
 async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
     // Silently defaulting to «today» instead of rejecting an unrecognised date would produce
     // a report for the wrong date — apparently valid, but for a different period.
-    let harness = harness();
+    let harness = harness().await;
     let (status, contour) = call(
         &harness.router,
         post(
@@ -4858,7 +4866,7 @@ async fn an_unparsable_report_date_is_refused_and_a_valid_one_is_honoured() {
 
 #[tokio::test]
 async fn report_series_entries_match_single_date_routes_in_requested_order() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, contour) = call(
         &harness.router,
         post(
@@ -4953,7 +4961,7 @@ async fn report_series_entries_match_single_date_routes_in_requested_order() {
 
 #[tokio::test]
 async fn report_series_refuses_over_cap_duplicates_and_partial_failures() {
-    let harness = harness();
+    let harness = harness().await;
     let over_cap = (0..32)
         .map(|offset| (date!(2025 - 01 - 01) + TimeDuration::days(offset)).to_string())
         .collect::<Vec<_>>()
@@ -5031,7 +5039,7 @@ async fn report_series_refuses_over_cap_duplicates_and_partial_failures() {
 
 #[tokio::test]
 async fn report_series_routes_publish_parameters_and_responses_in_openapi() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK, "{spec}");
 
@@ -5065,7 +5073,7 @@ async fn a_report_for_today_leaves_a_snapshot_and_a_report_for_a_past_date_does_
     // same key and silently substitute its state into the next request.
     // This is checked with a direct database query: from the outside, the substitution looks
     // like an ordinary response, just with incorrect figures.
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let (status, contour) = call(
         &harness.router,
         post(
@@ -5179,7 +5187,7 @@ async fn an_event_added_behind_the_snapshot_boundary_forces_a_recompute_not_a_fa
     // the fingerprint of the folded prefix: the core refuses to advance
     // the snapshot, while the wrapper must recalculate the entire log and still
     // return a response — one that accounts for the new event.
-    let harness = harness();
+    let harness = harness().await;
     let (status, contour) = call(
         &harness.router,
         post(
@@ -5273,7 +5281,7 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
     // Revocation is not deletion: the record remains in the history, but ceases to
     // be active. A record missing from the list would mean «there was no
     // access», not «access was revoked at such-and-such time».
-    let harness = broker_access_harness();
+    let harness = broker_access_harness().await;
 
     let (status, list) = call(
         &harness.router,
@@ -5315,7 +5323,7 @@ async fn a_provisioned_access_is_listed_and_a_revoked_one_stops_being_current() 
 async fn a_read_only_token_may_not_touch_broker_access_at_all() {
     // Reading the list and revoking an access are management operations, not portfolio
     // reading. A read token manages nothing.
-    let harness = broker_access_harness();
+    let harness = broker_access_harness().await;
 
     let (status, body) = call(
         &harness.router,
@@ -5347,7 +5355,7 @@ fn find_access(list: &Value, id: &str) -> Option<Value> {
 
 #[tokio::test]
 async fn the_removed_claim_route_is_not_documented_or_available() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, body) = call(
         &harness.router,
@@ -5374,7 +5382,7 @@ async fn an_owner_token_is_never_issued_through_the_api() {
     // An owner is created with `iaam claim --label <label>`. A route issuing
     // full access would turn one stolen token into indistinguishable copies,
     // and revoking the original would change nothing.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, body) = call(
         &harness.router,
@@ -5396,7 +5404,7 @@ async fn an_agent_token_may_not_manage_tokens_at_all() {
     // An agent submits operations, but does not grant access to the portfolio:
     // otherwise a stolen agent token could issue itself a replacement
     // faster than the owner could revoke it.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, body) = call(
         &harness.router,
@@ -5435,7 +5443,7 @@ async fn the_token_list_carries_neither_tokens_nor_their_hashes() {
     // exposing hashes would be a list of skeleton keys. Check for the substring
     // throughout the entire body, not by field: a field added tomorrow will not
     // be checked by eye.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -5478,7 +5486,7 @@ async fn a_revoked_token_stops_being_accepted_and_stays_in_the_history() {
     // Revocation is not deletion: the record remains as history, but no longer
     // grants access. A record missing from the list would answer «no such token»,
     // rather than «the token was revoked at such-and-such time».
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -5533,7 +5541,7 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
     // on the revocation request, anyone knowing someone else's identifier could revoke
     // their token. The response deliberately matches «not found» — different responses
     // would tell an outsider that the record exists (§14).
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
 
     // The second owner's token is created through a second connection to the same
     // database: it cannot be created via the API — the system has only one owner, and this is
@@ -5585,7 +5593,7 @@ async fn a_token_of_another_owner_is_as_absent_as_a_missing_one() {
 
 #[tokio::test]
 async fn classification_rules_are_visible_versioned_and_retirable() {
-    let harness = harness();
+    let harness = harness().await;
     let request = json!({
         "matcher": { "kind": "income" },
         "outcome": { "kind": "external_flow" },
@@ -5634,7 +5642,7 @@ async fn classification_rules_are_visible_versioned_and_retirable() {
 
 #[tokio::test]
 async fn a_read_only_token_cannot_manage_classification_rules() {
-    let harness = harness();
+    let harness = harness().await;
     let rule = json!({
         "matcher": { "kind": "income" },
         "outcome": { "kind": "external_flow" },
@@ -5674,7 +5682,7 @@ async fn a_read_only_token_cannot_manage_classification_rules() {
 
 #[tokio::test]
 async fn reconciliation_returns_nonempty_status_content() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     add_reconciliation_assertion(&path, harness.owner, harness.account);
 
     let (status, response) = call(
@@ -5710,7 +5718,7 @@ async fn reconciliation_returns_nonempty_status_content() {
 
 #[tokio::test]
 async fn reconciliation_balance_returns_nonempty_status_content() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     add_reconciliation_assertion(&path, harness.owner, harness.account);
     let balance = json!({
         "account": harness.account.inner(),
@@ -5750,7 +5758,7 @@ async fn reconciliation_balance_returns_nonempty_status_content() {
 /// reported exactly as one that did.
 #[tokio::test]
 async fn a_recorded_balance_says_whether_the_claim_reached_the_journal() {
-    let harness = harness();
+    let harness = harness().await;
     let claim = json!({
         "account": harness.account.inner(),
         "from": "2026-08-01",
@@ -5799,7 +5807,7 @@ async fn a_recorded_balance_says_whether_the_claim_reached_the_journal() {
 /// can read that against: two `inserted` entries naming two different events.
 #[tokio::test]
 async fn an_opening_and_a_closing_claim_are_two_written_facts() {
-    let harness = harness();
+    let harness = harness().await;
     let mut written = Vec::new();
     for at in ["opening", "closing"] {
         let (status, response) = call(
@@ -5885,7 +5893,7 @@ fn add_coverage_gap(
 /// about an account whose import demonstrably refused a row.
 #[tokio::test]
 async fn the_reconciliation_response_carries_a_gap_that_matched_no_status() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     add_coverage_gap(
         &path,
         harness.owner,
@@ -5933,7 +5941,7 @@ async fn the_reconciliation_response_carries_a_gap_that_matched_no_status() {
 /// must render the same status, so a re-divergence fails here and not at a reader.
 #[tokio::test]
 async fn the_balances_report_and_the_reconciliation_route_render_one_status() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     add_reconciliation_assertion_for_period(
         &path,
         harness.owner,
@@ -6009,7 +6017,8 @@ async fn broker_sync_numbers_recorded_verdicts_from_one() {
     let harness = harness_with_factory(
         SqliteStore::open_in_memory().expect("in-memory database"),
         Some(factory),
-    );
+    )
+    .await;
     let body = json!({
         "account": harness.account.inner(),
         "from": "2025-01-01",
@@ -6039,7 +6048,8 @@ async fn broker_sync_returns_the_scenario_outcome() {
     let harness = harness_with_factory(
         SqliteStore::open_in_memory().expect("in-memory database"),
         Some(factory),
-    );
+    )
+    .await;
     let body = json!({
         "account": harness.account.inner(),
         "from": "2025-01-01",
@@ -6059,7 +6069,7 @@ async fn broker_sync_returns_the_scenario_outcome() {
 
 #[tokio::test]
 async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "account": harness.account.inner(),
         "from": "2025-01-01",
@@ -6085,7 +6095,7 @@ async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() 
 
 #[tokio::test]
 async fn ingest_verdicts_return_their_populated_fields() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "contract",
         "operations": [{
@@ -6151,7 +6161,7 @@ async fn ingest_verdicts_return_their_populated_fields() {
 
 #[tokio::test]
 async fn a_document_verdict_return_contains_its_detail() {
-    let harness = harness();
+    let harness = harness().await;
     let request = Request::builder()
         .uri(format!("/v1/documents?account={}", harness.account.inner()))
         .method("POST")
@@ -6319,27 +6329,27 @@ fn seed_directory(store: &SqliteStore) -> InstrumentId {
     instrument
 }
 
-fn seeded_harness() -> Harness {
+async fn seeded_harness() -> Harness {
     let store = SqliteStore::open_in_memory().expect("in-memory database");
     let instrument = seed_directory(&store);
-    let mut harness = harness_with(store);
+    let mut harness = harness_with(store).await;
     harness.instrument = instrument;
     harness
 }
 
-fn server_with_one_alias() -> (Router, String, InstrumentId) {
-    let harness = seeded_harness();
+async fn server_with_one_alias() -> (Router, String, InstrumentId) {
+    let harness = seeded_harness().await;
     (harness.router, harness.owner_token, harness.instrument)
 }
 
-fn server_with_one_alias_and_agent_token() -> (Router, String, InstrumentId) {
-    let harness = seeded_harness();
+async fn server_with_one_alias_and_agent_token() -> (Router, String, InstrumentId) {
+    let harness = seeded_harness().await;
     (harness.router, harness.agent_token, harness.instrument)
 }
 
 #[tokio::test]
 async fn listing_instruments_returns_the_global_directory() {
-    let (app, token, instrument) = server_with_one_alias();
+    let (app, token, instrument) = server_with_one_alias().await;
     let (status, body) = call(&app, get("/v1/instruments", Some(&token))).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -6354,7 +6364,7 @@ async fn listing_instruments_returns_the_global_directory() {
 
 #[tokio::test]
 async fn resolving_a_known_code_returns_its_instrument() {
-    let (app, token, instrument) = server_with_one_alias();
+    let (app, token, instrument) = server_with_one_alias().await;
     let (status, body) = call(
         &app,
         post(
@@ -6371,7 +6381,7 @@ async fn resolving_a_known_code_returns_its_instrument() {
 
 #[tokio::test]
 async fn resolving_an_unknown_code_is_a_404() {
-    let (app, token, _) = server_with_one_alias();
+    let (app, token, _) = server_with_one_alias().await;
     let (status, _) = call(
         &app,
         post(
@@ -6387,7 +6397,7 @@ async fn resolving_an_unknown_code_is_a_404() {
 
 #[tokio::test]
 async fn resolving_a_code_outside_its_interval_names_the_known_range() {
-    let (app, token, _) = server_with_one_alias();
+    let (app, token, _) = server_with_one_alias().await;
     let (status, body) = call(
         &app,
         post(
@@ -6445,7 +6455,7 @@ async fn a_two_word_namespace_resolves_under_the_spelling_the_contract_publishes
             source: SourceId::new_random(),
         })
         .expect("alias");
-    let harness = harness_with(store);
+    let harness = harness_with(store).await;
 
     let (status, body) = call(
         &harness.router,
@@ -6471,7 +6481,7 @@ const NAMESPACE_CODES: [&str; 5] = ["isin", "moex_secid", "ticker", "figi", "bro
 
 #[tokio::test]
 async fn an_invalid_namespace_is_refused_with_the_valid_ones_named() {
-    let (app, token, _) = server_with_one_alias();
+    let (app, token, _) = server_with_one_alias().await;
     // Typing this field moved its refusal upstream into the body extractor, and
     // for as long as that extractor was axum's own the refusal arrived as text.
     // `refusal` asserts the envelope; the assertions below assert what is in it.
@@ -6509,7 +6519,7 @@ async fn the_openapi_document_enumerates_every_namespace_and_explains_the_resolv
     // Reported from outside: an agent guessed `code_kind`, `code` and `as_of`
     // before reading the schema, and the schema then did not say which
     // namespaces exist. Both halves are checked here.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -6545,7 +6555,7 @@ async fn every_namespace_code_arrives_with_the_sentence_that_explains_it() {
     // `dto.rs` reached a reader of `dto.rs` and nobody else. `moex_secid` next
     // to `ticker` is exactly the choice a client gets wrong when the document
     // says only that both exist.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -6584,7 +6594,7 @@ async fn every_namespace_code_arrives_with_the_sentence_that_explains_it() {
 
 #[tokio::test]
 async fn the_instrument_dto_does_not_leak_the_alias_source() {
-    let (app, token, instrument) = server_with_one_alias();
+    let (app, token, instrument) = server_with_one_alias().await;
     let (status, body) = call(
         &app,
         get(
@@ -6603,7 +6613,7 @@ async fn the_instrument_dto_does_not_leak_the_alias_source() {
 
 #[tokio::test]
 async fn an_agent_token_may_not_write_to_the_directory() {
-    let (app, agent_token, _) = server_with_one_alias_and_agent_token();
+    let (app, agent_token, _) = server_with_one_alias_and_agent_token().await;
     let (status, _) = call(
         &app,
         post(
@@ -6623,7 +6633,7 @@ async fn an_agent_token_may_not_write_to_the_directory() {
 
 #[tokio::test]
 async fn an_owner_can_record_an_instrument_in_directory() {
-    let harness = harness();
+    let harness = harness().await;
     let instrument = Uuid::new_v4().to_string();
     let (status, body) = call(
         &harness.router,
@@ -6662,7 +6672,7 @@ async fn an_owner_can_record_an_instrument_in_directory() {
 
 #[tokio::test]
 async fn market_reference_routes_require_auth_and_preserve_provenance() {
-    let harness = harness();
+    let harness = harness().await;
     seed_market(&harness).await;
 
     let prices_path = format!(
@@ -6750,9 +6760,9 @@ async fn an_empty_series_still_says_how_far_the_data_goes() {
     // value in that interval". The two are different facts, and only the
     // completeness boundary tells them apart, so it rides on the answer rather
     // than on a row that may not exist.
-    let held = harness();
+    let held = harness().await;
     seed_market(&held).await;
-    let empty = harness();
+    let empty = harness().await;
 
     let prices_of = |instrument: iaam_core::ids::InstrumentId, from: &str, to: &str| {
         format!(
@@ -6812,7 +6822,7 @@ async fn an_empty_series_still_says_how_far_the_data_goes() {
 
 #[tokio::test]
 async fn the_market_series_wrapper_is_written_down_in_the_contract() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -6877,7 +6887,7 @@ async fn the_exchange_rate_route_spells_the_pair_and_the_interval_apart() {
     // so an agent that had learned the interval sent `from=2026-01-01` and was
     // told to send a currency instead. The pair is `base`/`quote`; `from` and
     // `to` are the interval, as on every other route.
-    let harness = harness();
+    let harness = harness().await;
     seed_market(&harness).await;
 
     let path = "/v1/market/fx?base=USD&quote=RUB&from=2026-08-01&to=2026-08-03";
@@ -6927,7 +6937,7 @@ async fn one_name_for_the_currency_pair_runs_from_the_query_to_the_row() {
     // pair under one pair of names and read it back under another, which is the
     // same defect one level down. Request body, response row and query all say
     // `base`/`quote` now.
-    let harness = harness();
+    let harness = harness().await;
     seed_market(&harness).await;
 
     let path = "/v1/market/fx?base=USD&quote=RUB&from=2026-08-01&to=2026-08-03";
@@ -7016,7 +7026,7 @@ async fn one_name_for_the_currency_pair_runs_from_the_query_to_the_row() {
 async fn every_market_parameter_is_described_and_the_moex_ones_name_their_origin() {
     // A bare `board` or `session` cannot be guessed: both are MOEX ISS column
     // values, and the contract is the only place an agent can learn that.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -7068,8 +7078,8 @@ async fn every_market_parameter_is_described_and_the_moex_ones_name_their_origin
 
 #[tokio::test]
 async fn an_amortisation_is_recorded_through_the_journal_route() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7101,8 +7111,8 @@ async fn an_amortisation_is_recorded_through_the_journal_route() {
 
 #[tokio::test]
 async fn an_offer_settlement_is_recorded_through_the_journal_route() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7216,8 +7226,8 @@ async fn retract_journal_import(harness: &Harness, label: &str) -> (StatusCode, 
 /// Every amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn journal_facts_are_retractable_as_the_import_they_were_declared_under() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let (status, body) = post_amortisation(
         &harness,
         Some("may"),
@@ -7269,7 +7279,7 @@ async fn journal_facts_are_retractable_as_the_import_they_were_declared_under() 
 /// the wrong account.
 #[tokio::test]
 async fn a_declared_batch_of_journal_facts_refuses_a_fact_for_another_account() {
-    let harness = harness();
+    let harness = harness().await;
     let elsewhere = another_account(&harness, "Savings").await;
     let body = json!({
         "source": {
@@ -7344,8 +7354,8 @@ async fn a_declared_batch_of_journal_facts_refuses_a_fact_for_another_account() 
 /// this test pins: the facts land, and no import names them.
 #[tokio::test]
 async fn an_undeclared_journal_fact_is_still_recorded_and_names_no_import() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let (status, body) = post_amortisation(
         &harness,
         None,
@@ -7384,7 +7394,7 @@ async fn an_undeclared_journal_fact_is_still_recorded_and_names_no_import() {
 /// gives this route a declaration that does answer it.
 #[tokio::test]
 async fn the_journal_fact_request_declares_a_source_and_no_longer_a_bare_label() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -7403,8 +7413,8 @@ async fn the_journal_fact_request_declares_a_source_and_no_longer_a_bare_label()
 /// in the response identifies the exact fact that was rejected.
 #[tokio::test]
 async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let body = json!({
         "source_label": "test",
         "events": [
@@ -7456,7 +7466,7 @@ async fn a_mixed_batch_accepts_one_fact_and_refuses_its_neighbour() {
 /// must occur before writing: the journal is append-only.
 #[tokio::test]
 async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7484,8 +7494,8 @@ async fn a_zero_compensation_is_refused_and_never_becomes_cash() {
 }
 #[tokio::test]
 async fn the_ingest_route_ignores_a_client_supplied_allocation() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7550,8 +7560,8 @@ async fn the_ingest_route_ignores_a_client_supplied_allocation() {
 
 #[tokio::test]
 async fn an_unknown_allocation_is_named_to_the_owner() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let contour = json!({
         "title": "Portfolio with amortisation",
         "accounts": [harness.account.inner()],
@@ -7642,7 +7652,7 @@ async fn an_unknown_allocation_is_named_to_the_owner() {
 
 #[tokio::test]
 async fn a_read_only_token_may_not_submit_journal_events() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7670,8 +7680,8 @@ async fn a_read_only_token_may_not_submit_journal_events() {
 /// an error in it.
 #[tokio::test]
 async fn a_redemption_is_recorded_through_the_journal_route() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let body = json!({
         "source_label": "test",
         "events": [{
@@ -7703,8 +7713,8 @@ async fn a_redemption_is_recorded_through_the_journal_route() {
 
 #[tokio::test]
 async fn a_conversion_is_recorded_through_the_journal_route() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let successor = InstrumentId::new_random();
     seed_instrument_id(&path, successor, "CONV");
     let body = json!({
@@ -7742,8 +7752,8 @@ async fn a_conversion_is_recorded_through_the_journal_route() {
 /// of the compensation comes with the amount, rather than in a separate field.
 #[tokio::test]
 async fn a_cash_compensated_fraction_travels_with_its_currency() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let successor = InstrumentId::new_random();
     seed_instrument_id(&path, successor, "CONV");
     let body = json!({
@@ -7781,8 +7791,8 @@ async fn a_cash_compensated_fraction_travels_with_its_currency() {
 
 #[tokio::test]
 async fn an_offer_application_and_its_withdrawal_are_recorded() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let submission = Uuid::new_v4();
     let body = json!({
         "source_label": "test",
@@ -7829,7 +7839,7 @@ async fn an_offer_application_and_its_withdrawal_are_recorded() {
 /// is indistinguishable from working code: the response for an owner token is the same.
 #[tokio::test]
 async fn a_read_only_token_may_not_sync_the_market() {
-    let harness = harness();
+    let harness = harness().await;
     let body = json!({
         "source": { "source": "cbr_daily" },
         "from": "2026-08-01",
@@ -8008,7 +8018,7 @@ fn the_seven_unverifiable_scheduled_posting_reasons_are_distinguishable() {
 }
 #[tokio::test]
 async fn custody_repair_is_described_and_scope_refusal_reaches_the_client() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -8055,7 +8065,7 @@ async fn custody_repair_is_described_and_scope_refusal_reaches_the_client() {
 
 #[tokio::test]
 async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
-    let (harness, db_path) = harness_on_disk();
+    let (harness, db_path) = harness_on_disk().await;
     seed_instrument(&db_path, &harness);
     // The affected trade's custody is deliberately `harness.account.inner()`
     // — the T4 custody defect this route repairs, where an effective trade's
@@ -8063,15 +8073,17 @@ async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
     // and account ids are separate namespaces, so registering a custody
     // place under that same value is legitimate fixture data, not a
     // modelling error.
-    SqliteStore::open(&db_path)
-        .expect("second connection")
-        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
-            id: CustodyId(harness.account.inner()),
-            owner: harness.owner,
-            title: "Account-Derived Custody".into(),
-            institution: None,
-            origin: CustodyOrigin::Declared,
-        })
+    SqliteAdapter::new(SqliteStore::open(&db_path).expect("second connection"))
+        .record_custody_place(
+            harness.owner,
+            CustodyUpsert {
+                id: CustodyId(harness.account.inner()),
+                title: "Account-Derived Custody".into(),
+                institution: None,
+                origin: CustodyOrigin::Declared,
+            },
+        )
+        .await
         .expect("account-derived custody place");
     let (status, seeded) = call(
         &harness.router,
@@ -8148,7 +8160,7 @@ async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
 }
 #[tokio::test]
 async fn the_same_declared_source_yields_the_same_source_id() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let account = harness.account.inner();
     let body = json!({
         "source_label": "paste",
@@ -8183,7 +8195,7 @@ async fn the_same_declared_source_yields_the_same_source_id() {
 
 #[tokio::test]
 async fn source_category_survives_api_and_store_round_trip() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let body = json!({
         "source_label": "paste",
         "source": { "account": harness.account.inner(), "channel": "paste" },
@@ -8232,7 +8244,7 @@ async fn source_category_survives_api_and_store_round_trip() {
 /// the operation word, and the category rules, which want the category.
 #[tokio::test]
 async fn the_source_word_and_the_source_category_are_stored_in_their_own_fields() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let body = json!({
         "source_label": "paste",
         "source": { "account": harness.account.inner(), "channel": "paste" },
@@ -8289,7 +8301,7 @@ async fn the_source_word_and_the_source_category_are_stored_in_their_own_fields(
 
 #[tokio::test]
 async fn an_empty_channel_is_rejected() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     for channel in ["", "x23456789012345678901234567890123"] {
@@ -8330,7 +8342,7 @@ fn distinct_source_ids(
 }
 #[tokio::test]
 async fn flow_report_exposes_all_quantities_and_residual() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = json!({
         "title": "August flow",
         "accounts": [harness.account.inner()],
@@ -8412,7 +8424,7 @@ async fn flow_report_exposes_all_quantities_and_residual() {
 
 #[tokio::test]
 async fn flow_report_rejects_a_reversed_interval() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = json!({
         "title": "August flow",
         "accounts": [harness.account.inner()],
@@ -8439,8 +8451,8 @@ async fn flow_report_rejects_a_reversed_interval() {
 
 #[tokio::test]
 async fn balances_keep_cash_and_positions_as_separate_fields() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let contour = json!({
         "title": "August balances",
         "accounts": [harness.account.inner()],
@@ -8520,7 +8532,7 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
 
 #[tokio::test]
 async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let unstated_account = AccountId::new_random();
     SqliteStore::open(&path)
         .expect("second connection")
@@ -8628,7 +8640,7 @@ async fn balances_report_distinguishes_reconciled_and_unstated_accounts() {
 /// its opening leg.
 #[tokio::test]
 async fn an_opening_assertion_does_not_publish_a_cash_balance() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = json!({
         "title": "August starts",
         "accounts": [harness.account.inner()],
@@ -8699,7 +8711,7 @@ async fn an_opening_assertion_does_not_publish_a_cash_balance() {
 /// as a balance a figure with an unknown start.
 #[tokio::test]
 async fn an_opening_assertion_that_starts_too_late_asserts_nothing() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = json!({
         "title": "Late opening",
         "accounts": [harness.account.inner()],
@@ -8769,7 +8781,7 @@ async fn an_opening_assertion_that_starts_too_late_asserts_nothing() {
 /// the impossible negative. Both are marked; only one is anomalous.
 #[tokio::test]
 async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -8913,7 +8925,7 @@ async fn a_negative_cash_balance_is_stated_by_the_answer_and_not_refused() {
 /// let one unrecognised row disable the whole portfolio.
 #[tokio::test]
 async fn margin_financing_refuses_one_accounts_period_reports_and_no_others() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -9053,7 +9065,7 @@ async fn margin_financing_refuses_one_accounts_period_reports_and_no_others() {
 /// silent — silence would be indistinguishable from an account nobody assessed.
 #[tokio::test]
 async fn a_temporary_settlement_deficit_does_not_refuse_the_period_reports() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner().to_string();
     let contour = json!({
         "title": "Settlement timing",
@@ -9126,7 +9138,7 @@ async fn the_openapi_document_enumerates_and_explains_both_balance_points() {
     // The field was a bare `String`, so the document said only that a string
     // was wanted, and a caller reaching for the start of the interval could
     // write `open`, `start` or `begin` and learn the answer by being refused.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -9167,7 +9179,7 @@ async fn the_openapi_document_enumerates_and_explains_both_balance_points() {
 async fn an_invalid_balance_point_is_refused_with_both_codes_named() {
     // `open` is the guess the old contract invited: it published a string, and
     // the two values it would accept lived in the handler.
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = refusal(
         &harness.router,
         post(
@@ -9205,7 +9217,7 @@ async fn an_invalid_balance_point_is_refused_with_both_codes_named() {
 /// with a literal a test author chose.
 #[tokio::test]
 async fn a_balance_point_taken_from_an_action_is_accepted_verbatim() {
-    let harness = harness();
+    let harness = harness().await;
     let operations = json!({
         "source_label": "manual entry",
         "operations": [{
@@ -9287,7 +9299,7 @@ async fn a_balance_point_taken_from_an_action_is_accepted_verbatim() {
 /// question before the opening one is answered.
 #[tokio::test]
 async fn the_action_queue_asks_for_the_opening_balance_before_the_closing_one() {
-    let harness = harness();
+    let harness = harness().await;
     let operations = json!({
         "source_label": "manual entry",
         "operations": [{
@@ -9378,7 +9390,7 @@ async fn the_action_queue_asks_for_the_opening_balance_before_the_closing_one() 
 
 #[tokio::test]
 async fn flow_and_balances_reports_require_authentication() {
-    let harness = harness();
+    let harness = harness().await;
     for path in [
         "/v1/reports/flow?contour=00000000-0000-0000-0000-000000000000&from=2026-08-01&to=2026-08-31",
         "/v1/reports/balances?contour=00000000-0000-0000-0000-000000000000&as_of=2026-08-31",
@@ -9389,7 +9401,7 @@ async fn flow_and_balances_reports_require_authentication() {
 }
 #[tokio::test]
 async fn flow_report_names_an_unexplained_account() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = json!({
         "title": "Opening balance flow",
         "accounts": [harness.account.inner()],
@@ -9439,7 +9451,7 @@ async fn flow_report_names_an_unexplained_account() {
 
 #[tokio::test]
 async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let body = json!({
         "source_label": "manual entry",
         "operations": [{
@@ -9496,7 +9508,7 @@ async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
 
 #[tokio::test]
 async fn tax_amounts_are_rejected_per_row_when_not_positive() {
-    let harness = harness();
+    let harness = harness().await;
     for (row, amount) in ["0.00", "-1.00"].into_iter().enumerate() {
         let body = json!({
             "source_label": "manual entry",
@@ -9524,7 +9536,7 @@ async fn tax_amounts_are_rejected_per_row_when_not_positive() {
 
 #[tokio::test]
 async fn a_category_group_can_be_created_and_then_holds_a_category() {
-    let (harness, _path) = harness_on_disk();
+    let (harness, _path) = harness_on_disk().await;
 
     let (status, group) = call(
         &harness.router,
@@ -9561,7 +9573,7 @@ async fn a_category_group_can_be_created_and_then_holds_a_category() {
 
 #[tokio::test]
 async fn a_category_group_without_a_title_is_refused_by_field() {
-    let (harness, _path) = harness_on_disk();
+    let (harness, _path) = harness_on_disk().await;
 
     let (status, body) = call(
         &harness.router,
@@ -9578,7 +9590,7 @@ async fn a_category_group_without_a_title_is_refused_by_field() {
 
 #[tokio::test]
 async fn a_read_only_token_may_read_category_groups_and_not_write_them() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, body) = call(
         &harness.router,
@@ -9607,7 +9619,7 @@ async fn a_read_only_token_may_read_category_groups_and_not_write_them() {
 
 #[tokio::test]
 async fn categories_can_be_retired_without_disappearing() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut store = SqliteStore::open(&path).expect("second connection");
     let group = store
         .insert_category_group(harness.owner, "Usual Expenses")
@@ -9657,7 +9669,7 @@ async fn categories_can_be_retired_without_disappearing() {
 
 #[tokio::test]
 async fn category_rule_preview_does_not_write_and_rules_are_listed() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut store = SqliteStore::open(&path).expect("second connection");
     let group = store
         .insert_category_group(harness.owner, "Usual Expenses")
@@ -9752,7 +9764,7 @@ async fn a_row_rule_pins_a_row_whose_source_named_no_identifier() {
     // which a card statement never states — so without the fallback to the
     // client's idempotency key the strongest precedence level is unreachable
     // for exactly the imports that need it.
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut store = SqliteStore::open(&path).expect("second connection");
     let group = store
         .insert_category_group(harness.owner, "Usual Expenses")
@@ -9814,7 +9826,7 @@ async fn a_row_rule_pins_a_row_whose_source_named_no_identifier() {
 
 #[tokio::test]
 async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut store = SqliteStore::open(&path).expect("second connection");
     let group = store
         .insert_category_group(harness.owner, "Usual Expenses")
@@ -9910,7 +9922,7 @@ async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate
 
 #[tokio::test]
 async fn flow_report_exposes_category_decomposition_residual_and_rule_versions() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut store = SqliteStore::open(&path).expect("second connection");
     let group = store
         .insert_category_group(harness.owner, "Usual Expenses")
@@ -10003,7 +10015,7 @@ async fn flow_report_exposes_category_decomposition_residual_and_rule_versions()
 
 #[tokio::test]
 async fn category_routes_cover_matcher_forms_and_reference_refusals() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut store = SqliteStore::open(&path).expect("second connection");
     let group = store
         .insert_category_group(harness.owner, "Usual Expenses")
@@ -10194,7 +10206,7 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
 
 #[tokio::test]
 async fn categories_and_category_rules_require_authentication() {
-    let harness = harness();
+    let harness = harness().await;
     let requests = [
         call(&harness.router, get("/v1/categories", None)),
         call(&harness.router, post_public("/v1/categories", &json!({}))),
@@ -10245,7 +10257,7 @@ async fn retired_category_group_failure_has_actionable_response_fields() {
 
 #[tokio::test]
 async fn actions_endpoint_is_authenticated_and_reports_the_empty_frontier() {
-    let harness = empty_owner_harness();
+    let harness = empty_owner_harness().await;
     let (status, body) = call(&harness.router, get("/v1/actions", None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["code"], "unauthorized");
@@ -10291,7 +10303,7 @@ async fn actions_endpoint_is_authenticated_and_reports_the_empty_frontier() {
 
 #[tokio::test]
 async fn actions_endpoint_rejects_unknown_query_parameters() {
-    let harness = empty_owner_harness();
+    let harness = empty_owner_harness().await;
     let (status, body) = call(
         &harness.router,
         get("/v1/actions?bogus=1", Some(&harness.owner_token)),
@@ -10319,7 +10331,7 @@ async fn actions_endpoint_rejects_unknown_query_parameters() {
 /// fold that put every item into every report.
 #[tokio::test]
 async fn the_queue_says_where_each_report_stands_and_names_what_stands_in_the_way() {
-    for harness in [harness(), empty_owner_harness()] {
+    for harness in [harness().await, empty_owner_harness().await] {
         let (status, body) = call(
             &harness.router,
             get("/v1/actions", Some(&harness.owner_token)),
@@ -10401,7 +10413,7 @@ async fn the_queue_says_where_each_report_stands_and_names_what_stands_in_the_wa
     // fixture holds an account in no scope, which keeps three reports and not
     // reconciliation — a report computed for an account, which resolves no
     // scope at all.
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         get("/v1/actions", Some(&harness.owner_token)),
@@ -10435,7 +10447,7 @@ async fn the_queue_says_where_each_report_stands_and_names_what_stands_in_the_wa
     // whole queue is one blocking item, which declares no goal — so a fold
     // reading only what the items declare would publish four unobstructed
     // reports about a system with no account, no scope and no fact in it.
-    let empty = empty_owner_harness();
+    let empty = empty_owner_harness().await;
     let (status, body) = call(&empty.router, get("/v1/actions", Some(&empty.owner_token))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let items = body["items"].as_array().expect("action items");
@@ -10467,8 +10479,8 @@ async fn the_queue_says_where_each_report_stands_and_names_what_stands_in_the_wa
 #[tokio::test]
 async fn every_field_the_queue_asks_the_owner_for_arrives_with_the_question_to_put_to_him() {
     let mut asked: BTreeSet<String> = BTreeSet::new();
-    let populated = harness();
-    let empty = empty_owner_harness();
+    let populated = harness().await;
+    let empty = empty_owner_harness().await;
     for owner in [&populated, &empty] {
         let (status, body) =
             call(&owner.router, get("/v1/actions", Some(&owner.owner_token))).await;
@@ -10539,7 +10551,7 @@ async fn every_field_the_queue_asks_the_owner_for_arrives_with_the_question_to_p
 
 #[tokio::test]
 async fn actions_endpoint_reports_the_first_contour_and_its_candidates() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         get("/v1/actions", Some(&harness.owner_token)),
@@ -10578,7 +10590,7 @@ async fn actions_endpoint_reports_the_first_contour_and_its_candidates() {
 
 #[tokio::test]
 async fn each_advertised_action_address_reaches_its_handler() {
-    let empty = empty_owner_harness();
+    let empty = empty_owner_harness().await;
     let (status, body) = call(
         &empty.router,
         post(
@@ -10590,7 +10602,7 @@ async fn each_advertised_action_address_reaches_its_handler() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    let contour = harness();
+    let contour = harness().await;
     let (status, body) = call(
         &contour.router,
         post(
@@ -10603,9 +10615,9 @@ async fn each_advertised_action_address_reaches_its_handler() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
-#[test]
-fn every_action_kind_resolves_to_one_matching_post_operation() {
-    let harness = harness();
+#[tokio::test]
+async fn every_action_kind_resolves_to_one_matching_post_operation() {
+    let harness = harness().await;
     let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
     for (key, path) in [
         (OperationKey::CreateAccount, "/v1/accounts"),
@@ -10631,9 +10643,9 @@ fn every_action_kind_resolves_to_one_matching_post_operation() {
     }
 }
 
-#[test]
-fn action_catalog_rejects_missing_and_duplicate_operation_ids() {
-    let harness = harness();
+#[tokio::test]
+async fn action_catalog_rejects_missing_and_duplicate_operation_ids() {
+    let harness = harness().await;
 
     let mut missing = harness.api.clone();
     missing
@@ -10674,8 +10686,8 @@ fn action_catalog_rejects_missing_and_duplicate_operation_ids() {
     ));
 }
 
-#[test]
-fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
+#[tokio::test]
+async fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
     let target = json!({
         "type": "operation",
         "operationId": "create_account",
@@ -10689,7 +10701,7 @@ fn action_target_is_tagged_and_round_trips_with_an_exclusive_schema() {
         serde_json::from_value(target.clone()).expect("tagged target");
     assert_eq!(serde_json::to_value(parsed).expect("target JSON"), target);
 
-    let harness = harness();
+    let harness = harness().await;
     let schema = serde_json::to_value(&harness.api).expect("OpenAPI JSON")["components"]["schemas"]
         ["ActionTargetDto"]
         .clone();
@@ -10756,7 +10768,7 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
     // earlier version of this test compared the schema against a literal, which
     // would have stayed green while the response stopped advertising a field —
     // the same shape of mistake this epic exists to remove.
-    for harness in [empty_owner_harness(), harness()] {
+    for harness in [empty_owner_harness().await, harness().await] {
         let body_of_spec = serde_json::to_value(&harness.api).expect("OpenAPI JSON");
         let (status, body) = call(
             &harness.router,
@@ -10917,7 +10929,7 @@ async fn every_action_request_schema_required_input_is_advertised_as_missing() {
 /// absence from the whole response body.
 #[tokio::test]
 async fn reconciliation_actions_name_only_the_requested_account() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -10987,7 +10999,7 @@ async fn reconciliation_actions_name_only_the_requested_account() {
 /// test: a filter that dropped everything would satisfy the exclusion alone.
 #[tokio::test]
 async fn reconciliation_actions_exclude_a_period_outside_the_requested_range() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     add_coverage_gap(
         &path,
         harness.owner,
@@ -11042,7 +11054,7 @@ async fn reconciliation_actions_exclude_a_period_outside_the_requested_range() {
 /// would pass — and the reuse is a review point, not a test.
 #[tokio::test]
 async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     add_coverage_gap(
         &path,
         harness.owner,
@@ -11114,7 +11126,7 @@ async fn an_attached_action_carries_the_whole_envelope_and_names_no_scope() {
 /// empty array says the carrier looked and found nothing.
 #[tokio::test]
 async fn a_clean_instance_carries_actions_present_and_empty() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = json!({
         "title": "Empty contour",
         "accounts": [harness.account.inner()],
@@ -11168,7 +11180,7 @@ async fn a_clean_instance_carries_actions_present_and_empty() {
 /// owner can supply, and the transfer says truthfully that no rule applies to it.
 #[tokio::test]
 async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, outside_account) = call(
         &harness.router,
         post(
@@ -11353,7 +11365,7 @@ async fn an_outflow_names_the_rule_operation_and_a_transfer_names_no_remedy() {
 /// gaps of one category prove the second key is applied.
 #[tokio::test]
 async fn actions_of_one_category_come_back_in_id_order() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     add_coverage_gap(
         &path,
         harness.owner,
@@ -11412,7 +11424,7 @@ async fn actions_of_one_category_come_back_in_id_order() {
 /// them ride along in the figures.
 #[tokio::test]
 async fn flow_report_actions_name_only_accounts_in_the_contour() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -11573,7 +11585,8 @@ async fn a_sync_carries_one_bound_item_per_possible_duplicate() {
     let harness = harness_with_factory(
         SqliteStore::open_in_memory().expect("in-memory database"),
         Some(factory),
-    );
+    )
+    .await;
 
     // The prior event, recorded through another channel: the same operation,
     // named by neither a row identifier nor a document, so a later import can
@@ -11657,7 +11670,8 @@ async fn a_sync_whose_verdicts_are_all_provisional_carries_an_empty_actions_arra
     let harness = harness_with_factory(
         SqliteStore::open_in_memory().expect("in-memory database"),
         Some(factory),
-    );
+    )
+    .await;
     let (status, response) = call(
         &harness.router,
         post(
@@ -11683,7 +11697,7 @@ async fn a_sync_whose_verdicts_are_all_provisional_carries_an_empty_actions_arra
 /// never say anything.
 #[tokio::test]
 async fn the_csv_and_document_responses_carry_no_actions_key() {
-    let harness = harness();
+    let harness = harness().await;
     let document = "date,type,account,counterparty_account,instrument,custody,quantity,amount,fee,accrued_interest,currency,idempotency_key\n\
         2025-01-01,deposit,Brokerage,,,,,1000.00,,,RUB,csv-actions-1\n";
     let request = Request::builder()
@@ -11753,7 +11767,7 @@ async fn a_missing_query_parameter_is_refused_in_the_documented_shape() {
     // axum's own `Query` answers `400 text/plain` here. A client parsing
     // errors would then need two encodings, and the operation declares
     // neither the status nor the media type it was actually served.
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = refusal(
         &harness.router,
         get("/v1/reconciliation", Some(&harness.owner_token)),
@@ -11775,7 +11789,7 @@ async fn a_missing_query_parameter_is_refused_in_the_documented_shape() {
 
 #[tokio::test]
 async fn every_get_route_reports_all_required_query_parameters() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -11841,7 +11855,7 @@ async fn every_get_route_reports_all_required_query_parameters() {
 
 #[tokio::test]
 async fn one_missing_query_parameter_keeps_the_existing_refusal_shape() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = refusal(
         &harness.router,
         get(
@@ -11857,7 +11871,7 @@ async fn one_missing_query_parameter_keeps_the_existing_refusal_shape() {
 
 #[tokio::test]
 async fn api_error_openapi_documents_the_complete_missing_field_set() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
     let property = &spec["components"]["schemas"]["ApiError"]["properties"]["missing_fields"];
@@ -11875,7 +11889,7 @@ async fn api_error_openapi_documents_the_complete_missing_field_set() {
 
 #[tokio::test]
 async fn a_body_missing_a_required_field_is_refused_in_the_documented_shape() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = refusal(
         &harness.router,
         post(
@@ -11906,7 +11920,7 @@ async fn a_refused_body_does_not_come_back_in_the_refusal() {
     // The value that failed is the caller's, and a rejected body is exactly
     // the kind of thing that carries the owner's data. Only the name of the
     // field and the type expected of it may be returned.
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = refusal(
         &harness.router,
         post(
@@ -11925,7 +11939,7 @@ async fn a_refused_body_does_not_come_back_in_the_refusal() {
 
 #[tokio::test]
 async fn a_syntactically_broken_body_is_refused_in_the_documented_shape() {
-    let harness = harness();
+    let harness = harness().await;
     let request = Request::builder()
         .uri("/v1/accounts")
         .method("POST")
@@ -11942,7 +11956,7 @@ async fn a_syntactically_broken_body_is_refused_in_the_documented_shape() {
 async fn a_body_without_the_json_content_type_is_refused_in_the_documented_shape() {
     // The one refusal that is deliberately not a `422`: nothing was parsed,
     // so there is no field to name. The status differs; the shape does not.
-    let harness = harness();
+    let harness = harness().await;
     let request = Request::builder()
         .uri("/v1/accounts")
         .method("POST")
@@ -11957,7 +11971,7 @@ async fn a_body_without_the_json_content_type_is_refused_in_the_documented_shape
 
 #[tokio::test]
 async fn an_unparsable_path_parameter_is_refused_in_the_documented_shape() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = refusal(
         &harness.router,
         get("/v1/instruments/not-a-uuid", Some(&harness.owner_token)),
@@ -11975,7 +11989,7 @@ async fn an_unparsable_path_parameter_is_refused_in_the_documented_shape() {
 /// its evidence-based bound in the scenario.
 #[tokio::test]
 async fn corrections_are_described_and_scope_checked() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -12104,7 +12118,7 @@ async fn corrections_are_described_and_scope_checked() {
 /// A key held by a reversed event is quarantined without aborting its batch.
 #[tokio::test]
 async fn a_reversed_event_key_quarantine_names_replacement() {
-    let harness = harness();
+    let harness = harness().await;
     let event = seed_correctable_deposit(&harness, "file", "key-held", "100.00").await;
 
     let (status, reversed) = call(
@@ -12206,7 +12220,7 @@ async fn seed_correctable_deposit(
 
 #[tokio::test]
 async fn a_correction_is_refused_until_the_owner_acknowledges_the_retraction() {
-    let harness = harness();
+    let harness = harness().await;
     let event = seed_correctable_deposit(&harness, "file", "correction-ack", "100.00").await;
 
     let (status, body) = call(
@@ -12237,7 +12251,7 @@ async fn a_correction_is_refused_until_the_owner_acknowledges_the_retraction() {
 
 #[tokio::test]
 async fn a_correction_naming_an_event_the_journal_does_not_hold_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let missing = Uuid::new_v4();
     let (status, body) = call(
         &harness.router,
@@ -12262,7 +12276,7 @@ async fn a_correction_naming_an_event_the_journal_does_not_hold_is_refused() {
 /// would fail every later read rather than only the request that added it.
 #[tokio::test]
 async fn a_conflicting_replacement_is_refused_and_leaves_the_journal_untouched() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let event = seed_correctable_deposit(&harness, "file", "correction-conflict", "100.00").await;
 
     let replacement = json!({
@@ -12321,7 +12335,7 @@ async fn a_conflicting_replacement_is_refused_and_leaves_the_journal_untouched()
 /// force when the correction is done, because retiring it is his own act.
 #[tokio::test]
 async fn correcting_a_row_a_rule_filed_says_the_rule_behind_it_is_still_standing() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -12474,7 +12488,7 @@ async fn correcting_a_row_a_rule_filed_says_the_rule_behind_it_is_still_standing
 /// by hand a row one of his rules may well have decided for him.
 #[tokio::test]
 async fn a_correction_names_no_rule_where_the_fact_records_none_and_where_it_records_nothing() {
-    let harness = harness();
+    let harness = harness().await;
     let stated = seed_correctable_deposit(&harness, "file", "hbxz-stated", "100.00").await;
 
     // The first state, asserted rather than assumed: the reading ran and settled
@@ -12563,7 +12577,7 @@ async fn a_correction_names_no_rule_where_the_fact_records_none_and_where_it_rec
 /// better than writing a correction whose effect the owner cannot observe.
 #[tokio::test]
 async fn reversing_a_reversal_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let event = seed_correctable_deposit(&harness, "file", "correction-double", "100.00").await;
     let (status, body) = call(
         &harness.router,
@@ -12600,7 +12614,7 @@ async fn reversing_a_reversal_is_refused() {
 /// no second reversal of the same event.
 #[tokio::test]
 async fn correcting_one_import_twice_writes_nothing_the_second_time() {
-    let harness = harness();
+    let harness = harness().await;
     seed_correctable_deposit(&harness, "file", "correction-repeat-a", "100.00").await;
     seed_correctable_deposit(&harness, "file", "correction-repeat-b", "200.00").await;
 
@@ -12652,7 +12666,7 @@ fn journal_of(path: &std::path::Path, owner: OwnerId) -> Vec<iaam_core::event::E
 /// reports move to match.
 #[tokio::test]
 async fn an_import_against_the_wrong_account_map_is_corrected_end_to_end() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let wrong = harness.account.inner();
 
     let (status, created) = call(
@@ -12932,7 +12946,7 @@ async fn an_ingested_operation_can_be_read_back_by_its_idempotency_key() {
     // The defect this route exists for: 177 rows went in with verdict
     // `provisional` and then could not be looked at. An agent forbidden its own
     // arithmetic has nothing to quote about a single row unless it can read it.
-    let harness = harness();
+    let harness = harness().await;
     let event = ingest_deposit(
         &harness,
         harness.account,
@@ -12973,7 +12987,7 @@ async fn an_ingested_operation_can_be_read_back_by_its_idempotency_key() {
 }
 #[tokio::test]
 async fn the_journal_marks_only_effective_correction_rows_as_standing() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let plain = seed_correctable_deposit(&harness, "stands", "stands-plain", "1.01").await;
     let reversed = seed_correctable_deposit(&harness, "stands", "stands-reversed", "2.02").await;
     let replaced = seed_correctable_deposit(&harness, "stands", "stands-replaced", "3.03").await;
@@ -13077,7 +13091,7 @@ async fn the_journal_marks_only_effective_correction_rows_as_standing() {
 }
 #[tokio::test]
 async fn the_journal_filters_by_standing_membership_without_changing_store_paging() {
-    let harness = harness();
+    let harness = harness().await;
     let plain = seed_correctable_deposit(&harness, "stands-filter", "filter-plain", "1.01").await;
     let reversed =
         seed_correctable_deposit(&harness, "stands-filter", "filter-reversed", "2.02").await;
@@ -13193,7 +13207,7 @@ async fn the_journal_filters_by_standing_membership_without_changing_store_pagin
 
 #[tokio::test]
 async fn the_journal_openapi_describes_an_optional_stands_filter() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -13220,7 +13234,7 @@ async fn the_journal_openapi_describes_an_optional_stands_filter() {
 async fn an_idempotency_key_that_addresses_nothing_is_a_clean_not_found() {
     // An empty page would say "the journal holds no such row" in the same
     // breath as "you narrowed to nothing", and the caller cannot tell which.
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         get(
@@ -13234,7 +13248,7 @@ async fn an_idempotency_key_that_addresses_nothing_is_a_clean_not_found() {
 }
 #[tokio::test]
 async fn the_journal_narrows_by_account_and_by_date_range() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = create_account(&harness, "Savings").await;
     ingest_deposit(
         &harness,
@@ -13288,7 +13302,7 @@ async fn the_journal_narrows_by_account_and_by_date_range() {
 
 #[tokio::test]
 async fn the_journal_can_filter_events_touching_the_receiving_account() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = create_account(&harness, "Savings").await;
     let (status, verdicts) = call(
         &harness.router,
@@ -13357,7 +13371,7 @@ async fn the_journal_can_filter_events_touching_the_receiving_account() {
 /// answer the same question (`iaam-9xku`).
 #[tokio::test]
 async fn the_journal_filters_by_counterparty_narrower_than_touching() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = create_account(&harness, "Savings").await;
     let (status, verdicts) = call(
         &harness.router,
@@ -13448,7 +13462,7 @@ async fn the_journal_filters_by_counterparty_narrower_than_touching() {
 /// never a sentinel category.
 #[tokio::test]
 async fn the_journal_filters_by_category_and_uncategorised() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, group) = call(
         &harness.router,
         post(
@@ -13582,7 +13596,7 @@ async fn the_journal_filters_by_category_and_uncategorised() {
 /// naming both is refused rather than silently answering one of them.
 #[tokio::test]
 async fn category_and_uncategorised_together_are_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         get(
@@ -13603,7 +13617,7 @@ async fn category_and_uncategorised_together_are_refused() {
 /// names (Task 11).
 #[tokio::test]
 async fn the_journal_openapi_describes_category_and_counterparty_filters() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -13626,7 +13640,7 @@ async fn the_journal_narrows_by_the_source_the_caller_declared() {
     // only way to ask "what did that import put in" is to name the account and
     // channel again. If this read derived it differently from ingest, the
     // answer would be empty and look like an import that never landed.
-    let harness = harness();
+    let harness = harness().await;
     ingest_deposit(
         &harness,
         harness.account,
@@ -13675,7 +13689,7 @@ async fn the_journal_narrows_by_the_source_the_caller_declared() {
 /// carrying a label need never have passed through a session at all.
 #[tokio::test]
 async fn a_journal_row_names_the_import_session_that_committed_it() {
-    let harness = harness();
+    let harness = harness().await;
     ingest_deposit(
         &harness,
         harness.account,
@@ -13793,7 +13807,7 @@ async fn a_journal_row_names_the_import_session_that_committed_it() {
 /// Every amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_journal_row_names_the_import_that_carried_it() {
-    let harness = harness();
+    let harness = harness().await;
     let labelled = json!({
         "source": {
             "account": harness.account.inner(),
@@ -13934,7 +13948,7 @@ async fn a_journal_row_names_the_import_that_carried_it() {
 async fn the_journal_lists_without_any_narrowing() {
     // Reading the list is not a privilege beyond reading the aggregates: every
     // balance, flow and return this API serves is computed from these very rows.
-    let harness = harness();
+    let harness = harness().await;
     let savings = create_account(&harness, "Savings").await;
     ingest_deposit(
         &harness,
@@ -13968,7 +13982,7 @@ async fn paging_the_journal_neither_skips_nor_repeats_a_row() {
     // Two events on one day is the case an offset gets wrong and a date-only
     // cursor gets wrong in the other direction: the second row of the day would
     // either be served twice or never.
-    let harness = harness();
+    let harness = harness().await;
     for (index, key) in ["one", "two", "three", "four"].iter().enumerate() {
         let day = format!("2026-03-{:02}", index / 2 + 1);
         ingest_deposit(&harness, harness.account, "1000.00", &day, key, None).await;
@@ -14006,7 +14020,7 @@ async fn paging_the_journal_neither_skips_nor_repeats_a_row() {
 }
 #[tokio::test]
 async fn a_page_size_outside_the_permitted_range_is_refused_by_name() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         get("/v1/journal/events?limit=1000", Some(&harness.agent_token)),
@@ -14032,8 +14046,8 @@ async fn a_page_size_outside_the_permitted_range_is_refused_by_name() {
 async fn one_owners_journal_is_invisible_to_another() {
     // A read scoped by a filter and not by the owner would let anyone holding a
     // token read every journal on the instance (§14).
-    let mine = harness();
-    let theirs = harness();
+    let mine = harness().await;
+    let theirs = harness().await;
     ingest_deposit(&mine, mine.account, "1000.00", "2026-03-01", "mine", None).await;
     let (status, page) = call(
         &theirs.router,
@@ -14056,7 +14070,7 @@ async fn one_owners_journal_is_invisible_to_another() {
 /// fixture and could not have caught it.
 #[tokio::test]
 async fn the_two_routes_agree_about_a_financing_account() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner().to_string();
 
     let contour = json!({ "title": "Financing", "accounts": [account] });
@@ -14169,7 +14183,7 @@ async fn every_documented_parameter_sits_where_the_route_reads_it() {
     // in `path` exactly when the path template names it, and in `query`
     // otherwise. That way a route added later is covered by the guard on the
     // day it is written, which a list of known names would not do.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -14209,7 +14223,7 @@ async fn every_documented_parameter_sits_where_the_route_reads_it() {
 /// keyed more coarsely than its own description.
 #[tokio::test]
 async fn two_labelled_imports_through_one_channel_retract_separately() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let account = harness.account.inner();
 
     let import = |label: &str, key: &str, amount: &str, day: &str| {
@@ -14306,7 +14320,7 @@ async fn two_labelled_imports_through_one_channel_retract_separately() {
 /// account the caller never named.
 #[tokio::test]
 async fn an_operation_disagreeing_with_the_declared_account_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let declared = harness.account.inner();
 
     let (status, created) = call(
@@ -14357,7 +14371,7 @@ async fn an_operation_disagreeing_with_the_declared_account_is_refused() {
 /// and channel is how a destructive operation gets called on the wrong rows.
 #[tokio::test]
 async fn the_import_correction_publishes_the_key_it_actually_retracts_on() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -14397,7 +14411,7 @@ async fn the_import_correction_publishes_the_key_it_actually_retracts_on() {
 /// the plan the rule change computes is returned instead of being discarded.
 #[tokio::test]
 async fn a_classification_rule_reports_the_history_it_would_correct() {
-    let harness = harness();
+    let harness = harness().await;
     let operations = json!({
         "source_label": "test",
         "operations": [{
@@ -14554,7 +14568,7 @@ async fn a_classification_rule_reports_the_history_it_would_correct() {
 /// shape the server itself writes that has to be readable as a request.
 #[tokio::test]
 async fn a_classification_rule_round_trips_through_the_shape_it_is_read_in() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = account_with(&harness, &json!({ "title": "Savings" })).await;
 
     let (status, created) = call(
@@ -14676,7 +14690,7 @@ async fn a_classification_rule_round_trips_through_the_shape_it_is_read_in() {
 /// A rule matching nothing says so, rather than saying nothing.
 #[tokio::test]
 async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
-    let harness = harness();
+    let harness = harness().await;
     let rule = json!({
         "matcher": { "description_contains": "nothing here" },
         "outcome": { "kind": "income" },
@@ -14705,7 +14719,7 @@ async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
 /// imported every row correctly and was absent from every report.
 #[tokio::test]
 async fn an_account_in_no_contour_is_named_by_the_queue() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, second) = call(
         &harness.router,
         post(
@@ -14849,7 +14863,7 @@ fn published_option<'a>(item: &'a Value, operation_id: &str) -> Option<&'a Value
 /// list and are not the same question.
 #[tokio::test]
 async fn every_queue_item_about_an_account_names_the_account() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -14923,7 +14937,7 @@ async fn every_queue_item_about_an_account_names_the_account() {
 /// sentence. Printing a title for one would mean inventing a name for a fact.
 #[tokio::test]
 async fn an_event_subject_carries_no_name() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, actions) = call(
         &harness.router,
         get("/v1/actions", Some(&harness.owner_token)),
@@ -14957,7 +14971,7 @@ async fn an_event_subject_carries_no_name() {
 /// the wrong one.
 #[tokio::test]
 async fn an_account_scope_answer_names_the_account() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -15012,7 +15026,7 @@ async fn an_account_scope_answer_names_the_account() {
 /// comparable, and it advances on every accepted call including a withdrawal.
 #[tokio::test]
 async fn a_retirement_names_the_account_and_the_revision_it_minted() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -15069,7 +15083,7 @@ async fn a_retirement_names_the_account_and_the_revision_it_minted() {
 /// the reversible first statement; the route no longer gates it by actor.
 #[tokio::test]
 async fn a_retirement_refuses_a_second_statement_a_future_date_and_a_stranger() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -15142,7 +15156,7 @@ async fn a_retirement_refuses_a_second_statement_a_future_date_and_a_stranger() 
 /// identical with nothing to explain it.
 #[tokio::test]
 async fn withdrawing_a_retirement_is_a_further_revision_and_never_a_no_op() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -15226,7 +15240,7 @@ async fn withdrawing_a_retirement_is_a_further_revision_and_never_a_no_op() {
 /// table incomplete for exactly the accounts whose rows are missing.
 #[tokio::test]
 async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() {
-    let harness = harness();
+    let harness = harness().await;
     let account = |title: &str| {
         post(
             "/v1/accounts",
@@ -15380,7 +15394,7 @@ async fn a_closed_product_leaves_the_asset_report_and_stays_in_its_population() 
 /// one that hid a balance.
 #[tokio::test]
 async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -15500,7 +15514,7 @@ async fn a_retired_account_that_still_holds_money_keeps_its_row_and_says_why() {
 /// the fix would have replaced a silent omission with a permanent nag.
 #[tokio::test]
 async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, outside) = call(
         &harness.router,
         post(
@@ -15605,7 +15619,7 @@ async fn an_account_ruled_outside_the_perimeter_stops_being_asked_about() {
 /// The disposition route refuses what it cannot honour, and says why.
 #[tokio::test]
 async fn a_scope_decision_needs_a_reason_and_cannot_claim_membership() {
-    let harness = harness();
+    let harness = harness().await;
     let scope_path = format!("/v1/accounts/{}/scope", harness.account.inner());
 
     let (status, inside) = call(
@@ -15683,7 +15697,7 @@ async fn a_scope_decision_needs_a_reason_and_cannot_claim_membership() {
 /// that once got this wrong, asserted the other way round.
 #[tokio::test]
 async fn no_queue_item_promises_a_call_it_does_not_have() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, actions) = call(
         &harness.router,
         get("/v1/actions", Some(&harness.owner_token)),
@@ -15727,7 +15741,7 @@ async fn no_queue_item_promises_a_call_it_does_not_have() {
 /// it may in fact begin.
 #[tokio::test]
 async fn every_resolution_publishes_its_own_floor_and_the_item_publishes_the_narrowest() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, actions) = call(
         &harness.router,
         get("/v1/actions", Some(&harness.owner_token)),
@@ -15798,7 +15812,7 @@ async fn every_resolution_publishes_its_own_floor_and_the_item_publishes_the_nar
 /// as an answer about all of it.
 #[tokio::test]
 async fn every_report_names_the_population_it_answered_about() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, contour_response) = call(
         &harness.router,
@@ -15868,7 +15882,7 @@ async fn every_report_names_the_population_it_answered_about() {
 /// the scope contained would pass that test and mean nothing.
 #[tokio::test]
 async fn a_report_over_every_known_account_says_its_population_is_whole() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -15954,7 +15968,7 @@ async fn a_report_over_every_known_account_says_its_population_is_whole() {
 /// comparison against a source possible for the one party that holds it.
 #[tokio::test]
 async fn the_population_verdict_names_its_denominator_and_publishes_it() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -16026,7 +16040,7 @@ async fn the_population_verdict_names_its_denominator_and_publishes_it() {
 /// and the response says which of the two kinds of omission it is.
 #[tokio::test]
 async fn an_account_placed_in_another_scope_is_not_reported_as_undecided() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -16098,7 +16112,7 @@ async fn an_account_placed_in_another_scope_is_not_reported_as_undecided() {
 /// changes, and the line that offered the call is gone.
 #[tokio::test]
 async fn an_account_the_owner_ruled_outside_stops_being_one_nobody_ruled_on() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -16215,7 +16229,7 @@ async fn an_account_the_owner_ruled_outside_stops_being_one_nobody_ruled_on() {
 /// level goes on reading it there.
 #[tokio::test]
 async fn the_population_joins_the_returns_report_without_moving_its_fields() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, contour_response) = call(
         &harness.router,
         post(
@@ -16247,7 +16261,7 @@ async fn the_population_joins_the_returns_report_without_moving_its_fields() {
 /// vocabulary the server sends.
 #[tokio::test]
 async fn the_openapi_document_declares_the_population_a_report_covered() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -16310,7 +16324,7 @@ fn see_resolves(report: &Value, path: &str) -> bool {
 /// truth — that is why nothing here asserts an amount.
 #[tokio::test]
 async fn every_report_opens_with_what_its_figures_do_not_account_for() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, contour_response) = call(
         &harness.router,
@@ -16424,7 +16438,7 @@ async fn every_report_opens_with_what_its_figures_do_not_account_for() {
 /// the same fact.
 #[tokio::test]
 async fn a_running_cash_sum_is_named_by_account_and_currency() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, contour_response) = call(
         &harness.router,
         post(
@@ -16514,7 +16528,7 @@ async fn a_running_cash_sum_is_named_by_account_and_currency() {
 /// report that carries it.
 #[tokio::test]
 async fn the_openapi_document_declares_the_register_a_report_opens_with() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -16590,9 +16604,9 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
 /// What is left for a test is that those two facts stay true: every key the
 /// register can name resolves through the same catalogue the queue uses, and
 /// resolves to the operation the document declares under that identifier.
-#[test]
-fn every_remedy_the_register_names_is_a_call_the_contract_publishes() {
-    let harness = harness();
+#[tokio::test]
+async fn every_remedy_the_register_names_is_a_call_the_contract_publishes() {
+    let harness = harness().await;
     let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
 
     // The catalogue addresses the whole vocabulary. If it ever went back to a
@@ -16880,7 +16894,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
     // records moves the account to `account_ruled_outside` — and the promise is
     // about this line, so the assertion is about this kind.
     for remedy in ["add_contour_version", "record_account_scope"] {
-        let harness = harness();
+        let harness = harness().await;
         let brokerage = harness.account.inner().to_string();
         let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
         let savings = make_account(&harness, "Savings").await;
@@ -16930,8 +16944,8 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
 
     // --- position_facts_missing ---------------------------------------------
     {
-        let (harness, path) = harness_on_disk();
-        seed_instrument_and_custody(&path, &harness);
+        let (harness, path) = harness_on_disk().await;
+        seed_instrument_and_custody(&path, &harness).await;
         let securities = make_account(&harness, "Securities").await;
         let reported = make_contour(&harness, "Reported", &[securities.as_str()]).await;
 
@@ -16978,7 +16992,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
 
     // --- account_in_another_scope -------------------------------------------
     {
-        let harness = harness();
+        let harness = harness().await;
         let brokerage = harness.account.inner().to_string();
         let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
         let savings = make_account(&harness, "Savings").await;
@@ -17016,7 +17030,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
     // account's money into these figures is membership. Naming it is not advice
     // that he should, and nothing clears the exclusion — membership outranks it.
     {
-        let harness = harness();
+        let harness = harness().await;
         let brokerage = harness.account.inner().to_string();
         let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
         let savings = make_account(&harness, "Savings").await;
@@ -17062,7 +17076,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
     // a balance. A control assertion is reconciliation evidence and does not
     // close this caveat.
     {
-        let harness = harness();
+        let harness = harness().await;
         let brokerage = harness.account.inner().to_string();
         let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
         let (status, verdicts) = call(
@@ -17126,7 +17140,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
     // contour, so the fixture is an outflow the source labelled — the rows a
     // rule is for.
     {
-        let harness = harness();
+        let harness = harness().await;
         let brokerage = harness.account.inner().to_string();
         let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
         let (status, verdicts) = call(
@@ -17205,7 +17219,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
     // the reconstructed opening makes the movements sum to zero, and the
     // retirement then removes the row on its own.
     {
-        let harness = harness();
+        let harness = harness().await;
         let (term, contour, _event) = a_retired_product_still_holding_something(&harness).await;
         let (status, recorded) = call(
             &harness.router,
@@ -17235,7 +17249,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
     }
     // The second: a fact on the account that should stop counting.
     {
-        let harness = harness();
+        let harness = harness().await;
         let (_term, contour, event) = a_retired_product_still_holding_something(&harness).await;
         let (status, verdicts) = call(
             &harness.router,
@@ -17261,7 +17275,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
     // The route carries both directions and only one of them is the remedy —
     // sending `retired` again is refused over a statement that stands.
     {
-        let harness = harness();
+        let harness = harness().await;
         let (term, contour, _event) = a_retired_product_still_holding_something(&harness).await;
         let (status, again) = call(
             &harness.router,
@@ -17346,7 +17360,7 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
 /// in the one call whose purpose is to state a real figure.
 #[tokio::test]
 async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
-    let harness = harness();
+    let harness = harness().await;
     let (term, contour, _event) = a_retired_product_still_holding_something(&harness).await;
 
     let queue = |token: &str| get("/v1/actions", Some(token));
@@ -17539,7 +17553,7 @@ async fn the_queue_offers_the_act_for_a_retirement_that_did_not_take_effect() {
 /// the queue answers, and answers without an item nobody is owed.
 #[tokio::test]
 async fn a_queue_for_an_owner_who_has_retired_nothing_carries_no_such_item() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, actions) = call(
         &harness.router,
         get("/v1/actions", Some(&harness.owner_token)),
@@ -17571,8 +17585,8 @@ async fn a_queue_for_an_owner_who_has_retired_nothing_carries_no_such_item() {
 /// because only the queue knows the account and the interval.
 #[tokio::test]
 async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
 
     let (status, contour_response) = call(
         &harness.router,
@@ -17735,7 +17749,7 @@ async fn a_caveat_carries_the_call_that_closes_it_and_says_so_when_nothing_does(
 /// same intent, not a second perimeter.
 #[tokio::test]
 async fn creating_a_contour_twice_with_the_same_intent_writes_one_contour() {
-    let harness = harness();
+    let harness = harness().await;
     let intent = json!({
         "title": "Household",
         "accounts": [harness.account.inner()],
@@ -17782,7 +17796,7 @@ async fn creating_a_contour_twice_with_the_same_intent_writes_one_contour() {
 /// meant.
 #[tokio::test]
 async fn the_create_route_refuses_a_contour_identifier_and_names_the_versions_route() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, refused) = call(
         &harness.router,
         post(
@@ -17822,7 +17836,7 @@ async fn the_create_route_refuses_a_contour_identifier_and_names_the_versions_ro
 /// was handed against what the system believes.
 #[tokio::test]
 async fn a_contour_can_be_listed_and_read_back_with_its_accounts() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -17886,7 +17900,7 @@ async fn a_contour_can_be_listed_and_read_back_with_its_accounts() {
 /// inside a second perimeter.
 #[tokio::test]
 async fn an_account_is_added_to_an_existing_contour_without_a_second_contour() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, second) = call(
         &harness.router,
         post(
@@ -17973,7 +17987,7 @@ async fn an_account_is_added_to_an_existing_contour_without_a_second_contour() {
 /// contour moved under it.
 #[tokio::test]
 async fn versioning_a_contour_that_moved_under_the_caller_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, second) = call(
         &harness.router,
         post(
@@ -18056,7 +18070,7 @@ async fn versioning_a_contour_that_moved_under_the_caller_is_refused() {
 /// perimeter in the report.
 #[tokio::test]
 async fn the_queue_points_an_undecided_account_at_an_existing_contour() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, orphan) = call(
         &harness.router,
         post(
@@ -18182,7 +18196,7 @@ fn document_reparse(harness: &Harness, document_hash: &str, workbook: &[u8]) -> 
 /// empty-bodied call is a different operation wearing the same name.
 #[tokio::test]
 async fn a_stored_document_is_reparsed_without_being_sent_again() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, uploaded) =
         call(&harness.router, document_upload(&harness, SYNTHETIC_REPORT)).await;
@@ -18218,7 +18232,7 @@ async fn a_stored_document_is_reparsed_without_being_sent_again() {
 /// name a document that is not on record.
 #[tokio::test]
 async fn the_same_document_uploaded_twice_keeps_one_source_identifier() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, first) = call(&harness.router, document_upload(&harness, SYNTHETIC_REPORT)).await;
     assert_eq!(status, StatusCode::OK, "{first}");
@@ -18239,7 +18253,7 @@ async fn the_same_document_uploaded_twice_keeps_one_source_identifier() {
 /// workbook for that case, and says so when it is given neither.
 #[tokio::test]
 async fn a_reparse_of_a_document_that_was_never_stored_says_why_it_cannot() {
-    let harness = harness();
+    let harness = harness().await;
     let never_uploaded = "b".repeat(64);
 
     let (status, refusal) = call(
@@ -18260,7 +18274,7 @@ async fn a_reparse_of_a_document_that_was_never_stored_says_why_it_cannot() {
 /// The published contract tells a client when the body is still needed.
 #[tokio::test]
 async fn the_openapi_document_says_when_a_reparse_still_needs_the_bytes() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -18319,7 +18333,7 @@ async fn transfer_partners_queue(harness: &Harness) -> Vec<Value> {
 /// given closes the new question.
 #[tokio::test]
 async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_the_question() {
-    let harness = harness();
+    let harness = harness().await;
     let main = harness.account.inner().to_string();
 
     // One account: there is no other side, so nothing is asked.
@@ -18484,7 +18498,7 @@ async fn the_owner_states_his_transfer_relationships_and_a_new_account_reopens_t
 /// An account identifier is not an access right, in either position.
 #[tokio::test]
 async fn a_transfer_statement_cannot_name_an_account_the_owner_does_not_hold() {
-    let harness = harness();
+    let harness = harness().await;
     let main = harness.account.inner().to_string();
     let stranger = Uuid::new_v4();
 
@@ -18543,7 +18557,7 @@ fn sorted_partners(statement: &Value) -> Vec<&str> {
 /// number of statements — it shrinks the number of round trips.
 #[tokio::test]
 async fn a_batch_answers_several_accounts_at_once_without_answering_any_for_another() {
-    let harness = harness();
+    let harness = harness().await;
     let main = harness.account.inner().to_string();
 
     let mut opened = Vec::new();
@@ -18645,7 +18659,7 @@ async fn a_batch_answers_several_accounts_at_once_without_answering_any_for_anot
 /// statement's undo; the remaining cases prove the shared validation.
 #[tokio::test]
 async fn a_batch_accepts_reversible_statements_and_refuses_the_same_invalid_ones() {
-    let harness = harness();
+    let harness = harness().await;
     let main = harness.account.inner().to_string();
     let stranger = Uuid::new_v4();
 
@@ -18763,7 +18777,7 @@ async fn a_batch_accepts_reversible_statements_and_refuses_the_same_invalid_ones
 /// half-said anything.
 #[tokio::test]
 async fn a_refused_batch_leaves_every_standing_statement_as_it_was() {
-    let harness = harness();
+    let harness = harness().await;
     let main = harness.account.inner().to_string();
     let stranger = Uuid::new_v4();
 
@@ -18872,7 +18886,7 @@ async fn a_refused_batch_leaves_every_standing_statement_as_it_was() {
 /// caller finds the shape of every other route it calls.
 #[tokio::test]
 async fn the_queue_asks_per_account_and_the_batch_is_discoverable_from_the_specification() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, savings) = call(
         &harness.router,
@@ -19000,7 +19014,7 @@ fn recorded_under(account: Uuid, key: &str, word: &str, amount: &str) -> Value {
 /// This is the half before, and it writes nothing.
 #[tokio::test]
 async fn an_answers_standing_decision_shows_what_it_would_settle_before_it_stands() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     // Two movements already recorded under the word a decision would be made
@@ -19208,7 +19222,7 @@ async fn an_answers_standing_decision_shows_what_it_would_settle_before_it_stand
 /// name that reason rather than show two empty lists.
 #[tokio::test]
 async fn a_forecast_for_an_answer_that_keeps_no_standing_decision_says_which_reason_it_is() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -19277,7 +19291,7 @@ async fn a_forecast_for_an_answer_that_keeps_no_standing_decision_says_which_rea
 /// resolve, and the client that finds out is the one being built.
 #[tokio::test]
 async fn the_contract_publishes_the_forecast_and_the_shapes_it_is_read_by() {
-    let harness = harness();
+    let harness = harness().await;
     let document = serde_json::to_value(&harness.api).expect("OpenAPI JSON");
     let path = document["paths"]
         ["/v1/import-sessions/{session}/questions/{question}/answer/preview"]["post"]
@@ -19372,7 +19386,7 @@ async fn journal_keys(harness: &Harness) -> Vec<String> {
 /// while it waits.
 #[tokio::test]
 async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_it() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let before = journal_rows(&harness).await;
 
@@ -19458,7 +19472,7 @@ async fn a_question_about_an_unresolved_row_outlives_the_response_that_carried_i
 /// is what a person recognises a line on a statement by.
 #[tokio::test]
 async fn two_rows_that_differ_only_in_date_and_amount_get_questions_that_name_them() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, session) = call(
@@ -19538,7 +19552,7 @@ async fn two_rows_that_differ_only_in_date_and_amount_get_questions_that_name_th
 /// items nothing tells apart.
 #[tokio::test]
 async fn the_outstanding_work_item_names_the_row_the_question_is_about() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -19580,7 +19594,7 @@ async fn the_outstanding_work_item_names_the_row_the_question_is_about() {
 /// not have to split one sentence into seven.
 #[tokio::test]
 async fn every_alternative_a_question_offers_says_what_it_does_to_the_report() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -19699,7 +19713,7 @@ async fn every_alternative_a_question_offers_says_what_it_does_to_the_report() {
 /// the question itself.
 #[tokio::test]
 async fn a_question_that_needs_an_account_offers_the_accounts_it_may_name() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -19798,7 +19812,7 @@ async fn a_question_that_needs_an_account_offers_the_accounts_it_may_name() {
 
 #[tokio::test]
 async fn import_session_answers_route_publishes_its_batch_contract() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK, "{spec}");
 
@@ -19830,7 +19844,7 @@ async fn import_session_answers_route_publishes_its_batch_contract() {
 
 #[tokio::test]
 async fn a_batch_answers_several_distinct_questions_in_request_order() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let (status, raised) = call(
         &harness.router,
@@ -19902,7 +19916,7 @@ async fn a_batch_answers_several_distinct_questions_in_request_order() {
 
 #[tokio::test]
 async fn a_batch_keeps_valid_and_refused_answers_as_independent_outcomes() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let (status, raised) = call(
         &harness.router,
@@ -19991,7 +20005,7 @@ async fn a_batch_keeps_valid_and_refused_answers_as_independent_outcomes() {
 
 #[tokio::test]
 async fn a_closed_question_is_refused_and_later_batch_answers_still_run() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let mut distinct = unresolved_row(account, "batch-closed-distinct");
     distinct["source_kind"] = json!("OUTER");
@@ -20054,7 +20068,7 @@ async fn a_closed_question_is_refused_and_later_batch_answers_still_run() {
 
 #[tokio::test]
 async fn a_principal_without_answer_permission_is_refused_before_batch_application() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let (status, raised) = call(
         &harness.router,
@@ -20107,7 +20121,7 @@ async fn a_principal_without_answer_permission_is_refused_before_batch_applicati
 /// copying an id out of either could not tell which was right.
 #[tokio::test]
 async fn the_question_and_the_action_queue_offer_the_same_accounts() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let _savings = another_account(&harness, "Savings").await;
 
@@ -20170,7 +20184,7 @@ async fn the_question_and_the_action_queue_offer_the_same_accounts() {
 /// because a name a client can be wrong about is what caused the mistake.
 #[tokio::test]
 async fn a_session_publishes_its_row_count_under_a_name_no_client_can_index() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -20237,7 +20251,7 @@ async fn a_session_publishes_its_row_count_under_a_name_no_client_can_index() {
 /// this test cannot produce and the core's own tests hold.
 #[tokio::test]
 async fn the_journal_returns_the_rows_one_rule_filed_and_each_row_names_it() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -20409,7 +20423,7 @@ async fn the_journal_returns_the_rows_one_rule_filed_and_each_row_names_it() {
 /// Every account, amount, date and key here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_rules_group_holds_the_rows_the_answer_that_minted_it_settled_and_says_which() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -20600,7 +20614,7 @@ async fn a_rules_group_holds_the_rows_the_answer_that_minted_it_settled_and_says
 /// import.
 #[tokio::test]
 async fn answering_the_question_writes_a_rule_that_settles_what_the_next_row_is() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -20781,7 +20795,7 @@ fn merchant_inflow_row(account: Uuid, key: &str) -> Value {
 /// the same sum, in the same month.
 #[tokio::test]
 async fn an_observed_refund_reaches_the_journal_as_a_refund() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, session) = call(
@@ -20883,7 +20897,7 @@ async fn an_observed_refund_reaches_the_journal_as_a_refund() {
 /// row supplies one.
 #[tokio::test]
 async fn an_answer_that_names_income_may_name_which_earning_it_was() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -21019,7 +21033,7 @@ async fn one_row_session(harness: &Harness, label: &str, row: Value) -> (String,
 /// The falsification is the first half: the same row with no rule is a question.
 #[tokio::test]
 async fn a_rule_on_the_sources_own_category_settles_a_row_naming_no_operation_word() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (_, asked) = one_row_session(&harness, "march", filed_row(account, "filed-one")).await;
@@ -21089,7 +21103,7 @@ async fn a_rule_on_the_sources_own_category_settles_a_row_naming_no_operation_wo
 /// settled it, rather than presenting a complete-looking list of rows.
 #[tokio::test]
 async fn reconciliation_names_a_row_diverted_by_a_standing_transfer_rule() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -21157,7 +21171,7 @@ async fn reconciliation_names_a_row_diverted_by_a_standing_transfer_rule() {
 /// in the owner's own standing decisions.
 #[tokio::test]
 async fn a_rule_on_a_category_leaves_a_row_naming_that_word_as_its_operation_word_open() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, created) = call(
@@ -21189,7 +21203,7 @@ async fn a_rule_on_a_category_leaves_a_row_naming_that_word_as_its_operation_wor
 /// A session defers everything, and abandoning it leaves the journal untouched.
 #[tokio::test]
 async fn an_abandoned_import_session_writes_nothing_to_the_journal() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let before = journal_rows(&harness).await;
 
@@ -21270,7 +21284,7 @@ async fn an_abandoned_import_session_writes_nothing_to_the_journal() {
 /// back the identifier the rows need.
 #[tokio::test]
 async fn a_session_is_declared_by_the_identifier_the_source_prints() {
-    let harness = harness();
+    let harness = harness().await;
     let created = account_with(
         &harness,
         &json!({
@@ -21352,7 +21366,7 @@ async fn a_session_is_declared_by_the_identifier_the_source_prints() {
 /// submit a batch.
 #[tokio::test]
 async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
-    let harness = harness();
+    let harness = harness().await;
     let created = account_with(
         &harness,
         &json!({
@@ -21434,7 +21448,7 @@ async fn a_row_names_its_account_by_the_identifier_the_source_prints() {
 /// word, because a verdict is what the route said and the journal is what it did.
 #[tokio::test]
 async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
-    let harness = harness();
+    let harness = harness().await;
     account_with(
         &harness,
         &json!({
@@ -21525,7 +21539,7 @@ async fn a_row_naming_no_account_is_rejected_beside_rows_that_are_not() {
 /// it already had.
 #[tokio::test]
 async fn a_declaration_by_identifier_and_by_uuid_reach_the_same_session() {
-    let harness = harness();
+    let harness = harness().await;
     let created = account_with(
         &harness,
         &json!({
@@ -21571,7 +21585,7 @@ async fn a_declaration_by_identifier_and_by_uuid_reach_the_same_session() {
 /// open call, and there is nothing in an empty session to mix a statement into.
 #[tokio::test]
 async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_names_the_session() {
-    let harness = harness();
+    let harness = harness().await;
     let account = account_with(
         &harness,
         &json!({ "title": "Main", "provider": "bank-one", "provider_account_id": "acct-1" }),
@@ -21711,7 +21725,7 @@ async fn a_declared_import_that_already_holds_rows_is_refused_and_the_refusal_na
 /// Every account, label and amount below is invented for this test (CLAUDE.md).
 #[tokio::test]
 async fn a_declared_session_refuses_a_row_for_an_account_it_did_not_declare() {
-    let harness = harness();
+    let harness = harness().await;
     let main = another_account(&harness, "Main").await;
     let savings = another_account(&harness, "Savings").await;
 
@@ -21812,7 +21826,7 @@ async fn a_declared_session_refuses_a_row_for_an_account_it_did_not_declare() {
 /// With every question answered, committing is what the refusal leads with.
 #[tokio::test]
 async fn a_settled_import_under_way_is_refused_with_the_commit_that_ends_it() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let declaration =
         json!({ "source": { "account": account, "channel": "file", "label": "march" } });
@@ -21866,7 +21880,7 @@ async fn a_settled_import_under_way_is_refused_with_the_commit_that_ends_it() {
 /// A card is an identifier too, and the interval on it does not gate the file.
 #[tokio::test]
 async fn a_session_is_declared_by_an_alias() {
-    let harness = harness();
+    let harness = harness().await;
     let created = account_with(
         &harness,
         &json!({
@@ -21896,7 +21910,7 @@ async fn a_session_is_declared_by_an_alias() {
 /// Two accounts answering to one identifier are refused, not picked between.
 #[tokio::test]
 async fn an_ambiguous_declared_account_is_refused_and_the_refusal_says_why() {
-    let harness = harness();
+    let harness = harness().await;
     let first = account_with(
         &harness,
         &json!({
@@ -21956,7 +21970,7 @@ async fn an_ambiguous_declared_account_is_refused_and_the_refusal_says_why() {
 /// Commit refuses while a question is open, and writes once when it is answered.
 #[tokio::test]
 async fn a_session_commits_only_after_every_question_has_been_answered() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
     let before = journal_rows(&harness).await;
@@ -22059,7 +22073,7 @@ async fn a_session_commits_only_after_every_question_has_been_answered() {
 /// An answer the question never offered is refused before anything is written.
 #[tokio::test]
 async fn an_answer_the_question_does_not_admit_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -22129,7 +22143,7 @@ async fn an_answer_the_question_does_not_admit_is_refused() {
 /// observation shape must not cause.
 #[tokio::test]
 async fn a_concluded_row_is_recorded_exactly_as_it_was_before_sessions_existed() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -22182,7 +22196,7 @@ async fn a_concluded_row_is_recorded_exactly_as_it_was_before_sessions_existed()
 /// when it opened.
 #[tokio::test]
 async fn a_free_sessions_rows_are_retractable_as_the_import_the_session_is() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, opened) = call(
@@ -22267,7 +22281,7 @@ async fn a_free_sessions_rows_are_retractable_as_the_import_the_session_is() {
 /// group.
 #[tokio::test]
 async fn two_free_sessions_are_two_imports() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let mut sessions = Vec::new();
@@ -22413,7 +22427,7 @@ fn delta_list<'a>(plan: &'a Value, section: &str) -> &'a Vec<Value> {
 /// Every account, amount, date and identifier here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_row_identified_by_its_source_is_a_duplicate_before_the_commit_says_so() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let rows = json!([{
         "account": account,
@@ -22480,7 +22494,7 @@ async fn a_row_identified_by_its_source_is_a_duplicate_before_the_commit_says_so
 /// Every account, amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_row_naming_no_identity_is_disclosed_and_still_written() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let rows = json!([{
         "account": account,
@@ -22550,7 +22564,7 @@ async fn a_row_naming_no_identity_is_disclosed_and_still_written() {
 /// Every account, amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn two_alike_rows_in_one_import_are_two_facts_and_no_resemblance() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let row = json!({
         "account": account,
@@ -22595,7 +22609,7 @@ async fn two_alike_rows_in_one_import_are_two_facts_and_no_resemblance() {
 /// Every account, amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_second_undeclared_session_opens_and_its_assessment_names_the_repeat() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let rows = json!([{
         "account": account,
@@ -22652,7 +22666,7 @@ async fn a_second_undeclared_session_opens_and_its_assessment_names_the_repeat()
 /// Every account, amount, date and label here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_declared_session_holding_rows_still_refuses_the_second_open() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let declaration = json!({
         "source": { "account": account, "channel": "file", "label": "july" }
@@ -22694,7 +22708,7 @@ async fn a_declared_session_holding_rows_still_refuses_the_second_open() {
 /// prevent.
 #[tokio::test]
 async fn a_declaration_without_a_label_reaches_the_session_it_already_opened() {
-    let harness = harness();
+    let harness = harness().await;
     let declaration = json!({
         "source": { "account": harness.account.inner(), "channel": "file" }
     });
@@ -22744,7 +22758,7 @@ async fn a_declaration_without_a_label_reaches_the_session_it_already_opened() {
 /// read, and nothing else here would notice: the routes still answer.
 #[tokio::test]
 async fn every_schema_reference_in_the_contract_resolves() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -22796,7 +22810,7 @@ fn collect_refs(value: &Value, found: &mut impl FnMut(&str)) {
 /// the route that answers it — is taken from the queue alone.
 #[tokio::test]
 async fn an_open_classification_question_is_an_item_in_the_action_queue() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -22943,7 +22957,7 @@ async fn an_open_classification_question_is_an_item_in_the_action_queue() {
 /// ordinary answer route can then be used again without abandoning the session.
 #[tokio::test]
 async fn a_retired_import_rule_can_be_withdrawn_and_answered_again() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
     let (status, verdicts) = call(
@@ -23145,7 +23159,7 @@ async fn session_holding_one_row(harness: &Harness, label: &str, key: &str) -> S
 /// act is then to import the same statement again.
 #[tokio::test]
 async fn a_session_holding_rows_is_in_the_queue_with_nothing_to_answer() {
-    let harness = harness();
+    let harness = harness().await;
     let id = session_holding_one_row(&harness, "august", "queued-one").await;
 
     let items = unfinished_session_items(&harness).await;
@@ -23205,7 +23219,7 @@ async fn a_session_holding_rows_is_in_the_queue_with_nothing_to_answer() {
 /// first. This item makes no claim about any row: it says the session is open.
 #[tokio::test]
 async fn abandoning_a_session_closes_its_queue_item() {
-    let harness = harness();
+    let harness = harness().await;
     let id = session_holding_one_row(&harness, "september", "queued-two").await;
     assert_eq!(unfinished_session_items(&harness).await.len(), 1);
 
@@ -23237,7 +23251,7 @@ async fn abandoning_a_session_closes_its_queue_item() {
 /// by planning the commit.
 #[tokio::test]
 async fn the_session_list_says_what_each_session_holds() {
-    let harness = harness();
+    let harness = harness().await;
     let id = session_holding_one_row(&harness, "october", "listed-one").await;
 
     let (status, sessions) = call(
@@ -23329,7 +23343,7 @@ async fn a_session_with_one_mirrored_movement(harness: &Harness) -> (String, Uui
 /// since decision 0031; the queue never consulted the pairing at all.
 #[tokio::test]
 async fn a_movement_printed_on_both_of_its_accounts_is_one_item() {
-    let harness = harness();
+    let harness = harness().await;
     let (session, _) = a_session_with_one_mirrored_movement(&harness).await;
 
     let items = open_question_items(&harness).await;
@@ -23387,7 +23401,7 @@ async fn a_movement_printed_on_both_of_its_accounts_is_one_item() {
 /// directory recognises as one of his own accounts.
 #[tokio::test]
 async fn a_settled_row_of_the_same_shape_stops_the_queue_pairing_the_two_open_ones() {
-    let harness = harness();
+    let harness = harness().await;
     let main = another_account(&harness, "Main").await;
     let savings = another_account(&harness, "Savings").await;
     let reserve = another_account(&harness, "Reserve").await;
@@ -23465,7 +23479,7 @@ async fn a_settled_row_of_the_same_shape_stops_the_queue_pairing_the_two_open_on
 /// already publishes those words.
 #[tokio::test]
 async fn one_item_for_a_pair_can_still_be_answered_they_are_two_different_things() {
-    let harness = harness();
+    let harness = harness().await;
     let _ = a_session_with_one_mirrored_movement(&harness).await;
 
     let items = open_question_items(&harness).await;
@@ -23564,7 +23578,7 @@ async fn one_item_for_a_pair_can_still_be_answered_they_are_two_different_things
 /// Answering the pair settles both legs, and the queue lists neither again.
 #[tokio::test]
 async fn answering_one_item_for_a_pair_settles_both_of_its_legs() {
-    let harness = harness();
+    let harness = harness().await;
     let (_, savings) = a_session_with_one_mirrored_movement(&harness).await;
 
     let items = open_question_items(&harness).await;
@@ -23610,7 +23624,7 @@ async fn answering_one_item_for_a_pair_settles_both_of_its_legs() {
 /// one row nothing in the document mirrors.
 #[tokio::test]
 async fn a_leg_a_one_account_document_holds_no_counterpart_for_says_which_and_why() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, session) = call(
@@ -23708,7 +23722,7 @@ async fn a_leg_a_one_account_document_holds_no_counterpart_for_says_which_and_wh
 /// a test resting on two of them cannot say which one it is pinning.
 #[tokio::test]
 async fn a_leg_a_many_account_document_holds_no_counterpart_for_says_only_that() {
-    let harness = harness();
+    let harness = harness().await;
     let main = another_account(&harness, "Main").await;
     let savings = another_account(&harness, "Savings").await;
 
@@ -23780,7 +23794,7 @@ async fn a_leg_a_many_account_document_holds_no_counterpart_for_says_only_that()
 /// Every value is invented for this file.
 #[tokio::test]
 async fn a_payment_to_a_named_merchant_is_not_told_the_document_holds_no_counterpart() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, session) = call(
@@ -23852,7 +23866,7 @@ async fn a_payment_to_a_named_merchant_is_not_told_the_document_holds_no_counter
 /// which of the two things happened to a row decides which sentence it gets.
 #[tokio::test]
 async fn an_ambiguous_leg_is_not_told_the_document_holds_no_counterpart() {
-    let harness = harness();
+    let harness = harness().await;
     let main = another_account(&harness, "Main").await;
     let savings = another_account(&harness, "Savings").await;
     let reserve = another_account(&harness, "Reserve").await;
@@ -23934,7 +23948,7 @@ async fn an_ambiguous_leg_is_not_told_the_document_holds_no_counterpart() {
 /// have noticed.
 #[tokio::test]
 async fn a_session_publishes_the_path_to_its_own_assessment() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, opened) = call(
@@ -24071,7 +24085,7 @@ fn check_of<'a>(plan: &'a Value, figure: &str) -> &'a Value {
 /// Every account and amount is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_control_section_is_refused_where_it_is_a_transcription_mistake() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Main").await;
     let session = session_holding(&harness, account, "refusals", json!([])).await;
 
@@ -24223,7 +24237,7 @@ async fn a_control_section_is_refused_where_it_is_a_transcription_mistake() {
 /// Every account and amount is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_mirrored_transfer_leg_fails_the_turnover_the_statement_printed() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Main").await;
     let session = session_holding(
         &harness,
@@ -24364,7 +24378,7 @@ async fn a_mirrored_transfer_leg_fails_the_turnover_the_statement_printed() {
 /// Every account and amount is invented (CLAUDE.md).
 #[tokio::test]
 async fn an_import_off_by_a_factor_of_a_hundred_misses_the_closing_balance() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Main").await;
     let session = session_holding(
         &harness,
@@ -24434,7 +24448,7 @@ async fn an_import_off_by_a_factor_of_a_hundred_misses_the_closing_balance() {
 /// Every account and amount is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Savings").await;
     let session = session_holding(
         &harness,
@@ -24568,7 +24582,7 @@ async fn a_batch_that_agrees_with_its_source_commits_the_reconciliation_with_it(
 /// Every account, amount and key here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_commit_that_declines_a_row_writes_the_coverage_gap_that_says_so() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Main").await;
     let session = session_holding(
         &harness,
@@ -24693,7 +24707,7 @@ async fn a_commit_that_declines_a_row_writes_the_coverage_gap_that_says_so() {
 /// Every account, amount and key here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_commit_with_no_stated_control_section_writes_no_coverage_gap() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Savings").await;
     let session = session_holding(
         &harness,
@@ -24750,7 +24764,7 @@ async fn a_commit_with_no_stated_control_section_writes_no_coverage_gap() {
 /// Every account, amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn rows_dated_outside_the_stated_interval_refuse_a_commit_that_otherwise_adds_up() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Main").await;
     let session = session_holding(
         &harness,
@@ -24887,7 +24901,7 @@ async fn rows_dated_outside_the_stated_interval_refuse_a_commit_that_otherwise_a
 /// Every account, amount and date here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_batch_inside_its_stated_interval_reports_a_fit_and_needs_no_flag() {
-    let harness = harness();
+    let harness = harness().await;
     let account = another_account(&harness, "Savings").await;
     let session = session_holding(
         &harness,
@@ -24967,7 +24981,7 @@ async fn a_batch_inside_its_stated_interval_reports_a_fit_and_needs_no_flag() {
 /// Every amount and account here is invented (CLAUDE.md).
 #[tokio::test]
 async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
-    let harness = harness();
+    let harness = harness().await;
     let main = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -25119,7 +25133,7 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
 /// Every amount and account here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_plan_names_the_provenance_its_facts_will_be_written_under() {
-    let harness = harness();
+    let harness = harness().await;
     let main = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -25248,7 +25262,7 @@ async fn a_plan_names_the_provenance_its_facts_will_be_written_under() {
 /// disposition is named, and the readiness says whose decision is outstanding.
 #[tokio::test]
 async fn an_assessment_says_what_the_import_will_and_will_not_record() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
     let before = journal_rows(&harness).await;
@@ -25515,7 +25529,7 @@ async fn an_assessment_says_what_the_import_will_and_will_not_record() {
 /// is a made-up word, and the amounts were chosen for this test.
 #[tokio::test]
 async fn adopting_the_offered_rule_settles_the_rows_it_covers_and_the_session_commits() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let before = journal_rows(&harness).await;
 
@@ -25706,7 +25720,7 @@ async fn adopting_the_offered_rule_settles_the_rows_it_covers_and_the_session_co
 /// are made up, and the amounts were chosen for this test.
 #[tokio::test]
 async fn a_word_that_holds_two_things_is_published_with_its_contents_and_no_rule() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, session) = call(
@@ -25850,7 +25864,7 @@ async fn a_word_that_holds_two_things_is_published_with_its_contents_and_no_rule
 /// matches the other meaning in the same session.
 #[tokio::test]
 async fn answering_one_of_mixed_counterparty_rows_mints_no_rule() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, session) = call(
@@ -25943,7 +25957,7 @@ async fn answering_one_of_mixed_counterparty_rows_mints_no_rule() {
 /// miniature.
 #[tokio::test]
 async fn a_commit_against_a_stale_revision_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let before = journal_rows(&harness).await;
 
@@ -26062,7 +26076,7 @@ async fn a_commit_against_a_stale_revision_is_refused() {
 /// stop counting.
 #[tokio::test]
 async fn a_transfer_pairing_is_proposed_with_its_evidence_and_never_confirmed_blindly() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let elsewhere = another_account(&harness, "Elsewhere").await;
 
@@ -26206,7 +26220,7 @@ async fn a_transfer_pairing_is_proposed_with_its_evidence_and_never_confirmed_bl
 async fn an_account_created_without_an_identity_states_none() {
     // Every account that existed before decision 0004 is in this state, and the
     // wire shape must keep saying so rather than filling the gap in.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -26230,7 +26244,7 @@ async fn a_create_repeating_an_external_identity_returns_the_account_created_las
     // A re-import must find the account it created last time. The title differs
     // on the second call on purpose: a title is a display name, so repeating an
     // identity under a new one is not a rename and must not become one.
-    let harness = harness();
+    let harness = harness().await;
     let identity = json!({ "provider": "bank-one", "provider_account_id": "opaque-1" });
 
     let (status, first) = call(
@@ -26293,7 +26307,7 @@ async fn a_create_repeating_an_external_identity_returns_the_account_created_las
 async fn one_provider_account_id_at_two_providers_is_two_accounts() {
     // Uniqueness is scoped by provider: two sources that both print short
     // sequential identifiers would otherwise collide on values neither controls.
-    let harness = harness();
+    let harness = harness().await;
 
     for provider in ["bank-one", "bank-two"] {
         let (status, body) = call(
@@ -26332,7 +26346,7 @@ async fn half_an_external_identity_is_refused() {
     // all, and the caller would learn that only on the re-import that minted a
     // duplicate. This is a check on the shape of the pair, never on the value:
     // `provider_account_id` stays opaque.
-    let harness = harness();
+    let harness = harness().await;
 
     for body in [
         json!({ "title": "Main", "provider": "bank-one" }),
@@ -26357,7 +26371,7 @@ async fn two_cards_over_one_account_are_one_account_with_two_aliases() {
     // The balance is counted once because there is one account. A card that
     // stopped working is an alias whose interval closed, and that is all the
     // model records about it.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -26400,7 +26414,7 @@ async fn two_cards_over_one_account_are_one_account_with_two_aliases() {
 
 #[tokio::test]
 async fn an_alias_interval_that_ends_before_it_begins_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, refusal) = call(
         &harness.router,
@@ -26423,7 +26437,7 @@ async fn an_alias_interval_that_ends_before_it_begins_is_refused() {
 
 #[tokio::test]
 async fn a_cash_class_the_owner_states_survives_the_round_trip() {
-    let harness = harness();
+    let harness = harness().await;
 
     for class in ["deposit", "savings", "card_account", "wallet"] {
         let (status, created) = call(
@@ -26445,7 +26459,7 @@ async fn a_cash_class_outside_the_cash_perimeter_is_refused() {
     // `brokerage` and `security_position` are not values here: positions are
     // what the journal records, and the projection separates them from cash
     // structurally. An unknown class is refused rather than defaulted.
-    let harness = harness();
+    let harness = harness().await;
 
     for class in ["brokerage", "security_position", "invented"] {
         let (status, refusal) = call(
@@ -26467,7 +26481,7 @@ async fn an_alias_the_owner_adds_later_reaches_the_same_account() {
     // second card appears over it. Without a route for that, an account's
     // aliases could only ever be stated at creation, and the case decision 0004
     // was written about would still need two accounts.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, created) = call(
         &harness.router,
@@ -26515,7 +26529,7 @@ async fn an_alias_the_owner_adds_later_reaches_the_same_account() {
 
 #[tokio::test]
 async fn aliases_cannot_be_written_against_an_account_the_owner_does_not_hold() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, refusal) = call(
         &harness.router,
@@ -26536,7 +26550,7 @@ async fn an_agent_may_not_state_an_accounts_aliases() {
     // An alias decides which printed identifier reaches which account, and
     // therefore which account a row lands on. This is instance administration,
     // not the reversible account-creation operation.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, refusal) = call(
         &harness.router,
@@ -26585,7 +26599,7 @@ async fn an_account_that_states_no_identity_can_be_given_one_later() {
     // it — correctly, because it is idempotent rather than an update. Nothing
     // else wrote these three. So every account created before decision 0004
     // could never acquire an identity, a class or an expectation.
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(&harness, &json!({ "title": "Main" })).await;
 
     let (status, recorded) = declare(
@@ -26662,7 +26676,7 @@ async fn a_declaration_the_request_does_not_mention_is_left_alone() {
     // Absence is the third state. A replacement that read an unmentioned field
     // as «none» would withdraw, on every call, everything the caller did not
     // happen to repeat — including the identity a later import resolves by.
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(
         &harness,
         &json!({
@@ -26698,7 +26712,7 @@ async fn a_declaration_the_request_does_not_mention_is_left_alone() {
 
 #[tokio::test]
 async fn stating_none_clears_a_declaration_and_is_not_the_same_call_as_omitting_it() {
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(
         &harness,
         &json!({
@@ -26730,7 +26744,7 @@ async fn re_pointing_an_identity_is_recorded_and_says_what_it_did_not_do() {
     // records its account and a free source label, and nothing records the
     // external identity in force when it arrived. So the change is made and the
     // response says what it did not do.
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(
         &harness,
         &json!({
@@ -26820,7 +26834,7 @@ async fn re_pointing_an_identity_is_recorded_and_says_what_it_did_not_do() {
 
 #[tokio::test]
 async fn withdrawing_an_identity_reports_the_one_it_displaced() {
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(
         &harness,
         &json!({
@@ -26850,7 +26864,7 @@ async fn withdrawing_an_identity_reports_the_one_it_displaced() {
 async fn an_identity_another_account_already_answers_to_is_refused() {
     // Two accounts under one identity would leave the next import's upsert
     // picking between them.
-    let harness = harness();
+    let harness = harness().await;
     account_with(
         &harness,
         &json!({
@@ -26881,7 +26895,7 @@ async fn an_identity_another_account_already_answers_to_is_refused() {
 
 #[tokio::test]
 async fn half_an_identity_is_refused_when_it_is_stated_as_it_is_at_creation() {
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(&harness, &json!({ "title": "Main" })).await;
 
     for body in [
@@ -26920,7 +26934,7 @@ async fn half_an_identity_is_refused_when_it_is_stated_as_it_is_at_creation() {
 
 #[tokio::test]
 async fn a_declaration_stated_without_a_value_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(&harness, &json!({ "title": "Main" })).await;
 
     for body in [
@@ -26940,7 +26954,7 @@ async fn a_declaration_stated_without_a_value_is_refused() {
 
 #[tokio::test]
 async fn declarations_cannot_be_written_against_an_account_the_owner_does_not_hold() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, refusal) = declare(
         &harness,
@@ -26957,7 +26971,7 @@ async fn declarations_cannot_be_written_against_an_account_the_owner_does_not_ho
 async fn an_agent_may_not_state_an_accounts_declarations() {
     // An identity decides which account a later import addresses. This is
     // instance administration, not the reversible account-creation operation.
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, refusal) = call(
         &harness.router,
@@ -26976,7 +26990,7 @@ async fn an_agent_may_not_state_an_accounts_declarations() {
 async fn an_empty_declaration_request_changes_nothing() {
     // Every field absent is «he mentioned nothing», and the honest answer is the
     // account exactly as it stood.
-    let harness = harness();
+    let harness = harness().await;
     let id = account_with(
         &harness,
         &json!({
@@ -27007,7 +27021,7 @@ async fn an_empty_declaration_request_changes_nothing() {
 /// refuses everywhere else.
 #[tokio::test]
 async fn the_asset_snapshot_groups_cash_by_the_class_the_owner_declared() {
-    let harness = harness();
+    let harness = harness().await;
 
     let mut created = Vec::new();
     for (title, class) in [
@@ -27142,7 +27156,7 @@ async fn the_asset_snapshot_groups_cash_by_the_class_the_owner_declared() {
 /// evidence, not a cash leg.
 #[tokio::test]
 async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
-    let harness = harness();
+    let harness = harness().await;
 
     let mut created = Vec::new();
     for title in ["Savings One", "Savings Two"] {
@@ -27291,8 +27305,8 @@ async fn a_class_total_whose_accounts_disagree_states_both_parts_and_no_sum() {
 /// market-dependent figure cannot read as a bank figure.
 #[tokio::test]
 async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_total() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
 
     let (status, contour_response) = call(
         &harness.router,
@@ -27411,8 +27425,8 @@ async fn the_asset_snapshot_states_both_halves_and_the_price_date_before_the_tot
 /// up; absence is a question.
 #[tokio::test]
 async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
 
     let (status, contour_response) = call(
         &harness.router,
@@ -27504,8 +27518,8 @@ async fn an_unvalued_holding_is_absent_from_the_snapshot_total_and_is_a_caveat()
 /// cash products, and a position fact must close the former.
 #[tokio::test]
 async fn an_asset_report_names_missing_position_facts_only_for_securities_accounts() {
-    let (harness, path) = harness_on_disk();
-    seed_instrument_and_custody(&path, &harness);
+    let (harness, path) = harness_on_disk().await;
+    seed_instrument_and_custody(&path, &harness).await;
     let router = &harness.router;
     let owner_token = &harness.owner_token;
 
@@ -27686,7 +27700,7 @@ async fn an_asset_report_names_missing_position_facts_only_for_securities_accoun
 /// Same-title contours are distinct perimeters, not versions of one another.
 #[tokio::test]
 async fn a_contour_listing_names_other_contours_with_the_same_title() {
-    let harness = harness();
+    let harness = harness().await;
     let router = &harness.router;
     let owner_token = &harness.owner_token;
     let create_account = |title: &str| {
@@ -27770,7 +27784,7 @@ async fn a_contour_listing_names_other_contours_with_the_same_title() {
 
 #[tokio::test]
 async fn new_scope_silence_fields_and_caveat_are_described_in_openapi() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -27801,7 +27815,7 @@ async fn new_scope_silence_fields_and_caveat_are_described_in_openapi() {
 /// a minus on a margin account, and the two mean opposite things.
 #[tokio::test]
 async fn a_negative_balance_the_owner_called_unexpected_is_reported_as_contradicting_him() {
-    let harness = harness();
+    let harness = harness().await;
 
     let (status, account) = call(
         &harness.router,
@@ -27910,7 +27924,7 @@ async fn a_negative_balance_the_owner_called_unexpected_is_reported_as_contradic
 /// is where the code would show it.
 #[tokio::test]
 async fn a_savings_account_the_owner_said_nothing_about_is_not_warned_on() {
-    let harness = harness();
+    let harness = harness().await;
 
     let mut ids = Vec::new();
     for (title, expectation) in [
@@ -28043,7 +28057,7 @@ fn is_rfc6901_pointer(pointer: &str) -> bool {
 /// was refused, with no parsing of its own.
 #[tokio::test]
 async fn a_rejected_field_is_addressed_by_a_json_pointer() {
-    let harness = harness();
+    let harness = harness().await;
     let missing = Uuid::new_v4();
     let (status, body) = call(
         &harness.router,
@@ -28087,7 +28101,7 @@ async fn a_rejected_field_is_addressed_by_a_json_pointer() {
 /// to retry from it would have to split prose on commas and the word "or".
 #[tokio::test]
 async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         post(
@@ -28124,7 +28138,7 @@ async fn a_rejected_field_with_a_closed_vocabulary_publishes_its_values() {
 /// written and lost in the same call.
 #[tokio::test]
 async fn a_rejected_classification_outcome_publishes_the_words_it_admits() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         post(
@@ -28171,7 +28185,7 @@ async fn a_rejected_classification_outcome_publishes_the_words_it_admits() {
 /// address, the two path segments already known, and the one field still wanted.
 #[tokio::test]
 async fn a_commit_refused_for_an_open_question_names_the_call_that_answers_it() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -28363,7 +28377,7 @@ async fn classification_rule_count(harness: &Harness) -> usize {
 /// says the rule still exists for the caller entitled to it.
 #[tokio::test]
 async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = another_account(&harness, "Savings").await;
     let before = journal_rows(&harness).await;
 
@@ -28474,7 +28488,7 @@ async fn an_agents_answer_settles_the_row_and_writes_no_rule() {
 /// type itself, this is the call that would fail.
 #[tokio::test]
 async fn an_answer_that_could_not_generalise_publishes_the_rule_it_would_have_made() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = another_account(&harness, "Savings").await;
 
     let (session, question) = ask_one_question(&harness, &harness.agent_token, "agent-inner").await;
@@ -28549,7 +28563,7 @@ async fn an_answer_that_could_not_generalise_publishes_the_rule_it_would_have_ma
 /// merely described the body would fail here.
 #[tokio::test]
 async fn a_rule_an_answer_could_not_write_is_queued_for_the_owner_to_adopt() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = another_account(&harness, "Savings").await;
 
     let (session, question) = ask_one_question(&harness, &harness.agent_token, "queue-adopt").await;
@@ -28654,7 +28668,7 @@ async fn a_rule_an_answer_could_not_write_is_queued_for_the_owner_to_adopt() {
 /// through its own operation.
 #[tokio::test]
 async fn the_agent_can_send_the_reversible_rule_the_queue_offers() {
-    let harness = harness();
+    let harness = harness().await;
     let savings = another_account(&harness, "Savings").await;
 
     let (session, question) =
@@ -28703,7 +28717,7 @@ async fn adopt_rule_items(harness: &Harness) -> Vec<Value> {
 /// that generalised nothing.
 #[tokio::test]
 async fn an_unanswered_question_names_its_own_state() {
-    let harness = harness();
+    let harness = harness().await;
     let (session, _) = ask_one_question(&harness, &harness.agent_token, "still-open").await;
 
     let (status, contents) = call(
@@ -28768,7 +28782,7 @@ async fn declare_import(harness: &Harness, token: &str, label: &str, key: &str) 
 /// owner's — he made none about rows the agent put there.
 #[tokio::test]
 async fn an_agent_retracts_the_import_it_declared() {
-    let harness = harness();
+    let harness = harness().await;
     let before = journal_rows(&harness).await;
     let source = declare_import(&harness, &harness.agent_token, "agent-august", "agent-own").await;
     assert_eq!(journal_rows(&harness).await, before + 1);
@@ -28814,7 +28828,7 @@ async fn an_agent_retracts_the_import_it_declared() {
 /// happy case and lets one of these through is the defect it was meant to close.
 #[tokio::test]
 async fn an_agent_may_not_retract_anything_it_did_not_declare() {
-    let harness = harness();
+    let harness = harness().await;
     let owners = declare_import(&harness, &harness.owner_token, "owner-august", "owner-own").await;
 
     // 1. Not the caller's declaration.
@@ -28945,7 +28959,7 @@ async fn an_agent_may_not_retract_anything_it_did_not_declare() {
 /// evidence the agent's does.
 #[tokio::test]
 async fn a_read_only_token_may_not_retract_an_import() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, refused) = call(
         &harness.router,
         post(
@@ -28991,7 +29005,7 @@ async fn a_source_that_names_the_far_side_as_the_owners_records_a_fact_and_asks_
     // «between your own accounts», each of which raised a question and held the
     // commit. Now each becomes a fact of its own — one that posts nothing,
     // because the direction is still unstated, and says so.
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -29047,7 +29061,7 @@ async fn a_source_that_names_the_far_side_as_the_owners_records_a_fact_and_asks_
 /// Every account, amount, date and key here is invented (CLAUDE.md).
 #[tokio::test]
 async fn a_change_the_legs_cannot_see_is_named_and_a_sum_no_leg_carries_is_shown() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     seed_instrument(&path, &harness);
     let account = harness.account.inner();
 
@@ -29194,7 +29208,7 @@ async fn a_change_the_legs_cannot_see_is_named_and_a_sum_no_leg_carries_is_shown
 async fn the_same_row_with_a_direction_posts_one_leg_and_is_not_spending() {
     // With a direction the account really did move, so the journal posts it —
     // and still not as `cash_out`, which would count the amount as money spent.
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let mut row = own_account_row(account, "own-two");
     row["direction"] = json!("out");
@@ -29227,7 +29241,7 @@ async fn the_same_row_with_a_direction_posts_one_leg_and_is_not_spending() {
 async fn a_far_side_word_the_contract_does_not_know_is_refused_rather_than_dropped() {
     // Dropping it would read the row as one whose source said nothing about the
     // far side, which is a weaker statement than the caller meant to make.
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let mut row = own_account_row(account, "own-three");
     row["far_side"] = json!("mine");
@@ -29258,7 +29272,7 @@ async fn a_far_side_word_the_contract_does_not_know_is_refused_rather_than_dropp
 /// spending. This is the word for what he actually knows.
 #[tokio::test]
 async fn the_owner_can_say_it_was_between_his_own_accounts_without_naming_which() {
-    let harness = harness();
+    let harness = harness().await;
     let before = journal_rows(&harness).await;
 
     let (session, question) = ask_one_question(&harness, &harness.owner_token, "unnamed-own").await;
@@ -29349,7 +29363,7 @@ async fn the_owner_can_say_it_was_between_his_own_accounts_without_naming_which(
 /// The same answer on a row whose direction the source did print.
 #[tokio::test]
 async fn the_eighth_answer_posts_a_leg_where_the_statement_stated_a_direction() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, verdicts) = call(
@@ -29415,7 +29429,7 @@ async fn a_movement_between_two_instruments_over_one_account_is_settled_without_
     // balance does not change and there is no second leg to wait for. Nothing
     // is asked, and the outcome is a word of its own — not `quarantined`,
     // which would say a fact could not be written.
-    let harness = harness();
+    let harness = harness().await;
     let created = account_with(
         &harness,
         &json!({
@@ -29475,7 +29489,7 @@ async fn a_movement_between_two_instruments_over_one_account_is_settled_without_
 #[tokio::test]
 async fn the_verdict_vocabulary_publishes_the_settled_row_and_says_what_it_means() {
     // A code with no published meaning is a promise a client waits on for ever.
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK, "{spec}");
     let verdict = &spec["components"]["schemas"]["VerdictCodeDto"];
@@ -29577,7 +29591,7 @@ async fn balances_over(harness: &Harness, contour: &str, held: Option<&str>) -> 
 /// the answer over held rows names the session it folded.
 #[tokio::test]
 async fn a_report_reads_the_journal_alone_until_the_request_names_a_session() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = contour_over_the_account(&harness, "March").await;
     let session = population_session_holding(
         &harness,
@@ -29628,7 +29642,7 @@ async fn a_report_reads_the_journal_alone_until_the_request_names_a_session() {
 /// moves nothing.
 #[tokio::test]
 async fn a_figure_over_held_rows_publishes_the_rows_it_could_not_include() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let contour = contour_over_the_account(&harness, "March").await;
     let session = population_session_holding(
@@ -29670,7 +29684,7 @@ async fn a_figure_over_held_rows_publishes_the_rows_it_could_not_include() {
 /// the answer says about the session.
 #[tokio::test]
 async fn a_committed_session_is_named_and_folded_once() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = contour_over_the_account(&harness, "March").await;
     let session = population_session_holding(
         &harness,
@@ -29728,7 +29742,7 @@ async fn a_committed_session_is_named_and_folded_once() {
 /// invisible here: the figures would simply be wrong.
 #[tokio::test]
 async fn the_figure_over_a_held_session_is_the_figure_it_commits_to() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = contour_over_the_account(&harness, "March").await;
     let session = population_session_holding(
         &harness,
@@ -29773,7 +29787,7 @@ async fn the_figure_over_a_held_session_is_the_figure_it_commits_to() {
 /// them apart would read the first as the second and stop looking.
 #[tokio::test]
 async fn everything_held_names_every_open_session_and_echoes_the_quantifier() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let contour = contour_over_the_account(&harness, "March").await;
     let first = population_session_holding(
@@ -29812,7 +29826,7 @@ async fn everything_held_names_every_open_session_and_echoes_the_quantifier() {
 /// defect this parameter exists to remove.
 #[tokio::test]
 async fn a_session_named_twice_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = contour_over_the_account(&harness, "March").await;
     let session = population_session_holding(
         &harness,
@@ -29839,7 +29853,7 @@ async fn a_session_named_twice_is_refused() {
 /// refusal publishes the vocabulary.
 #[tokio::test]
 async fn an_unreadable_population_is_refused_with_the_vocabulary() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = contour_over_the_account(&harness, "March").await;
 
     for value in ["", "everything", "not-a-uuid"] {
@@ -29871,7 +29885,7 @@ async fn an_unreadable_population_is_refused_with_the_vocabulary() {
 /// was never handed out.
 #[tokio::test]
 async fn a_population_naming_an_unknown_session_is_not_found() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = contour_over_the_account(&harness, "March").await;
     let stranger = Uuid::new_v4();
 
@@ -29897,7 +29911,7 @@ async fn a_population_naming_an_unknown_session_is_not_found() {
 /// next read. Decision 0018 §3.
 #[tokio::test]
 async fn every_report_states_its_population_and_the_journal_page_states_none() {
-    let harness = harness();
+    let harness = harness().await;
     let contour = contour_over_the_account(&harness, "March").await;
     let session = population_session_holding(
         &harness,
@@ -29963,7 +29977,7 @@ async fn every_report_states_its_population_and_the_journal_page_states_none() {
 /// read still saves one, so this is about the held rows and not about the date.
 #[tokio::test]
 async fn a_projection_folded_over_held_rows_is_never_saved() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let contour = contour_over_the_account(&harness, "Held").await;
     let session = population_session_holding(
         &harness,
@@ -30034,7 +30048,7 @@ async fn a_projection_folded_over_held_rows_is_never_saved() {
 /// month later is an export answered "no profile recognises this document".
 #[tokio::test]
 async fn the_instance_publishes_the_source_profiles_it_reads_with() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, catalogue) = call(
         &harness.router,
         get("/v1/source-profiles", Some(&harness.owner_token)),
@@ -30083,7 +30097,7 @@ async fn the_instance_publishes_the_source_profiles_it_reads_with() {
 /// and no other.
 #[tokio::test]
 async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
-    let harness = harness();
+    let harness = harness().await;
     for title in ["Main", "Savings"] {
         let (status, account) = call(
             &harness.router,
@@ -30477,7 +30491,7 @@ async fn an_institution_s_export_is_read_into_a_session_through_its_profile() {
 /// Picking either silently would import a month the caller did not send.
 #[tokio::test]
 async fn a_document_named_twice_or_not_at_all_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, session) = call(
         &harness.router,
         post("/v1/import-sessions", &harness.owner_token, &json!({})),
@@ -30514,7 +30528,7 @@ async fn a_document_named_twice_or_not_at_all_is_refused() {
 /// instance does read.
 #[tokio::test]
 async fn a_document_no_profile_recognises_is_refused_by_name() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let (status, session) = call(
         &harness.router,
@@ -30566,9 +30580,9 @@ async fn a_document_no_profile_recognises_is_refused_by_name() {
 /// the function it documents, and this route declares none. That default is
 /// what the catalogue resolves against, so it is pinned here together with the
 /// address it resolves to.
-#[test]
-fn the_document_channel_resolves_to_the_route_that_answers_it() {
-    let harness = harness();
+#[tokio::test]
+async fn the_document_channel_resolves_to_the_route_that_answers_it() {
+    let harness = harness().await;
     let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
     let resolved = catalog.operation(OperationKey::ReadImportDocument);
 
@@ -30599,9 +30613,9 @@ fn the_document_channel_resolves_to_the_route_that_answers_it() {
 /// The identifier is the handler's own name, as its sibling's is: utoipa
 /// defaults `operation_id` to the function it documents and this route declares
 /// none, so the default is pinned here with the address it resolves to.
-#[test]
-fn the_row_channel_resolves_to_the_route_that_answers_it() {
-    let harness = harness();
+#[tokio::test]
+async fn the_row_channel_resolves_to_the_route_that_answers_it() {
+    let harness = harness().await;
     let catalog = ActionCatalog::from_openapi(&harness.api).expect("action catalog");
     let resolved = catalog.operation(OperationKey::AddImportRows);
 
@@ -30643,7 +30657,7 @@ fn the_row_channel_resolves_to_the_route_that_answers_it() {
 /// would be worse than no resolution at all.
 #[tokio::test]
 async fn beginning_an_import_publishes_every_call_that_begins_one() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, actions) = call(
         &harness.router,
         get("/v1/actions", Some(&harness.owner_token)),
@@ -30738,7 +30752,7 @@ async fn the_profile_catalogue_is_a_read_and_gets_no_operation_key() {
         "a target is a call that changes something"
     );
 
-    let harness = harness();
+    let harness = harness().await;
     let (status, catalogue) = call(
         &harness.router,
         get("/v1/source-profiles", Some(&harness.readonly_token)),
@@ -30766,7 +30780,7 @@ async fn the_profile_catalogue_is_a_read_and_gets_no_operation_key() {
 /// `scope`, and the route's own documented refusal was never produced.
 #[tokio::test]
 async fn a_read_only_token_may_not_read_a_document_into_a_session() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, session) = call(
         &harness.router,
         post("/v1/import-sessions", &harness.owner_token, &json!({})),
@@ -30824,7 +30838,7 @@ async fn a_read_only_token_may_not_read_a_document_into_a_session() {
 /// is the answer the route gives.
 #[tokio::test]
 async fn an_agent_token_reads_an_institution_s_export_into_a_session() {
-    let harness = harness();
+    let harness = harness().await;
     for title in ["Main", "Savings"] {
         let (status, account) = call(
             &harness.router,
@@ -30886,7 +30900,7 @@ async fn an_agent_token_reads_an_institution_s_export_into_a_session() {
 /// rows were made up for this test.
 #[tokio::test]
 async fn the_queue_and_the_assessment_agree_on_what_an_answer_keeps() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
 
     let (status, session) = call(
@@ -31016,7 +31030,7 @@ async fn decision_group_consequence(harness: &Harness, token: &str, session: &st
 /// Every account, amount, date and key here is invented (CLAUDE.md).
 #[tokio::test]
 async fn an_operation_reads_back_as_the_acts_the_owner_took_on_it() {
-    let harness = harness();
+    let harness = harness().await;
     let account = harness.account.inner();
     let savings = another_account(&harness, "Savings").await;
 
@@ -31254,7 +31268,7 @@ async fn an_operation_reads_back_as_the_acts_the_owner_took_on_it() {
 // which side is wrong.
 #[tokio::test]
 async fn a_history_with_an_unheld_target_still_publishes_its_arrival() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut head = {
         seed_correctable_deposit(&harness, "history", "history-unheld", "5.05").await;
         journal_of(&path, harness.owner)
@@ -31307,7 +31321,7 @@ async fn a_history_with_an_unheld_target_still_publishes_its_arrival() {
 /// differently, so they are different codes.
 #[tokio::test]
 async fn a_history_of_nothing_is_not_found_and_an_unreadable_identifier_is_refused() {
-    let harness = harness();
+    let harness = harness().await;
 
     let stranger = Uuid::new_v4();
     let (status, body) = call(
@@ -31337,7 +31351,7 @@ async fn a_history_of_nothing_is_not_found_and_an_unreadable_identifier_is_refus
 /// a schema nobody registered is a contract the caller cannot read.
 #[tokio::test]
 async fn the_history_route_and_its_schemas_are_published() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -31386,7 +31400,7 @@ async fn the_history_route_and_its_schemas_are_published() {
 /// A paired leg's missing counterpart must not be read as evidence that no counterpart exists.
 #[tokio::test]
 async fn history_contract_explains_that_transfer_counterparts_are_not_included() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -31431,7 +31445,7 @@ async fn history_contract_explains_that_transfer_counterparts_are_not_included()
 /// retirement removes an account the owner wants (`iaam-j485`).
 #[tokio::test]
 async fn an_account_can_be_renamed_and_the_old_name_stops_reaching_it() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, created) = call(
         &harness.router,
         post(
@@ -31499,7 +31513,7 @@ async fn an_account_can_be_renamed_and_the_old_name_stops_reaching_it() {
 /// Invented end to end: `Groceries` is the *shape* of word an export prints.
 #[tokio::test]
 async fn a_source_category_fed_to_a_session_reaches_the_committed_fact() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let (status, opened) = call(
         &harness.router,
         post(
@@ -31571,7 +31585,7 @@ async fn a_source_category_fed_to_a_session_reaches_the_committed_fact() {
 /// the machine-readable half (`iaam-801g.5`).
 #[tokio::test]
 async fn the_published_matcher_names_are_the_ones_the_route_accepts() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -31609,7 +31623,7 @@ async fn the_published_matcher_names_are_the_ones_the_route_accepts() {
 /// grouping the event's filing account.
 #[tokio::test]
 async fn the_journal_aggregate_answers_effective_leg_movement() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let plain = seed_correctable_deposit(&harness, "aggregate", "aggregate-plain", "1.01").await;
     let reversed =
         seed_correctable_deposit(&harness, "aggregate", "aggregate-reversed", "2.02").await;
@@ -31875,7 +31889,7 @@ async fn the_journal_aggregate_answers_effective_leg_movement() {
 /// A non-paginated aggregate refuses an answer whose group set is too large.
 #[tokio::test]
 async fn the_journal_aggregate_refuses_more_than_its_group_ceiling() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let mut events = Vec::with_capacity(1_001);
     for index in 0..1_001_i32 {
         let year = 2000 + index / 12;
@@ -31928,7 +31942,7 @@ async fn the_journal_aggregate_refuses_more_than_its_group_ceiling() {
 }
 #[tokio::test]
 async fn the_journal_filters_by_a_list_of_kinds_on_rows_and_aggregate() {
-    let harness = harness();
+    let harness = harness().await;
     ingest_deposit(
         &harness,
         harness.account,
@@ -32003,7 +32017,7 @@ async fn the_journal_filters_by_a_list_of_kinds_on_rows_and_aggregate() {
 
 #[tokio::test]
 async fn an_unknown_journal_kind_names_the_accepted_vocabulary() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         get(
@@ -32037,7 +32051,7 @@ async fn an_unknown_journal_kind_names_the_accepted_vocabulary() {
 /// currency, on an event a real trade could produce.
 #[tokio::test]
 async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
-    let (harness, path) = harness_on_disk();
+    let (harness, path) = harness_on_disk().await;
     let rub = CurrencyCode::Rub;
     let usd = CurrencyCode::Usd;
     let custody = iaam_core::ids::CustodyId::new_random();
@@ -32091,14 +32105,17 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
             lineage: None,
         })
         .expect("instrument");
-    second_connection
-        .upsert_custody_place(&iaam_store::reference::CustodyRecord {
-            id: custody,
-            owner: harness.owner,
-            title: "Test Custody".to_owned(),
-            institution: None,
-            origin: CustodyOrigin::Declared,
-        })
+    SqliteAdapter::new(SqliteStore::open(&path).expect("custody connection"))
+        .record_custody_place(
+            harness.owner,
+            CustodyUpsert {
+                id: custody,
+                title: "Test Custody".to_owned(),
+                institution: None,
+                origin: CustodyOrigin::Declared,
+            },
+        )
+        .await
         .expect("custody place");
     second_connection
         .append_event(&event, IdentityScope::Source)
@@ -32166,7 +32183,7 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
 
 #[tokio::test]
 async fn journal_content_filters_are_published_on_both_routes() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
     for route in ["/v1/journal/events", "/v1/journal/aggregate"] {
@@ -32189,7 +32206,7 @@ async fn journal_content_filters_are_published_on_both_routes() {
 }
 #[tokio::test]
 async fn an_unknown_journal_currency_names_the_accepted_vocabulary() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         get(
@@ -32210,7 +32227,7 @@ async fn an_unknown_journal_currency_names_the_accepted_vocabulary() {
 }
 #[tokio::test]
 async fn account_create_batch_applies_valid_rows_and_reports_invalid_rows() {
-    let harness = empty_owner_harness();
+    let harness = empty_owner_harness().await;
     let (status, body) = call(
         &harness.router,
         post(
@@ -32245,7 +32262,7 @@ async fn account_create_batch_applies_valid_rows_and_reports_invalid_rows() {
 
 #[tokio::test]
 async fn account_create_batch_requires_the_single_route_permission() {
-    let harness = empty_owner_harness();
+    let harness = empty_owner_harness().await;
     let (status, body) = call(
         &harness.router,
         post(
@@ -32270,7 +32287,7 @@ async fn account_create_batch_requires_the_single_route_permission() {
 
 #[tokio::test]
 async fn account_alias_batch_applies_valid_rows_without_writing_invalid_rows() {
-    let harness = harness();
+    let harness = harness().await;
     let second = create_account(&harness, "Second account").await.inner();
     let (status, body) = call(
         &harness.router,
@@ -32320,7 +32337,7 @@ async fn account_alias_batch_applies_valid_rows_without_writing_invalid_rows() {
 
 #[tokio::test]
 async fn account_alias_batch_requires_owner_administration_before_writing() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         put(
@@ -32347,7 +32364,7 @@ async fn account_alias_batch_requires_owner_administration_before_writing() {
 
 #[tokio::test]
 async fn account_title_batch_applies_valid_rows_without_writing_blank_rows() {
-    let harness = harness();
+    let harness = harness().await;
     let second = create_account(&harness, "Second title").await.inner();
     let (status, body) = call(
         &harness.router,
@@ -32378,7 +32395,7 @@ async fn account_title_batch_applies_valid_rows_without_writing_blank_rows() {
 
 #[tokio::test]
 async fn account_title_batch_requires_the_single_route_permission() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         put(
@@ -32402,7 +32419,7 @@ async fn account_title_batch_requires_the_single_route_permission() {
 
 #[tokio::test]
 async fn account_declarations_batch_applies_valid_rows_without_writing_invalid_rows() {
-    let harness = harness();
+    let harness = harness().await;
     let second = create_account(&harness, "Second declaration").await.inner();
     let (status, body) = call(
         &harness.router,
@@ -32433,7 +32450,7 @@ async fn account_declarations_batch_applies_valid_rows_without_writing_invalid_r
 
 #[tokio::test]
 async fn account_declarations_batch_requires_owner_administration_before_writing() {
-    let harness = harness();
+    let harness = harness().await;
     let (status, body) = call(
         &harness.router,
         put(
@@ -32460,7 +32477,7 @@ async fn account_declarations_batch_requires_owner_administration_before_writing
 
 #[tokio::test]
 async fn instrument_filter_returns_requested_instruments_and_missing_identifiers() {
-    let harness = seeded_harness();
+    let harness = seeded_harness().await;
     let missing = Uuid::new_v4();
     let (status, body) = call(
         &harness.router,
@@ -32490,7 +32507,7 @@ async fn instrument_filter_returns_requested_instruments_and_missing_identifiers
 
 #[tokio::test]
 async fn instrument_filter_rejects_unknown_query_keys() {
-    let harness = seeded_harness();
+    let harness = seeded_harness().await;
     let (status, body) = call(
         &harness.router,
         get(

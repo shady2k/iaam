@@ -7,13 +7,13 @@
 //! [`columns_referencing`] returns exact `(table, column)` pairs, and every
 //! test in this file compares exact sets.
 //!
-//! Custody is checked below. A later task adds the same shape of guard for
-//! `REFERENCES instruments`, sharing [`columns_referencing`] with a
-//! different `target` and a different covered list; nothing here is written
-//! to make that harder.
+//! Custody is checked below, and instruments the same shape after it:
+//! [`columns_referencing`] is shared, with a different `target` and a
+//! different covered list.
 
 use std::collections::BTreeSet;
 
+use iaam_store::bundle::INSTRUMENT_REFERENCE_COLUMNS;
 use iaam_store::journal::CUSTODY_REFERENCE_COLUMNS;
 
 const SCHEMA: &str = include_str!("../migrations/0001_schema.sql");
@@ -109,5 +109,58 @@ fn the_guard_would_catch_an_uncovered_custody_column() {
         schema_pairs, covered,
         "an uncovered custody column on an already-listed table must break \
          the guard, or the guard is only checking table names"
+    );
+}
+
+#[test]
+fn event_tables_referencing_instruments_match_the_covered_list() {
+    let schema_pairs = columns_referencing(SCHEMA, "instruments");
+    let covered: BTreeSet<(String, String)> = INSTRUMENT_REFERENCE_COLUMNS
+        .iter()
+        .map(|(table, column)| ((*table).to_owned(), (*column).to_owned()))
+        .collect();
+
+    assert_eq!(
+        schema_pairs, covered,
+        "0001_schema.sql declares a REFERENCES instruments column on an \
+         event* table that INSTRUMENT_REFERENCE_COLUMNS does not list (or \
+         vice versa) — bundle::REFERENCE_CLOSURE_SQL must cover exactly \
+         this set"
+    );
+}
+
+/// The same proof as `the_guard_would_catch_an_uncovered_custody_column`,
+/// for instruments: `event_corporate_action` already carries three
+/// `REFERENCES instruments` columns, so a fourth landing on it is exactly
+/// the case a table-name check would let through.
+#[test]
+fn the_guard_would_catch_an_uncovered_instrument_column() {
+    let sql_with_an_extra_column = SCHEMA.replace(
+        "CREATE TABLE event_corporate_action (",
+        "CREATE TABLE event_corporate_action (\n    \
+         second_instrument TEXT REFERENCES instruments (id),",
+    );
+    assert_ne!(
+        sql_with_an_extra_column, SCHEMA,
+        "the replacement above must actually have matched something"
+    );
+
+    let schema_pairs = columns_referencing(&sql_with_an_extra_column, "instruments");
+    let covered: BTreeSet<(String, String)> = INSTRUMENT_REFERENCE_COLUMNS
+        .iter()
+        .map(|(table, column)| ((*table).to_owned(), (*column).to_owned()))
+        .collect();
+
+    assert!(
+        schema_pairs.contains(&(
+            "event_corporate_action".to_owned(),
+            "second_instrument".to_owned()
+        )),
+        "the parser did not see the injected column at all: {schema_pairs:?}"
+    );
+    assert_ne!(
+        schema_pairs, covered,
+        "an uncovered instrument column on an already-listed table must \
+         break the guard, or the guard is only checking table names"
     );
 }

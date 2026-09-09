@@ -7,7 +7,7 @@ use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
 use iaam_core::event::{Confidence, Event, Relation};
-use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, PrincipalId, SourceId};
+use iaam_core::ids::{AccountId, EventId, InstrumentId, PrincipalId, SourceId};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::perimeter::{PerimeterPolicy, assess};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};

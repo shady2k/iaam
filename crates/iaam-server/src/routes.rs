@@ -61,7 +61,7 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
-    AccountId, CategoryId, CategoryRuleId, ClassificationRuleId, CustodyId, EventId, ImportId,
+    AccountId, CategoryId, CategoryRuleId, ClassificationRuleId, EventId, ImportId,
     ImportQuestionId, ImportSessionId, InstrumentId, SourceId,
 };
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};

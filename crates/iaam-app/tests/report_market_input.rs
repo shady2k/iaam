@@ -83,7 +83,7 @@ async fn seed_position(
         account,
         kind: OperationKind::OpeningPosition {
             instrument,
-            custody,
+            custody: Some(custody),
             quantity: Dec::one(),
             cost_basis_minor: None,
             currency: CurrencyCode::Rub,

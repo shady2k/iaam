@@ -830,7 +830,12 @@ fn build(
                     cost_basis,
                     assertions: assertions.unwrap_or_default(),
                 },
-                vec![security_leg(account, *custody, *instrument, Quantity(*quantity))],
+                vec![security_leg(
+                    account,
+                    *custody,
+                    *instrument,
+                    Quantity(*quantity),
+                )],
             ))
         }
         OperationKind::Valuation {

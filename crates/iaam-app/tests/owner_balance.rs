@@ -234,10 +234,9 @@ async fn every_claim_of_one_call_is_recorded() {
             positions: positions
                 .iter()
                 .enumerate()
-                .map(|(index, (instrument, custody))| {
+                .map(|(index, (instrument, _custody))| {
                     (
                         *instrument,
-                        *custody,
                         Quantity(Dec::new(Decimal::from(10 + index as i64))),
                     )
                 })
@@ -284,16 +283,8 @@ async fn two_positions_in_one_call_are_not_one_position() {
             at: BalancePoint::Closing,
             cash: None,
             positions: vec![
-                (
-                    first_instrument,
-                    custody,
-                    Quantity(Dec::new(Decimal::from(5))),
-                ),
-                (
-                    second_instrument,
-                    custody,
-                    Quantity(Dec::new(Decimal::from(7))),
-                ),
+                (first_instrument, Quantity(Dec::new(Decimal::from(5)))),
+                (second_instrument, Quantity(Dec::new(Decimal::from(7)))),
             ],
             raw_hash: stated(),
         },

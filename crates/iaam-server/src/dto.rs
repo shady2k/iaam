@@ -1463,7 +1463,6 @@ impl ImportCorrectionDto {
     }
 }
 
-
 /// Verdict for a single operation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct VerdictDto {

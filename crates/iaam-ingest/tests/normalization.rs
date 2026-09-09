@@ -106,7 +106,7 @@ fn all_kinds() -> Vec<OperationKind> {
         },
         OperationKind::OpeningPosition {
             instrument,
-            custody,
+            custody: Some(custody),
             quantity,
             cost_basis_minor: None,
             currency: CurrencyCode::Rub,

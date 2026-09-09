@@ -525,7 +525,11 @@ pub enum OperationKindDto {
     },
     Buy {
         instrument: Uuid,
-        custody: Uuid,
+        /// Where the security is kept, when the source states one. A bank
+        /// statement states none, and a caller is no longer made to invent
+        /// one: custody is description here, not a position's identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custody: Option<Uuid>,
         quantity: String,
         amount: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -536,7 +540,11 @@ pub enum OperationKindDto {
     },
     Sell {
         instrument: Uuid,
-        custody: Uuid,
+        /// Where the security is kept, when the source states one. A bank
+        /// statement states none, and a caller is no longer made to invent
+        /// one: custody is description here, not a position's identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custody: Option<Uuid>,
         quantity: String,
         amount: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,7 +580,11 @@ pub enum OperationKindDto {
     },
     OpeningPosition {
         instrument: Uuid,
-        custody: Uuid,
+        /// Where the security is kept, when the source states one. A bank
+        /// statement states none, and a caller is no longer made to invent
+        /// one: custody is description here, not a position's identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custody: Option<Uuid>,
         quantity: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_basis: Option<String>,
@@ -910,6 +922,10 @@ impl OperationDto {
         Ok(SubmittedOperation {
             account: directory.resolve_row(&self.account)?,
             kind,
+            // No broker handle reaches this route: it carries what a document
+            // or a caller stated, and `source_position_id` is a broker's own
+            // identifier for a portfolio row.
+            source_position_id: None,
             dates: OperationDates {
                 trade: self.dates.trade,
                 settled: self.dates.settled,
@@ -960,7 +976,7 @@ impl OperationDto {
                 currency,
             } => OperationKind::Buy {
                 instrument: InstrumentId(*instrument),
-                custody: CustodyId(*custody),
+                custody: custody.map(CustodyId),
                 quantity: Dec::new(decimal(quantity, "quantity")?),
                 gross_minor: minor(amount, *currency, "amount")?,
                 fee_minor: optional_minor(fee.as_ref(), *currency, "fee")?,
@@ -982,7 +998,7 @@ impl OperationDto {
                 currency,
             } => OperationKind::Sell {
                 instrument: InstrumentId(*instrument),
-                custody: CustodyId(*custody),
+                custody: custody.map(CustodyId),
                 quantity: Dec::new(decimal(quantity, "quantity")?),
                 gross_minor: minor(amount, *currency, "amount")?,
                 fee_minor: optional_minor(fee.as_ref(), *currency, "fee")?,
@@ -1036,7 +1052,7 @@ impl OperationDto {
                 assertions,
             } => OperationKind::OpeningPosition {
                 instrument: InstrumentId(*instrument),
-                custody: CustodyId(*custody),
+                custody: custody.map(CustodyId),
                 quantity: Dec::new(decimal(quantity, "quantity")?),
                 cost_basis_minor: optional_minor(cost_basis.as_ref(), *currency, "cost_basis")?,
                 currency: currency.to_domain(),
@@ -1447,63 +1463,6 @@ impl ImportCorrectionDto {
     }
 }
 
-/// Acknowledgement required before retracting affected trades without live broker access.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CustodyRepairRequest {
-    /// Acknowledge that retracted facts may not be restored by a subsequent synchronisation.
-    #[serde(default)]
-    pub acknowledge_without_live_access: bool,
-}
-
-/// Which case the account was in when the repair ran.
-///
-/// An enum rather than a free string: the caller decides what to do next from this
-/// value, and a schema that does not enumerate the cases leaves them to be guessed
-/// from prose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CustodyRepairCaseDto {
-    /// Affected trades exist and an unrevoked broker access can restore them.
-    AffectedWithLiveAccess,
-    /// Affected trades exist and no unrevoked broker access can restore them.
-    AffectedWithoutLiveAccess,
-    /// Nothing was left to repair.
-    NothingAffected,
-}
-
-/// Outcome of repairing account-derived custody facts.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
-pub struct CustodyRepairOutcomeDto {
-    pub case: CustodyRepairCaseDto,
-    pub affected_trades: usize,
-    /// Reversed by an earlier run: a repeat run reports these and writes nothing.
-    pub already_reversed: usize,
-    /// Written by this run. A partial run reports what it managed, rather than
-    /// leaving the caller to infer it.
-    pub written: usize,
-}
-
-impl CustodyRepairOutcomeDto {
-    #[must_use]
-    pub fn from_domain(outcome: iaam_app::scenarios::custody_repair::CustodyRepairOutcome) -> Self {
-        use iaam_app::scenarios::custody_repair::CustodyRepairCase;
-        let case = match outcome.case {
-            CustodyRepairCase::AffectedWithLiveAccess => {
-                CustodyRepairCaseDto::AffectedWithLiveAccess
-            }
-            CustodyRepairCase::AffectedWithoutLiveAccess => {
-                CustodyRepairCaseDto::AffectedWithoutLiveAccess
-            }
-            CustodyRepairCase::NothingAffected => CustodyRepairCaseDto::NothingAffected,
-        };
-        Self {
-            case,
-            affected_trades: outcome.affected_trades,
-            already_reversed: outcome.already_reversed,
-            written: outcome.written,
-        }
-    }
-}
 
 /// Verdict for a single operation.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -8369,7 +8328,6 @@ pub struct OwnerCashDto {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct OwnerPositionDto {
     pub instrument: Uuid,
-    pub custody: Uuid,
     pub quantity: String,
 }
 

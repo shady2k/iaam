@@ -282,7 +282,9 @@ pub enum OperationKind {
     /// so rather than substituting the market value.
     OpeningPosition {
         instrument: InstrumentId,
-        custody: CustodyId,
+        /// Description, not identity, exactly as [`Self::Buy`]'s is: an opening
+        /// position a bank statement states carries no place at all.
+        custody: Option<CustodyId>,
         quantity: Dec,
         cost_basis_minor: Option<i64>,
         currency: CurrencyCode,
@@ -828,12 +830,7 @@ fn build(
                     cost_basis,
                     assertions: assertions.unwrap_or_default(),
                 },
-                vec![Leg::security(
-                    account,
-                    *custody,
-                    *instrument,
-                    Quantity(*quantity),
-                )],
+                vec![security_leg(account, *custody, *instrument, Quantity(*quantity))],
             ))
         }
         OperationKind::Valuation {

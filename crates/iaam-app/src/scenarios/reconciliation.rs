@@ -27,7 +27,7 @@ pub struct OwnerBalance {
     pub period: AssertionPeriod,
     pub at: BalancePoint,
     pub cash: Option<(CurrencyCode, PostedMinor)>,
-    pub positions: Vec<(InstrumentId, CustodyId, Quantity)>,
+    pub positions: Vec<(InstrumentId, Quantity)>,
     pub raw_hash: RawHash,
 }
 
@@ -256,7 +256,7 @@ pub async fn record_owner_balance(
         // `custody` is still what the owner stated (§10.4's own field, one
         // step removed) but no longer part of what a position claim asserts
         // (iaam-40zv): custody is not part of a position's identity.
-        |(instrument, _custody, quantity)| ControlClaim::PositionQuantity {
+        |(instrument, quantity)| ControlClaim::PositionQuantity {
             instrument,
             quantity,
             at: balance.at,

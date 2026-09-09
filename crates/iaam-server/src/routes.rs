@@ -986,7 +986,6 @@ pub async fn reconciliation_balance(
         })?;
         positions.push((
             iaam_core::ids::InstrumentId(position.instrument),
-            CustodyId(position.custody),
             Quantity(Dec::new(quantity)),
         ));
     }

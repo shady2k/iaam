@@ -381,7 +381,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
             account: card,
             kind: OperationKind::OpeningPosition {
                 instrument,
-                custody,
+                custody: Some(custody),
                 quantity: Dec::one(),
                 cost_basis_minor: None,
                 currency: CurrencyCode::Rub,

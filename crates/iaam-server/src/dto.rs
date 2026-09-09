@@ -2177,7 +2177,6 @@ impl ComputedLifetimeCohortMetricsDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BondPositionMetricsDto {
     pub account: Uuid,
-    pub custody: Option<Uuid>,
     pub instrument: Uuid,
     pub scenarios: Vec<BondScenarioResultDto>,
 }
@@ -2186,7 +2185,6 @@ impl BondPositionMetricsDto {
     fn from_domain(value: &iaam_core::returns::BondPositionMetrics) -> Self {
         Self {
             account: value.account.inner(),
-            custody: value.custody.map(|id| id.inner()),
             instrument: value.instrument.inner(),
             scenarios: value
                 .scenarios
@@ -2342,7 +2340,6 @@ pub struct PriceProvenanceDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EvaluatedPositionDto {
     pub account: Uuid,
-    pub custody: Option<Uuid>,
     pub instrument: Uuid,
     pub quantity: String,
     pub price: SelectedPriceDto,
@@ -2352,7 +2349,6 @@ pub struct EvaluatedPositionDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UncoveredPositionDto {
     pub account: Uuid,
-    pub custody: Option<Uuid>,
     pub instrument: Uuid,
     pub reason: String,
 }
@@ -2361,7 +2357,6 @@ pub struct UncoveredPositionDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LegacyDerivedPositionDto {
     pub account: Uuid,
-    pub custody: Option<Uuid>,
     pub instrument: Uuid,
     pub quality: String,
 }
@@ -2406,7 +2401,6 @@ pub struct LiquidationEstimateDto {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BondPositionAttributesDto {
     pub account: Uuid,
-    pub custody: Option<Uuid>,
     pub instrument: Uuid,
     pub accrued_interest: ComputedDto,
     pub accrued_interest_payable_on_termination: ComputedDto,
@@ -2517,7 +2511,6 @@ impl EvaluatedPositionDto {
     fn from_domain(position: &EvaluatedPosition) -> Self {
         Self {
             account: position.account.inner(),
-            custody: position.custody.map(|custody| custody.inner()),
             instrument: position.instrument.inner(),
             quantity: position.quantity.0.inner().to_string(),
             price: SelectedPriceDto::from_domain(&position.price),
@@ -2529,7 +2522,6 @@ impl UncoveredPositionDto {
     fn from_domain(position: &UncoveredPosition) -> Self {
         Self {
             account: position.account.inner(),
-            custody: position.custody.map(|custody| custody.inner()),
             instrument: position.instrument.inner(),
             reason: uncovered_reason(&position.reason).to_owned(),
         }
@@ -2540,7 +2532,6 @@ impl LegacyDerivedPositionDto {
     fn from_domain(position: &iaam_core::returns::LegacyDerivedPosition) -> Self {
         Self {
             account: position.account.inner(),
-            custody: position.custody.map(|custody| custody.inner()),
             instrument: position.instrument.inner(),
             quality: position.quality.code().to_owned(),
         }
@@ -2673,7 +2664,6 @@ impl BondPositionAttributesDto {
     fn from_domain(attributes: &BondPositionAttributes) -> Self {
         Self {
             account: attributes.account.0,
-            custody: attributes.custody.map(|custody| custody.0),
             instrument: attributes.instrument.0,
             accrued_interest: ComputedDto::from_dec(&attributes.accrued_interest),
             accrued_interest_payable_on_termination: ComputedDto::from_dec(
@@ -3928,7 +3918,6 @@ fn decimal_amount(money: Money) -> String {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PositionQuantityDto {
     pub instrument: Uuid,
-    pub custody: Option<Uuid>,
     pub quantity: String,
 }
 
@@ -3997,7 +3986,6 @@ impl AccountBalanceDto {
                 .iter()
                 .map(|(key, quantity)| PositionQuantityDto {
                     instrument: key.instrument.inner(),
-                    custody: key.custody.map(|custody| custody.inner()),
                     quantity: quantity.0.inner().to_string(),
                 })
                 .collect(),
@@ -4174,8 +4162,8 @@ pub struct PositionsSideDto {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct HoldingValueDto {
     pub instrument: Uuid,
-    /// The quantity across every account and custody location in the scope. The
-    /// per-account keys stay on `accounts[].positions`.
+    /// The quantity across every account in the scope. The per-account keys
+    /// stay on `accounts[].positions`.
     pub quantity: String,
     /// What the valuation policy decided for this instrument, whichever way it
     /// decided. Null only where an older rule's determination lost the
@@ -4358,7 +4346,6 @@ impl AssetSnapshotDto {
                         .iter()
                         .map(|(key, quantity)| PositionQuantityDto {
                             instrument: key.instrument.inner(),
-                            custody: key.custody.map(|custody| custody.inner()),
                             quantity: quantity.0.inner().to_string(),
                         })
                         .collect(),
@@ -6968,7 +6955,6 @@ mod tests {
     fn an_unknown_termination_value_serialises_with_a_reason_not_a_zero() {
         let dto = BondPositionAttributesDto::from_domain(&BondPositionAttributes {
             account: AccountId::new_random(),
-            custody: None,
             instrument: InstrumentId::new_random(),
             accrued_interest: Computed::Value(Dec::new(Decimal::from_str_exact("15.17").unwrap())),
             accrued_interest_payable_on_termination: Computed::NotComputable {
@@ -7248,7 +7234,6 @@ mod tests {
         let value = rendered(&claim_check(
             ControlClaim::PositionQuantity {
                 instrument: InstrumentId::new_random(),
-                custody: iaam_core::ids::CustodyId::new_random(),
                 quantity: iaam_core::money::Quantity(Dec::new(rust_decimal::Decimal::from(10))),
                 at: iaam_core::reconciliation::claim::BalancePoint::Closing,
             },
@@ -7620,7 +7605,6 @@ pub enum ClaimDto {
     },
     PositionQuantity {
         instrument: Uuid,
-        custody: Uuid,
         at: String,
         claimed: ClaimValueDto,
     },
@@ -7874,12 +7858,10 @@ fn claim_dto(claim: ControlClaim) -> ClaimDto {
         },
         ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity,
             at,
         } => ClaimDto::PositionQuantity {
             instrument: instrument.inner(),
-            custody: custody.inner(),
             at: at.code().to_owned(),
             claimed: claim_value_dto(ClaimValue::Quantity(quantity)),
         },

@@ -56,6 +56,7 @@ pub(crate) struct EventRow {
     pub raw_hash: String,
     pub parser_version: String,
     pub source_operation_id: Option<String>,
+    pub source_position_id: Option<String>,
     pub source_category: Option<String>,
     pub source_kind: Option<String>,
     pub owner_category: Option<String>,

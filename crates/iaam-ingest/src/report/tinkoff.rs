@@ -162,8 +162,11 @@ fn parse_trade_sheet(sheet: &Sheet, directory: &Directory, rows: &mut Vec<Locate
                 text_value(cell(row, instrument_col))?,
                 Some(date),
             )?;
-            let custody =
-                lookup_custody(directory, text_value(cell(row, custody_col))?, "custody")?;
+            let custody = Some(lookup_custody(
+                directory,
+                text_value(cell(row, custody_col))?,
+                "custody",
+            )?);
             let quantity = quantity_value(cell(row, quantity_col), "quantity")?;
             let gross_minor = money_value(cell(row, gross_col), "amount", currency)?;
             let fee_minor =
@@ -675,6 +678,9 @@ fn operation(
         source_time: None,
         idempotency_key: None,
         source_operation_id: source_id.map(str::to_owned),
+        // This channel is a report file: it has no broker position handle,
+        // only the custody it names on the operation's own kind.
+        source_position_id: None,
         source_category: None,
         owner_category: None,
         source_code: None,

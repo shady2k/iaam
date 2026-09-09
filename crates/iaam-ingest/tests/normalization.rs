@@ -37,6 +37,7 @@ fn submit(kind: OperationKind) -> SubmittedOperation {
         source_time: None,
         idempotency_key: None,
         source_operation_id: None,
+        source_position_id: None,
         source_category: None,
         owner_category: None,
         source_code: None,
@@ -65,7 +66,7 @@ fn all_kinds() -> Vec<OperationKind> {
         },
         OperationKind::Buy {
             instrument,
-            custody,
+            custody: Some(custody),
             quantity,
             gross_minor: 900_000,
             fee_minor: Some(1_500),
@@ -75,7 +76,7 @@ fn all_kinds() -> Vec<OperationKind> {
         },
         OperationKind::Sell {
             instrument,
-            custody,
+            custody: Some(custody),
             quantity,
             gross_minor: 950_000,
             fee_minor: Some(1_500),
@@ -196,7 +197,7 @@ fn a_purchase_settles_for_body_plus_accrued_plus_fee() {
     // 9 000,00 principal + 7,00 accrued interest + 15,00 commission = debit of 9 022,00.
     let operation = submit(OperationKind::Buy {
         instrument: InstrumentId::new_random(),
-        custody: CustodyId::new_random(),
+        custody: Some(CustodyId::new_random()),
         quantity: Dec::new(Decimal::from(10)),
         gross_minor: 900_000,
         fee_minor: Some(1_500),
@@ -216,7 +217,7 @@ fn a_sale_settles_for_body_plus_accrued_minus_fee() {
     // 9 500,00 principal + 3,00 accrued interest − 15,00 commission = credit of 9 488,00.
     let operation = submit(OperationKind::Sell {
         instrument: InstrumentId::new_random(),
-        custody: CustodyId::new_random(),
+        custody: Some(CustodyId::new_random()),
         quantity: Dec::new(Decimal::from(10)),
         gross_minor: 950_000,
         fee_minor: Some(1_500),
@@ -247,7 +248,7 @@ fn a_basis_fee_is_rounded_and_retained_without_changing_cash_settlement() {
     );
     let operation = submit(OperationKind::Buy {
         instrument: InstrumentId::new_random(),
-        custody: CustodyId::new_random(),
+        custody: Some(CustodyId::new_random()),
         quantity: Dec::one(),
         gross_minor: 27_013,
         fee_minor: None,

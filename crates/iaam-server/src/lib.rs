@@ -142,7 +142,6 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
         .routes(routes!(routes::read_journal_event_history))
         .routes(routes!(routes::upload_document))
         .routes(routes!(routes::reparse_document))
-        .routes(routes!(routes::repair_custody))
         .routes(routes!(routes::submit_corrections))
         .routes(routes!(routes::correct_import))
         .routes(routes!(routes::reconciliation))

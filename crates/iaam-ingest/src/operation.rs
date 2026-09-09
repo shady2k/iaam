@@ -182,9 +182,16 @@ pub enum OperationKind {
     /// `basis_fee` is deliberately **not** in that sum: it is a commission that
     /// belongs to the tax basis and moves no cash. The exact value is kept
     /// beside the rounded one on the event, so the rounding stays auditable.
+    ///
+    /// `custody` is **not** part of the position's identity (`iaam-xep0`): it
+    /// is description, carried only where a source actually states a place —
+    /// a report's own "место хранения" column, or a manual entry. `None` is
+    /// what a channel that never named one submits, the API broker channel
+    /// among them; `build` records the security leg with no custody rather
+    /// than inventing a place nobody named.
     Buy {
         instrument: InstrumentId,
-        custody: CustodyId,
+        custody: Option<CustodyId>,
         quantity: Dec,
         gross_minor: i64,
         fee_minor: Option<i64>,
@@ -205,9 +212,12 @@ pub enum OperationKind {
     /// deducted from the proceeds. This is the one place where the fee's sign
     /// differs in effect between the two sides, and it is why `fee_minor` is
     /// submitted positive on both.
+    ///
+    /// `custody` carries the same meaning as [`Self::Buy`]'s: description
+    /// where a source states one, `None` where it does not.
     Sell {
         instrument: InstrumentId,
-        custody: CustodyId,
+        custody: Option<CustodyId>,
         quantity: Dec,
         gross_minor: i64,
         fee_minor: Option<i64>,
@@ -324,6 +334,19 @@ pub struct SubmittedOperation {
     pub idempotency_key: Option<String>,
     /// Operation identifier in the source, if present.
     pub source_operation_id: Option<String>,
+    /// The broker's own handle for the position this operation moved,
+    /// verbatim, if the channel names one.
+    ///
+    /// Evidence, not identity: this used to be read into a custody field —
+    /// the API channel's `positionUid` stood in for a place of storage it
+    /// never named (`iaam-xep0`, T4) — and now lands where it is what it
+    /// actually is, beside [`Self::source_operation_id`].
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and an
+    /// import session written before this field existed said nothing about
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_position_id: Option<String>,
     /// The source's own word for what the operation was **for**, verbatim.
     ///
     /// Retained for later rule matching, and never the same field as
@@ -444,6 +467,10 @@ pub fn normalize(
                     Provenance::new(context.source, raw_hash, context.parser_version.clone());
                 let base = match operation.source_operation_id.as_deref() {
                     Some(id) => base.with_source_operation_id(id),
+                    None => base,
+                };
+                let base = match operation.source_position_id.as_deref() {
+                    Some(id) => base.with_source_position_id(id),
                     None => base,
                 };
                 let base = match operation.source_category.as_deref() {
@@ -680,7 +707,7 @@ fn build(
                 },
                 vec![
                     Leg::cash(account, money(-settlement, *currency)),
-                    Leg::security(account, *custody, *instrument, Quantity(*quantity)),
+                    security_leg(account, *custody, *instrument, Quantity(*quantity)),
                 ],
             ))
         }
@@ -722,7 +749,7 @@ fn build(
                 },
                 vec![
                     Leg::cash(account, money(settlement, *currency)),
-                    Leg::security(account, *custody, *instrument, Quantity(sold)),
+                    security_leg(account, *custody, *instrument, Quantity(sold)),
                 ],
             ))
         }
@@ -823,6 +850,24 @@ fn build(
             },
             vec![],
         )),
+    }
+}
+
+/// A trade's security leg, with or without a stated custody.
+///
+/// `OperationKind::Buy` and `Sell` carry custody as `Option<CustodyId>`
+/// because it is description, not identity: a report names a place, the API
+/// broker channel names none. This is the one branch, so `build`'s two trade
+/// arms cannot drift on which constructor a `None` reaches.
+fn security_leg(
+    account: AccountId,
+    custody: Option<CustodyId>,
+    instrument: InstrumentId,
+    quantity: Quantity,
+) -> Leg {
+    match custody {
+        Some(custody) => Leg::security(account, custody, instrument, quantity),
+        None => Leg::security_without_custody(account, instrument, quantity),
     }
 }
 

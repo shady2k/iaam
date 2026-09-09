@@ -158,7 +158,7 @@ fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> Su
         account,
         kind: OperationKind::Buy {
             instrument,
-            custody,
+            custody: Some(custody),
             quantity: Dec::one(),
             gross_minor: 10_000,
             fee_minor: None,
@@ -175,6 +175,41 @@ fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> Su
         source_time: None,
         idempotency_key: None,
         source_operation_id: Some("TRADE-MARCH-1".to_owned()),
+        source_position_id: None,
+        source_category: None,
+        owner_category: None,
+        source_code: None,
+        source_kind: None,
+        description: None,
+    }
+}
+
+/// A trade as the API broker channel actually produces one: no custody
+/// stated at all, since the channel names none — only its own opaque
+/// position handle, which the caller sets on `source_position_id`.
+fn trade_without_custody(account: AccountId, instrument: InstrumentId) -> SubmittedOperation {
+    SubmittedOperation {
+        account,
+        kind: OperationKind::Buy {
+            instrument,
+            custody: None,
+            quantity: Dec::one(),
+            gross_minor: 10_000,
+            fee_minor: None,
+            basis_fee: None,
+            accrued_interest_minor: None,
+            currency: CurrencyCode::Rub,
+        },
+        dates: OperationDates {
+            trade: Some(date!(2026 - 03 - 15)),
+            settled: Some(date!(2026 - 03 - 17)),
+            cash_posted: Some(date!(2026 - 03 - 17)),
+            paid: None,
+        },
+        source_time: None,
+        idempotency_key: None,
+        source_operation_id: Some("TRADE-MARCH-1".to_owned()),
+        source_position_id: None,
         source_category: None,
         owner_category: None,
         source_code: None,
@@ -223,10 +258,9 @@ fn cash_opening_claim() -> ControlClaim {
     }
 }
 
-fn position_opening_claim(instrument: InstrumentId, custody: CustodyId) -> ControlClaim {
+fn position_opening_claim(instrument: InstrumentId) -> ControlClaim {
     ControlClaim::PositionQuantity {
         instrument,
-        custody,
         quantity: iaam_core::money::Quantity::zero(),
         at: BalancePoint::Opening,
     }
@@ -237,12 +271,12 @@ fn report_opening_assertions(
     owner: OwnerId,
     account: AccountId,
     source: SourceId,
-    holding: Option<(InstrumentId, CustodyId)>,
+    holding: Option<InstrumentId>,
 ) -> Vec<Event> {
     let period = AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
         .unwrap_or_else(|| panic!("March period"));
     let mut claims = vec![cash_opening_claim()];
-    claims.extend(holding.map(|(instrument, custody)| position_opening_claim(instrument, custody)));
+    claims.extend(holding.map(position_opening_claim));
     claims
         .into_iter()
         .enumerate()
@@ -301,7 +335,6 @@ fn report_position_assertion(
     account: AccountId,
     source: SourceId,
     instrument: InstrumentId,
-    custody: CustodyId,
 ) -> Event {
     let period = AssertionPeriod::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31))
         .unwrap_or_else(|| panic!("March period"));
@@ -313,7 +346,6 @@ fn report_position_assertion(
             period,
             claim: ControlClaim::PositionQuantity {
                 instrument,
-                custody,
                 quantity: iaam_core::money::Quantity(Dec::one()),
                 at: BalancePoint::Closing,
             },
@@ -364,6 +396,7 @@ fn api_with_claims(
         portfolio: Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
             claims,
+            refused: Vec::new(),
         }),
     }
 }
@@ -387,62 +420,24 @@ async fn load_all(services: &AppServices, owner: OwnerId) -> Vec<Event> {
         .unwrap_or_else(|error| panic!("load all events: {error}"))
 }
 
-fn seeded_trade(
-    owner: OwnerId,
-    account: AccountId,
-    instrument: InstrumentId,
-    custody: CustodyId,
-    day: Date,
-) -> Event {
-    let mut operation = trade(account, instrument, custody);
-    operation.dates.trade = Some(day);
-    operation.dates.settled = Some(day);
-    operation.dates.cash_posted = Some(day);
-    iaam_ingest::normalize(
-        &operation,
-        &iaam_ingest::operation::NormalizationContext {
-            owner,
-            source: SourceId::new_random(),
-            parser_version: ParserVersion(PARSER_VERSION.to_owned()),
-        },
-    )
-    .unwrap_or_else(|error| panic!("seed trade: {error:?}"))
-    .event
-}
-fn reversal(owner: OwnerId, target: &Event, target_id: EventId) -> Event {
-    let mut reversal = target.clone();
-    reversal.id = EventId::new_random();
-    reversal.owner = owner;
-    reversal.relation = Relation::Reversal { target: target_id };
-    reversal.provenance = Provenance::new(
-        SourceId::new_random(),
-        iaam_core::event::provenance::RawHash::parse(&"c".repeat(64))
-            .unwrap_or_else(|| panic!("reversal hash")),
-        ParserVersion("repair/1".to_owned()),
-    );
-    reversal
-}
-
-/// **The operations loop is one of two append paths, and this proves it works
-/// with no custody place seeded at all.** The trade's custody is minted by
-/// the channel, not chosen by the owner, so the sync must register it itself
-/// before appending the leg that names it.
+/// **The operations loop writes `positionUid` as provenance, not as a
+/// custody place, and mints nothing.** A position is an account and an
+/// instrument (`iaam-xep0`); the channel's own handle is carried on
+/// `Provenance::source_position_id`, and the leg it appends names no
+/// custody at all — there is nothing left to register.
 #[tokio::test]
-async fn a_sync_registers_the_handle_a_trade_names_with_no_custody_seeded() {
+async fn a_sync_writes_the_position_handle_as_provenance_and_registers_no_custody() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let broker = api(
-        account,
-        SourceId::new_random(),
-        trade(account, instrument, custody),
-    );
+    let mut operation = trade_without_custody(account, instrument);
+    operation.source_position_id = Some("f1a60ae6-3f1e-43c8-8d46-042df0fdc97a".to_owned());
+    let broker = api(account, SourceId::new_random(), operation);
     let outcome = sync_broker(
         &services,
         &principal(owner),
@@ -452,44 +447,43 @@ async fn a_sync_registers_the_handle_a_trade_names_with_no_custody_seeded() {
         date!(2026 - 03 - 31),
     )
     .await
-    .unwrap_or_else(|error| panic!("sync with no seeded custody: {error}"));
+    .unwrap_or_else(|error| panic!("sync with no custody stated: {error}"));
 
     assert!(matches!(
         outcome.recorded.first(),
         Some(Verdict::Provisional { .. })
     ));
     let events = load_all(&services, owner).await;
-    let leg_custody = events
+    let trade_event = events
         .iter()
         .find(|event| matches!(event.kind, EventKind::Trade { .. }))
-        .expect("trade event recorded")
-        .legs
-        .iter()
-        .find_map(|leg| leg.custody)
-        .expect("trade leg names a custody");
-    // The value is the one the channel produced, unchanged.
-    assert_eq!(leg_custody, custody);
+        .expect("trade event recorded");
+    assert!(
+        trade_event.legs.iter().all(|leg| leg.custody.is_none()),
+        "a broker sync must not mint a leg's custody"
+    );
+    assert_eq!(
+        trade_event.provenance.source_position_id(),
+        Some("f1a60ae6-3f1e-43c8-8d46-042df0fdc97a")
+    );
     let places = services
         .directory
         .list_custody_places(owner)
         .await
         .expect("list custody places");
-    assert_eq!(places.len(), 1);
-    assert_eq!(places[0].id, custody);
-    assert_eq!(places[0].origin, CustodyOrigin::Minted);
+    assert!(places.is_empty(), "no sync may create a custody_places row");
 }
 
-/// **The portfolio loop is the second, independent append path, and this is
-/// the case that fails if only the operations loop registers.** A holding
-/// the broker reports but that saw no trade in the interval reaches this
-/// loop with no operation behind it at all, so a registration driven from
-/// the accepted operations alone never sees its handle.
+/// **The portfolio loop is the second, independent append path, and it
+/// mints nothing either.** A holding the broker reports but that saw no
+/// trade in the interval reaches this loop with no operation behind it at
+/// all — and, since a position claim carries no custody field any more,
+/// there is nothing here to register in the first place.
 #[tokio::test]
-async fn a_position_with_no_trade_in_the_interval_is_still_asserted_with_no_custody_seeded() {
+async fn a_position_with_no_trade_in_the_interval_registers_no_custody() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
@@ -510,10 +504,10 @@ async fn a_position_with_no_trade_in_the_interval_is_still_asserted_with_no_cust
             as_of: PortfolioAsOf::Current,
             claims: vec![ControlClaim::PositionQuantity {
                 instrument,
-                custody,
                 quantity: iaam_core::money::Quantity(Dec::one()),
                 at: BalancePoint::Closing,
             }],
+            refused: Vec::new(),
         }),
     };
 
@@ -526,35 +520,15 @@ async fn a_position_with_no_trade_in_the_interval_is_still_asserted_with_no_cust
         date!(2026 - 03 - 31),
     )
     .await
-    .unwrap_or_else(|error| panic!("portfolio-only sync with no seeded custody: {error}"));
+    .unwrap_or_else(|error| panic!("portfolio-only sync with no custody stated: {error}"));
 
     assert_eq!(outcome.assertions, 1);
-    let events = load_all(&services, owner).await;
-    let EventKind::ControlAssertion { claim, .. } = &events
-        .iter()
-        .find(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
-        .expect("control assertion recorded")
-        .kind
-    else {
-        unreachable!("filtered above");
-    };
-    let ControlClaim::PositionQuantity {
-        custody: claim_custody,
-        ..
-    } = claim
-    else {
-        panic!("expected a position claim");
-    };
-    // The value is the one the channel produced, unchanged.
-    assert_eq!(*claim_custody, custody);
     let places = services
         .directory
         .list_custody_places(owner)
         .await
         .expect("list custody places");
-    assert_eq!(places.len(), 1);
-    assert_eq!(places[0].id, custody);
-    assert_eq!(places[0].origin, CustodyOrigin::Minted);
+    assert!(places.is_empty(), "no sync may create a custody_places row");
 }
 
 #[tokio::test]
@@ -562,7 +536,6 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
     let owner = OwnerId::new_random();
     let source = SourceId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let first_account = AccountId::new_random();
     let second_account = AccountId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
@@ -571,8 +544,8 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let first_operation = trade(first_account, instrument, custody);
-    let second_operation = trade(second_account, instrument, custody);
+    let first_operation = trade_without_custody(first_account, instrument);
+    let second_operation = trade_without_custody(second_account, instrument);
     let make_broker = |operation| FakeBroker {
         source: SourceChannel {
             source,
@@ -587,6 +560,7 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
         portfolio: Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
             claims: Vec::new(),
+            refused: Vec::new(),
         }),
     };
 
@@ -738,14 +712,9 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
                 vec![
                     existing,
                     report_cash_assertion(owner, account, report_source),
-                    report_position_assertion(owner, account, report_source, instrument, custody),
+                    report_position_assertion(owner, account, report_source, instrument),
                 ],
-                report_opening_assertions(
-                    owner,
-                    account,
-                    report_source,
-                    Some((instrument, custody)),
-                ),
+                report_opening_assertions(owner, account, report_source, Some(instrument)),
             ]
             .concat(),
             IdentityScope::Source,
@@ -759,7 +728,7 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
         operation,
         vec![
             cash_opening_claim(),
-            position_opening_claim(instrument, custody),
+            position_opening_claim(instrument),
             ControlClaim::CashBalance {
                 currency: CurrencyCode::Rub,
                 amount: PostedMinor::new(-10_000),
@@ -767,7 +736,6 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
             },
             ControlClaim::PositionQuantity {
                 instrument,
-                custody,
                 quantity: iaam_core::money::Quantity(Dec::one()),
                 at: BalancePoint::Closing,
             },
@@ -837,13 +805,12 @@ async fn repeating_refused_sync_appends_one_coverage_gap() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let operation = trade(account, instrument, custody);
+    let operation = trade_without_custody(account, instrument);
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
         accepted: broker
@@ -915,14 +882,9 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
                 vec![
                     report_trade_event(owner, &operation, report_source),
                     report_cash_assertion(owner, account, report_source),
-                    report_position_assertion(owner, account, report_source, instrument, custody),
+                    report_position_assertion(owner, account, report_source, instrument),
                 ],
-                report_opening_assertions(
-                    owner,
-                    account,
-                    report_source,
-                    Some((instrument, custody)),
-                ),
+                report_opening_assertions(owner, account, report_source, Some(instrument)),
             ]
             .concat(),
             IdentityScope::Source,
@@ -936,7 +898,7 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
         operation,
         vec![
             cash_opening_claim(),
-            position_opening_claim(instrument, custody),
+            position_opening_claim(instrument),
             ControlClaim::CashBalance {
                 currency: CurrencyCode::Rub,
                 amount: PostedMinor::new(-10_000),
@@ -944,7 +906,6 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
             },
             ControlClaim::PositionQuantity {
                 instrument,
-                custody,
                 quantity: iaam_core::money::Quantity(Dec::one()),
                 at: BalancePoint::Closing,
             },
@@ -1150,7 +1111,6 @@ async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
     let instrument = InstrumentId::new_random();
     let custody = CustodyId::new_random();
     let fresh_instrument = InstrumentId::new_random();
-    let fresh_custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
@@ -1170,7 +1130,7 @@ async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
 
     let mut possible = duplicate.clone();
     possible.source_operation_id = None;
-    let mut fresh = trade(account, fresh_instrument, fresh_custody);
+    let mut fresh = trade_without_custody(account, fresh_instrument);
     fresh.source_operation_id = Some("FRESH-1".to_owned());
     let mut broker = api(account, SourceId::new_random(), possible.clone());
     broker.operations = Ok(ParsedOperations {
@@ -1211,13 +1171,12 @@ async fn corrected_parser_records_new_assertion_while_document_hash_stays_parser
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let operation = trade(account, instrument, custody);
+    let operation = trade_without_custody(account, instrument);
     let mut broker = api(account, SourceId::new_random(), operation);
 
     let first = sync_broker(
@@ -1269,13 +1228,12 @@ async fn repeating_sync_is_idempotent_for_operations_and_assertions() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let operation = trade(account, instrument, custody);
+    let operation = trade_without_custody(account, instrument);
     let broker = api(account, SourceId::new_random(), operation);
     let first = sync_broker(
         &services,
@@ -1309,13 +1267,12 @@ async fn partial_operations_record_control_assertion_and_coverage_gap() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let operation = trade(account, instrument, custody);
+    let operation = trade_without_custody(account, instrument);
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
         accepted: broker
@@ -1351,17 +1308,15 @@ async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_r
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let first_instrument = InstrumentId::new_random();
-    let first_custody = CustodyId::new_random();
     let second_instrument = InstrumentId::new_random();
-    let second_custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, first_instrument, "SHAREONE");
         seed_instrument(store, second_instrument, "SHARETWO");
     });
 
-    let first = trade(account, first_instrument, first_custody);
-    let mut second = trade(account, second_instrument, second_custody);
+    let first = trade_without_custody(account, first_instrument);
+    let mut second = trade_without_custody(account, second_instrument);
     second.source_operation_id = Some("TRADE-MARCH-2".to_owned());
     let mut broker = api(account, SourceId::new_random(), first);
     broker.operations = Ok(ParsedOperations {
@@ -1407,13 +1362,12 @@ async fn bond_amortisation_and_unknown_rows_become_quarantined_verdicts() {
         let owner = OwnerId::new_random();
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
-        let custody = CustodyId::new_random();
         let services = services_with(date!(2026 - 03 - 31), |store| {
             seed_account(store, owner, account, "Main");
             seed_instrument(store, instrument, "TESTSHARE");
         });
 
-        let broker_operation = trade(account, instrument, custody);
+        let broker_operation = trade_without_custody(account, instrument);
         let mut broker = api(account, SourceId::new_random(), broker_operation);
         broker.operations = Ok(ParsedOperations {
             accepted: broker
@@ -1456,14 +1410,13 @@ async fn a_normalisation_rejection_stops_one_row_and_records_the_other_rows() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let valid = trade(account, instrument, custody);
-    let mut invalid = trade(account, InstrumentId::new_random(), CustodyId::new_random());
+    let valid = trade_without_custody(account, instrument);
+    let mut invalid = trade_without_custody(account, InstrumentId::new_random());
     invalid.dates = OperationDates::default();
     invalid.source_operation_id = Some("INVALID-MARCH-1".to_owned());
     let mut broker = api(account, SourceId::new_random(), valid.clone());
@@ -1621,7 +1574,6 @@ async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
@@ -1630,7 +1582,7 @@ async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
     let mut broker = api(
         account,
         SourceId::new_random(),
-        trade(account, instrument, custody),
+        trade_without_custody(account, instrument),
     );
     broker.operations = Ok(ParsedOperations {
         accepted: broker
@@ -1693,7 +1645,6 @@ async fn one_broker_failure_does_not_poison_another_sync() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
@@ -1729,7 +1680,7 @@ async fn one_broker_failure_does_not_poison_another_sync() {
     let good = api(
         account,
         SourceId::new_random(),
-        trade(account, instrument, custody),
+        trade_without_custody(account, instrument),
     );
     let outcome = sync_broker(
         &services,
@@ -1746,431 +1697,16 @@ async fn one_broker_failure_does_not_poison_another_sync() {
 }
 
 #[tokio::test]
-async fn sync_refuses_account_with_account_derived_trade_custody() {
-    let owner = OwnerId::new_random();
-    let account = AccountId::new_random();
-    let instrument = InstrumentId::new_random();
-    let account_derived_custody = CustodyId(account.inner());
-    let custody = CustodyId::new_random();
-    let services = services_with(date!(2026 - 03 - 31), |store| {
-        seed_account(store, owner, account, "Main");
-        seed_instrument(store, instrument, "TESTSHARE");
-    });
-    // Declared: this place backs a fact appended directly below, outside
-    // the sync under test, so the sync's own registration never reaches it.
-    seed_custody(
-        &services,
-        owner,
-        account_derived_custody,
-        "Account-Derived Custody",
-    )
-    .await;
-
-    let old = seeded_trade(
-        owner,
-        account,
-        instrument,
-        account_derived_custody,
-        date!(2026 - 03 - 15),
-    );
-    services
-        .store
-        .append_events(vec![old], IdentityScope::Source)
-        .await
-        .unwrap_or_else(|error| panic!("seed old trade: {error}"));
-    let broker = api(
-        account,
-        SourceId::new_random(),
-        trade(account, instrument, custody),
-    );
-
-    let error = sync_broker(
-        &services,
-        &principal(owner),
-        &broker,
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
-    )
-    .await
-    .expect_err("affected account must be refused");
-
-    let text = error.to_string();
-    assert!(text.contains("1"), "refusal must name the count: {text}");
-    assert!(
-        text.contains("iaam-y3a2"),
-        "refusal must name the repair task: {text}"
-    );
-    assert_eq!(load_all(&services, owner).await.len(), 1);
-}
-
-#[tokio::test]
-async fn sync_allows_account_when_all_affected_trades_are_reversed() {
-    let owner = OwnerId::new_random();
-    let account = AccountId::new_random();
-    let first_instrument = InstrumentId::new_random();
-    let second_instrument = InstrumentId::new_random();
-    let account_derived_custody = CustodyId(account.inner());
-    let custody = CustodyId::new_random();
-    let services = services_with(date!(2026 - 03 - 31), |store| {
-        seed_account(store, owner, account, "Main");
-        seed_instrument(store, first_instrument, "SHAREONE");
-        seed_instrument(store, second_instrument, "SHARETWO");
-    });
-    // Declared: this place backs a fact appended directly below, outside
-    // the sync under test, so the sync's own registration never reaches it.
-    seed_custody(
-        &services,
-        owner,
-        account_derived_custody,
-        "Account-Derived Custody",
-    )
-    .await;
-
-    let first = seeded_trade(
-        owner,
-        account,
-        first_instrument,
-        account_derived_custody,
-        date!(2026 - 03 - 15),
-    );
-    let second = seeded_trade(
-        owner,
-        account,
-        second_instrument,
-        account_derived_custody,
-        date!(2026 - 03 - 16),
-    );
-    let first_reversal = reversal(owner, &first, first.id);
-    let second_reversal = reversal(owner, &second, second.id);
-    services
-        .store
-        .append_events(
-            vec![first, second, first_reversal, second_reversal],
-            IdentityScope::Source,
-        )
-        .await
-        .unwrap_or_else(|error| panic!("seed reversed trades: {error}"));
-    let broker = api(
-        account,
-        SourceId::new_random(),
-        trade(account, first_instrument, custody),
-    );
-
-    let outcome = sync_broker(
-        &services,
-        &principal(owner),
-        &broker,
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
-    )
-    .await
-    .unwrap_or_else(|error| panic!("reversed account sync: {error}"));
-
-    assert_eq!(outcome.assertions, 1);
-}
-
-#[tokio::test]
-async fn sync_refusal_counts_only_unreversed_affected_trades() {
-    let owner = OwnerId::new_random();
-    let account = AccountId::new_random();
-    let first_instrument = InstrumentId::new_random();
-    let second_instrument = InstrumentId::new_random();
-    let account_derived_custody = CustodyId(account.inner());
-    let custody = CustodyId::new_random();
-    let services = services_with(date!(2026 - 03 - 31), |store| {
-        seed_account(store, owner, account, "Main");
-        seed_instrument(store, first_instrument, "SHAREONE");
-        seed_instrument(store, second_instrument, "SHARETWO");
-    });
-    // Declared: this place backs a fact appended directly below, outside
-    // the sync under test, so the sync's own registration never reaches it.
-    seed_custody(
-        &services,
-        owner,
-        account_derived_custody,
-        "Account-Derived Custody",
-    )
-    .await;
-
-    let first = seeded_trade(
-        owner,
-        account,
-        first_instrument,
-        account_derived_custody,
-        date!(2026 - 03 - 15),
-    );
-    let second = seeded_trade(
-        owner,
-        account,
-        second_instrument,
-        account_derived_custody,
-        date!(2026 - 03 - 16),
-    );
-    let first_reversal = reversal(owner, &first, first.id);
-    services
-        .store
-        .append_events(vec![first, second, first_reversal], IdentityScope::Source)
-        .await
-        .unwrap_or_else(|error| panic!("seed partially reversed trades: {error}"));
-    let broker = api(
-        account,
-        SourceId::new_random(),
-        trade(account, first_instrument, custody),
-    );
-
-    let error = sync_broker(
-        &services,
-        &principal(owner),
-        &broker,
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
-    )
-    .await
-    .expect_err("unreversed affected account must be refused");
-
-    assert!(
-        error
-            .to_string()
-            .contains("1 trade event(s) carry account-derived custody"),
-        "refusal must count only unreversed trades: {error}"
-    );
-}
-
-/// **Currently unwritable, and this is not a fixture bug — reported rather
-/// than worked around (iaam-c2fk).** This fixture's whole premise is a
-/// `dangling` reversal naming a target (`EventId::new_random()`) that is
-/// never itself written, so `sync_broker`'s in-memory correction resolution
-/// (`iaam_core::event::correction::resolve`) can be shown catching it and
-/// returning `AppError::Correction` — a fact the read side of the domain
-/// explicitly documents as reachable (see the twin finding in
-/// `crates/iaam-app/src/scenarios/journal.rs`,
-/// `a_fact_naming_a_target_outside_his_journal_is_where_his_history_begins`).
-/// But seeding it now fails at the *write* side instead: `events.relation_target`
-/// is `FOREIGN KEY (owner, relation_target) REFERENCES events (owner, id)
-/// DEFERRABLE INITIALLY DEFERRED` (schema collapse, T8), and a target that
-/// will never be written can never satisfy it, deferred or not, typed writer
-/// or raw. The seed itself now raises a generic `AppError::Store` FOREIGN KEY
-/// error before `sync_broker` is even called, so this test can no longer
-/// exercise what it names. Disabled rather than weakened or deleted, for the
-/// same maintainer decision the twin finding already asks for.
-#[tokio::test]
-async fn sync_returns_an_error_when_corrections_do_not_resolve() {
-    let owner = OwnerId::new_random();
-    let account = AccountId::new_random();
-    let affected_instrument = InstrumentId::new_random();
-    let account_derived_custody = CustodyId(account.inner());
-    let custody = CustodyId::new_random();
-    let services = services_with(date!(2026 - 03 - 31), |store| {
-        seed_account(store, owner, account, "Main");
-        seed_instrument(store, affected_instrument, "SHAREONE");
-    });
-    // Declared: this place backs a fact appended directly below, outside
-    // the sync under test, so the sync's own registration never reaches it.
-    seed_custody(
-        &services,
-        owner,
-        account_derived_custody,
-        "Account-Derived Custody",
-    )
-    .await;
-
-    let affected = seeded_trade(
-        owner,
-        account,
-        affected_instrument,
-        account_derived_custody,
-        date!(2026 - 03 - 15),
-    );
-    let dangling = reversal(owner, &affected, EventId::new_random());
-    services
-        .store
-        .append_events(vec![affected, dangling], IdentityScope::Source)
-        .await
-        .unwrap_or_else(|error| panic!("seed dangling correction: {error}"));
-    let broker = api(
-        account,
-        SourceId::new_random(),
-        trade(account, affected_instrument, custody),
-    );
-
-    let error = sync_broker(
-        &services,
-        &principal(owner),
-        &broker,
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
-    )
-    .await
-    .expect_err("invalid corrections must not lift the refusal");
-
-    // Not AppError::Reconciliation: a journal whose own correction links are
-    // inconsistent is not an inability to verify data, and naming it so would send
-    // an investigator to the reconciliation register instead of the journal.
-    assert!(matches!(error, AppError::Correction(_)));
-    assert!(
-        error.to_string().contains("references non-existent"),
-        "correction error must surface to the caller: {error}"
-    );
-}
-
-#[tokio::test]
-async fn sync_allows_account_with_only_position_derived_trade_custody() {
-    let owner = OwnerId::new_random();
-    let account = AccountId::new_random();
-    let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
-    let services = services_with(date!(2026 - 03 - 31), |store| {
-        seed_account(store, owner, account, "Main");
-        seed_instrument(store, instrument, "TESTSHARE");
-    });
-
-    let broker = api(
-        account,
-        SourceId::new_random(),
-        trade(account, instrument, custody),
-    );
-
-    let outcome = sync_broker(
-        &services,
-        &principal(owner),
-        &broker,
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
-    )
-    .await
-    .unwrap_or_else(|error| panic!("position-derived sync: {error}"));
-
-    assert_eq!(outcome.assertions, 1);
-    assert_eq!(load_all(&services, owner).await.len(), 2);
-}
-
-#[tokio::test]
-async fn sync_refusal_is_scoped_to_the_affected_account() {
-    let owner = OwnerId::new_random();
-    let affected = AccountId::new_random();
-    let unaffected = AccountId::new_random();
-    let affected_instrument = InstrumentId::new_random();
-    let affected_custody = CustodyId(affected.inner());
-    let unaffected_instrument = InstrumentId::new_random();
-    let unaffected_custody = CustodyId::new_random();
-    let services = services_with(date!(2026 - 03 - 31), |store| {
-        seed_account(store, owner, affected, "Main");
-        seed_account(store, owner, unaffected, "Savings");
-        seed_instrument(store, affected_instrument, "SHAREONE");
-        seed_instrument(store, unaffected_instrument, "SHARETWO");
-    });
-    // Declared: this place backs a fact appended directly below, outside
-    // the sync under test, so the sync's own registration never reaches it.
-    seed_custody(
-        &services,
-        owner,
-        affected_custody,
-        "Account-Derived Custody",
-    )
-    .await;
-
-    let old = seeded_trade(
-        owner,
-        affected,
-        affected_instrument,
-        affected_custody,
-        date!(2026 - 03 - 15),
-    );
-    services
-        .store
-        .append_events(vec![old], IdentityScope::Source)
-        .await
-        .unwrap_or_else(|error| panic!("seed affected trade: {error}"));
-    let mut unaffected_operation = trade(unaffected, unaffected_instrument, unaffected_custody);
-    unaffected_operation.source_operation_id = Some("UNAFF-MARCH-1".to_owned());
-    let broker = api(unaffected, SourceId::new_random(), unaffected_operation);
-
-    let outcome = sync_broker(
-        &services,
-        &principal(owner),
-        &broker,
-        unaffected,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
-    )
-    .await
-    .unwrap_or_else(|error| panic!("unaffected account sync: {error}"));
-
-    assert_eq!(outcome.assertions, 1);
-    assert_eq!(load_all(&services, owner).await.len(), 3);
-}
-
-#[tokio::test]
-async fn sync_refuses_account_derived_trade_after_requested_interval() {
-    let owner = OwnerId::new_random();
-    let account = AccountId::new_random();
-    let old_instrument = InstrumentId::new_random();
-    let account_derived_custody = CustodyId(account.inner());
-    let custody = CustodyId::new_random();
-    let services = services_with(date!(2026 - 03 - 31), |store| {
-        seed_account(store, owner, account, "Main");
-        seed_instrument(store, old_instrument, "SHAREONE");
-    });
-    // Declared: this place backs a fact appended directly below, outside
-    // the sync under test, so the sync's own registration never reaches it.
-    seed_custody(
-        &services,
-        owner,
-        account_derived_custody,
-        "Account-Derived Custody",
-    )
-    .await;
-
-    let old = seeded_trade(
-        owner,
-        account,
-        old_instrument,
-        account_derived_custody,
-        date!(2026 - 04 - 15),
-    );
-    services
-        .store
-        .append_events(vec![old], IdentityScope::Source)
-        .await
-        .unwrap_or_else(|error| panic!("seed later trade: {error}"));
-    let broker = api(
-        account,
-        SourceId::new_random(),
-        trade(account, old_instrument, custody),
-    );
-
-    let error = sync_broker(
-        &services,
-        &principal(owner),
-        &broker,
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
-    )
-    .await
-    .expect_err("later affected trade must still refuse sync");
-
-    assert!(error.to_string().contains("1"));
-    assert_eq!(load_all(&services, owner).await.len(), 1);
-}
-
-#[tokio::test]
 async fn out_of_interval_trade_fact_is_recorded_without_a_control_assertion() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let mut operation = trade(account, instrument, custody);
+    let mut operation = trade_without_custody(account, instrument);
     operation.dates.trade = Some(date!(2026 - 04 - 02));
     let broker = api(account, SourceId::new_random(), operation);
 
@@ -2204,7 +1740,6 @@ async fn a_current_portfolio_is_withheld_when_interval_ends_before_clock_date() 
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 04 - 01), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
@@ -2213,7 +1748,7 @@ async fn a_current_portfolio_is_withheld_when_interval_ends_before_clock_date() 
     let broker = api(
         account,
         SourceId::new_random(),
-        trade(account, instrument, custody),
+        trade_without_custody(account, instrument),
     );
 
     let outcome = sync_broker(
@@ -2258,13 +1793,12 @@ async fn a_current_portfolio_is_withheld_when_interval_contains_today_but_ends_l
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(today, |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
     });
 
-    let mut operation = trade(account, instrument, custody);
+    let mut operation = trade_without_custody(account, instrument);
     operation.dates.trade = Some(today);
     let broker = api(account, SourceId::new_random(), operation);
 
@@ -2298,7 +1832,6 @@ async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let services = services_with(date!(2026 - 04 - 01), |store| {
         seed_account(store, owner, account, "Main");
         seed_instrument(store, instrument, "TESTSHARE");
@@ -2307,7 +1840,7 @@ async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {
     let mut broker = api(
         account,
         SourceId::new_random(),
-        trade(account, instrument, custody),
+        trade_without_custody(account, instrument),
     );
     broker.portfolio.as_mut().expect("portfolio").as_of = PortfolioAsOf::Requested;
 

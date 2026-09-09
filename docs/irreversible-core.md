@@ -99,8 +99,7 @@ reinterpreting the journal.
 | The channel's own order state is a typed contract, not a string compared in passing | `iaam_broker::tinkoff::ChannelOrderState`, with `Unrecognised(String)` for a state the contract does not name |
 | Only an executed order becomes a fact; every other state becomes one quarantine row rather than silence or an aborted batch | the state gate in `adapt_operations`, between `dictionary.kind_of` and `operation_to_submitted` |
 | One fill is one fact: quantity, price and moment come from the fill, not from the order that carried it | one `SubmittedOperation` per element of `trades_info.trades` |
-| Custody is the position's identifier, never the account's | `positionUid` on the trading row; a row without one is quarantined naming the field |
-| A security leg whose custody equals the account is a defect of past imports, not an old but valid shape | the whole history is read through `Date::MAX`, and the account's import is refused before any append (repair: iaam-y3a2) |
+| A position's identity is the account and the instrument, never a place of custody; the channel's `positionUid` is carried as provenance and nowhere else | `Provenance::source_position_id`; a trading row without one is quarantined naming the field |
 | A securities transfer is not cash, and its direction is part of its meaning | `ChannelOperationKind::{SecuritiesTransferIn, SecuritiesTransferOut}`, dictionary codes `securities_transfer_in` and `securities_transfer_out` |
 | A reported accrued interest of zero is a value; only a charged fee treats zero as absent | `accrued_interest_money` against `fee_money` in `iaam_ingest::operation` |
 | An order's reported payment is checked against the exact total of its fills, and the remainder is allocated by a stated rule rather than by the adapter | `rules::trade_allocation::{check_order_completeness, allocate_minor}` |
@@ -114,14 +113,16 @@ money. The rewrite is the migration this section is about — a dictionary
 row is an owner's decision about meaning, and the old meaning was wrong
 rather than merely coarse.
 
-The refusal deserves its own note. Re-importing is not repair: an old
-fact carries account-derived custody inside its `OperationKind`, so a
-re-imported one differs by content fingerprint, arrives as `Fresh`, and
-is inserted beside the old one — double-counting the position. Until the
-reversal exists, refusing the account's import is the only answer that
-does not corrupt the journal, and it is deliberately wider than the
-requested interval: an owner re-importing a suspicious month must not be
-told the rest of the history is sound.
+**Superseded.** This section used to say custody was the position's
+identifier, that a trade's leg carrying the account's own identifier as
+custody was a defect ("T4"), and that a sync refused an affected account
+outright until a dedicated repair route (`iaam-y3a2`) reversed the defective
+facts. A position is an account and an instrument (`iaam-xep0`): custody
+left the key, the sync gate had no subject once it did, and the repair route
+retracted facts for a defect that no longer affects any figure — both are
+gone, and `positionUid` is carried as provenance (`Provenance::source_position_id`)
+rather than a place of custody. The system was greenfield when this changed,
+so there was nothing on disk for either removal to migrate.
 
 Cannot change without a migration:
 
@@ -131,11 +132,10 @@ Cannot change without a migration:
 - One-fact-per-fill and the identity built from the fill. Collapsing
   fills back onto the order would change source-operation identity for
   every trade already recorded.
-- Custody as the position's identifier, and the defect predicate that
-  detects the account-derived shape. The predicate is the shape itself,
-  not the parser version and not the source channel: a fact from this
-  branch is `tinkoff-api/3` and still defective, and a persisted
-  `SourceId` names an access record that may since have been revoked.
+- ~~Custody as the position's identifier, and the defect predicate that
+  detects the account-derived shape~~ — superseded by `iaam-xep0`: a
+  position's identity is the account and the instrument, and neither the
+  predicate nor the repair route it justified exists any more.
 - The meaning and the codes of `securities_transfer_in` and
   `securities_transfer_out` — they are already in `broker_operation_kinds`.
 - Accrued interest accepting a reported zero. Restoring the rejection
@@ -217,39 +217,20 @@ Cannot change without a migration:
 
 ## E5: the journal starts correcting itself
 
-The custody repair (`iaam-y3a2`) is the first production code that writes a
-correction. Until it, `Relation::Reversal` existed and nothing produced one:
-`recompute_history` computed a correction plan and discarded it. The facts
-below have now been written, so they cannot be redefined.
-
-| Requirement | Where implemented |
-|---|---|
-| A correction retracts and does not fabricate: the corrected custody comes from the broker on re-import, never from the journal | `scenarios::custody_repair::repair_custody`, reversal only |
-| A reversed event is effective nowhere that sums legs | `resolve` inside `perimeter::assess` and `active_instruments`; `build_with` resolves once and `observe` takes `&[&Event]` |
-| A repaired account is no longer refused | `sync::affected_trade_count` over the resolved set |
-| A journal whose own correction links do not resolve is named as that, not as a failure to reconcile | `AppError::Correction`, code `corrections_do_not_resolve` |
-| An owner is told before facts are retracted that nothing may restore them | `CustodyRepairCase`, and the acknowledgement the route requires |
-
-Cannot change without a migration:
-
-- The repair's parser version `custody-repair/1` and its idempotency key
-  `custody-repair/{account}/{target}`. Both are in the journal; a different
-  key would write a second reversal for a target already reversed.
-- That a reversal's provenance carries **no** `source_operation_id`. It is not
-  a nicety: `find_duplicate` tests that identity before the idempotency key,
-  so a reversal carrying its target's identity is found as a duplicate of the
-  event it reverses and is never written — while the repair reports success.
-- That "already reversed" is read from `Relation` links rather than from a
-  store duplicate. Idempotency keys are client-supplied, so a taken key proves
-  only that it is taken.
-
-Two limits are worth stating because they look like defects otherwise. A
-reversed fact's identity can never be reused: `events_idempotency_key` and
-`events_source_operation` are unique, and `events_are_immutable` refuses to
-mark the superseded row, so correction-aware uniqueness would have to live in
-the index itself. And the repair's «can this be restored» test asks only
-whether the owner holds any unrevoked broker access — a revoked access's
-`SourceId` cannot be matched to the facts it recorded.
+**The custody repair this section documented is retired (`iaam-xep0`).** It
+used to be cited here as the first production code that writes a correction:
+`scenarios::custody_repair::repair_custody`, the `sync_broker` gate it
+existed to lift (`sync::affected_trade_count`, `sync::is_affected_trade`),
+its route, its DTOs (`CustodyRepairCase` among them), its parser version
+`custody-repair/1` and its idempotency key shape are all gone, along with the
+defect they answered — custody stopped being part of a position's identity,
+so an account-derived custody value is no longer a shape any trade can carry.
+The general claims below about what a correction guarantees — a reversed
+event summing nowhere, a journal whose correction links do not resolve being
+named `AppError::Correction`, a reused reversal identity being refused —
+still hold of `scenarios::correction`'s own reversal path
+(`reversal_for_with`), which is unaffected by this retirement; what is gone
+is the custody-repair-specific detail that illustrated them.
 
 ## E5, continued: a movement whose far side is the owner's and unnamed
 

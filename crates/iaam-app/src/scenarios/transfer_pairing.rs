@@ -433,6 +433,7 @@ fn transfer_for(
         // recognised as the same act rather than written as a second transfer.
         idempotency_key: Some(format!("pairing/{}/{}", outgoing.inner(), incoming.inner())),
         source_operation_id: None,
+        source_position_id: None,
         source_category: None,
         // Neither the owner's own word at either bank nor either bank's code:
         // for the reason the description is dropped just below, and one of its
@@ -478,6 +479,7 @@ mod tests {
                 source_time: None,
                 idempotency_key: None,
                 source_operation_id: None,
+                source_position_id: None,
                 source_category: None,
                 owner_category: None,
                 source_code: None,

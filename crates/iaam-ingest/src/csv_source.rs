@@ -616,6 +616,7 @@ fn row_to_operation(row: &Row, directory: &Directory) -> Result<SubmittedOperati
         source_time: None,
         idempotency_key: row.idempotency_key.clone(),
         source_operation_id: None,
+        source_position_id: None,
         // The category column arrives with the mapping importer.
         source_category: None,
         owner_category: None,
@@ -751,7 +752,7 @@ fn build_trade(
         row.instrument.as_deref().unwrap_or_default(),
         date,
     )?;
-    let custody = resolve_custody(row.custody.as_deref(), directory)?;
+    let custody = Some(resolve_custody(row.custody.as_deref(), directory)?);
     let quantity = Dec::new(decimal(row.quantity.as_deref(), "quantity")?);
     let gross_minor = minor(row.amount.as_deref(), "amount", currency)?;
     let fee_minor = optional_minor(row.fee.as_deref(), "fee", currency)?;

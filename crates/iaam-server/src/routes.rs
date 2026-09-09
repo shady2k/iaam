@@ -95,16 +95,15 @@ use crate::dto::{
     ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
     ContourVersionDto, CorrectImportRequest, CorrectionVerdictDto, CreateAccountRequest,
     CreateAccountsBatchRequest, CreateContourVersionRequest, CreateInstrumentRequest,
-    CreateTokenRequest, CurrencyDto, CustodyRepairOutcomeDto, CustodyRepairRequest, DecisionDto,
-    DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto, HealthDto,
-    ImportCorrectionDto, InputAlternativeDto, InstrumentDto, InstrumentListDto, IssuedTokenDto,
-    JournalAggregateDto, JournalEventReadDto, JournalPageDto, MarketFxDto, MarketFxSeriesDto,
-    MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto, MarketPriceSeriesDto,
-    MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
-    NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
-    PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
-    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
-    RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
+    CreateTokenRequest, CurrencyDto, DecisionDto, DeclaredAccountDto, DeclaredSourceDto,
+    DocumentDto, DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto,
+    InstrumentDto, InstrumentListDto, IssuedTokenDto, JournalAggregateDto, JournalEventReadDto,
+    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
+    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
+    MoneyFlowReportDto, NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest,
+    OwnerQuestionDto, PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto,
+    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
+    ReconciliationStatusDto, RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
     RenameAccountRequest, RenameAccountsBatchRequest, ReplaceAccountAliasesBatchRequest,
     ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsBatchRequest,
@@ -727,40 +726,6 @@ pub async fn reparse_document(
     )
     .await?;
     Ok(Json(document_dto(result)))
-}
-
-/// Retract trades whose custody was fabricated from the account identifier.
-#[utoipa::path(
-    post,
-    path = "/v1/accounts/{account}/repairs/custody",
-    params(("account" = Uuid, Path, description = "Account identifier")),
-    request_body = CustodyRepairRequest,
-    responses(
-        (status = 200, description = "Custody repair outcome", body = CustodyRepairOutcomeDto),
-        (status = 403, description = "Insufficient permissions", body = ApiError),
-        (status = 422, description = "Invalid repair request", body = ApiError),
-        (status = 409, description = "Repair idempotency conflict", body = ApiError),
-        (status = 503, description = "Broker access is not configured", body = ApiError),
-        (status = 400, description = "Request body could not be read", body = ApiError),
-        (status = 413, description = "Request body exceeds the limit", body = ApiError),
-        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
-    ),
-    security(("bearer" = []))
-)]
-pub async fn repair_custody(
-    State(state): State<ServerState>,
-    Extension(principal): Extension<Principal>,
-    ApiPath(account): ApiPath<Uuid>,
-    ApiJson(request): ApiJson<CustodyRepairRequest>,
-) -> Result<Json<CustodyRepairOutcomeDto>, ApiFailure> {
-    let outcome = iaam_app::scenarios::custody_repair::repair_custody(
-        &state.services,
-        &principal,
-        AccountId(account),
-        request.acknowledge_without_live_access,
-    )
-    .await?;
-    Ok(Json(CustodyRepairOutcomeDto::from_domain(outcome)))
 }
 
 /// Correct events the owner names: retract one, or supersede one with another.
@@ -7245,7 +7210,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// [`require_admin`] states: the queue and the caveat register are about the
 /// owner's money and these are about the shape of the instance, so there is no
 /// second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 31] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 30] = [
     (
         "rename_account",
         "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
@@ -7293,10 +7258,6 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 31] = [
     (
         "reparse_document",
         "Not asked for. It reads a kept document again after a parser is fixed, which is a repair the operator reaches for; nothing in the journal says a document should be read a second time.",
-    ),
-    (
-        "repair_custody",
-        "Not asked for. The state it repairs is published in a report's own diagnostics, and an item for it would be a second place saying so.",
     ),
     (
         "confirm_transfer_pairing",

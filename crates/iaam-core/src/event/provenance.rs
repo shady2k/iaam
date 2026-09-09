@@ -145,6 +145,20 @@ pub struct Provenance {
     raw_hash: RawHash,
     parser_version: ParserVersion,
     source_operation_id: Option<String>,
+    /// The broker's own handle for the position this fact moved, verbatim.
+    ///
+    /// This used to be read into a custody field — the API channel's
+    /// `positionUid` stood in for a place of storage nowhere it named one
+    /// (`iaam-xep0`, T4). It is evidence exactly like [`Self::source_operation_id`]
+    /// beside it: the channel's own bookkeeping key for the position, not an
+    /// identifier this journal keys anything on and not a place the owner
+    /// would recognise.
+    ///
+    /// `#[serde(default)]` is required: the journal is append-only and an
+    /// import session written before this field existed said nothing about
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_position_id: Option<String>,
     /// The category the source itself assigned to the row.
     ///
     /// Retained separately from any owner category and never rewritten. It is
@@ -324,6 +338,7 @@ impl Provenance {
             raw_hash,
             parser_version,
             source_operation_id: None,
+            source_position_id: None,
             source_category: None,
             source_kind: None,
             owner_category: None,
@@ -340,6 +355,12 @@ impl Provenance {
     #[must_use]
     pub fn with_source_operation_id(mut self, id: impl Into<String>) -> Self {
         self.source_operation_id = Some(id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_source_position_id(mut self, id: impl Into<String>) -> Self {
+        self.source_position_id = Some(id.into());
         self
     }
 
@@ -513,6 +534,11 @@ impl Provenance {
     #[must_use]
     pub fn source_operation_id(&self) -> Option<&str> {
         self.source_operation_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn source_position_id(&self) -> Option<&str> {
+        self.source_position_id.as_deref()
     }
 
     #[must_use]

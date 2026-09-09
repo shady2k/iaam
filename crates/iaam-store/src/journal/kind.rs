@@ -121,6 +121,7 @@ pub(crate) fn to_rows(event: &Event) -> Result<(EventRow, Vec<LegRow>, DetailRow
         raw_hash: event.provenance.raw_hash().as_str().to_owned(),
         parser_version: event.provenance.parser_version().0.clone(),
         source_operation_id: event.provenance.source_operation_id().map(str::to_owned),
+        source_position_id: event.provenance.source_position_id().map(str::to_owned),
         source_category: event.provenance.source_category().map(str::to_owned),
         source_kind: event.provenance.source_kind().map(str::to_owned),
         owner_category: event.provenance.owner_category().map(str::to_owned),
@@ -1194,6 +1195,9 @@ fn decode_provenance(header: &EventRow) -> Result<Provenance, StoreError> {
     );
     if let Some(value) = header.source_operation_id.clone() {
         provenance = provenance.with_source_operation_id(value);
+    }
+    if let Some(value) = header.source_position_id.clone() {
+        provenance = provenance.with_source_position_id(value);
     }
     if let Some(value) = header.source_category.clone() {
         provenance = provenance.with_source_category(value);

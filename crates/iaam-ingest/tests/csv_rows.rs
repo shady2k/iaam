@@ -203,8 +203,8 @@ fn an_empty_custody_column_falls_back_to_the_default_and_a_named_one_does_not() 
         },
         ParsedRow::Rejected(_) => None,
     };
-    assert_eq!(custody_of(&rows[0]), Some(default));
-    assert_eq!(custody_of(&rows[1]), Some(named));
+    assert_eq!(custody_of(&rows[0]), Some(Some(default)));
+    assert_eq!(custody_of(&rows[1]), Some(Some(named)));
     assert_eq!(
         custody_of(&rows[2]),
         None,

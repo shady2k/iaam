@@ -92,6 +92,7 @@ impl ReportParser for TinkoffParser {
             directory,
             report.period.map(|period| period.to),
             &mut report.sections,
+            &mut report.rows,
         );
         parse_totals(workbook.sheet("Итоги"), &mut report.sections);
         report
@@ -433,7 +434,9 @@ fn parse_positions(
     directory: &Directory,
     on: Option<Date>,
     sections: &mut ControlSections,
+    rows: &mut Vec<LocatedRow>,
 ) {
+    const SHEET: &str = "Остатки ценных бумаг";
     let Some(sheet) = sheet else { return };
     let Some(headers) = headers(sheet) else {
         return;
@@ -446,21 +449,30 @@ fn parse_positions(
     };
     let opening_col = column(&headers, "количество на начало");
     let closing_col = column(&headers, "количество на конец");
-    for row in data_rows(sheet) {
-        let Ok(instrument) = lookup_instrument(
+    for (index, row) in data_rows(sheet).enumerate() {
+        let row_number = index as u64 + 2;
+        let instrument = match lookup_instrument(
             directory,
             "ticker",
             text_value(cell(row, instrument_col)).unwrap_or_default(),
             on,
-        ) else {
-            continue;
+        ) {
+            Ok(instrument) => instrument,
+            Err(rejection) => {
+                rows.push(located(SHEET, row_number, Err(rejection)));
+                continue;
+            }
         };
-        let Ok(custody) = lookup_custody(
+        let custody = match lookup_custody(
             directory,
             text_value(cell(row, custody_col)).unwrap_or_default(),
             "custody",
-        ) else {
-            continue;
+        ) {
+            Ok(custody) => custody,
+            Err(rejection) => {
+                rows.push(located(SHEET, row_number, Err(rejection)));
+                continue;
+            }
         };
         if let Some(column) = opening_col {
             if let Ok(quantity) = quantity_value(cell(row, column), "opening_quantity") {

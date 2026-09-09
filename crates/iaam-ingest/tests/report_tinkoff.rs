@@ -411,6 +411,53 @@ fn tinkoff_report_preserves_rows_operations_period_controls_and_repo_quarantine(
 }
 
 #[test]
+fn tinkoff_position_rows_are_refused_with_their_coordinates_not_dropped() {
+    let workbook = Workbook::open(REPORT).unwrap();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    // An empty custody directory: nothing in it can resolve "НРД", the title
+    // the fixture's position sheet names. The deposit on "Денежные операции"
+    // names no custody at all and must import regardless.
+    let mut directory = directory(account, CustodyId::new_random(), instrument);
+    directory.custodies = Default::default();
+
+    let report = TinkoffParser.parse(&workbook, &directory);
+
+    assert!(
+        report.rows.iter().any(|row| matches!(
+            &row.outcome,
+            ParsedRow::Operation(operation)
+                if matches!(operation.kind, OperationKind::Deposit { .. })
+        )),
+        "the cash deposit must still import when custody cannot be resolved"
+    );
+
+    let position_rows: Vec<_> = report
+        .rows
+        .iter()
+        .filter(|row| row.locator.sheet.as_deref() == Some("Остатки ценных бумаг"))
+        .collect();
+    // The fixture's position sheet holds one data row, carrying both the
+    // opening and the closing balance; one row failing to resolve custody is
+    // one located rejection, not two.
+    assert_eq!(position_rows.len(), 1);
+    for row in &position_rows {
+        let ParsedRow::Rejected(rejection) = &row.outcome else {
+            panic!("expected a rejection, got {:?}", row.outcome);
+        };
+        assert_eq!(rejection.field, "custody");
+    }
+    // No `PositionQuantity` claim is recorded for a row that never resolved.
+    assert!(
+        report
+            .sections
+            .claims()
+            .iter()
+            .all(|claim| !matches!(claim, ControlClaim::PositionQuantity { .. }))
+    );
+}
+
+#[test]
 fn control_sections_keep_absent_claims_absent() {
     let sections = ControlSections::default();
     assert!(sections.claims().is_empty());

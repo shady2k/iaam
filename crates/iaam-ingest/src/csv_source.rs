@@ -686,7 +686,7 @@ fn build_kind(
 }
 
 /// Storage location: a named one is validated against the directory, an unnamed one
-/// is taken from the default.
+/// is taken from the default, when one is set.
 ///
 /// Extracted into a separate function **for testability, not readability**.
 /// An empty string cannot be obtained from inside `parse`: CSV parsing returns
@@ -694,13 +694,19 @@ fn build_kind(
 /// would therefore be unreachable, and the mutation shield would call it
 /// equivalent. An unreachable check is one whose behavior is unknown;
 /// a separate function can be called directly, including with an empty string.
+///
+/// **No production caller ever sets a default.** `directory.default_custody`
+/// exists for a fixture that wants to exercise the fallback branch; nothing on
+/// the wired API path populates it, and this build has no route that registers
+/// a place of custody at all. The refusal below says so, rather than pointing
+/// the caller at a capability that does not exist (iaam-pzxl).
 fn resolve_custody(name: Option<&str>, directory: &Directory) -> Result<CustodyId, Rejection> {
     match name {
         Some(name) if !name.is_empty() => resolve_named_custody(name, directory, "custody"),
         _ => directory.default_custody.ok_or_else(|| Rejection {
             field: "custody".into(),
-            expected: "a place of custody of the owner's, or a default one for \
-                       this account"
+            expected: "a custody title already registered for this owner; this \
+                       build has no API that registers one from a document"
                 .into(),
             actual: "not specified".into(),
         }),

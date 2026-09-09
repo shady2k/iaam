@@ -91,6 +91,7 @@ impl ReportParser for FinamParser {
             directory,
             report.period.map(|period| period.to),
             &mut report.sections,
+            &mut report.rows,
         );
         parse_totals(workbook.sheet("Сводные итоги"), &mut report.sections);
         report
@@ -436,7 +437,9 @@ fn parse_positions(
     directory: &Directory,
     on: Option<Date>,
     sections: &mut ControlSections,
+    rows: &mut Vec<LocatedRow>,
 ) {
+    const SHEET: &str = "Позиции";
     let Some(sheet) = sheet else { return };
     let Some(headers) = headers(sheet) else {
         return;
@@ -449,12 +452,21 @@ fn parse_positions(
     };
     let opening_col = column(&headers, "остаток на начало");
     let closing_col = column(&headers, "остаток на конец");
-    for row in data_rows(sheet) {
-        let Ok(instrument) = instrument_value(directory, cell(row, instrument_col), on) else {
-            continue;
+    for (index, row) in data_rows(sheet).enumerate() {
+        let row_number = index as u64 + 2;
+        let instrument = match instrument_value(directory, cell(row, instrument_col), on) {
+            Ok(instrument) => instrument,
+            Err(rejection) => {
+                rows.push(located(SHEET, row_number, Err(rejection)));
+                continue;
+            }
         };
-        let Ok(custody) = custody_value(directory, cell(row, custody_col), "custody") else {
-            continue;
+        let custody = match custody_value(directory, cell(row, custody_col), "custody") {
+            Ok(custody) => custody,
+            Err(rejection) => {
+                rows.push(located(SHEET, row_number, Err(rejection)));
+                continue;
+            }
         };
         if let Some(column) = opening_col {
             if let Ok(quantity) = quantity_value(cell(row, column), "opening_quantity") {

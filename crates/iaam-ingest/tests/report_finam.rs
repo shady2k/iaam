@@ -252,7 +252,10 @@ fn finam_report_preserves_rows_operations_period_controls_and_repo_quarantine() 
                 currency,
                 ..
             } => {
-                assert_eq!((*actual_instrument, *actual_custody), (instrument, custody));
+                assert_eq!(
+                    (*actual_instrument, *actual_custody),
+                    (instrument, Some(custody))
+                );
                 assert_eq!(
                     (
                         *quantity,
@@ -281,7 +284,10 @@ fn finam_report_preserves_rows_operations_period_controls_and_repo_quarantine() 
                 currency,
                 ..
             } => {
-                assert_eq!((*actual_instrument, *actual_custody), (instrument, custody));
+                assert_eq!(
+                    (*actual_instrument, *actual_custody),
+                    (instrument, Some(custody))
+                );
                 assert_eq!(
                     (
                         *quantity,

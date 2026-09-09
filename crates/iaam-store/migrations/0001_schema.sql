@@ -1092,6 +1092,10 @@ CREATE TABLE events (
     raw_hash                TEXT NOT NULL,
     parser_version          TEXT NOT NULL,
     source_operation_id     TEXT,
+    -- The broker's own handle for the position, where the channel stated
+    -- one. Evidence beside `source_operation_id`, never a custody place
+    -- (iaam-xep0, T4): `Provenance::source_position_id` documents why.
+    source_position_id      TEXT,
     source_category         TEXT,
     source_kind             TEXT,
     owner_category          TEXT,
@@ -1204,7 +1208,12 @@ CREATE TABLE event_legs (
                                       AND custody IS NULL AND instrument IS NULL AND quantity IS NULL
             WHEN 'principal'         THEN amount IS NOT NULL AND currency IS NOT NULL
                                       AND instrument IS NOT NULL AND custody IS NULL AND quantity IS NULL
-            WHEN 'security_quantity' THEN instrument IS NOT NULL AND custody IS NOT NULL
+            -- `custody` is unconstrained here on purpose: a position is an
+            -- account and an instrument (`iaam-xep0`), so custody is
+            -- description and not every source states one. A source that
+            -- does — a report's own "место хранения" column — still
+            -- carries it; the API broker channel carries none.
+            WHEN 'security_quantity' THEN instrument IS NOT NULL
                                       AND quantity IS NOT NULL AND amount IS NULL AND currency IS NULL
         END
     )

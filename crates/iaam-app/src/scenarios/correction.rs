@@ -1202,8 +1202,8 @@ fn reversal_for(original: &Event, declared_by: PrincipalId) -> Event {
 fn reversal_for_with(original: &Event, declared_by: Option<PrincipalId>) -> Event {
     let idempotency_key = format!("correction/reversal/{}", original.id.inner());
     let raw_hash = hash_of(&idempotency_key);
-    // Sequence zero, like custody repair: the store assigns the real one within
-    // the day in the same transaction as the insert (§4.8).
+    // Sequence zero: the store assigns the real one within the day in the
+    // same transaction as the insert (§4.8).
     let order = original.order.source_time().map_or_else(
         || EffectiveOrder::new(original.order.date(), 0),
         |source_time| EffectiveOrder::with_source_time(original.order.date(), source_time, 0),
@@ -1399,6 +1399,7 @@ mod tests {
                 source_time: None,
                 idempotency_key: None,
                 source_operation_id: None,
+                source_position_id: None,
                 source_category: None,
                 owner_category: None,
                 source_code: None,

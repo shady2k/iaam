@@ -2040,10 +2040,19 @@ pub enum PortfolioAsOf {
 }
 
 /// Portfolio claims together with the date semantics of the answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `refused` carries the rows a channel reported that could not become a
+/// claim at all — two portfolio rows naming one instrument, refused as a
+/// pair rather than summed (`iaam-xep0`, T4) — exactly as `quarantined`
+/// carries an operation `parse_operations` could not accept. `claims` still
+/// carries every other instrument's answer: a refused pair withholds an
+/// opinion about the instruments it names, not about the rest of the
+/// snapshot.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PortfolioSnapshot {
     pub as_of: PortfolioAsOf,
     pub claims: Vec<ControlClaim>,
+    pub refused: Vec<Quarantined>,
 }
 
 /// Broker channel: a second way to obtain the same data.

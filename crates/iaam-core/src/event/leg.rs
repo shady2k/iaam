@@ -68,6 +68,29 @@ impl Leg {
         }
     }
 
+    /// A security-quantity leg for a source that named no place of custody.
+    ///
+    /// A position is an account and an instrument (`iaam-xep0`); custody is
+    /// description, not identity, and description that was never stated is
+    /// not invented here. The API broker channel's own trades are the case
+    /// this exists for: its `positionUid` is an opaque handle, not a place,
+    /// and the honest leg for a trade it reports carries no custody at all.
+    #[must_use]
+    pub const fn security_without_custody(
+        account: AccountId,
+        instrument: InstrumentId,
+        quantity: Quantity,
+    ) -> Self {
+        Self {
+            kind: LegKind::SecurityQuantity,
+            account,
+            custody: None,
+            instrument: Some(instrument),
+            money: None,
+            quantity: Some(quantity),
+        }
+    }
+
     #[must_use]
     pub const fn fee(account: AccountId, money: Money) -> Self {
         Self {

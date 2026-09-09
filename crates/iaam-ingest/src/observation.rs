@@ -556,6 +556,9 @@ impl ObservedRow {
             source_time: self.source_time,
             idempotency_key: self.identity.idempotency_key.clone(),
             source_operation_id: self.identity.row.clone(),
+            // The report/CSV channels have no broker position handle to
+            // carry; only the API broker adapter fills this field.
+            source_position_id: None,
             // Each word to its own field. This used to carry `source_kind`,
             // and the pair round-tripped — `scenarios/classification.rs` read
             // it back out as `source_kind` again — so nothing failed and the

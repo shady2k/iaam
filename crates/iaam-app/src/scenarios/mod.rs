@@ -18,6 +18,5 @@ pub mod transfer_pairing;
 pub mod broker_dictionary;
 pub mod classification;
 pub mod correction;
-pub mod custody_repair;
 pub mod documents;
 pub mod reconciliation;

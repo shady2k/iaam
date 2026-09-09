@@ -4,21 +4,22 @@
 //! the body, quarantines rejected rows, and binds stable
 //! port types.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 
 use async_trait::async_trait;
 use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, ChannelOrderState,
-    GetOperationsByCursorRequest, ParseError, TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError,
-    parse_operations, parse_portfolio,
+    ChannelPortfolioPosition, GetOperationsByCursorRequest, ParseError, TINKOFF_PARSER_VERSION,
+    TinkoffClient, TinkoffError, parse_operations, parse_portfolio, parse_portfolio_positions,
 };
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::ParserVersion;
-use iaam_core::ids::{AccountId, CustodyId, InstrumentId, SourceId};
+use iaam_core::ids::{AccountId, InstrumentId, SourceId};
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::reconciliation::claim::ControlClaim;
 use iaam_core::reconciliation::{Dimension, evidence::SourceChannel};
 use iaam_core::rules::trade_allocation::{
     allocate_minor as core_allocate_minor, check_order_completeness,
@@ -110,13 +111,103 @@ impl BrokerChannel for TinkoffChannel {
     }
 }
 
+/// Turns the channel's portfolio answer into claims, refusing any instrument
+/// two rows disagree about instead of guessing which one is right.
+///
+/// `parse_portfolio` still does the lossy projection (§`parse_portfolio`'s
+/// own doc comment): one `ControlClaim::PositionQuantity` per row, with no
+/// way for either of two rows for one instrument to say why there are two.
+/// `parse_portfolio_positions` carries the fields that would answer that —
+/// `blocked`, `blockedLots`, `quantityLots` — so this function groups by
+/// instrument there, drops every claim whose instrument has more than one
+/// row, and reports the dropped rows as `refused` instead of silently
+/// discarding an opinion the channel never gave.
 fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
-    parse_portfolio(body)
-        .map(|claims| PortfolioSnapshot {
-            as_of: PortfolioAsOf::Current,
-            claims,
+    let claims = parse_portfolio(body).map_err(parse_error)?;
+    let positions = parse_portfolio_positions(body).map_err(parse_error)?;
+
+    let mut by_instrument: HashMap<&str, Vec<&ChannelPortfolioPosition>> = HashMap::new();
+    for position in &positions {
+        by_instrument
+            .entry(position.instrument_uid.as_str())
+            .or_default()
+            .push(position);
+    }
+    let duplicated: HashSet<&str> = by_instrument
+        .iter()
+        .filter(|(_, rows)| rows.len() > 1)
+        .map(|(instrument, _)| *instrument)
+        .collect();
+    let refused = duplicated
+        .iter()
+        .map(|instrument| duplicate_position_refusal(instrument, &by_instrument[instrument]))
+        .collect();
+
+    let claims = claims
+        .into_iter()
+        .filter(|claim| match claim {
+            ControlClaim::PositionQuantity { instrument, .. } => {
+                !duplicated.contains(instrument.inner().to_string().as_str())
+            }
+            ControlClaim::CashBalance { .. }
+            | ControlClaim::CashTurnover { .. }
+            | ControlClaim::FeesTotal { .. }
+            | ControlClaim::IncomeTotal { .. }
+            | ControlClaim::TaxWithheldTotal { .. } => true,
         })
-        .map_err(parse_error)
+        .collect();
+
+    Ok(PortfolioSnapshot {
+        as_of: PortfolioAsOf::Current,
+        claims,
+        refused,
+    })
+}
+
+/// Two or more portfolio rows the channel reported for one instrument,
+/// refused as a pair rather than summed.
+///
+/// Summing is only valid if the rows are disjoint additive components, and
+/// nothing here can establish that — a total and one of its own subsets
+/// looks identical to two peers once `blocked`, `blockedLots` and
+/// `quantityLots` are gone, which is exactly what plain
+/// `ControlClaim::PositionQuantity` values are (`iaam-xep0`, T4). The
+/// refusal names both rows by their own `positionUid` rather than reporting
+/// two opaque duplicates.
+fn duplicate_position_refusal(
+    instrument_uid: &str,
+    rows: &[&ChannelPortfolioPosition],
+) -> Quarantined {
+    let position_uids = rows
+        .iter()
+        .map(|row| row.position_uid.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let raw = serde_json::json!({
+        "instrumentUid": instrument_uid,
+        "positions": rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "positionUid": row.position_uid,
+                    "quantity": row.quantity.0.inner().to_string(),
+                    "quantityLots": row.quantity_lots.map(|value| value.0.inner().to_string()),
+                    "blocked": row.blocked,
+                    "blockedLots": row.blocked_lots.map(|value| value.0.inner().to_string()),
+                    "classCode": row.class_code,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    Quarantined {
+        raw,
+        reason: format!(
+            "instrument {instrument_uid} carries {} portfolio rows (positionUid {position_uids}); \
+             refused as a pair rather than summed — nothing establishes they are disjoint",
+            rows.len()
+        ),
+        dimensions: [Dimension::Positions].into_iter().collect(),
+    }
 }
 
 async fn fetch_operation_pages<F, Fut>(
@@ -465,6 +556,8 @@ fn operation_to_submitted(
         source_time: operation.source_time,
         idempotency_key: Some(operation.deduplication_key),
         source_operation_id: Some(operation.operation_id),
+        // Not a trade: no position handle applies here.
+        source_position_id: None,
         source_category: None,
         owner_category: None,
         source_code: None,
@@ -621,7 +714,6 @@ fn trade_operations(
     if operation.trades.is_empty() {
         return Ok(Vec::new());
     }
-    let custody = required_custody(&operation)?;
     let buy = matches!(kind, ChannelOperationKind::Buy);
     let instrument = required_instrument(&operation)?;
     let mut trades = operation.trades;
@@ -667,10 +759,14 @@ fn trade_operations(
                 .raw();
             let basis_fee = calc_money_from_minor(commission, currency);
             let accrued_interest_minor = accrued_known.then_some(accrued);
+            // No custody here: the channel names no place of storage for a
+            // trade, only an opaque `positionUid` handle, carried below as
+            // `source_position_id` — where it is what it is (`iaam-xep0`,
+            // T4).
             let operation_kind = if buy {
                 OperationKind::Buy {
                     instrument,
-                    custody,
+                    custody: None,
                     quantity: trade.quantity.0,
                     gross_minor,
                     fee_minor: None,
@@ -681,7 +777,7 @@ fn trade_operations(
             } else {
                 OperationKind::Sell {
                     instrument,
-                    custody,
+                    custody: None,
                     quantity: trade.quantity.0,
                     gross_minor,
                     fee_minor: None,
@@ -709,6 +805,10 @@ fn trade_operations(
                     escape_component(&operation.operation_id),
                     escape_component(&trade.num)
                 )),
+                // Verbatim: `trade_row_reason` has already refused every
+                // trade whose order carries no `positionUid`, so this is
+                // always present here.
+                source_position_id: operation.position_uid.clone(),
                 source_category: None,
                 owner_category: None,
                 source_code: None,
@@ -809,16 +909,6 @@ fn required_instrument(operation: &ChannelOperation) -> Result<InstrumentId, Row
     parse_instrument(value)
 }
 
-fn required_custody(operation: &ChannelOperation) -> Result<CustodyId, RowRefusal> {
-    let value = operation
-        .position_uid
-        .as_deref()
-        .ok_or_else(|| row_unparsable("trading operation does not contain positionUid"))?;
-    Uuid::parse_str(value)
-        .map(CustodyId)
-        .map_err(|_| row_unparsable(format!("positionUid is not a UUID: {value}")))
-}
-
 fn optional_instrument(operation: &ChannelOperation) -> Result<Option<InstrumentId>, RowRefusal> {
     operation
         .instrument_uid
@@ -888,7 +978,7 @@ mod tests {
     use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
     use iaam_core::event::kind::{EventKind, IncomeKind};
     use iaam_core::event::provenance::ParserVersion;
-    use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
+    use iaam_core::ids::{AccountId, EventId, InstrumentId, OwnerId, SourceId};
     use iaam_core::projection::{ProjectionContext, project};
     use iaam_core::reconciliation::{Dimension, claim::ControlClaim};
     use iaam_core::rules::{LotRuleVersion, RuleRegistry};
@@ -1175,23 +1265,22 @@ mod tests {
         );
     }
     #[test]
-    fn a_trade_uses_the_recorded_position_uid_as_custody() {
+    fn a_trade_carries_the_recorded_position_uid_as_provenance_and_no_custody() {
         let operations = parse_operations(include_str!(
             "../../../../tests/fixtures/api/tinkoff-operations.json"
         ))
         .expect("parsing");
         let parsed =
             adapt_operations(trading_account(), operations, &dictionary()).expect("adaptation");
-        let expected = CustodyId(
-            Uuid::parse_str("f1a60ae6-3f1e-43c8-8d46-042df0fdc97a").expect("position UID"),
-        );
+        let expected = "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a";
 
-        assert!(parsed.accepted.iter().any(|operation| {
-            matches!(
-                operation.kind,
-                OperationKind::Buy { custody, .. } if custody == expected
-            )
-        }));
+        let buy = parsed
+            .accepted
+            .iter()
+            .find(|operation| matches!(operation.kind, OperationKind::Buy { .. }))
+            .expect("a recorded buy");
+        assert_eq!(buy.source_position_id.as_deref(), Some(expected));
+        assert!(matches!(buy.kind, OperationKind::Buy { custody: None, .. }));
     }
 
     #[test]
@@ -1955,45 +2044,6 @@ mod tests {
         }
     }
     #[test]
-    fn a_trade_and_portfolio_claim_for_sber_share_the_same_custody() {
-        let operations = parse_operations(include_str!(
-            "../../../../tests/fixtures/api/tinkoff-operations.json"
-        ))
-        .expect("operations parsing");
-        let parsed =
-            adapt_operations(trading_account(), operations, &dictionary()).expect("adaptation");
-        let instrument = InstrumentId(
-            Uuid::parse_str("1c004240-d18d-46e1-8ac1-2aa05ebfdb38").expect("instrument UID"),
-        );
-        let trade_custody = parsed
-            .accepted
-            .iter()
-            .find_map(|operation| match &operation.kind {
-                OperationKind::Buy {
-                    instrument: found,
-                    custody,
-                    ..
-                } if *found == instrument => Some(*custody),
-                _ => None,
-            });
-        let claim_custody = parse_portfolio(include_str!(
-            "../../../../tests/fixtures/api/tinkoff-portfolio.json"
-        ))
-        .expect("portfolio parsing")
-        .into_iter()
-        .find_map(|claim| match claim {
-            ControlClaim::PositionQuantity {
-                instrument: found,
-                custody,
-                ..
-            } if found == instrument => Some(custody),
-            _ => None,
-        });
-
-        assert_eq!(trade_custody, claim_custody);
-    }
-
-    #[test]
     fn t_invest_portfolio_answers_with_current_date_semantics() {
         let snapshot = adapt_portfolio(include_str!(
             "../../../../tests/fixtures/api/tinkoff-portfolio.json"
@@ -2001,6 +2051,85 @@ mod tests {
         .expect("portfolio adaptation");
 
         assert_eq!(snapshot.as_of, PortfolioAsOf::Current);
+        assert!(snapshot.refused.is_empty());
+    }
+
+    /// Two rows naming one instrument are refused as a pair — naming both by
+    /// their own `positionUid` — while the instrument only one row names
+    /// still becomes a claim.
+    #[test]
+    fn two_portfolio_rows_for_one_instrument_are_refused_as_a_pair() {
+        let body = r#"{
+            "positions": [
+                {
+                    "instrumentType": "share",
+                    "quantity": {"units": "10", "nano": 0},
+                    "positionUid": "aaaaaaaa-0000-0000-0000-000000000001",
+                    "instrumentUid": "cccccccc-0000-0000-0000-000000000099",
+                    "blocked": false
+                },
+                {
+                    "instrumentType": "share",
+                    "quantity": {"units": "5", "nano": 0},
+                    "positionUid": "aaaaaaaa-0000-0000-0000-000000000002",
+                    "instrumentUid": "cccccccc-0000-0000-0000-000000000099",
+                    "blocked": true,
+                    "blockedLots": {"units": "5", "nano": 0}
+                },
+                {
+                    "instrumentType": "share",
+                    "quantity": {"units": "3", "nano": 0},
+                    "positionUid": "bbbbbbbb-0000-0000-0000-000000000001",
+                    "instrumentUid": "dddddddd-0000-0000-0000-000000000042",
+                    "blocked": false
+                }
+            ]
+        }"#;
+
+        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+
+        let disputed = InstrumentId(
+            Uuid::parse_str("cccccccc-0000-0000-0000-000000000099").expect("instrument UID"),
+        );
+        let undisputed = InstrumentId(
+            Uuid::parse_str("dddddddd-0000-0000-0000-000000000042").expect("instrument UID"),
+        );
+        assert!(
+            !snapshot.claims.iter().any(|claim| matches!(
+                claim,
+                ControlClaim::PositionQuantity { instrument, .. } if *instrument == disputed
+            )),
+            "the disputed instrument must not become a claim"
+        );
+        assert!(
+            snapshot.claims.iter().any(|claim| matches!(
+                claim,
+                ControlClaim::PositionQuantity { instrument, .. } if *instrument == undisputed
+            )),
+            "the rest of the snapshot must still import"
+        );
+
+        assert_eq!(snapshot.refused.len(), 1);
+        let refusal = &snapshot.refused[0];
+        assert!(
+            refusal
+                .reason
+                .contains("aaaaaaaa-0000-0000-0000-000000000001")
+        );
+        assert!(
+            refusal
+                .reason
+                .contains("aaaaaaaa-0000-0000-0000-000000000002")
+        );
+        assert!(
+            refusal
+                .reason
+                .contains("cccccccc-0000-0000-0000-000000000099")
+        );
+        assert_eq!(
+            refusal.dimensions,
+            [Dimension::Positions].into_iter().collect()
+        );
     }
 
     /// An opening position assertion of nothing held, for the instrument and
@@ -2014,12 +2143,7 @@ mod tests {
         claim: &ControlClaim,
         period: iaam_core::reconciliation::claim::AssertionPeriod,
     ) -> iaam_core::event::Event {
-        let ControlClaim::PositionQuantity {
-            instrument,
-            custody,
-            ..
-        } = *claim
-        else {
+        let ControlClaim::PositionQuantity { instrument, .. } = *claim else {
             panic!("a position claim");
         };
         let mut anchor = event.clone();
@@ -2027,7 +2151,6 @@ mod tests {
             period,
             claim: ControlClaim::PositionQuantity {
                 instrument,
-                custody,
                 quantity: iaam_core::money::Quantity::zero(),
                 at: iaam_core::reconciliation::claim::BalancePoint::Opening,
             },
@@ -2088,30 +2211,6 @@ mod tests {
             iaam_core::reconciliation::check::check_claim(&claim, &observed),
             iaam_core::reconciliation::check::ClaimOutcome::Matched
         );
-
-        let mut old_operation = operation;
-        if let OperationKind::Buy { custody, .. } = &mut old_operation.kind {
-            *custody = CustodyId(trading_account().inner());
-        } else {
-            panic!("expected buy");
-        }
-        let old_event = normalize(
-            &old_operation,
-            &NormalizationContext {
-                owner: OwnerId::new_random(),
-                source: SourceId::new_random(),
-                parser_version: ParserVersion(PARSER_VERSION.to_owned()),
-            },
-        )
-        .expect("old trade normalization")
-        .event;
-        let old_observed =
-            iaam_core::reconciliation::observed::observe(&[&old_event], trading_account(), period)
-                .expect("old observation");
-        assert!(matches!(
-            iaam_core::reconciliation::check::check_claim(&claim, &old_observed),
-            iaam_core::reconciliation::check::ClaimOutcome::Discrepant(_)
-        ));
     }
 
     #[test]

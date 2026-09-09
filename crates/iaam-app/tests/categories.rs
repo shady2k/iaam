@@ -115,6 +115,7 @@ impl Ctx {
             source_time: None,
             idempotency_key: None,
             source_operation_id: None,
+            source_position_id: None,
             source_category: source_category.map(str::to_owned),
             owner_category: None,
             source_code: None,

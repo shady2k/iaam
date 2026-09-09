@@ -2762,21 +2762,16 @@ fn diagnostics(
 
 /// A refused row stays refused, and this record stays as the account of it.
 ///
-/// `Blocked` still, and the sentence now says why the two routes a reader
-/// reaches for first are not the remedy — which is the half a reader previously
-/// had to supply from nothing.
+/// `Blocked` still, and the sentence now says why the route a reader reaches
+/// for first is not the remedy — which is the half a reader previously had
+/// to supply from nothing.
 ///
-/// - `POST /v1/accounts/{account}/repairs/custody` retracts `EventKind::Trade`
-///   events whose quantity leg carries a custody identifier equal to the
-///   account's own; `sync::is_affected_trade` is the whole of its predicate. It
-///   never reads or writes an `ImportCoverageGap`, and retracting a trade cannot
-///   record a row that was never parsed.
-/// - `POST /v1/corrections/imports` selects the effective journal by provenance
-///   alone — `ImportTarget::covers` matches on the import identity or the source,
-///   with no filter on the kind — so it retracts this very coverage-gap event
-///   along with every row of that import which *did* arrive. The item would stop
-///   being published because the record of the refusal was withdrawn, which is
-///   the one outcome worse than the gap.
+/// `POST /v1/corrections/imports` selects the effective journal by
+/// provenance alone — `ImportTarget::covers` matches on the import identity
+/// or the source, with no filter on the kind — so it retracts this very
+/// coverage-gap event along with every row of that import which *did*
+/// arrive. The item would stop being published because the record of the
+/// refusal was withdrawn, which is the one outcome worse than the gap.
 ///
 /// What changes this item is not an operation addressed to it. Importing the
 /// interval again through a channel that reads these rows leaves the record
@@ -2809,12 +2804,11 @@ fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCateg
         Some(ActionSubject::Account(AccountSubject::of(account))),
         format!(
             "Account {} ({}) has a coverage gap from {} through {} in dimensions {}; {} ({} rows \
-             refused). No operation in this API records a refused row, and neither obvious \
-             route is one: retracting the import withdraws the rows that did arrive and this \
-             record of the refusal with them, and the custody repair acts only on trades whose \
-             custody was fabricated from the account identifier. Import the interval again \
-             through a channel that reads these rows; this record stays, because it is a \
-             statement about one attempt and not about the interval.",
+             refused). No operation in this API records a refused row, and the obvious route is \
+             not one: retracting the import withdraws the rows that did arrive and this record \
+             of the refusal with them. Import the interval again through a channel that reads \
+             these rows; this record stays, because it is a statement about one attempt and not \
+             about the interval.",
             gap.account.inner(),
             account.title,
             gap.period.from,
@@ -9767,15 +9761,10 @@ mod tests {
         assert_eq!(action.required_scope(), None);
         assert_eq!(action.target(), &ActionTarget::None);
         assert!(action.reason().contains("given:row-17"));
-        // The half a reader had to supply from nothing: why the two routes that
-        // look like a repair are not one.
+        // The half a reader had to supply from nothing: why the route that
+        // looks like a repair is not one.
         assert!(
             action.reason().contains("retracting the import"),
-            "{}",
-            action.reason()
-        );
-        assert!(
-            action.reason().contains("custody repair"),
             "{}",
             action.reason()
         );

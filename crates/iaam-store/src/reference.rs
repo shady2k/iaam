@@ -1,6 +1,7 @@
 //! Reference data: accounts, instruments, and environment versions.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{
     AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind, Lineage, LineageReason,
@@ -291,6 +292,7 @@ pub struct CustodyRecord {
     pub owner: OwnerId,
     pub title: String,
     pub institution: Option<String>,
+    pub origin: CustodyOrigin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -771,10 +773,18 @@ impl SqliteStore {
     /// required for the same reason as accounts: without it, a request
     /// with someone else's identifier would overwrite another
     /// owner's storage location (§14).
+    ///
+    /// The title is trimmed here, not by a caller, so every writer gets it:
+    /// `"Broker One"` and `" Broker One "` are one key under
+    /// `custody_places_declared_title`, not two.
+    ///
+    /// `origin` is **not** updated on conflict. A handle a channel minted does not
+    /// become a place of the owner's because a later call said so, and a place of
+    /// his does not stop being one because a channel met its identifier.
     pub fn upsert_custody_place(&self, place: &CustodyRecord) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO custody_places (id, owner, title, institution, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO custody_places (id, owner, title, institution, origin, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT (id) DO UPDATE SET
                  title = excluded.title,
                  institution = excluded.institution
@@ -782,8 +792,9 @@ impl SqliteStore {
             params![
                 place.id.inner().to_string(),
                 place.owner.inner().to_string(),
-                place.title,
+                place.title.trim(),
                 place.institution,
+                place.origin.code(),
                 now(),
             ],
         )?;
@@ -792,7 +803,7 @@ impl SqliteStore {
 
     pub fn list_custody_places(&self, owner: OwnerId) -> Result<Vec<CustodyRecord>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT id, title, institution FROM custody_places
+            "SELECT id, title, institution, origin FROM custody_places
              WHERE owner = ?1 ORDER BY title, id",
         )?;
         let rows = statement.query_map([owner.inner().to_string()], |row| {
@@ -800,16 +811,21 @@ impl SqliteStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut places = Vec::new();
         for row in rows {
-            let (id, title, institution) = row?;
+            let (id, title, institution, origin) = row?;
             places.push(CustodyRecord {
                 id: CustodyId(parse_uuid(&id, "custody")?),
                 owner,
                 title,
                 institution,
+                origin: CustodyOrigin::from_code(&origin).ok_or_else(|| StoreError::NotFound {
+                    what: "custody origin",
+                    id: origin,
+                })?,
             });
         }
         Ok(places)

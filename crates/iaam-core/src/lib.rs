@@ -8,6 +8,7 @@ pub mod batch;
 pub mod bond;
 pub mod category;
 pub mod contour;
+pub mod custody;
 pub mod dates;
 pub mod event;
 pub mod goal;

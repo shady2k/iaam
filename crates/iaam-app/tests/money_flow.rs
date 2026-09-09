@@ -9,6 +9,7 @@ use iaam_app::scenarios::reports::{
     OpeningIncorporation, account_balances, money_flow,
 };
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::event::provenance::{ParserVersion, RawHash};
 use iaam_core::ids::{AccountId, InstrumentId, OwnerId, SourceId};
 use iaam_core::money::CurrencyCode;
@@ -338,6 +339,7 @@ async fn an_account_with_no_movements_still_appears_without_combining_balances()
                 owner,
                 title: "Shop One Custody".to_owned(),
                 institution: None,
+                origin: CustodyOrigin::Declared,
             })
             .unwrap_or_else(|error| panic!("insert custody place: {error}"));
     });

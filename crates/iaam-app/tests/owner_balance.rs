@@ -14,6 +14,7 @@ use iaam_app::ports::{AccountView, Clock, Principal, Recorded, Scope};
 use iaam_app::scenarios::reconciliation::{
     OWNER_STATED_CHANNEL, OwnerBalance, record_owner_balance,
 };
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::event::provenance::RawHash;
 use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -122,6 +123,7 @@ fn seed_custody(store: &mut SqliteStore, owner: OwnerId, custody: CustodyId, tit
             owner,
             title: title.to_owned(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .unwrap_or_else(|error| panic!("insert custody place: {error}"));
 }

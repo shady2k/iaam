@@ -32,6 +32,7 @@ use iaam_app::storage::{
 };
 use iaam_broker::credentials::Key;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::{DateCertainty, EventKind};
 use iaam_core::event::provenance::ParserVersion;
@@ -248,6 +249,7 @@ fn seed_custody(path: &std::path::Path, harness: &Harness) {
             owner: harness.owner,
             title: "Custody One".into(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .expect("custody place");
 }
@@ -8068,6 +8070,7 @@ async fn custody_repair_requires_acknowledgement_and_is_idempotent() {
             owner: harness.owner,
             title: "Account-Derived Custody".into(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .expect("account-derived custody place");
     let (status, seeded) = call(
@@ -32094,6 +32097,7 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
             owner: harness.owner,
             title: "Test Custody".to_owned(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .expect("custody place");
     second_connection

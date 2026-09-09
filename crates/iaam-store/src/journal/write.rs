@@ -486,6 +486,7 @@ fn insert_offer_exercise(tx: &Transaction<'_>, row: &OfferExerciseRow) -> Result
 mod tests {
     use std::panic::{self, AssertUnwindSafe};
 
+    use iaam_core::custody::CustodyOrigin;
     use iaam_core::dates::{EffectiveOrder, EventDates};
     use iaam_core::event::kind::{EventKind, TradeSide};
     use iaam_core::event::leg::Leg;
@@ -592,6 +593,7 @@ mod tests {
                     owner,
                     title: "Shop One Custody".to_owned(),
                     institution: None,
+                    origin: CustodyOrigin::Declared,
                 })
                 .expect("custody place created");
 
@@ -795,6 +797,7 @@ mod tests {
                 owner: foreign_owner,
                 title: "Shop One Custody".to_owned(),
                 institution: None,
+                origin: CustodyOrigin::Declared,
             })
             .expect("foreign custody place created");
 

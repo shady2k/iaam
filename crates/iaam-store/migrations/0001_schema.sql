@@ -155,12 +155,26 @@ CREATE TABLE custody_places (
     owner       TEXT NOT NULL,
     title       TEXT NOT NULL,
     institution TEXT,
+    -- Where the identifier came from: 'declared' is a place of the owner's and
+    -- may be reached by its title; 'minted' is a bare handle a broker channel
+    -- produced and is never offered as a place. The CHECK is here rather than
+    -- only in Rust because the column decides what a document reader is shown,
+    -- and a third value written by any path would silently widen that.
+    origin      TEXT NOT NULL CHECK (origin IN ('declared', 'minted')),
     created_at  TEXT NOT NULL
 ) STRICT;
 
 -- Владелец в уникальном ключе — как у accounts: иначе чужое место
 -- хранения подставится в ногу сделки (§14).
 CREATE UNIQUE INDEX custody_places_by_owner ON custody_places (owner, id);
+
+-- A declared place is found by the owner's title for it, and a title names at
+-- most one. Without this the schema would admit duplicates while the document
+-- reader's own lookup refuses an ambiguous title (`lookup_custody`) - a state
+-- no reader can interpret. Minted rows are outside the constraint: they carry
+-- generated titles, repeat them freely, and nothing resolves them by title.
+CREATE UNIQUE INDEX custody_places_declared_title
+    ON custody_places (owner, title) WHERE origin = 'declared';
 
 -- =============================================================================
 -- Contours and snapshots (0001_initial.sql)

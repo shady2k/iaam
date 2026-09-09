@@ -1,6 +1,7 @@
 //! Archived bundle: export, import, corruption.
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::corporate_action::{BasisTransferRule, CorporateAction, FractionalTreatment};
 use iaam_core::event::kind::{EventKind, IncomeKind};
@@ -372,6 +373,7 @@ impl BondReferenceData {
                 owner,
                 title: "Shop One Custody".to_owned(),
                 institution: None,
+                origin: CustodyOrigin::Declared,
             })
             .unwrap();
     }

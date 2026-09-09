@@ -12,6 +12,7 @@ use iaam_app::ports::{
 use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_app::scenarios::schedule::{SOURCE_ID, ScheduleSyncRequest, sync_schedule};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -134,6 +135,7 @@ fn fixture_services() -> (
             owner,
             title: "Main Custody".to_owned(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .expect("custody place created");
     let adapter = Arc::new(SqliteAdapter::new(store));

@@ -594,6 +594,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use iaam_core::custody::CustodyOrigin;
     use iaam_core::dates::{EffectiveOrder, EventDates};
     use iaam_core::event::kind::{EventKind, TradeSide};
     use iaam_core::event::leg::Leg;
@@ -685,6 +686,7 @@ mod tests {
                     owner,
                     title: "Shop One Custody".to_owned(),
                     institution: None,
+                    origin: CustodyOrigin::Declared,
                 })
                 .expect("custody place created");
 

@@ -206,6 +206,15 @@ pub fn parse_operations(body: &str) -> Result<OperationsPage, ParseError> {
 }
 
 /// Parse portfolio cash and positions into control claims.
+///
+/// A control claim can only say what `ControlClaim::PositionQuantity`
+/// (`iaam_core::reconciliation::claim`) has a field for, which today is a
+/// single quantity and nothing else — no encumbrance, no lot count. This
+/// function therefore stays a lossy projection on purpose: whatever the
+/// response said beyond that single number is not dropped, it is carried by
+/// [`ChannelPortfolioPosition`] and reachable through
+/// [`parse_portfolio_positions`], the boundary that keeps it available to a
+/// caller that can eventually express it.
 pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
     let response: RawPortfolioResponse = parse_json(body)?;
     let mut claims = Vec::new();
@@ -232,32 +241,118 @@ pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
             continue;
         }
 
-        let quantity = position
-            .quantity
-            .as_ref()
-            .ok_or(ParseError::MissingField { field: "quantity" })
-            .and_then(|value| parse_quantity(value, "quantity"))?;
-        let instrument_uid =
-            position
-                .instrument_uid
-                .as_deref()
-                .ok_or(ParseError::MissingField {
-                    field: "instrumentUid",
-                })?;
-        let position_uid = position
-            .position_uid
-            .as_deref()
-            .ok_or(ParseError::MissingField {
-                field: "positionUid",
-            })?;
+        let parsed = parse_portfolio_position_row(&position)?;
         claims.push(ControlClaim::PositionQuantity {
-            instrument: parse_identifier(instrument_uid, "instrumentUid")?,
-            custody: parse_identifier(position_uid, "positionUid")?,
-            quantity,
+            instrument: parse_identifier(&parsed.instrument_uid, "instrumentUid")?,
+            custody: parse_identifier(&parsed.position_uid, "positionUid")?,
+            quantity: parsed.quantity,
             at: BalancePoint::Closing,
         });
     }
     Ok(claims)
+}
+
+/// One non-currency portfolio position as the response stated it, before it
+/// is reduced to the single number a [`ControlClaim`] can carry.
+///
+/// The response reports an encumbrance (`blocked`, `blockedLots`) and a lot
+/// count (`quantityLots`) on a position, and `RawPortfolioPosition` used to
+/// declare no field for any of the three, so they vanished at
+/// deserialisation — silently, and before anything got a chance to decide
+/// they did not matter. This type is where they now land instead.
+///
+/// `ControlClaim::PositionQuantity` has no field to put an encumbrance in,
+/// and changing that claim is out of scope here: a concurrent change to it
+/// is in flight elsewhere in this codebase, and colliding with it would cost
+/// more than the field is worth. So this struct is deliberately not folded
+/// into a claim — it is the smallest honest shape that keeps the broker's
+/// statement intact until a caller exists that can do something with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelPortfolioPosition {
+    /// `instrumentUid` from the response.
+    pub instrument_uid: String,
+    /// `positionUid` from the response.
+    pub position_uid: String,
+    /// `instrumentType`, if the response named one.
+    pub instrument_type: Option<String>,
+    /// Quantity in instrument units — the same value `parse_portfolio` turns
+    /// into `ControlClaim::PositionQuantity::quantity`.
+    pub quantity: Quantity,
+    /// `quantityLots`: quantity expressed in lots rather than instrument
+    /// units. It is **not** the same unit as `quantity`, and converting one
+    /// to the other needs the instrument's lot size, which this response
+    /// does not carry — so the two are kept apart rather than combined into
+    /// a guess.
+    pub quantity_lots: Option<Quantity>,
+    /// `blocked`: whether the broker reports any part of this position as
+    /// blocked.
+    pub blocked: Option<bool>,
+    /// `blockedLots`: the blocked quantity, in lots — the broker's own unit
+    /// for this field, and subject to the same caveat as `quantity_lots`.
+    pub blocked_lots: Option<Quantity>,
+    /// `classCode`, carried without interpretation.
+    pub class_code: Option<String>,
+}
+
+/// Parse portfolio positions with everything the response stated about them,
+/// including the fields `parse_portfolio` cannot carry into a
+/// [`ControlClaim`] — see [`ChannelPortfolioPosition`].
+///
+/// Currency positions are omitted: `parse_portfolio` turns them into
+/// `CashBalance` claims rather than `PositionQuantity` ones, and an
+/// encumbrance on cash is a different concept this parser has not been asked
+/// to represent.
+pub fn parse_portfolio_positions(body: &str) -> Result<Vec<ChannelPortfolioPosition>, ParseError> {
+    let response: RawPortfolioResponse = parse_json(body)?;
+    response
+        .positions
+        .unwrap_or_default()
+        .iter()
+        .filter(|position| position.instrument_type.as_deref() != Some("currency"))
+        .map(parse_portfolio_position_row)
+        .collect()
+}
+
+fn parse_portfolio_position_row(
+    position: &RawPortfolioPosition,
+) -> Result<ChannelPortfolioPosition, ParseError> {
+    let quantity = position
+        .quantity
+        .as_ref()
+        .ok_or(ParseError::MissingField { field: "quantity" })
+        .and_then(|value| parse_quantity(value, "quantity"))?;
+    let instrument_uid = position
+        .instrument_uid
+        .clone()
+        .ok_or(ParseError::MissingField {
+            field: "instrumentUid",
+        })?;
+    let position_uid = position
+        .position_uid
+        .clone()
+        .ok_or(ParseError::MissingField {
+            field: "positionUid",
+        })?;
+    let quantity_lots = position
+        .quantity_lots
+        .as_ref()
+        .map(|value| parse_quantity(value, "quantityLots"))
+        .transpose()?;
+    let blocked_lots = position
+        .blocked_lots
+        .as_ref()
+        .map(|value| parse_quantity(value, "blockedLots"))
+        .transpose()?;
+    Ok(ChannelPortfolioPosition {
+        instrument_uid,
+        position_uid,
+        instrument_type: position.instrument_type.clone(),
+        quantity,
+        quantity_lots,
+        blocked: position.blocked,
+        blocked_lots,
+        class_code: position.class_code.clone(),
+    })
 }
 
 fn position_currency(position: &RawPortfolioPosition) -> Result<CurrencyCode, ParseError> {
@@ -745,6 +840,18 @@ struct RawTrade {
     price: Option<RawMoneyValue>,
 }
 
+/// Response of `GetPortfolio`.
+///
+/// `virtualPositions` is part of the wire schema and is deliberately not
+/// mapped here. In the T-Invest API it reports the broker's projected view
+/// of the portfolio once trades pending settlement clear — a forward
+/// position, not the settled one `positions` reports. Every claim this
+/// parser builds is a statement about the account as it stands, at a named
+/// `BalancePoint` (§10.3); "what the balance will become once T+n
+/// settlement lands" is a different assertion this system has no concept
+/// for today. Inventing one to consume this field would be a domain
+/// decision smuggled into a parser fix, so it is declined here rather than
+/// guessed at.
 #[derive(Debug, Deserialize)]
 struct RawPortfolioResponse {
     positions: Option<Vec<RawPortfolioPosition>>,
@@ -753,6 +860,8 @@ struct RawPortfolioResponse {
 #[derive(Debug, Deserialize)]
 struct RawPortfolioPosition {
     quantity: Option<RawQuotation>,
+    #[serde(rename = "quantityLots")]
+    quantity_lots: Option<RawQuotation>,
     #[serde(rename = "positionUid")]
     position_uid: Option<String>,
     #[serde(rename = "instrumentUid")]
@@ -763,6 +872,12 @@ struct RawPortfolioPosition {
     current_price: Option<RawMoneyValue>,
     #[serde(rename = "averagePositionPrice")]
     average_position_price: Option<RawMoneyValue>,
+    /// Whether the broker reports any part of the position blocked.
+    blocked: Option<bool>,
+    #[serde(rename = "blockedLots")]
+    blocked_lots: Option<RawQuotation>,
+    #[serde(rename = "classCode")]
+    class_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

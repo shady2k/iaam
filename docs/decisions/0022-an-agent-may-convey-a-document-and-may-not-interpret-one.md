@@ -1,6 +1,18 @@
 # 0022. An agent may convey a document, and may not interpret one
 
-Date: 2026-09-04 · Status: proposed · Beads: `iaam-cw3k`
+Date: 2026-09-04 · Status: proposed · amended · Beads: `iaam-cw3k`, `iaam-x3ls`
+
+`iaam-x3ls` found this decision's prohibition stated as a rule of its own where
+it is in fact an instance of a larger one: `docs/agent-skill/SKILL.md`'s
+overriding rule, that iaam is the point of truth and an agent asserts nothing
+it did not answer, for what leaves as much as for what arrives. Nothing below
+is reversed by that finding — conveying is still the ordinary route, an
+improvised reading is still refused, and the argument in §4 for why still
+holds. What changes is §3's claim to be a rule of its own, stated "without an
+exception," when a converter this project has itself reviewed —
+`tools/tbank-csv-import`, unmentioned by §3 and never a document the agent
+opened for itself — was already how one export got imported. §3 carries the
+amendment.
 
 ## Context
 
@@ -95,12 +107,29 @@ transfer rather than around an act.
 
 ### 3. Interpreting is refused, and this half is now the whole rule
 
-The old §4 had two halves, and the one that survives has to carry the weight
-alone. So it is stated without an exception:
+**Amendment — 2026-09-09 (`iaam-x3ls`).** "Stated without an exception" was
+wrong the day it was written: `tools/tbank-csv-import` already read a
+statement's rows to import it, and this section's own first bullet forbade
+exactly that act with no carve-out for it. The exception was not a new
+permission being granted here; it was a fact about the system this section
+failed to admit. What distinguishes the tool's reading from the one still
+refused is not that the tool holds no LLM judgement — it is that somebody
+reviewed the tool once, in the open, before this document arrived, the way the
+engine's profile is reviewed before any document reaches it. An agent reading
+the export itself, on the spot, is reviewed by nobody. That is the line the
+bullets below now draw, and it is the line §4 already argued for without quite
+stating it.
 
-- The agent does not parse a statement, and there is no "just to check". The
-  check that reading would buy is bought by fixtures invented end to end and by
-  an engine whose rejections name the cell.
+The old §4 had two halves, and the one that survives has to carry the weight
+alone. So it is stated without an exception for a reading the agent invents for
+itself:
+
+- The agent does not parse a statement itself, and there is no "just to check".
+  Reading it through a converter this project has reviewed — `tools/`, kept in
+  tree, never rewritten for the moment — is not the agent parsing it; the check
+  an improvised reading would buy is bought by fixtures invented end to end, by
+  an engine whose rejections name the cell, and by the dry run a reviewed
+  converter shows the owner before anything is submitted.
 - The agent does not summarise a document for the owner, even where it submits
   nothing. A summary is a reading, he acts on it, and nothing records that the
   agent produced it. The assessment already answers the same question from a

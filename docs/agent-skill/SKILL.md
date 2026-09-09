@@ -121,6 +121,13 @@ Everything below is what those three steps cannot tell you.
 
 ## The overriding rule
 
+**Interpret freely on the way in; assert nothing that iaam has not answered on
+the way out.** Reading a statement to get facts into the journal is work.
+Telling him a figure the journal did not produce is the error — whether it came
+from a statement, from arithmetic, or from memory. One rule, in two directions:
+what follows is the way out; the way in is stated below, where an import
+begins.
+
 **Arithmetic of your own is forbidden.** Every number in your answer must be
 present verbatim in the API's answer. Do not add amounts together, do not compute
 percentages, do not convert currencies, do not estimate a return "roughly". A
@@ -158,27 +165,34 @@ question and the answers it admits, and relay what he says.
 Never answer in his place, never read silence as a value, and never narrow what
 he is being asked because a shorter sentence reads better — where two answers
 land in different figures of his year, he hears both. Rendering a question is
-yours and answering it is his, which is the same boundary as an agent conveying a
-document it may not interpret, one level up.
+yours and answering it is his, which is the overriding rule again, one level up:
+a fact he has not told you and iaam has not answered is not yours to supply.
 
 An import begins with a document the owner has — a statement, an export, a file
-his institution gave him. There are two acts you can perform on it, and the
-difference between them is the whole rule.
+his institution gave him. This is the overriding rule's other direction: getting
+its facts into the journal is work, and the only thing refused is a reading of
+your own standing in for a reader that was actually checked.
 
 **You may convey it.** Handing the document to his own instance is the ordinary
 way an import starts; the contract names the operation. The instance reads it
 through a profile written for that institution and document type, and what you
 get back is a session holding rows.
 
-**You may not interpret it.** Do not parse it, do not summarise its rows, do not
-tabulate it, and do not decide what a row was — not its direction, not its kind,
-not whose account is on the other side, not its category. This is not a rule
-about secrecy: the amounts, the dates and the counterparties reach you anyway,
-through the assessment and through every question the session raises. It is a
-rule about a format having one reader. A reading of your own is a second
-implementation of that institution's rules, it does not fail loudly, and what it
-produces is an import that files the wrong operations with nothing saying so.
-Which reader read a row is recorded on the fact, for as long as the fact exists.
+**Beyond conveying, only a reviewed reader may interpret it — never you,
+improvising.** The engine is one such reader, and conveying is how you reach it.
+A converter of this project's own, reviewed once rather than improvised for the
+moment, is another; running one is the same permission, read from the other
+side. What stays refused, on any document, is a reading nobody checked: you
+parsing it yourself, summarising its rows, tabulating it, deciding what a row
+was — its direction, its kind, whose account is on the other side, its category
+— on your own say-so. This is not a rule about secrecy: the amounts, the dates
+and the counterparties reach you anyway, through the assessment and through
+every question the session raises. It is a rule about a format having one
+reader. A reading of your own is a second implementation of that institution's
+rules, it does not fail loudly, and what it produces is an import that files the
+wrong operations with nothing saying so — the same failure the overriding rule
+refuses on the way out, reached from the other direction. Which reader read a
+row is recorded on the fact, for as long as the fact exists.
 
 **If you cannot reach the document, say so.** An agent that does not run on the
 machine holding the file cannot convey it, and no reading of this lets you

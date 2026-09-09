@@ -126,12 +126,18 @@ world they always happened together.
   way an import starts, because it is the only one that needs no user interface,
   no mounted directory and no terminal, and the only one that is agent-first
   rather than a substitute for an agent nobody has.
-- **Interpreting is refused.** The agent does not parse a statement, does not
-  summarise its rows, does not tabulate it, and does not decide what a row was:
-  not its direction, not its kind, not whose account the far side is, not which
-  category it belongs to. The engine reads the document through a source profile
-  (decision 0019) and produces observations; the session settles what the
-  owner's directory and his standing rules settle, and asks him about the rest.
+- **An improvised reading is refused; a reviewed one is not.** The agent does
+  not parse a statement itself, does not summarise its rows, does not tabulate
+  it, and does not decide what a row was — not its direction, not its kind, not
+  whose account the far side is, not which category it belongs to — on a
+  reading nobody but the agent produced, on the spot, for this one document.
+  The engine reads the document through a source profile (decision 0019) and
+  produces observations; `tools/tbank-csv-import`, reviewed and kept in this
+  repository for the one export it covers, may read one the same way, because
+  what makes a reading admissible was never that the engine did it — it is that
+  somebody checked it before this document arrived. Either way the session
+  settles what the owner's directory and his standing rules settle, and asks
+  him about the rest.
 - **Still no store access, and no file of his judgements.** The agent is an
   external client: it knows what the journal holds because a route answered, and
   never because it opened his database. And handing it a file of the owner's
@@ -153,6 +159,16 @@ they say is. Restating a value the owner has already read out for himself is not
 interpreting either — that is the observation shape, and §5 and §6 are about it.
 Where he pastes the export's own text rather than values he read off it, that
 text is the export, and reading it is the engine's work.
+
+Underneath the possession question is a narrower one, and it is the one that
+actually does the work: **who read it, not who held it.** A reading the engine
+or a reviewed converter produced is admitted; a reading the agent produced for
+this one document, checked by nobody, is not. `docs/agent-skill/SKILL.md`
+states this as one rule and gives the answer for both directions: every number
+the agent hands the owner must come from iaam's own answer, and a row the agent
+put into iaam without a reviewed reader behind it is the same failure, met on
+the way in rather than the way out. This section is that rule's instance for a
+document, not a second rule beside it.
 
 **Nothing was ever protected by the agent's not touching the bytes.** The old
 rule's stated ground was disclosure and it did not hold: the same section granted

@@ -1,5 +1,6 @@
 //! Resolving an instrument by external code on a given date (E3.1).
 
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::ids::{CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind};
 use iaam_core::money::CurrencyCode;
@@ -246,6 +247,7 @@ fn a_custody_place_of_another_owner_is_not_overwritten() {
             owner: mine,
             title: "Custody A".to_owned(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .expect("my custody place");
 
@@ -255,6 +257,7 @@ fn a_custody_place_of_another_owner_is_not_overwritten() {
             owner: theirs,
             title: "Captured".to_owned(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .expect("foreign owner's request succeeds but changes nothing");
 
@@ -357,4 +360,78 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         store.list_instruments().expect("instrument list"),
         vec![earlier, later]
     );
+}
+
+#[test]
+fn a_custody_place_keeps_the_origin_it_was_written_with() {
+    let store = SqliteStore::open_in_memory().expect("memory store");
+    let owner = OwnerId::new_random();
+    let declared = CustodyId::new_random();
+    let minted = CustodyId::new_random();
+
+    store
+        .upsert_custody_place(&CustodyRecord {
+            id: declared,
+            owner,
+            title: "Broker One".to_owned(),
+            institution: Some("Broker One".to_owned()),
+            origin: CustodyOrigin::Declared,
+        })
+        .expect("declared place");
+    store
+        .upsert_custody_place(&CustodyRecord {
+            id: minted,
+            owner,
+            title: "broker-channel handle".to_owned(),
+            institution: None,
+            origin: CustodyOrigin::Minted,
+        })
+        .expect("minted place");
+
+    let places = store.list_custody_places(owner).expect("list");
+    let origins: Vec<(CustodyId, CustodyOrigin)> = places
+        .iter()
+        .map(|place| (place.id, place.origin))
+        .collect();
+    assert!(origins.contains(&(declared, CustodyOrigin::Declared)));
+    assert!(origins.contains(&(minted, CustodyOrigin::Minted)));
+}
+
+#[test]
+fn two_declared_places_of_one_owner_cannot_share_a_title() {
+    let store = SqliteStore::open_in_memory().expect("memory store");
+    let owner = OwnerId::new_random();
+
+    let declared = |id| CustodyRecord {
+        id,
+        owner,
+        title: "Broker One".to_owned(),
+        institution: Some("Broker One".to_owned()),
+        origin: CustodyOrigin::Declared,
+    };
+    store
+        .upsert_custody_place(&declared(CustodyId::new_random()))
+        .expect("first declared place");
+    assert!(
+        store
+            .upsert_custody_place(&declared(CustodyId::new_random()))
+            .is_err(),
+        "a second declared place under one title is a state no lookup can interpret"
+    );
+
+    // A minted handle carries a generated title and many of them may repeat it:
+    // nothing resolves them by title, so nothing is made ambiguous.
+    let minted = |id| CustodyRecord {
+        id,
+        owner,
+        title: "broker-channel handle".to_owned(),
+        institution: None,
+        origin: CustodyOrigin::Minted,
+    };
+    store
+        .upsert_custody_place(&minted(CustodyId::new_random()))
+        .expect("first handle");
+    store
+        .upsert_custody_place(&minted(CustodyId::new_random()))
+        .expect("second handle");
 }

@@ -6,6 +6,7 @@ use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::error::AppError;
 use iaam_app::ports::{BrokerAccessView, BrokerEnvironment, BrokerVault, Clock, Principal, Scope};
 use iaam_app::scenarios::custody_repair::{CustodyRepairCase, repair_custody};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
@@ -110,13 +111,14 @@ fn register_account(store: &SqliteStore, owner: OwnerId, account: AccountId) {
         .unwrap_or_else(|error| panic!("insert account: {error}"));
 }
 
-fn register_custody(store: &SqliteStore, owner: OwnerId, custody: CustodyId) {
+fn register_custody(store: &SqliteStore, owner: OwnerId, custody: CustodyId, title: &str) {
     store
         .upsert_custody_place(&CustodyRecord {
             id: custody,
             owner,
-            title: "Main".into(),
+            title: title.to_owned(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .unwrap_or_else(|error| panic!("insert custody place: {error}"));
 }
@@ -285,8 +287,8 @@ async fn repair_then_reimport_reconciles_without_doubling_the_position() {
     let store =
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
     register_account(&store, owner, account);
-    register_custody(&store, owner, CustodyId(account.inner()));
-    register_custody(&store, owner, real_custody);
+    register_custody(&store, owner, CustodyId(account.inner()), "Main");
+    register_custody(&store, owner, real_custody, "Broker One");
     register_instrument(&store, instrument);
     let services = services_with_store(store, vec![live_access()]);
     let original = affected_trade(owner, account, instrument);
@@ -361,7 +363,7 @@ async fn repair_writes_reversals_with_fresh_provenance_and_is_idempotent() {
     let store =
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
     register_account(&store, owner, account);
-    register_custody(&store, owner, CustodyId(account.inner()));
+    register_custody(&store, owner, CustodyId(account.inner()), "Main");
     let first_instrument = InstrumentId::new_random();
     let second_instrument = InstrumentId::new_random();
     register_instrument(&store, first_instrument);
@@ -428,7 +430,7 @@ async fn unaffected_account_writes_nothing() {
     let store =
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
     register_account(&store, owner, account);
-    register_custody(&store, owner, real_custody);
+    register_custody(&store, owner, real_custody, "Main");
     let instrument = InstrumentId::new_random();
     register_instrument(&store, instrument);
     let services = services_with_store(store, Vec::new());
@@ -456,7 +458,7 @@ async fn no_live_access_requires_acknowledgement_before_writing() {
     let store =
         SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
     register_account(&store, owner, account);
-    register_custody(&store, owner, CustodyId(account.inner()));
+    register_custody(&store, owner, CustodyId(account.inner()), "Main");
     let instrument = InstrumentId::new_random();
     register_instrument(&store, instrument);
     let services = services_with_store(store, vec![revoked_access()]);

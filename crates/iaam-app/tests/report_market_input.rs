@@ -5,6 +5,7 @@ use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ports::{AccountView, Clock, InstrumentUpsert, Principal, Scope};
 use iaam_app::scenarios::reports::{HeldScope, ReturnsQuery, returns};
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
@@ -189,6 +190,7 @@ async fn report_values_position_from_market_observation() {
         owner,
         title: "Main Custody".to_owned(),
         institution: None,
+        origin: CustodyOrigin::Declared,
     }]);
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
     services
@@ -271,6 +273,7 @@ async fn contradictory_price_leaves_only_its_position_uncovered() {
         owner,
         title: "Main Custody".to_owned(),
         institution: None,
+        origin: CustodyOrigin::Declared,
     }]);
     let contour = ContourDefinition::new(ContourId::new_random(), ContourVersion(1), [account]);
     services

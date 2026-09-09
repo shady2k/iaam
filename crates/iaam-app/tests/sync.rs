@@ -11,6 +11,7 @@ use iaam_app::ports::{
 };
 use iaam_app::scenarios::ingest::append_checked;
 use iaam_app::sync::{AssertionsWithheld, sync_broker};
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::{ParserVersion, Provenance};
@@ -131,6 +132,7 @@ fn seed_custody(store: &SqliteStore, owner: OwnerId, custody: CustodyId, title: 
             owner,
             title: title.to_owned(),
             institution: None,
+            origin: CustodyOrigin::Declared,
         })
         .unwrap_or_else(|error| panic!("seed custody place: {error}"));
 }

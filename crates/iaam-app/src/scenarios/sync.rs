@@ -5,8 +5,9 @@
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{BrokerChannel, PortfolioAsOf, Principal, Recorded};
+use crate::ports::{BrokerChannel, CustodyUpsert, PortfolioAsOf, Principal, Recorded};
 use crate::scenarios::coverage_gap;
+use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
@@ -18,7 +19,7 @@ use iaam_core::ids::{AccountId, CustodyId, EventId, OwnerId, PrincipalId};
 use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
 use iaam_http::HttpRequest;
 use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
-use iaam_ingest::operation::NormalizationContext;
+use iaam_ingest::operation::{NormalizationContext, OperationKind, SubmittedOperation};
 use iaam_ingest::{Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
@@ -186,6 +187,20 @@ pub async fn sync_broker(
             continue;
         }
 
+        // The channel mints this identifier from its own data - `positionUid`
+        // for one broker, its own account identifier for another - and neither
+        // is a place the owner would recognise. It is registered anyway,
+        // because the journal's foreign key requires the row to exist, and it
+        // is marked `minted` so nothing offers it to him as one of his places.
+        //
+        // The value itself is not corrected here. It is part of the
+        // deduplication fingerprint, so changing it would stop a re-import
+        // recognising rows it already holds and double the positions instead
+        // (`iaam-xep0`).
+        for custody in minted_custody(&operation) {
+            register_minted(services, principal.owner, &channel, custody).await?;
+        }
+
         let result = crate::scenarios::ingest::append_checked(
             services,
             vec![event.clone()],
@@ -308,6 +323,16 @@ pub async fn sync_broker(
             duplicates += 1;
             recorded.push(Verdict::Duplicate { existing });
             continue;
+        }
+        // The portfolio loop is a second, independent append path: a claim
+        // reaches it with no operation behind it whenever the position it
+        // reports saw no trade in the requested interval, so the operations
+        // loop above never sees its handle. `referenced_custodies` is the
+        // same traversal the store's ownership check uses, so this and the
+        // check it satisfies cannot disagree about which custody a fact
+        // names.
+        for custody in event.referenced_custodies().collect::<Vec<_>>() {
+            register_minted(services, principal.owner, &channel, custody).await?;
         }
         let result = crate::scenarios::ingest::append_checked(
             services,
@@ -443,6 +468,57 @@ fn affected_trade_count(events: &[Event], account: AccountId) -> Result<usize, A
         .into_iter()
         .filter(|event| is_affected_trade(event, account))
         .count())
+}
+
+/// The custody handles one operation names.
+///
+/// Every arm is spelled out, with no `_ =>`: a new variant that starts
+/// carrying a handle must fail to compile here, not silently lose it.
+fn minted_custody(operation: &SubmittedOperation) -> Vec<CustodyId> {
+    match &operation.kind {
+        OperationKind::Buy { custody, .. }
+        | OperationKind::Sell { custody, .. }
+        | OperationKind::OpeningPosition { custody, .. } => vec![*custody],
+        OperationKind::Deposit { .. }
+        | OperationKind::Withdrawal { .. }
+        | OperationKind::Refund { .. }
+        | OperationKind::Transfer { .. }
+        | OperationKind::OwnAccountMovement { .. }
+        | OperationKind::Income { .. }
+        | OperationKind::Fee { .. }
+        | OperationKind::Tax { .. }
+        | OperationKind::OpeningCash { .. }
+        | OperationKind::Valuation { .. } => Vec::new(),
+    }
+}
+
+/// Registering one handle, so both append paths do it the same way.
+///
+/// Not in the same transaction as the append, and that is accepted: the
+/// ordering means the only partial state reachable is an unreferenced
+/// `minted` row, which no reader consumes - balances and reconciliation are
+/// both event-driven, the document directory filters it out, and the bundle
+/// carries only reachable ones. The dangerous ordering, an append committing
+/// while its custody row is absent, cannot occur.
+async fn register_minted(
+    services: &AppServices,
+    owner: OwnerId,
+    channel: &SourceChannel,
+    custody: CustodyId,
+) -> Result<(), AppError> {
+    services
+        .directory
+        .record_custody_place(
+            owner,
+            CustodyUpsert {
+                id: custody,
+                title: format!("{} handle", channel.source.inner()),
+                institution: None,
+                origin: CustodyOrigin::Minted,
+            },
+        )
+        .await
+        .map(|_| ())
 }
 
 /// T4's custody defect: an effective trade carries the account identifier as custody.

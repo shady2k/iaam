@@ -892,6 +892,7 @@ mod tests {
                 owner: foreign_owner,
                 title: "Shop One Custody".to_owned(),
                 institution: None,
+                origin: CustodyOrigin::Declared,
             })
             .expect("foreign custody place created");
 
@@ -927,6 +928,7 @@ mod tests {
                 owner: foreign_owner,
                 title: "Shop One Custody".to_owned(),
                 institution: None,
+                origin: CustodyOrigin::Declared,
             })
             .expect("foreign custody place created");
 
@@ -984,6 +986,7 @@ mod tests {
                 owner: foreign_owner,
                 title: "Shop One Custody".to_owned(),
                 institution: None,
+                origin: CustodyOrigin::Declared,
             })
             .expect("foreign custody place created");
 

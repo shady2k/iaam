@@ -374,10 +374,29 @@ def build(
         ordinals[ordinal_key] += 1
         row_ordinals[id(row)] = ordinals[ordinal_key]
 
+    # An unmatched internal-transfer leg is never submitted, so it never earns a
+    # canonical account above -- but it still needs the same ordinal a submitted
+    # row would get, because the identifier reported for it below (`key_for`)
+    # must be computable. Sharing `ordinals` rather than a second counter is
+    # deliberate: a row that collides on (account, day, digest) with something
+    # else is the same disambiguation this counter already exists for.
+    for row in singles:
+        if id(row) in row_ordinals:
+            continue
+        account_id = accounts.get(row["Имя счёта"])
+        if account_id is None or not is_internal_transfer(row):
+            continue
+        day = date_of(row).date().isoformat()
+        digest = hashlib.sha256(raw_lines[id(row)].encode("utf-8")).hexdigest()
+        ordinal_key = (account_id, day, digest)
+        ordinals[ordinal_key] += 1
+        row_ordinals[id(row)] = ordinals[ordinal_key]
+
     operations_with_positions = []
     summary = {
         "submitted": 0,
         "dropped_second_leg": 0,
+        "dropped_legs": [],
         "skipped_outside_contour": 0,
         "unmatched_legs": 0,
         "unmatched": [],
@@ -402,6 +421,23 @@ def build(
             operation["idempotency_key"] = key_for(out_row, out_id)
             operations_with_positions.append((positions[id(out_row)], operation))
             summary["dropped_second_leg"] += 1
+            # The counter alone does not say WHICH row vanished or where it
+            # went. `folded_into` is the surviving operation's idempotency_key,
+            # so this leg is locatable both in the source (line/date/amount/
+            # description) and, once the batch is submitted, in the journal
+            # through `event_id` -- filled in below from that operation's own
+            # verdict.
+            summary["dropped_legs"].append(
+                {
+                    "line": positions[id(in_row)] + 2,
+                    "account": in_row["Имя счёта"],
+                    "date": in_row["Дата операции"],
+                    "amount": amount_of(in_row),
+                    "description": in_row["Описание"],
+                    "folded_into": operation["idempotency_key"],
+                    "event_id": None,
+                }
+            )
         elif out_id or in_id:
             inside = out_row if out_id else in_row
             account_id = out_id or in_id
@@ -426,6 +462,12 @@ def build(
                     "date": row["Дата операции"],
                     "amount": amount_of(row),
                     "description": row["Описание"],
+                    # The identifier this row would carry if it were ever
+                    # submitted on its own -- never sent anywhere, since an
+                    # unmatched leg is dropped rather than submitted, but a
+                    # stable handle beyond "search by date and amount" once the
+                    # tolerance is widened and the export is run again.
+                    "idempotency_key": key_for(row, account_id),
                 }
             )
             print(
@@ -660,6 +702,8 @@ def main():
         return
 
     verdicts_by_kind = defaultdict(int)
+    duplicates = []
+    event_id_by_key = {}
     for account_id, batch in by_account.items():
         if args.replace_retracted:
             targets = targets_by_account[account_id]
@@ -704,6 +748,28 @@ def main():
         for verdict in verdicts:
             verdict_by_kind = verdict["verdict"]
             verdicts_by_kind[verdict_by_kind] += 1
+            # `batch` holds the ORIGINAL operations regardless of mode: in
+            # replace-retracted mode the request wraps a copy under a
+            # `correction/replacement/...` key, but `row` still indexes this
+            # same list, so this is the one idempotency_key that also appears
+            # in `dropped_legs` and everywhere else in this summary.
+            row_index = verdict.get("row")
+            idempotency_key = (
+                batch[row_index]["idempotency_key"]
+                if row_index is not None and row_index < len(batch)
+                else None
+            )
+            event_id = verdict.get("event_id")
+            if idempotency_key is not None and event_id is not None:
+                event_id_by_key[idempotency_key] = event_id
+            if verdict_by_kind == "duplicate":
+                # A count alone is not an answer to "what did I collide with":
+                # the API already names the existing event on every duplicate
+                # verdict (crates/iaam-server/src/dto.rs Verdict::Duplicate),
+                # so it is kept here rather than thrown away.
+                duplicates.append(
+                    {"idempotency_key": idempotency_key, "event_id": event_id}
+                )
             if verdict_by_kind == "rejected":
                 print(json.dumps(verdict, ensure_ascii=False), file=sys.stderr)
     # The whole tally, not a chosen pair of counters. "submitted" is what was
@@ -715,6 +781,45 @@ def main():
     summary["verdicts"] = dict(sorted(verdicts_by_kind.items()))
     summary["rejected"] = verdicts_by_kind["rejected"]
     summary["already_known"] = verdicts_by_kind["duplicate"]
+    summary["duplicates"] = duplicates
+
+    # Many rows collapsing onto ONE existing event is almost always an
+    # idempotency-key defect -- a carried or None component came out the same
+    # for rows that are not in fact the same operation -- rather than an
+    # ordinary re-import. That must not have to be inferred from a total, so
+    # it is grouped and called out here rather than left for the reader to
+    # notice only after querying the journal directly.
+    collisions_by_event = defaultdict(list)
+    for duplicate in duplicates:
+        if duplicate["event_id"] is not None:
+            collisions_by_event[duplicate["event_id"]].append(
+                duplicate["idempotency_key"]
+            )
+    summary["duplicate_collisions"] = [
+        {
+            "event_id": event_id,
+            "row_count": len(keys),
+            "idempotency_keys": keys,
+        }
+        for event_id, keys in sorted(collisions_by_event.items())
+        if len(keys) > 1
+    ]
+    for collision in summary["duplicate_collisions"]:
+        print(
+            f"duplicate collision: {collision['row_count']} rows all collided "
+            f"with event {collision['event_id']} -- almost certainly an "
+            "idempotency key defect, not a re-import",
+            file=sys.stderr,
+        )
+
+    # The dropped leg's own row was never submitted, but the operation it was
+    # folded into was -- so once that operation has a verdict, the leg's entry
+    # can carry the same event_id rather than staying a promise of one.
+    for leg in summary["dropped_legs"]:
+        folded_event_id = event_id_by_key.get(leg["folded_into"])
+        if folded_event_id is not None:
+            leg["event_id"] = folded_event_id
+
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

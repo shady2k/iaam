@@ -136,9 +136,31 @@ money in (`inflow`), money out (`outflow`), and net movement (`net`). The row
 count is intentionally the converted-row count; a paired transfer's discarded
 second leg remains visible in the top-level `dropped_second_leg` counter. The
 `operations` entries also carry the same display name, so a preview shows both
-the per-row destination and the per-account movement. Unpaired internal-transfer
-legs remain counted in `unmatched_legs` and are listed in `unmatched` with their
-statement line, account, timestamp, amount and description.
+the per-row destination and the per-account movement.
+
+### Locating a folded or unpaired transfer leg
+
+A counter says how many rows were affected; it does not say which rows, and a
+search by date and amount in the source file is not a reliable way to find out.
+Two lists exist so that never has to happen:
+
+- **`dropped_legs`**, one entry per row `dropped_second_leg` counts: the second
+  leg of a matched internal-transfer pair, which is folded into a single
+  `transfer` operation rather than submitted on its own. Each entry gives
+  `line`, `account`, `date`, `amount` and `description` from the dropped row
+  itself, `folded_into` — the `idempotency_key` of the operation it was folded
+  into — and `event_id`, which is `null` on a dry run and filled in with that
+  operation's own verdict once the batch is submitted. `folded_into` and
+  `event_id` locate the *surviving* operation in the journal; the other fields
+  locate the *dropped row* in the source file.
+- **`unmatched`**, one entry per row `unmatched_legs` counts: an
+  internal-transfer leg with no partner within the pairing tolerance, dropped
+  rather than guessed into an operation. Each entry gives `line`, `account`,
+  `date`, `amount`, `description` and `idempotency_key` — the identifier the
+  row would carry were it ever submitted on its own. An unmatched leg is never
+  submitted, so this key never appears in a verdict; it is here so the row is
+  still identifiable, beyond date and amount, once the pairing tolerance is
+  corrected and the export is run again.
 
 ## Checking the tool
 
@@ -199,6 +221,32 @@ because iaam compares idempotency keys globally per owner; omitting either can
 make identical rows from two institutions collide. The key is stable when the
 same export is imported again, including when an overlapping export adds an
 unrelated row.
+
+## Verdicts, duplicates and collisions
+
+`--submit` and `--replace-retracted` add a `verdicts` count for every verdict
+kind the API returned (`accepted`, `provisional`, `duplicate`,
+`possible_duplicate`, `discrepancy`, `needs_reconciliation`, `rejected`), plus
+two summaries carried forward from that same tally:
+
+- **`already_known`** is the plain count of `duplicate` verdicts — how many
+  submitted rows the journal already held.
+- **`duplicates`** is that same set of rows, named rather than counted: one
+  entry per duplicate verdict, each an `{idempotency_key, event_id}` pair. The
+  API already returns the event a duplicate collided with on every such
+  verdict; this is that value kept rather than thrown away.
+- **`duplicate_collisions`** calls out the case a count hides: many different
+  rows answered `duplicate` against the *same* `event_id`. One export
+  genuinely re-imported is one row per collision; many rows collapsing onto
+  one event is almost always an idempotency-key defect — a carried or `None`
+  component that came out the same for rows that are not in fact the same
+  operation — and this list, plus a matching line on stderr, exists so that
+  does not have to be inferred from `already_known` after the fact. Each entry
+  gives the `event_id`, the `row_count` that collided with it, and the
+  `idempotency_keys` involved.
+
+All three are absent from a `--dry-run` summary: no verdict exists until
+something is submitted.
 
 ## What this tool must never contain
 

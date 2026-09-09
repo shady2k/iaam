@@ -2,6 +2,17 @@
   "rows_in_file": 13,
   "submitted": 10,
   "dropped_second_leg": 1,
+  "dropped_legs": [
+    {
+      "line": 6,
+      "account": "Savings",
+      "date": "06.08.2026 09:00:01",
+      "amount": "5000.00",
+      "description": "Между своими счетами",
+      "folded_into": "Main/file/9f3f5a56e6b907de8cc9d64e6b7827a9405fc9d2ba4d84085122197a8da8f2a7/1",
+      "event_id": null
+    }
+  ],
   "skipped_outside_contour": 2,
   "unmatched_legs": 0,
   "unmatched": [],

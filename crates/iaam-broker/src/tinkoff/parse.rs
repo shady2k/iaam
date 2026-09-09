@@ -241,10 +241,13 @@ pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
             continue;
         }
 
+        // The shared row helper keeps everything the response stated about the
+        // position; the claim can still carry only the quantity. Custody is gone
+        // from the claim because a position is an account and an instrument
+        // (iaam-xep0), and this channel's handle was never a place anyway.
         let parsed = parse_portfolio_position_row(&position)?;
         claims.push(ControlClaim::PositionQuantity {
             instrument: parse_identifier(&parsed.instrument_uid, "instrumentUid")?,
-            custody: parse_identifier(&parsed.position_uid, "positionUid")?,
             quantity: parsed.quantity,
             at: BalancePoint::Closing,
         });
@@ -862,7 +865,12 @@ struct RawPortfolioPosition {
     quantity: Option<RawQuotation>,
     #[serde(rename = "quantityLots")]
     quantity_lots: Option<RawQuotation>,
+    // No longer read as a custody place (iaam-xep0): a position no longer keys
+    // on custody, and this channel's own handle is not a place of custody at
+    // all. Kept on the wire struct because a later change carries it as
+    // `source_position_id` provenance, which is what it actually is.
     #[serde(rename = "positionUid")]
+    #[allow(dead_code)]
     position_uid: Option<String>,
     #[serde(rename = "instrumentUid")]
     instrument_uid: Option<String>,

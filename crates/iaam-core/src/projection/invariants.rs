@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::balances::PositionKey;
 use super::lots::LotKey;
 use super::state::LedgerState;
 use crate::event::{Event, EventValidationError};
@@ -132,7 +133,13 @@ pub fn check(
             .map(|entry| entry.quantity())
             .transpose()?
             .unwrap_or_else(Quantity::zero);
-        let position = state.balances().quantity_of(key.account, key.instrument)?;
+        let position = state
+            .balances()
+            .position(&PositionKey {
+                account: key.account,
+                instrument: key.instrument,
+            })
+            .unwrap_or_else(Quantity::zero);
         if lots != position {
             return Err(InvariantViolation::LotsDoNotMatchPosition {
                 key,

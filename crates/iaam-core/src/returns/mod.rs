@@ -1977,7 +1977,13 @@ fn position_assessments(
             };
             PositionAssessment {
                 account: key.account,
-                custody: key.custody,
+                // `PositionKey` no longer carries a custody location
+                // (iaam-40zv): a position is an account and an instrument.
+                // This surface still has its own `custody` field; it is not
+                // this task's to redesign, so it is filled with the only
+                // honest value left once the key it used to read no longer
+                // has one.
+                custody: None,
                 instrument: key.instrument,
                 quantity,
                 raw_price,
@@ -3998,7 +4004,6 @@ mod tests {
                 3,
                 crate::reconciliation::claim::ControlClaim::PositionQuantity {
                     instrument,
-                    custody,
                     quantity,
                     at: crate::reconciliation::claim::BalancePoint::Closing,
                 },

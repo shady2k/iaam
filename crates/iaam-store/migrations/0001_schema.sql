@@ -1344,9 +1344,9 @@ CREATE TABLE event_control_assertion (
     -- cash_balance, cash_turnover, fees_total, income_total, tax_withheld_total.
     currency      TEXT,
     amount        INTEGER,
-    -- position_quantity only.
+    -- position_quantity only. No custody column: a place of custody is not
+    -- part of a position's identity, so a position_quantity claim names none.
     instrument    TEXT REFERENCES instruments (id),
-    custody       TEXT REFERENCES custody_places (id),
     quantity      TEXT,
     -- cash_turnover only.
     debit         INTEGER,
@@ -1361,27 +1361,27 @@ CREATE TABLE event_control_assertion (
         CASE claim_kind
             WHEN 'cash_balance' THEN
                 currency IS NOT NULL AND amount IS NOT NULL AND balance_point IS NOT NULL
-                AND instrument IS NULL AND custody IS NULL AND quantity IS NULL
+                AND instrument IS NULL AND quantity IS NULL
                 AND debit IS NULL AND credit IS NULL
             WHEN 'position_quantity' THEN
-                instrument IS NOT NULL AND custody IS NOT NULL AND quantity IS NOT NULL
+                instrument IS NOT NULL AND quantity IS NOT NULL
                 AND balance_point IS NOT NULL
                 AND currency IS NULL AND amount IS NULL AND debit IS NULL AND credit IS NULL
             WHEN 'cash_turnover' THEN
                 currency IS NOT NULL AND debit IS NOT NULL AND credit IS NOT NULL
                 AND amount IS NULL AND balance_point IS NULL
-                AND instrument IS NULL AND custody IS NULL AND quantity IS NULL
+                AND instrument IS NULL AND quantity IS NULL
             WHEN 'fees_total' THEN
                 currency IS NOT NULL AND amount IS NOT NULL
-                AND balance_point IS NULL AND instrument IS NULL AND custody IS NULL
+                AND balance_point IS NULL AND instrument IS NULL
                 AND quantity IS NULL AND debit IS NULL AND credit IS NULL
             WHEN 'income_total' THEN
                 currency IS NOT NULL AND amount IS NOT NULL
-                AND balance_point IS NULL AND instrument IS NULL AND custody IS NULL
+                AND balance_point IS NULL AND instrument IS NULL
                 AND quantity IS NULL AND debit IS NULL AND credit IS NULL
             WHEN 'tax_withheld_total' THEN
                 currency IS NOT NULL AND amount IS NOT NULL
-                AND balance_point IS NULL AND instrument IS NULL AND custody IS NULL
+                AND balance_point IS NULL AND instrument IS NULL
                 AND quantity IS NULL AND debit IS NULL AND credit IS NULL
         END
     )

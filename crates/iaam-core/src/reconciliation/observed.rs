@@ -22,7 +22,7 @@ use crate::event::Event;
 use crate::event::correction::CorrectionError;
 use crate::event::kind::EventKind;
 use crate::event::leg::LegKind;
-use crate::ids::{AccountId, CustodyId, EventId, InstrumentId};
+use crate::ids::{AccountId, EventId, InstrumentId};
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
 use crate::numeric::NumericError;
 use crate::projection::balances::{BalanceError, Balances, PositionKey};
@@ -217,8 +217,8 @@ pub enum ObserveError {
 pub struct ObservedTotals {
     cash_opening: BTreeMap<CurrencyCode, PostedMinor>,
     cash_closing: BTreeMap<CurrencyCode, PostedMinor>,
-    positions_opening: BTreeMap<(InstrumentId, CustodyId), Quantity>,
-    positions_closing: BTreeMap<(InstrumentId, CustodyId), Quantity>,
+    positions_opening: BTreeMap<InstrumentId, Quantity>,
+    positions_closing: BTreeMap<InstrumentId, Quantity>,
     turnover: BTreeMap<CurrencyCode, Turnover>,
     fees: BTreeMap<CurrencyCode, PostedMinor>,
     income: BTreeMap<CurrencyCode, PostedMinor>,
@@ -229,7 +229,7 @@ pub struct ObservedTotals {
     /// the question does not arise: there is no sum whose start could have been
     /// invented.
     cash_anchor: BTreeMap<CurrencyCode, OpeningAnchor>,
-    position_anchor: BTreeMap<(InstrumentId, CustodyId), OpeningAnchor>,
+    position_anchor: BTreeMap<InstrumentId, OpeningAnchor>,
     before: FoldSpan,
     within: FoldSpan,
     /// The earlier stated balance each of this interval's two balance points can
@@ -247,15 +247,10 @@ impl ObservedTotals {
     }
 
     #[must_use]
-    pub fn position_at(
-        &self,
-        at: BalancePoint,
-        instrument: InstrumentId,
-        custody: CustodyId,
-    ) -> Option<Quantity> {
+    pub fn position_at(&self, at: BalancePoint, instrument: InstrumentId) -> Option<Quantity> {
         match at {
-            BalancePoint::Opening => self.positions_opening.get(&(instrument, custody)).copied(),
-            BalancePoint::Closing => self.positions_closing.get(&(instrument, custody)).copied(),
+            BalancePoint::Opening => self.positions_opening.get(&instrument).copied(),
+            BalancePoint::Closing => self.positions_closing.get(&instrument).copied(),
         }
     }
 
@@ -299,14 +294,10 @@ impl ObservedTotals {
     }
 
     /// The same for one holding. `None` under the same condition: no leg of
-    /// this instrument in this depository has ever touched the account.
+    /// this instrument has ever touched the account.
     #[must_use]
-    pub fn position_anchor(
-        &self,
-        instrument: InstrumentId,
-        custody: CustodyId,
-    ) -> Option<OpeningAnchor> {
-        self.position_anchor.get(&(instrument, custody)).copied()
+    pub fn position_anchor(&self, instrument: InstrumentId) -> Option<OpeningAnchor> {
+        self.position_anchor.get(&instrument).copied()
     }
 
     /// The account's events dated before the interval — the fold an opening
@@ -562,17 +553,16 @@ fn record_anchors(anchors: &OpeningAnchors, account: AccountId, totals: &mut Obs
             .cash_anchor
             .insert(currency, anchors.cash(account, currency));
     }
-    for (instrument, custody) in totals
+    for instrument in totals
         .positions_opening
         .keys()
         .chain(totals.positions_closing.keys())
         .copied()
         .collect::<Vec<_>>()
     {
-        totals.position_anchor.insert(
-            (instrument, custody),
-            anchors.position(account, instrument, custody),
-        );
+        totals
+            .position_anchor
+            .insert(instrument, anchors.position(account, instrument));
     }
 }
 
@@ -591,23 +581,21 @@ fn snapshot_cash(
 fn snapshot_positions(
     balances: &Balances,
     account: AccountId,
-    into: &mut BTreeMap<(InstrumentId, CustodyId), Quantity>,
+    into: &mut BTreeMap<InstrumentId, Quantity>,
 ) {
     for (key, quantity) in balances.iter_positions() {
         let PositionKey {
             account: owner,
-            custody,
             instrument,
         } = key;
         if *owner != account {
             continue;
         }
-        // The report's claim always names a depository, so
-        // a position recorded without one is not eligible for reconciliation and is
-        // not included in the snapshot: there would be nothing to compare it against.
-        if let Some(custody) = custody {
-            into.insert((*instrument, *custody), quantity);
-        }
+        // Custody is not part of a position's identity, so nothing here
+        // depends on whether one is known: a position an API sync produced,
+        // with no depository named at all, is as eligible for reconciliation
+        // as one a report stated.
+        into.insert(*instrument, quantity);
     }
 }
 
@@ -684,6 +672,7 @@ mod tests {
     use crate::event::kind::{FeeOrigin, TradeSide};
     use crate::event::leg::Leg;
     use crate::event::test_support::event_with;
+    use crate::ids::CustodyId;
     use crate::money::Money;
     use crate::numeric::decimal::Dec;
     use rust_decimal::Decimal;
@@ -783,7 +772,7 @@ mod tests {
             "the Principal leg must be included in turnover: it is already monetary"
         );
         assert_eq!(
-            observed.position_at(BalancePoint::Closing, instrument, custody),
+            observed.position_at(BalancePoint::Closing, instrument),
             Some(qty(10)),
             "amortisation does not remove the security from the position"
         );
@@ -848,9 +837,46 @@ mod tests {
             Some(PostedMinor::new(1_000_000))
         );
         assert_eq!(
-            observed.position_at(BalancePoint::Closing, instrument, custody),
+            observed.position_at(BalancePoint::Closing, instrument),
             Some(qty(0)),
             "a redeemed security does not remain in the position"
+        );
+    }
+
+    #[test]
+    fn a_position_with_no_custody_is_reconciled_not_skipped() {
+        // A position an API sync produced can carry no custody at all — the
+        // channel's own handle is not a place — and custody is not part of a
+        // position's identity, so nothing here is entitled to treat that
+        // position as ineligible for reconciliation. This fails before the
+        // `snapshot_positions` fix: the old branch dropped exactly this row.
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let events = vec![event_with(
+            account,
+            date!(2026 - 02 - 10),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity: qty(10),
+                cost_basis: Some(rub(1_000_000)),
+                assertions: crate::event::kind::OpeningAssertions::default(),
+            },
+            vec![Leg {
+                kind: LegKind::SecurityQuantity,
+                account,
+                custody: None,
+                instrument: Some(instrument),
+                money: None,
+                quantity: Some(qty(10)),
+            }],
+        )];
+
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.position_at(BalancePoint::Closing, instrument),
+            Some(qty(10)),
+            "a custody-less position must still appear in the snapshot"
         );
     }
 

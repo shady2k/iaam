@@ -194,7 +194,6 @@ fn every_control_claim() -> Vec<ControlClaim> {
         },
         ControlClaim::PositionQuantity {
             instrument: InstrumentId::new_random(),
-            custody: CustodyId::new_random(),
             quantity: qty("1"),
             at: BalancePoint::Opening,
         },

@@ -45,15 +45,16 @@ use crate::StoreError;
 /// name starts with `event` declares `REFERENCES custody_places`.
 ///
 /// This is the ground truth [`Event::referenced_custodies`] promises to
-/// cover: `event_legs.custody` through the leg loop, the other three
-/// through the exhaustive `match` over the event's detail. Re-exported (via
+/// cover: `event_legs.custody` through the leg loop, the other two through
+/// the exhaustive `match` over the event's detail. `event_control_assertion`
+/// carries no such column: a `PositionQuantity` claim names no place of
+/// custody, custody being no part of a position's identity. Re-exported (via
 /// `crate::journal`) so that `schema_coverage.rs` — an integration test,
 /// outside this crate's own boundary — can hold the schema to it: growing
 /// this list without adding the matching arm is exactly the drift that test
 /// exists to catch.
 pub const CUSTODY_REFERENCE_COLUMNS: &[(&str, &str)] = &[
     ("event_legs", "custody"),
-    ("event_control_assertion", "custody"),
     ("event_corporate_action", "custody"),
     ("event_offer_exercise", "custody"),
 ];
@@ -114,8 +115,8 @@ pub(crate) fn insert_event_in(tx: &Transaction<'_>, event: &Event) -> Result<(),
 ///
 /// Accounts are still read off the legs: every account this journal moves
 /// money or securities through appears there. Custody places are not — a
-/// control assertion has no legs at all, and a partial redemption's only leg
-/// is the cash — so custody is checked over
+/// partial redemption's only leg is the cash, and a settled offer's security
+/// leg is the fixture's own — so custody is checked over
 /// [`Event::referenced_custodies`], the one traversal that also reaches the
 /// detail rows.
 ///
@@ -388,8 +389,8 @@ fn insert_control_assertion(
     tx.execute(
         "INSERT INTO event_control_assertion (
             event, period_from, period_to, claim_kind, balance_point, currency,
-            amount, instrument, custody, quantity, debit, credit
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            amount, instrument, quantity, debit, credit
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
             row.event,
             row.period_from,
@@ -399,7 +400,6 @@ fn insert_control_assertion(
             row.currency,
             row.amount,
             row.instrument,
-            row.custody,
             row.quantity,
             row.debit,
             row.credit,
@@ -676,16 +676,11 @@ mod tests {
             )
         }
 
-        /// A no-leg event whose only external references — `instrument` and
-        /// `custody` — live entirely in the detail row, not in any leg. Used
-        /// to induce a fault-injection failure at the detail insert without
-        /// the leg insert already having failed on the same reference.
-        fn position_assertion(
-            &self,
-            sequence: u32,
-            instrument: InstrumentId,
-            custody: CustodyId,
-        ) -> Event {
+        /// A no-leg event whose only external reference — `instrument` —
+        /// lives entirely in the detail row, not in any leg. Used to induce a
+        /// fault-injection failure at the detail insert without the leg
+        /// insert already having failed on the same reference.
+        fn position_assertion(&self, sequence: u32, instrument: InstrumentId) -> Event {
             self.base_event(
                 sequence,
                 EventKind::ControlAssertion {
@@ -693,7 +688,6 @@ mod tests {
                         .unwrap(),
                     claim: ControlClaim::PositionQuantity {
                         instrument,
-                        custody,
                         quantity: qty("1"),
                         at: BalancePoint::Closing,
                     },
@@ -878,42 +872,6 @@ mod tests {
             Dec::new(Decimal::from_str_exact(text).unwrap()),
             CurrencyCode::Rub,
         )
-    }
-
-    #[test]
-    fn a_control_assertion_naming_a_custody_place_of_another_owner_is_refused() {
-        let mut store = open_store();
-        let fixture = Fixture::new(&store);
-        let foreign_owner = OwnerId::new_random();
-        let foreign_custody = CustodyId::new_random();
-        store
-            .upsert_custody_place(&CustodyRecord {
-                id: foreign_custody,
-                owner: foreign_owner,
-                title: "Shop One Custody".to_owned(),
-                institution: None,
-                origin: CustodyOrigin::Declared,
-            })
-            .expect("foreign custody place created");
-
-        // Legless: a `PositionQuantity` assertion carries no leg at all, so
-        // only the detail row names the custody place.
-        let event = fixture.position_assertion(1, fixture.instrument, foreign_custody);
-
-        let tx = store.connection_mut().transaction().expect("open tx");
-        let outcome = insert_event_in(&tx, &event);
-        assert!(
-            matches!(
-                outcome,
-                Err(StoreError::NotFound {
-                    what: "custody place",
-                    ..
-                })
-            ),
-            "expected NotFound, got {outcome:?}"
-        );
-        drop(tx);
-        assert_eq!(total_rows_for_event(store.connection(), event.id), 0);
     }
 
     #[test]
@@ -1107,14 +1065,15 @@ mod tests {
     fn a_foreign_key_failure_inserting_the_detail_row_leaves_no_rows() {
         let mut store = open_store();
         let fixture = Fixture::new(&store);
-        // No legs at all for this kind, and the custody place is real and
-        // owned — the ownership check passes — only the detail row's own
-        // instrument reference is bad. Instruments carry no ownership check
-        // (they are global reference data), so this reaches genuine SQL at
-        // the detail insert specifically, unlike an unregistered custody
-        // place, which the ownership check now refuses before any SQL runs.
+        // No legs at all for this kind: a `PositionQuantity` claim names no
+        // custody place, so nothing here goes through the ownership check at
+        // all, and the detail row's own instrument reference is what fails.
+        // Instruments carry no ownership check (they are global reference
+        // data), so this reaches genuine SQL at the detail insert
+        // specifically, unlike an unregistered custody place elsewhere, which
+        // the ownership check refuses before any SQL runs.
         let unregistered_instrument = InstrumentId::new_random();
-        let event = fixture.position_assertion(1, unregistered_instrument, fixture.custody);
+        let event = fixture.position_assertion(1, unregistered_instrument);
 
         let tx = store.connection_mut().transaction().expect("open tx");
         let outcome = insert_event_in(&tx, &event);

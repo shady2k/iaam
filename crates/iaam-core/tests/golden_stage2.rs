@@ -505,7 +505,6 @@ fn golden_channels_and_perimeter_are_account_scoped() {
     );
     let repo_claim = ControlClaim::PositionQuantity {
         instrument: iaam_core::ids::InstrumentId::new_random(),
-        custody: iaam_core::ids::CustodyId::new_random(),
         quantity: iaam_core::money::Quantity(iaam_core::numeric::decimal::Dec::one()),
         at: BalancePoint::Closing,
     };

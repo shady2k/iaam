@@ -243,8 +243,14 @@ impl Event {
     /// One traversal, in the domain, because two readers need the same
     /// answer and must not drift: the store's ownership check, and the
     /// synchronisation that registers a handle before appending. The store
-    /// cannot compute this from the legs alone — a `PositionQuantity`
-    /// assertion has none, and a partial redemption's only leg is the cash.
+    /// cannot compute this from the legs alone — a corporate action's or a
+    /// settled offer's custody lives on the action, not on a leg, and a
+    /// control assertion has no legs at all.
+    ///
+    /// A `ControlAssertion` never contributes: custody is not part of a
+    /// position's identity, so `PositionQuantity` — the one claim that used
+    /// to carry a custody field — does not name a place of custody any more
+    /// than a cash balance does.
     ///
     /// Every arm is spelled out, with no `..` and no `_ =>`. A wildcard here
     /// would let a new custody field ship unchecked, which is exactly the
@@ -259,8 +265,8 @@ impl Event {
         let mut found: Vec<CustodyId> = self.legs.iter().filter_map(|leg| leg.custody).collect();
         match &self.kind {
             EventKind::ControlAssertion { claim, .. } => match claim {
-                ControlClaim::PositionQuantity { custody, .. } => found.push(*custody),
                 ControlClaim::CashBalance { .. }
+                | ControlClaim::PositionQuantity { .. }
                 | ControlClaim::CashTurnover { .. }
                 | ControlClaim::FeesTotal { .. }
                 | ControlClaim::IncomeTotal { .. }
@@ -3948,7 +3954,6 @@ mod tests {
             period,
             claim: ControlClaim::PositionQuantity {
                 instrument: InstrumentId::new_random(),
-                custody: CustodyId::new_random(),
                 quantity: Quantity(Dec::new(Decimal::from(-10))),
                 at: BalancePoint::Closing,
             },

@@ -16,6 +16,7 @@ use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId, Sourc
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::numeric::approx::SolverPolicy;
 use iaam_core::numeric::decimal::Dec;
+use iaam_core::projection::balances::PositionKey;
 use iaam_core::projection::{ProjectionContext, project};
 use iaam_core::returns::{ReturnsRequest, returns_report};
 use iaam_core::rules::{LotRuleVersion, RuleRegistry};
@@ -190,7 +191,10 @@ fn single_account_answers_the_three_questions_of_stage_one() {
     assert_eq!(
         state
             .balances()
-            .quantity_of(fixture.account, fixture.instrument)
+            .position(&PositionKey {
+                account: fixture.account,
+                instrument: fixture.instrument,
+            })
             .expect("quantity"),
         qty(100)
     );

@@ -236,14 +236,9 @@ pub fn observation_basis(claim: &ControlClaim, observed: &ObservedTotals) -> Obs
             start: start_of(observed.cash_anchor(currency)),
             compared: cash_compared(observed, at, currency),
         },
-        ControlClaim::PositionQuantity {
-            instrument,
-            custody,
-            at,
-            ..
-        } => ObservationBasis {
+        ControlClaim::PositionQuantity { instrument, at, .. } => ObservationBasis {
             folded: folded_to(at, observed),
-            start: start_of(observed.position_anchor(instrument, custody)),
+            start: start_of(observed.position_anchor(instrument)),
             compared: Compared::Level,
         },
         ControlClaim::CashTurnover { .. }
@@ -387,19 +382,15 @@ pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutc
         // start is the net of the trades that were imported, and a source
         // stating the holding is not contradicting it — there is nothing for it
         // to contradict. The two arms are written out rather than shared: the
-        // anchor is keyed by currency for cash and by instrument-and-depository
-        // for a holding, and a helper over both would have to invent a key that
-        // is neither.
+        // anchor is keyed by currency for cash and by instrument for a
+        // holding, and a helper over both would have to invent a key that is
+        // neither.
         ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity,
             at,
-        } => match observed.position_at(at, instrument, custody) {
-            Some(_)
-                if observed.position_anchor(instrument, custody)
-                    == Some(OpeningAnchor::Unasserted) =>
-            {
+        } => match observed.position_at(at, instrument) {
+            Some(_) if observed.position_anchor(instrument) == Some(OpeningAnchor::Unasserted) => {
                 ClaimOutcome::NotComparable {
                     reason: NotComparable::OpeningNotAsserted,
                 }
@@ -1030,10 +1021,9 @@ mod tests {
 
     #[test]
     fn a_position_summed_from_an_unasserted_start_is_not_compared() {
-        // The same rule for a holding, keyed by instrument and depository. A
-        // quantity summed from the trades that happen to have been imported is
-        // not the position, and a source stating the holding is not
-        // contradicting it.
+        // The same rule for a holding, keyed by instrument. A quantity summed
+        // from the trades that happen to have been imported is not the
+        // position, and a source stating the holding is not contradicting it.
         let account = AccountId::new_random();
         let custody = CustodyId::new_random();
         let instrument = InstrumentId::new_random();
@@ -1061,7 +1051,6 @@ mod tests {
         let observed = observe(&events, account, march()).unwrap();
         let claim = ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity: Quantity(Dec::new(Decimal::from(4))),
             at: BalancePoint::Closing,
         };
@@ -1339,12 +1328,13 @@ mod tests {
     }
 
     #[test]
-    fn a_position_quantity_is_compared_per_custody() {
-        // The same quantity in another depository is a different position:
-        // a transfer of securities between depositories within the same broker
-        // is a real transaction (§4.5).
+    fn a_position_quantity_is_compared_across_custody_not_per_custody() {
+        // The owner keeps positions at the level of the broker and of the
+        // account, not below it: a place of custody is not part of a
+        // position's identity, so a claim naming the instrument alone is
+        // compared against everything the account holds of it, regardless of
+        // which depository each leg named.
         let account = AccountId::new_random();
-        let custody = CustodyId::new_random();
         let instrument = InstrumentId::new_random();
         let quantity = Quantity(Dec::new(Decimal::from(10)));
         let events = vec![event_with(
@@ -1357,26 +1347,29 @@ mod tests {
                 cost_basis: None,
                 assertions: crate::event::kind::OpeningAssertions::default(),
             },
-            vec![Leg::security(account, custody, instrument, quantity)],
+            vec![Leg::security(
+                account,
+                CustodyId::new_random(),
+                instrument,
+                quantity,
+            )],
         )];
         let observed = observe(&events, account, march()).unwrap();
 
         let matching = ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity,
             at: BalancePoint::Closing,
         };
         assert_eq!(check_claim(&matching, &observed), ClaimOutcome::Matched);
 
-        let elsewhere = ControlClaim::PositionQuantity {
+        let wrong_quantity = ControlClaim::PositionQuantity {
             instrument,
-            custody: CustodyId::new_random(),
-            quantity,
+            quantity: Quantity(Dec::new(Decimal::from(4))),
             at: BalancePoint::Closing,
         };
         assert!(matches!(
-            check_claim(&elsewhere, &observed),
+            check_claim(&wrong_quantity, &observed),
             ClaimOutcome::Discrepant(_)
         ));
     }

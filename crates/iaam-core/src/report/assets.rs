@@ -795,7 +795,6 @@ mod tests {
     fn position(account: AccountId, instrument: InstrumentId) -> PositionKey {
         PositionKey {
             account,
-            custody: None,
             instrument,
         }
     }

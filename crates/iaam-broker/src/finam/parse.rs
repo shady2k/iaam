@@ -121,13 +121,6 @@ pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
     if positions.is_empty() {
         return Ok(claims);
     }
-    let account_id = response
-        .account_id
-        .as_deref()
-        .ok_or(ParseError::MissingField {
-            field: "account_id",
-        })?;
-    let custody = parse_identifier(account_id, "account_id")?;
     for position in positions {
         let symbol = position
             .symbol
@@ -140,7 +133,6 @@ pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
             .and_then(|value| parse_quantity(value, "quantity"))?;
         claims.push(ControlClaim::PositionQuantity {
             instrument: parse_identifier(symbol, "symbol")?,
-            custody,
             quantity,
             at: BalancePoint::Closing,
         });
@@ -396,7 +388,12 @@ struct RawTrade {
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawPortfolioResponse {
+    // No longer read (iaam-40zv): a position no longer keys on custody, and
+    // this channel's account handle is not a place of custody at all. Kept
+    // on the wire struct rather than dropped, since it deserializes real
+    // response data another change may still need.
     #[serde(rename = "accountId", alias = "account_id")]
+    #[allow(dead_code)]
     account_id: Option<String>,
     cash: Option<Vec<RawMoneyValue>>,
     positions: Option<Vec<RawPortfolioPosition>>,

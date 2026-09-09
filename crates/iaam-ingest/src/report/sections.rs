@@ -86,7 +86,6 @@ impl ControlSections {
         for position in &self.positions {
             claims.push(ControlClaim::PositionQuantity {
                 instrument: position.instrument,
-                custody: position.custody,
                 quantity: position.quantity,
                 at: position.at,
             });

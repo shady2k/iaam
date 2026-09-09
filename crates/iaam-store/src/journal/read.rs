@@ -359,7 +359,6 @@ fn load_control_assertion(
             currency: row.get("currency")?,
             amount: row.get("amount")?,
             instrument: row.get("instrument")?,
-            custody: row.get("custody")?,
             quantity: row.get("quantity")?,
             debit: row.get("debit")?,
             credit: row.get("credit")?,
@@ -948,8 +947,8 @@ mod tests {
         conn.execute(
             "INSERT INTO event_control_assertion (
                 event, period_from, period_to, claim_kind, balance_point, currency,
-                amount, instrument, custody, quantity, debit, credit
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                amount, instrument, quantity, debit, credit
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 row.event,
                 row.period_from,
@@ -959,7 +958,6 @@ mod tests {
                 row.currency,
                 row.amount,
                 row.instrument,
-                row.custody,
                 row.quantity,
                 row.debit,
                 row.credit,

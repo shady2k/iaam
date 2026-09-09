@@ -85,6 +85,50 @@ ensure_guard() {
   return 0
 }
 
+SWEEP_BEGIN='# --- BEGIN IAAM WORKTREE SWEEP (iaam-ph3d) ---'
+
+IFS= read -r -d '' SWEEP_BLOCK <<'BLOCK' || true
+
+# --- BEGIN IAAM WORKTREE SWEEP (iaam-ph3d) ---
+# Managed by scripts/install-hooks.sh. Kept OUTSIDE the beads section markers
+# for the same reason the privacy guard is: beads preserves what lies outside
+# them, so this survives `bd hooks install` regenerating the file.
+#
+# An agent working here opens a git worktree per task, and every worktree
+# carries its own target/. Several building at once is tens of gigabytes, and a
+# worktree left registered after its branch is merged fills again the next time
+# anything builds in it. A merge is the moment a worktree stops being work and
+# starts being residue, so that is where the sweep runs.
+#
+# It never fails the merge. A cleanup that could interrupt a merge would cost
+# more than the disk it reclaims.
+_iaam_root=$(git rev-parse --show-toplevel) || exit 0
+[ -x "$_iaam_root/scripts/sweep-build-space.sh" ] || exit 0
+"$_iaam_root/scripts/sweep-build-space.sh" || true
+# --- END IAAM WORKTREE SWEEP (iaam-ph3d) ---
+BLOCK
+
+# The sweep, on its own hook. Deliberately not the guard's function: the guard
+# refuses a commit when it cannot run, and this one must never refuse anything.
+ensure_sweep() {
+  local hook="$1"
+  mkdir -p "$(dirname -- "$hook")"
+  if [ ! -e "$hook" ]; then
+    printf '%s\n' '#!/usr/bin/env sh' > "$hook"
+  fi
+  if grep -Fq "$SWEEP_BEGIN" "$hook"; then
+    chmod +x "$hook"
+    return 1
+  fi
+  if grep -qE '^[[:space:]]*exec[[:space:]]' "$hook"; then
+    echo "HOOKS: $hook ends in an exec; the sweep appended after it would never run." >&2
+    return 1
+  fi
+  printf '%s\n' "$SWEEP_BLOCK" >> "$hook"
+  chmod +x "$hook"
+  return 0
+}
+
 # The directory git consults for hooks. `core.hooksPath` wins when set; a
 # relative value is read relative to the top of the working tree.
 hooks_dir=$(git config --get core.hooksPath || true)
@@ -101,6 +145,13 @@ if ensure_guard "$active_hook"; then
   echo "installed: $active_hook"
 else
   echo "already present: $active_hook"
+fi
+
+merge_hook="$hooks_dir/post-merge"
+if ensure_sweep "$merge_hook"; then
+  echo "installed: $merge_hook (retires merged agent worktrees)"
+else
+  echo "already present: $merge_hook"
 fi
 
 # Belt and braces. `bd hooks install --beads` points core.hooksPath at

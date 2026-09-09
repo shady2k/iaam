@@ -338,7 +338,6 @@ fn control_assertion_to_row(
         currency: None,
         amount: None,
         instrument: None,
-        custody: None,
         quantity: None,
         debit: None,
         credit: None,
@@ -356,13 +355,11 @@ fn control_assertion_to_row(
         },
         ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity,
             at,
         } => ControlAssertionRow {
             balance_point: Some(balance_point_code(at).to_owned()),
             instrument: Some(instrument.inner().to_string()),
-            custody: Some(custody.inner().to_string()),
             quantity: Some(dec_to_text(quantity.0)),
             ..base
         },
@@ -948,10 +945,6 @@ fn control_assertion_from_row(row: ControlAssertionRow) -> Result<EventKind, Sto
             instrument: InstrumentId(parse_uuid(
                 field,
                 &require_str(field, row.instrument.as_deref())?,
-            )?),
-            custody: CustodyId(parse_uuid(
-                field,
-                &require_str(field, row.custody.as_deref())?,
             )?),
             quantity: Quantity(dec_from_text(
                 field,
@@ -2322,13 +2315,11 @@ mod tests {
             },
             ControlClaim::PositionQuantity {
                 instrument: f.instrument,
-                custody: f.custody,
                 quantity: qty("15"),
                 at: BalancePoint::Opening,
             },
             ControlClaim::PositionQuantity {
                 instrument: f.instrument,
-                custody: f.custody,
                 quantity: qty("0"),
                 at: BalancePoint::Closing,
             },

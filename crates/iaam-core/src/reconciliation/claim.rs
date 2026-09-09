@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use time::Date;
 
 use super::Dimension;
-use crate::ids::{CustodyId, InstrumentId};
+use crate::ids::InstrumentId;
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
 
 /// The interval covered by the assertion. Both boundaries are inclusive:
@@ -91,7 +91,6 @@ pub enum ControlClaim {
     /// Security quantity at the start or end of the interval.
     PositionQuantity {
         instrument: InstrumentId,
-        custody: CustodyId,
         quantity: Quantity,
         at: BalancePoint,
     },
@@ -156,8 +155,10 @@ impl ControlClaim {
     /// one fact — the same account's cash in the same currency at the same
     /// point of the same interval — so one supersedes or repeats the other.
     /// Anything that would make them separate facts is in the key: the
-    /// discriminant, the balance point where there is one, and the currency,
-    /// instrument and custody that name which cash and which position.
+    /// discriminant, the balance point where there is one, and the currency
+    /// or instrument that names which cash and which position. Custody does
+    /// not: a place of custody is not part of a position's identity, so it
+    /// plays no part in what makes two position claims the same subject.
     ///
     /// The value asserted is deliberately **not** in the key. A subject is the
     /// question, not the answer; folding the amount in would make «the balance
@@ -182,17 +183,9 @@ impl ControlClaim {
             Self::CashBalance { currency, at, .. } => {
                 format!("{discriminant}:{}:{}", at.code(), currency.code())
             }
-            Self::PositionQuantity {
-                instrument,
-                custody,
-                at,
-                ..
-            } => format!(
-                "{discriminant}:{}:{}:{}",
-                at.code(),
-                instrument.inner(),
-                custody.inner()
-            ),
+            Self::PositionQuantity { instrument, at, .. } => {
+                format!("{discriminant}:{}:{}", at.code(), instrument.inner())
+            }
             Self::CashTurnover { currency, .. }
             | Self::FeesTotal { currency, .. }
             | Self::IncomeTotal { currency, .. }
@@ -293,7 +286,6 @@ mod tests {
         };
         let position = ControlClaim::PositionQuantity {
             instrument: InstrumentId::new_random(),
-            custody: CustodyId::new_random(),
             quantity: Quantity(Dec::new(Decimal::from(10))),
             at: BalancePoint::Closing,
         };
@@ -323,7 +315,6 @@ mod tests {
             },
             ControlClaim::PositionQuantity {
                 instrument: InstrumentId::new_random(),
-                custody: CustodyId::new_random(),
                 quantity: Quantity(Dec::one()),
                 at: BalancePoint::Opening,
             },
@@ -419,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subject_key_separates_currencies_instruments_and_custodies() {
+    fn a_subject_key_separates_currencies_and_instruments_but_not_custodies() {
         let rubles = ControlClaim::CashBalance {
             currency: CurrencyCode::Rub,
             amount: rub(100),
@@ -433,31 +424,17 @@ mod tests {
         assert_ne!(rubles.subject_key(), dollars.subject_key());
 
         let instrument = InstrumentId::new_random();
-        let custody = CustodyId::new_random();
         let held = ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity: Quantity(Dec::new(Decimal::from(10))),
             at: BalancePoint::Closing,
         };
         let other_instrument = ControlClaim::PositionQuantity {
             instrument: InstrumentId::new_random(),
-            custody,
-            quantity: Quantity(Dec::new(Decimal::from(10))),
-            at: BalancePoint::Closing,
-        };
-        let other_custody = ControlClaim::PositionQuantity {
-            instrument,
-            custody: CustodyId::new_random(),
             quantity: Quantity(Dec::new(Decimal::from(10))),
             at: BalancePoint::Closing,
         };
         assert_ne!(held.subject_key(), other_instrument.subject_key());
-        assert_ne!(
-            held.subject_key(),
-            other_custody.subject_key(),
-            "one holding in two depositories is two facts"
-        );
     }
 
     #[test]
@@ -479,7 +456,6 @@ mod tests {
             },
             ControlClaim::PositionQuantity {
                 instrument: InstrumentId::new_random(),
-                custody: CustodyId::new_random(),
                 quantity: Quantity(Dec::one()),
                 at: BalancePoint::Closing,
             },

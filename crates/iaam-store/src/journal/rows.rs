@@ -199,7 +199,6 @@ pub(crate) struct ControlAssertionRow {
     pub currency: Option<String>,
     pub amount: Option<i64>,
     pub instrument: Option<String>,
-    pub custody: Option<String>,
     pub quantity: Option<String>,
     pub debit: Option<i64>,
     pub credit: Option<i64>,

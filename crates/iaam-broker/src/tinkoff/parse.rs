@@ -244,15 +244,8 @@ pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
                 .ok_or(ParseError::MissingField {
                     field: "instrumentUid",
                 })?;
-        let position_uid = position
-            .position_uid
-            .as_deref()
-            .ok_or(ParseError::MissingField {
-                field: "positionUid",
-            })?;
         claims.push(ControlClaim::PositionQuantity {
             instrument: parse_identifier(instrument_uid, "instrumentUid")?,
-            custody: parse_identifier(position_uid, "positionUid")?,
             quantity,
             at: BalancePoint::Closing,
         });
@@ -753,7 +746,12 @@ struct RawPortfolioResponse {
 #[derive(Debug, Deserialize)]
 struct RawPortfolioPosition {
     quantity: Option<RawQuotation>,
+    // No longer read (iaam-40zv): a position no longer keys on custody, and
+    // this channel's own handle is not a place of custody at all. Kept on
+    // the wire struct rather than dropped, since it deserializes real
+    // response data another change may still need.
     #[serde(rename = "positionUid")]
+    #[allow(dead_code)]
     position_uid: Option<String>,
     #[serde(rename = "instrumentUid")]
     instrument_uid: Option<String>,

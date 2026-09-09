@@ -5,7 +5,7 @@ use iaam_core::event::kind::EventKind;
 use iaam_core::event::leg::Leg;
 use iaam_core::event::source_row::{RefusedRow, RowName, SourceRowKey};
 use iaam_core::event::{Event, EventValidationError, Relation};
-use iaam_core::ids::{AccountId, CustodyId, EventId, InstrumentId, OwnerId};
+use iaam_core::ids::{AccountId, EventId, InstrumentId, OwnerId};
 use iaam_core::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use iaam_core::reconciliation::check::{ClaimOutcome, Discrepancy};
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
@@ -121,7 +121,6 @@ fn position_section(
     account: AccountId,
     period: AssertionPeriod,
     instrument: InstrumentId,
-    custody: CustodyId,
 ) -> Event {
     event_on(
         channel,
@@ -135,7 +134,6 @@ fn position_section(
             period,
             claim: ControlClaim::PositionQuantity {
                 instrument,
-                custody,
                 quantity: Quantity::zero(),
                 at: BalancePoint::Closing,
             },
@@ -149,7 +147,6 @@ fn full_sections_with_position(
     scope: AssertionScope,
     sections: Sections,
     instrument: InstrumentId,
-    custody: CustodyId,
 ) -> Vec<Event> {
     let mut events = full_sections(channel, scope.owner, scope.account, scope.period, sections);
     events.push(position_section(
@@ -158,7 +155,6 @@ fn full_sections_with_position(
         scope.account,
         scope.period,
         instrument,
-        custody,
     ));
     events
 }
@@ -197,18 +193,10 @@ fn coverage_gap(
     )
 }
 
-fn seeded_journal() -> (
-    OwnerId,
-    AccountId,
-    InstrumentId,
-    CustodyId,
-    TestChannel,
-    Vec<Event>,
-) {
+fn seeded_journal() -> (OwnerId, AccountId, InstrumentId, TestChannel, Vec<Event>) {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let instrument = InstrumentId::new_random();
-    let custody = CustodyId::new_random();
     let first_channel = TestChannel::new("tinkoff-api/1", "first");
     let second_channel = TestChannel::new("tinkoff-xlsx/1", "second");
     let mut events = vec![deposit(&first_channel, owner, account, 100_000)];
@@ -227,15 +215,14 @@ fn seeded_journal() -> (
                 credit: 0,
             },
             instrument,
-            custody,
         ));
     }
-    (owner, account, instrument, custody, first_channel, events)
+    (owner, account, instrument, first_channel, events)
 }
 
 #[test]
 fn a_matching_coverage_gap_withholds_cash_independent_confirmation() {
-    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    let (owner, account, _instrument, first_channel, mut events) = seeded_journal();
     events.push(coverage_gap(
         &channel_with_document(&first_channel, "gap"),
         AssertionScope {
@@ -257,7 +244,7 @@ fn a_matching_coverage_gap_withholds_cash_independent_confirmation() {
 
 #[test]
 fn a_coverage_gap_does_not_withhold_a_dimension_it_does_not_name() {
-    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    let (owner, account, _instrument, first_channel, mut events) = seeded_journal();
     events.push(coverage_gap(
         &channel_with_document(&first_channel, "gap"),
         AssertionScope {
@@ -279,7 +266,7 @@ fn a_coverage_gap_does_not_withhold_a_dimension_it_does_not_name() {
 
 #[test]
 fn a_gap_from_another_source_or_parser_leaves_the_group_intact() {
-    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    let (owner, account, _instrument, first_channel, mut events) = seeded_journal();
     let different_source = TestChannel::new("tinkoff-api/1", "different-source");
     let different_parser = channel_with_parser(&first_channel, "other-parser/1");
     events.push(coverage_gap(
@@ -314,7 +301,7 @@ fn a_gap_from_another_source_or_parser_leaves_the_group_intact() {
 
 #[test]
 fn a_later_group_without_a_gap_can_restore_independent_confirmation() {
-    let (owner, account, instrument, custody, first_channel, mut events) = seeded_journal();
+    let (owner, account, instrument, first_channel, mut events) = seeded_journal();
     let later_channel = TestChannel::new("later-parser/1", "later");
     events.extend(full_sections_with_position(
         &later_channel,
@@ -330,7 +317,6 @@ fn a_later_group_without_a_gap_can_restore_independent_confirmation() {
             credit: 0,
         },
         instrument,
-        custody,
     ));
     events.push(coverage_gap(
         &channel_with_document(&first_channel, "gap"),
@@ -896,7 +882,7 @@ fn reversal_of(event: &Event) -> Event {
 
 #[test]
 fn a_reversed_control_assertion_no_longer_confirms() {
-    let (_owner, account, _instrument, _custody, _channel, mut events) = seeded_journal();
+    let (_owner, account, _instrument, _channel, mut events) = seeded_journal();
     assert_eq!(
         ReconciliationLedger::build(&events).unwrap().status_for(
             account,
@@ -924,7 +910,7 @@ fn a_reversed_control_assertion_no_longer_confirms() {
 
 #[test]
 fn a_reversed_coverage_gap_stops_withholding_confirmation() {
-    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    let (owner, account, _instrument, first_channel, mut events) = seeded_journal();
     let gap = coverage_gap(
         &channel_with_document(&first_channel, "gap"),
         AssertionScope {
@@ -953,7 +939,7 @@ fn a_reversed_coverage_gap_stops_withholding_confirmation() {
 /// or "no taints" would prove only that the fixture built nothing.
 #[test]
 fn a_tainted_status_carries_the_gaps_rows_and_an_untainted_status_carries_none() {
-    let (owner, account, _instrument, _custody, first_channel, mut events) = seeded_journal();
+    let (owner, account, _instrument, first_channel, mut events) = seeded_journal();
 
     for status in ReconciliationLedger::build(&events).unwrap().statuses() {
         assert!(

@@ -631,17 +631,15 @@ fn continuous(closing: ControlClaim, opening: ControlClaim) -> bool {
         (
             ControlClaim::PositionQuantity {
                 instrument: left_instrument,
-                custody: left_custody,
                 quantity: left,
                 at: BalancePoint::Closing,
             },
             ControlClaim::PositionQuantity {
                 instrument: right_instrument,
-                custody: right_custody,
                 quantity: right,
                 at: BalancePoint::Opening,
             },
-        ) => left_instrument == right_instrument && left_custody == right_custody && left == right,
+        ) => left_instrument == right_instrument && left == right,
         _ => false,
     }
 }
@@ -807,7 +805,7 @@ mod internals {
     use crate::event::Relation;
     use crate::event::provenance::{ParserVersion, RawHash};
     use crate::event::test_support::sample_event_with;
-    use crate::ids::{CustodyId, InstrumentId, SourceId};
+    use crate::ids::{InstrumentId, SourceId};
     use crate::money::{CurrencyCode, PostedMinor, Quantity};
     use crate::numeric::decimal::Dec;
     use time::macros::date;
@@ -929,38 +927,23 @@ mod internals {
     }
 
     #[test]
-    fn position_continuity_requires_the_same_instrument_and_custody() {
+    fn position_continuity_requires_the_same_instrument_not_the_same_custody() {
         let instrument = InstrumentId::new_random();
-        let custody = CustodyId::new_random();
         let quantity = Quantity(Dec::one());
         let closing = ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity,
             at: BalancePoint::Closing,
         };
         let opening = ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity,
             at: BalancePoint::Opening,
         };
         assert!(continuous(closing, opening));
 
-        let elsewhere = ControlClaim::PositionQuantity {
-            instrument,
-            custody: CustodyId::new_random(),
-            quantity,
-            at: BalancePoint::Opening,
-        };
-        assert!(
-            !continuous(closing, elsewhere),
-            "the same quantity in another depository is a different position"
-        );
-
         let other_paper = ControlClaim::PositionQuantity {
             instrument: InstrumentId::new_random(),
-            custody,
             quantity,
             at: BalancePoint::Opening,
         };

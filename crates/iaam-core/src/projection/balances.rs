@@ -11,17 +11,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::event::Event;
-use crate::ids::{AccountId, CustodyId, EventId, InstrumentId};
+use crate::ids::{AccountId, EventId, InstrumentId};
 use crate::money::{CurrencyCode, Money, PostedMinor, Quantity};
 use crate::numeric::NumericError;
 
-/// A position is defined by a triple: account, custody location, instrument.
-/// A transfer of securities between depositories within the same broker is a real
-/// operation, so custody is part of the key (§4.5).
+/// A position is defined by a pair: account and instrument.
+///
+/// An account already says which broker and which account there. A place of
+/// custody adds nothing to that identity — the owner keeps positions at the
+/// level of the broker and of the account, not below it, and that is a
+/// settled product question, not an engineering preference. Custody stays
+/// elsewhere, as description (`Leg.custody` and the like); it is not part of
+/// this key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PositionKey {
     pub account: AccountId,
-    pub custody: Option<CustodyId>,
     pub instrument: InstrumentId,
 }
 
@@ -73,7 +77,6 @@ impl Balances {
                     .ok_or(BalanceError::QuantityWithoutInstrument { event: event.id })?;
                 let key = PositionKey {
                     account: leg.account,
-                    custody: leg.custody,
                     instrument,
                 };
                 let slot = self.positions.entry(key).or_insert_with(Quantity::zero);
@@ -98,6 +101,13 @@ impl Balances {
             .map(|((account, currency), amount)| (*account, Money::new(*amount, *currency)))
     }
 
+    /// The quantity held under one key, account and instrument.
+    ///
+    /// A single lookup and not a sum: since custody left the key, there is at
+    /// most one entry per account and instrument, so summing across custody
+    /// (what this method used to do, under the name `quantity_of`) and
+    /// looking the position up directly are the same operation. Two names for
+    /// one answer is worse than one, so only one remains.
     #[must_use]
     pub fn position(&self, key: &PositionKey) -> Option<Quantity> {
         self.positions.get(key).copied()
@@ -105,20 +115,6 @@ impl Balances {
 
     pub fn iter_positions(&self) -> impl Iterator<Item = (&PositionKey, Quantity)> {
         self.positions.iter().map(|(key, qty)| (key, *qty))
-    }
-
-    /// Total instrument quantity in the account across all custody locations.
-    /// This is what is compared with the sum of lots: lots do not distinguish custody.
-    pub fn quantity_of(
-        &self,
-        account: AccountId,
-        instrument: InstrumentId,
-    ) -> Result<Quantity, NumericError> {
-        self.positions
-            .iter()
-            .filter(|(key, _)| key.account == account && key.instrument == instrument)
-            .try_fold(Quantity::zero().0, |acc, (_, qty)| acc.checked_add(qty.0))
-            .map(Quantity)
     }
 
     /// Accounts with a negative cash balance (§15.9).
@@ -196,9 +192,11 @@ mod tests {
     }
 
     #[test]
-    fn quantity_sums_across_custodies_of_the_same_account() {
-        // Lots do not distinguish custody locations, so they must be compared
-        // with the sum across all custody, not with an individual position row.
+    fn two_trades_with_different_custody_are_one_position() {
+        // The owner keeps positions at the level of the broker and of the
+        // account, not below it: custody is not part of the key, so two legs
+        // for the same account and instrument land in one row regardless of
+        // which depository each named.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let mut balances = Balances::new();
@@ -213,16 +211,21 @@ mod tests {
             )];
             balances.apply(&event).unwrap();
         }
+        let key = PositionKey {
+            account,
+            instrument,
+        };
         assert_eq!(
-            balances.quantity_of(account, instrument).unwrap(),
-            Quantity(crate::numeric::decimal::Dec::new(20.into()))
+            balances.position(&key),
+            Some(Quantity(crate::numeric::decimal::Dec::new(20.into())))
         );
+        assert_eq!(balances.iter_positions().count(), 1);
     }
 
     #[test]
-    fn quantity_of_sums_neither_a_foreign_account_nor_a_foreign_instrument() {
-        // Both halves of the selection condition must apply: without either
-        // of them, the sum would silently include an unrelated position.
+    fn a_position_is_addressed_by_neither_a_foreign_account_nor_a_foreign_instrument() {
+        // Both halves of the key must apply: without either of them, a
+        // lookup would silently return an unrelated position.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let other_account = AccountId::new_random();
@@ -244,8 +247,11 @@ mod tests {
         put(other_account, instrument, 500);
 
         assert_eq!(
-            balances.quantity_of(account, instrument).unwrap(),
-            Quantity(crate::numeric::decimal::Dec::new(3.into()))
+            balances.position(&PositionKey {
+                account,
+                instrument
+            }),
+            Some(Quantity(crate::numeric::decimal::Dec::new(3.into())))
         );
     }
 
@@ -267,37 +273,32 @@ mod tests {
             Err(BalanceError::QuantityWithoutInstrument { .. })
         ));
     }
+
     #[test]
-    fn a_position_is_addressed_by_account_custody_and_instrument() {
+    fn a_position_recorded_with_no_custody_is_still_a_position() {
+        // A position an API sync produced can carry no custody at all: the
+        // key no longer needs one to exist.
         let account = AccountId::new_random();
-        let custody = CustodyId::new_random();
         let instrument = InstrumentId::new_random();
         let mut balances = Balances::new();
         let mut event = cash_event(account, rub(1));
-        event.legs = vec![Leg::security(
+        event.legs = vec![Leg {
+            kind: crate::event::leg::LegKind::SecurityQuantity,
             account,
-            custody,
-            instrument,
-            Quantity(crate::numeric::decimal::Dec::new(7.into())),
-        )];
+            custody: None,
+            instrument: Some(instrument),
+            money: None,
+            quantity: Some(Quantity(crate::numeric::decimal::Dec::new(7.into()))),
+        }];
         balances.apply(&event).unwrap();
 
         let key = PositionKey {
             account,
-            custody: Some(custody),
             instrument,
         };
         assert_eq!(
             balances.position(&key),
             Some(Quantity(crate::numeric::decimal::Dec::new(7.into())))
-        );
-        // A different custody location is a different position, not the same one.
-        assert_eq!(
-            balances.position(&PositionKey {
-                custody: Some(CustodyId::new_random()),
-                ..key
-            }),
-            None
         );
         assert_eq!(balances.iter_positions().count(), 1);
     }

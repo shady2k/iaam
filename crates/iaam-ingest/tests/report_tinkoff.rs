@@ -369,13 +369,11 @@ fn tinkoff_report_preserves_rows_operations_period_controls_and_repo_quarantine(
         },
         ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity: Quantity(dec(0)),
             at: BalancePoint::Opening,
         },
         ControlClaim::PositionQuantity {
             instrument,
-            custody,
             quantity: Quantity(dec(EXPECTED_POSITION_CLOSING)),
             at: BalancePoint::Closing,
         },

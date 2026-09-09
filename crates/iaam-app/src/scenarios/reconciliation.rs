@@ -252,19 +252,16 @@ pub async fn record_owner_balance(
             at: balance.at,
         });
     }
-    claims.extend(
-        balance
-            .positions
-            .into_iter()
-            .map(
-                |(instrument, custody, quantity)| ControlClaim::PositionQuantity {
-                    instrument,
-                    custody,
-                    quantity,
-                    at: balance.at,
-                },
-            ),
-    );
+    claims.extend(balance.positions.into_iter().map(
+        // `custody` is still what the owner stated (§10.4's own field, one
+        // step removed) but no longer part of what a position claim asserts
+        // (iaam-40zv): custody is not part of a position's identity.
+        |(instrument, _custody, quantity)| ControlClaim::PositionQuantity {
+            instrument,
+            quantity,
+            at: balance.at,
+        },
+    ));
     if claims.is_empty() {
         return Err(AppError::Invalid {
             field: "balance".into(),

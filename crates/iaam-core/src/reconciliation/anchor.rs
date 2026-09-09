@@ -42,7 +42,7 @@ use super::claim::{BalancePoint, ControlClaim};
 use crate::event::Event;
 use crate::event::kind::EventKind;
 use crate::event::leg::LegKind;
-use crate::ids::{AccountId, CustodyId, InstrumentId};
+use crate::ids::{AccountId, InstrumentId};
 use crate::money::CurrencyCode;
 
 /// Whether anything asserts the state a fold began from.
@@ -97,19 +97,19 @@ pub enum OpeningIncorporation {
 pub struct OpeningAnchors {
     /// The first date a cash leg moved, per account and currency.
     first_cash: BTreeMap<(AccountId, CurrencyCode), Date>,
-    /// The first date a security leg moved, per account, instrument and custody.
-    first_security: BTreeMap<(AccountId, InstrumentId, CustodyId), Date>,
+    /// The first date a security leg moved, per account and instrument.
+    first_security: BTreeMap<(AccountId, InstrumentId), Date>,
     /// The first date a §10.7 reconstructed opening stated a starting amount,
     /// under the same keys. Compared against the key's first movement rather
     /// than assumed to be it: a reconstruction recorded *after* an ordinary
     /// transaction states the state before itself, not before the journal.
     reconstructed_cash: BTreeMap<(AccountId, CurrencyCode), Date>,
-    reconstructed_position: BTreeMap<(AccountId, InstrumentId, CustodyId), Date>,
+    reconstructed_position: BTreeMap<(AccountId, InstrumentId), Date>,
     /// The start of every interval an opening cash assertion speaks about.
     /// A `Vec` and not a map of minima: the earliest one wins, and taking the
     /// minimum here would hide from a reader that several may cover.
     cash_openings: Vec<(AccountId, CurrencyCode, Date)>,
-    position_openings: Vec<(AccountId, InstrumentId, CustodyId, Date)>,
+    position_openings: Vec<(AccountId, InstrumentId, Date)>,
 }
 
 impl OpeningAnchors {
@@ -181,44 +181,39 @@ impl OpeningAnchors {
         &self,
         account: AccountId,
         instrument: InstrumentId,
-        custody: CustodyId,
     ) -> OpeningIncorporation {
-        let Some(first) = self.first_security.get(&(account, instrument, custody)) else {
+        let Some(first) = self.first_security.get(&(account, instrument)) else {
             return OpeningIncorporation::Unincorporated;
         };
         incorporation(
             self.reconstructed_position
-                .get(&(account, instrument, custody))
+                .get(&(account, instrument))
                 .copied(),
             *first,
         )
     }
 
     /// The same question for one holding: an account's quantity of one
-    /// instrument in one depository.
+    /// instrument.
     ///
-    /// Keyed by depository as well as instrument because that is what a
-    /// position assertion names and what a position figure is about: the same
-    /// quantity in another depository is a different position (§4.5).
+    /// Keyed by account and instrument only. A place of custody is not part
+    /// of a position's identity — the owner keeps positions at the level of
+    /// the broker and of the account, not below it — so a transfer between
+    /// two depositories within the same broker does not start a second
+    /// holding here; it is the same holding throughout.
     #[must_use]
-    pub fn position(
-        &self,
-        account: AccountId,
-        instrument: InstrumentId,
-        custody: CustodyId,
-    ) -> OpeningAnchor {
-        let Some(first) = self.first_security.get(&(account, instrument, custody)) else {
+    pub fn position(&self, account: AccountId, instrument: InstrumentId) -> OpeningAnchor {
+        let Some(first) = self.first_security.get(&(account, instrument)) else {
             return OpeningAnchor::Unasserted;
         };
         anchored(
             self.position_openings
                 .iter()
-                .filter_map(|(owner, held, where_held, from)| {
-                    (*owner == account && *held == instrument && *where_held == custody)
-                        .then_some(*from)
+                .filter_map(|(owner, held, from)| {
+                    (*owner == account && *held == instrument).then_some(*from)
                 }),
             self.reconstructed_position
-                .get(&(account, instrument, custody))
+                .get(&(account, instrument))
                 .copied(),
             *first,
         )
@@ -241,9 +236,9 @@ impl OpeningAnchors {
                 }
             }
             if leg.kind == LegKind::SecurityQuantity
-                && let (Some(instrument), Some(custody)) = (leg.instrument, leg.custody)
+                && let Some(instrument) = leg.instrument
             {
-                let key = (leg.account, instrument, custody);
+                let key = (leg.account, instrument);
                 earliest(&mut self.first_security, key, date);
                 if reconstructed {
                     earliest(&mut self.reconstructed_position, key, date);
@@ -273,12 +268,11 @@ impl OpeningAnchors {
                 .push((event.account, currency, period.from)),
             ControlClaim::PositionQuantity {
                 instrument,
-                custody,
                 at: BalancePoint::Opening,
                 ..
             } => self
                 .position_openings
-                .push((event.account, instrument, custody, period.from)),
+                .push((event.account, instrument, period.from)),
             // A closing assertion states where the interval ended, which is the
             // claim side of the check and not a statement about where the fold
             // began. Interval totals state no state at all.

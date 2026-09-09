@@ -494,7 +494,6 @@ pub enum UncoveredReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UncoveredPosition {
     pub account: AccountId,
-    pub custody: Option<crate::ids::CustodyId>,
     pub instrument: InstrumentId,
     pub reason: UncoveredReason,
 }
@@ -503,7 +502,6 @@ pub struct UncoveredPosition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyDerivedPosition {
     pub account: AccountId,
-    pub custody: Option<crate::ids::CustodyId>,
     pub instrument: InstrumentId,
     pub quality: PriceQuality,
 }
@@ -512,7 +510,6 @@ pub struct LegacyDerivedPosition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluatedPosition {
     pub account: AccountId,
-    pub custody: Option<crate::ids::CustodyId>,
     pub instrument: InstrumentId,
     pub quantity: crate::money::Quantity,
     pub price: SelectedPrice,
@@ -521,7 +518,6 @@ pub struct EvaluatedPosition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BondPositionAttributes {
     pub account: AccountId,
-    pub custody: Option<crate::ids::CustodyId>,
     pub instrument: InstrumentId,
     /// Income accrued on the position as of the date: accrued interest per bond × quantity.
     pub accrued_interest: Computed<Dec>,
@@ -536,7 +532,6 @@ pub struct BondPositionAttributes {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BondPositionMetrics {
     pub account: AccountId,
-    pub custody: Option<crate::ids::CustodyId>,
     pub instrument: InstrumentId,
     pub scenarios: Vec<crate::returns::zero_reinvestment::BondScenarioResult>,
 }
@@ -731,7 +726,6 @@ impl ReturnsReport {
 #[derive(Serialize)]
 struct SelectedPosition {
     account: AccountId,
-    custody: Option<crate::ids::CustodyId>,
     instrument: InstrumentId,
     quantity: crate::money::Quantity,
     valuation: PositionValuation,
@@ -960,7 +954,6 @@ fn inputs_hash_with_bond_inputs(
         .map(|assessment| {
             let PositionAssessment {
                 account,
-                custody,
                 instrument,
                 quantity,
                 raw_price,
@@ -983,7 +976,6 @@ fn inputs_hash_with_bond_inputs(
             };
             SelectedPosition {
                 account,
-                custody,
                 instrument,
                 quantity,
                 valuation,
@@ -1242,7 +1234,6 @@ fn bond_position_attributes(
                 .unwrap_or((None, None));
             BondPositionAttributes {
                 account: assessment.account,
-                custody: assessment.custody,
                 instrument: assessment.instrument,
                 accrued_interest: accrued,
                 accrued_interest_payable_on_termination: payable,
@@ -1893,7 +1884,6 @@ fn bond_position_metrics(
                 .collect();
             Some(BondPositionMetrics {
                 account: assessment.account,
-                custody: assessment.custody,
                 instrument: assessment.instrument,
                 scenarios,
             })
@@ -1928,7 +1918,6 @@ enum PositionAssessmentKind {
 #[derive(Debug)]
 struct PositionAssessment {
     account: AccountId,
-    custody: Option<crate::ids::CustodyId>,
     instrument: InstrumentId,
     quantity: crate::money::Quantity,
     raw_price: Option<crate::valuation::InstrumentPrice>,
@@ -1977,13 +1966,6 @@ fn position_assessments(
             };
             PositionAssessment {
                 account: key.account,
-                // `PositionKey` no longer carries a custody location
-                // (iaam-40zv): a position is an account and an instrument.
-                // This surface still has its own `custody` field; it is not
-                // this task's to redesign, so it is filled with the only
-                // honest value left once the key it used to read no longer
-                // has one.
-                custody: None,
                 instrument: key.instrument,
                 quantity,
                 raw_price,
@@ -2195,7 +2177,6 @@ fn data_quality(
                 position_coverage.evaluated_positions += 1;
                 position_coverage.selected.push(EvaluatedPosition {
                     account: assessment.account,
-                    custody: assessment.custody,
                     instrument: assessment.instrument,
                     quantity: assessment.quantity,
                     price: (**selected).clone(),
@@ -2205,7 +2186,6 @@ fn data_quality(
             (PositionAssessmentKind::Selected(_), Err(reason)) => {
                 position_coverage.uncovered.push(UncoveredPosition {
                     account: assessment.account,
-                    custody: assessment.custody,
                     instrument: assessment.instrument,
                     reason: UncoveredReason::NotComputable {
                         reason: reason.clone(),
@@ -2218,7 +2198,6 @@ fn data_quality(
                     .legacy_derived
                     .push(LegacyDerivedPosition {
                         account: assessment.account,
-                        custody: assessment.custody,
                         instrument: assessment.instrument,
                         quality: *quality,
                     });
@@ -2227,7 +2206,6 @@ fn data_quality(
             (PositionAssessmentKind::LegacyDerived(_), Err(reason)) => {
                 position_coverage.uncovered.push(UncoveredPosition {
                     account: assessment.account,
-                    custody: assessment.custody,
                     instrument: assessment.instrument,
                     reason: UncoveredReason::NotComputable {
                         reason: reason.clone(),
@@ -2237,7 +2215,6 @@ fn data_quality(
             (PositionAssessmentKind::Uncovered(reason), _) => {
                 position_coverage.uncovered.push(UncoveredPosition {
                     account: assessment.account,
-                    custody: assessment.custody,
                     instrument: assessment.instrument,
                     reason: reason.clone(),
                 });
@@ -2485,7 +2462,6 @@ mod tests {
     ) -> PositionAssessment {
         PositionAssessment {
             account,
-            custody: None,
             instrument,
             quantity,
             raw_price: None,
@@ -2501,7 +2477,6 @@ mod tests {
     ) -> PositionAssessment {
         PositionAssessment {
             account,
-            custody: None,
             instrument,
             quantity,
             raw_price,
@@ -2571,7 +2546,6 @@ mod tests {
         };
         PositionAssessment {
             account,
-            custody: None,
             instrument,
             quantity,
             raw_price: None,
@@ -3297,7 +3271,6 @@ mod tests {
                 &request,
                 vec![PositionAssessment {
                     account,
-                    custody: None,
                     instrument,
                     quantity: crate::money::Quantity(Dec::one()),
                     raw_price: None,
@@ -3382,7 +3355,6 @@ mod tests {
                 &request,
                 vec![PositionAssessment {
                     account,
-                    custody: None,
                     instrument,
                     quantity: crate::money::Quantity(Dec::one()),
                     raw_price: None,
@@ -3669,7 +3641,6 @@ mod tests {
             selected: Vec::new(),
             uncovered: vec![UncoveredPosition {
                 account: AccountId::new_random(),
-                custody: None,
                 instrument,
                 reason: UncoveredReason::TooOld,
             }],
@@ -4116,7 +4087,6 @@ mod tests {
     fn unknown_termination_values_make_only_their_aggregate_unknown() {
         let attributes = vec![BondPositionAttributes {
             account: AccountId::new_random(),
-            custody: None,
             instrument: InstrumentId::new_random(),
             accrued_interest: Computed::Value(dec("15.17")),
             accrued_interest_payable_on_termination: Computed::NotComputable {
@@ -5196,9 +5166,11 @@ mod tests {
         event
     }
 
-    /// Purchase into the specified custody location. A separate helper, because
-    /// that `bond_purchase` fabricates a depository on every call,
-    /// and here it matters that the security was booked specifically to this one.
+    /// Purchase tagged with a caller-chosen custody value, rather than the
+    /// random one `bond_purchase` fabricates on every call. Custody is
+    /// descriptive only now — it does not affect which position or lot the
+    /// purchase belongs to — so this exists to let a fixture control what a
+    /// leg records, not what it identifies.
     fn bond_purchase_in_custody(
         account: AccountId,
         instrument: InstrumentId,
@@ -5822,9 +5794,10 @@ mod tests {
         instrument: InstrumentId,
         fact_dates: &[Date],
     ) -> Vec<crate::event::Event> {
-        // One storage location for the entire journal: otherwise a sale would have removed
-        // the security from a depository where it was never deposited, and the number of positions would
-        // be three — the test would check duplication rather than the ownership boundary.
+        // One custody value tags every leg. Custody no longer affects which
+        // position a leg belongs to — a purchase and the sale that closes it
+        // are one position and one lot history regardless of the value here —
+        // so this is a fixture simplification, not a correctness requirement.
         let custody = CustodyId::new_random();
         let mut events = vec![
             cash_in(account, date!(2026 - 01 - 05)),
@@ -6104,9 +6077,11 @@ mod tests {
 
     #[test]
     fn a_bond_kept_in_two_custodies_reports_one_miss_once() {
-        // Position iteration uses `PositionKey` with the storage location,
-        // while `LotKey` is reconciled without it: the same problem would otherwise
-        // is emitted once per depository.
+        // Custody is not part of `PositionKey` (a position is an account and
+        // an instrument): two purchases whose legs are tagged with different
+        // custody values are one position, so a missing coupon on it is one
+        // issue — not a duplicate emitted once per storage location, which is
+        // no longer a distinction the position identity makes.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -6123,8 +6098,9 @@ mod tests {
 
         assert_eq!(
             report.bond_metrics.len(),
-            2,
-            "there must be two positions, otherwise the test proves nothing"
+            1,
+            "custody does not split identity: two purchases tagged with \
+             different custody values are one position, not two"
         );
         let issues = missing_postings(&report);
         assert_eq!(issues.len(), 1, "issues: {issues:?}");
@@ -6132,10 +6108,13 @@ mod tests {
 
     #[test]
     fn moving_a_bond_between_custodies_raises_no_false_alarm() {
-        // There is no separate event kind for transferring a security between
-        // There are no transfers between depositories in the model: a transfer is visible only through state —
-        // one `LotKey` under two `PositionKey` entries. That is exactly what is being tested:
-        // a complete coupon history produces no alerts.
+        // There is no separate event kind for a transfer between
+        // depositories: it is visible only as two purchases whose legs carry
+        // different custody values. Custody is description now, not
+        // identity, so those purchases are one position with one continuous
+        // history — a complete coupon history on it produces no alerts,
+        // rather than an alarm manufactured by treating the transfer as two
+        // partial holdings.
         let account = AccountId::new_random();
         let instrument = InstrumentId::new_random();
         let schedule = coupon_schedule(
@@ -6153,7 +6132,7 @@ mod tests {
         );
         let report = reconciliation_report(&[account], instrument, &events, &schedule);
 
-        assert_eq!(report.bond_metrics.len(), 2);
+        assert_eq!(report.bond_metrics.len(), 1);
         assert!(missing_postings(&report).is_empty());
         assert!(!contains(&report, |issue| matches!(
             issue,
@@ -6161,7 +6140,9 @@ mod tests {
         )));
     }
 
-    /// One security in one account at two custody locations.
+    /// One security in one account, purchased twice with a different custody
+    /// value tagged on each purchase's legs. Custody is not part of a
+    /// position's identity, so the two purchases are one position.
     fn journal_for_bond_in_two_custodies(
         account: AccountId,
         instrument: InstrumentId,

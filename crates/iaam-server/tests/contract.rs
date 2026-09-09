@@ -1583,8 +1583,10 @@ async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     assert_eq!(bond_metrics.len(), 1);
     let bond = &bond_metrics[0];
     assert_eq!(bond["account"], json!(harness.account.inner()));
-    assert_eq!(bond["custody"], json!(harness.custody.inner()));
     assert_eq!(bond["instrument"], json!(harness.instrument.inner()));
+    // Custody is not part of a position's identity: the DTO does not publish
+    // a custody dimension.
+    assert!(bond.get("custody").is_none());
     let attributes = report["bond_attributes"]
         .as_array()
         .expect("bond_attributes");
@@ -8518,11 +8520,10 @@ async fn balances_keep_cash_and_positions_as_separate_fields() {
         row["positions"][0]["instrument"],
         harness.instrument.inner().to_string()
     );
-    assert_eq!(
-        row["positions"][0]["custody"],
-        harness.custody.inner().to_string()
-    );
     assert_eq!(row["positions"][0]["quantity"], "10");
+    // Custody is not part of a position's identity: the row names the
+    // instrument and the quantity, and nothing else.
+    assert!(row["positions"][0].get("custody").is_none());
     assert!(row["reconciliation"].is_array());
     assert!(row.get("total").is_none());
 

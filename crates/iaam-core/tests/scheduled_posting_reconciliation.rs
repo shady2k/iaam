@@ -647,11 +647,13 @@ fn the_waiting_window_expires_exactly_twenty_one_days_after_the_scheduled_date()
     );
 }
 
-/// Two purchases and a sale of the earlier lot from the same depository.
+/// Two purchases and a sale of the earlier lot, all tagged with the same
+/// custody value.
 ///
-/// A single depository is used for the entire journal: otherwise the sale would remove the security
-/// from a place where it was never deposited, and there would be three positions—the test would check
-/// duplication rather than the ownership boundary.
+/// Custody no longer affects which position a leg belongs to — a purchase
+/// and the sale that closes it are one position and one lot history
+/// regardless of the value here — so reusing one value is a fixture
+/// simplification, not a correctness requirement.
 fn journal_with_early_lot_sold(fact_dates: &[Date]) -> Vec<Event> {
     let mut events = vec![
         cash_in(date!(2026 - 01 - 05), 1),
@@ -727,10 +729,11 @@ fn two_purchases_with_a_complete_history_raise_no_alarm() {
 
 #[test]
 fn one_bond_in_two_custodies_reports_a_single_missing_coupon() {
-    // Positions are traversed by custody location, while reconciliation uses the
-    // (account, security) pair without it: otherwise the same payment would be
-    // reported once per depository, and the owner would look for two missed payments
-    // instead of one.
+    // Custody is not part of `PositionKey` (a position is an account and an
+    // instrument): the two purchases, tagged with different custody values,
+    // are one position, so the missed coupon is one issue — not a duplicate
+    // reported once per storage location, which is no longer a distinction
+    // the position identity makes.
     let events = vec![
         cash_in(date!(2026 - 01 - 05), 1),
         purchase(CUSTODY, date!(2026 - 01 - 10), 2),
@@ -746,8 +749,9 @@ fn one_bond_in_two_custodies_reports_a_single_missing_coupon() {
     assert_flow_built(&report);
     assert_eq!(
         report.bond_metrics.len(),
-        2,
-        "there must be two positions, otherwise the test proves nothing"
+        1,
+        "custody does not split identity: two purchases tagged with \
+         different custody values are one position, not two"
     );
     let issues = missing_postings(&report);
     assert_eq!(issues.len(), 1, "issues: {issues:?}");

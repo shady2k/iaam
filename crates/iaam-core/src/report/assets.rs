@@ -137,9 +137,9 @@ pub struct CashSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoldingValue {
     pub instrument: InstrumentId,
-    /// The quantity across every account and custody location in the scope. A
-    /// position is keyed by all three, but «how much is invested» is a question
-    /// about the instrument, and the per-account keys stay on the rows.
+    /// The quantity across every account in the scope. A position is keyed by
+    /// account and instrument, but «how much is invested» is a question about
+    /// the instrument, and the per-account keys stay on the rows.
     pub quantity: Quantity,
     /// What the valuation policy decided for this instrument on this date, in
     /// full: the observation it chose and why, or the reason it chose none.

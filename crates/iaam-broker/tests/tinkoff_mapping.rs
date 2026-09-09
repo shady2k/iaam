@@ -7,6 +7,7 @@ use std::error::Error;
 
 use iaam_broker::tinkoff::{
     ParseError, TINKOFF_PARSER_VERSION, parse_operations as parse_operations_page, parse_portfolio,
+    parse_portfolio_positions,
 };
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor};
@@ -252,4 +253,118 @@ fn refuses_a_position_without_uuid_identifiers() {
         }"#,
     );
     assert!(matches!(result, Err(ParseError::InvalidIdentifier { .. })));
+}
+
+/// This is the defect `iaam-1u7b` exists to fix, using the report's own
+/// example: ten held, of which four blocked. The old `RawPortfolioPosition`
+/// had no field for `blocked` or `blockedLots`, so a response like this one
+/// vanished at deserialisation and reached the caller as an unqualified
+/// "ten". The body here is written from scratch, not sourced from any real
+/// portfolio.
+///
+/// A reader of `ControlClaim::PositionQuantity` alone still cannot see the
+/// encumbrance — that claim has no field for it, and widening it is a
+/// different, in-flight change — but `parse_portfolio` used to be the
+/// *only* way to read a T-Invest portfolio, which made the blocked quantity
+/// unrecoverable once parsed. It no longer is: `parse_portfolio_positions`
+/// is the boundary that keeps the broker's statement intact.
+#[test]
+fn a_blocked_quantity_reported_by_the_broker_is_not_discarded() -> Result<(), Box<dyn Error>> {
+    let body = r#"{
+        "positions": [{
+            "instrumentType": "share",
+            "quantity": {"units": "10", "nano": 0},
+            "quantityLots": {"units": "10", "nano": 0},
+            "blocked": true,
+            "blockedLots": {"units": "4", "nano": 0},
+            "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+            "instrumentUid": "1c004240-d18d-46e1-8ac1-2aa05ebfdb38",
+            "classCode": "TQBR"
+        }]
+    }"#;
+
+    let positions = parse_portfolio_positions(body)?;
+    let position = positions
+        .first()
+        .ok_or("sample does not contain the position")?;
+
+    assert_eq!(position.quantity.0.inner().to_string(), "10");
+    assert_eq!(position.blocked, Some(true));
+    assert_eq!(
+        position
+            .blocked_lots
+            .as_ref()
+            .map(|quantity| quantity.0.inner().to_string()),
+        Some("4".to_owned())
+    );
+    assert_eq!(
+        position
+            .quantity_lots
+            .as_ref()
+            .map(|quantity| quantity.0.inner().to_string()),
+        Some("10".to_owned())
+    );
+    assert_eq!(position.class_code.as_deref(), Some("TQBR"));
+    assert_eq!(positions.len(), 1);
+
+    // `ControlClaim::PositionQuantity` still cannot express the
+    // encumbrance today: this is not this task's gap to close (a
+    // concurrent change to that claim is in flight), and the test makes
+    // the boundary explicit rather than leaving it to be rediscovered. A
+    // reader of the claim alone sees "ten held" with nothing to say four of
+    // them are blocked.
+    let claims = parse_portfolio(body)?;
+    let claim_quantity = claims.iter().find_map(|claim| match claim {
+        ControlClaim::PositionQuantity { quantity, .. } => Some(quantity.0.inner().to_string()),
+        _ => None,
+    });
+    assert_eq!(claim_quantity, Some("10".to_owned()));
+
+    Ok(())
+}
+
+#[test]
+fn refuses_an_unparsable_blocked_quantity_rather_than_dropping_it() {
+    let result = parse_portfolio_positions(
+        r#"{
+            "positions": [{
+                "instrumentType": "share",
+                "quantity": {"units": "1", "nano": 0},
+                "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+                "instrumentUid": "1c004240-d18d-46e1-8ac1-2aa05ebfdb38",
+                "blocked": true,
+                "blockedLots": {"nano": 0}
+            }]
+        }"#,
+    );
+    assert!(matches!(
+        result,
+        Err(ParseError::MissingField {
+            field: "blockedLots",
+        })
+    ));
+}
+
+/// `virtualPositions` is part of the wire schema and this parser declines to
+/// read it (see the comment on `RawPortfolioResponse`). A non-trivial value
+/// there must not break parsing of the fields this system does read.
+#[test]
+fn a_non_empty_virtual_positions_array_does_not_break_parsing() -> Result<(), Box<dyn Error>> {
+    let claims = parse_portfolio(
+        r#"{
+            "positions": [{
+                "instrumentType": "share",
+                "quantity": {"units": "1", "nano": 0},
+                "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+                "instrumentUid": "1c004240-d18d-46e1-8ac1-2aa05ebfdb38"
+            }],
+            "virtualPositions": [{
+                "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+                "instrumentUid": "1c004240-d18d-46e1-8ac1-2aa05ebfdb38",
+                "quantity": {"units": "1", "nano": 0}
+            }]
+        }"#,
+    )?;
+    assert_eq!(claims.len(), 1);
+    Ok(())
 }

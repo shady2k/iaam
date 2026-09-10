@@ -15601,6 +15601,258 @@ async fn withdrawing_a_retirement_is_a_further_revision_and_never_a_no_op() {
     assert_eq!(again["revision"], 3, "{again}");
 }
 
+/// `iaam-o0oj`'s field case, end to end: an agent creates an account by
+/// mistake, and retracting it clears the queue item, the account never
+/// reaches a report's population, and the retraction is itself a standing
+/// decision an agent can withdraw.
+#[tokio::test]
+async fn a_mistaken_account_is_retracted_and_the_queue_stops_naming_it() {
+    let harness = harness().await;
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.agent_token,
+            &json!({ "title": "Probe" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let probe = created["id"].as_str().expect("account id").to_owned();
+    let path = format!("/v1/accounts/{probe}/retraction");
+
+    // Before: the account has no facts, so it asks for a statement.
+    let (status, actions) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{actions}");
+    assert!(
+        actions["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .any(|item| item["kind"] == "start_account_import" && item["subject"]["id"] == probe),
+        "a fresh empty account must ask for a statement, or this test proves nothing: {actions}"
+    );
+
+    // Reading before recording: absence is `retracted: false`, not a 404 —
+    // the route always has an answer, the same as `GET .../retirement` does.
+    let (status, before) = call(&harness.router, get(&path, Some(&harness.owner_token))).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert_eq!(before["retracted"], false, "{before}");
+    assert_eq!(before["title"], "Probe", "{before}");
+
+    let (status, retracted) = call(
+        &harness.router,
+        post(&path, &harness.agent_token, &json!({ "retracted": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["retracted"], true, "{retracted}");
+
+    // After: the queue names it nowhere at all, not only in the one item this
+    // account happened to raise before.
+    let (status, after) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert!(
+        after["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .all(|item| item["subject"]["id"] != probe),
+        "a retracted account must be named by no item at all: {after}"
+    );
+
+    // A second retraction over one that stands is refused, the same shape a
+    // retirement's own repeat is.
+    let (status, again) = call(
+        &harness.router,
+        post(&path, &harness.agent_token, &json!({ "retracted": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{again}");
+
+    // It is withdrawable: a wrong retraction is recoverable, not a silent
+    // deletion.
+    let (status, withdrawn) = call(
+        &harness.router,
+        post(&path, &harness.agent_token, &json!({ "retracted": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{withdrawn}");
+    assert_eq!(withdrawn["retracted"], false, "{withdrawn}");
+
+    let (status, revived) = call(
+        &harness.router,
+        get("/v1/actions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{revived}");
+    assert!(
+        revived["items"]
+            .as_array()
+            .expect("action items")
+            .iter()
+            .any(|item| item["kind"] == "start_account_import" && item["subject"]["id"] == probe),
+        "withdrawing the retraction must bring the account back into the queue: {revived}"
+    );
+
+    // Withdrawing twice is refused, the same shape a retirement's own repeat
+    // withdrawal is.
+    let (status, nothing_to_withdraw) = call(
+        &harness.router,
+        post(&path, &harness.agent_token, &json!({ "retracted": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{nothing_to_withdraw}");
+}
+
+/// You cannot un-exist a thing money moved through, and the refusal names the
+/// way to fix it — `retired_account_not_empty`'s own shape.
+#[tokio::test]
+async fn an_account_carrying_a_business_fact_cannot_be_retracted() {
+    let harness = harness().await;
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Main" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let account = created["id"].as_str().expect("account id").to_owned();
+
+    let (status, posted) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "10.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "retraction-refusal-1"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{account}/retraction"),
+            &harness.owner_token,
+            &json!({ "retracted": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let detail = refused["message"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("submit_corrections") || detail.contains("corrections"),
+        "the refusal must name the way to fix it, the way retired_account_not_empty's does: \
+         {refused}"
+    );
+    assert!(
+        detail.contains("retirement"),
+        "the refusal must also name retirement, for the case the fact is real and the \
+         product simply ceased: {refused}"
+    );
+}
+
+/// The owner may always retract; an agent may retract only what it declared
+/// itself — attribution (`iaam-7ffl`) is what makes that checkable, and this
+/// pins the two sides of the line.
+#[tokio::test]
+async fn only_the_owner_or_the_declaring_agent_may_retract_an_account() {
+    let harness = harness().await;
+
+    // A second, distinct agent credential — not `harness.agent_token`.
+    let (status, issued) = call(
+        &harness.router,
+        post(
+            "/v1/tokens",
+            &harness.owner_token,
+            &json!({ "label": "a stranger agent", "scope": "agent" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let stranger = issued["token"].as_str().expect("issued token").to_owned();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.agent_token,
+            &json!({ "title": "Mine" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let account = created["id"].as_str().expect("account id").to_owned();
+    let path = format!("/v1/accounts/{account}/retraction");
+
+    // The stranger did not declare this account and is refused.
+    let (status, refused) = call(
+        &harness.router,
+        post(&path, &stranger, &json!({ "retracted": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "account", "{refused}");
+
+    // `harness.account`, provisioned directly into the store, carries no
+    // `declared_by` at all — the same fixture `iaam-7ffl`'s own attribution
+    // test relies on not being swept in by an agent's identity. Absence must
+    // refuse an agent exactly as a foreign declarer does.
+    let stranger_on_undeclared = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{}/retraction", harness.account.inner()),
+            &harness.agent_token,
+            &json!({ "retracted": true }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        stranger_on_undeclared.0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{:?}",
+        stranger_on_undeclared.1
+    );
+
+    // The declaring agent may retract its own account.
+    let (status, declarer_done) = call(
+        &harness.router,
+        post(&path, &harness.agent_token, &json!({ "retracted": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{declarer_done}");
+
+    // The owner may always withdraw it, whoever declared it.
+    let (status, owner_done) = call(
+        &harness.router,
+        post(&path, &harness.owner_token, &json!({ "retracted": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{owner_done}");
+}
+
 /// The two bounds `iaam-gua5` is held to, asserted over one closed product.
 ///
 /// A term deposit is opened, emptied into another account of the owner's, and
@@ -16580,16 +16832,30 @@ async fn an_account_the_owner_ruled_outside_stops_being_one_nobody_ruled_on() {
     );
     assert_eq!(ruled_out["see"], "population.outside[]", "{ruled_out}");
     // The figures are still partial — deliberately — so the caveat stands. What
-    // it must not do is offer him the call he has already made.
+    // it must not do is offer him the call he has already made. The second
+    // remedy is `iaam-o0oj`'s: this account genuinely exists and was
+    // deliberately excluded, so retraction is offered as a call that exists,
+    // not as advice that it applies here — see
+    // `every_remedy_the_register_names_removes_the_caveat_it_is_named_for`
+    // for the scenario where the account actually is a mistake.
     assert_eq!(
         ruled_out["closed_by"],
-        json!([{
-            "operationId": "add_contour_version",
-            "method": "POST",
-            "path": "/v1/contours/{contour}/versions",
-            "requestSchema": "#/components/schemas/AddContourVersionRequest",
-            "requiredScope": "agent",
-        }]),
+        json!([
+            {
+                "operationId": "add_contour_version",
+                "method": "POST",
+                "path": "/v1/contours/{contour}/versions",
+                "requestSchema": "#/components/schemas/AddContourVersionRequest",
+                "requiredScope": "agent",
+            },
+            {
+                "operationId": "record_account_retraction",
+                "method": "POST",
+                "path": "/v1/accounts/{id}/retraction",
+                "requestSchema": "#/components/schemas/RecordAccountRetractionRequest",
+                "requiredScope": "agent",
+            }
+        ]),
         "{ruled_out}"
     );
 }
@@ -17480,13 +17746,19 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
         exercised.insert(CaveatKind::AccountInAnotherScope);
     }
 
-    // --- account_ruled_outside ----------------------------------------------
+    // --- account_ruled_outside -----------------------------------------------
     //
-    // The one remedy, read from the other end: the owner has already ruled, so
-    // the scope call has nothing left to record and the only call that puts this
-    // account's money into these figures is membership. Naming it is not advice
-    // that he should, and nothing clears the exclusion — membership outranks it.
-    {
+    // Two remedies, and they answer two different questions about the same
+    // ruled-outside account. Membership is the one that was always here: the
+    // owner has already ruled, so the scope call has nothing left to record,
+    // and the only call that puts this account's money into these figures is
+    // adding it to the contour. Retraction (`iaam-o0oj`) answers the other
+    // question — "should this row exist at all" — and closes the same caveat
+    // by removing the account from the population outright rather than moving
+    // it inside a contour. Naming either is not advice that it applies; the
+    // scenario below drives retraction against a genuinely empty account, the
+    // case it is written for.
+    for remedy in ["add_contour_version", "record_account_retraction"] {
         let harness = harness().await;
         let brokerage = harness.account.inner().to_string();
         let reported = make_contour(&harness, "Reported", &[brokerage.as_str()]).await;
@@ -17505,25 +17777,59 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
         let before = balances_of(&harness, &reported, "2026-01-31").await;
         assert!(
             caveat_kinds(&before).contains(&"account_ruled_outside".to_owned()),
-            "{before}"
+            "{remedy}: {before}"
+        );
+        assert_eq!(
+            before["confidence"]["complete"], false,
+            "{remedy}: {before}"
         );
 
-        let (status, done) = call(
-            &harness.router,
-            post(
-                &format!("/v1/contours/{reported}/versions"),
-                &harness.owner_token,
-                &json!({ "accounts": [harness.account.inner(), savings] }),
-            ),
-        )
-        .await;
-        assert!(status.is_success(), "{done}");
+        let (status, done) = match remedy {
+            "add_contour_version" => {
+                call(
+                    &harness.router,
+                    post(
+                        &format!("/v1/contours/{reported}/versions"),
+                        &harness.owner_token,
+                        &json!({ "accounts": [harness.account.inner(), savings] }),
+                    ),
+                )
+                .await
+            }
+            _ => {
+                call(
+                    &harness.router,
+                    post(
+                        &format!("/v1/accounts/{savings}/retraction"),
+                        &harness.owner_token,
+                        &json!({ "retracted": true }),
+                    ),
+                )
+                .await
+            }
+        };
+        assert!(status.is_success(), "{remedy}: {done}");
 
         let after = balances_of(&harness, &reported, "2026-01-31").await;
         assert!(
             !caveat_kinds(&after).contains(&"account_ruled_outside".to_owned()),
-            "{after}"
+            "{remedy} left the caveat standing: {after}"
         );
+        if remedy == "record_account_retraction" {
+            // The retracted account carries the only outstanding caveat this
+            // fixture raises, so its removal is what `complete` reports too —
+            // pinning both fields is `iaam-o0oj`'s own acceptance criterion:
+            // the third act clears `complete: false`, not merely the one line.
+            assert_eq!(after["confidence"]["complete"], true, "{after}");
+            assert!(
+                !after["population"]["outside"]
+                    .as_array()
+                    .expect("outside accounts")
+                    .iter()
+                    .any(|entry| entry["account"] == savings),
+                "a retracted account must not go on naming a standing at all: {after}"
+            );
+        }
         exercised.insert(CaveatKind::AccountRuledOutside);
     }
 

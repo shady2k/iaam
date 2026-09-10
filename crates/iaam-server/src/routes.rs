@@ -132,6 +132,8 @@ use crate::dto::{AnswerRuleForecastDto, PreviewAnswerRequest};
 use crate::dto::OwnerBalanceOutcomeDto;
 // Types added by wave O, in a block of their own for the same reason.
 use crate::dto::{AccountRetirementDto, AccountRetirementStateDto, RecordAccountRetirementRequest};
+// The third axis (iaam-o0oj), in a block of its own for the same reason.
+use crate::dto::{AccountRetractionDto, RecordAccountRetractionRequest};
 // Types added by wave T, in a block of their own for the same reason.
 use crate::dto::{
     SourceDocumentDto, SourceDocumentParams, SourceProfileCatalogueDto,
@@ -148,6 +150,10 @@ use iaam_app::scenarios::retirement::{
     AccountRetirementOutcome, account_retirement,
     record_account_retirement as record_account_retirement_statement, withdraw_account_retirement,
 };
+use iaam_app::scenarios::retraction::{
+    AccountRetractionOutcome, account_retraction,
+    record_account_retraction as record_account_retraction_statement, withdraw_account_retraction,
+};
 use iaam_core::batch::ControlSection;
 
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
@@ -158,6 +164,14 @@ pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 /// different things about one account, and the report that motivated both needs
 /// a closed product to stay *inside* the perimeter.
 pub const RECORD_ACCOUNT_RETIREMENT_OPERATION_ID: &str = "record_account_retirement";
+/// The third axis (`iaam-o0oj`): not a product that existed and ended, and not
+/// a product the owner's reports leave out — a row that should never have
+/// existed at all. Named apart from every route above for the same reason
+/// [`RECORD_ACCOUNT_RETIREMENT_OPERATION_ID`] is: it decides a different
+/// question about one account, with a different consequence — it removes the
+/// account from a report's population outright, rather than annotating it
+/// there.
+pub const RECORD_ACCOUNT_RETRACTION_OPERATION_ID: &str = "record_account_retraction";
 /// What a name a document printed turned out to be, where it is not an account
 /// of the owner's at all (`iaam-mk1n`). Named apart from every account route
 /// above because there is no account: the subject is a string a statement
@@ -3468,6 +3482,111 @@ fn account_retirement_dto(
         },
         effective_on: outcome.effective_on,
         revision: outcome.revision.0,
+    }
+}
+
+/// Whether an account has been declared a mistake.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{id}/retraction",
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    responses(
+        (status = 200, description = "What has been said about this account", body = AccountRetractionDto),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_account_retraction(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<AccountRetractionDto>, ApiFailure> {
+    let named = owned_account(&state, &principal, AccountId(id)).await?;
+    let outcome = account_retraction(&state.services, &principal, named.id).await?;
+    Ok(Json(account_retraction_dto(&named, &outcome)))
+}
+
+/// Record, or withdraw, the statement that an account should never have
+/// existed (`iaam-o0oj`).
+///
+/// **The third axis, and the reason it is neither route above it.** A
+/// retirement says a product existed and ended, and stays inside a contour on
+/// purpose. A scope disposition says a product exists and the owner's reports
+/// leave it out, on purpose, with a reason. This says there was no product: the
+/// row is an artefact, not a fact about his money, and its consequence is the
+/// one neither neighbour has — it clears the account from every report's
+/// population outright, so there is nothing left there for either axis to say
+/// about it.
+///
+/// **Refused while the account carries a business fact.** You cannot un-exist
+/// a thing money moved through; see [`iaam_core::retraction::accept_retraction`].
+///
+/// **Authority is attribution, not a flat scope.** The owner may always
+/// retract. An agent may retract only an account it declared itself —
+/// `accounts.declared_by` (`iaam-7ffl`) is what makes that checkable, the same
+/// doctrine `docs/api/conventions.md` §4.5-§4.7 apply to retracting a declared
+/// import. The floor this route publishes is the general one every agent
+/// reaches; the narrower, per-account rule is decided against the journal
+/// inside the call, exactly as an import retraction's is.
+#[utoipa::path(
+    post,
+    path = "/v1/accounts/{id}/retraction",
+    operation_id = RECORD_ACCOUNT_RETRACTION_OPERATION_ID,
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = RecordAccountRetractionRequest,
+    responses(
+        (status = 200, description = "Statement recorded or withdrawn", body = AccountRetractionDto),
+        (status = 403, description = "Insufficient privileges", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 409, description = "A statement already stands, none does to withdraw, or the account carries a business fact", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read, or the caller did not declare this account", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_account_retraction(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(request): ApiJson<RecordAccountRetractionRequest>,
+) -> Result<Json<AccountRetractionDto>, ApiFailure> {
+    require(&principal, OperationKey::RetractAccount)?;
+    let named = owned_account(&state, &principal, AccountId(id)).await?;
+
+    let outcome = if request.retracted {
+        record_account_retraction_statement(&state.services, &principal, named.id).await?
+    } else {
+        withdraw_account_retraction(&state.services, &principal, named.id).await?
+    };
+    record_decision(
+        &state,
+        &principal,
+        OperationKey::RetractAccount,
+        named.id.inner().to_string(),
+        serde_json::json!({"account": named.id.inner(), "retracted": request.retracted}),
+        "withdraw under the same account key",
+    )
+    .await?;
+    Ok(Json(account_retraction_dto(&named, &outcome)))
+}
+
+/// The answer both routes above return.
+///
+/// Built here from the account the transport already resolved, for
+/// [`account_retirement_dto`]'s own reason: the title beside the identifier
+/// comes from the read that authorised the call rather than from a second one.
+fn account_retraction_dto(
+    account: &AccountView,
+    outcome: &AccountRetractionOutcome,
+) -> AccountRetractionDto {
+    AccountRetractionDto {
+        account: outcome.account.inner(),
+        title: account.title.clone(),
+        institution: account.institution.clone(),
+        retracted: outcome.retracted,
     }
 }
 

@@ -651,7 +651,38 @@ async fn report_population(
     principal: &Principal,
     definition: &ContourDefinition,
 ) -> Result<ReportPopulation, AppError> {
-    let accounts = services.store.list_accounts(principal.owner).await?;
+    // Retracted accounts are read out before anything else touches the list:
+    // a retracted account was never an account of the owner's, so it must not
+    // reach a population at all — not `Covered`, not any of the three
+    // `Outside` standings, nothing. A caveat naming it would be exactly the
+    // sentence retraction exists to prevent: "there was never an account to
+    // leave out" is a claim about the population, not about the queue, and
+    // `iaam-o0oj`'s field session found the two do not move together
+    // (`crate::actions::frontier` filters the queue's own reads the same way).
+    //
+    // **Only the retractions that still hold**, which is a conjunction with the
+    // account carrying no business fact — see
+    // [`crate::scenarios::retraction::retractions_that_hold`]. A retraction
+    // that outlived its own premise would take the money on the account out of
+    // every report while leaving it in the journal, and §6.4 forbids that of
+    // the weaker act beside it.
+    let retracted = crate::scenarios::retraction::retractions_that_hold(
+        &services
+            .store
+            .list_account_retractions(principal.owner)
+            .await?,
+        &services
+            .store
+            .list_account_activity(principal.owner)
+            .await?,
+    );
+    let accounts: Vec<AccountView> = services
+        .store
+        .list_accounts(principal.owner)
+        .await?
+        .into_iter()
+        .filter(|account| !retracted.contains(&account.id))
+        .collect();
     let placed_elsewhere =
         accounts_placed_elsewhere(services, principal, definition, &accounts).await?;
     // The owner's own ruling, read rather than inferred. Before this read the

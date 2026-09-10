@@ -5747,6 +5747,40 @@ pub struct RecordAccountRetirementRequest {
     pub effective_on: Option<Date>,
 }
 
+/// The owner's, or an agent's, statement that an account should never have
+/// existed (`iaam-o0oj`).
+///
+/// **A third axis, not a spelling of the two above it.** A retirement says a
+/// product existed and ended; a scope disposition says a product exists and
+/// the owner's reports leave it out. This says there was never an account
+/// here at all — see `iaam_core::retraction`'s own doc comment for the
+/// distinction and why blurring it is exactly the mistake `iaam-o0oj` found.
+///
+/// `title` and `institution` travel with `account` under
+/// `docs/api/conventions.md` §3, the same as every other account route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccountRetractionDto {
+    pub account: Uuid,
+    /// What the owner calls this account.
+    pub title: String,
+    /// The institution he said holds it, when he said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub institution: Option<String>,
+    pub retracted: bool,
+}
+
+/// Record, or withdraw, that statement for one account.
+///
+/// Refused when the account carries a business fact: you cannot un-exist a
+/// thing money moved through. Refused too when a caller other than the owner
+/// did not declare the account itself — the owner may always retract, and an
+/// agent may retract only what it created (`iaam-7ffl`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+pub struct RecordAccountRetractionRequest {
+    /// `true` to record the statement, `false` to withdraw it.
+    pub retracted: bool,
+}
+
 /// The owner's statement about which of his accounts money moves between.
 ///
 /// `stated` is the field that carries the third state. An empty `partners` list

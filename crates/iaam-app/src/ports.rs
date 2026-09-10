@@ -174,6 +174,14 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         }
         // Account retirement is withdrawn under the same account key.
         OperationKey::RecordAccountRetirement => Scope::Agent,
+        // A retraction is withdrawn under the same account key, the same
+        // shape a retirement's undo has. The floor is the general one every
+        // agent reaches; which particular account an agent may retract —
+        // only one it declared itself, never the owner's or another agent's —
+        // is narrower than any scope and is decided against the account's own
+        // `declared_by`, the way `docs/api/conventions.md` §4.5-§4.7 decide an
+        // import retraction against the journal rather than at this floor.
+        OperationKey::RetractAccount => Scope::Agent,
         // A name disposition is undone by stating `undecided`, the settled
         // item's own target.
         OperationKey::RecordAccountNameDisposition => Scope::Agent,
@@ -1082,6 +1090,35 @@ pub trait Store: Send + Sync {
         owner: OwnerId,
         account: AccountId,
     ) -> Result<RetirementRevision, AppError>;
+
+    /// Every account the owner or an agent has retracted — declared should
+    /// never have existed (`iaam-o0oj`).
+    async fn list_account_retractions(&self, owner: OwnerId) -> Result<Vec<AccountId>, AppError>;
+
+    /// Record, or restate, that statement for one account.
+    ///
+    /// **Whether it may be recorded at all is not decided here.** A second
+    /// statement over a standing one, or one over an account carrying a
+    /// business fact, is refused by
+    /// [`iaam_core::retraction::accept_retraction`], the same split
+    /// [`Self::record_account_retirement`]'s own doc comment describes.
+    async fn record_account_retraction(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError>;
+
+    /// Withdraw that statement, returning the account to standing.
+    ///
+    /// Not an erasure: the account is recoverable, but nothing here restates
+    /// what the account looked like in a report published while the
+    /// retraction stood — there was nothing to publish about it, because it
+    /// was not in the population at all.
+    async fn withdraw_account_retraction(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError>;
 
     /// Every account the owner has stated the transfer partners of.
     async fn list_account_transfer_statements(

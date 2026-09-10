@@ -45,6 +45,13 @@ fn accounts_has_declared_by(store: &SqliteStore) -> bool {
         .is_ok()
 }
 
+fn has_account_retractions_table(store: &SqliteStore) -> bool {
+    store
+        .connection()
+        .prepare("SELECT account FROM account_retractions LIMIT 0")
+        .is_ok()
+}
+
 #[test]
 fn a_database_left_at_version_one_gains_the_counterparty_column() {
     let store = SqliteStore::open_in_memory().expect("open");
@@ -60,6 +67,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
             "ALTER TABLE events DROP COLUMN source_counterparty; \
              DROP TABLE event_stated_securities_value; \
              ALTER TABLE accounts DROP COLUMN declared_by; \
+             DROP TABLE account_retractions; \
              PRAGMA user_version = 1;",
         )
         .expect("winding the database back to version 1");
@@ -74,6 +82,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         !accounts_has_declared_by(&store),
         "and this column too, or migration 0004 is not actually being exercised"
+    );
+    assert!(
+        !has_account_retractions_table(&store),
+        "and this table too, or migration 0005 is not actually being exercised"
     );
 
     migrate(store.connection()).expect("migrating the wound-back database");
@@ -91,6 +103,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         accounts_has_declared_by(&store),
         "and it must gain the column 0004 adds, for the same reason as source_counterparty"
+    );
+    assert!(
+        has_account_retractions_table(&store),
+        "and it must gain the table 0005 adds, for the same reason"
     );
     assert_eq!(
         user_version(&store),
@@ -137,15 +153,17 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
         .expect("seeding an invented journal");
 
     // Back to the version before the rebuild, so `migrate` performs it again —
-    // this time over a journal that is not empty. `accounts.declared_by` is
-    // dropped too: `migrate` still catches this database up to the current
-    // `SCHEMA_VERSION` afterwards, and migration 0004's `ALTER TABLE ... ADD
-    // COLUMN` would otherwise find the column already there from the initial
-    // `open_in_memory` and fail on a name that already exists.
+    // this time over a journal that is not empty. `accounts.declared_by` and
+    // `account_retractions` are dropped too: `migrate` still catches this
+    // database up to the current `SCHEMA_VERSION` afterwards, and migrations
+    // 0004 and 0005 would otherwise find the column and the table already
+    // there from the initial `open_in_memory` and fail on a name that already
+    // exists.
     connection
         .execute_batch(
             "DROP TABLE event_stated_securities_value; \
              ALTER TABLE accounts DROP COLUMN declared_by; \
+             DROP TABLE account_retractions; \
              PRAGMA user_version = 2;",
         )
         .expect("winding the database back to version 2");

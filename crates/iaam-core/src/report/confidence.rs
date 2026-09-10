@@ -300,9 +300,22 @@ impl CaveatKind {
                 OperationKey::AddContourVersion,
                 OperationKey::RecordAccountScope,
             ],
-            Self::AccountInAnotherScope | Self::AccountRuledOutside => {
-                &[OperationKey::AddContourVersion]
-            }
+            Self::AccountInAnotherScope => &[OperationKey::AddContourVersion],
+            // Membership was long the only call that reached this line's own
+            // state — the owner has already ruled, so the scope call has
+            // nothing left to record — but "he ruled it outside every scope"
+            // and "he never in fact created it" are different sentences, and
+            // this line could answer only the first. `RetractAccount` answers
+            // the second: an empty account ruled outside every scope is
+            // exactly the state a mistaken creation leaves behind, and it
+            // closes this line by removing the account from the population
+            // rather than moving it inside a contour. It is refused, as
+            // membership never is, wherever the account carries a business
+            // fact.
+            Self::AccountRuledOutside => &[
+                OperationKey::AddContourVersion,
+                OperationKey::RetractAccount,
+            ],
             Self::RunningCashSum => &[OperationKey::SubmitOperations],
             Self::RetiredAccountNotEmpty => &[
                 OperationKey::SubmitOperations,

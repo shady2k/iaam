@@ -876,6 +876,37 @@ impl Store for SqliteAdapter {
         .await
     }
 
+    async fn list_account_retractions(&self, owner: OwnerId) -> Result<Vec<AccountId>, AppError> {
+        self.blocking(move |store| store.list_account_retractions(owner).map_err(store_error))
+            .await
+    }
+
+    async fn record_account_retraction(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .record_account_retraction(owner, account)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn withdraw_account_retraction(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), AppError> {
+        self.blocking(move |store| {
+            store
+                .withdraw_account_retraction(owner, account)
+                .map_err(store_error)
+        })
+        .await
+    }
+
     async fn list_account_transfer_statements(
         &self,
         owner: OwnerId,

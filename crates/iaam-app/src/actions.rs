@@ -2299,11 +2299,38 @@ pub async fn frontier(
     store: &dyn Store,
     rules: &dyn ClassificationRuleStore,
 ) -> Result<Vec<Action>, AppError> {
-    let accounts = store.list_accounts(owner).await?;
+    // Retracted first, and every other per-account read filtered against it
+    // below: a retracted account is not merely ineligible for one item, it was
+    // never an account at all (`iaam-o0oj`). Filtering `accounts` alone would
+    // leave it standing in `activity`, and `AccountNames::get` would then meet
+    // an account named by an activity row that the accounts list does not
+    // hold — the exact "store contradicting itself" state that accessor
+    // exists to catch, for an account that is not contradicting anything.
+    //
+    // **Which retractions hold is a conjunction, not a lookup.** A fact that
+    // arrived after a retraction was accepted brings its account back — see
+    // `crate::scenarios::retraction::retractions_that_hold`, which states why:
+    // a retraction that outlived its own premise would leave money in the
+    // journal and in no report, and §6.4 forbids exactly that of the weaker
+    // act beside it.
+    let all_activity = store.list_account_activity(owner).await?;
+    let retracted = crate::scenarios::retraction::retractions_that_hold(
+        &store.list_account_retractions(owner).await?,
+        &all_activity,
+    );
+    let accounts: Vec<AccountView> = store
+        .list_accounts(owner)
+        .await?
+        .into_iter()
+        .filter(|account| !retracted.contains(&account.id))
+        .collect();
     let contours = store.list_contours(owner).await?;
     let exclusions = store.list_account_scope_exclusions(owner).await?;
     let transfers = store.list_account_transfer_statements(owner).await?;
-    let activity = store.list_account_activity(owner).await?;
+    let activity: Vec<AccountActivityView> = all_activity
+        .into_iter()
+        .filter(|activity| !retracted.contains(&activity.account))
+        .collect();
     let rule_views = rules.list_rules(owner).await?;
     let retired_rule_ids: BTreeSet<String> = rule_views
         .iter()
@@ -3447,10 +3474,10 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
             + questions.len()
             + sessions.len(),
     );
-    for account in activity
-        .iter()
-        .filter(|activity| account_import_eligibility(activity) && account_import_gap(activity))
-    {
+    for account in activity.iter().filter(|activity| {
+        account_import_eligibility(activity, retired.products(), contours, exclusions)
+            && account_import_gap(activity)
+    }) {
         actions.push(start_account_import_action(names.get(account.account)?));
     }
     for account in activity
@@ -3583,13 +3610,43 @@ fn actions_from_state(state: &OwnerState<'_>) -> Result<Vec<Action>, AppError> {
     Ok(actions)
 }
 
-/// An account is always eligible to be imported into.
+/// An account is eligible to be asked for a statement unless the owner has
+/// already said, in one of two ways, that no statement is coming.
 ///
-/// Kept as a named function beside the gap and the completion rather than
-/// folded away: the three are separate concepts everywhere else in this module,
-/// and an eligibility that silently does not exist is how the distinction rots.
-const fn account_import_eligibility(_activity: &AccountActivityView) -> bool {
-    true
+/// **Retirement and an outside-every-scope ruling both suppress the item, and
+/// each does so for a different reason** — `docs/api/conventions.md` §6 is the
+/// authority for keeping them apart, and this predicate must not blur them
+/// into one condition that happens to read the same.
+///
+/// - **Retirement** says the product ceased. A ceased product has no future
+///   statement to ask for: the owner is not going to receive another
+///   month's export from a bank that closed the account, so asking is a
+///   question with a knowable, permanent answer of "no".
+/// - **Ruled outside every scope** says the account's money is not in any of
+///   his reports, with a reason. An account his reports do not read from is
+///   not one his reports need rows from — the import would be recorded and
+///   then folded into nothing, because every contour that could fold it has
+///   already been told to leave it out.
+///
+/// Neither means "this account should never have existed" — see
+/// [`iaam_core::retraction`] for the third act that does, and for why
+/// suppressing this item is not what closes that state.
+///
+/// Kept as a named function beside the gap and the completion, as the three
+/// other goals in this module are: an eligibility that silently does not
+/// exist is how the distinction rots.
+fn account_import_eligibility(
+    activity: &AccountActivityView,
+    retired: &[RetiredProduct],
+    contours: &[ContourView],
+    exclusions: &[AccountScopeExclusionView],
+) -> bool {
+    let retired = retired
+        .iter()
+        .any(|product| product.account == activity.account);
+    let ruled_outside =
+        account_scope(activity.account, contours, exclusions) == AccountScope::Outside;
+    !retired && !ruled_outside
 }
 
 fn account_import_gap(activity: &AccountActivityView) -> bool {
@@ -9445,6 +9502,73 @@ mod tests {
             .expect("actions from state")
             .iter()
             .all(|action| action.kind() != ActionKind::StartAccountImport)
+        );
+    }
+
+    /// A retired account with no facts is not asked for a statement — the
+    /// case `iaam-o0oj`'s acceptance criteria name directly: a product the
+    /// owner says ceased has no future statement to ask for.
+    #[test]
+    fn a_retired_empty_account_is_not_asked_for_a_statement() {
+        let account = account();
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&account),
+            contours: &[],
+            exclusions: &[],
+            transfers: &[],
+            activity: &[no_facts(account.id)],
+            assertions: &[],
+            retired: RetirementAssessment::Assessed(&[ceased(account.id, true)]),
+            sessions: &[],
+            questions: &[],
+            may_generalise: true,
+            rules: &[],
+            wanted_accounts: &[],
+        })
+        .expect("actions from state");
+
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.kind() != ActionKind::StartAccountImport),
+            "a retired account must not go on asking for a statement: {actions:#?}"
+        );
+    }
+
+    /// An account ruled outside every scope, with no facts, is not asked for a
+    /// statement either — the second half of `iaam-o0oj`'s acceptance
+    /// criteria, and a different reason from retirement: his reports do not
+    /// want this account's rows, so importing into it answers nothing any
+    /// report reads.
+    #[test]
+    fn an_account_ruled_outside_every_scope_is_not_asked_for_a_statement() {
+        let account = account();
+        let exclusion = AccountScopeExclusionView {
+            account: account.id,
+            reason: "Not the owner's money.".to_owned(),
+        };
+        let actions = actions_from_state(&OwnerState {
+            accounts: std::slice::from_ref(&account),
+            contours: &[],
+            exclusions: std::slice::from_ref(&exclusion),
+            transfers: &[],
+            activity: &[no_facts(account.id)],
+            assertions: &[],
+            retired: RetirementAssessment::Assessed(&[]),
+            sessions: &[],
+            questions: &[],
+            may_generalise: true,
+            rules: &[],
+            wanted_accounts: &[],
+        })
+        .expect("actions from state");
+
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.kind() != ActionKind::StartAccountImport),
+            "an account ruled outside every scope must not go on asking for a statement: \
+             {actions:#?}"
         );
     }
 

@@ -229,6 +229,23 @@ pub enum OperationKey {
     /// `ControlAssertion` removes the claim, and `observe` runs over the same
     /// effective set, so superseding a journal event changes what was observed.
     SubmitCorrections,
+    /// Record, or withdraw, the statement that an account should never have
+    /// existed (`iaam-o0oj`).
+    ///
+    /// **A third axis, not a spelling of the other two.** [`Self::RecordAccountRetirement`]
+    /// says a product existed and ended; [`Self::RecordAccountScope`] says a
+    /// product exists and the owner's reports leave it out. Both presuppose the
+    /// account is real. This says it never was one — the row is an artefact, not
+    /// a fact about his money — and its consequence is the one neither
+    /// neighbour has: it clears the account from a report's population outright
+    /// rather than annotating it there, so there is nothing left for
+    /// [`crate::report::confidence::CaveatKind`] to say about it.
+    ///
+    /// Named here because `AccountRuledOutside` offers it: an account ruled
+    /// outside every scope that also carries no business fact is exactly the
+    /// state a mistaken creation leaves behind, and retraction is the call that
+    /// removes the row rather than annotating it.
+    RetractAccount,
 }
 
 impl OperationKey {
@@ -242,7 +259,7 @@ impl OperationKey {
     /// The declared length is the only thing holding the twenty-second variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -265,6 +282,7 @@ impl OperationKey {
         Self::CommitImportSession,
         Self::AbandonImportSession,
         Self::SubmitCorrections,
+        Self::RetractAccount,
     ];
 
     /// The route operation identifier declared by the transport.
@@ -293,6 +311,7 @@ impl OperationKey {
             Self::CommitImportSession => "commit_import_session",
             Self::AbandonImportSession => "abandon_import_session",
             Self::SubmitCorrections => "submit_corrections",
+            Self::RetractAccount => "record_account_retraction",
         }
     }
 }

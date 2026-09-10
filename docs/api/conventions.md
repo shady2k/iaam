@@ -535,6 +535,8 @@ The undo must be part of the operation's contract:
 - Rules are undone by retirement, and retirement reports what the rule reached.
 - Transfer partners and account scope are restated under their existing keys.
 - Retirement is withdrawn under the same account key.
+- Retraction is withdrawn under the same account key, the same shape a
+  retirement's own undo has. §6.6 draws the line between the two.
 - A name disposition is undone with `disposition: undecided`.
 - Corrections are append-only facts and are undone by another correction.
 - A control balance is restated under the same account and period. It is
@@ -558,6 +560,8 @@ write above.
 | Repair custody, upload and reparse a document | yes | yes | no |
 | Retract an import the caller declared, untouched | yes | yes | no |
 | Retract any other import | yes | no | no |
+| Retract an account the caller declared, empty of business facts | yes | yes | no |
+| Retract any other account | yes | no | no |
 | Reverse or replace a named journal event | yes | yes | no |
 | Confirm a transfer pairing (writes two corrections) | yes | yes | no |
 | Record a control balance | yes | yes | no |
@@ -970,6 +974,45 @@ Retiring an account that still holds money is **not** refused. It is his
 statement about his product, and refusing it because a fold disagrees would make
 his word conditional on how much of his history has been imported. §6.4 is what
 makes that safe.
+
+### 6.6 A third axis: a row that should never have existed
+
+A retirement and a scope exclusion both presuppose an account: something real
+that either stopped existing or that the owner's reports leave out on purpose.
+`iaam-o0oj` found a case neither answers. A probe rebuilding one instance from
+another minted three accounts the owner confirmed he never created. Retiring
+them said "these products existed and ended" — false, nothing ever existed.
+Ruling them outside every scope said "I have decided my reports do not want
+this money" — also false, and worse: it makes an account the owner
+*deliberately* excluded indistinguishable from leftover test data, which is
+exactly the confusion §6.1's fork exists to prevent one axis over.
+
+**Retraction is the third act, and it removes rather than annotates.** A
+retirement and a scope exclusion both add a fact *beside* the account inside a
+report's population — a date, a standing. Retraction takes the account out of
+the population outright: `population.outside[]` does not name it, no caveat is
+raised about it, and the outstanding-work queue names it nowhere. Nothing was
+omitted, because there was never an account to leave out — which is a sentence
+neither neighbour can make true, because both keep the row standing.
+
+**It is refused wherever the account carries a business fact.** You cannot
+un-exist a thing money moved through — the same restraint §6.4 places on a
+retirement's own refusal, read the other way: there `RetiredAccountNotEmpty`
+lets the row stand and names the remedy, here the call itself refuses and
+names the remedy — retract a fact that should never have counted with a
+correction, or record a retirement instead where the fact is real and the
+product simply ceased.
+
+**Its authority is attribution, not a flat scope.** The owner may always
+retract. An agent may retract only an account it declared itself —
+`accounts.declared_by` (`iaam-7ffl`) is what makes that checkable, the exact
+doctrine §4.5-§4.7 already state for retracting a declared import, carried
+over to an account instead of a journal fact.
+
+**It is itself a standing decision, and it is withdrawable** under the same
+account key, §4.2's own list. A wrong retraction is recoverable — the account
+returns to standing, and every report and the queue see it again — because an
+act this consequential must not be more dangerous than the mess it cleans.
 
 ---
 

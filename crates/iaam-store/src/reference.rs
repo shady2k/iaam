@@ -1554,6 +1554,67 @@ impl SqliteStore {
         Ok(exclusions)
     }
 
+    /// Record, or restate, that an account should never have existed
+    /// (`iaam-o0oj`).
+    ///
+    /// An upsert, the same shape [`Self::record_account_scope_exclusion`]
+    /// uses and for the same reason: presence is the whole of a retraction,
+    /// there is no date and no reason to overwrite, so a second call while one
+    /// stands changes nothing on disk even though the caller above refuses it
+    /// before reaching here.
+    pub fn record_account_retraction(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO account_retractions (owner, account, recorded_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (owner, account) DO UPDATE SET
+                 recorded_at = excluded.recorded_at
+             WHERE account_retractions.owner = excluded.owner",
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Withdraw the statement, returning the account to standing.
+    ///
+    /// Deletes the row rather than writing a third value, for
+    /// [`Self::clear_account_scope_exclusion`]'s reason: the absence of a row
+    /// is what "not retracted" means everywhere else this table is read, and
+    /// two ways of spelling one state is how they disagree.
+    pub fn withdraw_account_retraction(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM account_retractions WHERE owner = ?1 AND account = ?2",
+            params![owner.inner().to_string(), account.inner().to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Every account the owner or an agent has retracted, still standing.
+    pub fn list_account_retractions(&self, owner: OwnerId) -> Result<Vec<AccountId>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT account FROM account_retractions
+             WHERE owner = ?1 ORDER BY account",
+        )?;
+        let rows =
+            statement.query_map([owner.inner().to_string()], |row| row.get::<_, String>(0))?;
+        let mut retracted = Vec::new();
+        for row in rows {
+            retracted.push(AccountId(parse_uuid(&row?, "account")?));
+        }
+        Ok(retracted)
+    }
+
     /// Highest circuit version. Report without an explicitly specified version
     /// is calculated from the last one—and writes it to the applied rules.
     pub fn latest_contour_version(

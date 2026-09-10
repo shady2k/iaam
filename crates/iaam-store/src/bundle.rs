@@ -262,6 +262,18 @@ pub struct AccountScopeExclusionSection {
     pub recorded_at: String,
 }
 
+/// The owner's or an agent's statement that an account should never have
+/// existed, carried the way `account_retractions` stores it (`iaam-o0oj`).
+///
+/// No `reason`, unlike its neighbour one type up: a retraction has no
+/// judgement to record beyond "this was a mistake", and who made the call
+/// travels on `decision_history` instead, exactly as it does for a retirement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountRetractionSection {
+    pub account: uuid::Uuid,
+    pub recorded_at: String,
+}
+
 /// The owner's statement about one account's transfer partners: one row of
 /// `account_transfer_statements` plus the `account_transfer_partners` it
 /// names.
@@ -762,6 +774,10 @@ pub struct Bundle {
     /// The full `account_retirements` history, every revision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_retirements: Vec<AccountRetirementSection>,
+    /// The owner's or an agent's standing declarations that an account should
+    /// never have existed (`iaam-o0oj`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_retractions: Vec<AccountRetractionSection>,
     /// Every account alias.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_aliases: Vec<AccountAliasSection>,
@@ -857,6 +873,8 @@ struct BundleContent<'a> {
     account_transfers: &'a [AccountTransferSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     account_retirements: &'a [AccountRetirementSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    account_retractions: &'a [AccountRetractionSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     account_aliases: &'a [AccountAliasSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -977,6 +995,7 @@ impl Bundle {
             account_scope_exclusions: &self.account_scope_exclusions,
             account_transfers: &self.account_transfers,
             account_retirements: &self.account_retirements,
+            account_retractions: &self.account_retractions,
             account_aliases: &self.account_aliases,
             declined_account_names: &self.declined_account_names,
             decision_history: &self.decision_history,
@@ -1163,6 +1182,10 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("account_transfer_statements", TableDisposition::Carried),
     ("account_transfer_partners", TableDisposition::Carried),
     ("account_retirements", TableDisposition::Carried),
+    // A standing decision like the two above it, and carried for the same
+    // reason: a restore that dropped it would silently un-retract an account
+    // an agent had withdrawn from every report (`iaam-o0oj`).
+    ("account_retractions", TableDisposition::Carried),
     ("account_aliases", TableDisposition::Carried),
     ("declined_account_names", TableDisposition::Carried),
     ("decision_history", TableDisposition::Carried),
@@ -1602,6 +1625,24 @@ impl SqliteStore {
                 revision,
                 account: parse(&account, "account")?,
                 effective_on,
+                recorded_at,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT account, recorded_at
+             FROM account_retractions
+             WHERE owner = ?1
+             ORDER BY account",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut account_retractions = Vec::new();
+        for row in rows {
+            let (account, recorded_at) = row?;
+            account_retractions.push(AccountRetractionSection {
+                account: parse(&account, "account")?,
                 recorded_at,
             });
         }
@@ -2467,6 +2508,7 @@ impl SqliteStore {
             account_scope_exclusions,
             account_transfers,
             account_retirements,
+            account_retractions,
             account_aliases,
             declined_account_names,
             decision_history,
@@ -2654,6 +2696,19 @@ impl SqliteStore {
                     retirement.account.to_string(),
                     retirement.effective_on,
                     retirement.recorded_at,
+                ],
+            )?;
+        }
+
+        for retraction in &bundle.account_retractions {
+            transaction.execute(
+                "INSERT INTO account_retractions (owner, account, recorded_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (owner, account) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    retraction.account.to_string(),
+                    retraction.recorded_at,
                 ],
             )?;
         }

@@ -14577,6 +14577,336 @@ async fn a_classification_rule_that_matches_nothing_returns_an_empty_plan() {
     );
 }
 
+/// The plan can be read without writing a rule to provoke it (`iaam-k3gh.14`).
+///
+/// A caller who wants to know whether the standing rule set has reached the
+/// recorded journal used to have no way to ask except by writing a rule and
+/// reading the plan that write provoked. `GET /v1/classification-rules/plan`
+/// answers the same question with no write of its own.
+#[tokio::test]
+async fn the_recompute_plan_is_readable_without_writing_a_rule() {
+    let harness = harness().await;
+    let operations = json!({
+        "source_label": "test",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "1200.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-12" },
+            "source_kind": "Card operation",
+            "description": "Shop One",
+            "idempotency_key": "plan-route-withdrawal"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let event = verdicts[0]["event_id"]
+        .as_str()
+        .expect("the recorded event")
+        .to_owned();
+
+    let rule = json!({
+        "matcher": { "description_contains": "shop one" },
+        "outcome": { "kind": "fee", "origin": "account_maintenance" },
+    });
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/classification-rules", &harness.owner_token, &rule),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let rules_before = classification_rule_count(&harness).await;
+
+    // Asked for on its own: no rule is written, and the request carries no
+    // proposal to evaluate — the question is "what does the rule set as it
+    // stands imply", not "what would this hypothetical rule do".
+    let (status, plan) = call(
+        &harness.router,
+        get("/v1/classification-rules/plan", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["applied"], false, "{plan}");
+    let corrections = plan["corrections"].as_array().expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{plan}");
+    assert_eq!(corrections[0]["event"], event, "{plan}");
+    assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{plan}");
+
+    // Reading it wrote nothing: the rule set did not grow, and the same
+    // correction is still pending on a second read — had the read applied
+    // anything, the event would already read as `fee` and the correction
+    // would be gone from the plan a second call returns.
+    assert_eq!(
+        classification_rule_count(&harness).await,
+        rules_before,
+        "reading the plan must not write a rule"
+    );
+    let (status, plan_again) = call(
+        &harness.router,
+        get("/v1/classification-rules/plan", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan_again}");
+    assert_eq!(
+        plan_again, plan,
+        "reading the plan twice must read the same thing"
+    );
+}
+
+/// The plan is a report over decisions already on record, not a proposal to
+/// simulate, so a read-only token reaches it exactly as it reaches
+/// `GET /v1/classification-rules` beside it (conventions §4.3).
+#[tokio::test]
+async fn a_read_only_token_can_read_the_recompute_plan() {
+    let harness = harness().await;
+    let (status, plan) = call(
+        &harness.router,
+        get(
+            "/v1/classification-rules/plan",
+            Some(&harness.readonly_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["applied"], false, "{plan}");
+    assert!(
+        plan["corrections"]
+            .as_array()
+            .expect("a plan, not silence")
+            .is_empty(),
+        "{plan}"
+    );
+}
+
+/// The identifier a recorded batch-row verdict names its rule with.
+///
+/// `VerdictDto::accepted_classification_rule` carries the identifier in
+/// `detail` — "classification rule `<id>` was recorded" — the same shape
+/// `accepted_category_rule` uses, and this is the one place a test has to
+/// agree with that sentence's words in order to pull the identifier back out.
+fn rule_id_from_verdict(verdict: &Value) -> String {
+    verdict["detail"]
+        .as_str()
+        .expect("a recorded verdict names the rule it wrote")
+        .split_whitespace()
+        .nth(2)
+        .expect("\"classification rule <id> was recorded\"")
+        .to_owned()
+}
+
+/// A batch of classification rules, one verdict per rule, in request order
+/// (`iaam-k3gh.3`).
+#[tokio::test]
+async fn a_classification_rule_batch_writes_several_rules_in_request_order() {
+    let harness = harness().await;
+    let batch = json!({
+        "rules": [
+            { "matcher": { "description_contains": "alpha" }, "outcome": { "kind": "income" } },
+            { "matcher": { "description_contains": "beta" }, "outcome": { "kind": "fee", "origin": "other" } },
+            { "matcher": { "description_contains": "gamma" }, "outcome": { "kind": "refund" } },
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules/batch",
+            &harness.owner_token,
+            &batch,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let verdicts = verdicts.as_array().expect("one verdict per rule");
+    assert_eq!(verdicts.len(), 3, "{verdicts:?}");
+    for (index, verdict) in verdicts.iter().enumerate() {
+        assert_eq!(verdict["row"], index + 1, "{verdict}");
+        assert_eq!(verdict["verdict"], "provisional", "{verdict}");
+    }
+
+    let (status, history) = call(
+        &harness.router,
+        get("/v1/classification-rules", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let history = history.as_array().expect("history");
+    assert_eq!(history.len(), 3, "{history:?}");
+
+    // Each verdict names the rule its own request row wrote: reading the
+    // identifier back out of the verdict and the matcher back out of the
+    // listing must agree that request order was preserved end to end, not
+    // merely that three rules of some order arrived.
+    let expected = [
+        ("alpha", json!({ "kind": "income" })),
+        ("beta", json!({ "kind": "fee", "origin": "other" })),
+        ("gamma", json!({ "kind": "refund" })),
+    ];
+    for (verdict, (description, outcome)) in verdicts.iter().zip(expected) {
+        let id = rule_id_from_verdict(verdict);
+        let rule = history
+            .iter()
+            .find(|rule| rule["id"] == json!(id))
+            .unwrap_or_else(|| panic!("rule {id} from the verdict is in the listing"));
+        assert_eq!(
+            rule["matcher"],
+            json!({ "description_contains": description }),
+            "{rule}"
+        );
+        assert_eq!(rule["outcome"], outcome, "{rule}");
+    }
+}
+
+/// A bad rule among good ones is readable from its own verdict, and writes
+/// nothing, while its neighbours are written as if it were never sent.
+#[tokio::test]
+async fn a_classification_rule_batch_reports_a_bad_rule_without_losing_its_neighbours() {
+    let harness = harness().await;
+    let rules_before = classification_rule_count(&harness).await;
+    let batch = json!({
+        "rules": [
+            { "matcher": { "description_contains": "alpha" }, "outcome": { "kind": "income" } },
+            { "matcher": { "description_contains": "beta" }, "outcome": { "kind": "not_a_real_kind" } },
+            { "matcher": { "description_contains": "gamma" }, "outcome": { "kind": "refund" } },
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules/batch",
+            &harness.owner_token,
+            &batch,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let verdicts = verdicts.as_array().expect("one verdict per rule");
+    assert_eq!(verdicts.len(), 3, "{verdicts:?}");
+    assert_eq!(verdicts[0]["row"], 1, "{verdicts:?}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts:?}");
+    assert_eq!(verdicts[1]["row"], 2, "{verdicts:?}");
+    assert_eq!(verdicts[1]["verdict"], "rejected", "{verdicts:?}");
+    assert_eq!(verdicts[1]["field"], "outcome", "{verdicts:?}");
+    assert_eq!(verdicts[1]["actual"], "not_a_real_kind", "{verdicts:?}");
+    assert_eq!(verdicts[2]["row"], 3, "{verdicts:?}");
+    assert_eq!(verdicts[2]["verdict"], "provisional", "{verdicts:?}");
+
+    // What happened to each rule is readable from its own verdict, without
+    // re-listing the whole rule set — and the rejected row wrote nothing: the
+    // count grew by exactly the two good rules.
+    assert_eq!(
+        classification_rule_count(&harness).await,
+        rules_before + 2,
+        "the rejected row must not have written anything"
+    );
+}
+
+/// The scope floor a single rule write publishes is the floor the batch keeps.
+#[tokio::test]
+async fn a_read_only_token_cannot_batch_write_classification_rules() {
+    let harness = harness().await;
+    let rules_before = classification_rule_count(&harness).await;
+    let batch = json!({
+        "rules": [
+            { "matcher": { "description_contains": "alpha" }, "outcome": { "kind": "income" } },
+        ]
+    });
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules/batch",
+            &harness.readonly_token,
+            &batch,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(response["code"], "forbidden", "{response}");
+    assert_eq!(
+        classification_rule_count(&harness).await,
+        rules_before,
+        "a refused batch must write nothing"
+    );
+}
+
+/// The intended pairing (`iaam-k3gh.3`, `iaam-k3gh.14`): the batch restores a
+/// rule set fast and reports what happened to each rule; the plan route
+/// answers what the restored rule set, taken as a whole, now implies about
+/// the journal — asked for once, rather than once per rule.
+#[tokio::test]
+async fn a_classification_rule_batch_is_read_through_the_plan_route_afterwards() {
+    let harness = harness().await;
+    let operations = json!({
+        "source_label": "test",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "withdrawal",
+            "amount": "1200.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-12" },
+            "source_kind": "Card operation",
+            "description": "Shop One",
+            "idempotency_key": "batch-then-plan-withdrawal"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let event = verdicts[0]["event_id"]
+        .as_str()
+        .expect("the recorded event")
+        .to_owned();
+
+    let batch = json!({
+        "rules": [
+            { "matcher": { "description_contains": "nothing matches this" }, "outcome": { "kind": "income" } },
+            {
+                "matcher": { "description_contains": "shop one" },
+                "outcome": { "kind": "fee", "origin": "account_maintenance" },
+            },
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/classification-rules/batch",
+            &harness.owner_token,
+            &batch,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert!(
+        verdicts
+            .as_array()
+            .expect("verdicts")
+            .iter()
+            .all(|verdict| verdict["verdict"] == "provisional"),
+        "{verdicts}"
+    );
+
+    // One call answers what the whole batch now implies, rather than reading
+    // it off either of the two verdicts above — neither of which carries a
+    // plan at all.
+    let (status, plan) = call(
+        &harness.router,
+        get("/v1/classification-rules/plan", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    let corrections = plan["corrections"].as_array().expect("a plan, not silence");
+    assert_eq!(corrections.len(), 1, "{plan}");
+    assert_eq!(corrections[0]["event"], event, "{plan}");
+    assert_eq!(corrections[0]["becomes"]["kind"], "fee", "{plan}");
+}
+
 /// Two contours exist and one account belongs to neither.
 ///
 /// The queue was silent about this for the whole life of an instance after its

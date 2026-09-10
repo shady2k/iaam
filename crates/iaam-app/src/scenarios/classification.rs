@@ -251,6 +251,65 @@ pub async fn retire_rule(
     recompute_history(services, principal.owner).await
 }
 
+/// One row of a classification-rule batch, in the classifier's own types.
+///
+/// `outcome` is a `Result` and not a bare [`Classification`] because parsing it
+/// is the one part of a row that can fail before anything is written — the
+/// transport's `ClassifiedAsDto::to_domain` returns exactly that `Result` — and
+/// a row whose outcome the classifier does not recognise must still occupy its
+/// place in the batch's answer rather than aborting rows behind it. `matcher`
+/// carries no such case: `RuleMatcherDto::to_domain` cannot fail.
+#[derive(Debug)]
+pub struct RuleBatchRow {
+    pub matcher: RuleMatcher,
+    pub outcome: Result<Classification, AppError>,
+    pub replaces: Option<Uuid>,
+}
+
+/// Write several rules independently, and answer with one outcome per row.
+///
+/// **Deliberately not [`create_rule`] called in a loop.** That function
+/// recomputes the plan after its one write, and calling it 2 708 times would
+/// recompute the plan 2 708 times over the same rule set and the same
+/// journal — expensive for a number nobody reads that way, because a plan
+/// only means anything for the rule set as it stands once the whole batch has
+/// landed. So this writes each row with the store port directly and computes
+/// no plan at all; the plan for the resulting rule set is `GET
+/// /v1/classification-rules/plan` (iaam-k3gh.14), asked once, after the
+/// batch — see `create_classification_rules_batch_route`'s own doc comment for
+/// how the two calls are meant to be used together.
+///
+/// The readability check still runs once, before any row is written, for the
+/// same reason [`create_rule`] runs it before its own single write: a rule
+/// already in the set that this build cannot read must refuse the whole batch
+/// before the store holds even the first of 2 708 new rows, not after.
+///
+/// A row's own failure — an unreadable outcome, or a store refusal such as an
+/// unknown `replaces` target — is carried in that row's `Result` rather than
+/// raised, so one bad rule among many good ones does not cost the caller the
+/// rest of the restore.
+pub async fn create_rules_batch(
+    services: &AppServices,
+    principal: &Principal,
+    rows: Vec<RuleBatchRow>,
+) -> Result<Vec<Result<ClassificationRuleView, AppError>>, AppError> {
+    refuse_unreadable_rules(services, principal.owner).await?;
+    let mut results = Vec::with_capacity(rows.len());
+    for row in rows {
+        let outcome = match row.outcome {
+            Ok(classification) => {
+                services
+                    .rules
+                    .create_rule(principal.owner, row.matcher, classification, row.replaces)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        results.push(outcome);
+    }
+    Ok(results)
+}
+
 /// What the current rule set says the recorded history should be corrected to.
 ///
 /// **The plan is returned, not applied**, and the caller is the owner's
@@ -287,7 +346,17 @@ pub async fn retire_rule(
 /// correction. This scenario does not modify events itself or perform monetary
 /// arithmetic in the wrapper; it only builds the same correction candidates and
 /// preview that the acknowledged route will later write.
-async fn recompute_history(
+///
+/// **Public because a third caller needs it that writes nothing at all.**
+/// [`create_rule`] and [`retire_rule`] still call it after their one write, as
+/// before; `GET /v1/classification-rules/plan` calls it with no write
+/// preceding it, to answer "what does the rule set as it stands imply about
+/// the journal as it stands" without a caller writing a rule merely to provoke
+/// the plan it wanted to read (iaam-k3gh.14). Nothing about the function
+/// changes for that reader: it already read the store fresh on every call
+/// rather than carrying state left over from a write, so a caller that never
+/// wrote anything is not a new code path, only a third reader of the same one.
+pub async fn recompute_history(
     services: &AppServices,
     owner: OwnerId,
 ) -> Result<RecomputePlan, AppError> {

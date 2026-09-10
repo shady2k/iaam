@@ -32,7 +32,9 @@ use iaam_app::scenarios::categories::{
     list_category_rules, list_groups, preview_category_rule, preview_category_rules,
     retire_category,
 };
-use iaam_app::scenarios::classification::{create_rule, list_rules, retire_rule};
+use iaam_app::scenarios::classification::{
+    RuleBatchRow, create_rule, create_rules_batch, list_rules, recompute_history, retire_rule,
+};
 use iaam_app::scenarios::correction::{ImportTarget, correct_events};
 use iaam_app::scenarios::documents::{reparse_report, upload_report};
 use iaam_app::scenarios::import_session::{HeldRow, IntakeOutcome, SessionContents, submit_intake};
@@ -92,18 +94,19 @@ use crate::dto::{
     BalancesReportSeriesEntryDto, BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto,
     CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryMatcherDto, CategoryRequest,
     CategoryRuleBatchRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest,
-    ClassificationRuleChangeDto, ClassificationRuleDto, ClassificationRuleRequest, ContourDto,
-    ContourVersionDto, CorrectImportRequest, CorrectionVerdictDto, CreateAccountRequest,
-    CreateAccountsBatchRequest, CreateContourVersionRequest, CreateInstrumentRequest,
-    CreateTokenRequest, CurrencyDto, DecisionDto, DeclaredAccountDto, DeclaredSourceDto,
-    DocumentDto, DocumentParams, FxRateDto, HealthDto, ImportCorrectionDto, InputAlternativeDto,
-    InstrumentDto, InstrumentListDto, IssuedTokenDto, JournalAggregateDto, JournalEventReadDto,
-    JournalPageDto, MarketFxDto, MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto,
-    MarketPriceDto, MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto,
-    MoneyFlowReportDto, NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest,
-    OwnerQuestionDto, PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto,
-    QuotationBasisStatusDto, RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto,
-    ReconciliationStatusDto, RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
+    ClassificationRuleBatchRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
+    ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
+    CorrectionVerdictDto, CreateAccountRequest, CreateAccountsBatchRequest,
+    CreateContourVersionRequest, CreateInstrumentRequest, CreateTokenRequest, CurrencyDto,
+    DecisionDto, DeclaredAccountDto, DeclaredSourceDto, DocumentDto, DocumentParams, FxRateDto,
+    HealthDto, ImportCorrectionDto, InputAlternativeDto, InstrumentDto, InstrumentListDto,
+    IssuedTokenDto, JournalAggregateDto, JournalEventReadDto, JournalPageDto, MarketFxDto,
+    MarketFxSeriesDto, MarketKeyRateDto, MarketKeyRateSeriesDto, MarketPriceDto,
+    MarketPriceSeriesDto, MarketSourceDto, MarketSyncRequest, MissingInputDto, MoneyFlowReportDto,
+    NegativeBalanceExpectationDto, OperationHistoryDto, OwnerBalanceRequest, OwnerQuestionDto,
+    PrintedAccountNameDto, ProposedAnswerDto, QuotationBasisDto, QuotationBasisStatusDto,
+    RecomputePlanDto, ReconciliationParams, ReconciliationResponseDto, ReconciliationStatusDto,
+    RecordAccountNameDispositionRequest, RecordAccountScopeRequest,
     RecordAccountTransferPartnersBatchRequest, RecordAccountTransferPartnersRequest,
     RenameAccountRequest, RenameAccountsBatchRequest, ReplaceAccountAliasesBatchRequest,
     ReplaceAccountAliasesRequest, ReplaceAccountDeclarationsBatchRequest,
@@ -183,6 +186,12 @@ pub const CREATE_CATEGORY_OPERATION_ID: &str = "create_category";
 pub const CREATE_CATEGORY_RULE_OPERATION_ID: &str = "create_category_rule";
 pub const ANSWER_IMPORT_QUESTIONS_BATCH_OPERATION_ID: &str = "answer_import_questions_batch";
 pub const CREATE_CATEGORY_RULE_BATCH_OPERATION_ID: &str = "create_category_rule_batch";
+/// The batch form. Deliberately absent from [`OperationKey`], for the same
+/// reason `create_category_rule_batch` beside it is: a bulk write of standing
+/// decisions is a caller convenience and no queue item can know the particular
+/// set of rules to write, so each row is graded under
+/// `OperationKey::CreateClassificationRule` instead.
+pub const CREATE_CLASSIFICATION_RULE_BATCH_OPERATION_ID: &str = "create_classification_rule_batch";
 
 /// The computed actions currently blocking or advancing owner setup, and which
 /// of the four reports they stand between the owner and.
@@ -1140,6 +1149,143 @@ pub async fn delete_classification_rule(
     .await?;
     Ok(Json(RecomputePlanDto::from_domain(plan)))
 }
+
+/// What the active rule set implies over the recorded journal, asked for on
+/// its own.
+///
+/// **Reading what would change is not the same act as changing it.** The two
+/// existing producers of this plan shape — [`create_classification_rule`] and
+/// [`delete_classification_rule`] — both write first and answer with the plan
+/// their own write provoked; this route writes nothing and answers with the
+/// plan the rule set as it stands, and the journal as it stands, already
+/// imply. So its floor is not [`OperationKey::CreateClassificationRule`]'s: it
+/// carries no `OperationKey` at all and is gated the way
+/// [`list_classification_rules`] beside it is — open to every scope,
+/// including read-only. Conventions §4.3 admits a read-only token to "read
+/// any report", and this is exactly that: a report over decisions already on
+/// record — the standing rule set, the journal already committed — with no
+/// proposal in the request for it to simulate. That is the line that keeps it
+/// apart from [`preview_category_rule_route`], which takes a hypothetical
+/// rule as its body and is gated at [`require_submit`] because previewing a
+/// decision not yet made sits beside the decision itself, not beside a report
+/// on ones already taken.
+///
+/// The shape is [`RecomputePlanDto`], identical to the one
+/// [`create_classification_rule`] and [`delete_classification_rule`] return,
+/// so a client needs one reader for all three: `applied` is always `false`,
+/// and applying the plan is still `POST /v1/corrections`, with the
+/// acknowledgement it already requires. This route applies nothing.
+///
+/// Closes iaam-k3gh.14: an instance restored through
+/// [`create_classification_rules_batch_route`] had no way to ask this
+/// question without writing a rule merely to provoke the answer it wanted.
+#[utoipa::path(
+    get,
+    path = "/v1/classification-rules/plan",
+    responses(
+        (status = 200, description = "The plan the active rule set implies over the recorded journal", body = RecomputePlanDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn classification_rules_plan(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<RecomputePlanDto>, ApiFailure> {
+    let plan = recompute_history(&state.services, principal.owner).await?;
+    Ok(Json(RecomputePlanDto::from_domain(plan)))
+}
+
+/// Create classification rules independently and answer with one verdict per
+/// rule, in request order.
+///
+/// Restoring a rule set through `POST /v1/classification-rules` one call at a
+/// time takes as long as the rate limiter allows and gives up as many chances
+/// to be interrupted halfway (iaam-k3gh.3): 2 708 rules at 120 requests a
+/// minute is 85 minutes, and any one of them failing partway leaves the caller
+/// uncertain which rules landed and which did not.
+///
+/// **No plan here, per row or as a whole.** [`create_classification_rule`]
+/// recomputes the plan after its one write because that write is the caller's
+/// only chance to see it; this route writes many rules, and computing the
+/// plan after every one of them would recompute the same rule set against the
+/// same journal 2 708 times for a number that means nothing until the whole
+/// batch has landed — see [`create_rules_batch`]'s own doc comment for why
+/// that cost is paid nowhere at all. Each row is written directly, with no
+/// plan attached to its verdict, and the caller asks for the plan the
+/// resulting rule set implies with [`classification_rules_plan`]
+/// (`GET /v1/classification-rules/plan`, iaam-k3gh.14), once, after this route
+/// answers. That is the two routes' intended pairing: this one restores the
+/// rule set fast and reports what happened to each rule; that one reports
+/// what the restored rule set, taken as a whole, now implies about the
+/// journal — the same information a single `POST /v1/classification-rules`
+/// would have carried, asked for once instead of 2 708 times.
+///
+/// Not an [`OperationKey`]: a bulk write of standing decisions is a caller
+/// convenience and no queue item can know the particular set of rules to
+/// write, so each row is graded under the reversible
+/// `OperationKey::CreateClassificationRule` floor instead — see
+/// [`WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY`].
+///
+/// A row's failure is readable from its own verdict — `rejected`, with the
+/// field the store refused — without re-listing the whole rule set: the
+/// caller learns what happened to each of 2 708 rules from one response the
+/// size of the request, not from a second call.
+#[utoipa::path(
+    post,
+    path = "/v1/classification-rules/batch",
+    operation_id = CREATE_CLASSIFICATION_RULE_BATCH_OPERATION_ID,
+    request_body = ClassificationRuleBatchRequest,
+    responses(
+        (status = 200, description = "One verdict per classification rule", body = Vec<VerdictDto>),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn create_classification_rules_batch_route(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    Extension(catalog): Extension<Arc<ActionCatalog>>,
+    ApiJson(request): ApiJson<ClassificationRuleBatchRequest>,
+) -> Result<Json<Vec<VerdictDto>>, ApiFailure> {
+    require(&principal, OperationKey::CreateClassificationRule)?;
+    let rows: Vec<RuleBatchRow> = request
+        .rules
+        .into_iter()
+        .map(|item| RuleBatchRow {
+            matcher: item.matcher.to_domain(),
+            outcome: item.outcome.to_domain(),
+            replaces: item.replaces,
+        })
+        .collect();
+    let results = create_rules_batch(&state.services, &principal, rows).await?;
+    let mut verdicts = Vec::with_capacity(results.len());
+    for (index, outcome) in results.into_iter().enumerate() {
+        match outcome {
+            Ok(rule) => {
+                record_decision(
+                    &state,
+                    &principal,
+                    OperationKey::CreateClassificationRule,
+                    rule.id.to_string(),
+                    serde_json::json!({"rule": rule.id}),
+                    "retire the classification rule; its recomputation plan names the affected facts",
+                )
+                .await?;
+                verdicts.push(VerdictDto::accepted_classification_rule(index + 1, rule.id));
+            }
+            Err(error) => verdicts.push(VerdictDto::rejected_classification_rule(
+                index + 1,
+                ApiFailure::body_from_app(error, &catalog),
+            )),
+        }
+    }
+    Ok(Json(verdicts))
+}
+
 /// Active and retired owner category groups.
 #[utoipa::path(
     get,
@@ -7209,7 +7355,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// [`require_admin`] states: the queue and the caveat register are about the
 /// owner's money and these are about the shape of the instance, so there is no
 /// second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 30] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 31] = [
     (
         "rename_account",
         "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
@@ -7273,6 +7419,10 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 30] = [
     (
         "create_category_rule_batch",
         "A bulk write of standing decisions is a caller convenience, not a computed remedy: no queue item can know the particular set of rules to write. It therefore stays outside the operation-key vocabulary, while each row uses the reversible create_category_rule floor.",
+    ),
+    (
+        "create_classification_rule_batch",
+        "The batch spelling of create_classification_rule, for the same reason create_category_rule_batch beside it is one: a bulk write of standing decisions is a caller convenience and no queue item can know the particular set of rules to write, so each row uses the reversible create_classification_rule floor instead.",
     ),
     (
         "answer_import_questions_batch",

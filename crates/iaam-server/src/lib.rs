@@ -153,6 +153,8 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             routes::create_classification_rule
         ))
         .routes(routes!(routes::delete_classification_rule))
+        .routes(routes!(routes::classification_rules_plan))
+        .routes(routes!(routes::create_classification_rules_batch_route))
         .routes(routes!(
             routes::list_category_groups,
             routes::create_category_group_route

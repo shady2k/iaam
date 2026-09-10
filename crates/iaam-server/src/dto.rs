@@ -1738,6 +1738,54 @@ impl VerdictDto {
             alternatives: None,
         }
     }
+
+    /// Use the §10.1 verdict shape for a recorded classification-rule batch row.
+    ///
+    /// Carries the rule's identifier and nothing about what it would correct:
+    /// `POST /v1/classification-rules/batch` deliberately computes no plan per
+    /// row (see that route's own doc comment), so there is no plan here to
+    /// report — the plan for the resulting rule set is
+    /// `GET /v1/classification-rules/plan`, asked once after the batch lands.
+    #[must_use]
+    pub fn accepted_classification_rule(row: usize, rule_id: Uuid) -> Self {
+        Self {
+            row,
+            verdict: VerdictCodeDto::Provisional,
+            event_id: None,
+            of_event_id: None,
+            level: None,
+            field: None,
+            expected: None,
+            actual: None,
+            detail: Some(format!("classification rule {rule_id} was recorded")),
+            account_id: None,
+            dimension: None,
+            session_id: None,
+            question_id: None,
+            alternatives: None,
+        }
+    }
+
+    /// Use the §10.1 verdict shape for a refused classification-rule batch row.
+    #[must_use]
+    pub fn rejected_classification_rule(row: usize, error: ApiError) -> Self {
+        Self {
+            row,
+            verdict: VerdictCodeDto::Rejected,
+            event_id: None,
+            of_event_id: None,
+            level: None,
+            field: error.field,
+            expected: error.expected,
+            actual: error.actual,
+            detail: Some(error.message),
+            account_id: None,
+            dimension: None,
+            session_id: None,
+            question_id: None,
+            alternatives: None,
+        }
+    }
 }
 
 /// A value that the system may have declined to calculate.
@@ -8889,6 +8937,17 @@ pub struct ClassificationRuleRequest {
     /// have been written for one answer replaces nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces: Option<Uuid>,
+}
+
+/// Several independent classification-rule creates in one request.
+///
+/// The same wrapper [`CategoryRuleBatchRequest`] uses beside it: `POST
+/// /v1/category-rules/batch` already carries several proposals as `rules`, and
+/// a caller restoring both kinds of rule set should not have to learn a second
+/// shape for the same idea.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ClassificationRuleBatchRequest {
+    pub rules: Vec<ClassificationRuleRequest>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]

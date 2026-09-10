@@ -1930,7 +1930,17 @@ pub async fn list_market_key_rate(
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct MarketSyncOutcomeDto {
     pub status: String,
-    pub rows: usize,
+    /// How many rows this run wrote. A count, not a list — the rows
+    /// themselves are not returned here; a caller reads them back through
+    /// `GET /v1/market/prices` or its siblings, keyed by the series the run
+    /// synchronised.
+    ///
+    /// `row_count` and not `rows`, for the reason `SourceInventoryDto::row_count`
+    /// and `ImportSessionContentsDto::row_count` already give: a plural noun
+    /// reads as the list itself, and an external client wrote `len(rows)`
+    /// against exactly that shape before this convention had a name for the
+    /// mistake.
+    pub row_count: usize,
     pub covered_from: Option<String>,
     pub covered_to: Option<String>,
 }
@@ -1939,7 +1949,7 @@ impl MarketSyncOutcomeDto {
     fn from_domain(outcome: iaam_app::sync::MarketSyncResult) -> Self {
         Self {
             status: outcome.status().to_owned(),
-            rows: outcome.rows,
+            row_count: outcome.rows,
             covered_from: outcome.covered.map(|coverage| coverage.from.to_string()),
             covered_to: outcome.covered.map(|coverage| coverage.to.to_string()),
         }

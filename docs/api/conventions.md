@@ -199,6 +199,7 @@ things. Read it as the lookup table for §1.
 | Route | Response | Shape | Why |
 |---|---|---|---|
 | `GET /v1/accounts` | `[AccountDto]` | bare array | whole list, nothing about the set |
+| `POST /v1/accounts/batch` | `[AccountBatchResultDto]` | bare array | one outcome per request row — `created`, `existing`, `applied` or `rejected` — with exactly one of `account`, `declarations` and `error` set; the alias, title and declaration batch routes answer with the same shape |
 | `GET /v1/instruments` | `InstrumentListDto` | object, `instruments`, `missing` | requested instruments plus identifiers not found; the wrapper is required because a bare array cannot say which requested identifiers were missing |
 | `GET /v1/categories` | `[CategoryDto]` | bare array | whole history; each item carries its own retirement |
 | `GET /v1/category-groups` | `[CategoryGroupDto]` | bare array | whole list |
@@ -208,6 +209,7 @@ things. Read it as the lookup table for §1.
 | `GET /v1/tokens` | `[TokenDto]` | bare array | whole list, revoked included |
 | `GET /v1/broker-access` | `[BrokerAccessDto]` | bare array | whole list, revoked included |
 | `GET /v1/contours` | `[ContourDto]` | bare array | whole list; each contour carries its own version |
+| `POST /v1/contours` | `ContourVersionDto` | object, `accounts` | `created` — whether this call brought the contour into existence, which no account in the composition can say; `POST /v1/contours/{contour}/versions` answers the same shape for a later version of one already there |
 | `GET /v1/import-sessions` | `[ImportSessionSummaryDto]` | bare array | whole list, newest first; each entry carries `row_count` and `unanswered` beside the header, so «which import is still waiting on me» is one request rather than one per session |
 | `GET /v1/decisions` | `[DecisionDto]` | bare array | the owner's own after-the-fact audit; nothing is true of the whole trail that is not true of one entry — each names its own actor, what it settled and what undoes it |
 | `GET /v1/actions` | `ActionsResponseDto` | object, `items` | `reports` — where each of the four reports stands, which is stated for an unobstructed one by the absence of items and so can be carried by none of them (§1.4a) |
@@ -219,9 +221,15 @@ things. Read it as the lookup table for §1.
 | `GET /v1/reconciliation` | `ReconciliationResponseDto` | object, `statuses` | three lists — `statuses`, `gaps`, `actions` — none of them a property of another's rows |
 | `GET /v1/transfer-pairings` | `CrossSourceMatchingDto` | object, `candidates` | `without_counterpart` — the legs nothing paired with, which no candidate can carry |
 | `GET /v1/accounts/{id}/transfer-partners` | `AccountTransferPartnersDto` | object, `partners` | `stated` — whether the owner has ruled at all, which an empty array cannot say |
+| `GET /v1/accounts/{id}/scope` | `AccountScopeDto` | object, `contours` | `disposition` — `inside`, `outside` or `undecided` — and `reason`, present for `outside`; `contours` is empty unless `disposition` is `inside`, since membership is a fact of contour composition and not a stored flag |
 | `GET /v1/import-sessions/{session}` | `ImportSessionContentsDto` | object, `questions` | the session it belongs to, `row_count`, and how many questions are unanswered |
+| `POST /v1/import-sessions/{session}/questions/{question}/answer` | `ImportQuestionDto` | object, three lists — `alternatives`, `accounts`, `also_settled` | `also_settled` — the other rows this one answer reached, a property of the call and not of the question, so it is absent everywhere a question is merely read |
+| `POST /v1/import-sessions/{session}/answers` | `[ImportAnswerVerdictDto]` | bare array | one outcome per submitted answer, in request order; an applied answer carries the exact single-answer success body beside its verdict, a refused one the exact error body, so neither need be re-fetched |
+| `POST /v1/import-sessions/{session}/questions/{question}/answer/preview` | `AnswerRuleForecastDto` | object, three lists — `in_this_import`, `already_recorded`, `undecided` | `state` says whether answering writes a standing decision at all; the two reasons a line has no future match both publish empty lists, and `state` is what tells them apart |
+| `POST /v1/import-sessions/{session}/control-figures` | `[ControlSectionDto]` | bare array | every control section the session now holds, replacing what it held before |
 | `GET /v1/reports/balances` | `BalancesReportDto` | object, `accounts` | `negative_cash`, `population`, `held_rows` |
 | `GET /v1/reports/balances/series` | `BalancesReportSeriesDto` | object, `reports` | one complete `BalancesReportDto` per requested date, beside its date, in request order |
+| `GET /v1/reports/assets` | `AssetSnapshotDto` | object, `accounts` | `total`, `population`, `held_rows` — the same three facts `GET /v1/reports/balances` publishes beside its rows, for the same reason |
 | `GET /v1/reports/assets/series` | `AssetSnapshotSeriesDto` | object, `reports` | one complete `AssetSnapshotDto` per requested date, beside its date, in request order |
 | `GET /v1/reports/returns` | `ReturnsAnswerDto` | object | not a list at the top level; `population` and `held_rows` sit beside the report's own figures |
 | `GET /v1/reports/flow` | `MoneyFlowReportDto` | object, `currencies` | the interval, the scope version, `population`, `held_rows`, `actions` |
@@ -240,9 +248,9 @@ things. Read it as the lookup table for §1.
 | `POST /v1/classification-rules/batch` | `[VerdictDto]` | bare array | one verdict per submitted rule, in the caller's own order; the plan for the rule set the batch leaves behind is read once afterwards, from the route below, rather than recomputed per row |
 | `GET /v1/classification-rules/plan` | `RecomputePlanDto` | object, `corrections` | `applied: false`; the plan the active rule set implies over the recorded journal, asked for without writing a rule to provoke it |
 | `GET /v1/journal/aggregate` | `JournalAggregateDto` | object, `groups` | the grouping the request asked for, which no group can state on its own |
-| `POST /v1/category-rules/preview` | `CategoryRuleImpactDto` | object, `preview_rows` | the rule's own reach — and note `rows` beside it is a **count**, §1.4b's collision in the one place it was not renamed |
+| `POST /v1/category-rules/preview` | `CategoryRuleImpactDto` | object, `preview_rows` | the rule's own reach — and note `rows` beside it is a **count**, §1.4b's collision left standing here and again on `CategoryMoveDto.rows` nested below it (`iaam-k3gh.16`); `MarketSyncOutcomeDto.rows` was the third and is now `row_count` |
 | `POST /v1/category-rules/preview/batch` | `[CategoryRuleImpactDto]` | bare array | one impact per submitted rule, each shaped as the single form above |
-| `POST /v1/accounts/{id}/transfer-partners/batch` | `AccountTransferPartnersBatchDto` | object, `statements` | one complete `AccountTransferPartnersDto` per account in the batch, each carrying its own `stated` |
+| `PUT /v1/accounts/transfer-partners` | `AccountTransferPartnersBatchDto` | object, `statements` | one complete `AccountTransferPartnersDto` per account in the batch, each carrying its own `stated` |
 | `DELETE /v1/classification-rules/{id}` | `RecomputePlanDto` | object, `corrections` | `applied: false` |
 
 A batch response — a verdict per submitted row — is a bare array for the same

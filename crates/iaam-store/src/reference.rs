@@ -2,7 +2,7 @@
 
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::custody::CustodyOrigin;
-use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, SourceId};
+use iaam_core::ids::{AccountId, CustodyId, InstrumentId, OwnerId, PrincipalId, SourceId};
 use iaam_core::instrument::{
     AliasInterval, AliasNamespace, CurrencyRoles, InstrumentKind, Lineage, LineageReason,
 };
@@ -150,6 +150,28 @@ pub struct AccountDetailRecord {
     /// lives here precisely so no rule can reach it.
     pub negative_balance_expectation: Option<NegativeBalanceExpectation>,
     pub aliases: Vec<AccountAliasRecord>,
+    /// The credential this account was created under, in the vocabulary
+    /// [`iaam_core::event::provenance::Provenance::declared_by`] already uses
+    /// for a fact — not a second word for the same idea. An account is the one
+    /// thing every fact hangs on, and keeping its origin in `decision_history`
+    /// instead — a second place, joined by subject — is exactly what that
+    /// field's own doc comment argues against: a second place recording where
+    /// something came from is a second place that can disagree with it.
+    ///
+    /// **Set once, at creation, and never rewritten.** [`SqliteStore::create_account`]
+    /// writes whatever the caller supplies here and nothing else touches the
+    /// column afterwards — not [`SqliteStore::replace_account_declarations`],
+    /// which updates only the identity, class and expectation, and not a create
+    /// call that matches an existing identity, which changes nothing about the
+    /// account it found.
+    ///
+    /// `None` is "not recorded", never "created by the owner". Every account
+    /// written before this field existed reads back `None`, and so does one
+    /// written by a path that appends without a caller behind it — the same
+    /// reading `declared_by`'s own doc comment establishes, and a rule of the
+    /// form "you may retire what you yourself declared" must refuse on `None`
+    /// rather than hand an unattributed account to whoever asks first.
+    pub declared_by: Option<PrincipalId>,
 }
 
 /// What [`SqliteStore::create_account`] did.
@@ -435,8 +457,8 @@ impl SqliteStore {
             "INSERT INTO accounts
                  (id, owner, title, institution, created_at,
                   provider, provider_account_id, cash_class,
-                  negative_balance_expectation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                  negative_balance_expectation, declared_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 account.id.inner().to_string(),
                 account.owner.inner().to_string(),
@@ -452,6 +474,9 @@ impl SqliteStore {
                 account
                     .negative_balance_expectation
                     .map(NegativeBalanceExpectation::code),
+                account
+                    .declared_by
+                    .map(|principal| principal.inner().to_string()),
             ],
         )?;
         for alias in &account.aliases {
@@ -666,7 +691,7 @@ impl SqliteStore {
     ) -> Result<Vec<AccountDetailRecord>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT id, title, institution, provider, provider_account_id, cash_class,
-                    negative_balance_expectation
+                    negative_balance_expectation, declared_by
              FROM accounts WHERE owner = ?1 ORDER BY title, id",
         )?;
         let rows = statement.query_map([owner.inner().to_string()], |row| {
@@ -678,6 +703,7 @@ impl SqliteStore {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut accounts = Vec::new();
@@ -690,6 +716,7 @@ impl SqliteStore {
                 provider_account_id,
                 cash_class,
                 negative_balance_expectation,
+                declared_by,
             ) = row?;
             accounts.push(AccountDetailRecord {
                 id: AccountId(parse_uuid(&id, "account")?),
@@ -702,6 +729,7 @@ impl SqliteStore {
                     negative_balance_expectation.as_deref(),
                 )?,
                 aliases: Vec::new(),
+                declared_by: parse_principal(declared_by.as_deref())?,
             });
         }
         drop(statement);
@@ -1592,34 +1620,50 @@ fn parse_negative_balance_expectation(
     .transpose()
 }
 
+/// A stored `declared_by` column, refusing a value this build cannot parse as
+/// a UUID.
+///
+/// `None` reads as "not recorded" rather than as an error: it is the ordinary
+/// state for an account written before the column existed, and for one
+/// written by a path that appends without a caller behind it (`upsert_account`,
+/// a broker synchronisation). A malformed non-empty value, by contrast, is a
+/// corrupted row this build should refuse to pretend it understood.
+fn parse_principal(value: Option<&str>) -> Result<Option<PrincipalId>, StoreError> {
+    value
+        .map(|value| parse_uuid(value, "account.declared_by").map(PrincipalId))
+        .transpose()
+}
+
 /// One account with its identity, class and aliases, read inside a transaction.
 fn read_account_detail(
     transaction: &rusqlite::Transaction<'_>,
     owner: OwnerId,
     id: AccountId,
 ) -> Result<AccountDetailRecord, StoreError> {
-    let (title, institution, provider, provider_account_id, cash_class, expectation) = transaction
-        .query_row(
-            "SELECT title, institution, provider, provider_account_id, cash_class,
-                    negative_balance_expectation
+    let (title, institution, provider, provider_account_id, cash_class, expectation, declared_by) =
+        transaction
+            .query_row(
+                "SELECT title, institution, provider, provider_account_id, cash_class,
+                    negative_balance_expectation, declared_by
              FROM accounts WHERE owner = ?1 AND id = ?2",
-            params![owner.inner().to_string(), id.inner().to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::NotFound {
-            what: "account",
-            id: id.inner().to_string(),
-        })?;
+                params![owner.inner().to_string(), id.inner().to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::NotFound {
+                what: "account",
+                id: id.inner().to_string(),
+            })?;
 
     let mut statement = transaction.prepare(
         "SELECT value, valid_from, valid_to FROM account_aliases
@@ -1656,6 +1700,7 @@ fn read_account_detail(
         cash_class: parse_cash_class(cash_class.as_deref())?,
         negative_balance_expectation: parse_negative_balance_expectation(expectation.as_deref())?,
         aliases,
+        declared_by: parse_principal(declared_by.as_deref())?,
     })
 }
 

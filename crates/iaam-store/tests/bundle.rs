@@ -28,8 +28,8 @@ use iaam_store::import_session::{NewQuestion, StoredControlFigures};
 use iaam_store::market::{AccruedInterestRow, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};
 use iaam_store::market_source_codes::SourceCodeEntry;
 use iaam_store::reference::{
-    AccountAliasRecord, AccountRecord, AccountScopeExclusionRecord, AliasRecord, CustodyRecord,
-    InstrumentRecord,
+    AccountAliasRecord, AccountDetailRecord, AccountRecord, AccountScopeExclusionRecord,
+    AliasRecord, CustodyRecord, InstrumentRecord,
 };
 use iaam_store::rules::NewRule;
 use iaam_store::schedule::IssueTermsRow;
@@ -1302,6 +1302,66 @@ fn declined_account_names_and_decision_history_round_trip() {
 }
 
 #[test]
+fn an_accounts_declaring_principal_round_trips() {
+    // An account created under a credential, beside one nobody attributed —
+    // the export must carry the first's `declared_by` and the second's
+    // absence, and a restore into an empty database must read both back
+    // exactly as recorded.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let agent = PrincipalId::new_random();
+    store
+        .create_account(&AccountDetailRecord {
+            id: AccountId::new_random(),
+            owner,
+            title: "Opened by an agent".into(),
+            institution: None,
+            identity: None,
+            cash_class: None,
+            negative_balance_expectation: None,
+            aliases: Vec::new(),
+            declared_by: Some(agent),
+        })
+        .unwrap();
+    store
+        .upsert_account(&AccountRecord {
+            id: AccountId::new_random(),
+            owner,
+            title: "Pre-existing".into(),
+            institution: None,
+        })
+        .unwrap();
+
+    let bundle = store.export_bundle(owner).unwrap();
+    let attributed = bundle
+        .accounts
+        .iter()
+        .find(|account| account.title == "Opened by an agent")
+        .expect("the agent's account is in the export");
+    assert_eq!(attributed.declared_by, Some(agent.inner()));
+    let unattributed = bundle
+        .accounts
+        .iter()
+        .find(|account| account.title == "Pre-existing")
+        .expect("the pre-existing account is in the export");
+    assert_eq!(unattributed.declared_by, None);
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    let accounts = restored.list_account_details(owner).unwrap();
+    let attributed = accounts
+        .iter()
+        .find(|account| account.title == "Opened by an agent")
+        .expect("restored");
+    assert_eq!(attributed.declared_by, Some(agent));
+    let unattributed = accounts
+        .iter()
+        .find(|account| account.title == "Pre-existing")
+        .expect("restored");
+    assert_eq!(unattributed.declared_by, None);
+}
+
+#[test]
 fn importing_the_owners_decisions_twice_changes_nothing() {
     let (source, owner, _account, _category) = owner_decisions_fixture();
     let bundle = source.export_bundle(owner).unwrap();
@@ -1348,6 +1408,38 @@ fn an_archive_written_before_the_owners_decisions_existed_still_verifies_and_res
         .import_bundle(&bundle)
         .expect("an archive written before the owner's decisions travelled must still restore");
     assert_eq!(restored.load_events(bundle.owner).unwrap().len(), 1);
+}
+
+#[test]
+fn an_archive_written_before_account_attribution_existed_still_verifies_and_restores() {
+    // The same fixed archive every other "still verifies" test in this file
+    // reads: its one account carries no `declared_by` key at all, because the
+    // column did not exist when it was written (iaam-7ffl). The absence must
+    // read as "not recorded", the checksum computed under the old shape must
+    // still match, and the restore must still go through.
+    let bundle: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert_eq!(bundle.accounts.len(), 1);
+    assert_eq!(
+        bundle.accounts[0].declared_by, None,
+        "an account exported before attribution existed carries none"
+    );
+    assert_eq!(
+        bundle.checksum,
+        bundle.compute_checksum(),
+        "a field nobody wrote must contribute no bytes"
+    );
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("an archive written before attribution existed must still restore");
+    let accounts = restored.list_account_details(bundle.owner).unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(
+        accounts[0].declared_by, None,
+        "the restored account reads as unknown, never as the owner's own"
+    );
 }
 
 // --- iaam-k3gh.9.3: evidence he acquired and cannot fetch again -----------

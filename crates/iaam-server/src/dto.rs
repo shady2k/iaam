@@ -4819,6 +4819,17 @@ pub struct AccountDto {
     /// underlying account are one account with two aliases.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<AccountAliasDto>,
+    /// The credential this account was created under. `Provenance::declared_by`'s
+    /// own vocabulary, not a new word for the same idea — a token identifier,
+    /// never accepted as input, and set once at creation from the request's own
+    /// credential.
+    ///
+    /// Absent is «not recorded», never «created by the owner»: it is what
+    /// every account created before this field existed reads back as, and a
+    /// client that read it as agreement would hand an unattributed account to
+    /// whoever asked first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_by: Option<Uuid>,
 }
 
 /// One alias of an account, valid over a half-open interval.
@@ -6928,6 +6939,7 @@ mod tests {
             cash_class: None,
             negative_balance_expectation: None,
             aliases: Vec::new(),
+            declared_by: None,
         }])
     }
 

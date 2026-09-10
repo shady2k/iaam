@@ -89,7 +89,18 @@ use crate::{SqliteStore, StoreError};
 /// (iaam-k3gh.9.1), and carrying the detail rows without it would either
 /// dangle the foreign key on restore or reopen that decision — see
 /// [`TABLE_DISPOSITIONS`]'s own comment on the three for the full reasoning.
-pub const BUNDLE_VERSION: u32 = 5;
+///
+/// Version 6 (`iaam-7ffl`) adds [`AccountSection::declared_by`]: the
+/// credential that created the account, in `Provenance::declared_by`'s own
+/// vocabulary. The field is optional and contributes no bytes when absent, so
+/// an archive written under version 6 reads back correctly on a build that
+/// only knows version 5 — but that older build would then silently drop the
+/// attribution on its own next export, rather than fail on a fact it does not
+/// know how to carry. That is exactly the data loss this module's own doc
+/// comment says a version bump exists to refuse rather than commit quietly,
+/// so the version is bumped for it even though nothing about reading an older
+/// archive under this build needed one.
+pub const BUNDLE_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContourSection {
@@ -104,6 +115,21 @@ pub struct AccountSection {
     pub id: uuid::Uuid,
     pub title: String,
     pub institution: Option<String>,
+    /// The credential the account was created under, in `accounts.declared_by`'s
+    /// own vocabulary — a reference to a token, not the token itself, which
+    /// does not travel at all (see the `Credential` disposition on
+    /// `api_tokens` in [`TABLE_DISPOSITIONS`]). Added at bundle version 6
+    /// (`iaam-7ffl`).
+    ///
+    /// `#[serde(default)]` is what lets an archive written before this field
+    /// existed still deserialize; `skip_serializing_if` is what keeps its
+    /// checksum unchanged once it does — every account in such an archive
+    /// reads back `None`, and a section nobody wrote contributes no bytes.
+    /// `None` is «not recorded», never «the owner's own account»: it is the
+    /// state of every account restored from an archive this old, and a
+    /// restore must not read it as agreement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_by: Option<uuid::Uuid>,
 }
 
 /// A place of custody, carried the way `custody_places` stores it.
@@ -1198,15 +1224,39 @@ impl SqliteStore {
     /// Bundle export.
     pub fn export_bundle(&self, owner: OwnerId) -> Result<Bundle, StoreError> {
         let events = self.load_events(owner)?;
-        let accounts = self
-            .list_accounts(owner)?
-            .into_iter()
-            .map(|record| AccountSection {
-                id: record.id.inner(),
-                title: record.title,
-                institution: record.institution,
-            })
-            .collect();
+        // `declared_by` is read directly here rather than through
+        // `list_accounts`: that call returns the deliberately reduced summary
+        // `AccountRecord` (id, title, institution) that most of this crate's
+        // callers read, the same way `AccountView` withholds `cash_class` from
+        // its own readers — see that type's own doc comment. A bundle export
+        // is not one of those callers; it needs the column the summary leaves
+        // out, so it reads the table itself instead of widening a view every
+        // other caller would then also see.
+        let mut statement = self.conn.prepare(
+            "SELECT id, title, institution, declared_by FROM accounts
+             WHERE owner = ?1 ORDER BY title, id",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut accounts = Vec::new();
+        for row in rows {
+            let (id, title, institution, declared_by) = row?;
+            accounts.push(AccountSection {
+                id: parse(&id, "account")?,
+                title,
+                institution,
+                declared_by: declared_by
+                    .map(|value| parse(&value, "account.declared_by"))
+                    .transpose()?,
+            });
+        }
+        drop(statement);
 
         let mut statement = self.conn.prepare(
             "SELECT v.contour, v.version, v.title, a.account
@@ -2502,9 +2552,15 @@ impl SqliteStore {
         let transaction = self.conn.transaction()?;
 
         for account in &bundle.accounts {
+            // `declared_by` is written on the `INSERT` branch only and named in
+            // neither `ON CONFLICT` `SET` clause, alongside `title` and
+            // `institution`: an account already present is not re-attributed by
+            // a later restore, for the same reason [`SqliteStore::create_account`]
+            // never rewrites the column once set — it is who created the
+            // account, not a restatement a later archive gets to correct.
             transaction.execute(
-                "INSERT INTO accounts (id, owner, title, institution, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO accounts (id, owner, title, institution, created_at, declared_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (id) DO UPDATE SET
                      title = excluded.title,
                      institution = excluded.institution
@@ -2515,6 +2571,7 @@ impl SqliteStore {
                     account.title,
                     account.institution,
                     created_at,
+                    account.declared_by.map(|id| id.to_string()),
                 ],
             )?;
         }

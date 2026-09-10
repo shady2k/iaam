@@ -1,7 +1,7 @@
 //! The identity a source prints for an account, its aliases, and its class
 //! (decision 0004).
 
-use iaam_core::ids::{AccountId, OwnerId};
+use iaam_core::ids::{AccountId, OwnerId, PrincipalId};
 use iaam_core::instrument::AliasInterval;
 use iaam_core::report::balances::NegativeBalanceExpectation;
 use iaam_store::reference::{
@@ -21,6 +21,7 @@ fn plain(owner: OwnerId, title: &str) -> AccountDetailRecord {
         cash_class: None,
         negative_balance_expectation: None,
         aliases: Vec::new(),
+        declared_by: None,
     }
 }
 
@@ -226,6 +227,7 @@ fn an_account_created_before_decision_0004_keeps_working() {
             cash_class: None,
             negative_balance_expectation: None,
             aliases: Vec::new(),
+            declared_by: None,
         }]
     );
 }
@@ -715,5 +717,123 @@ fn declarations_cannot_be_written_against_another_owners_account() {
         store.list_account_details(one).unwrap()[0].cash_class,
         None,
         "a statement about someone else's account records nothing"
+    );
+}
+
+// --- `declared_by` (iaam-7ffl): the account carries its writer -----------
+
+#[test]
+fn the_declaring_principal_is_written_at_creation_and_read_back() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let agent = PrincipalId::new_random();
+    let record = AccountDetailRecord {
+        declared_by: Some(agent),
+        ..plain(owner, "Main")
+    };
+
+    let AccountCreation::Created(stored) = store.create_account(&record).unwrap() else {
+        panic!("a fresh identity is a creation");
+    };
+
+    assert_eq!(stored.declared_by, Some(agent));
+    assert_eq!(
+        store.list_account_details(owner).unwrap()[0].declared_by,
+        Some(agent)
+    );
+}
+
+#[test]
+fn an_account_created_with_no_declaring_principal_reads_as_unknown() {
+    // `plain` states none, and none is the honest answer: this must never be
+    // read as "the owner created it" — absence is not evidence, exactly as
+    // `Provenance::declared_by` already establishes for a fact.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+
+    store.create_account(&plain(owner, "Main")).unwrap();
+
+    assert_eq!(
+        store.list_account_details(owner).unwrap()[0].declared_by,
+        None
+    );
+}
+
+#[test]
+fn a_create_that_matches_an_existing_identity_does_not_reattribute_it() {
+    // The account already exists, so nothing is created — and nothing about
+    // who created it changes on the strength of a second caller supplying a
+    // different value. Attribution is written once, at creation, like a
+    // fact's provenance.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let identity = AccountIdentity {
+        provider: "bank-one".into(),
+        provider_account_id: "opaque-1".into(),
+    };
+    let creator = PrincipalId::new_random();
+    let finder = PrincipalId::new_random();
+    assert_ne!(creator, finder);
+
+    let AccountCreation::Created(first) = store
+        .create_account(&AccountDetailRecord {
+            identity: Some(identity.clone()),
+            declared_by: Some(creator),
+            ..plain(owner, "Main")
+        })
+        .unwrap()
+    else {
+        panic!("the first create mints an account");
+    };
+    assert_eq!(first.declared_by, Some(creator));
+
+    let repeated = store
+        .create_account(&AccountDetailRecord {
+            identity: Some(identity),
+            declared_by: Some(finder),
+            ..plain(owner, "Main, as a second caller names it")
+        })
+        .unwrap();
+
+    let AccountCreation::Existing(found) = repeated else {
+        panic!("a repeated identity is a match, not a creation");
+    };
+    assert_eq!(
+        found.declared_by,
+        Some(creator),
+        "the match must not adopt the finder's identity"
+    );
+    assert_eq!(
+        store.list_account_details(owner).unwrap()[0].declared_by,
+        Some(creator)
+    );
+}
+
+#[test]
+fn replacing_declarations_does_not_touch_who_created_the_account() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let creator = PrincipalId::new_random();
+    let record = AccountDetailRecord {
+        declared_by: Some(creator),
+        ..plain(owner, "Main")
+    };
+    store.create_account(&record).unwrap();
+
+    let recorded = store
+        .replace_account_declarations(
+            owner,
+            record.id,
+            &AccountDeclarations {
+                cash_class: Declared::Stated(CashAssetClass::Savings),
+                ..nothing_stated()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        recorded.account.declared_by,
+        Some(creator),
+        "a statement about the class is not a statement about who created it"
     );
 }

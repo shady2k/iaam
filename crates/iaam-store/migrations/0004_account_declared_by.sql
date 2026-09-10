@@ -1,0 +1,34 @@
+-- The credential that created an account, in the same vocabulary a fact
+-- already uses (`Provenance::declared_by`, `iaam-7ffl`).
+--
+-- An account is the one thing every fact hangs on, and until this column
+-- existed its origin was kept in a second place — `decision_history`, joined
+-- by subject — which is precisely the arrangement `Provenance::declared_by`'s
+-- own doc comment argues against: a second place recording where something
+-- came from is a second place that can disagree with it. This column puts
+-- the origin on the account itself, the same way a fact's origin is kept on
+-- the fact.
+--
+-- NULL is "not recorded", never "created by the owner". Every account
+-- written before this column existed reads back NULL, and so does one
+-- written by a path that appends without a caller behind it — exactly the
+-- reading `Provenance::declared_by` already establishes, so a rule of the
+-- form "you may retire what you yourself declared" refuses on NULL rather
+-- than handing an unattributed account to whoever asks first.
+--
+-- No FOREIGN KEY to `api_tokens`, for the same reason `events.declared_by`
+-- has none: `Bundle` carries accounts but not tokens (see `TABLE_DISPOSITIONS`
+-- — a credential must not travel in a file the owner copies between
+-- machines), so a bundle restored into an empty database would refuse on the
+-- first attributed account if this were a real reference. It is an archival
+-- handle, not a reference into a registry this database keeps.
+--
+-- A second migration rather than a line added to `0001_schema.sql`: that
+-- file is the collapse of the migrations that preceded it, applied only to a
+-- database still at version 0. A database already at `user_version = 3`
+-- skips `0001` through `0003` entirely, so a column added there would exist
+-- in a database created after this change and in none created before it.
+--
+-- A plain `ALTER TABLE ... ADD COLUMN`, unlike `0003`: nothing here narrows
+-- or widens a `CHECK`, so `accounts` does not need to be rebuilt to gain it.
+ALTER TABLE accounts ADD COLUMN declared_by TEXT;

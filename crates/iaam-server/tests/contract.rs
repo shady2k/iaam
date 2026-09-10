@@ -4053,6 +4053,150 @@ async fn an_agent_may_submit_and_make_reversible_reference_decisions() {
 }
 
 #[tokio::test]
+async fn a_create_call_that_matches_an_existing_account_records_no_decision() {
+    // iaam-7ffl, hole 2: `create_account` used to fold `Created` and
+    // `Existing` into one binding and record a `create_account` decision for
+    // both, so the trail claimed a creation on a call that only found an
+    // account already there. A call that mints nothing has nothing to undo,
+    // and the account already names who created it (`declared_by`) — so the
+    // trail carries exactly one entry, from the call that actually created
+    // the account, and none from the one that matched it.
+    let harness = harness().await;
+    let identity = json!({ "provider": "bank-one", "provider_account_id": "opaque-1" });
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main",
+                "provider": identity["provider"],
+                "provider_account_id": identity["provider_account_id"],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+
+    let (status, repeated) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({
+                "title": "Main, renamed at the source",
+                "provider": identity["provider"],
+                "provider_account_id": identity["provider_account_id"],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    assert_eq!(repeated["id"], first["id"], "{repeated}");
+
+    let (status, decisions) = call(
+        &harness.router,
+        get("/v1/decisions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{decisions}");
+    let create_decisions: Vec<&serde_json::Value> = decisions
+        .as_array()
+        .expect("decision list")
+        .iter()
+        .filter(|decision| {
+            decision["operation"] == "create_account" && decision["subject"] == first["id"]
+        })
+        .collect();
+    assert_eq!(
+        create_decisions.len(),
+        1,
+        "a call that matched an existing account must not add a second create_account entry: \
+         {decisions}"
+    );
+}
+
+#[tokio::test]
+async fn the_accounts_one_credential_created_are_recovered_from_attribution_alone() {
+    // iaam-7ffl's own field case: an agent creates accounts, and the set it
+    // created must come back from `declared_by` — the attribution the account
+    // itself carries — never from reading a timestamp or walking the decision
+    // trail. This test deliberately never touches `GET /v1/decisions`.
+    let harness = harness().await;
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.agent_token,
+            &json!({ "title": "Agent One" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let agent_id = first["declared_by"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("a created account names its declaring credential");
+
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.agent_token,
+            &json!({ "title": "Agent Two" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_eq!(
+        second["declared_by"], first["declared_by"],
+        "one credential creating twice is one declaring principal, not two"
+    );
+
+    let (status, owned) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Owner One" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{owned}");
+    assert_ne!(
+        owned["declared_by"], first["declared_by"],
+        "a different credential must carry a different identity"
+    );
+
+    // `harness.account` was provisioned directly into the store, never through
+    // this route, so it carries no `declared_by` at all — filtering by the
+    // agent's identity must not sweep it in.
+    let (status, filtered) = call(
+        &harness.router,
+        get(
+            &format!("/v1/accounts?declared_by={agent_id}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{filtered}");
+    let titles: std::collections::BTreeSet<&str> = filtered
+        .as_array()
+        .expect("account list")
+        .iter()
+        .map(|account| account["title"].as_str().expect("title"))
+        .collect();
+    assert_eq!(
+        titles,
+        std::collections::BTreeSet::from(["Agent One", "Agent Two"]),
+        "the filter must name exactly the two accounts this credential created, and nothing \
+         seeded, owner-created or created by another credential: {filtered}"
+    );
+}
+
+#[tokio::test]
 async fn a_created_account_appears_in_the_list_and_a_readonly_token_can_read_it() {
     // A newly created account must be retrievable: an empty list
     // looks like «there are no accounts», not «the list is broken».
@@ -32919,6 +33063,63 @@ async fn account_create_batch_applies_valid_rows_and_reports_invalid_rows() {
         accounts.as_array().expect("accounts").len(),
         1,
         "{accounts}"
+    );
+}
+
+#[tokio::test]
+async fn account_create_batch_records_no_decision_for_a_row_that_matched_an_existing_account() {
+    // The batch route's own copy of iaam-7ffl's hole 2: an "existing" row is a
+    // match, not a creation, and must not add a `create_account` decision.
+    let harness = empty_owner_harness().await;
+    let row = json!({
+        "title": "Batch Main",
+        "provider": "bank-one",
+        "provider_account_id": "opaque-1",
+    });
+
+    let (status, first) = call(
+        &harness.router,
+        post(
+            "/v1/accounts/batch",
+            &harness.owner_token,
+            &json!({ "accounts": [row] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first[0]["outcome"], "created", "{first}");
+    let account_id = first[0]["account"]["id"].clone();
+
+    let (status, second) = call(
+        &harness.router,
+        post(
+            "/v1/accounts/batch",
+            &harness.owner_token,
+            &json!({ "accounts": [row] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second[0]["outcome"], "existing", "{second}");
+    assert_eq!(second[0]["account"]["id"], account_id, "{second}");
+
+    let (status, decisions) = call(
+        &harness.router,
+        get("/v1/decisions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{decisions}");
+    let create_decisions = decisions
+        .as_array()
+        .expect("decision list")
+        .iter()
+        .filter(|decision| {
+            decision["operation"] == "create_account" && decision["subject"] == account_id
+        })
+        .count();
+    assert_eq!(
+        create_decisions, 1,
+        "a batch row that matched an existing account must not add a second entry: {decisions}"
     );
 }
 

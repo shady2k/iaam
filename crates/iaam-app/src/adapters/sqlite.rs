@@ -2338,6 +2338,7 @@ fn account_detail_record(owner: OwnerId, account: AccountDetailView) -> AccountD
         ),
         cash_class: account.cash_class,
         negative_balance_expectation: account.negative_balance_expectation,
+        declared_by: account.declared_by,
         aliases: account
             .aliases
             .into_iter()
@@ -2381,6 +2382,7 @@ fn account_detail_view(record: AccountDetailRecord) -> AccountDetailView {
         provider_account_id,
         cash_class: record.cash_class,
         negative_balance_expectation: record.negative_balance_expectation,
+        declared_by: record.declared_by,
         aliases: record
             .aliases
             .into_iter()

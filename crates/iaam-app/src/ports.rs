@@ -282,6 +282,18 @@ pub struct AccountDetailView {
     /// interval. Two cards over one underlying account are one account with two
     /// aliases, so the balance is counted once.
     pub aliases: Vec<AccountAliasView>,
+    /// The credential this account was created under, in
+    /// [`iaam_core::event::provenance::Provenance::declared_by`]'s own
+    /// vocabulary — not a new word for the same idea. Written once, by
+    /// [`Store::create_account`], from the principal that called it; nothing
+    /// else ever changes it, the same way nothing but a fact's own creation
+    /// sets its provenance.
+    ///
+    /// `None` is «not recorded», never «created by the owner». It is the state
+    /// of every account written before this field existed, and of one written
+    /// by a path that appends without a caller behind it — reading it as «the
+    /// owner's own» would hand an unattributed account to whoever asks first.
+    pub declared_by: Option<PrincipalId>,
 }
 
 /// One alias of an account, valid over a half-open interval.

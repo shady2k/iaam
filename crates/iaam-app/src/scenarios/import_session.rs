@@ -9465,6 +9465,7 @@ mod tests {
             // anything but the balances report from reading it.
             negative_balance_expectation: None,
             aliases: Vec::new(),
+            declared_by: None,
         }
     }
 

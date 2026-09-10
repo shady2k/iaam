@@ -64,7 +64,7 @@ use iaam_core::event::kind::EventKind;
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{
     AccountId, CategoryId, CategoryRuleId, ClassificationRuleId, EventId, ImportId,
-    ImportQuestionId, ImportSessionId, InstrumentId, SourceId,
+    ImportQuestionId, ImportSessionId, InstrumentId, PrincipalId, SourceId,
 };
 use iaam_core::instrument::{CurrencyRoles, InstrumentKind};
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
@@ -2021,23 +2021,51 @@ pub async fn health() -> Json<HealthDto> {
     })
 }
 
+/// `GET /v1/accounts` filter.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct ListAccountsParams {
+    /// Only accounts created under this credential — `accounts.declared_by`,
+    /// read directly rather than through the decision trail: the trail
+    /// carries every reversible decision an owner or an agent has ever made
+    /// and would have to be pulled and filtered by subject to answer the same
+    /// question this reads off the accounts themselves in one pass. Absent
+    /// returns every account, exactly as this route answered before the
+    /// field existed.
+    #[serde(default)]
+    pub declared_by: Option<Uuid>,
+}
+
+impl crate::extract::QueryRequirements for ListAccountsParams {
+    const REQUIRED: &'static [&'static str] = &[];
+}
+
 /// Account list.
 #[utoipa::path(
     get,
     path = "/v1/accounts",
+    params(ListAccountsParams),
     responses((status = 200, description = "Owner's accounts", body = Vec<AccountDto>)),
     security(("bearer" = []))
 )]
 pub async fn list_accounts(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
+    ApiQuery(params): ApiQuery<ListAccountsParams>,
 ) -> Result<Json<Vec<AccountDto>>, ApiFailure> {
     let accounts = state
         .services
         .store
         .list_account_details(principal.owner)
         .await?;
-    Ok(Json(accounts.into_iter().map(account_dto).collect()))
+    let wanted = params.declared_by.map(PrincipalId);
+    let accounts = accounts
+        .into_iter()
+        .filter(|account| wanted.is_none_or(|wanted| account.declared_by == Some(wanted)))
+        .map(account_dto)
+        .collect();
+    Ok(Json(accounts))
 }
 
 /// Create an account.
@@ -2084,6 +2112,11 @@ pub async fn create_account(
             .negative_balance_expectation
             .map(NegativeBalanceExpectationDto::to_domain),
         aliases,
+        // Written from the credential that called, never from anything the
+        // request body carries — `CreateAccountRequest` has no field a caller
+        // could use to state this instead, the same way a caller cannot state
+        // a fact's own source.
+        declared_by: Some(PrincipalId(principal.token_id)),
     };
     let created = state
         .services
@@ -2094,22 +2127,27 @@ pub async fn create_account(
     // `200 OK` when the identity was already known: nothing was created, and
     // reporting `201` for an account minted on an earlier call would be a lie a
     // client cannot check.
-    let status = match created {
-        AccountCreated::Created(_) => StatusCode::CREATED,
-        AccountCreated::Existing(_) => StatusCode::OK,
+    //
+    // A decision is recorded only for `Created`: `Existing` means the call
+    // matched an account that was already there, and a decision trail
+    // carrying an entry for it would claim a creation that did not happen —
+    // the account itself already carries who created it (`declared_by`), so
+    // the trail has nothing left to add for a call that minted nothing.
+    let (status, account) = match created {
+        AccountCreated::Created(account) => {
+            record_decision(
+                &state,
+                &principal,
+                OperationKey::CreateAccount,
+                account.id.inner().to_string(),
+                serde_json::json!({"account": account.id.inner()}),
+                "retire the account; an account carrying no facts is inert",
+            )
+            .await?;
+            (StatusCode::CREATED, account)
+        }
+        AccountCreated::Existing(account) => (StatusCode::OK, account),
     };
-    let account = match created {
-        AccountCreated::Created(account) | AccountCreated::Existing(account) => account,
-    };
-    record_decision(
-        &state,
-        &principal,
-        OperationKey::CreateAccount,
-        account.id.inner().to_string(),
-        serde_json::json!({"account": account.id.inner()}),
-        "retire the account; an account carrying no facts is inert",
-    )
-    .await?;
     Ok((status, Json(account_dto(account))))
 }
 
@@ -2203,6 +2241,9 @@ pub async fn create_accounts_batch(
                 .negative_balance_expectation
                 .map(NegativeBalanceExpectationDto::to_domain),
             aliases,
+            // See the single-account route's own comment: written from the
+            // credential that called, never from the request body.
+            declared_by: Some(PrincipalId(principal.token_id)),
         };
         let created = match state
             .services
@@ -2219,19 +2260,26 @@ pub async fn create_accounts_batch(
                 continue;
             }
         };
+        // A decision is recorded only for a row that minted an account — see
+        // the single-account route's own comment for why `Existing` gets
+        // none: the account already names its own creator, and a decision
+        // entry for a row that created nothing would claim a creation that
+        // did not happen.
         let (outcome, account) = match created {
-            AccountCreated::Created(account) => ("created", account),
+            AccountCreated::Created(account) => {
+                record_decision(
+                    &state,
+                    &principal,
+                    OperationKey::CreateAccount,
+                    account.id.inner().to_string(),
+                    serde_json::json!({"account": account.id.inner()}),
+                    "retire the account; an account carrying no facts is inert",
+                )
+                .await?;
+                ("created", account)
+            }
             AccountCreated::Existing(account) => ("existing", account),
         };
-        record_decision(
-            &state,
-            &principal,
-            OperationKey::CreateAccount,
-            account.id.inner().to_string(),
-            serde_json::json!({"account": account.id.inner()}),
-            "retire the account; an account carrying no facts is inert",
-        )
-        .await?;
         outcomes.push(AccountBatchResultDto::accepted(
             row,
             outcome,
@@ -3036,6 +3084,7 @@ fn account_dto(account: AccountDetailView) -> AccountDto {
                 valid_to: alias.valid_to,
             })
             .collect(),
+        declared_by: account.declared_by.map(|principal| principal.inner()),
     }
 }
 

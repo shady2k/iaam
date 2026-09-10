@@ -23,7 +23,13 @@ use crate::StoreError;
 /// time, on a statement naming a column that is not there.
 pub const SCHEMA_VERSION: u32 = 2;
 
-const MIGRATIONS: [(u32, &str); 2] = [
+/// Every migration, numbered and embedded, in application order.
+///
+/// `pub` so `tests/bundle_coverage.rs` can read the whole schema without
+/// hard-coding a second list of migration filenames: that test's job is to
+/// notice a `CREATE TABLE` this crate forgot to classify, and it can only do
+/// that against the same migrations this build actually applies.
+pub const MIGRATIONS: [(u32, &str); 2] = [
     (1, include_str!("../migrations/0001_schema.sql")),
     (
         2,

@@ -41,7 +41,16 @@ use crate::{SqliteStore, StoreError};
 /// section would result in data loss. Version 2 adds the reference data an
 /// event's legs point at — without it a bundle holding one security leg
 /// could not be restored into an empty database at all.
-pub const BUNDLE_VERSION: u32 = 2;
+///
+/// Version 3 (iaam-k3gh.9.2) carries the owner's standing decisions, settled
+/// 2026-09-10: a bundle is the transferable state of an instance, not an
+/// archive of the journal, and it carries everything. Before this a restore
+/// held his facts and not one of his judgements about them — classification
+/// rules, category rules and groups, the category-assignment projection,
+/// account scope exclusions, transfer partners, retirements, aliases,
+/// declined account names, and the decision-history audit trail. See
+/// [`TABLE_DISPOSITIONS`] for what still does not travel, and why.
+pub const BUNDLE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContourSection {
@@ -88,6 +97,175 @@ pub struct InstrumentSection {
     pub lineage_reason: Option<String>,
 }
 
+/// An owner classification rule, carried the way `classification_rules`
+/// stores it (§10.4).
+///
+/// `retired_at` and `replaces` travel exactly as stored: a restore that
+/// dropped either would silently turn a retired rule back into a live one, or
+/// lose the decision chain an edit recorded (iaam-k3gh.9.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassificationRuleSection {
+    pub id: uuid::Uuid,
+    pub version: u32,
+    pub counterparty_account: Option<String>,
+    pub description_contains: Option<String>,
+    pub source_kind: Option<String>,
+    pub source_category: Option<String>,
+    pub owner_category: Option<String>,
+    pub source_code: Option<String>,
+    pub movement: Option<String>,
+    pub outcome_kind: String,
+    pub to_account: Option<uuid::Uuid>,
+    pub fee_origin: Option<String>,
+    pub income_kind: Option<String>,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub replaces: Option<uuid::Uuid>,
+}
+
+/// A category group, carried the way `category_groups` stores it.
+///
+/// `retired_at` is carried for the reason it is on the rules above:
+/// retirement preserves the names historical reports used, and dropping it
+/// would resurrect a group the owner closed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryGroupSection {
+    pub id: uuid::Uuid,
+    pub title: String,
+    pub retired_at: Option<String>,
+    pub is_income: bool,
+}
+
+/// A category belonging to one group, carried the way `categories` stores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategorySection {
+    pub id: uuid::Uuid,
+    pub group_id: uuid::Uuid,
+    pub title: String,
+    pub retired_at: Option<String>,
+}
+
+/// A category assignment rule, carried the way `category_rules` stores it.
+///
+/// `matcher_kind`, `value`, `text` and `description_mode` are `CategoryMatcher`'s
+/// four variants as the schema's own raw columns, not the domain enum — the
+/// same reason [`CustodyPlaceSection::origin`] carries a raw code: the
+/// schema's `CHECK`, not this type, is where an invalid combination is
+/// refused. `retired_at` and `replaces` carry the same weight they do on
+/// [`ClassificationRuleSection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryRuleSection {
+    pub id: uuid::Uuid,
+    pub version: u32,
+    pub matcher_kind: String,
+    pub value: Option<String>,
+    pub text: Option<String>,
+    pub description_mode: Option<String>,
+    pub category: uuid::Uuid,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
+    pub created_at: String,
+    pub retired_at: Option<String>,
+    pub replaces: Option<uuid::Uuid>,
+}
+
+/// One event's category assignment, carried the way
+/// `event_category_assignments` stores it.
+///
+/// That table's own doc comment calls it a read model, rebuilt rather than
+/// repaired — and the owner's decision (iaam-k3gh.9) is to carry it anyway,
+/// because a rebuild on the far side needs `classification_rules` and
+/// `category_rules` to already be there in exactly the state that produced
+/// this projection, and nothing guarantees a later instance runs the same
+/// rebuild before anyone reads a report. Carrying the projection removes that
+/// dependency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventCategoryAssignmentSection {
+    pub event: uuid::Uuid,
+    pub category: uuid::Uuid,
+    pub rule: uuid::Uuid,
+    pub basis: String,
+    pub rules_revision: i64,
+}
+
+/// The owner's statement that an account sits outside every contour, carried
+/// the way `account_scope_exclusions` stores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountScopeExclusionSection {
+    pub account: uuid::Uuid,
+    pub reason: String,
+    pub recorded_at: String,
+}
+
+/// The owner's statement about one account's transfer partners: one row of
+/// `account_transfer_statements` plus the `account_transfer_partners` it
+/// names.
+///
+/// `partners` may be empty, and that is a real answer — "money moves between
+/// this account and none of my others" — not "he has not said": the absence
+/// of a section entirely is what the second means. This is why the two
+/// tables are one section rather than two: an empty partner list carried
+/// without its statement would be indistinguishable from silence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountTransferSection {
+    pub account: uuid::Uuid,
+    pub recorded_at: String,
+    pub partners: Vec<uuid::Uuid>,
+}
+
+/// One row of `account_retirements`, exactly as stored.
+///
+/// This table is an APPEND-ONLY HISTORY (see its own doc comment), and the
+/// whole of it travels rather than only the state currently in force: a
+/// report published under an earlier revision names that revision, and only
+/// the raw rows — in revision order — let a restored instance keep answering
+/// to it. `effective_on` is `None` exactly on the row that withdraws a
+/// previous retirement; losing that against a `Some` is exactly what turns a
+/// withdrawn retirement back into a live one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountRetirementSection {
+    pub revision: u32,
+    pub account: uuid::Uuid,
+    pub effective_on: Option<String>,
+    pub recorded_at: String,
+}
+
+/// A further identifier reaching one account, carried the way
+/// `account_aliases` stores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccountAliasSection {
+    pub account: uuid::Uuid,
+    pub value: String,
+    pub valid_from: String,
+    pub valid_to: Option<String>,
+}
+
+/// A printed name the owner has said is not one of his accounts, carried the
+/// way `declined_account_names` stores it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeclinedAccountNameSection {
+    pub printed: String,
+    pub reason: String,
+    pub recorded_at: String,
+}
+
+/// One row of the reversible-decision audit trail, carried the way
+/// `decision_history` stores it.
+///
+/// `declared_by` travels as the bare identifier this table already stores it
+/// as — a reference to a token, not the token itself, which does not travel
+/// at all (see the `Credential` disposition on `api_tokens` in
+/// [`TABLE_DISPOSITIONS`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionHistorySection {
+    pub declared_by: Option<uuid::Uuid>,
+    pub operation: String,
+    pub subject: String,
+    pub decision: String,
+    pub undo: String,
+    pub recorded_at: String,
+}
+
 /// The complete bundle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bundle {
@@ -108,6 +286,42 @@ pub struct Bundle {
     /// `#[serde(default)]` reasoning applies here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instruments: Vec<InstrumentSection>,
+    /// The owner's classification rules (§10.4), including retired ones.
+    /// Added at version 3 (iaam-k3gh.9.2); the `#[serde(default)]` reasoning
+    /// above `custody_places` applies to every field from here down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classification_rules: Vec<ClassificationRuleSection>,
+    /// The owner's category groups, including retired ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub category_groups: Vec<CategoryGroupSection>,
+    /// The owner's categories, including retired ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<CategorySection>,
+    /// The owner's category assignment rules, including retired ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub category_rules: Vec<CategoryRuleSection>,
+    /// The category-assignment projection over the exported events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_category_assignments: Vec<EventCategoryAssignmentSection>,
+    /// The owner's declarations that an account sits outside every contour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_scope_exclusions: Vec<AccountScopeExclusionSection>,
+    /// The owner's statements about which accounts transfer money between
+    /// each other.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_transfers: Vec<AccountTransferSection>,
+    /// The full `account_retirements` history, every revision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_retirements: Vec<AccountRetirementSection>,
+    /// Every account alias.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_aliases: Vec<AccountAliasSection>,
+    /// Printed names the owner has said are not his accounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declined_account_names: Vec<DeclinedAccountNameSection>,
+    /// The reversible-decision audit trail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_history: Vec<DecisionHistorySection>,
     /// Content checksum. Computed from the canonical
     /// representation of all sections except the checksum itself.
     pub checksum: String,
@@ -137,6 +351,28 @@ struct BundleContent<'a> {
     custody_places: &'a [CustodyPlaceSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     instruments: &'a [InstrumentSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    classification_rules: &'a [ClassificationRuleSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    category_groups: &'a [CategoryGroupSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    categories: &'a [CategorySection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    category_rules: &'a [CategoryRuleSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    event_category_assignments: &'a [EventCategoryAssignmentSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    account_scope_exclusions: &'a [AccountScopeExclusionSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    account_transfers: &'a [AccountTransferSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    account_retirements: &'a [AccountRetirementSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    account_aliases: &'a [AccountAliasSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    declined_account_names: &'a [DeclinedAccountNameSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    decision_history: &'a [DecisionHistorySection],
 }
 
 impl Bundle {
@@ -161,6 +397,17 @@ impl Bundle {
             contours: &self.contours,
             custody_places: &self.custody_places,
             instruments: &self.instruments,
+            classification_rules: &self.classification_rules,
+            category_groups: &self.category_groups,
+            categories: &self.categories,
+            category_rules: &self.category_rules,
+            event_category_assignments: &self.event_category_assignments,
+            account_scope_exclusions: &self.account_scope_exclusions,
+            account_transfers: &self.account_transfers,
+            account_retirements: &self.account_retirements,
+            account_aliases: &self.account_aliases,
+            declined_account_names: &self.declined_account_names,
+            decision_history: &self.decision_history,
         };
         let mut body = Vec::new();
         ciborium::into_writer(&content, &mut body)
@@ -240,6 +487,183 @@ pub const REFERENCE_CLOSURE_SQL: &str = "
       FROM instruments n JOIN reached r ON n.id = r.id
      ORDER BY n.symbol, n.id
 ";
+
+/// Why a table in the schema does, or does not yet, travel in a bundle.
+///
+/// A closed set, not free text, so that "not yet done" cannot masquerade as
+/// "deliberately excluded" (iaam-k3gh.9.1). [`TABLE_DISPOSITIONS`] pairs every
+/// table the schema declares with exactly one of these, and
+/// `tests/bundle_coverage.rs` holds that pairing to the schema the way
+/// `tests/schema_coverage.rs` holds [`INSTRUMENT_REFERENCE_COLUMNS`] to it: a
+/// table added later and left off the list fails the build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableDisposition {
+    /// Recomputable from the journal and the owner's other standing decisions
+    /// on restore: a cache whose loss changes nothing a reader can observe,
+    /// because the projection is rebuilt from first principles rather than
+    /// repaired. Snapshots, schedule snapshots and schedule completeness.
+    Derived,
+    /// A secret that must not travel in a file the owner copies between
+    /// machines: `api_tokens`, `token_usage`, `broker_access`. A bundle is a
+    /// portable archive, and a token inside it is a credential copied along
+    /// with it — this is the owner's call to overturn, not a flag to add.
+    Credential,
+    /// Carried by [`Bundle`] today.
+    Carried,
+    /// Classified — not a credential, not derived, not left off by
+    /// oversight — but not yet carried. Names the bead that will carry it, so
+    /// the remaining work stays visible in code rather than only in a
+    /// tracker.
+    Pending(&'static str),
+}
+
+/// Every table the schema declares, classified by [`TableDisposition`].
+///
+/// This is the device iaam-k3gh.9 asked for in place of prose: a bundle
+/// drifted to five sections out of fifty-nine because nothing failed when a
+/// table was added and not exported. `tests/bundle_coverage.rs` asserts this
+/// list's key set equals the exact set of `CREATE TABLE` names across every
+/// migration in [`crate::schema::MIGRATIONS`] — so a table missing from
+/// either side fails the build, and there is no substring or table-family
+/// shortcut for a reviewer to be fooled by.
+///
+/// The four groups below are the ones the owner's decision (iaam-k3gh.9,
+/// 2026-09-10) recorded, not re-derived here: the sections already in
+/// [`Bundle`] before this list existed; the owner's standing decisions
+/// (iaam-k3gh.9.2); evidence he acquired and cannot re-fetch (iaam-k3gh.9.3);
+/// data derived from the journal; and credentials.
+pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
+    // --- Already carried, via `events` and its per-kind detail tables. ---
+    ("events", TableDisposition::Carried),
+    ("event_legs", TableDisposition::Carried),
+    ("event_trade", TableDisposition::Carried),
+    ("event_cash_transfer", TableDisposition::Carried),
+    ("event_unresolved_movement", TableDisposition::Carried),
+    ("event_income", TableDisposition::Carried),
+    ("event_fee", TableDisposition::Carried),
+    ("event_tax", TableDisposition::Carried),
+    ("event_opening_position", TableDisposition::Carried),
+    ("event_valuation", TableDisposition::Carried),
+    ("event_control_assertion", TableDisposition::Carried),
+    ("event_coverage_gap", TableDisposition::Carried),
+    ("event_corporate_action", TableDisposition::Carried),
+    ("event_offer_exercise", TableDisposition::Carried),
+    ("event_coverage_gap_rows", TableDisposition::Carried),
+    (
+        "event_coverage_gap_row_dimensions",
+        TableDisposition::Carried,
+    ),
+    // --- Already carried, via `accounts`, `contours`, `custody_places`,
+    // `instruments`. ---
+    ("accounts", TableDisposition::Carried),
+    ("contour_versions", TableDisposition::Carried),
+    ("contour_accounts", TableDisposition::Carried),
+    ("custody_places", TableDisposition::Carried),
+    ("instruments", TableDisposition::Carried),
+    // --- The owner's standing decisions (iaam-k3gh.9.2). Carried as of that
+    // task: `classification_rules`, `category_rules`, `event_category_assignments`
+    // and the account declarations below, each with its own bundle section. ---
+    ("classification_rules", TableDisposition::Carried),
+    ("category_groups", TableDisposition::Carried),
+    ("categories", TableDisposition::Carried),
+    ("category_rules", TableDisposition::Carried),
+    ("event_category_assignments", TableDisposition::Carried),
+    ("account_scope_exclusions", TableDisposition::Carried),
+    ("account_transfer_statements", TableDisposition::Carried),
+    ("account_transfer_partners", TableDisposition::Carried),
+    ("account_retirements", TableDisposition::Carried),
+    ("account_aliases", TableDisposition::Carried),
+    ("declined_account_names", TableDisposition::Carried),
+    ("decision_history", TableDisposition::Carried),
+    // --- Evidence the owner acquired and cannot re-fetch (iaam-k3gh.9.3). ---
+    (
+        "instrument_aliases",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "source_documents",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    ("raw_rows", TableDisposition::Pending("iaam-k3gh.9.3")),
+    (
+        "document_unresolved_accounts",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "source_profile_versions",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    // A durable synchronization run, the same operational-evidence shape as
+    // the observation tables it leases for below: not a decision, not
+    // recomputable from the journal, not a secret.
+    ("sync_runs", TableDisposition::Pending("iaam-k3gh.9.3")),
+    (
+        "price_observations",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "fx_observations",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "key_rate_observations",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "series_completeness",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "accrued_interest_observations",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "broker_operation_kinds",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "schedule_coupon_periods",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "schedule_principal_repayments",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "schedule_offer_windows",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    ("issue_terms", TableDisposition::Pending("iaam-k3gh.9.3")),
+    (
+        "market_source_codes",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "import_sessions",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "import_observations",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "import_questions",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    (
+        "import_control_figures",
+        TableDisposition::Pending("iaam-k3gh.9.3"),
+    ),
+    // --- Derived from the journal: recomputed on restore, never carried. ---
+    ("snapshots", TableDisposition::Derived),
+    ("schedule_snapshots", TableDisposition::Derived),
+    ("schedule_completeness", TableDisposition::Derived),
+    // --- Credentials: must not travel in a file the owner copies between
+    // machines (see the module doc above `Bundle`). ---
+    ("api_tokens", TableDisposition::Credential),
+    ("token_usage", TableDisposition::Credential),
+    ("broker_access", TableDisposition::Credential),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportOutcome {
@@ -372,6 +796,312 @@ impl SqliteStore {
             });
         }
 
+        // The owner's standing decisions (iaam-k3gh.9.2). `rule_history` and
+        // `list_category_rules`/`list_groups`/`list_categories` already
+        // return every row including retired ones, in decision order — the
+        // history a restore needs is the history these calls already answer.
+        let classification_rules = self
+            .rule_history(owner)?
+            .into_iter()
+            .map(|rule| ClassificationRuleSection {
+                id: rule.id.inner(),
+                version: rule.version,
+                counterparty_account: rule.counterparty_account,
+                description_contains: rule.description_contains,
+                source_kind: rule.source_kind,
+                source_category: rule.source_category,
+                owner_category: rule.owner_category,
+                source_code: rule.source_code,
+                movement: rule.movement,
+                outcome_kind: rule.outcome_kind,
+                to_account: rule.to_account.map(|account| account.inner()),
+                fee_origin: rule.fee_origin,
+                income_kind: rule.income_kind,
+                created_at: rule.created_at,
+                retired_at: rule.retired_at,
+                replaces: rule.replaces.map(|id| id.inner()),
+            })
+            .collect();
+
+        let category_groups = self
+            .list_groups(owner)?
+            .into_iter()
+            .map(|group| CategoryGroupSection {
+                id: group.id,
+                title: group.title,
+                retired_at: group.retired_at,
+                is_income: group.is_income,
+            })
+            .collect();
+
+        let categories = self
+            .list_categories(owner)?
+            .into_iter()
+            .map(|category| CategorySection {
+                id: category.id,
+                group_id: category.group_id,
+                title: category.title,
+                retired_at: category.retired_at,
+            })
+            .collect();
+
+        // Raw columns, not `CategoryMatcher`: as with `CustodyPlaceSection`,
+        // the wire format carries what the schema stores, not the domain
+        // type — `list_category_rules` decodes into the enum for its own
+        // callers, which is exactly the step this must not depend on.
+        let mut statement = self.conn.prepare(
+            "SELECT id, version, matcher_kind, value, text, description_mode,
+                    category, valid_from, valid_to, created_at, retired_at, replaces
+             FROM category_rules
+             WHERE owner = ?1
+             ORDER BY version",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+        let mut category_rules = Vec::new();
+        for row in rows {
+            let (
+                id,
+                version,
+                matcher_kind,
+                value,
+                text,
+                description_mode,
+                category,
+                valid_from,
+                valid_to,
+                created_at,
+                retired_at,
+                replaces,
+            ) = row?;
+            category_rules.push(CategoryRuleSection {
+                id: parse(&id, "category_rule")?,
+                version,
+                matcher_kind,
+                value,
+                text,
+                description_mode,
+                category: parse(&category, "category")?,
+                valid_from,
+                valid_to,
+                created_at,
+                retired_at,
+                replaces: replaces
+                    .map(|value| parse(&value, "category_rule"))
+                    .transpose()?,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT event, category, rule, basis, rules_revision
+             FROM event_category_assignments
+             WHERE owner = ?1
+             ORDER BY event",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut event_category_assignments = Vec::new();
+        for row in rows {
+            let (event, category, rule, basis, rules_revision) = row?;
+            event_category_assignments.push(EventCategoryAssignmentSection {
+                event: parse(&event, "event")?,
+                category: parse(&category, "category")?,
+                rule: parse(&rule, "category_rule")?,
+                basis,
+                rules_revision,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT account, reason, recorded_at
+             FROM account_scope_exclusions
+             WHERE owner = ?1
+             ORDER BY account",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut account_scope_exclusions = Vec::new();
+        for row in rows {
+            let (account, reason, recorded_at) = row?;
+            account_scope_exclusions.push(AccountScopeExclusionSection {
+                account: parse(&account, "account")?,
+                reason,
+                recorded_at,
+            });
+        }
+
+        // One statement row per account, each carrying the partners named
+        // for it — the same shape `list_account_transfer_statements` builds,
+        // rebuilt here so `recorded_at` (which that call does not select)
+        // travels too.
+        let mut statement = self.conn.prepare(
+            "SELECT account, partner FROM account_transfer_partners
+             WHERE owner = ?1
+             ORDER BY account, partner",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut partners_by_account: std::collections::BTreeMap<uuid::Uuid, Vec<uuid::Uuid>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (account, partner) = row?;
+            partners_by_account
+                .entry(parse(&account, "account")?)
+                .or_default()
+                .push(parse(&partner, "account")?);
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT account, recorded_at FROM account_transfer_statements
+             WHERE owner = ?1
+             ORDER BY account",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut account_transfers = Vec::new();
+        for row in rows {
+            let (account, recorded_at) = row?;
+            let account = parse(&account, "account")?;
+            account_transfers.push(AccountTransferSection {
+                account,
+                recorded_at,
+                partners: partners_by_account.remove(&account).unwrap_or_default(),
+            });
+        }
+
+        // The whole append-only history, not only the state in force: see
+        // the doc comment on `AccountRetirementSection`.
+        let mut statement = self.conn.prepare(
+            "SELECT revision, account, effective_on, recorded_at
+             FROM account_retirements
+             WHERE owner = ?1
+             ORDER BY revision",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut account_retirements = Vec::new();
+        for row in rows {
+            let (revision, account, effective_on, recorded_at) = row?;
+            account_retirements.push(AccountRetirementSection {
+                revision,
+                account: parse(&account, "account")?,
+                effective_on,
+                recorded_at,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT account, value, valid_from, valid_to
+             FROM account_aliases
+             WHERE owner = ?1
+             ORDER BY account, valid_from, value",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut account_aliases = Vec::new();
+        for row in rows {
+            let (account, value, valid_from, valid_to) = row?;
+            account_aliases.push(AccountAliasSection {
+                account: parse(&account, "account")?,
+                value,
+                valid_from,
+                valid_to,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT printed, reason, recorded_at
+             FROM declined_account_names
+             WHERE owner = ?1
+             ORDER BY recorded_at, printed",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut declined_account_names = Vec::new();
+        for row in rows {
+            let (printed, reason, recorded_at) = row?;
+            declined_account_names.push(DeclinedAccountNameSection {
+                printed,
+                reason,
+                recorded_at,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT declared_by, operation, subject, decision, undo, recorded_at
+             FROM decision_history
+             WHERE owner = ?1
+             ORDER BY recorded_at, id",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut decision_history = Vec::new();
+        for row in rows {
+            let (declared_by, operation, subject, decision, undo, recorded_at) = row?;
+            decision_history.push(DecisionHistorySection {
+                declared_by: declared_by
+                    .map(|value| parse(&value, "token"))
+                    .transpose()?,
+                operation,
+                subject,
+                decision,
+                undo,
+                recorded_at,
+            });
+        }
+
         let mut bundle = Bundle {
             bundle_version: BUNDLE_VERSION,
             schema_version: crate::schema::SCHEMA_VERSION,
@@ -384,6 +1114,17 @@ impl SqliteStore {
             contours,
             custody_places,
             instruments,
+            classification_rules,
+            category_groups,
+            categories,
+            category_rules,
+            event_category_assignments,
+            account_scope_exclusions,
+            account_transfers,
+            account_retirements,
+            account_aliases,
+            declined_account_names,
+            decision_history,
             checksum: String::new(),
         };
         bundle.checksum = bundle.compute_checksum();
@@ -451,6 +1192,144 @@ impl SqliteStore {
                     account.title,
                     account.institution,
                     created_at,
+                ],
+            )?;
+        }
+
+        // The owner's declarations about his accounts (iaam-k3gh.9.2): every
+        // one of these references `accounts (owner, id)` and nothing else,
+        // so any order among themselves is fine as long as they follow the
+        // accounts loop above. Each conflict resolves to `DO NOTHING`: an
+        // archive supplies what is missing and never overwrites what is
+        // there, the same rule `instruments` follows below — and
+        // `account_retirements` in particular has a trigger that would abort
+        // an `UPDATE`, so `DO NOTHING` is not merely a style choice there.
+        for alias in &bundle.account_aliases {
+            transaction.execute(
+                "INSERT INTO account_aliases (owner, account, value, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (owner, account, value, valid_from) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    alias.account.to_string(),
+                    alias.value,
+                    alias.valid_from,
+                    alias.valid_to,
+                ],
+            )?;
+        }
+
+        for exclusion in &bundle.account_scope_exclusions {
+            transaction.execute(
+                "INSERT INTO account_scope_exclusions (owner, account, reason, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (owner, account) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    exclusion.account.to_string(),
+                    exclusion.reason,
+                    exclusion.recorded_at,
+                ],
+            )?;
+        }
+
+        for transfer in &bundle.account_transfers {
+            transaction.execute(
+                "INSERT INTO account_transfer_statements (owner, account, recorded_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (owner, account) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    transfer.account.to_string(),
+                    transfer.recorded_at,
+                ],
+            )?;
+            for partner in &transfer.partners {
+                transaction.execute(
+                    "INSERT INTO account_transfer_partners (owner, account, partner)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT (owner, account, partner) DO NOTHING",
+                    params![
+                        owner.inner().to_string(),
+                        transfer.account.to_string(),
+                        partner.to_string(),
+                    ],
+                )?;
+            }
+        }
+
+        // The whole append-only history, in the revision order the section
+        // already carries it: a fresh `INSERT` with the original revision
+        // number, never `record_account_retirement`'s own MAX+1 allocation,
+        // because that would renumber every row and disconnect a published
+        // report from the revision it named.
+        for retirement in &bundle.account_retirements {
+            transaction.execute(
+                "INSERT INTO account_retirements (owner, revision, account, effective_on, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (owner, revision) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    retirement.revision,
+                    retirement.account.to_string(),
+                    retirement.effective_on,
+                    retirement.recorded_at,
+                ],
+            )?;
+        }
+
+        for declined in &bundle.declined_account_names {
+            transaction.execute(
+                "INSERT INTO declined_account_names (owner, printed, reason, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (owner, printed) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    declined.printed,
+                    declined.reason,
+                    declined.recorded_at,
+                ],
+            )?;
+        }
+
+        // No natural key beyond the autoincrement `id`, which this section
+        // does not carry — re-importing the same bundle must still change
+        // nothing, so a row is inserted only when an identical one is not
+        // already there. `IS` rather than `=` compares `declared_by`
+        // NULL-safely.
+        for decision in &bundle.decision_history {
+            let known: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM decision_history
+                     WHERE owner = ?1 AND declared_by IS ?2 AND operation = ?3
+                       AND subject = ?4 AND decision = ?5 AND undo = ?6 AND recorded_at = ?7",
+                    params![
+                        owner.inner().to_string(),
+                        decision.declared_by.map(|id| id.to_string()),
+                        decision.operation,
+                        decision.subject,
+                        decision.decision,
+                        decision.undo,
+                        decision.recorded_at,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if known.is_some() {
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO decision_history
+                     (owner, declared_by, operation, subject, decision, undo, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    owner.inner().to_string(),
+                    decision.declared_by.map(|id| id.to_string()),
+                    decision.operation,
+                    decision.subject,
+                    decision.decision,
+                    decision.undo,
+                    decision.recorded_at,
                 ],
             )?;
         }
@@ -587,6 +1466,107 @@ impl SqliteStore {
             }
         }
 
+        for group in &bundle.category_groups {
+            transaction.execute(
+                "INSERT INTO category_groups (id, owner, title, created_at, retired_at, is_income)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    group.id.to_string(),
+                    owner.inner().to_string(),
+                    group.title,
+                    created_at,
+                    group.retired_at,
+                    i64::from(group.is_income),
+                ],
+            )?;
+        }
+
+        for category in &bundle.categories {
+            transaction.execute(
+                "INSERT INTO categories (id, owner, group_id, title, created_at, retired_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    category.id.to_string(),
+                    owner.inner().to_string(),
+                    category.group_id.to_string(),
+                    category.title,
+                    created_at,
+                    category.retired_at,
+                ],
+            )?;
+        }
+
+        // `replaces` is a self-referencing foreign key naming a strictly
+        // earlier decision, so inserting in ascending `version` order —
+        // `rule_history`'s own order, re-sorted here rather than trusted, the
+        // way `instruments.lineage_parent` is not trusted to arrive
+        // pre-ordered either — guarantees a rule's `replaces` target is
+        // already in before it is needed.
+        let mut ordered_classification_rules: Vec<&ClassificationRuleSection> =
+            bundle.classification_rules.iter().collect();
+        ordered_classification_rules.sort_by_key(|rule| rule.version);
+        for rule in ordered_classification_rules {
+            transaction.execute(
+                "INSERT INTO classification_rules (
+                     id, owner, version,
+                     counterparty_account, description_contains, source_kind,
+                     source_category, owner_category, source_code, movement,
+                     outcome_kind, to_account, fee_origin, income_kind,
+                     created_at, retired_at, replaces
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    rule.id.to_string(),
+                    owner.inner().to_string(),
+                    rule.version,
+                    rule.counterparty_account,
+                    rule.description_contains,
+                    rule.source_kind,
+                    rule.source_category,
+                    rule.owner_category,
+                    rule.source_code,
+                    rule.movement,
+                    rule.outcome_kind,
+                    rule.to_account.map(|id| id.to_string()),
+                    rule.fee_origin,
+                    rule.income_kind,
+                    rule.created_at,
+                    rule.retired_at,
+                    rule.replaces.map(|id| id.to_string()),
+                ],
+            )?;
+        }
+
+        let mut ordered_category_rules: Vec<&CategoryRuleSection> =
+            bundle.category_rules.iter().collect();
+        ordered_category_rules.sort_by_key(|rule| rule.version);
+        for rule in ordered_category_rules {
+            transaction.execute(
+                "INSERT INTO category_rules (
+                     id, owner, version, matcher_kind, value, text, description_mode,
+                     category, valid_from, valid_to, created_at, retired_at, replaces
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    rule.id.to_string(),
+                    owner.inner().to_string(),
+                    rule.version,
+                    rule.matcher_kind,
+                    rule.value,
+                    rule.text,
+                    rule.description_mode,
+                    rule.category.to_string(),
+                    rule.valid_from,
+                    rule.valid_to,
+                    rule.created_at,
+                    rule.retired_at,
+                    rule.replaces.map(|id| id.to_string()),
+                ],
+            )?;
+        }
+
         let mut inserted = 0;
         let mut duplicates = 0;
         for event in &bundle.events {
@@ -602,6 +1582,24 @@ impl SqliteStore {
             }
             insert_event_in(&transaction, event)?;
             inserted += 1;
+        }
+
+        // After the events loop: this projection references `events (id)`.
+        for assignment in &bundle.event_category_assignments {
+            transaction.execute(
+                "INSERT INTO event_category_assignments
+                     (owner, event, category, rule, basis, rules_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (owner, event) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    assignment.event.to_string(),
+                    assignment.category.to_string(),
+                    assignment.rule.to_string(),
+                    assignment.basis,
+                    assignment.rules_revision,
+                ],
+            )?;
         }
 
         transaction.commit()?;

@@ -24,7 +24,7 @@ and it has two roles.
 | Role | Command | Run by |
 |---|---|---|
 | HTTP service | `iaam serve` | a service manager, unattended |
-| local administration | `iaam claim`, `iaam token issue`, `iaam broker key …`, `iaam broker access …` | the owner, at a console |
+| local administration | `iaam claim`, `iaam token issue`, `iaam broker key …`, `iaam broker access …`, `iaam bundle export`, `iaam bundle import` | the owner, at a console |
 
 The second role is not a convenience wrapper. Under
 [ADR-0003](decisions/0003-the-owner-speaks-to-an-agent-and-a-cli-keeps-the-secrets.md)
@@ -35,6 +35,15 @@ database and key files, and the boundary that decides who may execute it at all.
 A deployment where anyone can run `iaam claim` against the database file has
 given away ownership of the instance; §3.4 and §4.4 are where that boundary is
 actually set.
+
+`iaam bundle export` and `iaam bundle import` join this list for a different
+reason than the rest: they carry no secret (a bundle never contains a token or
+a broker credential — `crates/iaam-bootstrap/src/bundle.rs` names every table
+that stays out). What they share with the rest of the row is where the file
+lands: an export is the owner's entire financial history in one file, and
+writing it is a console act with a chosen path and no HTTP body, proxy or
+access log between the database and the disk — see that same doc comment for
+the full reasoning against a route.
 
 Three rules follow, and they hold for every step below.
 
@@ -786,12 +795,60 @@ $ ls -l /var/backups/
 ```
 
 A copy of the database file is not a complete backup: it is tied to a schema
-version and to a platform. Export the archive bundle regularly — it is portable
-and its checksum is verified on import.
+version and to a platform. Export the archive bundle regularly instead — it is
+portable and its checksum is verified on import:
+
+```console
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db \
+    iaam bundle export --output /var/backups/iaam-$(date +%F).bundle.json
+wrote /var/backups/iaam-2026-09-10.bundle.json (bundle format 3, schema 2, exported 2026-09-10T12:00:00Z, 812 events)
+```
+
+It refuses to overwrite a file that already exists, so a mistyped path fails
+loudly rather than replacing yesterday's archive.
+
+Restoring is the same command in reverse:
+
+```console
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/new-iaam.db \
+    iaam claim --label console
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/new-iaam.db \
+    iaam bundle import --input /var/backups/iaam-2026-09-10.bundle.json
+restored /var/backups/iaam-2026-09-10.bundle.json (bundle format 3, schema 2, exported 2026-09-10T12:00:00Z)
+archive was recorded under owner 1a85610c-…; tokens do not travel in a bundle, so it is attached to this instance's own owner 5e2f…-… instead
+events: 812 written, 0 already recorded
+not restored — 27 table(s) this build's schema holds do not travel in a bundle:
+  instrument_aliases: not yet carried; tracked as iaam-k3gh.9.3
+  … (evidence the owner acquired and cannot re-fetch, still being added table by table)
+  snapshots: recomputed from the journal on restore, not carried
+  schedule_snapshots: recomputed from the journal on restore, not carried
+  schedule_completeness: recomputed from the journal on restore, not carried
+  api_tokens: a credential; never copied into a portable file
+  token_usage: a credential; never copied into a portable file
+  broker_access: a credential; never copied into a portable file
+```
+
+The count and the list are read from the running build's own schema
+(`iaam_store::bundle::TABLE_DISPOSITIONS`), not typed in by this document, so
+it grows or shrinks exactly as the schema and the bundle's coverage of it do —
+what is missing today is what the report above says is missing, never less.
+
+`iaam claim` runs first because a restore attaches the archive's facts to
+*this* instance's owner, not the exporting instance's — no token from the old
+instance would ever be reissued under a different identifier, so the report
+says so rather than leaving a restored instance nobody's token can read.
+Restoring into a database that already holds journal facts is refused unless
+`--merge` is passed explicitly (`error: this instance already holds journal
+facts; …`): there is no default that quietly decides between "start fresh" and
+"add to what is here."
 
 The database file contains the entire journal of facts. Handle it like a bank
-statement. Back up the broker key separately and to a different place (§6.5); a
-backup of the database without the key restores the record but not the access.
+statement — the same is true of a bundle exported from it, and more so: it is
+a single file meant to be copied, so keep it exactly as guarded as the database
+itself. Back up the broker key separately and to a different place (§6.5); a
+backup of the database, or a bundle export, never carries the key or the
+broker access it protects — restoring one restores the record but not the
+access.
 
 ---
 
@@ -836,7 +893,10 @@ supplies what is missing and with which command.
 | `error: variable IAAM_LISTEN is invalid: 8080; allowed values: socket address such as 127.0.0.1:8080` | a port without a host | use `0.0.0.0:8080` in a container, `127.0.0.1:8080` on a host |
 | ``error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue` `` | a retired provisioning variable is set (§2.4) | remove it from the unit, profile or compose file and run the subcommand |
 | `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue --scope owner` (§7.3) |
-| ``error: instance has no owner: run `iaam claim --label <label>` first`` | `token issue` against an empty database | run `iaam claim --label console` (§3.5, §4.4) |
+| ``error: instance has no owner: run `iaam claim --label <label>` first`` | `token issue`, or `bundle export`/`bundle import`, against an empty database | run `iaam claim --label console` (§3.5, §4.4) |
+| `error: multiple owners recorded in the database: …` | `bundle export`/`bundle import` against a database with more than one owner | inspect the database; this is corruption in a single-owner system, not something the command guesses past |
+| `error: this instance already holds journal facts; restoring would merge the archive into them …` | `bundle import` against a database that is not empty, without `--merge` | pass `--merge` if merging is what is wanted (§9); otherwise restore into an empty database |
+| `error: … already exists: refusing to overwrite an existing archive` | `bundle export --output` names a file that is already there | choose a new path, or move the existing archive aside first |
 | ``error: key file /etc/iaam/broker-key not found; run `iaam broker key generate` `` | `IAAM_BROKER_KEY_FILE` points at nothing | the owner, at a console: §6.1 |
 | `error: key file … already exists: overwriting it would make every configured access unreadable` | `broker key generate` over an existing key | none needed; to change keys use `broker key rotate` (§6.5) |
 | `error: key file … exists but is unreadable or has an invalid format` | wrong file, or a damaged key | restore the key from backup. Do **not** create a new one over it |

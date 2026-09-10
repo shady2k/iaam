@@ -3,6 +3,7 @@
 //! The only place that knows about both transport and adapters.
 //! The architecture guard verifies that this remains true.
 
+mod bundle;
 mod config;
 mod provision;
 
@@ -54,6 +55,36 @@ enum Command {
     Broker {
         #[command(subcommand)]
         command: BrokerCommand,
+    },
+    /// Move an instance's transferable state in and out of a file (§14).
+    ///
+    /// A local administration command and not a route: see the doc comment
+    /// on `crate::bundle` for why an export is not the same act as reading a
+    /// report and does not belong beside them on the HTTP surface.
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BundleCommand {
+    /// Export the sole owner's bundle to a file.
+    Export {
+        /// Where to write the archive. Refused if it already exists.
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Restore an archive written by `bundle export` into this instance.
+    Import {
+        /// The archive to read.
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// Required when this instance already holds journal facts: an
+        /// explicit acknowledgement that the archive is merged into them
+        /// rather than restored into an empty database.
+        #[arg(long)]
+        merge: bool,
     },
 }
 
@@ -319,6 +350,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
+        Command::Bundle {
+            command: BundleCommand::Export { output },
+        } => {
+            let store = SqliteStore::open(&config.database)?;
+            let summary = bundle::export_to_file(&store, &output)?;
+            println!("{summary}");
+            Ok(())
+        }
+        Command::Bundle {
+            command: BundleCommand::Import { input, merge },
+        } => {
+            let mut store = SqliteStore::open(&config.database)?;
+            let report = bundle::import_from_file(&mut store, &input, merge)?;
+            println!("{report}");
+            Ok(())
+        }
     }
 }
 
@@ -512,9 +559,9 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, Cli, Command, SqliteAdapter,
-        TokenCommand, TokenScopeArg, claim_owner, format_error_chain, legacy_replacement,
-        read_broker_key,
+        BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, BundleCommand, Cli, Command,
+        SqliteAdapter, TokenCommand, TokenScopeArg, claim_owner, format_error_chain,
+        legacy_replacement, read_broker_key,
     };
     use clap::Parser;
 
@@ -608,6 +655,37 @@ mod tests {
                     },
                 },
             } if broker == "tinkoff"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_bundle_export_and_import() {
+        let export =
+            Cli::try_parse_from(["iaam", "bundle", "export", "--output", "out.json"]).unwrap();
+        assert!(matches!(
+            export.command,
+            Command::Bundle {
+                command: BundleCommand::Export { output }
+            } if output == std::path::Path::new("out.json")
+        ));
+
+        let import =
+            Cli::try_parse_from(["iaam", "bundle", "import", "--input", "in.json", "--merge"])
+                .unwrap();
+        assert!(matches!(
+            import.command,
+            Command::Bundle {
+                command: BundleCommand::Import { input, merge: true }
+            } if input == std::path::Path::new("in.json")
+        ));
+
+        let import_no_merge =
+            Cli::try_parse_from(["iaam", "bundle", "import", "--input", "in.json"]).unwrap();
+        assert!(matches!(
+            import_no_merge.command,
+            Command::Bundle {
+                command: BundleCommand::Import { merge: false, .. }
+            }
         ));
     }
 

@@ -1,5 +1,6 @@
 //! Archived bundle: export, import, corruption.
 
+use iaam_core::category::CategoryMatcher;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
@@ -11,15 +12,20 @@ use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash, RuleSettl
 use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportSessionId, InstrumentId, OwnerId,
-    SourceId,
+    PrincipalId, SourceId,
 };
-use iaam_core::instrument::{CurrencyRoles, Lineage, LineageReason};
+use iaam_core::instrument::{AliasInterval, CurrencyRoles, Lineage, LineageReason};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::evidence::IdentityScope;
+use iaam_core::retirement::AccountRetirement;
 use iaam_store::SqliteStore;
 use iaam_store::bundle::{Bundle, ImportOutcome};
-use iaam_store::reference::{AccountRecord, CustodyRecord, InstrumentRecord};
+use iaam_store::categories::NewCategoryRule;
+use iaam_store::reference::{
+    AccountAliasRecord, AccountRecord, AccountScopeExclusionRecord, CustodyRecord, InstrumentRecord,
+};
+use iaam_store::rules::NewRule;
 use time::macros::date;
 
 fn deposit(owner: OwnerId, account: AccountId, sequence: u32, minor: i64) -> Event {
@@ -899,4 +905,341 @@ fn an_import_of_an_event_carrying_import_session_and_rule_identifiers_the_bundle
         kept.provenance.rule_settlement(),
         Some(&RuleSettlement::Rule { rule, version: 1 })
     );
+}
+
+// --- iaam-k3gh.9.2: the owner's decisions travel --------------------------
+
+/// A minimal, always-valid classification rule: one condition
+/// (`description_contains`) and an outcome (`external_flow`) that needs none
+/// of the fields the schema's `CHECK` makes conditional on the others.
+fn invented_classification_rule() -> NewRule {
+    NewRule {
+        counterparty_account: None,
+        description_contains: Some("Coffee".to_owned()),
+        source_kind: None,
+        source_category: None,
+        owner_category: None,
+        source_code: None,
+        movement: None,
+        outcome_kind: "external_flow".to_owned(),
+        to_account: None,
+        fee_origin: None,
+        income_kind: None,
+    }
+}
+
+/// A store touching every table iaam-k3gh.9.2 carries: account aliases, a
+/// scope exclusion, a transfer statement with a partner, a retirement
+/// history two revisions deep, a declined account name, a recorded decision,
+/// a category group and category, a classification rule that has been
+/// amended once (so `retired_at` and `replaces` are both exercised), a
+/// category rule amended the same way, and the category-assignment
+/// projection rebuilt over an event that matches it.
+///
+/// Every value here is invented for this test; none of it is derived from a
+/// real export.
+fn owner_decisions_fixture() -> (SqliteStore, OwnerId, AccountId, uuid::Uuid) {
+    let (mut store, owner, account, _contour) = populated();
+    let partner = AccountId::new_random();
+    store
+        .upsert_account(&AccountRecord {
+            id: partner,
+            owner,
+            title: "Savings".into(),
+            institution: None,
+        })
+        .unwrap();
+
+    store
+        .replace_account_aliases(
+            owner,
+            account,
+            &[AccountAliasRecord {
+                value: "**** 0001".into(),
+                interval: AliasInterval {
+                    valid_from: date!(2026 - 01 - 01),
+                    valid_to: None,
+                },
+            }],
+        )
+        .unwrap();
+
+    store
+        .record_account_scope_exclusion(
+            owner,
+            &AccountScopeExclusionRecord {
+                account: partner,
+                reason: "a gift card, not really his money".into(),
+            },
+        )
+        .unwrap();
+
+    store
+        .record_account_transfer_statement(owner, account, &[partner])
+        .unwrap();
+
+    // Two revisions: a retirement, then its withdrawal — the append-only
+    // history a round trip must keep both rows of.
+    store
+        .record_account_retirement(
+            owner,
+            &AccountRetirement {
+                account: partner,
+                effective_on: date!(2026 - 06 - 01),
+            },
+        )
+        .unwrap();
+    store.withdraw_account_retirement(owner, partner).unwrap();
+
+    store
+        .decline_account_name(owner, "SOME BANK CARD ****9999", "not one of his cards")
+        .unwrap();
+
+    store
+        .record_decision(
+            owner,
+            Some(PrincipalId::new_random()),
+            "test_decision",
+            "invented-subject",
+            &serde_json::json!({"invented": true}),
+            "undo_test_decision",
+        )
+        .unwrap();
+
+    let group = store
+        .insert_category_group_of_kind(owner, "Groceries", false)
+        .unwrap();
+    let category = store.insert_category(owner, group, "Coffee").unwrap();
+
+    let rule = store
+        .insert_rule(owner, invented_classification_rule())
+        .unwrap();
+    store
+        .amend_rule(owner, rule.id, invented_classification_rule())
+        .unwrap();
+
+    let category_rule = store
+        .insert_category_rule(
+            owner,
+            NewCategoryRule {
+                matcher: CategoryMatcher::DescriptionContains {
+                    text: "Coffee".to_owned(),
+                },
+                category,
+                valid_from: None,
+                valid_to: None,
+            },
+            None,
+        )
+        .unwrap();
+    store
+        .amend_category_rule(
+            owner,
+            category_rule.id,
+            NewCategoryRule {
+                matcher: CategoryMatcher::DescriptionContains {
+                    text: "Coffee Shop".to_owned(),
+                },
+                category,
+                valid_from: None,
+                valid_to: None,
+            },
+        )
+        .unwrap();
+
+    let matching_event = Event {
+        provenance: Provenance::new(
+            SourceId::new_random(),
+            RawHash::parse(&"8".repeat(64)).unwrap(),
+            ParserVersion("manual/1".into()),
+        )
+        .with_description("Coffee Shop purchase"),
+        ..deposit(owner, account, 3, 5_000)
+    };
+    store
+        .append_event(&matching_event, IdentityScope::Source)
+        .unwrap();
+    let decomposed = store.rebuild_category_index(owner).unwrap();
+    assert_eq!(
+        decomposed, 1,
+        "the fixture event must actually match the active category rule, or this test proves \
+         nothing about event_category_assignments"
+    );
+
+    (store, owner, account, category)
+}
+
+#[test]
+fn the_owners_decisions_round_trip_into_a_genuinely_empty_database() {
+    let (source, owner, _account, _category) = owner_decisions_fixture();
+    let bundle = source.export_bundle(owner).unwrap();
+
+    assert_eq!(bundle.account_aliases.len(), 1);
+    assert_eq!(bundle.account_scope_exclusions.len(), 1);
+    assert_eq!(bundle.account_transfers.len(), 1);
+    assert_eq!(
+        bundle.account_retirements.len(),
+        2,
+        "both the retirement and its withdrawal must travel — the append-only history, not \
+         only the state in force"
+    );
+    assert_eq!(bundle.declined_account_names.len(), 1);
+    assert_eq!(bundle.decision_history.len(), 1);
+    assert_eq!(bundle.category_groups.len(), 1);
+    assert_eq!(bundle.categories.len(), 1);
+    assert_eq!(
+        bundle.classification_rules.len(),
+        2,
+        "the original rule and the one that replaced it — retirement does not delete a row"
+    );
+    assert_eq!(bundle.category_rules.len(), 2);
+    assert_eq!(bundle.event_category_assignments.len(), 1);
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("the owner's decisions must restore into a genuinely empty database");
+
+    let back = restored.export_bundle(owner).unwrap();
+    assert_eq!(back.account_aliases, bundle.account_aliases);
+    assert_eq!(
+        back.account_scope_exclusions,
+        bundle.account_scope_exclusions
+    );
+    assert_eq!(back.account_transfers, bundle.account_transfers);
+    assert_eq!(back.account_retirements, bundle.account_retirements);
+    assert_eq!(back.declined_account_names, bundle.declined_account_names);
+    assert_eq!(back.decision_history, bundle.decision_history);
+    assert_eq!(back.category_groups, bundle.category_groups);
+    assert_eq!(back.categories, bundle.categories);
+    assert_eq!(back.classification_rules, bundle.classification_rules);
+    assert_eq!(back.category_rules, bundle.category_rules);
+    assert_eq!(
+        back.event_category_assignments,
+        bundle.event_category_assignments
+    );
+}
+
+#[test]
+fn a_retired_classification_rule_is_not_live_after_a_round_trip() {
+    // The failure this exists to catch: dropping `retired_at` on restore
+    // would leave both the original and its replacement active, and a
+    // classification computed afterward would see two rules answer to one
+    // decision instead of one.
+    let (source, owner, _account, _category) = owner_decisions_fixture();
+    let bundle = source.export_bundle(owner).unwrap();
+    let retired = bundle
+        .classification_rules
+        .iter()
+        .find(|rule| rule.retired_at.is_some())
+        .expect("amend_rule must have retired the original rule");
+    assert!(retired.replaces.is_none());
+    let replacement = bundle
+        .classification_rules
+        .iter()
+        .find(|rule| rule.replaces == Some(retired.id))
+        .expect("the amended rule must name the one it replaces");
+    assert!(replacement.retired_at.is_none());
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    let active = restored.list_active_rules(owner).unwrap();
+    assert_eq!(
+        active.len(),
+        1,
+        "exactly one rule must be active after the restore, matching the source"
+    );
+    assert_eq!(active[0].id, ClassificationRuleId(replacement.id));
+}
+
+#[test]
+fn a_withdrawn_account_retirement_is_not_in_force_after_a_round_trip() {
+    // The failure this exists to catch: if only the "in force" state
+    // travelled, this fixture's account has none — the retirement was
+    // withdrawn — so the case worth proving is that a round trip does not
+    // resurrect the withdrawn retirement by dropping the second revision.
+    let (source, owner, _account, _category) = owner_decisions_fixture();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+
+    let in_force = restored.list_account_retirements(owner).unwrap();
+    assert!(
+        in_force.statements.is_empty(),
+        "the retirement was withdrawn in the source; it must not be in force after restore"
+    );
+    assert_eq!(
+        in_force.revision.0, 2,
+        "the revision counter must reflect both rows the history carried, not just the one \
+         in force"
+    );
+}
+
+#[test]
+fn declined_account_names_and_decision_history_round_trip() {
+    let (source, owner, _account, _category) = owner_decisions_fixture();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+
+    let declined = restored.list_declined_account_names(owner).unwrap();
+    assert_eq!(declined.len(), 1);
+    assert_eq!(declined[0].printed, "SOME BANK CARD ****9999");
+
+    let decisions = restored.list_decisions(owner, None, None).unwrap();
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.subject == "invented-subject"),
+        "the recorded decision must be readable back through the ordinary decision API"
+    );
+}
+
+#[test]
+fn importing_the_owners_decisions_twice_changes_nothing() {
+    let (source, owner, _account, _category) = owner_decisions_fixture();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    restored.import_bundle(&bundle).unwrap();
+
+    let back = restored.export_bundle(owner).unwrap();
+    assert_eq!(back.account_aliases, bundle.account_aliases);
+    assert_eq!(back.account_retirements, bundle.account_retirements);
+    assert_eq!(
+        back.decision_history.len(),
+        1,
+        "decision_history has no natural key beyond the id this section does not carry — a \
+         repeat import must not duplicate the row"
+    );
+    assert_eq!(back.classification_rules, bundle.classification_rules);
+    assert_eq!(back.category_rules, bundle.category_rules);
+}
+
+#[test]
+fn an_archive_written_before_the_owners_decisions_existed_still_verifies_and_restores() {
+    // The same pre-existing archive `an_archive_written_before_the_reference_sections_still_verifies`
+    // reads, extended one claim further: it must not merely deserialize —
+    // `import_bundle` must actually restore it, exactly as it did before any
+    // of the sections this task added existed.
+    let bundle: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert!(bundle.classification_rules.is_empty());
+    assert!(bundle.category_groups.is_empty());
+    assert!(bundle.categories.is_empty());
+    assert!(bundle.category_rules.is_empty());
+    assert!(bundle.event_category_assignments.is_empty());
+    assert!(bundle.account_scope_exclusions.is_empty());
+    assert!(bundle.account_transfers.is_empty());
+    assert!(bundle.account_retirements.is_empty());
+    assert!(bundle.account_aliases.is_empty());
+    assert!(bundle.declined_account_names.is_empty());
+    assert!(bundle.decision_history.is_empty());
+    assert_eq!(bundle.checksum, bundle.compute_checksum());
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("an archive written before the owner's decisions travelled must still restore");
+    assert_eq!(restored.load_events(bundle.owner).unwrap().len(), 1);
 }

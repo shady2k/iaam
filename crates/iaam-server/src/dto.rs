@@ -4830,6 +4830,39 @@ pub struct AccountDto {
     /// whoever asked first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_by: Option<Uuid>,
+    /// Whether the owner, or the agent that declared this account, has said it
+    /// should never have existed. `POST /v1/accounts/{id}/retraction` records
+    /// that statement and, with `{"retracted": false}`, withdraws it and
+    /// returns the account to standing (`iaam-o0oj`).
+    ///
+    /// **Always published, never omitted, exactly the way `TokenDto.revoked_at`
+    /// and `BrokerAccessDto.revoked_at` publish a withdrawn credential's own
+    /// state.** §2's row for this route states the same rule in the same
+    /// words theirs do: the list answers with the whole population, retracted
+    /// included. The alternative — dropping a retracted row from the list —
+    /// is refused for the reason `docs/api/conventions.md` §6.6 already gives
+    /// a report's population and the queue: an owner who cannot see the
+    /// account cannot find the thing he must withdraw the statement over. A
+    /// caller that wants only the live accounts, or only the retracted ones,
+    /// asks `GET /v1/accounts?retracted=false` or `?retracted=true` rather
+    /// than reading every row.
+    ///
+    /// **This reports the recorded statement, not the narrower set
+    /// [`iaam_app::scenarios::retraction::retractions_that_hold`] computes
+    /// for suppressing a report or the outstanding-work queue.** A retraction
+    /// is refused while the account carries a business fact, but nothing
+    /// refuses one arriving *afterwards* — the state `accept_retraction`
+    /// cannot produce and the journal can. When that happens,
+    /// `retractions_that_hold` drops the suppression so the fact reaches the
+    /// queue and every report again, while this field keeps reading `true`:
+    /// the owner said the account should never have existed, and a fact
+    /// landing on it later contradicts him, not this row. Reading it back to
+    /// `false` on his behalf would resolve that contradiction silently in
+    /// favour of the claim that turned out to be wrong — the same failure
+    /// §6.4 refuses to let a retirement commit against real money. The
+    /// difference between the two readings is his to see, not this row's to
+    /// smooth over.
+    pub retracted: bool,
 }
 
 /// One alias of an account, valid over a half-open interval.

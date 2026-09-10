@@ -2049,6 +2049,21 @@ pub struct ListAccountsParams {
     /// field existed.
     #[serde(default)]
     pub declared_by: Option<Uuid>,
+    /// Restrict to retracted accounts (`true`) or live ones (`false`). Absent
+    /// returns both, exactly as this route answered before the field existed
+    /// and before `AccountDto` carried `retracted` at all — the default this
+    /// filter sits over is unchanged, and §2's row for this route says so in
+    /// the words `GET /v1/tokens` and `GET /v1/broker-access` already use for
+    /// their own withdrawn state.
+    ///
+    /// Present so that a caller wanting only one population asks for it in
+    /// one request: `retracted=false` for the accounts the owner uses,
+    /// `retracted=true` for the ones he has said should never have existed —
+    /// rather than fetching the whole list and filtering client-side, or
+    /// walking `GET /v1/accounts/{id}/retraction` once per account the way
+    /// `iaam-op0o` found an agent reduced to.
+    #[serde(default)]
+    pub retracted: Option<bool>,
 }
 
 impl crate::extract::QueryRequirements for ListAccountsParams {
@@ -2056,11 +2071,16 @@ impl crate::extract::QueryRequirements for ListAccountsParams {
 }
 
 /// Account list.
+///
+/// One read pays for the whole `retracted` column: `list_account_retractions`
+/// already returns the owner's complete declared set in a single call, so
+/// every row's flag is a set membership test rather than a second query per
+/// account — the cost this route is not allowed to acquire per `iaam-op0o`.
 #[utoipa::path(
     get,
     path = "/v1/accounts",
     params(ListAccountsParams),
-    responses((status = 200, description = "Owner's accounts", body = Vec<AccountDto>)),
+    responses((status = 200, description = "Owner's accounts, retracted included", body = Vec<AccountDto>)),
     security(("bearer" = []))
 )]
 pub async fn list_accounts(
@@ -2073,13 +2093,43 @@ pub async fn list_accounts(
         .store
         .list_account_details(principal.owner)
         .await?;
+    let retracted = retracted_accounts(&state, principal.owner).await?;
     let wanted = params.declared_by.map(PrincipalId);
     let accounts = accounts
         .into_iter()
         .filter(|account| wanted.is_none_or(|wanted| account.declared_by == Some(wanted)))
-        .map(account_dto)
+        .map(|account| {
+            let is_retracted = retracted.contains(&account.id);
+            (account, is_retracted)
+        })
+        .filter(|(_, is_retracted)| {
+            params
+                .retracted
+                .is_none_or(|wanted| wanted == *is_retracted)
+        })
+        .map(|(account, is_retracted)| account_dto(account, is_retracted))
         .collect();
     Ok(Json(accounts))
+}
+
+/// The owner's whole declared set of retracted accounts, one store read for
+/// however many `AccountDto` rows a caller ends up building from it.
+///
+/// Every route that publishes `AccountDto.retracted` reads this once, never
+/// per account: a route touching one account still asks the store for the
+/// owner's complete set and tests membership, the same shape `list_accounts`
+/// uses for every row rather than one call per row.
+async fn retracted_accounts(
+    state: &ServerState,
+    owner: iaam_core::ids::OwnerId,
+) -> Result<BTreeSet<AccountId>, ApiFailure> {
+    Ok(state
+        .services
+        .store
+        .list_account_retractions(owner)
+        .await?
+        .into_iter()
+        .collect())
 }
 
 /// Create an account.
@@ -2162,7 +2212,15 @@ pub async fn create_account(
         }
         AccountCreated::Existing(account) => (StatusCode::OK, account),
     };
-    Ok((status, Json(account_dto(account))))
+    // `Created` never has: the account did not exist a moment ago, so it
+    // cannot be in anyone's declared set yet. `Existing` might — the matched
+    // identity could name an account retracted since the call that first
+    // minted it — so the membership test runs either way rather than
+    // special-casing the branch that is usually `false`.
+    let retracted = retracted_accounts(&state, principal.owner)
+        .await?
+        .contains(&account.id);
+    Ok((status, Json(account_dto(account, retracted))))
 }
 
 /// Validate the external identity pair used by account creation and declaration
@@ -2227,6 +2285,11 @@ pub async fn create_accounts_batch(
 ) -> Result<Json<Vec<AccountBatchResultDto>>, ApiFailure> {
     require(&principal, OperationKey::CreateAccount)?;
     let mut outcomes = Vec::with_capacity(request.accounts.len());
+    // One read for the whole batch, not one per row — see [`retracted_accounts`].
+    // Mostly answers `false` here, since a row usually mints a fresh account,
+    // but the `Existing` branch can match an account retracted since it was
+    // first created.
+    let retracted = retracted_accounts(&state, principal.owner).await?;
     for (index, request) in request.accounts.into_iter().enumerate() {
         let row = index + 1;
         let (provider, provider_account_id) =
@@ -2294,10 +2357,11 @@ pub async fn create_accounts_batch(
             }
             AccountCreated::Existing(account) => ("existing", account),
         };
+        let is_retracted = retracted.contains(&account.id);
         outcomes.push(AccountBatchResultDto::accepted(
             row,
             outcome,
-            account_dto(account),
+            account_dto(account, is_retracted),
         ));
     }
     Ok(Json(outcomes))
@@ -2340,6 +2404,8 @@ pub async fn replace_account_aliases_batch(
         .into_iter()
         .map(|account| (account.id, account))
         .collect();
+    // One read for the whole batch — see [`retracted_accounts`].
+    let retracted = retracted_accounts(&state, principal.owner).await?;
     for (index, item) in request.accounts.into_iter().enumerate() {
         let row = index + 1;
         if let Some(first) = seen.insert(AccountId(item.account), row) {
@@ -2389,10 +2455,11 @@ pub async fn replace_account_aliases_batch(
                 continue;
             }
         };
+        let is_retracted = retracted.contains(&account.id);
         outcomes.push(AccountBatchResultDto::accepted(
             row,
             "applied",
-            account_dto(account),
+            account_dto(account, is_retracted),
         ));
     }
     Ok(Json(outcomes))
@@ -2435,6 +2502,8 @@ pub async fn rename_accounts_batch(
         .into_iter()
         .map(|account| (account.id, account))
         .collect();
+    // One read for the whole batch — see [`retracted_accounts`].
+    let retracted = retracted_accounts(&state, principal.owner).await?;
     for (index, item) in request.accounts.into_iter().enumerate() {
         let row = index + 1;
         if let Some(first) = seen.insert(AccountId(item.account), row) {
@@ -2493,10 +2562,11 @@ pub async fn rename_accounts_batch(
                 continue;
             }
         };
+        let is_retracted = retracted.contains(&account.id);
         outcomes.push(AccountBatchResultDto::accepted(
             row,
             "applied",
-            account_dto(account),
+            account_dto(account, is_retracted),
         ));
     }
     Ok(Json(outcomes))
@@ -2538,6 +2608,8 @@ pub async fn replace_account_declarations_batch(
         .into_iter()
         .map(|account| (account.id, account))
         .collect();
+    // One read for the whole batch — see [`retracted_accounts`].
+    let retracted = retracted_accounts(&state, principal.owner).await?;
     let mut seen = BTreeMap::new();
     for (index, item) in request.accounts.into_iter().enumerate() {
         let row = index + 1;
@@ -2608,10 +2680,11 @@ pub async fn replace_account_declarations_batch(
                 not_done: identity_repointed_not_done(),
             }),
         };
+        let is_retracted = retracted.contains(&recorded.account.id);
         outcomes.push(AccountBatchResultDto::declarations(
             row,
             AccountDeclarationsDto {
-                account: account_dto(recorded.account),
+                account: account_dto(recorded.account, is_retracted),
                 identity_repointed,
             },
         ));
@@ -2680,7 +2753,10 @@ pub async fn replace_account_aliases(
                 ApiError::simple("not_found", format!("not found: account {id}")),
             )
         })?;
-    Ok(Json(account_dto(stored)))
+    let is_retracted = retracted_accounts(&state, principal.owner)
+        .await?
+        .contains(&stored.id);
+    Ok(Json(account_dto(stored, is_retracted)))
 }
 
 /// Change what the owner calls an account.
@@ -2768,7 +2844,10 @@ pub async fn rename_account(
                 ApiError::simple("not_found", format!("not found: account {id}")),
             )
         })?;
-    Ok(Json(account_dto(stored)))
+    let is_retracted = retracted_accounts(&state, principal.owner)
+        .await?
+        .contains(&stored.id);
+    Ok(Json(account_dto(stored, is_retracted)))
 }
 
 /// Trim and validate the owner's new account title.
@@ -2905,8 +2984,11 @@ pub async fn replace_account_declarations(
         }
     };
 
+    let is_retracted = retracted_accounts(&state, principal.owner)
+        .await?
+        .contains(&recorded.account.id);
     Ok(Json(AccountDeclarationsDto {
-        account: account_dto(recorded.account),
+        account: account_dto(recorded.account, is_retracted),
         identity_repointed,
     }))
 }
@@ -3077,8 +3159,11 @@ fn alias_views(aliases: Vec<AccountAliasDto>) -> Result<Vec<AccountAliasView>, A
     Ok(views)
 }
 
-/// One account on the wire.
-fn account_dto(account: AccountDetailView) -> AccountDto {
+/// One account on the wire. `retracted` is read by the caller, once per
+/// request rather than once per account — see [`retracted_accounts`] — and
+/// handed in here rather than looked up inside: this function builds a row
+/// from what it is given and issues no store read of its own.
+fn account_dto(account: AccountDetailView, retracted: bool) -> AccountDto {
     AccountDto {
         id: account.id.inner(),
         title: account.title,
@@ -3099,6 +3184,7 @@ fn account_dto(account: AccountDetailView) -> AccountDto {
             })
             .collect(),
         declared_by: account.declared_by.map(|principal| principal.inner()),
+        retracted,
     }
 }
 

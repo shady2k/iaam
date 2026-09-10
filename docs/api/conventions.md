@@ -198,7 +198,7 @@ things. Read it as the lookup table for §1.
 
 | Route | Response | Shape | Why |
 |---|---|---|---|
-| `GET /v1/accounts` | `[AccountDto]` | bare array | whole list, nothing about the set |
+| `GET /v1/accounts` | `[AccountDto]` | bare array | whole list, retracted included |
 | `POST /v1/accounts/batch` | `[AccountBatchResultDto]` | bare array | one outcome per request row — `created`, `existing`, `applied` or `rejected` — with exactly one of `account`, `declarations` and `error` set; the alias, title and declaration batch routes answer with the same shape |
 | `GET /v1/instruments` | `InstrumentListDto` | object, `instruments`, `missing` | requested instruments plus identifiers not found; the wrapper is required because a bare array cannot say which requested identifiers were missing |
 | `GET /v1/categories` | `[CategoryDto]` | bare array | whole history; each item carries its own retirement |

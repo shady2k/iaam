@@ -15853,6 +15853,202 @@ async fn only_the_owner_or_the_declaring_agent_may_retract_an_account() {
     assert_eq!(status, StatusCode::OK, "{owner_done}");
 }
 
+/// `iaam-op0o`'s own finding: the list kept returning a retracted account as
+/// an ordinary one, with no row-level way to tell it apart and no filter but
+/// `declared_by`. The decision was to keep the row — the same house rule §2
+/// gives `GET /v1/tokens` and `GET /v1/broker-access` for their own withdrawn
+/// state — carry `retracted` on it, and take a `retracted` query filter that
+/// separates the two populations in one request each.
+#[tokio::test]
+async fn the_account_list_names_a_retracted_account_and_the_filter_separates_the_two_populations() {
+    let harness = harness().await;
+    let seeded = harness.account.inner().to_string();
+
+    let (status, live) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Main" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{live}");
+    let live_id = live["id"].as_str().expect("account id").to_owned();
+    assert_eq!(
+        live["retracted"], false,
+        "a freshly created account is not retracted: {live}"
+    );
+
+    let (status, probe) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Probe" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{probe}");
+    let probe_id = probe["id"].as_str().expect("account id").to_owned();
+
+    let (status, retraction) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{probe_id}/retraction"),
+            &harness.owner_token,
+            &json!({ "retracted": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retraction}");
+
+    // The default answers with the whole list, retracted included, and every
+    // row states its own truth rather than the retracted one going missing.
+    let (status, unfiltered) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unfiltered}");
+    let rows = unfiltered.as_array().expect("account list");
+    let by_id: std::collections::BTreeMap<&str, &Value> = rows
+        .iter()
+        .map(|row| (row["id"].as_str().expect("id"), row))
+        .collect();
+    assert_eq!(
+        by_id.len(),
+        3,
+        "the unfiltered list must still name the seeded, live and retracted accounts: \
+         {unfiltered}"
+    );
+    assert_eq!(by_id[seeded.as_str()]["retracted"], false, "{unfiltered}");
+    assert_eq!(by_id[live_id.as_str()]["retracted"], false, "{unfiltered}");
+    assert_eq!(by_id[probe_id.as_str()]["retracted"], true, "{unfiltered}");
+
+    // `retracted=false` names only the live population.
+    let (status, live_only) = call(
+        &harness.router,
+        get("/v1/accounts?retracted=false", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{live_only}");
+    let live_ids: std::collections::BTreeSet<&str> = live_only
+        .as_array()
+        .expect("account list")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        live_ids,
+        std::collections::BTreeSet::from([seeded.as_str(), live_id.as_str()]),
+        "retracted=false must name exactly the accounts nobody has retracted: {live_only}"
+    );
+
+    // `retracted=true` names only the retracted population.
+    let (status, retracted_only) = call(
+        &harness.router,
+        get("/v1/accounts?retracted=true", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted_only}");
+    let retracted_ids: std::collections::BTreeSet<&str> = retracted_only
+        .as_array()
+        .expect("account list")
+        .iter()
+        .map(|row| row["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        retracted_ids,
+        std::collections::BTreeSet::from([probe_id.as_str()]),
+        "retracted=true must name exactly the retracted account: {retracted_only}"
+    );
+}
+
+/// A fact can still land on an account after it was retracted — the state
+/// `accept_retraction` refuses to produce and the journal produces anyway,
+/// because a retraction guards the write at the moment it is accepted and
+/// nothing yet guards one after (`iaam-n4my`, still open). When that happens,
+/// `retractions_that_hold` stops suppressing the account from the queue and
+/// every report — deliberately, so the fact is seen rather than hidden. This
+/// pins the row's own reading against that same case: `AccountDto.retracted`
+/// keeps answering `true`, because it reports the owner's recorded statement,
+/// not the narrower set that governs suppression. Smoothing it back to
+/// `false` on his behalf would erase the contradiction the queue and the
+/// reports are, right now, putting in front of him.
+#[tokio::test]
+async fn a_retracted_row_still_reads_retracted_after_a_fact_lands_on_it_afterwards() {
+    let harness = harness().await;
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Probe" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let account = created["id"].as_str().expect("account id").to_owned();
+
+    let (status, retracted) = call(
+        &harness.router,
+        post(
+            &format!("/v1/accounts/{account}/retraction"),
+            &harness.owner_token,
+            &json!({ "retracted": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retracted}");
+    assert_eq!(retracted["retracted"], true, "{retracted}");
+
+    let (status, posted) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "operations": [{
+                    "account": account,
+                    "type": "deposit",
+                    "amount": "10.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-01-05" },
+                    "idempotency_key": "retracted-then-fact-1"
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "iaam-n4my is still open: a write onto a retracted account is not yet refused, and \
+         this test needs that door open to reach the state it pins: {posted}"
+    );
+
+    let (status, list) = call(
+        &harness.router,
+        get("/v1/accounts", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let row = list
+        .as_array()
+        .expect("account list")
+        .iter()
+        .find(|row| row["id"] == account)
+        .expect("the retracted account is still named");
+    assert_eq!(
+        row["retracted"], true,
+        "the recorded statement stands even though a fact arrived afterwards, and the queue \
+         and every report now disagree with it in the owner's view instead of this row \
+         quietly agreeing with them: {row}"
+    );
+}
+
 /// The two bounds `iaam-gua5` is held to, asserted over one closed product.
 ///
 /// A term deposit is opened, emptied into another account of the owner's, and

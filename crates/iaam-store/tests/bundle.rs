@@ -14,18 +14,25 @@ use iaam_core::ids::{
     AccountId, ClassificationRuleId, CustodyId, EventId, ImportSessionId, InstrumentId, OwnerId,
     PrincipalId, SourceId,
 };
-use iaam_core::instrument::{AliasInterval, CurrencyRoles, Lineage, LineageReason};
+use iaam_core::instrument::{AliasInterval, AliasNamespace, CurrencyRoles, Lineage, LineageReason};
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_core::retirement::AccountRetirement;
 use iaam_store::SqliteStore;
+use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::bundle::{Bundle, ImportOutcome};
 use iaam_store::categories::NewCategoryRule;
+use iaam_store::documents::{BrokerCode, NewDocument, RawRow, ReportFormat, RowStatus};
+use iaam_store::import_session::{NewQuestion, StoredControlFigures};
+use iaam_store::market::{AccruedInterestRow, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};
+use iaam_store::market_source_codes::SourceCodeEntry;
 use iaam_store::reference::{
-    AccountAliasRecord, AccountRecord, AccountScopeExclusionRecord, CustodyRecord, InstrumentRecord,
+    AccountAliasRecord, AccountRecord, AccountScopeExclusionRecord, AliasRecord, CustodyRecord,
+    InstrumentRecord,
 };
 use iaam_store::rules::NewRule;
+use iaam_store::schedule::IssueTermsRow;
 use time::macros::date;
 
 fn deposit(owner: OwnerId, account: AccountId, sequence: u32, minor: i64) -> Event {
@@ -198,6 +205,102 @@ fn a_bundle_of_a_newer_format_is_refused() {
     bundle.checksum = bundle.compute_checksum();
     let mut restored = SqliteStore::open_in_memory().unwrap();
     assert!(restored.import_bundle(&bundle).is_err());
+}
+
+// --- iaam-k3gh.9.5: a version refusal distinguishes a newer build from ----
+// --- the numbering the schema collapse abandoned --------------------------
+
+#[test]
+fn a_bundle_written_under_an_abandoned_schema_generation_is_refused_by_name() {
+    // The exact false acceptance this task exists to close: an archive
+    // claiming the SAME schema_version this build currently uses, but
+    // written under the numbering the collapse discarded. Comparing
+    // schema_version alone (the old check) would accept this outright,
+    // because `found == supported` never trips `>`. Comparing generation
+    // first is what catches it.
+    let (source, owner, _, _) = populated();
+    let mut bundle = source.export_bundle(owner).unwrap();
+    assert_eq!(
+        bundle.schema_version,
+        iaam_store::schema::SCHEMA_VERSION,
+        "the fixture must actually collide on schema_version, or this test proves nothing \
+         about telling generations apart"
+    );
+    bundle.schema_generation = Some(0);
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let error = restored
+        .import_bundle(&bundle)
+        .expect_err("an archive from an abandoned schema numbering must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("numbering") || message.contains("generation"),
+        "the refusal must name the reason — a discarded numbering — not just report two \
+         numbers that happen to collide: {message}"
+    );
+}
+
+#[test]
+fn a_bundle_of_a_genuinely_newer_generation_is_refused_too() {
+    // The mismatch is symmetric: a generation this build has never heard of
+    // is just as incomparable as one it has already left behind, even
+    // though "newer" is not "abandoned."
+    let (source, owner, _, _) = populated();
+    let mut bundle = source.export_bundle(owner).unwrap();
+    bundle.schema_generation = Some(iaam_store::schema::SCHEMA_GENERATION + 1);
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    assert!(restored.import_bundle(&bundle).is_err());
+}
+
+#[test]
+fn an_unmarked_archive_within_the_unmarked_numbering_still_restores() {
+    // An archive written before the marker existed records no generation at
+    // all, and must not be refused on that account alone: while it claims a
+    // `schema_version` no unmarked build ever exceeded, it is an archive of
+    // this numbering and nothing about it is ambiguous.
+    let bundle: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert_eq!(bundle.schema_generation(), None);
+    assert!(bundle.schema_version <= iaam_store::schema::LAST_UNMARKED_SCHEMA_VERSION);
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("an archive predating the generation marker must still restore");
+}
+
+#[test]
+fn an_unmarked_archive_from_the_discarded_numbering_is_refused() {
+    // The archive iaam-k3gh.9.5 is actually about, and the one the first
+    // attempt at this fix let through: written by this codebase's own export
+    // before the collapse, under a counter that had reached 2, and carrying no
+    // generation marker because nobody was writing one yet. It cannot declare
+    // that it differs. Reading its silence as agreement accepts a description
+    // of a schema that no longer exists — and now that this build's own
+    // counter has reached 2 as well, the bare integers agree and nothing else
+    // would refuse it.
+    let mut bundle: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert_eq!(bundle.schema_generation(), None);
+    bundle.schema_version = iaam_store::schema::LAST_UNMARKED_SCHEMA_VERSION + 1;
+    assert_eq!(
+        bundle.schema_version,
+        iaam_store::schema::SCHEMA_VERSION,
+        "the point of the case is that the two integers agree"
+    );
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let error = restored
+        .import_bundle(&bundle)
+        .expect_err("an unmarked archive beyond the unmarked numbering must be refused");
+    assert!(
+        format!("{error}").contains("discarded"),
+        "the refusal must name the reason rather than report two numbers: {error}"
+    );
 }
 
 #[test]
@@ -1242,4 +1345,660 @@ fn an_archive_written_before_the_owners_decisions_existed_still_verifies_and_res
         .import_bundle(&bundle)
         .expect("an archive written before the owner's decisions travelled must still restore");
     assert_eq!(restored.load_events(bundle.owner).unwrap().len(), 1);
+}
+
+// --- iaam-k3gh.9.3: evidence he acquired and cannot fetch again -----------
+
+/// A store touching every table iaam-k3gh.9.3 carries: an instrument alias
+/// and a reading of issue terms on the instrument one security event already
+/// reaches; an uploaded document with its raw row; an import session holding
+/// an observation, a question and a control section, plus an unresolved
+/// account name recorded against it; a source-profile version binding; a
+/// broker operation kind and a market source code; and one synchronization
+/// run whose price, FX, key-rate and accrued-interest observations are what
+/// `finish_run` also publishes as series completeness.
+///
+/// Every value here is invented for this test; none of it is derived from a
+/// real export.
+fn evidence_fixture() -> (SqliteStore, OwnerId, BondReferenceData) {
+    let (mut store, owner, account, _contour) = populated();
+    let refs = BondReferenceData::new();
+    refs.register_in(&store, owner);
+    let event = every_new_fact(owner, account, &refs)
+        .into_iter()
+        .next()
+        .expect("every_new_fact always yields at least one fact");
+    store.append_event(&event, IdentityScope::Source).unwrap();
+
+    store
+        .record_alias(&AliasRecord {
+            namespace: AliasNamespace::Isin,
+            value: "XS0000000001".to_owned(),
+            instrument: refs.instrument,
+            interval: AliasInterval {
+                valid_from: date!(2020 - 01 - 01),
+                valid_to: None,
+            },
+            source: SourceId::new_random(),
+        })
+        .unwrap();
+
+    store
+        .record_issue_terms(&IssueTermsRow {
+            instrument_id: refs.instrument.inner().to_string(),
+            source_id: "invented-source".to_owned(),
+            observed_at: "2026-06-01T00:00:00Z".to_owned(),
+            effective_from: Some("2020-01-01".to_owned()),
+            maturity_date: Some("2030-01-01".to_owned()),
+            initial_face_value: Some("1000".to_owned()),
+            face_currency_code: Some("RUB".to_owned()),
+            coupon_periods_per_year: Some(2),
+            day_count: Some("actual/365".to_owned()),
+            calendar: Some("invented-calendar".to_owned()),
+            default_declared: false,
+            default_technical: false,
+        })
+        .unwrap();
+
+    let document_hash = RawHash::parse(&"2".repeat(64)).unwrap();
+    let document_id = SourceId::new_random();
+    store
+        .insert_document(&NewDocument {
+            id: document_id,
+            owner,
+            broker: BrokerCode::parse("invented-broker").unwrap(),
+            format: ReportFormat::parse("csv").unwrap(),
+            parser_version: ParserVersion("ingest/manual/1".to_owned()),
+            document_hash: document_hash.clone(),
+            body: b"invented,statement,contents".to_vec(),
+        })
+        .unwrap();
+    store
+        .insert_rows(
+            owner,
+            document_id,
+            &[RawRow {
+                sheet: None,
+                row: 1,
+                payload: "{\"invented\":true}".to_owned(),
+                status: RowStatus::Parsed,
+            }],
+        )
+        .unwrap();
+
+    let session = store
+        .open_import_session(owner, Some(account), None, None)
+        .unwrap();
+    store
+        .record_unresolved_accounts(
+            owner,
+            &document_hash,
+            session.id.inner(),
+            &[("SOME PRINTED NAME".to_owned(), 3)],
+        )
+        .unwrap();
+    store
+        .add_import_observation(
+            owner,
+            session.id,
+            Some("row-1"),
+            true,
+            "{\"invented\":true}",
+        )
+        .unwrap();
+    store
+        .record_import_question(
+            owner,
+            session.id,
+            1,
+            &NewQuestion {
+                question: "\"invented_question\"".to_owned(),
+                alternatives: "[\"a\",\"b\"]".to_owned(),
+                prompt: "which one?".to_owned(),
+            },
+        )
+        .unwrap();
+    store
+        .state_import_control_figures(
+            owner,
+            session.id,
+            &[StoredControlFigures {
+                account: "PRINTED ACCOUNT".to_owned(),
+                currency: "RUB".to_owned(),
+                period_from: "2026-01-01".to_owned(),
+                period_to: "2026-01-31".to_owned(),
+                opening: Some(100_000),
+                closing: Some(200_000),
+                debit_turnover: Some(50_000),
+                credit_turnover: Some(150_000),
+            }],
+        )
+        .unwrap();
+
+    store
+        .bind_source_profile_version("invented-profile", 1, "invented-digest")
+        .unwrap();
+
+    store
+        .extend_broker_operation_kinds(
+            &BrokerCode::parse("invented-broker").unwrap(),
+            "invented-dictionary",
+            &[BrokerOperationKind {
+                source_kind: "invented_code".to_owned(),
+                kind: "buy".to_owned(),
+            }],
+        )
+        .unwrap();
+    store
+        .extend_market_source_codes(
+            "invented-source",
+            "invented-dictionary",
+            &[SourceCodeEntry {
+                domain: "currency".to_owned(),
+                source_code: "invented_rub".to_owned(),
+                meaning: "RUB".to_owned(),
+            }],
+        )
+        .unwrap();
+
+    let series = SeriesKey {
+        source_id: "invented-source".to_owned(),
+        dataset: "prices".to_owned(),
+        series_key: "invented-series".to_owned(),
+    };
+    let run = store
+        .begin_run(
+            series,
+            date!(2026 - 06 - 01),
+            date!(2026 - 06 - 01),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .unwrap();
+    store
+        .record_prices(
+            &run,
+            &"3".repeat(64),
+            &[PriceRow {
+                instrument_id: refs.instrument.inner().to_string(),
+                board: "TQCB".to_owned(),
+                session: 1,
+                trade_date: "2026-06-01".to_owned(),
+                kind: "close".to_owned(),
+                observed_at: "2026-06-01T18:45:00Z".to_owned(),
+                price: "1005.5".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "percent_of_remaining_face".to_owned(),
+                basis_evidence: "invented".to_owned(),
+                executability: "executable".to_owned(),
+            }],
+        )
+        .unwrap();
+    store
+        .record_fx(
+            &run,
+            &"4".repeat(64),
+            &[FxRow {
+                from_code: "USD".to_owned(),
+                to_code: "RUB".to_owned(),
+                trade_date: "2026-06-01".to_owned(),
+                observed_at: "2026-06-01T18:45:00Z".to_owned(),
+                nominal: 1,
+                value: "90.5".to_owned(),
+                unit_rate: "90.5".to_owned(),
+            }],
+        )
+        .unwrap();
+    store
+        .record_key_rate(
+            &run,
+            &"5".repeat(64),
+            &[KeyRateRow {
+                trade_date: "2026-06-01".to_owned(),
+                observed_at: "2026-06-01T18:45:00Z".to_owned(),
+                rate: "18.0".to_owned(),
+            }],
+        )
+        .unwrap();
+    store
+        .record_accrued_interest(
+            &run,
+            &"6".repeat(64),
+            &[AccruedInterestRow {
+                instrument_id: refs.instrument.inner().to_string(),
+                board: "TQCB".to_owned(),
+                session: 1,
+                trade_date: "2026-06-01".to_owned(),
+                observed_at: "2026-06-01T18:45:00Z".to_owned(),
+                per_unit: "12.34".to_owned(),
+                currency: "RUB".to_owned(),
+            }],
+        )
+        .unwrap();
+    store.finish_run(&run, RunOutcome::Succeeded, None).unwrap();
+
+    (store, owner, refs)
+}
+
+#[test]
+fn the_evidence_he_acquired_round_trips_into_a_genuinely_empty_database() {
+    let (source, owner, _refs) = evidence_fixture();
+    let bundle = source.export_bundle(owner).unwrap();
+
+    assert_eq!(bundle.instrument_aliases.len(), 1);
+    assert_eq!(bundle.issue_terms.len(), 1);
+    assert_eq!(bundle.source_documents.len(), 1);
+    assert_eq!(bundle.raw_rows.len(), 1);
+    assert_eq!(bundle.document_unresolved_accounts.len(), 1);
+    assert_eq!(bundle.import_sessions.len(), 1);
+    assert_eq!(bundle.import_observations.len(), 1);
+    assert_eq!(bundle.import_questions.len(), 1);
+    assert_eq!(bundle.import_control_figures.len(), 1);
+    assert_eq!(bundle.source_profile_versions.len(), 1);
+    assert_eq!(bundle.broker_operation_kinds.len(), 1);
+    assert_eq!(bundle.market_source_codes.len(), 1);
+    assert_eq!(bundle.sync_runs.len(), 1);
+    assert_eq!(bundle.price_observations.len(), 1);
+    assert_eq!(bundle.fx_observations.len(), 1);
+    assert_eq!(bundle.key_rate_observations.len(), 1);
+    assert_eq!(bundle.series_completeness.len(), 1);
+    assert_eq!(bundle.accrued_interest_observations.len(), 1);
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("the evidence he acquired must restore into a genuinely empty database");
+
+    let back = restored.export_bundle(owner).unwrap();
+    assert_eq!(back.instrument_aliases, bundle.instrument_aliases);
+    assert_eq!(back.issue_terms, bundle.issue_terms);
+    assert_eq!(back.source_documents, bundle.source_documents);
+    assert_eq!(back.raw_rows, bundle.raw_rows);
+    assert_eq!(
+        back.document_unresolved_accounts,
+        bundle.document_unresolved_accounts
+    );
+    assert_eq!(back.import_sessions, bundle.import_sessions);
+    assert_eq!(back.import_observations, bundle.import_observations);
+    assert_eq!(back.import_questions, bundle.import_questions);
+    assert_eq!(back.import_control_figures, bundle.import_control_figures);
+    assert_eq!(back.source_profile_versions, bundle.source_profile_versions);
+    assert_eq!(back.broker_operation_kinds, bundle.broker_operation_kinds);
+    assert_eq!(back.market_source_codes, bundle.market_source_codes);
+    assert_eq!(back.sync_runs, bundle.sync_runs);
+    assert_eq!(back.price_observations, bundle.price_observations);
+    assert_eq!(back.fx_observations, bundle.fx_observations);
+    assert_eq!(back.key_rate_observations, bundle.key_rate_observations);
+    assert_eq!(back.series_completeness, bundle.series_completeness);
+    assert_eq!(
+        back.accrued_interest_observations,
+        bundle.accrued_interest_observations
+    );
+}
+
+#[test]
+fn importing_the_evidence_he_acquired_twice_changes_nothing() {
+    let (source, owner, _refs) = evidence_fixture();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    restored.import_bundle(&bundle).unwrap();
+
+    let back = restored.export_bundle(owner).unwrap();
+    assert_eq!(back.instrument_aliases, bundle.instrument_aliases);
+    assert_eq!(back.raw_rows, bundle.raw_rows);
+    assert_eq!(
+        back.accrued_interest_observations,
+        bundle.accrued_interest_observations
+    );
+    assert_eq!(
+        back.price_observations.len(),
+        1,
+        "a repeat import must not duplicate an observation"
+    );
+    assert_eq!(
+        back.import_sessions.len(),
+        1,
+        "a repeat import must not duplicate a session"
+    );
+}
+
+#[test]
+fn an_archive_written_before_the_evidence_sections_existed_still_verifies_and_restores() {
+    // The same pre-existing archive the reference-sections and owner's-
+    // decisions tests read, extended one claim further: every section this
+    // task added must default to empty on an archive that predates it, and
+    // the checksum computed over that (now larger) shape must still match
+    // what the archive itself carries — a section nobody wrote contributes
+    // no bytes.
+    let bundle: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert!(bundle.instrument_aliases.is_empty());
+    assert!(bundle.issue_terms.is_empty());
+    assert!(bundle.source_documents.is_empty());
+    assert!(bundle.raw_rows.is_empty());
+    assert!(bundle.document_unresolved_accounts.is_empty());
+    assert!(bundle.import_sessions.is_empty());
+    assert!(bundle.import_observations.is_empty());
+    assert!(bundle.import_questions.is_empty());
+    assert!(bundle.import_control_figures.is_empty());
+    assert!(bundle.source_profile_versions.is_empty());
+    assert!(bundle.broker_operation_kinds.is_empty());
+    assert!(bundle.market_source_codes.is_empty());
+    assert!(bundle.sync_runs.is_empty());
+    assert!(bundle.price_observations.is_empty());
+    assert!(bundle.fx_observations.is_empty());
+    assert!(bundle.key_rate_observations.is_empty());
+    assert!(bundle.series_completeness.is_empty());
+    assert!(bundle.accrued_interest_observations.is_empty());
+    assert_eq!(bundle.checksum, bundle.compute_checksum());
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("an archive predating this task's sections must still restore");
+    assert_eq!(restored.load_events(bundle.owner).unwrap().len(), 1);
+}
+
+/// A deterministic-looking but entirely synthetic date string. Not calendar-
+/// accurate (months are treated as 28 days) — nothing downstream parses it,
+/// the storage keeps every date and timestamp as an opaque string (see
+/// `market.rs`'s own doc comment) — only distinct and increasing in `offset`,
+/// which is what a primary key spanning `trade_date` needs.
+fn synthetic_date(offset: u32) -> String {
+    let day_in_month = offset % 28 + 1;
+    let month = (offset / 28) % 12 + 1;
+    let year = 2015 + offset / (28 * 12);
+    format!("{year:04}-{month:02}-{day_in_month:02}")
+}
+
+/// Measures what an export of a realistically sized instance weighs.
+///
+/// Not part of the default suite: it seeds several thousand rows, which
+/// takes real wall-clock time and has nothing to regress against — its job
+/// is to answer "how big," once, for the record, and to stay runnable so the
+/// answer can be checked again after a change that might affect it. Run
+/// with:
+/// `cargo test -p iaam-store --test bundle -- --ignored --nocapture measure`
+#[test]
+#[ignore = "seeds thousands of rows to measure export size; not a regression test"]
+fn measure_the_size_of_a_realistic_export() {
+    let (mut store, owner, account, _contour) = populated();
+
+    // Ten instruments, each carrying three years of daily price, FX-unrelated
+    // accrued-interest readings, an alias and a reading of issue terms — the
+    // shape one owner's bond-heavy portfolio takes over a few years of
+    // holding.
+    const INSTRUMENT_COUNT: usize = 10;
+    const TRADING_DAYS: u32 = 3 * 260; // ~3 years, ~260 trading days/year.
+    const DOCUMENT_COUNT: usize = 24; // two years of monthly broker statements.
+    const DOCUMENT_ROWS: u32 = 80; // rows per statement.
+    const DOCUMENT_BODY_BYTES: usize = 150_000; // a realistic statement export.
+    const IMPORT_SESSION_COUNT: usize = 24;
+    const EVENT_COUNT: u32 = 1_500;
+
+    let mut instruments = Vec::new();
+    for index in 0..INSTRUMENT_COUNT {
+        let instrument = InstrumentId::new_random();
+        store
+            .upsert_instrument(&InstrumentRecord {
+                id: instrument,
+                kind: None,
+                symbol: format!("SYNT-{index}"),
+                title: format!("Synthetic Bond {index}"),
+                currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+                lineage: None,
+            })
+            .unwrap();
+        store
+            .record_alias(&AliasRecord {
+                namespace: AliasNamespace::Isin,
+                value: format!("XS{index:010}"),
+                instrument,
+                interval: AliasInterval {
+                    valid_from: date!(2015 - 01 - 01),
+                    valid_to: None,
+                },
+                source: SourceId::new_random(),
+            })
+            .unwrap();
+        store
+            .record_issue_terms(&IssueTermsRow {
+                instrument_id: instrument.inner().to_string(),
+                source_id: "invented-source".to_owned(),
+                observed_at: "2015-01-01T00:00:00Z".to_owned(),
+                effective_from: Some("2015-01-01".to_owned()),
+                maturity_date: Some("2030-01-01".to_owned()),
+                initial_face_value: Some("1000".to_owned()),
+                face_currency_code: Some("RUB".to_owned()),
+                coupon_periods_per_year: Some(2),
+                day_count: Some("actual/365".to_owned()),
+                calendar: Some("invented-calendar".to_owned()),
+                default_declared: false,
+                default_technical: false,
+            })
+            .unwrap();
+        instruments.push(instrument);
+    }
+
+    // `instrument_aliases`, `issue_terms`, `price_observations` and
+    // `accrued_interest_observations` are scoped to the instrument closure
+    // `export_bundle` computes from the owner's own events (see the module
+    // doc comment on `bundle.rs`) — an instrument nothing in the journal
+    // reaches does not travel, on the same principle that keeps the bundle
+    // from carrying "the exchange's entire universe". One coupon income
+    // event per instrument, naming it, is what pulls each of the ten into
+    // that closure — the shape a bond-heavy portfolio's journal actually
+    // takes.
+    for (index, &instrument) in instruments.iter().enumerate() {
+        let coupon = Event {
+            id: EventId::new_random(),
+            owner,
+            account,
+            kind: EventKind::Income {
+                instrument: Some(instrument),
+                gross: Money::new(PostedMinor::new(70_000), CurrencyCode::Rub),
+                kind: Some(IncomeKind::Coupon),
+            },
+            dates: EventDates::for_cash(CashPostedDate(date!(2026 - 06 - 15))),
+            order: EffectiveOrder::new(
+                date!(2026 - 06 - 15),
+                1_000 + u32::try_from(index).unwrap(),
+            ),
+            legs: vec![Leg::cash(
+                account,
+                Money::new(PostedMinor::new(70_000), CurrencyCode::Rub),
+            )],
+            provenance: Provenance::new(
+                SourceId::new_random(),
+                RawHash::parse(&format!("{index:064x}")).unwrap(),
+                ParserVersion("ingest/manual/1".to_owned()),
+            ),
+            relation: Relation::None,
+            confidence: Confidence::Known,
+            idempotency_key: None,
+        };
+        store.append_event(&coupon, IdentityScope::Source).unwrap();
+    }
+
+    // One synchronization run per instrument, each publishing a full run of
+    // daily prices and accrued-interest readings.
+    for (index, &instrument) in instruments.iter().enumerate() {
+        let series = SeriesKey {
+            source_id: "invented-source".to_owned(),
+            dataset: "prices".to_owned(),
+            series_key: format!("SYNT-{index}"),
+        };
+        let run = store
+            .begin_run(
+                series,
+                date!(2015 - 01 - 01),
+                date!(2018 - 01 - 01),
+                time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            )
+            .unwrap();
+        let prices: Vec<PriceRow> = (0..TRADING_DAYS)
+            .map(|day| PriceRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQCB".to_owned(),
+                session: 1,
+                trade_date: synthetic_date(day),
+                kind: "close".to_owned(),
+                observed_at: format!("{}T18:45:00.{day:06}Z", synthetic_date(day)),
+                price: "1005.5".to_owned(),
+                currency: "RUB".to_owned(),
+                quotation_basis: "percent_of_remaining_face".to_owned(),
+                basis_evidence: "invented".to_owned(),
+                executability: "executable".to_owned(),
+            })
+            .collect();
+        store.record_prices(&run, &"3".repeat(64), &prices).unwrap();
+        let accrued: Vec<AccruedInterestRow> = (0..TRADING_DAYS)
+            .map(|day| AccruedInterestRow {
+                instrument_id: instrument.inner().to_string(),
+                board: "TQCB".to_owned(),
+                session: 1,
+                trade_date: synthetic_date(day),
+                observed_at: format!("{}T18:45:00.{day:06}Z", synthetic_date(day)),
+                per_unit: "12.34".to_owned(),
+                currency: "RUB".to_owned(),
+            })
+            .collect();
+        store
+            .record_accrued_interest(&run, &"6".repeat(64), &accrued)
+            .unwrap();
+        store.finish_run(&run, RunOutcome::Succeeded, None).unwrap();
+    }
+
+    // One global FX series and one key-rate series, three years daily.
+    let fx_series = SeriesKey {
+        source_id: "invented-source".to_owned(),
+        dataset: "fx".to_owned(),
+        series_key: "USD/RUB".to_owned(),
+    };
+    let fx_run = store
+        .begin_run(
+            fx_series,
+            date!(2015 - 01 - 01),
+            date!(2018 - 01 - 01),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .unwrap();
+    let fx_rows: Vec<FxRow> = (0..TRADING_DAYS)
+        .map(|day| FxRow {
+            from_code: "USD".to_owned(),
+            to_code: "RUB".to_owned(),
+            trade_date: synthetic_date(day),
+            observed_at: format!("{}T18:45:00.{day:06}Z", synthetic_date(day)),
+            nominal: 1,
+            value: "90.5".to_owned(),
+            unit_rate: "90.5".to_owned(),
+        })
+        .collect();
+    store.record_fx(&fx_run, &"4".repeat(64), &fx_rows).unwrap();
+    store
+        .finish_run(&fx_run, RunOutcome::Succeeded, None)
+        .unwrap();
+
+    let key_rate_series = SeriesKey {
+        source_id: "invented-source".to_owned(),
+        dataset: "key_rate".to_owned(),
+        series_key: "cbr".to_owned(),
+    };
+    let key_rate_run = store
+        .begin_run(
+            key_rate_series,
+            date!(2015 - 01 - 01),
+            date!(2018 - 01 - 01),
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .unwrap();
+    let key_rate_rows: Vec<KeyRateRow> = (0..TRADING_DAYS)
+        .map(|day| KeyRateRow {
+            trade_date: synthetic_date(day),
+            observed_at: format!("{}T18:45:00.{day:06}Z", synthetic_date(day)),
+            rate: "18.0".to_owned(),
+        })
+        .collect();
+    store
+        .record_key_rate(&key_rate_run, &"5".repeat(64), &key_rate_rows)
+        .unwrap();
+    store
+        .finish_run(&key_rate_run, RunOutcome::Succeeded, None)
+        .unwrap();
+
+    // Two years of monthly broker statements, each with a realistic body
+    // size and a page of raw rows, each read through its own import session.
+    let body = vec![b'x'; DOCUMENT_BODY_BYTES];
+    for index in 0..DOCUMENT_COUNT {
+        let document_id = SourceId::new_random();
+        let document_hash = RawHash::parse(&format!("{index:064x}")).unwrap();
+        store
+            .insert_document(&NewDocument {
+                id: document_id,
+                owner,
+                broker: BrokerCode::parse("invented-broker").unwrap(),
+                format: ReportFormat::parse("csv").unwrap(),
+                parser_version: ParserVersion("ingest/manual/1".to_owned()),
+                document_hash: document_hash.clone(),
+                body: body.clone(),
+            })
+            .unwrap();
+        let rows: Vec<RawRow> = (0..DOCUMENT_ROWS)
+            .map(|row| RawRow {
+                sheet: None,
+                row: u64::from(row),
+                payload: format!("{{\"invented\":true,\"row\":{row}}}"),
+                status: RowStatus::Parsed,
+            })
+            .collect();
+        store.insert_rows(owner, document_id, &rows).unwrap();
+
+        if index < IMPORT_SESSION_COUNT {
+            let session = store
+                .open_import_session(owner, Some(account), None, None)
+                .unwrap();
+            for row in 0..10 {
+                store
+                    .add_import_observation(
+                        owner,
+                        session.id,
+                        None,
+                        true,
+                        &format!("{{\"invented\":true,\"row\":{row}}}"),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    // `populated()` above already appended two events at sequence 1 and 2 on
+    // this same synthetic day; starting well clear of those avoids colliding
+    // with `events (owner, effective_date, sequence)`'s own uniqueness.
+    for sequence in 100..100 + EVENT_COUNT {
+        store
+            .append_event(
+                &deposit(owner, account, sequence, 10_000 + i64::from(sequence)),
+                IdentityScope::Source,
+            )
+            .unwrap();
+    }
+
+    let bundle = store.export_bundle(owner).unwrap();
+    let json = serde_json::to_vec(&bundle).unwrap();
+    println!(
+        "synthetic export: {} events, {} price observations, {} accrued-interest \
+         observations, {} fx observations, {} key-rate observations, {} documents \
+         ({} bytes of body each), {} raw rows, {} import sessions -> {} bytes ({:.2} MiB)",
+        bundle.events.len(),
+        bundle.price_observations.len(),
+        bundle.accrued_interest_observations.len(),
+        bundle.fx_observations.len(),
+        bundle.key_rate_observations.len(),
+        bundle.source_documents.len(),
+        DOCUMENT_BODY_BYTES,
+        bundle.raw_rows.len(),
+        bundle.import_sessions.len(),
+        json.len(),
+        f64::from(u32::try_from(json.len()).unwrap_or(u32::MAX)) / (1024.0 * 1024.0)
+    );
 }

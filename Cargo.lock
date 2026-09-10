@@ -1168,6 +1168,7 @@ dependencies = [
 name = "iaam-store"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "ciborium",
  "iaam-broker",
  "iaam-core",

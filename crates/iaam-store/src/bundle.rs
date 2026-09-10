@@ -14,18 +14,33 @@
 //! archive is needed exactly when the outside world is not available, and one
 //! that needs a market sync before it will restore is not an archive.
 //!
-//! What is not yet included in the stage 1 bundle, and why: market data and
-//! rates beyond the instrument catalogue itself (to be added in E3), tax
-//! context (E5), and classification rules (E2). Each of these sections will
-//! be added to the bundle with its own epic, and that is what the format
-//! version is for.
+//! The owner decided what a bundle is for (iaam-k3gh.9, 2026-09-10): the
+//! transferable state of an instance, not a journal archive, and it carries
+//! everything — not only events and the reference data their legs point at,
+//! but his standing decisions (iaam-k3gh.9.2: classification rules, category
+//! rules, account declarations, the decision-history audit trail) and the
+//! evidence he acquired that a re-sync cannot reliably reproduce
+//! (iaam-k3gh.9.3: prices, rates, uploaded statements, import sessions still
+//! in progress). [`TABLE_DISPOSITIONS`] is the complete, schema-checked
+//! account of what does and does not travel, and why.
+//!
+//! Market observations, instrument aliases and issue terms are scoped to the
+//! same instrument closure [`REFERENCE_CLOSURE_SQL`] computes for
+//! [`InstrumentSection`] — not the whole market directory, which a sync fills
+//! with an exchange's entire universe and an archive of one owner's affairs
+//! has no business carrying. `sync_runs`, `fx_observations`,
+//! `key_rate_observations` and `series_completeness` are not instrument-scoped
+//! at all and travel wholesale: this is architecturally a single-owner
+//! instance (`BundleCliError::AmbiguousOwner`'s own doc comment in
+//! `iaam-bootstrap` says so directly), so there is no second owner's data
+//! these global tables could be leaking.
 
 use std::collections::HashSet;
 
 use iaam_core::custody::CustodyOrigin;
 use iaam_core::event::Event;
 use iaam_core::ids::OwnerId;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -50,7 +65,31 @@ use crate::{SqliteStore, StoreError};
 /// account scope exclusions, transfer partners, retirements, aliases,
 /// declined account names, and the decision-history audit trail. See
 /// [`TABLE_DISPOSITIONS`] for what still does not travel, and why.
-pub const BUNDLE_VERSION: u32 = 3;
+///
+/// Version 4 (iaam-k3gh.9.5) adds [`Bundle::schema_generation`]: a bundle
+/// claiming `schema_version` alone could not be told apart from one written
+/// under the numbering the schema collapse discarded, because both use the
+/// same bare integers. This field is what lets `import_bundle` tell them
+/// apart, so it does not itself change what a bundle carries — no new
+/// section, nothing new to restore — and old archives that never wrote it
+/// are read as belonging to this build's own generation (see the field's own
+/// doc comment).
+///
+/// Version 5 (iaam-k3gh.9.3) carries the evidence the owner acquired and
+/// cannot fetch again: the instrument closure's aliases and issue terms; the
+/// documents he uploaded, body and all, and the raw rows read from them; the
+/// import sessions built while reading them, still-open ones included, and
+/// everything asked and answered inside one; the source-profile version
+/// ledger and the broker and market source-code dictionaries; and the market
+/// data family — synchronization runs, prices, FX rates, the key rate,
+/// series completeness markers and accrued-interest readings. Three tables
+/// that hang off `schedule_snapshots` by a real foreign key
+/// (`schedule_coupon_periods`, `schedule_principal_repayments`,
+/// `schedule_offer_windows`) do **not** travel: their header is `Derived`
+/// (iaam-k3gh.9.1), and carrying the detail rows without it would either
+/// dangle the foreign key on restore or reopen that decision — see
+/// [`TABLE_DISPOSITIONS`]'s own comment on the three for the full reasoning.
+pub const BUNDLE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContourSection {
@@ -266,11 +305,395 @@ pub struct DecisionHistorySection {
     pub recorded_at: String,
 }
 
+/// An instrument alias, carried the way `instrument_aliases` stores it.
+///
+/// Scoped to the same instrument closure [`InstrumentSection`] is (see
+/// [`REFERENCE_CLOSURE_SQL`]'s own doc comment), for the identical reason:
+/// `instrument` is a real foreign key, so an alias naming an instrument this
+/// bundle does not also carry would refuse on import, and one naming an
+/// instrument nobody's events reach has no business in one owner's archive
+/// regardless.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentAliasSection {
+    pub namespace: String,
+    pub value: String,
+    pub instrument: uuid::Uuid,
+    pub valid_from: String,
+    pub valid_to: Option<String>,
+    pub source: String,
+    pub created_at: String,
+}
+
+/// One row of `issue_terms`: a bond's terms as observed at a source, at a
+/// point in time.
+///
+/// Carried, not derived (iaam-k3gh.9.3): `default_declared` and
+/// `default_technical` are what a source said on the day it was asked, and a
+/// later reading of the same instrument can say something else — an issuer
+/// that was current on `observed_at` and later defaults does not rewrite the
+/// row that already recorded it wasn't. Scoped to the instrument closure for
+/// the same reason [`InstrumentAliasSection`] is: `instrument_id` is a real
+/// foreign key into [`InstrumentSection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IssueTermsSection {
+    pub instrument_id: uuid::Uuid,
+    pub source_id: String,
+    pub observed_at: String,
+    pub effective_from: Option<String>,
+    pub maturity_date: Option<String>,
+    pub initial_face_value: Option<String>,
+    pub face_currency_code: Option<String>,
+    pub coupon_periods_per_year: Option<i64>,
+    pub day_count: Option<String>,
+    pub calendar: Option<String>,
+    pub default_declared: bool,
+    pub default_technical: bool,
+    pub recorded_at: String,
+}
+
+/// A loaded document, carried the way `source_documents` stores it, body and
+/// all (iaam-k3gh.9.3).
+///
+/// **The body travels.** A statement the owner uploaded is exactly the kind
+/// of evidence this task's whole framing is about: the broker may no longer
+/// serve last year's report the way it served it then, or at all, and the
+/// parser version recorded beside it exists specifically so a corrected
+/// parser can replay the same bytes (see this crate's `documents` module).
+/// Losing the body on restore would leave that provenance pointing at
+/// nothing. `body` is base64 inside the JSON wire format (see
+/// `body_encoding` below) rather than serde's default byte-array
+/// representation, which would inflate a multi-megabyte statement several
+/// times over — exactly the "an export nobody can move" failure iaam-k3gh.9.3
+/// asks not to ship.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceDocumentSection {
+    pub id: uuid::Uuid,
+    pub broker: String,
+    pub format: String,
+    pub parser_version: String,
+    pub document_hash: String,
+    pub uploaded_at: String,
+    #[serde(with = "body_encoding")]
+    pub body: Vec<u8>,
+}
+
+/// Base64 for a document body, so the JSON wire format stores it as one
+/// compact string instead of serde's default array-of-integers rendering of
+/// `Vec<u8>` (roughly four bytes of JSON per byte of document, before this).
+mod body_encoding {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(text.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// One row of `raw_rows`: a document's row exactly as its source printed it,
+/// before any parsing decision.
+///
+/// Carried alongside [`SourceDocumentSection`] rather than folded into it:
+/// the schema keeps them as two tables (`documents.rs`'s own module doc
+/// explains why — the row is a fact about parsing a document, not a second
+/// copy of the document), and the bundle keeps the same shape so a restore
+/// writes exactly the rows the source produced, `status` included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawRowSection {
+    pub document: uuid::Uuid,
+    pub sheet: Option<String>,
+    pub row: i64,
+    pub payload: String,
+    pub status: String,
+}
+
+/// One row of `document_unresolved_accounts`: a name a reading of a document
+/// could not place, still open the day the owner exported.
+///
+/// Carried (iaam-k3gh.9.3) because it is not recomputable from anything a
+/// restore has: whether `printed` resolves depends on the account directory
+/// as it stood when the document was read, and that moment does not survive
+/// as a fact anywhere else once the row is gone. `import_session` is a real
+/// foreign key into [`ImportSessionSection`], which is why import order
+/// carries sessions first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentUnresolvedAccountSection {
+    pub document_hash: String,
+    pub printed: String,
+    pub ordinal: i64,
+    pub records: i64,
+    pub import_session: uuid::Uuid,
+    pub recorded_at: String,
+}
+
+/// A pre-journal import session, carried the way `import_sessions` stores it
+/// (iaam-k3gh.9.3).
+///
+/// The module doc comment on `iaam-store::import_session` calls a session
+/// **pre-journal state**: nothing in it is a fact, and that is exactly why it
+/// must travel rather than be treated as disposable scratch space — an open
+/// session the owner has half-answered is work he would have to redo from
+/// the statement again, and an abandoned or committed one is history of a
+/// decision he already made about a document. `source` and `import` are the
+/// same opaque hash-derived identifiers `iaam_core::ids` mints them as
+/// everywhere else, not a foreign key into anything this bundle carries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportSessionSection {
+    pub id: uuid::Uuid,
+    pub state: String,
+    pub source: Option<uuid::Uuid>,
+    pub import: Option<uuid::Uuid>,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+    pub account: Option<uuid::Uuid>,
+}
+
+/// One row of `import_observations`: one submitted line's provisional state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportObservationSection {
+    pub session: uuid::Uuid,
+    pub row: i64,
+    pub row_key: Option<String>,
+    pub concluded: bool,
+    pub payload: String,
+    pub answer: Option<String>,
+    pub answer_rule: Option<uuid::Uuid>,
+    pub answer_rule_version: Option<i64>,
+}
+
+/// One row of `import_questions`: one thing the engine could not decide on
+/// its own, and whatever the owner has answered so far.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportQuestionSection {
+    pub id: uuid::Uuid,
+    pub session: uuid::Uuid,
+    pub row: i64,
+    pub question: String,
+    pub alternatives: String,
+    pub prompt: String,
+    pub asked_at: String,
+    pub answered_at: Option<String>,
+    pub answer: Option<String>,
+    pub rule: Option<uuid::Uuid>,
+}
+
+/// One row of `import_control_figures`: the control section a statement
+/// prints about itself, deliberately not a foreign key into `accounts` — see
+/// that table's own comment, carried verbatim here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportControlFigureSection {
+    pub session: uuid::Uuid,
+    pub account: String,
+    pub currency: String,
+    pub period_from: String,
+    pub period_to: String,
+    pub opening: Option<i64>,
+    pub closing: Option<i64>,
+    pub debit_turnover: Option<i64>,
+    pub credit_turnover: Option<i64>,
+    pub stated_at: String,
+}
+
+/// One binding of `source_profile_versions`: which content a profile's
+/// `(id, version)` already names.
+///
+/// Instance-wide, not owner-scoped — that module's own doc comment says why —
+/// so this section is not filtered to the owner at all; a single-owner
+/// instance's whole ledger is small and is exactly the thing that makes «this
+/// id and version always mean this content» checkable after a restore.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceProfileVersionSection {
+    pub id: String,
+    pub version: u32,
+    pub digest: String,
+    pub first_loaded_at: String,
+}
+
+/// One row of `broker_operation_kinds`: the dictionary mapping one broker's
+/// own code for an operation to iaam's vocabulary for it.
+///
+/// Instance-wide dictionary data, not owner-scoped, carried wholesale for the
+/// same reason [`SourceProfileVersionSection`] is. `origin` distinguishes a
+/// row seeded from the broker's contract from one the owner corrected by
+/// hand — losing that on restore would make an owner's override
+/// indistinguishable from the seed it overrode, and a later reseed could
+/// silently take it back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrokerOperationKindSection {
+    pub broker: String,
+    pub source_kind: String,
+    pub kind: String,
+    pub origin: String,
+    pub dictionary: Option<String>,
+    pub recorded_at: String,
+}
+
+/// One row of `market_source_codes`: the same dictionary shape as
+/// [`BrokerOperationKindSection`], for a market data source's own codes
+/// instead of a broker's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarketSourceCodeSection {
+    pub source_id: String,
+    pub domain: String,
+    pub source_code: String,
+    pub meaning: String,
+    pub origin: String,
+    pub dictionary: Option<String>,
+    pub recorded_at: String,
+}
+
+/// One row of `sync_runs`: a durable record of one attempt to fetch a market
+/// data series, carried wholesale (iaam-k3gh.9.3).
+///
+/// Not owner-scoped — a run is not the owner's fact, it is this instance's
+/// own history of asking an external source something — and every
+/// observation section below names one by `sync_run_id`, a real foreign key,
+/// which is why runs are inserted before any of them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncRunSection {
+    pub id: uuid::Uuid,
+    pub source_id: String,
+    pub dataset: String,
+    pub series_key: String,
+    pub status: String,
+    pub requested_from: String,
+    pub requested_to: String,
+    pub covered_from: Option<String>,
+    pub covered_to: Option<String>,
+    pub pages: i64,
+    pub rows: i64,
+    pub page_errors: String,
+    pub rate_limit_hits: i64,
+    pub raw_hash: Option<String>,
+    pub lease_token: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// One row of `price_observations`: a historical quote, exactly as observed.
+///
+/// The clearest case iaam-k3gh.9.3 is about: MOEX does not promise to keep
+/// serving last month's closing prices forever, and a database that lost this
+/// table lost that history for good. Scoped to the instrument closure like
+/// [`InstrumentAliasSection`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PriceObservationSection {
+    pub instrument_id: uuid::Uuid,
+    pub board: String,
+    pub session: i64,
+    pub trade_date: String,
+    pub kind: String,
+    pub source_id: String,
+    pub observed_at: String,
+    pub price: String,
+    pub currency: String,
+    pub quotation_basis: String,
+    pub basis_evidence: String,
+    pub executability: String,
+    pub raw_hash: String,
+    pub sync_run_id: uuid::Uuid,
+}
+
+/// One row of `fx_observations`: a historical exchange rate. Not scoped to
+/// any instrument — currency pairs are not instrument-specific — so, like
+/// [`SyncRunSection`], every row travels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FxObservationSection {
+    pub from_code: String,
+    pub to_code: String,
+    pub trade_date: String,
+    pub source_id: String,
+    pub observed_at: String,
+    pub nominal: i64,
+    pub value: String,
+    pub unit_rate: String,
+    pub raw_hash: String,
+    pub sync_run_id: uuid::Uuid,
+}
+
+/// One row of `key_rate_observations`: a historical central bank key rate,
+/// carried wholesale for the same reason [`FxObservationSection`] is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyRateObservationSection {
+    pub trade_date: String,
+    pub source_id: String,
+    pub observed_at: String,
+    pub rate: String,
+    pub raw_hash: String,
+    pub sync_run_id: uuid::Uuid,
+}
+
+/// One row of `series_completeness`: how far one series is known to reach.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeriesCompletenessSection {
+    pub source_id: String,
+    pub dataset: String,
+    pub series_key: String,
+    pub complete_through: Option<String>,
+    pub updated_at: String,
+    pub last_successful_run: Option<uuid::Uuid>,
+}
+
+/// One row of `accrued_interest_observations`: a historical accrued-coupon
+/// reading. The schema does not declare `instrument_id` as a foreign key on
+/// this table (unlike [`PriceObservationSection::instrument_id`]), but this
+/// section is scoped to the instrument closure anyway: an accrued-interest
+/// reading for an instrument nowhere else in the archive is not this owner's
+/// affair either, and scoping it any differently from the rest of the market
+/// data family would be an inconsistency nobody asked for. `id` is a bare
+/// autoincrement surrogate referenced by nothing else, so it does not travel
+/// — a fresh one is assigned on insert, the same way [`ContourSection`]
+/// leaves out no key of its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AccruedInterestObservationSection {
+    pub instrument_id: uuid::Uuid,
+    pub board: String,
+    pub session: i64,
+    pub trade_date: String,
+    pub source_id: String,
+    pub observed_at: String,
+    pub per_unit: String,
+    pub currency: String,
+    pub raw_hash: String,
+    pub sync_run_id: uuid::Uuid,
+}
+
 /// The complete bundle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bundle {
     pub bundle_version: u32,
     pub schema_version: u32,
+    /// The schema numbering `schema_version` was written under
+    /// (iaam-k3gh.9.5).
+    ///
+    /// `None` on an archive written before this field existed, and **absence
+    /// is not agreement**. The archive that made this bead necessary was
+    /// written by this codebase's own export, under the numbering the collapse
+    /// later discarded, and it carries no marker precisely because nobody was
+    /// writing one yet: it cannot say it differs, and reading its silence as
+    /// «this build's generation» is the false acceptance the marker exists to
+    /// prevent, not a case the marker happens not to cover.
+    ///
+    /// What an unmarked archive can still be judged by is its own
+    /// `schema_version` against
+    /// [`crate::schema::LAST_UNMARKED_SCHEMA_VERSION`] — see
+    /// [`Self::refuse_unreadable_numbering`], which is where the rule lives.
+    #[serde(default)]
+    pub schema_generation: Option<u32>,
     pub exported_at: String,
     pub owner: OwnerId,
     pub events: Vec<Event>,
@@ -322,6 +745,45 @@ pub struct Bundle {
     /// The reversible-decision audit trail.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_history: Vec<DecisionHistorySection>,
+    /// Evidence the owner acquired and cannot fetch again (iaam-k3gh.9.3).
+    /// Added at version 5; the `#[serde(default)]` reasoning above
+    /// `custody_places` applies to every field from here down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instrument_aliases: Vec<InstrumentAliasSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issue_terms: Vec<IssueTermsSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_documents: Vec<SourceDocumentSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_rows: Vec<RawRowSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub document_unresolved_accounts: Vec<DocumentUnresolvedAccountSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_sessions: Vec<ImportSessionSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_observations: Vec<ImportObservationSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_questions: Vec<ImportQuestionSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_control_figures: Vec<ImportControlFigureSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_profile_versions: Vec<SourceProfileVersionSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broker_operation_kinds: Vec<BrokerOperationKindSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub market_source_codes: Vec<MarketSourceCodeSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_runs: Vec<SyncRunSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price_observations: Vec<PriceObservationSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fx_observations: Vec<FxObservationSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_rate_observations: Vec<KeyRateObservationSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series_completeness: Vec<SeriesCompletenessSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accrued_interest_observations: Vec<AccruedInterestObservationSection>,
     /// Content checksum. Computed from the canonical
     /// representation of all sections except the checksum itself.
     pub checksum: String,
@@ -343,6 +805,8 @@ pub struct Bundle {
 struct BundleContent<'a> {
     bundle_version: u32,
     schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_generation: Option<u32>,
     owner: OwnerId,
     events: &'a [Event],
     accounts: &'a [AccountSection],
@@ -373,9 +837,90 @@ struct BundleContent<'a> {
     declined_account_names: &'a [DeclinedAccountNameSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     decision_history: &'a [DecisionHistorySection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    instrument_aliases: &'a [InstrumentAliasSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    issue_terms: &'a [IssueTermsSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    source_documents: &'a [SourceDocumentSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    raw_rows: &'a [RawRowSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    document_unresolved_accounts: &'a [DocumentUnresolvedAccountSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    import_sessions: &'a [ImportSessionSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    import_observations: &'a [ImportObservationSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    import_questions: &'a [ImportQuestionSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    import_control_figures: &'a [ImportControlFigureSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    source_profile_versions: &'a [SourceProfileVersionSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    broker_operation_kinds: &'a [BrokerOperationKindSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    market_source_codes: &'a [MarketSourceCodeSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    sync_runs: &'a [SyncRunSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    price_observations: &'a [PriceObservationSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    fx_observations: &'a [FxObservationSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    key_rate_observations: &'a [KeyRateObservationSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    series_completeness: &'a [SeriesCompletenessSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    accrued_interest_observations: &'a [AccruedInterestObservationSection],
 }
 
 impl Bundle {
+    /// The generation this archive's `schema_version` was written under, when
+    /// the archive says.
+    ///
+    /// `None` is not «this build's generation». It is «nobody wrote it down»,
+    /// and the two must not be conflated: the archive iaam-k3gh.9.5 is about
+    /// carries no marker and claims `schema_version` 2 under the numbering the
+    /// collapse discarded, so reading its silence as agreement is precisely the
+    /// false acceptance the marker exists to prevent. What an unmarked archive
+    /// can still be judged by is
+    /// [`crate::schema::LAST_UNMARKED_SCHEMA_VERSION`] — see
+    /// [`Self::refuse_unreadable_numbering`].
+    #[must_use]
+    pub const fn schema_generation(&self) -> Option<u32> {
+        self.schema_generation
+    }
+
+    /// Refuse an archive whose `schema_version` this build cannot read as a
+    /// number of its own numbering.
+    ///
+    /// Two cases, and they are one rule: an archive that names a generation
+    /// other than this build's is refused by name, and an archive that names
+    /// none is refused as soon as its `schema_version` exceeds what any
+    /// unmarked build ever wrote. Both say the same thing — the counter that
+    /// produced this number is not the counter this build compares against —
+    /// and both are stated as such rather than as two integers that happen not
+    /// to collide.
+    fn refuse_unreadable_numbering(&self) -> Result<(), StoreError> {
+        match self.schema_generation {
+            Some(generation) if generation == crate::schema::SCHEMA_GENERATION => Ok(()),
+            Some(generation) => Err(StoreError::SchemaGenerationMismatch {
+                found: generation,
+                current: crate::schema::SCHEMA_GENERATION,
+            }),
+            None if self.schema_version > crate::schema::LAST_UNMARKED_SCHEMA_VERSION => {
+                Err(StoreError::BundleCorrupted {
+                    detail: format!(
+                        "archive names no schema generation and claims schema_version {},                          which no build writing no generation ever wrote: it belongs to the                          numbering the schema collapse discarded, and its version cannot be                          compared with this build's. Export it again from the instance that                          holds it",
+                        self.schema_version
+                    ),
+                })
+            }
+            None => Ok(()),
+        }
+    }
+
     /// Content checksum.
     ///
     /// Computed from the **canonical serialization of all contents**.
@@ -391,6 +936,7 @@ impl Bundle {
         let content = BundleContent {
             bundle_version: self.bundle_version,
             schema_version: self.schema_version,
+            schema_generation: self.schema_generation,
             owner: self.owner,
             events: &self.events,
             accounts: &self.accounts,
@@ -408,6 +954,24 @@ impl Bundle {
             account_aliases: &self.account_aliases,
             declined_account_names: &self.declined_account_names,
             decision_history: &self.decision_history,
+            instrument_aliases: &self.instrument_aliases,
+            issue_terms: &self.issue_terms,
+            source_documents: &self.source_documents,
+            raw_rows: &self.raw_rows,
+            document_unresolved_accounts: &self.document_unresolved_accounts,
+            import_sessions: &self.import_sessions,
+            import_observations: &self.import_observations,
+            import_questions: &self.import_questions,
+            import_control_figures: &self.import_control_figures,
+            source_profile_versions: &self.source_profile_versions,
+            broker_operation_kinds: &self.broker_operation_kinds,
+            market_source_codes: &self.market_source_codes,
+            sync_runs: &self.sync_runs,
+            price_observations: &self.price_observations,
+            fx_observations: &self.fx_observations,
+            key_rate_observations: &self.key_rate_observations,
+            series_completeness: &self.series_completeness,
+            accrued_interest_observations: &self.accrued_interest_observations,
         };
         let mut body = Vec::new();
         ciborium::into_writer(&content, &mut body)
@@ -575,85 +1139,43 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("account_aliases", TableDisposition::Carried),
     ("declined_account_names", TableDisposition::Carried),
     ("decision_history", TableDisposition::Carried),
-    // --- Evidence the owner acquired and cannot re-fetch (iaam-k3gh.9.3). ---
-    (
-        "instrument_aliases",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "source_documents",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    ("raw_rows", TableDisposition::Pending("iaam-k3gh.9.3")),
-    (
-        "document_unresolved_accounts",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "source_profile_versions",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
+    // --- Evidence the owner acquired and cannot re-fetch (iaam-k3gh.9.3).
+    // Carried as of that task, each for its own stated reason — see the
+    // section type's own doc comment for the reason behind each entry
+    // below; this list only records the verdict. ---
+    ("instrument_aliases", TableDisposition::Carried),
+    ("source_documents", TableDisposition::Carried),
+    ("raw_rows", TableDisposition::Carried),
+    ("document_unresolved_accounts", TableDisposition::Carried),
+    ("source_profile_versions", TableDisposition::Carried),
     // A durable synchronization run, the same operational-evidence shape as
     // the observation tables it leases for below: not a decision, not
     // recomputable from the journal, not a secret.
-    ("sync_runs", TableDisposition::Pending("iaam-k3gh.9.3")),
-    (
-        "price_observations",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "fx_observations",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "key_rate_observations",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "series_completeness",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "accrued_interest_observations",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "broker_operation_kinds",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "schedule_coupon_periods",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "schedule_principal_repayments",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "schedule_offer_windows",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    ("issue_terms", TableDisposition::Pending("iaam-k3gh.9.3")),
-    (
-        "market_source_codes",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "import_sessions",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "import_observations",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "import_questions",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
-    (
-        "import_control_figures",
-        TableDisposition::Pending("iaam-k3gh.9.3"),
-    ),
+    ("sync_runs", TableDisposition::Carried),
+    ("price_observations", TableDisposition::Carried),
+    ("fx_observations", TableDisposition::Carried),
+    ("key_rate_observations", TableDisposition::Carried),
+    ("series_completeness", TableDisposition::Carried),
+    ("accrued_interest_observations", TableDisposition::Carried),
+    ("broker_operation_kinds", TableDisposition::Carried),
+    ("issue_terms", TableDisposition::Carried),
+    ("market_source_codes", TableDisposition::Carried),
+    ("import_sessions", TableDisposition::Carried),
+    ("import_observations", TableDisposition::Carried),
+    ("import_questions", TableDisposition::Carried),
+    ("import_control_figures", TableDisposition::Carried),
+    // These three are the one deliberate exclusion this task's own
+    // acceptance criteria asked for: each has a real foreign key into
+    // `schedule_snapshots.id`, and that table is `Derived` — recomputed by a
+    // schedule re-sync on restore, not carried — so carrying the detail rows
+    // without their header would either orphan the foreign key on restore or
+    // require reversing the landed decision that the header itself does not
+    // travel (iaam-k3gh.9.1). A schedule re-sync recreates header and detail
+    // rows together; they are exactly as re-fetchable as the header they
+    // hang off, which is the test iaam-k3gh.9.3 asks this group to pass.
+    ("schedule_coupon_periods", TableDisposition::Derived),
+    ("schedule_principal_repayments", TableDisposition::Derived),
+    ("schedule_offer_windows", TableDisposition::Derived),
     // --- Derived from the journal: recomputed on restore, never carried. ---
     ("snapshots", TableDisposition::Derived),
     ("schedule_snapshots", TableDisposition::Derived),
@@ -795,6 +1317,16 @@ impl SqliteStore {
                 lineage_reason,
             });
         }
+
+        // The instrument closure `instruments` above already computed, kept
+        // as a set for the evidence sections below (iaam-k3gh.9.3) that are
+        // scoped to it: instrument aliases, issue terms, price observations
+        // and accrued-interest observations all name an instrument, and
+        // carrying one this bundle does not also carry `instruments` for
+        // would either dangle a real foreign key on restore or reintroduce
+        // "the exchange's entire universe" the closure exists to keep out.
+        let reached_instruments: HashSet<uuid::Uuid> =
+            instruments.iter().map(|section| section.id).collect();
 
         // The owner's standing decisions (iaam-k3gh.9.2). `rule_history` and
         // `list_category_rules`/`list_groups`/`list_categories` already
@@ -1102,9 +1634,771 @@ impl SqliteStore {
             });
         }
 
+        // --- Evidence the owner acquired and cannot re-fetch (iaam-k3gh.9.3) ---
+
+        let instrument_ids: Vec<String> = reached_instruments
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+
+        let mut instrument_aliases = Vec::new();
+        if !instrument_ids.is_empty() {
+            let sql = format!(
+                "SELECT namespace, value, instrument, valid_from, valid_to, source, created_at
+                 FROM instrument_aliases
+                 WHERE instrument IN ({})
+                 ORDER BY namespace, value, valid_from",
+                placeholders(instrument_ids.len())
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(instrument_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+            for row in rows {
+                let (namespace, value, instrument, valid_from, valid_to, source, created_at) = row?;
+                instrument_aliases.push(InstrumentAliasSection {
+                    namespace,
+                    value,
+                    instrument: parse(&instrument, "instrument")?,
+                    valid_from,
+                    valid_to,
+                    source,
+                    created_at,
+                });
+            }
+        }
+
+        let mut issue_terms = Vec::new();
+        if !instrument_ids.is_empty() {
+            let sql = format!(
+                "SELECT instrument_id, source_id, observed_at, effective_from, maturity_date,
+                        initial_face_value, face_currency_code, coupon_periods_per_year,
+                        day_count, calendar, default_declared, default_technical, recorded_at
+                 FROM issue_terms
+                 WHERE instrument_id IN ({})
+                 ORDER BY instrument_id, source_id, observed_at",
+                placeholders(instrument_ids.len())
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(instrument_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, String>(12)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    instrument_id,
+                    source_id,
+                    observed_at,
+                    effective_from,
+                    maturity_date,
+                    initial_face_value,
+                    face_currency_code,
+                    coupon_periods_per_year,
+                    day_count,
+                    calendar,
+                    default_declared,
+                    default_technical,
+                    recorded_at,
+                ) = row?;
+                issue_terms.push(IssueTermsSection {
+                    instrument_id: parse(&instrument_id, "instrument")?,
+                    source_id,
+                    observed_at,
+                    effective_from,
+                    maturity_date,
+                    initial_face_value,
+                    face_currency_code,
+                    coupon_periods_per_year,
+                    day_count,
+                    calendar,
+                    default_declared: default_declared != 0,
+                    default_technical: default_technical != 0,
+                    recorded_at,
+                });
+            }
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT id, broker, format, parser_version, document_hash, uploaded_at, body
+             FROM source_documents
+             WHERE owner = ?1
+             ORDER BY uploaded_at, id",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+            ))
+        })?;
+        let mut source_documents = Vec::new();
+        for row in rows {
+            let (id, broker, format, parser_version, document_hash, uploaded_at, body) = row?;
+            source_documents.push(SourceDocumentSection {
+                id: parse(&id, "document")?,
+                broker,
+                format,
+                parser_version,
+                document_hash,
+                uploaded_at,
+                body,
+            });
+        }
+
+        // Joined to `source_documents` for the owner scope: `raw_rows` has
+        // no `owner` column of its own.
+        let mut statement = self.conn.prepare(
+            "SELECT r.document, r.sheet, r.row, r.payload, r.status
+             FROM raw_rows r
+             JOIN source_documents d ON d.id = r.document
+             WHERE d.owner = ?1
+             ORDER BY r.document, r.sheet, r.row",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut raw_rows = Vec::new();
+        for row in rows {
+            let (document, sheet, row_number, payload, status) = row?;
+            raw_rows.push(RawRowSection {
+                document: parse(&document, "document")?,
+                sheet,
+                row: row_number,
+                payload,
+                status,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT document_hash, printed, ordinal, records, import_session, recorded_at
+             FROM document_unresolved_accounts
+             WHERE owner = ?1
+             ORDER BY document_hash, ordinal",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut document_unresolved_accounts = Vec::new();
+        for row in rows {
+            let (document_hash, printed, ordinal, records, import_session, recorded_at) = row?;
+            document_unresolved_accounts.push(DocumentUnresolvedAccountSection {
+                document_hash,
+                printed,
+                ordinal,
+                records,
+                import_session: parse(&import_session, "import session")?,
+                recorded_at,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT id, state, source, import, opened_at, closed_at, account
+             FROM import_sessions
+             WHERE owner = ?1
+             ORDER BY opened_at, id",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let mut import_sessions = Vec::new();
+        for row in rows {
+            let (id, state, source, import, opened_at, closed_at, account) = row?;
+            import_sessions.push(ImportSessionSection {
+                id: parse(&id, "import session")?,
+                state,
+                source: source.map(|value| parse(&value, "source")).transpose()?,
+                import: import.map(|value| parse(&value, "import")).transpose()?,
+                opened_at,
+                closed_at,
+                account: account.map(|value| parse(&value, "account")).transpose()?,
+            });
+        }
+
+        // Joined to `import_sessions` for the owner scope, exactly as
+        // `raw_rows` is joined to `source_documents`: none of the three
+        // tables below carries an `owner` column of its own.
+        let mut statement = self.conn.prepare(
+            "SELECT o.session, o.row, o.row_key, o.concluded, o.payload, o.answer,
+                    o.answer_rule, o.answer_rule_version
+             FROM import_observations o
+             JOIN import_sessions s ON s.id = o.session
+             WHERE s.owner = ?1
+             ORDER BY o.session, o.row",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+            ))
+        })?;
+        let mut import_observations = Vec::new();
+        for row in rows {
+            let (
+                session,
+                row_number,
+                row_key,
+                concluded,
+                payload,
+                answer,
+                answer_rule,
+                answer_rule_version,
+            ) = row?;
+            import_observations.push(ImportObservationSection {
+                session: parse(&session, "import session")?,
+                row: row_number,
+                row_key,
+                concluded: concluded != 0,
+                payload,
+                answer,
+                answer_rule: answer_rule
+                    .map(|value| parse(&value, "classification rule"))
+                    .transpose()?,
+                answer_rule_version,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT q.id, q.session, q.row, q.question, q.alternatives, q.prompt,
+                    q.asked_at, q.answered_at, q.answer, q.rule
+             FROM import_questions q
+             JOIN import_sessions s ON s.id = q.session
+             WHERE s.owner = ?1
+             ORDER BY q.session, q.row",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        let mut import_questions = Vec::new();
+        for row in rows {
+            let (
+                id,
+                session,
+                row_number,
+                question,
+                alternatives,
+                prompt,
+                asked_at,
+                answered_at,
+                answer,
+                rule,
+            ) = row?;
+            import_questions.push(ImportQuestionSection {
+                id: parse(&id, "import question")?,
+                session: parse(&session, "import session")?,
+                row: row_number,
+                question,
+                alternatives,
+                prompt,
+                asked_at,
+                answered_at,
+                answer,
+                rule: rule
+                    .map(|value| parse(&value, "classification rule"))
+                    .transpose()?,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT f.session, f.account, f.currency, f.period_from, f.period_to,
+                    f.opening, f.closing, f.debit_turnover, f.credit_turnover, f.stated_at
+             FROM import_control_figures f
+             JOIN import_sessions s ON s.id = f.session
+             WHERE s.owner = ?1
+             ORDER BY f.session, f.account, f.currency",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+        let mut import_control_figures = Vec::new();
+        for row in rows {
+            let (
+                session,
+                account,
+                currency,
+                period_from,
+                period_to,
+                opening,
+                closing,
+                debit_turnover,
+                credit_turnover,
+                stated_at,
+            ) = row?;
+            import_control_figures.push(ImportControlFigureSection {
+                session: parse(&session, "import session")?,
+                account,
+                currency,
+                period_from,
+                period_to,
+                opening,
+                closing,
+                debit_turnover,
+                credit_turnover,
+                stated_at,
+            });
+        }
+
+        // Everything from here down is instance-wide, not owner-scoped: see
+        // the module doc comment for why a single-owner instance carries
+        // these wholesale rather than filtering them.
+        let mut statement = self.conn.prepare(
+            "SELECT id, version, digest, first_loaded_at
+             FROM source_profile_versions
+             ORDER BY id, version",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut source_profile_versions = Vec::new();
+        for row in rows {
+            let (id, version, digest, first_loaded_at) = row?;
+            source_profile_versions.push(SourceProfileVersionSection {
+                id,
+                version,
+                digest,
+                first_loaded_at,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT broker, source_kind, kind, origin, dictionary, recorded_at
+             FROM broker_operation_kinds
+             ORDER BY broker, source_kind",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut broker_operation_kinds = Vec::new();
+        for row in rows {
+            let (broker, source_kind, kind, origin, dictionary, recorded_at) = row?;
+            broker_operation_kinds.push(BrokerOperationKindSection {
+                broker,
+                source_kind,
+                kind,
+                origin,
+                dictionary,
+                recorded_at,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT source_id, domain, source_code, meaning, origin, dictionary, recorded_at
+             FROM market_source_codes
+             ORDER BY source_id, domain, source_code",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut market_source_codes = Vec::new();
+        for row in rows {
+            let (source_id, domain, source_code, meaning, origin, dictionary, recorded_at) = row?;
+            market_source_codes.push(MarketSourceCodeSection {
+                source_id,
+                domain,
+                source_code,
+                meaning,
+                origin,
+                dictionary,
+                recorded_at,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT id, source_id, dataset, series_key, status, requested_from, requested_to,
+                    covered_from, covered_to, pages, rows, page_errors, rate_limit_hits,
+                    raw_hash, lease_token, lease_expires_at, started_at, finished_at
+             FROM sync_runs
+             ORDER BY started_at, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, String>(16)?,
+                row.get::<_, Option<String>>(17)?,
+            ))
+        })?;
+        let mut sync_runs = Vec::new();
+        for row in rows {
+            let (
+                id,
+                source_id,
+                dataset,
+                series_key,
+                status,
+                requested_from,
+                requested_to,
+                covered_from,
+                covered_to,
+                pages,
+                run_rows,
+                page_errors,
+                rate_limit_hits,
+                raw_hash,
+                lease_token,
+                lease_expires_at,
+                started_at,
+                finished_at,
+            ) = row?;
+            sync_runs.push(SyncRunSection {
+                id: parse(&id, "sync run")?,
+                source_id,
+                dataset,
+                series_key,
+                status,
+                requested_from,
+                requested_to,
+                covered_from,
+                covered_to,
+                pages,
+                rows: run_rows,
+                page_errors,
+                rate_limit_hits,
+                raw_hash,
+                lease_token,
+                lease_expires_at,
+                started_at,
+                finished_at,
+            });
+        }
+
+        let mut price_observations = Vec::new();
+        if !instrument_ids.is_empty() {
+            let sql = format!(
+                "SELECT instrument_id, board, session, trade_date, kind, source_id, observed_at,
+                        price, currency, quotation_basis, basis_evidence, executability,
+                        raw_hash, sync_run_id
+                 FROM price_observations
+                 WHERE instrument_id IN ({})
+                 ORDER BY instrument_id, board, session, trade_date, source_id, observed_at",
+                placeholders(instrument_ids.len())
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(instrument_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    instrument_id,
+                    board,
+                    session,
+                    trade_date,
+                    kind,
+                    source_id,
+                    observed_at,
+                    price,
+                    currency,
+                    quotation_basis,
+                    basis_evidence,
+                    executability,
+                    raw_hash,
+                    sync_run_id,
+                ) = row?;
+                price_observations.push(PriceObservationSection {
+                    instrument_id: parse(&instrument_id, "instrument")?,
+                    board,
+                    session,
+                    trade_date,
+                    kind,
+                    source_id,
+                    observed_at,
+                    price,
+                    currency,
+                    quotation_basis,
+                    basis_evidence,
+                    executability,
+                    raw_hash,
+                    sync_run_id: parse(&sync_run_id, "sync run")?,
+                });
+            }
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT from_code, to_code, trade_date, source_id, observed_at,
+                    nominal, value, unit_rate, raw_hash, sync_run_id
+             FROM fx_observations
+             ORDER BY from_code, to_code, trade_date, source_id, observed_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+        let mut fx_observations = Vec::new();
+        for row in rows {
+            let (
+                from_code,
+                to_code,
+                trade_date,
+                source_id,
+                observed_at,
+                nominal,
+                value,
+                unit_rate,
+                raw_hash,
+                sync_run_id,
+            ) = row?;
+            fx_observations.push(FxObservationSection {
+                from_code,
+                to_code,
+                trade_date,
+                source_id,
+                observed_at,
+                nominal,
+                value,
+                unit_rate,
+                raw_hash,
+                sync_run_id: parse(&sync_run_id, "sync run")?,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT trade_date, source_id, observed_at, rate, raw_hash, sync_run_id
+             FROM key_rate_observations
+             ORDER BY trade_date, source_id, observed_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut key_rate_observations = Vec::new();
+        for row in rows {
+            let (trade_date, source_id, observed_at, rate, raw_hash, sync_run_id) = row?;
+            key_rate_observations.push(KeyRateObservationSection {
+                trade_date,
+                source_id,
+                observed_at,
+                rate,
+                raw_hash,
+                sync_run_id: parse(&sync_run_id, "sync run")?,
+            });
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT source_id, dataset, series_key, complete_through, updated_at, last_successful_run
+             FROM series_completeness
+             ORDER BY source_id, dataset, series_key",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut series_completeness = Vec::new();
+        for row in rows {
+            let (source_id, dataset, series_key, complete_through, updated_at, last_successful_run) =
+                row?;
+            series_completeness.push(SeriesCompletenessSection {
+                source_id,
+                dataset,
+                series_key,
+                complete_through,
+                updated_at,
+                last_successful_run: last_successful_run
+                    .map(|value| parse(&value, "sync run"))
+                    .transpose()?,
+            });
+        }
+
+        let mut accrued_interest_observations = Vec::new();
+        if !instrument_ids.is_empty() {
+            let sql = format!(
+                "SELECT instrument_id, board, session, trade_date, source_id, observed_at,
+                        per_unit, currency, raw_hash, sync_run_id
+                 FROM accrued_interest_observations
+                 WHERE instrument_id IN ({})
+                 ORDER BY instrument_id, board, session, trade_date, source_id, observed_at",
+                placeholders(instrument_ids.len())
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(instrument_ids.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })?;
+            for row in rows {
+                let (
+                    instrument_id,
+                    board,
+                    session,
+                    trade_date,
+                    source_id,
+                    observed_at,
+                    per_unit,
+                    currency,
+                    raw_hash,
+                    sync_run_id,
+                ) = row?;
+                accrued_interest_observations.push(AccruedInterestObservationSection {
+                    instrument_id: parse(&instrument_id, "instrument")?,
+                    board,
+                    session,
+                    trade_date,
+                    source_id,
+                    observed_at,
+                    per_unit,
+                    currency,
+                    raw_hash,
+                    sync_run_id: parse(&sync_run_id, "sync run")?,
+                });
+            }
+        }
+
         let mut bundle = Bundle {
             bundle_version: BUNDLE_VERSION,
             schema_version: crate::schema::SCHEMA_VERSION,
+            schema_generation: Some(crate::schema::SCHEMA_GENERATION),
             exported_at: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| String::from("1970-01-01T00:00:00Z")),
@@ -1125,6 +2419,24 @@ impl SqliteStore {
             account_aliases,
             declined_account_names,
             decision_history,
+            instrument_aliases,
+            issue_terms,
+            source_documents,
+            raw_rows,
+            document_unresolved_accounts,
+            import_sessions,
+            import_observations,
+            import_questions,
+            import_control_figures,
+            source_profile_versions,
+            broker_operation_kinds,
+            market_source_codes,
+            sync_runs,
+            price_observations,
+            fx_observations,
+            key_rate_observations,
+            series_completeness,
+            accrued_interest_observations,
             checksum: String::new(),
         };
         bundle.checksum = bundle.compute_checksum();
@@ -1148,6 +2460,16 @@ impl SqliteStore {
                 supported: BUNDLE_VERSION,
             });
         }
+        // The generation check comes first and is not a version comparison:
+        // an archive whose generation does not match this build's own is not
+        // "older" or "newer" in `schema_version` terms at all, because the
+        // counter that produced it was reset. Comparing the versions
+        // regardless — as this code once did — is exactly the false
+        // acceptance iaam-k3gh.9.5 found: an archive written under the
+        // numbering the collapse discarded can claim the same bare integer a
+        // genuinely current archive would, and the two are not the same
+        // schema.
+        bundle.refuse_unreadable_numbering()?;
         if bundle.schema_version > crate::schema::SCHEMA_VERSION {
             return Err(StoreError::SchemaTooNew {
                 found: bundle.schema_version,
@@ -1423,6 +2745,74 @@ impl SqliteStore {
             pending = still_pending;
         }
 
+        // After the instruments loop above: both name `instrument` as a real
+        // foreign key. `DO NOTHING` throughout — this evidence is append-only
+        // by the schema's own triggers (`instrument_aliases` has none, but
+        // `issue_terms` behaves the same way in spirit: a later observation
+        // at a new `observed_at` is a new row, never a correction in place).
+        // Not a bare `ON CONFLICT (namespace, value, valid_from) DO NOTHING`:
+        // `instrument_aliases_do_not_overlap` is a `BEFORE INSERT` trigger,
+        // and SQLite runs it before it ever decides whether the row would
+        // conflict — so re-importing the very same row the trigger sees as
+        // "overlapping itself" and aborts, rather than the no-op a repeat
+        // import needs to be. The existence check below is what
+        // `ON CONFLICT` would have done, made explicit ahead of the insert
+        // instead of left to the constraint machinery this table's own
+        // trigger gets to first.
+        for alias in &bundle.instrument_aliases {
+            let known: Option<i64> = transaction
+                .query_row(
+                    "SELECT rowid FROM instrument_aliases
+                     WHERE namespace = ?1 AND value = ?2 AND valid_from = ?3",
+                    params![alias.namespace, alias.value, alias.valid_from],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if known.is_some() {
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO instrument_aliases
+                     (namespace, value, instrument, valid_from, valid_to, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    alias.namespace,
+                    alias.value,
+                    alias.instrument.to_string(),
+                    alias.valid_from,
+                    alias.valid_to,
+                    alias.source,
+                    alias.created_at,
+                ],
+            )?;
+        }
+
+        for terms in &bundle.issue_terms {
+            transaction.execute(
+                "INSERT INTO issue_terms (
+                     instrument_id, source_id, observed_at, effective_from, maturity_date,
+                     initial_face_value, face_currency_code, coupon_periods_per_year,
+                     day_count, calendar, default_declared, default_technical, recorded_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT (instrument_id, source_id, observed_at) DO NOTHING",
+                params![
+                    terms.instrument_id.to_string(),
+                    terms.source_id,
+                    terms.observed_at,
+                    terms.effective_from,
+                    terms.maturity_date,
+                    terms.initial_face_value,
+                    terms.face_currency_code,
+                    terms.coupon_periods_per_year,
+                    terms.day_count,
+                    terms.calendar,
+                    i64::from(terms.default_declared),
+                    i64::from(terms.default_technical),
+                    terms.recorded_at,
+                ],
+            )?;
+        }
+
         for contour in &bundle.contours {
             // The scope version is immutable: an existing one is skipped,
             // rather than overwritten.
@@ -1602,6 +2992,376 @@ impl SqliteStore {
             )?;
         }
 
+        // --- Evidence the owner acquired and cannot re-fetch (iaam-k3gh.9.3) ---
+        //
+        // `source_documents` before `raw_rows` (a real foreign key);
+        // `import_sessions` before its four dependents (also real foreign
+        // keys, `document_unresolved_accounts` included); `sync_runs` before
+        // every observation table naming a `sync_run_id` — all four
+        // orderings below follow directly from the schema. None of these
+        // tables is self-referential, so — unlike `instruments`,
+        // `classification_rules` and `category_rules` above — a single pass
+        // in bundle order is enough for each.
+
+        for document in &bundle.source_documents {
+            transaction.execute(
+                "INSERT INTO source_documents
+                     (id, owner, broker, format, parser_version, document_hash, uploaded_at, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    document.id.to_string(),
+                    owner.inner().to_string(),
+                    document.broker,
+                    document.format,
+                    document.parser_version,
+                    document.document_hash,
+                    document.uploaded_at,
+                    document.body,
+                ],
+            )?;
+        }
+
+        // `raw_rows` has no primary key of its own — only the unique index
+        // `raw_rows_by_locator` on `(document, ifnull(sheet, ''), row)` — so
+        // idempotency is a manual existence check, the same shape
+        // `decision_history` below uses for the same reason: a natural key
+        // exists, but it is not one `ON CONFLICT` can target directly against
+        // a bare `INSERT`.
+        for row in &bundle.raw_rows {
+            let known: Option<i64> = transaction
+                .query_row(
+                    "SELECT rowid FROM raw_rows
+                     WHERE document = ?1 AND sheet IS ?2 AND row = ?3",
+                    params![row.document.to_string(), row.sheet, row.row],
+                    |sql_row| sql_row.get(0),
+                )
+                .optional()?;
+            if known.is_some() {
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO raw_rows (document, sheet, row, payload, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    row.document.to_string(),
+                    row.sheet,
+                    row.row,
+                    row.payload,
+                    row.status,
+                ],
+            )?;
+        }
+
+        for session in &bundle.import_sessions {
+            transaction.execute(
+                "INSERT INTO import_sessions (id, owner, state, source, import, opened_at, closed_at, account)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    session.id.to_string(),
+                    owner.inner().to_string(),
+                    session.state,
+                    session.source.map(|id| id.to_string()),
+                    session.import.map(|id| id.to_string()),
+                    session.opened_at,
+                    session.closed_at,
+                    session.account.map(|id| id.to_string()),
+                ],
+            )?;
+        }
+
+        for unresolved in &bundle.document_unresolved_accounts {
+            transaction.execute(
+                "INSERT INTO document_unresolved_accounts
+                     (owner, document_hash, printed, ordinal, records, import_session, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (owner, document_hash, printed) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    unresolved.document_hash,
+                    unresolved.printed,
+                    unresolved.ordinal,
+                    unresolved.records,
+                    unresolved.import_session.to_string(),
+                    unresolved.recorded_at,
+                ],
+            )?;
+        }
+
+        for observation in &bundle.import_observations {
+            transaction.execute(
+                "INSERT INTO import_observations
+                     (session, row, row_key, concluded, payload, answer, answer_rule, answer_rule_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (session, row) DO NOTHING",
+                params![
+                    observation.session.to_string(),
+                    observation.row,
+                    observation.row_key,
+                    i64::from(observation.concluded),
+                    observation.payload,
+                    observation.answer,
+                    observation.answer_rule.map(|id| id.to_string()),
+                    observation.answer_rule_version,
+                ],
+            )?;
+        }
+
+        for question in &bundle.import_questions {
+            transaction.execute(
+                "INSERT INTO import_questions
+                     (id, session, row, question, alternatives, prompt, asked_at,
+                      answered_at, answer, rule)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    question.id.to_string(),
+                    question.session.to_string(),
+                    question.row,
+                    question.question,
+                    question.alternatives,
+                    question.prompt,
+                    question.asked_at,
+                    question.answered_at,
+                    question.answer,
+                    question.rule.map(|id| id.to_string()),
+                ],
+            )?;
+        }
+
+        for figure in &bundle.import_control_figures {
+            transaction.execute(
+                "INSERT INTO import_control_figures
+                     (session, account, currency, period_from, period_to,
+                      opening, closing, debit_turnover, credit_turnover, stated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (session, account, currency) DO NOTHING",
+                params![
+                    figure.session.to_string(),
+                    figure.account,
+                    figure.currency,
+                    figure.period_from,
+                    figure.period_to,
+                    figure.opening,
+                    figure.closing,
+                    figure.debit_turnover,
+                    figure.credit_turnover,
+                    figure.stated_at,
+                ],
+            )?;
+        }
+
+        // Instance-wide dictionaries and ledgers, not owner-scoped — see the
+        // module doc comment.
+        for version in &bundle.source_profile_versions {
+            transaction.execute(
+                "INSERT INTO source_profile_versions (id, version, digest, first_loaded_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (id, version) DO NOTHING",
+                params![
+                    version.id,
+                    version.version,
+                    version.digest,
+                    version.first_loaded_at
+                ],
+            )?;
+        }
+
+        for kind in &bundle.broker_operation_kinds {
+            transaction.execute(
+                "INSERT INTO broker_operation_kinds (broker, source_kind, kind, origin, dictionary, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (broker, source_kind) DO NOTHING",
+                params![
+                    kind.broker,
+                    kind.source_kind,
+                    kind.kind,
+                    kind.origin,
+                    kind.dictionary,
+                    kind.recorded_at,
+                ],
+            )?;
+        }
+
+        for code in &bundle.market_source_codes {
+            transaction.execute(
+                "INSERT INTO market_source_codes (source_id, domain, source_code, meaning, origin, dictionary, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (source_id, domain, source_code) DO NOTHING",
+                params![
+                    code.source_id,
+                    code.domain,
+                    code.source_code,
+                    code.meaning,
+                    code.origin,
+                    code.dictionary,
+                    code.recorded_at,
+                ],
+            )?;
+        }
+
+        // `sync_runs` before every observation table below that names one by
+        // `sync_run_id` — a real foreign key in every case.
+        for run in &bundle.sync_runs {
+            transaction.execute(
+                "INSERT INTO sync_runs (
+                     id, source_id, dataset, series_key, status,
+                     requested_from, requested_to, covered_from, covered_to,
+                     pages, rows, page_errors, rate_limit_hits, raw_hash,
+                     lease_token, lease_expires_at, started_at, finished_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                 ON CONFLICT (id) DO NOTHING",
+                params![
+                    run.id.to_string(),
+                    run.source_id,
+                    run.dataset,
+                    run.series_key,
+                    run.status,
+                    run.requested_from,
+                    run.requested_to,
+                    run.covered_from,
+                    run.covered_to,
+                    run.pages,
+                    run.rows,
+                    run.page_errors,
+                    run.rate_limit_hits,
+                    run.raw_hash,
+                    run.lease_token,
+                    run.lease_expires_at,
+                    run.started_at,
+                    run.finished_at,
+                ],
+            )?;
+        }
+
+        for price in &bundle.price_observations {
+            transaction.execute(
+                "INSERT INTO price_observations (
+                     instrument_id, board, session, trade_date, kind, source_id, observed_at,
+                     price, currency, quotation_basis, basis_evidence, executability,
+                     raw_hash, sync_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT (instrument_id, board, session, trade_date, kind, source_id, observed_at)
+                 DO NOTHING",
+                params![
+                    price.instrument_id.to_string(),
+                    price.board,
+                    price.session,
+                    price.trade_date,
+                    price.kind,
+                    price.source_id,
+                    price.observed_at,
+                    price.price,
+                    price.currency,
+                    price.quotation_basis,
+                    price.basis_evidence,
+                    price.executability,
+                    price.raw_hash,
+                    price.sync_run_id.to_string(),
+                ],
+            )?;
+        }
+
+        for fx in &bundle.fx_observations {
+            transaction.execute(
+                "INSERT INTO fx_observations (
+                     from_code, to_code, trade_date, source_id, observed_at,
+                     nominal, value, unit_rate, raw_hash, sync_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (from_code, to_code, trade_date, source_id, observed_at) DO NOTHING",
+                params![
+                    fx.from_code,
+                    fx.to_code,
+                    fx.trade_date,
+                    fx.source_id,
+                    fx.observed_at,
+                    fx.nominal,
+                    fx.value,
+                    fx.unit_rate,
+                    fx.raw_hash,
+                    fx.sync_run_id.to_string(),
+                ],
+            )?;
+        }
+
+        for key_rate in &bundle.key_rate_observations {
+            transaction.execute(
+                "INSERT INTO key_rate_observations (trade_date, source_id, observed_at, rate, raw_hash, sync_run_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (trade_date, source_id, observed_at) DO NOTHING",
+                params![
+                    key_rate.trade_date,
+                    key_rate.source_id,
+                    key_rate.observed_at,
+                    key_rate.rate,
+                    key_rate.raw_hash,
+                    key_rate.sync_run_id.to_string(),
+                ],
+            )?;
+        }
+
+        for completeness in &bundle.series_completeness {
+            transaction.execute(
+                "INSERT INTO series_completeness
+                     (source_id, dataset, series_key, complete_through, updated_at, last_successful_run)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (source_id, dataset, series_key) DO NOTHING",
+                params![
+                    completeness.source_id,
+                    completeness.dataset,
+                    completeness.series_key,
+                    completeness.complete_through,
+                    completeness.updated_at,
+                    completeness.last_successful_run.map(|id| id.to_string()),
+                ],
+            )?;
+        }
+
+        // No natural key besides the bare autoincrement `id`, which this
+        // section does not carry (see the section type's own doc comment):
+        // a manual existence check, the same shape `decision_history` and
+        // `raw_rows` above use for the same reason.
+        for interest in &bundle.accrued_interest_observations {
+            let known: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM accrued_interest_observations
+                     WHERE instrument_id = ?1 AND board = ?2 AND session = ?3
+                       AND trade_date = ?4 AND source_id = ?5 AND observed_at = ?6",
+                    params![
+                        interest.instrument_id.to_string(),
+                        interest.board,
+                        interest.session,
+                        interest.trade_date,
+                        interest.source_id,
+                        interest.observed_at,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if known.is_some() {
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO accrued_interest_observations (
+                     instrument_id, board, session, trade_date, source_id, observed_at,
+                     per_unit, currency, raw_hash, sync_run_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    interest.instrument_id.to_string(),
+                    interest.board,
+                    interest.session,
+                    interest.trade_date,
+                    interest.source_id,
+                    interest.observed_at,
+                    interest.per_unit,
+                    interest.currency,
+                    interest.raw_hash,
+                    interest.sync_run_id.to_string(),
+                ],
+            )?;
+        }
+
         transaction.commit()?;
         Ok(ImportOutcome::Applied {
             inserted,
@@ -1615,4 +3375,13 @@ fn parse(value: &str, what: &'static str) -> Result<uuid::Uuid, StoreError> {
         what,
         id: value.to_owned(),
     })
+}
+
+/// `?,?,...` for `count` placeholders, for an `IN (...)` clause whose arity
+/// (the size of the instrument closure) is not known until the export runs.
+/// The same idiom `journal::read::placeholders` already uses, duplicated
+/// rather than shared across a crate-private boundary neither module has a
+/// reason to cross otherwise.
+fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(",")
 }

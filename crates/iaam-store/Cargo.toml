@@ -22,6 +22,13 @@ serde_json = "1"
 ciborium = "0.2"
 # Контрольная сумма бандла по всему содержимому, а не по идентификаторам.
 sha2 = "0.11"
+# A document body travels in the bundle as evidence the owner cannot re-fetch
+# (iaam-k3gh.9.3). Left as `Vec<u8>`, serde_json would write it as a
+# comma-separated array of small integers — several times the size of the
+# bytes it encodes, exactly the "an export nobody can move" failure that task
+# asks not to ship. Already a dependency of `iaam-broker`, pinned to the same
+# version here.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 thiserror = "2"
 time = { version = "0.3", default-features = false, features = ["std", "macros", "parsing", "formatting"] }
 uuid = { version = "1", features = ["serde", "v4"] }

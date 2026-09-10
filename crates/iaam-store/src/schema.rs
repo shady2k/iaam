@@ -23,6 +23,46 @@ use crate::StoreError;
 /// time, on a statement naming a column that is not there.
 pub const SCHEMA_VERSION: u32 = 2;
 
+/// Which numbering [`SCHEMA_VERSION`] belongs to.
+///
+/// `SCHEMA_VERSION` counts migrations *within* a numbering scheme, and that
+/// scheme has already been reset once — the collapse this module's own doc
+/// comment describes. A version number alone cannot tell "migration 2 of the
+/// scheme this build implements" from "migration 2 of the scheme the collapse
+/// discarded": both are the bare integer `2`, and an archive stamped with the
+/// wrong one is not an old copy of this schema, it is a description of a
+/// schema that no longer exists (iaam-k3gh.9.5).
+///
+/// Bumped only when [`SCHEMA_VERSION`]'s own counter is reset, never on an
+/// ordinary migration — exactly the discipline `SCHEMA_VERSION` already
+/// documents for itself. Nothing has forced that since the collapse, so this
+/// is generation one: the first (and, so far, only) numbering this constant
+/// has ever named. A bundle archive (`iaam_store::bundle::Bundle`) carries
+/// this beside its own `schema_version` so `import_bundle` can refuse a
+/// mismatch by name rather than comparing two numbers that happen to collide.
+pub const SCHEMA_GENERATION: u32 = 1;
+
+/// The highest `schema_version` any build ever wrote **without** stamping
+/// [`SCHEMA_GENERATION`] beside it.
+///
+/// The marker was added after the collapse, so an archive that carries none
+/// is not thereby of this generation — it is an archive from before anyone
+/// wrote the generation down, and the counter it used cannot be recovered
+/// from the file. What can be recovered is this: every build that wrote no
+/// marker had `SCHEMA_VERSION` at this value or below, because the marker
+/// landed with the migration that raised it. So an unmarked archive claiming
+/// more than this was written under the numbering the collapse discarded —
+/// which is exactly the archive iaam-k3gh.9.5 is about, and exactly the one
+/// that would otherwise be waved through by reading its absent marker as
+/// agreement.
+///
+/// The one archive this refuses that is not from the discarded numbering is
+/// one exported in the short window between the migration that raised
+/// `SCHEMA_VERSION` to 2 and the marker landing hours later. Re-exporting it
+/// costs a command; accepting an archive whose numbering nobody can name
+/// costs a journal.
+pub const LAST_UNMARKED_SCHEMA_VERSION: u32 = 1;
+
 /// Every migration, numbered and embedded, in application order.
 ///
 /// `pub` so `tests/bundle_coverage.rs` can read the whole schema without

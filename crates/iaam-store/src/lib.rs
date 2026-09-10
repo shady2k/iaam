@@ -61,6 +61,22 @@ pub enum StoreError {
     SnapshotEncode(String),
     #[error("database schema version {found} is newer than supported version {supported}")]
     SchemaTooNew { found: u32, supported: u32 },
+    /// The archive's `schema_version` was written under a different schema
+    /// numbering than this build implements (iaam-k3gh.9.5): the collapse
+    /// that produced `0001_schema.sql` reset the counter once already, so the
+    /// same bare integer can name two different schemas depending which
+    /// numbering wrote it. Comparing `found` against `current` here the way
+    /// [`StoreError::SchemaTooNew`] compares versions would be exactly the
+    /// false acceptance this variant exists to refuse instead: two equal
+    /// generation numbers mean the versions beside them are comparable, and
+    /// two unequal ones mean they are not, regardless of which is larger.
+    #[error(
+        "archive schema numbering (generation {found}) does not match this build's schema \
+         numbering (generation {current}): its schema_version was written under a different \
+         numbering than this build's counter, so the two are not comparable and the archive \
+         cannot be safely restored"
+    )]
+    SchemaGenerationMismatch { found: u32, current: u32 },
     #[error("record {what} {id} not found in database")]
     NotFound { what: &'static str, id: String },
     #[error("active alias {namespace}:{value} not found for instrument {instrument}")]

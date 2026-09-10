@@ -26,7 +26,6 @@ pub struct CategoryRuleInput {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CategoryRuleImpact {
-    pub rows: u64,
     /// Every affected journal row, before the monthly aggregates below.
     pub preview_rows: Vec<CategoryPreviewRow>,
     /// By month, oldest first: what moved, and between which categories.
@@ -285,7 +284,6 @@ fn preview_category_rule_from(
     let grouped = group_category_impacts(moved)
         .map_err(|error| AppError::Store(format!("aggregate category preview: {error}")))?;
     Ok(CategoryRuleImpact {
-        rows: grouped.rows,
         preview_rows,
         months: grouped
             .months

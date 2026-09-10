@@ -459,3 +459,299 @@ fn the_guard_would_catch_a_phantom_row() {
         "a row naming a route the specification does not declare must be reported"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §1.4b's shape, checked on every schema, not just the tables above (iaam-k3gh.16)
+// ---------------------------------------------------------------------------
+
+/// Whether a schema's own `type` names `wanted`, however it is spelled.
+///
+/// OpenAPI 3.1 renders a nullable scalar or array as `"type": [X, "null"]`
+/// rather than as a `oneOf` — `HeldSessionDto.facts` (`Option<usize>`) comes
+/// back `{"type": ["integer", "null"], "minimum": 0}`, one object, not a
+/// union. Reading `"type"` as either a bare string or an array of them, and
+/// asking whether `wanted` is among them, reads both that shape and the plain
+/// `"type": "array"` shape with the same line, and doubles as the null-branch
+/// filter composition branches need below: `type_includes(branch, "null")` is
+/// true for exactly the branch a nullable wrapper adds and no other.
+fn type_includes(schema: &Value, wanted: &str) -> bool {
+    match schema.get("type") {
+        Some(Value::String(found)) => found == wanted,
+        Some(Value::Array(values)) => values.iter().any(|v| v.as_str() == Some(wanted)),
+        _ => false,
+    }
+}
+
+/// Whether a property's schema is a list, following a `$ref` or a nullable
+/// wrapper to find out, but never requiring the list's elements to be
+/// objects — `RowShapeDto.rows` is legitimately an array of row numbers, and
+/// this must accept it exactly as readily as an array of objects.
+fn is_array_shaped(schema: &Value, schemas: &Value) -> bool {
+    if type_includes(schema, "array") {
+        return true;
+    }
+    if let Some(name) = ref_name(schema) {
+        return schemas
+            .get(&name)
+            .is_some_and(|resolved| is_array_shaped(resolved, schemas));
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+            let carrying: Vec<&Value> = branches
+                .iter()
+                .filter(|branch| !type_includes(branch, "null"))
+                .collect();
+            if !carrying.is_empty() && carrying.iter().all(|b| is_array_shaped(b, schemas)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a property's schema is a count: an integer with no negative
+/// `minimum`, following a `$ref` or a nullable wrapper the same way
+/// [`is_array_shaped`] does. `"type": "number"` — a fractional value — is
+/// deliberately not `"integer"` and so is refused here, which is the other
+/// half of the shape §1.4b's name promises: a client that reads `row_count`
+/// as a whole number must never meet a fraction.
+fn is_nonneg_integer_shaped(schema: &Value, schemas: &Value) -> bool {
+    if type_includes(schema, "integer") {
+        return schema
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_none_or(|minimum| minimum >= 0.0);
+    }
+    if let Some(name) = ref_name(schema) {
+        return schemas
+            .get(&name)
+            .is_some_and(|resolved| is_nonneg_integer_shaped(resolved, schemas));
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+            let carrying: Vec<&Value> = branches
+                .iter()
+                .filter(|branch| !type_includes(branch, "null"))
+                .collect();
+            if !carrying.is_empty()
+                && carrying
+                    .iter()
+                    .all(|b| is_nonneg_integer_shaped(b, schemas))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Visits one named schema's own body exactly once, ever — `visited` is
+/// shared across the whole walk, so a schema reached through two different
+/// properties (or a cycle) is not re-descended, and every property it
+/// declares is always attributed to its own name, whichever path found it.
+fn walk_schema(
+    name: &str,
+    node: &Value,
+    schemas: &Value,
+    visited: &mut HashSet<String>,
+    defects: &mut BTreeSet<(String, String)>,
+) {
+    if !visited.insert(name.to_owned()) {
+        return;
+    }
+    walk_node(name, node, schemas, visited, defects);
+}
+
+/// Checks every property a schema node declares directly — merging in
+/// `allOf`/`oneOf`/`anyOf` branches that are inline rather than a `$ref`,
+/// which is what a `#[serde(flatten)]` field or an externally tagged variant
+/// becomes — and follows array `items` and property values one level deeper.
+///
+/// A `$ref` branch or property value is deliberately not walked inline here:
+/// the schema it names is a top-level entry in `components/schemas` in its
+/// own right, and [`row_shape_defects`] visits every one of those, so
+/// dereferencing here would only attribute its properties a second time
+/// (correctly or not) rather than see anything a direct visit would not.
+fn walk_node(
+    attribution: &str,
+    node: &Value,
+    schemas: &Value,
+    visited: &mut HashSet<String>,
+    defects: &mut BTreeSet<(String, String)>,
+) {
+    if let Some(properties) = node.get("properties").and_then(Value::as_object) {
+        for (property, value) in properties {
+            if property == "rows" && !is_array_shaped(value, schemas) {
+                defects.insert((attribution.to_owned(), property.clone()));
+            }
+            if property == "row_count" && !is_nonneg_integer_shaped(value, schemas) {
+                defects.insert((attribution.to_owned(), property.clone()));
+            }
+            walk_property_value(attribution, value, schemas, visited, defects);
+        }
+    }
+
+    for key in ["allOf", "oneOf", "anyOf"] {
+        let Some(branches) = node.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for branch in branches {
+            if let Some(name) = ref_name(branch) {
+                if let Some(resolved) = schemas.get(&name) {
+                    walk_schema(&name, resolved, schemas, visited, defects);
+                }
+            } else if !type_includes(branch, "null") {
+                walk_node(attribution, branch, schemas, visited, defects);
+            }
+        }
+    }
+
+    if type_includes(node, "array") {
+        if let Some(items) = node.get("items") {
+            walk_property_value(attribution, items, schemas, visited, defects);
+        }
+    }
+}
+
+/// A property's value, or an array's `items`: a `$ref` switches attribution
+/// to the schema it names (deduplicated by [`walk_schema`]); anything else is
+/// walked as a node in its own right, still attributed to the caller's
+/// schema, since an inline value published nowhere else has no name of its
+/// own to be attributed to.
+fn walk_property_value(
+    attribution: &str,
+    value: &Value,
+    schemas: &Value,
+    visited: &mut HashSet<String>,
+    defects: &mut BTreeSet<(String, String)>,
+) {
+    if let Some(name) = ref_name(value) {
+        if let Some(resolved) = schemas.get(&name) {
+            walk_schema(&name, resolved, schemas, visited, defects);
+        }
+        return;
+    }
+    walk_node(attribution, value, schemas, visited, defects);
+}
+
+/// Every `(schema, property)` pair, anywhere in the published document, where
+/// a property named `rows` is not a list or a property named `row_count` is
+/// not a non-negative integer.
+///
+/// Starts the walk from every name in `components/schemas`, not only from a
+/// route's own response body: a schema published only as a request, or only
+/// reached through another schema's property, still publishes a shape a
+/// client reads, and `visited` means starting from all of them costs nothing
+/// extra — each schema's body is still walked exactly once.
+fn row_shape_defects(spec: &Value) -> BTreeSet<(String, String)> {
+    let schemas = spec
+        .pointer("/components/schemas")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut defects = BTreeSet::new();
+    let mut visited = HashSet::new();
+    if let Some(names) = schemas.as_object() {
+        for name in names.keys() {
+            walk_schema(name, &schemas[name], &schemas, &mut visited, &mut defects);
+        }
+    }
+    defects
+}
+
+/// Exact exceptions to [`row_shape_defects`], the way `TABLE_DISPOSITIONS`
+/// classifies a table `bundle_coverage.rs` cannot otherwise place: named
+/// because a real one exists today, not as a general escape hatch. Empty —
+/// `iaam-k3gh.16` renamed `CategoryMoveDto.rows` and `BatchTotalDto.rows` to
+/// `row_count` and removed `CategoryRuleImpactDto.rows` outright, so nothing
+/// needs one. A name added here later must be the field's own justification
+/// for the exception, not a note that the guard was inconvenient.
+const ROW_SHAPE_EXCEPTIONS: &[(&str, &str)] = &[];
+
+/// §1.4b's rule, checked on the document a client reads rather than trusted
+/// to a reviewer rereading every DTO by eye — which is how three fields named
+/// `rows` for a count, one of them undocumented, survived past review before
+/// `iaam-k3gh.16`. Unlike `contract.rs`'s
+/// `each_list_wrapper_names_its_row_field_in_the_schema` and its hand-picked
+/// table, and unlike [`contains_a_list`]'s deliberate one hop, this walks
+/// every schema the document publishes, however deeply a property sits
+/// behind a `$ref`, an `allOf` flatten or a `oneOf` variant — because the
+/// defect this guards is exactly as likely to hide there as at a response's
+/// own top level, and `CategoryMoveDto.rows` was nested two hops down,
+/// inside `CategoryRuleImpactDto.months[].moved[]`, when this bead found it.
+///
+/// The comparison runs both ways, exactly as `bundle_coverage.rs`'s does: a
+/// defect absent from [`ROW_SHAPE_EXCEPTIONS`] fails the build, and so does a
+/// name left in [`ROW_SHAPE_EXCEPTIONS`] for a field that no longer has the
+/// defect — a stale exception is a claim nobody checks again, and it is what
+/// let `("CategoryRuleImpactDto", "rows")` sit in `contract.rs`'s own table
+/// naming the wrong field as the row-carrier until this bead read the schema
+/// rather than the name.
+#[test]
+fn every_rows_is_a_list_and_every_row_count_is_a_count() {
+    let spec = generated_spec();
+    let defects = row_shape_defects(&spec);
+    let exceptions: BTreeSet<(String, String)> = ROW_SHAPE_EXCEPTIONS
+        .iter()
+        .map(|(schema, property)| ((*schema).to_owned(), (*property).to_owned()))
+        .collect();
+    assert_eq!(
+        defects, exceptions,
+        "a property named `rows` must be an array and a property named `row_count` must be a \
+         non-negative integer (nullable forms allowed); a name here that is not in \
+         ROW_SHAPE_EXCEPTIONS is a new instance of the defect, and a name in \
+         ROW_SHAPE_EXCEPTIONS that is not here is a stale exception — either way the two must \
+         match exactly"
+    );
+}
+
+/// Proves the comparison above is not vacuous, the way
+/// [`the_guard_would_catch_a_genuinely_missing_route`] proves
+/// [`section_2_matches_the_generated_specification_exactly`] is not: a scalar
+/// `rows`, a list-valued `row_count`, and a fractional `row_count` must all be
+/// reported, and an array of bare numbers (no `properties` on its items) and
+/// a nullable, non-negative `row_count` must not be.
+#[test]
+fn the_guard_would_catch_a_misshapen_rows_or_row_count() {
+    let schemas = serde_json::json!({
+        "ScalarRowsDto": {
+            "type": "object",
+            "properties": { "rows": { "type": "integer", "minimum": 0 } }
+        },
+        "ListRowCountDto": {
+            "type": "object",
+            "properties": {
+                "row_count": { "type": "array", "items": { "type": "string" } }
+            }
+        },
+        "FractionalRowCountDto": {
+            "type": "object",
+            "properties": { "row_count": { "type": "number", "minimum": 0 } }
+        },
+        "HonestRowsDto": {
+            "type": "object",
+            "properties": {
+                "rows": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+            }
+        },
+        "HonestRowCountDto": {
+            "type": "object",
+            "properties": {
+                "row_count": { "type": ["integer", "null"], "minimum": 0 }
+            }
+        }
+    });
+    let spec = serde_json::json!({ "components": { "schemas": schemas } });
+
+    assert_eq!(
+        row_shape_defects(&spec),
+        [
+            ("FractionalRowCountDto".to_owned(), "row_count".to_owned()),
+            ("ListRowCountDto".to_owned(), "row_count".to_owned()),
+            ("ScalarRowsDto".to_owned(), "rows".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+        "a scalar `rows`, a list `row_count` and a fractional `row_count` must each be reported, \
+         and a list-of-numbers `rows` and a nullable non-negative `row_count` must not be"
+    );
+}

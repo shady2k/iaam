@@ -333,7 +333,7 @@ async fn a_preview_reports_what_would_move_and_writes_nothing() {
         .len();
 
     assert_eq!(before, after, "a preview must not write a rule");
-    assert_eq!(impact.rows, 3);
+    assert_eq!(impact.preview_rows.len(), 3);
     assert_eq!(impact.months.len(), 2);
     assert_eq!(impact.months[0].month, date!(2026 - 07 - 01));
     assert_eq!(impact.months[1].month, date!(2026 - 08 - 01));
@@ -397,7 +397,7 @@ async fn a_preview_with_no_changes_is_empty() {
         .len();
 
     assert_eq!(before, after);
-    assert_eq!(impact.rows, 0);
+    assert_eq!(impact.preview_rows.len(), 0);
     assert!(impact.months.is_empty());
 }
 

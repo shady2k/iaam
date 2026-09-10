@@ -8658,11 +8658,6 @@ pub struct CategoryRuleBatchRequest {
 /// The rows and monthly movements caused by a proposed category rule.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CategoryRuleImpactDto {
-    /// How many events the rule affects — a count, not a list.
-    ///
-    /// Named `rows` beside `preview_rows`, which is the field that actually
-    /// carries them: read this one for how many, and `preview_rows` for which.
-    pub rows: u64,
     /// Each affected event before the monthly aggregates below.
     pub preview_rows: Vec<CategoryPreviewRowDto>,
     /// The movements the proposed rule causes, month by month.
@@ -8705,14 +8700,21 @@ pub struct CategoryMoveDto {
     pub from: Option<Uuid>,
     pub to: Uuid,
     pub amount: String,
-    pub rows: u64,
+    /// How many events folded into this one `(month, from, to, currency)`
+    /// group. A real count and not a duplicate: the events themselves are
+    /// not published per group anywhere in this response, only their sum in
+    /// `amount`, so a caller cannot recover this figure by counting a list
+    /// the way it could `CategoryRuleImpactDto.preview_rows`'s own length
+    /// (§1.4b). Named `row_count` rather than `rows` for the reason
+    /// [`ImportSessionContentsDto::row_count`] gives: a plural noun beside a
+    /// count reads as a list.
+    pub row_count: u64,
 }
 
 impl CategoryRuleImpactDto {
     #[must_use]
     pub fn from_domain(impact: CategoryRuleImpact) -> Self {
         Self {
-            rows: impact.rows,
             preview_rows: impact
                 .preview_rows
                 .into_iter()
@@ -8756,7 +8758,7 @@ impl CategoryMoveDto {
             from: movement.from.map(|id| id.inner()),
             to: movement.to.inner(),
             amount: movement.amount.to_calc_dec().inner().to_string(),
-            rows: movement.rows,
+            row_count: movement.rows,
         }
     }
 }
@@ -13137,7 +13139,14 @@ pub struct BatchTotalDto {
     pub currency: CurrencyDto,
     /// How many of the rows above this total folded. Rows that moved no cash on
     /// the account are not among them.
-    pub rows: usize,
+    ///
+    /// `row_count` and not `rows`: those rows are not published anywhere in
+    /// this response, so this is a genuine count rather than a name a caller
+    /// could confuse for the list itself (§1.4b), and the plural noun is the
+    /// spelling that invites exactly that confusion —
+    /// [`ImportSessionContentsDto::row_count`] documents the client mistake
+    /// the suffix was bought with.
+    pub row_count: usize,
     /// What arrived, as a positive decimal string.
     pub debit: String,
     /// What left, as a positive decimal string.
@@ -13152,7 +13161,7 @@ impl BatchTotalDto {
         Self {
             account: total.account.inner(),
             currency: CurrencyDto::from_domain(total.currency),
-            rows: total.rows,
+            row_count: total.rows,
             debit: minor_amount(total.debit.raw(), total.currency),
             credit: minor_amount(total.credit.raw(), total.currency),
             net: minor_amount(total.net.raw(), total.currency),

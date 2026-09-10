@@ -9600,13 +9600,19 @@ async fn category_rule_preview_does_not_write_and_rules_are_listed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
-    assert_eq!(impact["rows"], 1);
+    assert_eq!(
+        impact["preview_rows"]
+            .as_array()
+            .expect("preview_rows")
+            .len(),
+        1
+    );
     assert_eq!(impact["preview_rows"][0]["row_key"], "preview-other");
     assert_eq!(impact["months"][0]["month"], "2026-08-01");
     assert_eq!(impact["months"][0]["moved"][0]["from"], Value::Null);
     assert_eq!(impact["months"][0]["moved"][0]["to"], category_id);
     assert_eq!(impact["months"][0]["moved"][0]["amount"], "500.00");
-    assert_eq!(impact["months"][0]["moved"][0]["rows"], 1);
+    assert_eq!(impact["months"][0]["moved"][0]["row_count"], 1);
 
     let (status, after) = call(
         &harness.router,
@@ -9680,7 +9686,14 @@ async fn a_row_rule_pins_a_row_whose_source_named_no_identifier() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
-    assert_eq!(impact["rows"], 1, "{impact}");
+    assert_eq!(
+        impact["preview_rows"]
+            .as_array()
+            .expect("preview_rows")
+            .len(),
+        1,
+        "{impact}"
+    );
     assert_eq!(
         impact["preview_rows"][0]["row_key"],
         "tbank/file/deadbeef/1"
@@ -9755,7 +9768,14 @@ async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
-    assert_eq!(impact["rows"], 1, "{impact}");
+    assert_eq!(
+        impact["preview_rows"]
+            .as_array()
+            .expect("preview_rows")
+            .len(),
+        1,
+        "{impact}"
+    );
     // A kind per mode, not one kind carrying a mode: `description_contains`
     // goes on taking the string it took before, so a rule already written
     // against it keeps its meaning and its spelling (`iaam-v77v`).
@@ -9776,7 +9796,14 @@ async fn a_description_rule_decomposes_a_row_the_source_category_cannot_separate
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{key}: {impact}");
-        assert_eq!(impact["rows"], 1, "{key}: {impact}");
+        assert_eq!(
+            impact["preview_rows"]
+                .as_array()
+                .expect("preview_rows")
+                .len(),
+            1,
+            "{key}: {impact}"
+        );
     }
 
     drop(harness);
@@ -10043,7 +10070,13 @@ async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{impact}");
-    assert_eq!(impact["rows"], 0);
+    assert_eq!(
+        impact["preview_rows"]
+            .as_array()
+            .expect("preview_rows")
+            .len(),
+        0
+    );
 
     // The rest of this test used to corrupt a stored rule directly — write
     // malformed JSON, or an unknown kind, into `category_rules.matcher` —
@@ -25364,7 +25397,7 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
         .iter()
         .find(|total| total["account"] == json!(main.to_string()))
         .expect("a total for the first account");
-    assert_eq!(on_main["rows"], 2, "{plan}");
+    assert_eq!(on_main["row_count"], 2, "{plan}");
     assert_eq!(on_main["debit"], "1000.00", "{plan}");
     assert_eq!(on_main["credit"], "250.00", "both sides positive: {plan}");
     assert_eq!(on_main["net"], "750.00", "{plan}");
@@ -25388,7 +25421,7 @@ async fn the_commit_delta_totals_its_rows_per_account_and_currency() {
     assert_eq!(duplicates.len(), 1, "{plan}");
     assert_eq!(duplicates[0]["account"], json!(main.to_string()), "{plan}");
     assert_eq!(duplicates[0]["debit"], "400.00", "{plan}");
-    assert_eq!(duplicates[0]["rows"], 1, "{plan}");
+    assert_eq!(duplicates[0]["row_count"], 1, "{plan}");
 }
 
 /// A plan says which provenance it will write its facts under.
@@ -33238,7 +33271,7 @@ async fn each_list_wrapper_names_its_row_field_in_the_schema() {
         ("SyncOutcomeDto", "recorded"),
         ("DocumentDto", "rows"),
         ("JournalAggregateDto", "groups"),
-        ("CategoryRuleImpactDto", "rows"),
+        ("CategoryRuleImpactDto", "preview_rows"),
         ("RecomputePlanDto", "corrections"),
     ];
     for (schema_name, field) in row_fields {

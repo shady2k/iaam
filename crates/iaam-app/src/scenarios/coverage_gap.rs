@@ -77,9 +77,15 @@ pub(crate) fn operation_dimensions(kind: &OperationKind) -> BTreeSet<Dimension> 
         | OperationKind::Tax { .. }
         | OperationKind::OpeningCash { .. } => [Dimension::Cash].into_iter().collect(),
         OperationKind::OpeningPosition { .. } => [Dimension::Positions].into_iter().collect(),
-        // Valuation changes no control dimension, so refusing it cannot taint
-        // cash, positions, income, or tax-basis assertions.
-        OperationKind::Valuation { .. } => BTreeSet::new(),
+        // Valuation and a stated securities value change no control
+        // dimension: neither posts a leg, so refusing either cannot taint
+        // cash, positions, income, or tax-basis assertions. The reconciliation
+        // dimensions this API recognises are all leg-derived, and a stated
+        // securities value is deliberately not one — see
+        // `iaam_core::event::kind::EventKind::StatedSecuritiesValue`.
+        OperationKind::Valuation { .. } | OperationKind::StatedSecuritiesValue { .. } => {
+            BTreeSet::new()
+        }
     }
 }
 

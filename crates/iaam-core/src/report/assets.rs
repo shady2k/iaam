@@ -46,6 +46,7 @@ use crate::money::{CalcMoney, CurrencyCode, Money, MoneyError, PerUnitAmount, Qu
 use crate::numeric::NumericError;
 use crate::numeric::decimal::Dec;
 use crate::projection::balances::PositionKey;
+use crate::projection::stated_securities::StatedSecuritiesValue;
 use crate::reconciliation::OpeningIncorporation;
 use crate::returns::KnowledgeCoordinate;
 use crate::rules::quotation::{QuotationRule, QuotationV1};
@@ -93,6 +94,11 @@ pub struct AssetAccount {
     /// added to a figure it is not the same kind of thing as.
     pub cash: Vec<AccountCash>,
     pub positions: Vec<(PositionKey, Quantity)>,
+    /// The owner's latest stated securities value at or before the report
+    /// date, echoed from [`super::balances::AccountBalanceRow::stated_securities`]
+    /// regardless of whether it still counts toward anything — see
+    /// [`PositionsSide::stated`] for the accounts where it does.
+    pub stated_securities: Option<StatedSecuritiesValue>,
 }
 
 /// One class of cash and what the accounts declared to be it hold.
@@ -157,6 +163,26 @@ pub struct HoldingValue {
     pub value: Option<CalcMoney>,
 }
 
+/// One account's securities, stated by the owner as a single figure rather
+/// than as holdings (`iaam-k3gh.11`). No instrument, no quantity, no lot: it
+/// is not a position and does not pretend to be one.
+///
+/// **Present only where the assertion is still active.** An account also
+/// carrying a real position fact is not listed here even when
+/// `AssetAccount.stated_securities` is `Some` — see [`fold_positions`] for the
+/// rule that reads `positions` before this one. That is the whole of how a
+/// full synchronisation supersedes the assertion: no relation, no
+/// retraction, just this rule choosing not to read it any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatedSecurities {
+    pub account: AccountId,
+    pub amount: Money,
+    /// The date the owner's figure is stated as of — not the report date,
+    /// which may be later: see
+    /// [`crate::projection::stated_securities::StatedSecuritiesLedger::value_at_or_before`].
+    pub as_of: Date,
+}
+
 /// The market-dependent half: positions, at the prices the policy selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionsSide {
@@ -165,10 +191,20 @@ pub struct PositionsSide {
     /// Accounts with no declared cash class and no position fact in the
     /// journal. Such an account may be a securities account whose holdings
     /// were never imported; cash-only classes are not candidates.
+    ///
+    /// **Not narrowed by [`Self::stated`].** An account the owner has given a
+    /// stated securities value is still an account whose composition the
+    /// journal does not know, so it stays in this list: the assertion answers
+    /// what the total should be, not what the account holds.
     pub accounts_without_position_facts: Vec<AccountId>,
-    /// The earliest date any price behind these figures was for — the oldest
-    /// link in the total, and the honest summary of «as of when». `None` when
-    /// nothing was priced.
+    /// Accounts whose securities value here is the owner's own assertion
+    /// rather than a sum of priced holdings — see [`StatedSecurities`] for
+    /// what makes an entry active and [`Self::stated_totals`] for what it
+    /// adds to.
+    pub stated: Vec<StatedSecurities>,
+    /// The earliest date any price behind [`Self::totals`] was for — the
+    /// oldest link in that total, and the honest summary of «as of when».
+    /// `None` when nothing was priced.
     ///
     /// The per-holding dates are on `holdings[].price`, because one summary
     /// date cannot say that one instrument is a day stale and another a year.
@@ -176,6 +212,17 @@ pub struct PositionsSide {
     /// The priced holdings added up, per currency, in the currency each quote
     /// was made in. An unpriced holding is in no total.
     pub totals: Vec<CalcMoney>,
+    /// [`Self::stated`] added up, per currency the owner stated a figure in.
+    ///
+    /// **A figure of its own, never folded into [`Self::totals`].** That list
+    /// is a sum of quotes; this one is a sum of assertions, and adding an
+    /// assertion into a total of quotes would make an owner-stated number
+    /// read as a system valuation — the exact confusion [`super`]'s own module
+    /// comment refuses between the cash half and the position half. Both
+    /// still reach [`AssetSnapshot::total`], which is the whole point: the
+    /// account's total comes out right, and the two figures that made it up
+    /// stay legible apart.
+    pub stated_totals: Vec<Money>,
 }
 
 /// What the owner holds at a date: two halves, and the whole.
@@ -228,6 +275,18 @@ impl AssetSnapshot {
             caveats.push(Caveat::new(
                 CaveatKind::PositionFactsMissing,
                 CaveatSubject::Account(*account),
+            ));
+        }
+        // Every active assertion, never the raw `AssetAccount.stated_securities`:
+        // `positions.stated` is already the list `fold_positions` decided is
+        // still read, and re-deriving that test here from the raw field would
+        // give one question two answers — the same reason
+        // `not_decomposed_by_account` is read rather than recomputed in
+        // `money_flow_confidence`.
+        for entry in &self.positions.stated {
+            caveats.push(Caveat::new(
+                CaveatKind::SecuritiesValueAsserted,
+                CaveatSubject::Account(entry.account),
             ));
         }
         for row in &self.accounts {
@@ -326,6 +385,7 @@ pub fn asset_snapshot(
             cash_class: classes.get(&row.account).cloned(),
             cash: row.cash.clone(),
             positions: row.positions.clone(),
+            stated_securities: row.stated_securities,
         })
         .collect();
 
@@ -619,6 +679,36 @@ fn fold_positions(
         });
     }
 
+    // An account with a real position fact has already been fully
+    // synchronised — its composition is known, whatever it asserted before
+    // — so the assertion is read for the accounts where `positions` is
+    // still empty and nowhere else. This is the whole of how a full
+    // synchronisation supersedes the assertion: no relation between the two
+    // events, no retraction, just this condition.
+    let mut stated_by_currency: BTreeMap<CurrencyCode, Vec<Money>> = BTreeMap::new();
+    let mut stated = Vec::new();
+    for row in accounts {
+        if !row.positions.is_empty() {
+            continue;
+        }
+        let Some(value) = row.stated_securities else {
+            continue;
+        };
+        stated.push(StatedSecurities {
+            account: row.account,
+            amount: value.amount,
+            as_of: value.as_of,
+        });
+        stated_by_currency
+            .entry(value.amount.currency())
+            .or_default()
+            .push(value.amount);
+    }
+    let stated_totals = stated_by_currency
+        .into_iter()
+        .map(|(currency, amounts)| Money::sum(&amounts, currency))
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(PositionsSide {
         holdings,
         accounts_without_position_facts: accounts
@@ -626,8 +716,10 @@ fn fold_positions(
             .filter(|row| row.cash_class.is_none() && row.positions.is_empty())
             .map(|row| row.account)
             .collect(),
+        stated,
         oldest_price_date,
         totals: totals.into_values().collect(),
+        stated_totals,
     })
 }
 
@@ -664,6 +756,19 @@ fn fold_total(
     for money in &positions.totals {
         if !without_a_whole.contains(&money.currency()) {
             add_calc(&mut total, *money)?;
+        }
+    }
+    // The owner's stated figures join the whole on the same terms as the
+    // priced holdings beside them: this is what makes the account's total
+    // come out right without inventing a composition, which is the reason
+    // this whole feature exists. They are never summed into `positions.totals`
+    // itself — see that field's own reasoning against `stated_totals`.
+    for money in &positions.stated_totals {
+        if !without_a_whole.contains(&money.currency()) {
+            add_calc(
+                &mut total,
+                CalcMoney::new(money.to_calc_dec(), money.currency()),
+            )?;
         }
     }
     Ok(total.into_values().collect())
@@ -755,6 +860,7 @@ mod tests {
             reconciliation: Vec::new(),
             positions: Vec::new(),
             period_reports: PeriodReports::Calculated,
+            stated_securities: None,
         }
     }
 
@@ -1599,6 +1705,159 @@ mod tests {
                 .caveats()
                 .iter()
                 .any(|caveat| caveat.kind() == CaveatKind::HoldingNotValued)
+        );
+    }
+
+    fn stated(minor: i64, as_of: Date) -> StatedSecuritiesValue {
+        StatedSecuritiesValue {
+            amount: rub(minor),
+            as_of,
+        }
+    }
+
+    fn row_with_stated(
+        account: AccountId,
+        cash: Vec<AccountCash>,
+        value: StatedSecuritiesValue,
+    ) -> AccountBalanceRow {
+        let mut built = row(account, cash);
+        built.stated_securities = Some(value);
+        built
+    }
+
+    /// `iaam-k3gh.11`'s whole reason for existing: the field agent's need was
+    /// the account's total coming out right without inventing a composition,
+    /// and this is that total, made of an owner-asserted figure that is never
+    /// silently mistaken for cash.
+    #[test]
+    fn a_stated_securities_value_reaches_the_account_total_without_entering_cash() {
+        let broker = account(10);
+        let report = report(vec![row_with_stated(
+            broker,
+            Vec::new(),
+            stated(50_000_000, date!(2026 - 01 - 15)),
+        )]);
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        assert!(
+            snapshot.cash.totals.is_empty(),
+            "a stated securities value must never enter the cash dimension: {:?}",
+            snapshot.cash.totals
+        );
+        assert_eq!(
+            snapshot.positions.stated,
+            vec![StatedSecurities {
+                account: broker,
+                amount: rub(50_000_000),
+                as_of: date!(2026 - 01 - 15),
+            }]
+        );
+        assert_eq!(
+            total_in(&snapshot.positions.totals, CurrencyCode::Rub),
+            Dec::zero(),
+            "the priced-holdings total is untouched by an assertion"
+        );
+        assert_eq!(
+            snapshot.positions.stated_totals,
+            vec![rub(50_000_000)],
+            "the assertion is stated apart from the priced-holdings total"
+        );
+        assert_eq!(
+            total_in(&snapshot.total, CurrencyCode::Rub),
+            Dec::new(500_000.into()),
+            "the account's total is right without a composition"
+        );
+    }
+
+    /// The report says what the figure is, not merely what it is worth: a
+    /// caveat names it as an assertion, and the coverage gap it stands in for
+    /// keeps firing beside it.
+    #[test]
+    fn a_stated_value_is_named_as_an_assertion_and_does_not_silence_the_coverage_gap() {
+        let broker = account(10);
+        let report = report(vec![row_with_stated(
+            broker,
+            Vec::new(),
+            stated(50_000_000, date!(2026 - 01 - 15)),
+        )]);
+        let snapshot = asset_snapshot(
+            AS_OF,
+            &report,
+            &BTreeMap::new(),
+            journal_only(&PriceBoard::new()),
+        )
+        .expect("snapshot");
+
+        let confidence = snapshot.confidence();
+        assert!(
+            confidence.caveats().iter().any(|caveat| caveat.kind()
+                == CaveatKind::SecuritiesValueAsserted
+                && caveat.subject() == CaveatSubject::Account(broker)),
+            "no caveat says the total rests on an assertion: {:?}",
+            confidence.caveats()
+        );
+        assert!(
+            confidence
+                .caveats()
+                .iter()
+                .any(|caveat| caveat.kind() == CaveatKind::PositionFactsMissing
+                    && caveat.subject() == CaveatSubject::Account(broker)),
+            "the composition is still unknown, and the older caveat must keep saying so: {:?}",
+            confidence.caveats()
+        );
+    }
+
+    /// The mechanism a full synchronisation uses to supersede the assertion:
+    /// presence of a real position, not a link between the two events. The
+    /// assertion stops contributing the moment the account carries one,
+    /// however recently it was dated.
+    #[test]
+    fn a_full_position_synchronisation_supersedes_the_stated_value() {
+        let broker = account(10);
+        let held = instrument(1);
+        let mut synced = row_with_stated(
+            broker,
+            Vec::new(),
+            stated(50_000_000, date!(2026 - 01 - 15)),
+        );
+        synced.positions = vec![(position(broker, held), quantity(4))];
+        let report = report(vec![synced]);
+
+        let mut board = PriceBoard::new();
+        priced(&mut board, held, 250, date!(2026 - 01 - 30));
+        let snapshot = asset_snapshot(AS_OF, &report, &BTreeMap::new(), journal_only(&board))
+            .expect("snapshot");
+
+        assert!(
+            snapshot.positions.stated.is_empty(),
+            "a real position must retire the assertion: {:?}",
+            snapshot.positions.stated
+        );
+        assert!(snapshot.positions.stated_totals.is_empty());
+        assert!(
+            snapshot
+                .confidence()
+                .caveats()
+                .iter()
+                .all(|caveat| caveat.kind() != CaveatKind::SecuritiesValueAsserted),
+            "a superseded assertion must not still be named as active"
+        );
+        // The echo on the row states the raw fact regardless — it is the
+        // fold that stops reading it, not the row that stops carrying it.
+        assert_eq!(
+            snapshot.accounts[0].stated_securities,
+            Some(stated(50_000_000, date!(2026 - 01 - 15)))
+        );
+        assert_eq!(
+            total_in(&snapshot.positions.totals, CurrencyCode::Rub),
+            Dec::new(1_000.into()),
+            "the priced position, not the retired assertion, is the total now"
         );
     }
 }

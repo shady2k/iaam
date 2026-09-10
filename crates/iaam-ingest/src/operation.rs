@@ -273,6 +273,33 @@ pub enum OperationKind {
         amount_minor: i64,
         currency: CurrencyCode,
     },
+    /// What the owner says his securities on this account are worth, with no
+    /// instrument named and no composition (`iaam-k3gh.11`).
+    ///
+    /// **Not [`Self::OpeningCash`] with a note.** That was the only way to
+    /// say "for now, balances only" before this existed, and it put a
+    /// securities figure in the cash dimension — inflating the account's
+    /// cash by exactly the amount that was not cash at all. This kind states
+    /// the securities half honestly instead, kept out of `cash` entirely.
+    ///
+    /// **`amount_minor` is always positive**, unlike `OpeningCash`'s: a
+    /// securities value of nothing is not asserted at all, and shorts are out
+    /// of scope for this API.
+    ///
+    /// **A second one on this account replaces the first, and by a different
+    /// mechanism than any other kind here.** This fact posts no leg — it
+    /// names no instrument to post a security leg against — so there is
+    /// nothing for two of them to accumulate through. The core reads the
+    /// assertion dated at or before the report date that is latest, exactly
+    /// as it reads the latest price for an instrument, so a second
+    /// `stated_securities_value` supersedes the first rather than adding to
+    /// it. Read [`iaam_core::event::kind::EventKind::StatedSecuritiesValue`]
+    /// for the full argument, including how a real position synchronisation
+    /// supersedes this too.
+    StatedSecuritiesValue {
+        amount_minor: i64,
+        currency: CurrencyCode,
+    },
     /// A position a reconstructed account already held before the journal
     /// begins.
     ///
@@ -833,6 +860,13 @@ fn build(
                 EventKind::OpeningCash { amount },
                 vec![Leg::cash(account, amount)],
             ))
+        }
+        OperationKind::StatedSecuritiesValue {
+            amount_minor,
+            currency,
+        } => {
+            let amount = money(positive(*amount_minor, "amount", *currency)?, *currency);
+            Ok((EventKind::StatedSecuritiesValue { amount }, Vec::new()))
         }
         OperationKind::OpeningPosition {
             instrument,

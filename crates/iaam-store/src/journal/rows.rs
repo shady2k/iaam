@@ -178,6 +178,16 @@ pub(crate) struct OpeningPositionRow {
     pub prior_corporate_actions: String,
 }
 
+/// `event_stated_securities_value`. Moves no money and names no instrument:
+/// the event has no legs, so both fields here are stored rather than
+/// reconstructed (`iaam-k3gh.11`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatedSecuritiesValueRow {
+    pub event: String,
+    pub amount: i64,
+    pub currency: String,
+}
+
 /// `event_valuation`. Moves no money: the event has no legs, so every field
 /// here is stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +323,7 @@ pub(crate) enum DetailRows {
     Fee(FeeRow),
     Tax(TaxRow),
     OpeningPosition(Box<OpeningPositionRow>),
+    StatedSecuritiesValue(StatedSecuritiesValueRow),
     Valuation(ValuationRow),
     ControlAssertion(ControlAssertionRow),
     CoverageGap(CoverageGapDetail),

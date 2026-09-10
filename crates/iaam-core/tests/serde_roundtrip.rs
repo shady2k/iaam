@@ -169,6 +169,12 @@ fn every_kind() -> Vec<Event> {
             vec![Leg::cash(account, rub(-42))],
         ),
         envelope(
+            EventKind::StatedSecuritiesValue {
+                amount: rub(50_000_000),
+            },
+            vec![],
+        ),
+        envelope(
             EventKind::Valuation {
                 instrument,
                 price: Dec::new(Decimal::new(1_234_567, 4)),
@@ -335,6 +341,7 @@ fn is_known(kind: &EventKind) -> bool {
         | EventKind::Tax { .. }
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }
+        | EventKind::StatedSecuritiesValue { .. }
         | EventKind::Valuation { .. }
         | EventKind::ControlAssertion { .. }
         | EventKind::ImportCoverageGap { .. }

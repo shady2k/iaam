@@ -276,20 +276,23 @@ fn an_unmarked_archive_within_the_unmarked_numbering_still_restores() {
 fn an_unmarked_archive_from_the_discarded_numbering_is_refused() {
     // The archive iaam-k3gh.9.5 is actually about, and the one the first
     // attempt at this fix let through: written by this codebase's own export
-    // before the collapse, under a counter that had reached 2, and carrying no
-    // generation marker because nobody was writing one yet. It cannot declare
-    // that it differs. Reading its silence as agreement accepts a description
-    // of a schema that no longer exists — and now that this build's own
-    // counter has reached 2 as well, the bare integers agree and nothing else
-    // would refuse it.
+    // before the collapse, under a counter from the discarded numbering, and
+    // carrying no generation marker because nobody was writing one yet. It
+    // cannot declare that it differs. Reading its silence as agreement
+    // accepts a description of a schema that no longer exists — and the
+    // sharpest version of that failure is exactly this one, where the archive's
+    // bare `schema_version` happens to equal this build's own current counter,
+    // so nothing but the marker's absence tells the two numbering schemes
+    // apart. `SCHEMA_VERSION` is read live rather than restated as a literal,
+    // because it moves with ordinary migrations and this case is about the
+    // *coincidence*, not about any particular integer.
     let mut bundle: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
         .expect("an old archive still reads");
     assert_eq!(bundle.schema_generation(), None);
-    bundle.schema_version = iaam_store::schema::LAST_UNMARKED_SCHEMA_VERSION + 1;
-    assert_eq!(
-        bundle.schema_version,
-        iaam_store::schema::SCHEMA_VERSION,
-        "the point of the case is that the two integers agree"
+    bundle.schema_version = iaam_store::schema::SCHEMA_VERSION;
+    assert!(
+        bundle.schema_version > iaam_store::schema::LAST_UNMARKED_SCHEMA_VERSION,
+        "the case requires the coincidence to also be beyond the unmarked numbering"
     );
     bundle.checksum = bundle.compute_checksum();
 

@@ -87,6 +87,16 @@ pub enum StoreError {
     },
     #[error("archived bundle is corrupted: {detail}")]
     BundleCorrupted { detail: String },
+    /// A migration left a child row pointing at a parent that is not there.
+    ///
+    /// Raised only from the migration path, and only after `PRAGMA
+    /// foreign_key_check` has said so inside the transaction that would have
+    /// committed the damage. The database is rolled back to what it was.
+    #[error(
+        "migration {version} would leave {violations} row(s) referencing a parent that is not \
+         there; the database was rolled back and is unchanged"
+    )]
+    MigrationBrokeReferences { version: u32, violations: usize },
     #[error("saved document {id} cannot be read: {detail}")]
     DocumentDecode { id: String, detail: String },
     #[error("row number {row} cannot be stored")]

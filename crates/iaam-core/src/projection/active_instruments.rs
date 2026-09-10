@@ -107,6 +107,7 @@ pub fn active_instruments(
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }
             | EventKind::OpeningCash { .. }
+            | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. }
             | EventKind::ImportCoverageGap { .. } => Vec::new(),

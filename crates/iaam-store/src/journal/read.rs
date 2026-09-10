@@ -9,8 +9,8 @@
 //! `events`, `event_legs` and a detail table would produce, so a page
 //! boundary on a joined query could cut one event's legs in half and hand
 //! the caller a fact silently missing a leg. Instead, [`hydrate`] issues one
-//! `SELECT ... WHERE <key> IN (...)` per table this journal has — sixteen
-//! statements: `events`, `event_legs`, the twelve detail tables of spec
+//! `SELECT ... WHERE <key> IN (...)` per table this journal has — seventeen
+//! statements: `events`, `event_legs`, the thirteen detail tables of spec
 //! §4.3, and the two `event_coverage_gap_*` collection tables of §4.4 —
 //! groups the returned rows by event in Rust, and hands each group to
 //! [`super::kind::from_rows`]. The statement count does not depend on how
@@ -28,8 +28,8 @@ use super::kind::from_rows;
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
     CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow, FeeRow,
-    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, TaxRow, TradeRow,
-    UnresolvedMovementRow, ValuationRow,
+    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, StatedSecuritiesValueRow, TaxRow,
+    TradeRow, UnresolvedMovementRow, ValuationRow,
 };
 use crate::StoreError;
 
@@ -342,6 +342,26 @@ fn load_valuation(conn: &Connection, ids: &[String]) -> Result<Vec<ValuationRow>
         .map_err(StoreError::from)
 }
 
+fn load_stated_securities_value(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<StatedSecuritiesValueRow>, StoreError> {
+    let sql = format!(
+        "SELECT * FROM event_stated_securities_value WHERE event IN ({})",
+        placeholders(ids.len())
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params_from_iter(ids), |row| {
+        Ok(StatedSecuritiesValueRow {
+            event: row.get("event")?,
+            amount: row.get("amount")?,
+            currency: row.get("currency")?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
 fn load_control_assertion(
     conn: &Connection,
     ids: &[String],
@@ -504,7 +524,7 @@ fn load_offer_exercise(
 }
 
 /// Every detail table's rows for `ids`, folded into one map keyed by event
-/// id. Each id matches at most one of the twelve tables — `to_rows` never
+/// id. Each id matches at most one of the thirteen tables — `to_rows` never
 /// writes a detail row to two families for the same event — so a plain
 /// `insert` is safe here; the five kinds with nothing beyond their legs
 /// simply leave no entry, and [`hydrate`] treats that absence as
@@ -538,6 +558,9 @@ fn load_details(
             row.event.clone(),
             DetailRows::OpeningPosition(Box::new(row)),
         );
+    }
+    for row in load_stated_securities_value(conn, ids)? {
+        map.insert(row.event.clone(), DetailRows::StatedSecuritiesValue(row));
     }
     for row in load_valuation(conn, ids)? {
         map.insert(row.event.clone(), DetailRows::Valuation(row));
@@ -619,8 +642,8 @@ mod tests {
     use super::super::rows::{
         CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
         CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow,
-        FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, TaxRow, TradeRow,
-        UnresolvedMovementRow, ValuationRow,
+        FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, StatedSecuritiesValueRow,
+        TaxRow, TradeRow, UnresolvedMovementRow, ValuationRow,
     };
     use super::{hydrate, hydrate_one};
     use crate::SqliteStore;
@@ -829,6 +852,7 @@ mod tests {
             DetailRows::Fee(row) => insert_fee(conn, &row),
             DetailRows::Tax(row) => insert_tax(conn, &row),
             DetailRows::OpeningPosition(row) => insert_opening_position(conn, &row),
+            DetailRows::StatedSecuritiesValue(row) => insert_stated_securities_value(conn, &row),
             DetailRows::Valuation(row) => insert_valuation(conn, &row),
             DetailRows::ControlAssertion(row) => insert_control_assertion(conn, &row),
             DetailRows::CoverageGap(detail) => insert_coverage_gap(conn, &detail),
@@ -932,6 +956,15 @@ mod tests {
             ],
         )
         .expect("insert opening position detail");
+    }
+
+    fn insert_stated_securities_value(conn: &rusqlite::Connection, row: &StatedSecuritiesValueRow) {
+        conn.execute(
+            "INSERT INTO event_stated_securities_value (event, amount, currency)
+             VALUES (?1,?2,?3)",
+            params![row.event, row.amount, row.currency],
+        )
+        .expect("insert stated securities value detail");
     }
 
     fn insert_valuation(conn: &rusqlite::Connection, row: &ValuationRow) {

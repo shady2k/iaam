@@ -1107,6 +1107,7 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("event_fee", TableDisposition::Carried),
     ("event_tax", TableDisposition::Carried),
     ("event_opening_position", TableDisposition::Carried),
+    ("event_stated_securities_value", TableDisposition::Carried),
     ("event_valuation", TableDisposition::Carried),
     ("event_control_assertion", TableDisposition::Carried),
     ("event_coverage_gap", TableDisposition::Carried),

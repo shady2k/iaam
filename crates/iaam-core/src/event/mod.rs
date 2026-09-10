@@ -293,6 +293,7 @@ impl Event {
             | EventKind::Tax { .. }
             | EventKind::OpeningPosition { .. }
             | EventKind::OpeningCash { .. }
+            | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }
             | EventKind::ImportCoverageGap { .. } => {}
         }
@@ -328,6 +329,9 @@ impl Event {
             EventKind::CashOut { amount } => self.expect_single_cash(name, *amount, Sign::Negative),
             EventKind::Refund { amount } => self.expect_single_cash(name, *amount, Sign::Positive),
             EventKind::OpeningCash { amount } => self.expect_single_cash(name, *amount, Sign::Any),
+            EventKind::StatedSecuritiesValue { amount } => {
+                self.validate_stated_securities_value(name, *amount)
+            }
             EventKind::Income { gross, .. } => {
                 self.expect_single_cash(name, *gross, Sign::Positive)
             }
@@ -895,6 +899,36 @@ impl Event {
                 kind: name,
                 field: "quantity",
             }),
+        }
+    }
+
+    /// A stated securities value names no instrument, so it can post no leg:
+    /// a leg needs an instrument to key its position on, and inventing one
+    /// would be exactly the composition this fact exists to avoid claiming.
+    /// The amount must be positive — a securities value of nothing is not
+    /// asserted at all, and a negative one is a parsing error, not a short
+    /// position (shorts are out of scope, as for a control assertion's
+    /// quantity).
+    fn validate_stated_securities_value(
+        &self,
+        name: &'static str,
+        amount: Money,
+    ) -> Result<(), EventValidationError> {
+        if amount.amount().raw() <= 0 {
+            return Err(EventValidationError::NonPositive {
+                kind: name,
+                field: "amount",
+                value: amount.to_calc_dec().inner().to_string(),
+            });
+        }
+        if self.legs.is_empty() {
+            Ok(())
+        } else {
+            Err(EventValidationError::LegCount {
+                kind: name,
+                expected: "no legs",
+                found: self.legs.len(),
+            })
         }
     }
 

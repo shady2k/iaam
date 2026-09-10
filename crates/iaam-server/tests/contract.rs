@@ -16908,6 +16908,7 @@ fn remedy_coverage(kind: CaveatKind) -> RemedyCoverage {
         | CaveatKind::AccountRuledOutside
         | CaveatKind::RunningCashSum
         | CaveatKind::PositionFactsMissing
+        | CaveatKind::SecuritiesValueAsserted
         | CaveatKind::UndecomposedMovements
         | CaveatKind::RetiredAccountNotEmpty => RemedyCoverage::Invoked,
         // Nothing in this API closes these, and that is a decision rather than
@@ -17181,6 +17182,89 @@ async fn every_remedy_the_register_names_removes_the_caveat_it_is_named_for() {
             "{after}"
         );
         exercised.insert(CaveatKind::PositionFactsMissing);
+
+        drop(harness);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- securities_value_asserted -------------------------------------------
+    //
+    // The caveat is not raised by an empty account — `position_facts_missing`
+    // covers that silence on its own — it is raised only once the owner has
+    // asserted a figure, and it is closed the same way `position_facts_missing`
+    // is: a full position synchronisation. The two stand together until the
+    // sync, because the composition is still unknown even while the total is
+    // now right (`iaam-k3gh.11`).
+    {
+        let (harness, path) = harness_on_disk().await;
+        seed_instrument_and_custody(&path, &harness).await;
+        let securities = make_account(&harness, "Securities").await;
+        let reported = make_contour(&harness, "Reported", &[securities.as_str()]).await;
+
+        let (status, stated) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "source_label": "manual securities value entry",
+                    "operations": [{
+                        "account": securities,
+                        "type": "stated_securities_value",
+                        "amount": "500000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2026-01-15" },
+                        "idempotency_key": "remedy-securities-value-asserted"
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{stated}");
+
+        let before = assets_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            caveat_kinds(&before).contains(&"securities_value_asserted".to_owned()),
+            "{before}"
+        );
+        // The composition is still unknown, so the older caveat stands beside
+        // the new one — an asserted total is not a substitute for a coverage
+        // answer.
+        assert!(
+            caveat_kinds(&before).contains(&"position_facts_missing".to_owned()),
+            "{before}"
+        );
+
+        let (status, done) = call(
+            &harness.router,
+            post(
+                "/v1/ingest/operations",
+                &harness.owner_token,
+                &json!({
+                    "source_label": "manual position entry",
+                    "operations": [{
+                        "account": securities,
+                        "type": "opening_position",
+                        "instrument": harness.instrument.inner(),
+                        "custody": harness.custody.inner(),
+                        "quantity": "4",
+                        "cost_basis": "400.00",
+                        "currency": "RUB",
+                        "dates": { "trade": "2026-01-02" },
+                        "idempotency_key": "remedy-securities-value-asserted-sync"
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+
+        let after = assets_of(&harness, &reported, "2026-01-31").await;
+        assert!(
+            !caveat_kinds(&after).contains(&"securities_value_asserted".to_owned()),
+            "{after}"
+        );
+        exercised.insert(CaveatKind::SecuritiesValueAsserted);
 
         drop(harness);
         let _ = std::fs::remove_file(path);

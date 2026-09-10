@@ -211,6 +211,7 @@ fn balances_from(state: &LedgerState, fixture: &Fixture) -> BalancesReport {
             reconciliation: Vec::new(),
             positions,
             period_reports: PeriodReports::Calculated,
+            stated_securities: None,
         }],
         negative_cash: Vec::new(),
         population: ReportPopulation {

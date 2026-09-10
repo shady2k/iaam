@@ -160,6 +160,7 @@ impl IncomeLedger {
             | EventKind::Tax { .. }
             | EventKind::OpeningPosition { .. }
             | EventKind::OpeningCash { .. }
+            | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. }
             | EventKind::ImportCoverageGap { .. } => Ok(()),

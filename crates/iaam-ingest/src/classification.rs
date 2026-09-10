@@ -1262,6 +1262,7 @@ pub const fn classification_of(event: &Event) -> Option<Classification> {
         EventKind::Trade { .. }
         | EventKind::OpeningPosition { .. }
         | EventKind::OpeningCash { .. }
+        | EventKind::StatedSecuritiesValue { .. }
         | EventKind::Valuation { .. }
         | EventKind::ControlAssertion { .. }
         | EventKind::ImportCoverageGap { .. }

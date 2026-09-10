@@ -1043,14 +1043,17 @@ fn kind_aspects(kind: &EventKind) -> KindAspects {
             ]),
             confidence: Vec::new(),
         },
-        // Six families whose whole claim is one sum. The unresolved own-account
-        // movement is the one that posts no leg to repeat it.
+        // Seven families whose whole claim is one sum. The unresolved
+        // own-account movement and the stated securities value are the two
+        // that post no leg to repeat it — the second because it names no
+        // instrument to post one against.
         EventKind::CashIn { amount }
         | EventKind::CashOut { amount }
         | EventKind::Refund { amount }
         | EventKind::OwnAccountMovement { amount }
         | EventKind::UnresolvedOwnAccountMovement { amount }
-        | EventKind::OpeningCash { amount } => KindAspects {
+        | EventKind::OpeningCash { amount }
+        | EventKind::StatedSecuritiesValue { amount } => KindAspects {
             word: Vec::new(),
             moved: vec![KindFigure::Money(*amount)],
             confidence: Vec::new(),

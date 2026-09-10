@@ -52,8 +52,8 @@ use time::{Date, OffsetDateTime, Time};
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail,
     CoverageGapDimensionRow, CoverageGapRow, CoverageGapSourceRow, DetailRows, EventRow, FeeRow,
-    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, TaxRow, TradeRow,
-    UnresolvedMovementRow, ValuationRow,
+    IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, StatedSecuritiesValueRow, TaxRow,
+    TradeRow, UnresolvedMovementRow, ValuationRow,
 };
 use crate::StoreError;
 
@@ -291,6 +291,13 @@ fn kind_to_detail(event: &str, kind: &EventKind) -> Result<DetailRows, StoreErro
                 prior_corporate_actions: knowledge_code(prior_corporate_actions).to_owned(),
             })))
         }
+        EventKind::StatedSecuritiesValue { amount } => Ok(DetailRows::StatedSecuritiesValue(
+            StatedSecuritiesValueRow {
+                event: event.to_owned(),
+                amount: amount.amount().raw(),
+                currency: amount.currency().code().to_owned(),
+            },
+        )),
         EventKind::Valuation {
             instrument,
             price,
@@ -770,6 +777,7 @@ fn detail_to_kind(kind: &str, detail: DetailRows, legs: &[Leg]) -> Result<EventK
             origin: parse_tax_origin(&row.origin)?,
         }),
         DetailRows::OpeningPosition(row) => opening_position_from_row(*row),
+        DetailRows::StatedSecuritiesValue(row) => stated_securities_value_from_row(row),
         DetailRows::Valuation(row) => valuation_from_row(row),
         DetailRows::ControlAssertion(row) => control_assertion_from_row(row),
         DetailRows::CoverageGap(detail) => coverage_gap_from_detail(detail),
@@ -922,6 +930,18 @@ fn opening_position_from_row(row: OpeningPositionRow) -> Result<EventKind, Store
         )?),
         cost_basis,
         assertions,
+    })
+}
+
+fn stated_securities_value_from_row(
+    row: StatedSecuritiesValueRow,
+) -> Result<EventKind, StoreError> {
+    Ok(EventKind::StatedSecuritiesValue {
+        amount: require_money(
+            "event_stated_securities_value",
+            Some(row.amount),
+            Some(&row.currency),
+        )?,
     })
 }
 
@@ -2157,6 +2177,14 @@ mod tests {
             vec![],
         ));
 
+        // --- StatedSecuritiesValue: no legs, its own detail table -----------
+        events.push(f.event(
+            EventKind::StatedSecuritiesValue {
+                amount: rub(50_000_000),
+            },
+            vec![],
+        ));
+
         // --- Income: every Option combination ------------------------------
         events.push(f.event(
             EventKind::Income {
@@ -2666,7 +2694,7 @@ mod tests {
     }
 
     #[test]
-    fn all_seventeen_discriminants_are_exercised() {
+    fn all_eighteen_discriminants_are_exercised() {
         let discriminants: BTreeSet<&'static str> = every_event_shape()
             .iter()
             .map(|event| event.kind.discriminant())

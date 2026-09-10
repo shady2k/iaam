@@ -277,6 +277,74 @@ pub enum EventKind {
     },
     /// Reconstructed cash balance.
     OpeningCash { amount: Money },
+    /// What the owner says his securities on this account are worth, with no
+    /// instrument named and no composition (`iaam-k3gh.11`).
+    ///
+    /// **The gap this closes.** A brokerage account was modelled either as
+    /// cash or through a full position synchronisation, and "for now,
+    /// balances only" — the ordinary state of a broker the owner has not
+    /// connected — was inexpressible. A field agent told exactly that had to
+    /// record the sum as [`Self::OpeningCash`] with a note that it was really
+    /// invested, which is a lie in the cash dimension: it inflates what the
+    /// account holds in cash by exactly the amount that is not cash at all.
+    /// This variant is the third thing, and the honest one: a figure about
+    /// the securities half, asserted with no composition, kept out of the
+    /// cash half entirely.
+    ///
+    /// **No legs, on the same grounds as [`Self::Valuation`].** It has no
+    /// instrument, no quantity and no lot, so there is nothing to post: a
+    /// security leg needs an instrument to be keyed on, and inventing one
+    /// would be exactly the composition this variant exists to avoid
+    /// claiming. The figure therefore never reaches [`Balances`] — see
+    /// [`crate::projection::stated_securities`], which is the fold that
+    /// reads it instead. Because it posts nothing, the report reads this
+    /// figure by date rather than by an accumulated total; see the next
+    /// paragraph for why that is exactly the opposite of two
+    /// `opening_cash` events on one account.
+    ///
+    /// **The second one replaces the first — read the sentence on
+    /// [`Self::OpeningCash`] about `opening_cash` before assuming this
+    /// variant behaves the same way.** That one is a movement: every
+    /// `opening_cash` event is folded by addition, so a second one on the
+    /// same account and currency is not a correction but a second amount
+    /// added to the first, silently. This one is not a movement — it names no
+    /// leg to fold at all — so the report cannot sum two of them the way it
+    /// sums two cash movements; what it does instead is read the assertion
+    /// dated at or before the report date that is latest, exactly as
+    /// [`crate::valuation::PriceBoard`] reads the latest price at or before a
+    /// date rather than summing every quote a source ever printed. A second
+    /// `stated_securities_value` therefore **supersedes** the first: the
+    /// report reads only the more recent of the two, and the earlier one
+    /// stops contributing to any figure from the moment a later one exists.
+    /// The mechanism is dating, not a correction and not a replacement
+    /// relation — the journal gains a second fact and the first is never
+    /// touched, exactly as a later `Valuation` never retracts an earlier one.
+    ///
+    /// **A full position synchronisation supersedes this, too, and by a
+    /// different mechanism: presence, not date.** Once the account carries a
+    /// real position fact — an [`Self::OpeningPosition`] or a
+    /// [`Self::Trade`] naming an instrument — the account's composition is
+    /// known, and the report stops reading this assertion for it at all,
+    /// however recently it was dated. See
+    /// `iaam_core::report::assets::fold_positions` for where that reading
+    /// happens: it is keyed on whether the account's own position rows are
+    /// empty, not on this event's own date or existence, so a real sync
+    /// silently retires the assertion without needing to name it, reverse it
+    /// or know it exists.
+    ///
+    /// **It does not silence the coverage gap it stands in for.** The account
+    /// this covers is still an account whose composition the journal does not
+    /// know — it holds one number and not a list of holdings — and
+    /// [`crate::report::confidence::CaveatKind::PositionFactsMissing`] goes on
+    /// naming it for exactly that reason. What this variant adds is a second,
+    /// narrower caveat that fires only while the figure is active,
+    /// [`crate::report::confidence::CaveatKind::SecuritiesValueAsserted`]: it
+    /// says the total the owner sees includes a number he asserted rather
+    /// than one the system derived, which `PositionFactsMissing` alone does
+    /// not say.
+    ///
+    /// [`Balances`]: crate::projection::balances::Balances
+    StatedSecuritiesValue { amount: Money },
     /// Valuation of an instrument at a per-unit price (§5.4).
     ///
     /// A fact with provenance, not a calculation: someone published or supplied the price,
@@ -359,7 +427,7 @@ impl EventKind {
     /// This is kept beside [`Self::discriminant`] so a route cannot accept a
     /// name the event model does not publish.
     #[must_use]
-    pub const fn discriminants() -> &'static [&'static str; 17] {
+    pub const fn discriminants() -> &'static [&'static str; 18] {
         &[
             "trade",
             "cash_in",
@@ -373,6 +441,7 @@ impl EventKind {
             "tax",
             "opening_position",
             "opening_cash",
+            "stated_securities_value",
             "valuation",
             CONTROL_ASSERTION_KIND,
             IMPORT_COVERAGE_GAP_KIND,
@@ -400,6 +469,7 @@ impl EventKind {
             Self::Tax { .. } => "tax",
             Self::OpeningPosition { .. } => "opening_position",
             Self::OpeningCash { .. } => "opening_cash",
+            Self::StatedSecuritiesValue { .. } => "stated_securities_value",
             Self::Valuation { .. } => "valuation",
             Self::ControlAssertion { .. } => CONTROL_ASSERTION_KIND,
             Self::ImportCoverageGap { .. } => IMPORT_COVERAGE_GAP_KIND,
@@ -443,6 +513,7 @@ impl EventKind {
             | Self::Tax { .. }
             | Self::OpeningPosition { .. }
             | Self::OpeningCash { .. }
+            | Self::StatedSecuritiesValue { .. }
             | Self::Valuation { .. }
             | Self::ImportCoverageGap { .. }
             | Self::ControlAssertion { .. }

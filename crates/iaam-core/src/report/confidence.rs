@@ -91,6 +91,10 @@ pub enum CaveatKind {
     /// An account that may hold securities has no position fact in the
     /// journal, so the report cannot tell whether securities were not imported.
     PositionFactsMissing,
+    /// Part of an account's securities figure is a value the owner stated
+    /// directly, with no composition, rather than a valuation this system
+    /// derived from a quote (`iaam-k3gh.11`).
+    SecuritiesValueAsserted,
     /// An account the owner has retired still shows something in the snapshot,
     /// so its row and its class membership stand.
     ///
@@ -120,7 +124,7 @@ impl CaveatKind {
     /// Iterated by the guard that resolves [`Self::closed_by`] against the
     /// published contract: a table checked for the kinds someone remembered to
     /// list is a table with a hole in it exactly where the mistake is.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::AccountInNoScope,
         Self::AccountInAnotherScope,
         Self::AccountRuledOutside,
@@ -131,6 +135,7 @@ impl CaveatKind {
         Self::UnpricedPosition,
         Self::HoldingNotValued,
         Self::PositionFactsMissing,
+        Self::SecuritiesValueAsserted,
         Self::RetiredAccountNotEmpty,
         Self::TerminalValueNotComputed,
         Self::ReturnNotComputed,
@@ -150,6 +155,7 @@ impl CaveatKind {
             Self::UnpricedPosition => "unpriced_position",
             Self::HoldingNotValued => "holding_not_valued",
             Self::PositionFactsMissing => "position_facts_missing",
+            Self::SecuritiesValueAsserted => "securities_value_asserted",
             Self::RetiredAccountNotEmpty => "retired_account_not_empty",
             Self::TerminalValueNotComputed => "terminal_value_not_computed",
             Self::ReturnNotComputed => "return_not_computed",
@@ -176,6 +182,7 @@ impl CaveatKind {
             Self::UnpricedPosition => "data_quality.position_coverage.uncovered[]",
             Self::HoldingNotValued => "positions.holdings[].value",
             Self::PositionFactsMissing => "positions.accounts_without_position_facts",
+            Self::SecuritiesValueAsserted => "positions.stated[]",
             Self::RetiredAccountNotEmpty => "accounts[]",
             Self::TerminalValueNotComputed => "terminal_value",
             Self::ReturnNotComputed => "xirr_pre_tax",
@@ -309,7 +316,15 @@ impl CaveatKind {
             | Self::HoldingNotValued
             | Self::TerminalValueNotComputed
             | Self::ReturnNotComputed => &[],
-            Self::PositionFactsMissing => &[OperationKey::SubmitOperations],
+            // A full position synchronisation is `SubmitOperations` for both:
+            // it is what makes `positions.accounts_without_position_facts`
+            // stop naming the account, and the same act is what makes
+            // `positions.stated[]` stop naming it too — the presence of a
+            // real position is what retires the owner's stated figure, per
+            // `EventKind::StatedSecuritiesValue`'s own doc comment.
+            Self::PositionFactsMissing | Self::SecuritiesValueAsserted => {
+                &[OperationKey::SubmitOperations]
+            }
         }
     }
 
@@ -350,6 +365,9 @@ impl CaveatKind {
             }
             Self::PositionFactsMissing => {
                 "This account may hold securities, but the journal has no position fact for it, so the report cannot distinguish an empty holding from securities that were never imported. The candidate is an account whose cash class the owner has never declared, because a declared class is a cash-only class: stating that this one is a card account or a deposit answers the question as surely as importing the holdings does."
+            }
+            Self::SecuritiesValueAsserted => {
+                "Part of this account's securities figure is a value the owner stated directly, with no instrument and no composition — not a valuation this system derived from a quote. A later full position synchronisation replaces it: once the account carries a real position, this figure is no longer read."
             }
             Self::RetiredAccountNotEmpty => {
                 "The owner has retired this account, and the snapshot still shows a figure for it, so its row and its class membership stand. A retirement never hides money: a retired account's row is dropped only where every one of its figures is zero."

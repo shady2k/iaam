@@ -17,6 +17,7 @@ pub mod money_flow;
 pub mod offers;
 pub mod ownership;
 pub mod state;
+pub mod stated_securities;
 
 pub use active_instruments::active_instruments;
 

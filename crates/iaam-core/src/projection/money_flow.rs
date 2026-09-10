@@ -442,6 +442,14 @@ impl MoneyFlow {
                     EventKind::OpeningCash { .. } => {
                         // Opening cash is a starting point, not a flow.
                     }
+                    EventKind::StatedSecuritiesValue { .. } => {
+                        // It has no legs, so this arm is unreachable through
+                        // the loop, on the same grounds as
+                        // `UnresolvedOwnAccountMovement` above. Named rather
+                        // than joined to a catch-all so that a build which
+                        // ever gave it one fails here instead of silently
+                        // reporting nothing.
+                    }
                     EventKind::Valuation { .. } => {
                         // A valuation changes no cash.
                     }
@@ -488,6 +496,7 @@ impl MoneyFlow {
                     | EventKind::Tax { .. }
                     | EventKind::OpeningPosition { .. }
                     | EventKind::OpeningCash { .. }
+                    | EventKind::StatedSecuritiesValue { .. }
                     | EventKind::Valuation { .. }
                     | EventKind::ControlAssertion { .. }
                     | EventKind::ImportCoverageGap { .. } => {

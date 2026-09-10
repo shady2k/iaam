@@ -18,6 +18,7 @@ use iaam_core::perimeter::{
 use iaam_core::projection::balances::Balances;
 use iaam_core::projection::money_flow::{DateWindow, MoneyFlow};
 use iaam_core::projection::offers::OfferBook;
+use iaam_core::projection::stated_securities::StatedSecuritiesLedger;
 use iaam_core::projection::{Projection, ProjectionContext, ProjectionError, advance, project};
 use iaam_core::reconciliation::claim::AssertionPeriod;
 use iaam_core::reconciliation::{OpeningAnchors, ReconciliationLedger};
@@ -926,12 +927,19 @@ async fn balances_with_prices(
     // makes: one definition of "this event carries a price", so a report cannot
     // value a holding from a price the projection would not have recorded.
     let mut prices = PriceBoard::new();
+    // The same reasoning as `prices`, for the owner's stated securities
+    // values: one definition of "this event carries such a figure", folded
+    // here beside `Balances` and `PriceBoard` rather than through the whole
+    // projection — see `iaam_core::projection::stated_securities` for why
+    // this fact is not wired into `LedgerState`.
+    let mut stated_securities = StatedSecuritiesLedger::new();
     for event in &effective {
         balances
             .apply(event)
             .map_err(ProjectionError::from)
             .map_err(AppError::from_projection)?;
         prices.observe(event);
+        stated_securities.observe(event);
     }
     // §11 is assessed from the set already in hand rather than from the raw
     // journal: `assess` would resolve it a second time, and a request that
@@ -989,6 +997,7 @@ async fn balances_with_prices(
             reconciliation,
             positions,
             period_reports: period_reports(&perimeter, account),
+            stated_securities: stated_securities.value_at_or_before(account, as_of),
         });
     }
     // At the report date at most one span per account and currency is still

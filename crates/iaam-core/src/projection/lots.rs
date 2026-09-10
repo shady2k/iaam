@@ -712,6 +712,7 @@ impl LotBook {
             | EventKind::Fee { .. }
             | EventKind::Tax { .. }
             | EventKind::OpeningCash { .. }
+            | EventKind::StatedSecuritiesValue { .. }
             | EventKind::Valuation { .. }
             | EventKind::ControlAssertion { .. }
             | EventKind::ImportCoverageGap { .. } => Ok(()),

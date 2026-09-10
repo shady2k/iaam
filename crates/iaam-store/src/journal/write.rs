@@ -36,8 +36,8 @@ use super::kind::to_rows;
 use super::read::hydrate_one;
 use super::rows::{
     CashTransferRow, ControlAssertionRow, CorporateActionRow, CoverageGapDetail, DetailRows,
-    EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow, TaxRow, TradeRow,
-    UnresolvedMovementRow, ValuationRow,
+    EventRow, FeeRow, IncomeRow, LegRow, OfferExerciseRow, OpeningPositionRow,
+    StatedSecuritiesValueRow, TaxRow, TradeRow, UnresolvedMovementRow, ValuationRow,
 };
 use crate::StoreError;
 
@@ -260,6 +260,7 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
         DetailRows::Fee(row) => insert_fee(tx, row),
         DetailRows::Tax(row) => insert_tax(tx, row),
         DetailRows::OpeningPosition(row) => insert_opening_position(tx, row),
+        DetailRows::StatedSecuritiesValue(row) => insert_stated_securities_value(tx, row),
         DetailRows::Valuation(row) => insert_valuation(tx, row),
         DetailRows::ControlAssertion(row) => insert_control_assertion(tx, row),
         DetailRows::CoverageGap(detail) => insert_coverage_gap(tx, detail),
@@ -367,6 +368,18 @@ fn insert_opening_position(
             row.ldv_eligibility,
             row.prior_corporate_actions,
         ],
+    )?;
+    Ok(())
+}
+
+fn insert_stated_securities_value(
+    tx: &Transaction<'_>,
+    row: &StatedSecuritiesValueRow,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO event_stated_securities_value (event, amount, currency)
+         VALUES (?1,?2,?3)",
+        params![row.event, row.amount, row.currency],
     )?;
     Ok(())
 }
@@ -706,6 +719,33 @@ mod tests {
     }
 
     // --- Happy path -----------------------------------------------------
+
+    /// The one place `journal::kind`'s pure row-mapping round trip cannot
+    /// reach: whether the migrated schema's own `CHECK (kind IN (...))`
+    /// actually accepts the discriminant. `0003_event_stated_securities_value.sql`
+    /// widened that list by rebuilding `events`, and a rebuild that dropped a
+    /// value or mistyped one would pass every Rust-level test in this crate
+    /// while SQLite refused every write of this kind at the boundary.
+    #[test]
+    fn a_stated_securities_value_writes_against_the_migrated_check_constraint() {
+        let mut store = open_store();
+        let fixture = Fixture::new(&store);
+        let event = fixture.base_event(
+            1,
+            EventKind::StatedSecuritiesValue {
+                amount: rub(50_000_000),
+            },
+            vec![],
+        );
+        let tx = store.connection_mut().transaction().expect("open tx");
+        insert_event_in(&tx, &event).expect("insert succeeds");
+        tx.commit().expect("commit");
+
+        let reconstructed = hydrate_one(store.connection(), event.id)
+            .expect("hydrate")
+            .expect("event exists");
+        assert_eq!(reconstructed, event);
+    }
 
     #[test]
     fn insert_event_in_writes_a_trade_and_reads_it_back_unchanged() {

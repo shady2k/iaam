@@ -12,14 +12,27 @@
 //! could not have caught it — nothing about `event_category_assignments`
 //! looks unlike the `event_*` family that already travelled — which is why
 //! this, like the foreign-key guards next to it, compares exact sets.
+//!
+//! **`DROP TABLE` and `ALTER TABLE … RENAME TO` are read too, not only
+//! `CREATE TABLE`.** `0003_event_stated_securities_value.sql` widens a
+//! `CHECK` SQLite has no `ALTER TABLE … ADD CONSTRAINT` for by rebuilding
+//! `events` under a scaffolding name and renaming it back — a `CREATE TABLE
+//! events_v3` that a name-only scanner would have to classify beside `events`
+//! itself, for a name that never exists in the schema this crate's own
+//! `SqliteStore::open` ever produces. Reading the three statements in order
+//! and folding them into one running set — `CREATE` adds, `DROP` removes,
+//! `RENAME` moves — is what makes the comparison the exact final schema
+//! rather than every name a migration's SQL text ever mentioned in passing.
 
 use std::collections::BTreeSet;
 
 use iaam_store::bundle::TABLE_DISPOSITIONS;
 use iaam_store::schema::MIGRATIONS;
 
-/// Every `CREATE TABLE <name>` across every migration, in the order the
-/// schema declares them, deduplicated into a set.
+/// The exact set of tables the schema holds once every migration has run, by
+/// replaying each one's `CREATE TABLE`, `DROP TABLE` and `ALTER TABLE …
+/// RENAME TO` statements against a running set, in the order the schema
+/// declares them.
 ///
 /// Reads [`MIGRATIONS`] rather than a fixed pair of `include_str!`s: `0002`
 /// exists today and more will, and this guard exists precisely so a future
@@ -30,15 +43,25 @@ fn every_table_name() -> BTreeSet<String> {
     for (_, sql) in MIGRATIONS {
         for line in sql.lines() {
             let trimmed = line.trim();
-            let Some(rest) = trimmed.strip_prefix("CREATE TABLE ") else {
+            if let Some(rest) = trimmed.strip_prefix("CREATE TABLE ") {
+                let name = rest
+                    .split_once('(')
+                    .map_or(rest, |(name, _)| name)
+                    .trim()
+                    .to_owned();
+                found.insert(name);
                 continue;
-            };
-            let name = rest
-                .split_once('(')
-                .map_or(rest, |(name, _)| name)
-                .trim()
-                .to_owned();
-            found.insert(name);
+            }
+            if let Some(rest) = trimmed.strip_prefix("DROP TABLE ") {
+                found.remove(rest.trim_end_matches(';').trim());
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("ALTER TABLE ")
+                && let Some((old, new)) = rest.split_once(" RENAME TO ")
+            {
+                found.remove(old.trim());
+                found.insert(new.trim_end_matches(';').trim().to_owned());
+            }
         }
     }
     found

@@ -607,6 +607,46 @@ pub enum OperationKindDto {
         amount: String,
         currency: CurrencyDto,
     },
+    /// What the owner says his securities on this account are worth, with no
+    /// instrument named and no composition (`iaam-k3gh.11`).
+    ///
+    /// **The state this exists for is the ordinary one: a broker the owner
+    /// has not connected.** Before this, the only way to say "there is money
+    /// invested here, composition not broken out" was `opening_cash` with a
+    /// note — which puts a securities figure in the cash dimension and
+    /// overstates the account's cash by exactly the amount that is not cash
+    /// at all. This variant states the securities half honestly instead: a
+    /// figure, with no instrument and no quantity, kept out of `cash`
+    /// entirely.
+    ///
+    /// **Unlike [`Self::OpeningCash`], a second one replaces the first
+    /// rather than adding to it.** This fact posts no leg — it names no
+    /// instrument to post a security leg against — so there is nothing for
+    /// two of them to accumulate through. The report instead reads the
+    /// assertion dated at or before the report date that is latest, exactly
+    /// as it reads the latest price for an instrument: a second
+    /// `stated_securities_value` on this account **supersedes** the first,
+    /// and the report never sums two of them.
+    ///
+    /// **A full position synchronisation supersedes this too, automatically.**
+    /// Once the account carries a real position fact — an `opening_position`
+    /// operation or a trade naming an instrument — this figure is no longer
+    /// read for it, however recently it was dated. Nothing needs to name this
+    /// assertion or retract it: the presence of a real position is what
+    /// retires it.
+    ///
+    /// **It does not silence the coverage gap it stands in for.** The account
+    /// is still one whose composition the journal does not know, and
+    /// `position_facts_missing` goes on naming it. What this closes is a
+    /// second, narrower caveat, `securities_value_asserted`, which fires only
+    /// while the figure is active and says the total includes a number the
+    /// owner asserted rather than one the system derived.
+    StatedSecuritiesValue {
+        /// Always positive: a securities value of nothing is not asserted at
+        /// all, and shorts are out of scope for this API.
+        amount: String,
+        currency: CurrencyDto,
+    },
     /// A reconstructed opening (§10.7) for one instrument, on the same terms as
     /// [`Self::OpeningCash`]: `quantity` is added to whatever the account
     /// already holds of this instrument, not assigned as the position. Two
@@ -1097,6 +1137,12 @@ impl OperationDto {
                 amount_minor: minor(amount, *currency, "amount")?,
                 currency: currency.to_domain(),
             },
+            OperationKindDto::StatedSecuritiesValue { amount, currency } => {
+                OperationKind::StatedSecuritiesValue {
+                    amount_minor: minor(amount, *currency, "amount")?,
+                    currency: currency.to_domain(),
+                }
+            }
             OperationKindDto::OpeningPosition {
                 instrument,
                 custody,
@@ -2986,8 +3032,9 @@ pub struct CaveatDto {
     /// `account_in_another_scope`, `account_ruled_outside`, `running_cash_sum`,
     /// `period_reports_refused`, `undecomposed_movements`,
     /// `unexplained_cash_change`, `unpriced_position`, `holding_not_valued`,
-    /// `position_facts_missing`, `retired_account_not_empty`,
-    /// `terminal_value_not_computed`, `return_not_computed`.
+    /// `position_facts_missing`, `securities_value_asserted`,
+    /// `retired_account_not_empty`, `terminal_value_not_computed`,
+    /// `return_not_computed`.
     ///
     /// A closed set. Every one of them is read off a computation the report
     /// already performs: nothing here folds the journal a second time.
@@ -3876,6 +3923,12 @@ pub struct AccountBalanceDto {
     pub cash: Vec<CashFigureDto>,
     pub reconciliation: Vec<ReconciliationStatusDto>,
     pub positions: Vec<PositionQuantityDto>,
+    /// The owner's latest stated securities value at or before the report
+    /// date, if he has asserted one (`iaam-k3gh.11`). The raw fact, stated
+    /// regardless of whether `positions` is already non-empty — read
+    /// `/v1/reports/assets`'s `positions.stated` for whether a full
+    /// synchronisation has already superseded it.
+    pub stated_securities_value: Option<StatedSecuritiesValueDto>,
     /// `calculated` — nothing in §11 stops the period's tax and financial
     /// reports for this account. `refused` — §11 stops them, and
     /// `period_reports_refused` says why.
@@ -4070,6 +4123,9 @@ impl AccountBalanceDto {
                     quantity: quantity.0.inner().to_string(),
                 })
                 .collect(),
+            stated_securities_value: row
+                .stated_securities
+                .map(StatedSecuritiesValueDto::from_domain),
             period_reports: row.period_reports.code().to_owned(),
             period_reports_refused: row
                 .period_reports
@@ -4215,12 +4271,19 @@ pub struct CashClassTotalDto {
     pub totals: Vec<CashFigureDto>,
 }
 
-/// Positions, at the prices the journal holds.
+/// Positions, at the prices the journal holds — and, for an account with no
+/// position fact yet, a figure the owner stated instead.
 ///
 /// The prices are the ones the journal itself records, the same board the
 /// projection builds from `valuation` events. This report runs no market
 /// selection of its own: an instrument the journal never priced is reported as
 /// unvalued rather than valued from a source this report chose.
+///
+/// `holdings`/`totals` and `stated`/`stated_totals` are kept apart for the
+/// same reason `AssetSnapshotDto.cash` and `.positions` are: they are not the
+/// same kind of fact. One is what a quote said; the other is what the owner
+/// asserted with no composition (`iaam-k3gh.11`). Mixing them into one figure
+/// would make an assertion read as a valuation.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PositionsSideDto {
     /// One entry per instrument held across the scope. Always present.
@@ -4229,7 +4292,24 @@ pub struct PositionsSideDto {
     /// position fact in the journal. This names the securities-capable accounts
     /// whose empty holdings could mean securities were never imported; cash-only
     /// classes are not candidates.
+    ///
+    /// **Not narrowed by `stated`.** An account carrying a stated securities
+    /// value is still an account whose composition the journal does not know,
+    /// so it stays in this list: the assertion answers what the total should
+    /// be, never what the account holds (`iaam-k3gh.11`).
     pub accounts_without_position_facts: Vec<Uuid>,
+    /// Accounts whose securities value here is the owner's own assertion
+    /// rather than a sum of priced holdings (`iaam-k3gh.11`). See
+    /// `OperationKindDto::StatedSecuritiesValue` for the fact and
+    /// `stated_totals` for what an entry here adds to.
+    ///
+    /// **Present only while the assertion is still active.** An account
+    /// already carrying a real position — `accounts[].positions` non-empty —
+    /// is not listed here even where it once asserted a figure: that is the
+    /// whole of how a full synchronisation supersedes the assertion, and
+    /// `confidence` carries `securities_value_asserted` for exactly the
+    /// accounts that are.
+    pub stated: Vec<StatedSecuritiesDto>,
     /// The earliest date any price behind `totals` was for — the oldest link,
     /// and the honest summary of «as of when». Null when nothing was priced.
     ///
@@ -4241,6 +4321,53 @@ pub struct PositionsSideDto {
     /// The priced holdings added up, per currency of the quote. An unvalued
     /// holding is in no total.
     pub totals: Vec<CalcMoneyDto>,
+    /// `stated` added up, per currency the owner stated a figure in.
+    ///
+    /// **Never folded into `totals`.** That list is a sum of quotes; this one
+    /// is a sum of assertions, and mixing them would make an owner-stated
+    /// number read as a system valuation. Both still reach the snapshot's
+    /// `total`, which is how the account's total comes out right without a
+    /// composition.
+    pub stated_totals: Vec<AmountDto>,
+}
+
+/// One account's securities value stated by the owner as a single figure,
+/// with no instrument named (`iaam-k3gh.11`). Not a position: it carries no
+/// instrument, no quantity and no lot.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StatedSecuritiesDto {
+    pub account: Uuid,
+    /// Decimal number as a string: binary floating-point loses pennies.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    /// The date the owner's figure is stated as of — not necessarily the
+    /// report date, which may be later.
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+}
+
+/// The owner's latest stated securities value for one account, echoed as the
+/// journal holds it regardless of whether it still counts toward anything.
+/// `PositionsSideDto.stated` is where a client checks whether it does.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct StatedSecuritiesValueDto {
+    /// Decimal number as a string: binary floating-point loses pennies.
+    pub amount: String,
+    pub currency: CurrencyDto,
+    #[serde(with = "iso_date")]
+    #[schema(value_type = String, format = Date)]
+    pub as_of: Date,
+}
+
+impl StatedSecuritiesValueDto {
+    fn from_domain(value: iaam_core::projection::stated_securities::StatedSecuritiesValue) -> Self {
+        Self {
+            amount: decimal_amount(value.amount),
+            currency: CurrencyDto::from_domain(value.amount.currency()),
+            as_of: value.as_of,
+        }
+    }
 }
 
 /// One instrument the owner holds, and what a quote said it was worth.
@@ -4340,6 +4467,10 @@ pub struct AssetAccountDto {
     pub cash_class: Option<String>,
     pub cash: Vec<CashFigureDto>,
     pub positions: Vec<PositionQuantityDto>,
+    /// The owner's latest stated securities value, echoed regardless of
+    /// whether `positions.stated` still reads it — see
+    /// `StatedSecuritiesValueDto`.
+    pub stated_securities: Option<StatedSecuritiesValueDto>,
 }
 
 impl AssetSnapshotDto {
@@ -4402,12 +4533,29 @@ impl AssetSnapshotDto {
                     .iter()
                     .map(|account| account.inner())
                     .collect(),
+                stated: snapshot
+                    .positions
+                    .stated
+                    .iter()
+                    .map(|entry| StatedSecuritiesDto {
+                        account: entry.account.inner(),
+                        amount: decimal_amount(entry.amount),
+                        currency: CurrencyDto::from_domain(entry.amount.currency()),
+                        as_of: entry.as_of,
+                    })
+                    .collect(),
                 oldest_price_date: snapshot.positions.oldest_price_date,
                 totals: snapshot
                     .positions
                     .totals
                     .iter()
                     .map(CalcMoneyDto::from_domain)
+                    .collect(),
+                stated_totals: snapshot
+                    .positions
+                    .stated_totals
+                    .iter()
+                    .map(|money| AmountDto::from_money(*money))
                     .collect(),
             },
             total: snapshot
@@ -4434,6 +4582,9 @@ impl AssetSnapshotDto {
                             quantity: quantity.0.inner().to_string(),
                         })
                         .collect(),
+                    stated_securities: row
+                        .stated_securities
+                        .map(StatedSecuritiesValueDto::from_domain),
                 })
                 .collect(),
             population: PopulationDto::from_domain(&snapshot.population),

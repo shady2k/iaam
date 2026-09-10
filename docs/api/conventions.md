@@ -986,3 +986,71 @@ and it names `agent` as the scope, because both routes accept an agent token.
 Reading the queue is not the only way to see this. `GET /v1/import-sessions`
 carries `row_count` and `unanswered` on every entry, which is the same question
 answered for every session in one request. Decision 0016 has the argument.
+
+---
+
+## 8. A figure the owner asserts, and how it stops being read (`iaam-k3gh.11`)
+
+`POST /v1/ingest/operations` accepts a `stated_securities_value` operation: a
+figure the owner states for what an account's securities are worth, with no
+instrument named and no composition. It exists for the ordinary state of a
+broker he has not connected — before it, the only way to say "there is money
+invested here, composition not broken out" was `opening_cash` with a note,
+which puts a securities figure in the cash dimension and overstates cash by
+exactly the amount that is not cash at all.
+
+### 8.1 Where it appears, and what it does not become
+
+The figure never enters `cash`. It reaches `GET /v1/reports/assets` two ways:
+
+- `accounts[].stated_securities` echoes the owner's latest assertion at or
+  before the report date, on every account that has one — the raw fact, exactly
+  as `accounts[].cash` states a figure whether or not an opening anchors it;
+- `positions.stated` lists it again, per account, **only while it is still
+  read into a total** — see §8.2 — and `positions.stated_totals` is that list
+  added up per currency. Both are kept apart from `positions.holdings` and
+  `positions.totals`: one is a sum of quotes, the other a sum of assertions,
+  and folding an assertion into a total of quotes would make an owner-stated
+  number read as a system valuation. Both still reach the snapshot's `total`,
+  which is how the account's total comes out right without a composition.
+
+`GET /v1/reports/balances` carries the same raw echo, at
+`accounts[].stated_securities_value`, for a caller that reads the balances
+answer rather than the asset snapshot.
+
+It is **not a position**. It carries no instrument, no quantity and no lot,
+and it is not returned as one: `positions.holdings` and `accounts[].positions`
+are unaffected by it.
+
+### 8.2 A second assertion replaces the first; a real position retires it
+
+Two different owner-asserted facts on this API accumulate when submitted
+twice — `opening_cash` and `opening_position` both do, deliberately (§6.4's own
+`opening_cash` reference is one such reconstructed opening). `stated_securities_value`
+does not, and the difference is structural rather than a special case: it
+posts no leg, because it names no instrument to post a security leg against,
+so there is nothing for two submissions to accumulate through. The report
+instead reads the assertion dated at or before the report date that is
+latest — exactly as it reads the latest price for an instrument — so a second
+`stated_securities_value` on one account **supersedes** the first rather than
+adding to it.
+
+A full position synchronisation supersedes it too, and by a different
+mechanism: presence, not date. The moment the account carries a real position
+fact — an `opening_position` operation or a trade naming an instrument —
+`positions.stated` stops listing it, however recently it was asserted. Nothing
+retracts the assertion and nothing links the two events; the presence of a
+real position is what retires it. `accounts[].stated_securities` keeps echoing
+the raw fact regardless — it is the fold behind `positions.stated` that stops
+reading it, not the row that stops carrying it.
+
+### 8.3 What it does not silence
+
+The account this covers is still one whose composition the journal does not
+know. `confidence` carries `position_facts_missing` for it exactly as it would
+without the assertion — an asserted total is not a coverage answer — and, only
+while the assertion is active, a second caveat, `securities_value_asserted`,
+saying the total includes a number the owner stated rather than one the system
+derived. Both are closed the same way: `submit_operations`, because a real
+position synchronisation is what makes `positions.accounts_without_position_facts`
+stop naming the account and what makes `positions.stated` stop naming it too.

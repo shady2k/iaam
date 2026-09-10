@@ -9,6 +9,7 @@ use crate::ids::AccountId;
 use crate::money::{CurrencyCode, Money, Quantity};
 use crate::perimeter::NegativeCashSpan;
 use crate::projection::balances::PositionKey;
+use crate::projection::stated_securities::StatedSecuritiesValue;
 use crate::reconciliation::{OpeningIncorporation, ReconciliationStatus};
 
 use super::confidence::{Caveat, CaveatKind, CaveatSubject, ReportConfidence};
@@ -159,6 +160,19 @@ pub struct AccountBalanceRow {
     pub positions: Vec<(PositionKey, Quantity)>,
     /// What §11 says about this account's period reports (§11).
     pub period_reports: PeriodReports,
+    /// The owner's latest stated securities value at or before the report
+    /// date, if he has asserted one (`iaam-k3gh.11`). The raw fact: it is
+    /// carried whether or not `positions` is already non-empty, because this
+    /// row states what the journal holds and not which half of it a later
+    /// fold decides to read.
+    ///
+    /// **Whether it still counts toward any total is decided downstream, not
+    /// here.** [`crate::report::assets::asset_snapshot`] is what reads
+    /// `positions` to decide whether a full synchronisation has already
+    /// superseded this figure — see that module's `fold_positions` for the
+    /// rule. This row states the assertion regardless, exactly as it states
+    /// `cash` regardless of whether an opening anchors it.
+    pub stated_securities: Option<StatedSecuritiesValue>,
 }
 
 /// The balances answer: one row per contour account, plus what is true of the
@@ -389,6 +403,7 @@ mod tests {
             reconciliation: Vec::new(),
             positions: Vec::new(),
             period_reports: PeriodReports::Calculated,
+            stated_securities: None,
         }
     }
 

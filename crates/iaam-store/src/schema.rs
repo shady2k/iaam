@@ -21,7 +21,7 @@ use crate::StoreError;
 /// altogether; the column would then exist in every database created after the
 /// change and in none created before it, and the failure would arrive at run
 /// time, on a statement naming a column that is not there.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Which numbering [`SCHEMA_VERSION`] belongs to.
 ///
@@ -69,11 +69,15 @@ pub const LAST_UNMARKED_SCHEMA_VERSION: u32 = 1;
 /// hard-coding a second list of migration filenames: that test's job is to
 /// notice a `CREATE TABLE` this crate forgot to classify, and it can only do
 /// that against the same migrations this build actually applies.
-pub const MIGRATIONS: [(u32, &str); 2] = [
+pub const MIGRATIONS: [(u32, &str); 3] = [
     (1, include_str!("../migrations/0001_schema.sql")),
     (
         2,
         include_str!("../migrations/0002_source_counterparty.sql"),
+    ),
+    (
+        3,
+        include_str!("../migrations/0003_event_stated_securities_value.sql"),
     ),
 ];
 
@@ -106,7 +110,30 @@ pub fn migrate(conn: &Connection) -> Result<(), StoreError> {
 /// taking the write lock at once rather than at the first write, and the version is read
 /// again inside it. The loser of the race then sees the work already done and commits
 /// nothing, instead of failing halfway through with `table … already exists`.
+///
+/// **`foreign_keys` is off for the duration, on every migration.** SQLite has
+/// no `ALTER TABLE … ADD CONSTRAINT`: widening the `CHECK` that names
+/// `events.kind`'s vocabulary — which `0003_event_stated_securities_value.sql`
+/// does — means rebuilding that table, and `DROP TABLE events` is refused
+/// outright while the fifteen tables that hold a foreign key to it are
+/// enforced, on rows that are not moving and not becoming invalid. SQLite
+/// only allows the pragma to change with no transaction pending, so it has
+/// to happen here, around `BEGIN IMMEDIATE`, and not inside a migration's own
+/// SQL, where it would already be too late to take effect. Applied to every
+/// migration rather than singled out for the one that currently needs it: a
+/// later migration that rebuilds a table is the ordinary case a schema this
+/// size will keep meeting, not an exception one flag should have to name.
 fn apply(conn: &Connection, version: u32, sql: &str) -> Result<(), StoreError> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = apply_inner(conn, version, sql);
+    // Restored unconditionally, success or failure: a migration that failed
+    // must not leave later, unrelated writes on this connection running with
+    // the guard off.
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
+fn apply_inner(conn: &Connection, version: u32, sql: &str) -> Result<(), StoreError> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let outcome = apply_inside_transaction(conn, version, sql);
     match outcome {
@@ -132,5 +159,39 @@ fn apply_inside_transaction(
         return Ok(false);
     }
     conn.execute_batch(&format!("{sql} PRAGMA user_version = {version};"))?;
+    refuse_broken_references(conn, version)?;
     Ok(true)
+}
+
+/// Refuse a migration that left a child row pointing at a parent that is not
+/// there, while the transaction can still be rolled back.
+///
+/// Every migration here runs with `PRAGMA foreign_keys` off, because a
+/// migration that rebuilds a table drops the parent the fifteen detail and leg
+/// tables reference and would otherwise be refused outright — see [`apply`].
+/// The cost of switching the guard off is that nothing checks it, and the one
+/// migration that has needed the rebuild is the one that copies every row of
+/// the owner's journal from one table into another: exactly the operation
+/// whose failure mode is a row left behind.
+///
+/// SQLite's own procedure for a table rebuild ends with this check for that
+/// reason, and it is run for every migration rather than for the rebuild
+/// alone: a migration that does not touch a foreign key passes it in
+/// microseconds, and the next one that does need it will not have to remember
+/// to ask.
+///
+/// Inside the transaction, deliberately. Reporting the damage after the commit
+/// would be a description of the owner's broken journal rather than a refusal
+/// to break it.
+fn refuse_broken_references(conn: &Connection, version: u32) -> Result<(), StoreError> {
+    let violations: i64 = conn
+        .prepare("SELECT count(*) FROM pragma_foreign_key_check")?
+        .query_row([], |row| row.get(0))?;
+    if violations > 0 {
+        return Err(StoreError::MigrationBrokeReferences {
+            version,
+            violations: violations.unsigned_abs() as usize,
+        });
+    }
+    Ok(())
 }

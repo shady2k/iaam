@@ -9456,6 +9456,105 @@ async fn flow_report_names_an_unexplained_account() {
     assert_eq!(body["unexplained"][0]["amount"], "500.00");
 }
 
+/// A fact and its reversal are the whole of an account's cash history: the
+/// pair must contribute zero, whichever leg's sign the reversal copies
+/// (`iaam-ukv9`). This drives the pair through the route a caller actually
+/// uses — `POST /v1/ingest/operations` then `POST /v1/corrections` — rather
+/// than through `resolve` directly, because the bead's field report is about
+/// what the HTTP route returns, not about the core function in isolation.
+#[tokio::test]
+async fn a_reversed_opening_balance_reports_no_movement() {
+    let harness = harness().await;
+    let contour = json!({
+        "title": "Reversed opening",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+
+    let opening = json!({
+        "source_label": "manual entry",
+        "operations": [{
+            "account": harness.account.inner(),
+            "type": "opening_cash",
+            "amount": "500.00",
+            "currency": "RUB",
+            "dates": { "cash_posted": "2026-08-05" },
+            "idempotency_key": "reversed-opening"
+        }]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &opening),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let original = verdicts[0]["event_id"]
+        .as_str()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .expect("opening event id");
+
+    let (status, corrected) = call(
+        &harness.router,
+        post(
+            "/v1/corrections",
+            &harness.owner_token,
+            &json!({
+                "acknowledge_retraction": true,
+                "corrections": [{ "relation": "reversal", "target": original }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{corrected}");
+
+    let (status, balances) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/balances?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{balances}");
+    let rows = balances["accounts"].as_array().expect("balance rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["cash"],
+        json!([]),
+        "the only fact on this account is reversed, so it carries no cash figure at all: {balances}"
+    );
+
+    let (status, snapshot) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/assets?contour={contour_id}&as_of=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{snapshot}");
+    let classes = snapshot["cash"]["classes"].as_array().expect("classes");
+    for class in classes {
+        assert_eq!(
+            class["totals"],
+            json!([]),
+            "no class carries a figure once the pair is excluded: {snapshot}"
+        );
+    }
+    assert_eq!(
+        snapshot["cash"]["totals"],
+        json!([]),
+        "the account's only cash events are a fact and its reversal, so the \
+         report should show no movement and no balance: {snapshot}"
+    );
+}
+
 #[tokio::test]
 async fn a_tax_operation_reaches_the_store_as_one_negative_tax_leg() {
     let (harness, path) = harness_on_disk().await;

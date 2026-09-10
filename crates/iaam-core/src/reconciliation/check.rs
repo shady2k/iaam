@@ -9,6 +9,7 @@
 use super::anchor::OpeningAnchor;
 use super::claim::{BalancePoint, ControlClaim};
 use super::observed::{Baseline, FoldSpan, ObservedTotals, Turnover};
+use crate::ids::InstrumentId;
 use crate::money::{CurrencyCode, PostedMinor, Quantity};
 use crate::numeric::decimal::Dec;
 use time::Date;
@@ -35,6 +36,47 @@ pub struct Discrepancy {
     pub claimed: ClaimValue,
     pub observed: ClaimValue,
     pub delta: ClaimValue,
+    /// The proven cause, where the system has one. See [`DiscrepancyReason`]
+    /// for what `None` means here: not «no cause exists», but «no cause is
+    /// known». Most discrepancies carry `None` and are read from the four
+    /// numbers above, which is by design (`iaam-k3gh.13`).
+    pub reason: Option<DiscrepancyReason>,
+}
+
+/// A discrepancy's cause, published as a code rather than left for the reader
+/// to guess from the magnitude of the delta (§13).
+///
+/// **The field report that asked for `field`/`claimed`/`observed`/`delta`
+/// praised that shape and was right: the magnitude of a delta is usually the
+/// clue, `−0.14` reads as interest.** This exists for the one shape where
+/// that stops being true — where the system **holds** the explanation and
+/// used to publish four numbers and stay silent about what it already knew.
+/// An opening dated the assertion's own start day is excluded from the
+/// opening fold by [`BalanceMoment::covers`](super::observed::BalanceMoment::covers)'s
+/// day cut (`iaam-k3gh.2`), and the resulting delta is exactly the excluded
+/// amount — [`ObservedTotals`] retains it, and [`check_claim`] names the cause
+/// only where the delta equals it exactly, never on a near miss.
+///
+/// **One variant, deliberately.** A second is added when a second cause can be
+/// *proved* from what the system already holds — not when one can be
+/// suspected from a pattern in the numbers. That second kind of guess is
+/// exactly the failure this type exists to end; growing it into a list of
+/// hunches would just move the failure behind a code instead of removing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscrepancyReason {
+    /// A reconstructed or asserted opening dated the interval's own start date
+    /// fell inside the interval rather than before it, so the opening fold
+    /// excluded it and the delta is exactly that amount.
+    OpeningExcludedByDayBoundary,
+}
+
+impl DiscrepancyReason {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OpeningExcludedByDayBoundary => "opening_excluded_by_day_boundary",
+        }
+    }
 }
 
 /// Why comparison is impossible.
@@ -371,11 +413,16 @@ pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutc
                     |baseline| compare_change(currency, amount, seen, baseline),
                 )
             }
-            seen => compare_money(
-                "amount",
+            seen => name_cash_boundary_reason(
+                compare_money(
+                    "amount",
+                    currency,
+                    amount,
+                    seen.unwrap_or(PostedMinor::new(0)),
+                ),
+                at,
                 currency,
-                amount,
-                seen.unwrap_or(PostedMinor::new(0)),
+                observed,
             ),
         },
         // The same, for the same reason. A quantity summed from an unasserted
@@ -395,7 +442,12 @@ pub fn check_claim(claim: &ControlClaim, observed: &ObservedTotals) -> ClaimOutc
                     reason: NotComparable::OpeningNotAsserted,
                 }
             }
-            seen => compare_quantity(quantity, seen.unwrap_or_else(Quantity::zero)),
+            seen => name_position_boundary_reason(
+                compare_quantity(quantity, seen.unwrap_or_else(Quantity::zero)),
+                at,
+                instrument,
+                observed,
+            ),
         },
         ControlClaim::CashTurnover {
             currency,
@@ -497,6 +549,10 @@ fn compare_money(
             amount: PostedMinor::new(delta),
             currency,
         },
+        // This function compares two posted amounts and knows nothing about
+        // where either came from; naming a cause is the caller's job, done by
+        // `name_cash_boundary_reason` where the claim is a cash balance.
+        reason: None,
     })
 }
 
@@ -516,7 +572,63 @@ fn compare_quantity(claimed: Quantity, observed: Quantity) -> ClaimOutcome {
         claimed: ClaimValue::Quantity(claimed),
         observed: ClaimValue::Quantity(observed),
         delta: ClaimValue::Quantity(Quantity(delta)),
+        // As in `compare_money`: naming a cause is the caller's job, done by
+        // `name_position_boundary_reason` where the claim is a position.
+        reason: None,
     })
+}
+
+/// Names the boundary cause on a cash discrepancy, where it can be proved.
+///
+/// Only an *opening* figure can be caused by the day cut — a closing figure
+/// already includes the interval's own events, so nothing about it was
+/// excluded by it — and only where the delta is exactly the amount
+/// [`ObservedTotals::cash_excluded_from_opening`] says the fold excluded on
+/// the boundary date. A near miss is a different cause: naming it here would
+/// send the reader to the wrong explanation with confidence (`iaam-k3gh.13`).
+fn name_cash_boundary_reason(
+    outcome: ClaimOutcome,
+    at: BalancePoint,
+    currency: CurrencyCode,
+    observed: &ObservedTotals,
+) -> ClaimOutcome {
+    let ClaimOutcome::Discrepant(mut discrepancy) = outcome else {
+        return outcome;
+    };
+    if at == BalancePoint::Opening
+        && let Some(excluded) = observed.cash_excluded_from_opening(currency)
+        && discrepancy.delta
+            == (ClaimValue::Money {
+                amount: excluded,
+                currency,
+            })
+    {
+        discrepancy.reason = Some(DiscrepancyReason::OpeningExcludedByDayBoundary);
+    }
+    ClaimOutcome::Discrepant(discrepancy)
+}
+
+/// The same for a position quantity. See [`name_cash_boundary_reason`] for the
+/// reasoning; it is written out separately rather than shared, for the reason
+/// [`check_claim`]'s own two arms are: cash is keyed by currency and a holding
+/// by instrument, and a helper over both would have to invent a key that is
+/// neither.
+fn name_position_boundary_reason(
+    outcome: ClaimOutcome,
+    at: BalancePoint,
+    instrument: InstrumentId,
+    observed: &ObservedTotals,
+) -> ClaimOutcome {
+    let ClaimOutcome::Discrepant(mut discrepancy) = outcome else {
+        return outcome;
+    };
+    if at == BalancePoint::Opening
+        && let Some(excluded) = observed.position_excluded_from_opening(instrument)
+        && discrepancy.delta == ClaimValue::Quantity(excluded)
+    {
+        discrepancy.reason = Some(DiscrepancyReason::OpeningExcludedByDayBoundary);
+    }
+    ClaimOutcome::Discrepant(discrepancy)
 }
 
 #[cfg(test)]
@@ -631,6 +743,11 @@ mod tests {
                 currency: CurrencyCode::Rub
             },
             "the difference is calculated as asserted minus observed"
+        );
+        assert_eq!(
+            discrepancy.reason, None,
+            "an ordinary posting error has no proven cause; it is read from the \
+             numbers, not guessed at by the system"
         );
     }
 
@@ -1071,10 +1188,118 @@ mod tests {
                     amount: PostedMinor::new(200_000),
                     currency: CurrencyCode::Rub,
                 },
+                // `iaam-k3gh.13`: the system holds exactly this explanation —
+                // `ObservedTotals::cash_excluded_from_opening` retained the
+                // 200 000 the boundary excluded — and the delta equals it
+                // exactly, so the cause is named instead of left for the
+                // reader to reconstruct from the arithmetic.
+                reason: Some(DiscrepancyReason::OpeningExcludedByDayBoundary),
             }),
             "an opening dated the assertion's own start day is excluded from the opening fold, \
              so the reconstructed figure the source just recorded reads back as a discrepancy \
-             of exactly that figure rather than as a match"
+             of exactly that figure rather than as a match, and the reason names the boundary \
+             as the cause"
+        );
+    }
+
+    #[test]
+    fn a_same_size_discrepancy_at_closing_names_no_boundary_reason() {
+        // `iaam-k3gh.13`'s scope discipline: naming the cause is not «the delta
+        // happens to equal an excluded amount somewhere in this fold» but «the
+        // figure in question is the one the boundary excludes». The same
+        // account as the pinned boundary test — one reconstructed opening,
+        // recorded on the interval's own start day, excluded from the opening
+        // fold and worth exactly 200 000 — but the claim here is about the
+        // *closing* balance, which already includes that day's events. A
+        // discrepancy of the very same size at closing is a different mistake
+        // (an owner claiming twice the reconstructed figure), and must stay
+        // silent rather than point at a boundary that had nothing to do with it.
+        let account = AccountId::new_random();
+        let events = vec![event_with(
+            account,
+            date!(2026 - 03 - 01),
+            1,
+            EventKind::OpeningCash {
+                amount: rub(200_000),
+            },
+            vec![Leg::cash(account, rub(200_000))],
+        )];
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.cash_excluded_from_opening(CurrencyCode::Rub),
+            Some(PostedMinor::new(200_000)),
+            "the fixture is the same boundary case the pinned test above proves"
+        );
+
+        let closing = ControlClaim::CashBalance {
+            currency: CurrencyCode::Rub,
+            amount: PostedMinor::new(400_000),
+            at: BalancePoint::Closing,
+        };
+        let outcome = check_claim(&closing, &observed);
+        let ClaimOutcome::Discrepant(discrepancy) = outcome else {
+            panic!("400 000 claimed against 200 000 observed must be a discrepancy: {outcome:?}");
+        };
+        assert_eq!(
+            discrepancy.delta,
+            ClaimValue::Money {
+                amount: PostedMinor::new(200_000),
+                currency: CurrencyCode::Rub,
+            },
+            "the same 200 000 the boundary case above excluded from the opening"
+        );
+        assert_eq!(
+            discrepancy.reason, None,
+            "a closing figure already includes the boundary date's events, so nothing \
+             about it was excluded by the cut; the matching size is a coincidence"
+        );
+    }
+
+    #[test]
+    fn a_position_opening_excluded_by_the_day_boundary_names_the_reason() {
+        // The position twin of the pinned cash test: `OpeningAnchors` and
+        // `observe`'s day cut apply identically to a security leg, and
+        // `BalancePointDto`'s own published description already names
+        // `opening_position` alongside `opening_cash` as recorded-the-same-day
+        // cases the cut excludes. A reconstructed position dated the interval's
+        // own start day is this account's only event, so the opening fold sees
+        // nothing and the closing fold sees the whole holding.
+        let account = AccountId::new_random();
+        let custody = CustodyId::new_random();
+        let instrument = InstrumentId::new_random();
+        let quantity = Quantity(Dec::new(Decimal::from(10)));
+        let events = vec![event_with(
+            account,
+            date!(2026 - 03 - 01),
+            1,
+            EventKind::OpeningPosition {
+                instrument,
+                quantity,
+                cost_basis: Some(rub(1_000_000)),
+                assertions: crate::event::kind::OpeningAssertions::default(),
+            },
+            vec![Leg::security(account, custody, instrument, quantity)],
+        )];
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.position_excluded_from_opening(instrument),
+            Some(quantity),
+            "the boundary-excluded holding is retained just as the cash one is"
+        );
+
+        let opening = ControlClaim::PositionQuantity {
+            instrument,
+            quantity,
+            at: BalancePoint::Opening,
+        };
+        let outcome = check_claim(&opening, &observed);
+        let ClaimOutcome::Discrepant(discrepancy) = outcome else {
+            panic!("the reconstructed holding is excluded from its own opening: {outcome:?}");
+        };
+        assert_eq!(discrepancy.delta, ClaimValue::Quantity(quantity));
+        assert_eq!(
+            discrepancy.reason,
+            Some(DiscrepancyReason::OpeningExcludedByDayBoundary)
         );
     }
 

@@ -89,7 +89,9 @@ use iaam_core::instrument::AliasNamespace;
 use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::projection::money_flow::MoneyFlowError;
-use iaam_core::reconciliation::check::{ClaimOutcome, ClaimValue, ObservationBasis};
+use iaam_core::reconciliation::check::{
+    ClaimOutcome, ClaimValue, DiscrepancyReason, ObservationBasis,
+};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use iaam_core::reconciliation::{ClaimCheck, Dimension, ReconciliationStatus, Taint};
 use iaam_core::returns::zero_reinvestment::{
@@ -7395,6 +7397,7 @@ mod tests {
                 amount: PostedMinor::new(600),
                 currency: CurrencyCode::Rub,
             },
+            reason: None,
         };
         let cases = [
             (ClaimOutcome::Matched, "matched", Vec::<&str>::new()),
@@ -7445,6 +7448,57 @@ mod tests {
                 "observed": { "money": { "amount": "4.00", "currency": "RUB" } },
                 "delta": { "money": { "amount": "6.00", "currency": "RUB" } },
             })
+        );
+    }
+
+    /// `iaam-k3gh.13`: a discrepancy with a proven cause renders it as a code
+    /// beside the four numbers, and one without renders no `reason` key at
+    /// all — not `null` — matching how every other closed vocabulary in this
+    /// contract behaves when its value is absent.
+    #[test]
+    fn a_discrepancy_renders_its_reason_only_when_one_is_known() {
+        let unexplained = iaam_core::reconciliation::check::Discrepancy {
+            field: "amount",
+            claimed: ClaimValue::Money {
+                amount: PostedMinor::new(1_000),
+                currency: CurrencyCode::Rub,
+            },
+            observed: ClaimValue::Money {
+                amount: PostedMinor::new(400),
+                currency: CurrencyCode::Rub,
+            },
+            delta: ClaimValue::Money {
+                amount: PostedMinor::new(600),
+                currency: CurrencyCode::Rub,
+            },
+            reason: None,
+        };
+        let value = rendered(&claim_check(
+            cash_balance(1_000),
+            ClaimOutcome::Discrepant(unexplained),
+        ));
+        assert!(
+            value["outcome"]["discrepancy"]
+                .as_object()
+                .expect("discrepancy renders as an object")
+                .get("reason")
+                .is_none(),
+            "an unproven cause renders no key at all: {value}"
+        );
+
+        let explained = iaam_core::reconciliation::check::Discrepancy {
+            reason: Some(
+                iaam_core::reconciliation::check::DiscrepancyReason::OpeningExcludedByDayBoundary,
+            ),
+            ..unexplained
+        };
+        let value = rendered(&claim_check(
+            cash_balance(1_000),
+            ClaimOutcome::Discrepant(explained),
+        ));
+        assert_eq!(
+            value["outcome"]["discrepancy"]["reason"],
+            "opening_excluded_by_day_boundary"
         );
     }
 
@@ -7884,13 +7938,91 @@ pub enum ClaimDto {
     },
 }
 
+/// What was asserted, what was observed, and the difference — plus, where the
+/// system can prove one, why.
+///
+/// **Most discrepancies carry no `reason`, by design.** The four figures above
+/// are usually enough on their own: the magnitude of `delta` is the clue, and
+/// a client that already knows the domain reads `−0.14` as interest without
+/// being told. `reason` exists for the cases where the system holds the
+/// explanation and used to publish the four numbers and say nothing else —
+/// see [`DiscrepancyReasonDto`] for the one such case published so far, and
+/// for why a missing `reason` means «no cause is known», not «no cause
+/// exists».
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DiscrepancyDto {
     pub field: String,
     pub claimed: ClaimValueDto,
     pub observed: ClaimValueDto,
     pub delta: ClaimValueDto,
+    /// The proven cause, where there is one. Absent far more often than
+    /// present: see the struct's own doc comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<DiscrepancyReasonDto>,
 }
+
+/// Why a discrepancy has the size it has, for the one cause the system can
+/// currently prove.
+///
+/// **One code, deliberately, the same way [`NotComparable`] and
+/// [`ReconciliationException`] on the core side each started as one fact the
+/// system could state and not a list of hunches.** A second is published when
+/// a second cause can be *proved* from what the system already holds, not
+/// when one can be suspected from a pattern in a delta — that second kind of
+/// guess is exactly the failure `reason` exists to end, and growing this into
+/// a list of them would just move the failure behind a code instead of
+/// removing it.
+///
+/// [`NotComparable`]: iaam_core::reconciliation::check::NotComparable
+/// [`ReconciliationException`]: iaam_core::reconciliation::check::ReconciliationException
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscrepancyReasonDto {
+    OpeningExcludedByDayBoundary,
+}
+
+impl DiscrepancyReasonDto {
+    /// The one published code with the sentence that explains it.
+    ///
+    /// The code half is taken from the domain, so the contract cannot come to
+    /// disagree with what the server can actually prove; only the meaning is
+    /// written here — the pattern [`BalancePointDto::VOCABULARY`] uses.
+    const VOCABULARY: &'static [(&'static str, &'static str)] = &[(
+        DiscrepancyReason::OpeningExcludedByDayBoundary.code(),
+        "A reconstructed or asserted opening dated the interval's own start date fell inside the interval rather than before it — see `BalancePointDto`'s `opening` entry for the day cut that draws that line — so the opening fold excluded it, and the discrepancy's `delta` is exactly that amount. Named only where `delta` equals the excluded amount exactly: a near miss is a different cause and is left with no `reason` rather than guessed at.",
+    )];
+
+    /// The code as it appears on the wire.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        self.to_domain().code()
+    }
+
+    #[must_use]
+    pub const fn to_domain(self) -> DiscrepancyReason {
+        match self {
+            Self::OpeningExcludedByDayBoundary => DiscrepancyReason::OpeningExcludedByDayBoundary,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_domain(reason: DiscrepancyReason) -> Self {
+        match reason {
+            DiscrepancyReason::OpeningExcludedByDayBoundary => Self::OpeningExcludedByDayBoundary,
+        }
+    }
+}
+
+impl PartialSchema for DiscrepancyReasonDto {
+    fn schema() -> RefOr<Schema> {
+        described_vocabulary(
+            "The discrepancy's proven cause, where the system has one. Absence means no cause is known, not that none exists — most discrepancies are read from `field`, `claimed`, `observed` and `delta` alone.",
+            Self::VOCABULARY,
+        )
+    }
+}
+
+impl ToSchema for DiscrepancyReasonDto {}
 
 /// What the observed side of a comparison was folded from.
 ///
@@ -8060,6 +8192,7 @@ impl ClaimOutcomeDto {
                     claimed: claim_value_dto(discrepancy.claimed),
                     observed: claim_value_dto(discrepancy.observed),
                     delta: claim_value_dto(discrepancy.delta),
+                    reason: discrepancy.reason.map(DiscrepancyReasonDto::from_domain),
                 }),
                 reason: None,
                 exception: None,

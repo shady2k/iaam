@@ -5375,6 +5375,14 @@ pub async fn confirm_transfer_pairing(
     Extension(principal): Extension<Principal>,
     ApiJson(request): ApiJson<ConfirmTransferPairingRequest>,
 ) -> Result<Json<ConfirmedPairingDto>, ApiFailure> {
+    // Not an `OperationKey` (see `WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY` above:
+    // the write is two corrections, gated where every correction is), so the
+    // floor is read here rather than resolved from one, exactly as
+    // `require_submit` exists for. A read-only token must be refused at the
+    // transport the same way `POST /v1/corrections` refuses one — 403, not
+    // the 422 `may_correct` would produce from inside the scenario once the
+    // request has already been accepted as well-formed.
+    require_submit(&principal)?;
     let confirmed = iaam_app::scenarios::transfer_pairing::confirm_journal_pairing(
         &state.services,
         &principal,

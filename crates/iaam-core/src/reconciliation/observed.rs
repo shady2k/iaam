@@ -235,6 +235,20 @@ pub struct ObservedTotals {
     /// The earlier stated balance each of this interval's two balance points can
     /// be measured from, where there is one.
     cash_baseline: BTreeMap<(BalancePoint, CurrencyCode), Baseline>,
+    /// The net effect of this account's events dated exactly on the interval's
+    /// own start date — the day [`BalanceMoment::of`]'s opening cut moved them
+    /// past instead of before (`iaam-k3gh.2`, `iaam-k3gh.13`).
+    ///
+    /// Retained so that a discrepancy the day boundary causes can be *proved*
+    /// rather than only ever read off the arithmetic: a reconstructed opening
+    /// recorded on the interval's own start day is excluded from the opening
+    /// fold, and the resulting discrepancy's delta is exactly this amount.
+    /// Present only for a currency this account's events on that day actually
+    /// moved — absence means nothing was excluded, not that it was excluded as
+    /// zero, the same distinction [`Self::cash_at`] draws for the fold itself.
+    cash_excluded_from_opening: BTreeMap<CurrencyCode, PostedMinor>,
+    /// The same, per holding.
+    position_excluded_from_opening: BTreeMap<InstrumentId, Quantity>,
 }
 
 impl ObservedTotals {
@@ -322,6 +336,26 @@ impl ObservedTotals {
         self.cash_baseline.get(&(at, currency)).copied()
     }
 
+    /// The net cash effect of this account's events dated exactly on the
+    /// interval's own start date — what the opening fold excluded by the day
+    /// cut rather than by any judgment about the events themselves.
+    ///
+    /// `None` means this account moved nothing in this currency on that day,
+    /// not that it moved zero: see the field's own doc comment for why the
+    /// distinction matters to a caller proving a discrepancy's cause.
+    #[must_use]
+    pub fn cash_excluded_from_opening(&self, currency: CurrencyCode) -> Option<PostedMinor> {
+        self.cash_excluded_from_opening.get(&currency).copied()
+    }
+
+    /// The same for one holding.
+    #[must_use]
+    pub fn position_excluded_from_opening(&self, instrument: InstrumentId) -> Option<Quantity> {
+        self.position_excluded_from_opening
+            .get(&instrument)
+            .copied()
+    }
+
     /// How many account events the journal saw during and before the interval.
     /// Zero means there is nothing to verify: no history exists.
     #[must_use]
@@ -346,6 +380,11 @@ pub fn observe(
 ) -> Result<ObservedTotals, ObserveError> {
     let mut opening = Balances::new();
     let mut closing = Balances::new();
+    // A fresh fold that sees only events dated exactly `period.from`: its
+    // snapshot at the end is precisely what the opening cut excluded by the
+    // day boundary, kept apart from `opening`/`closing` because neither of
+    // those isolates that one day on its own (`iaam-k3gh.13`).
+    let mut boundary = Balances::new();
     let mut totals = ObservedTotals::default();
     // Chosen before the fold, because a baseline is a moment to cut the fold at
     // and the cut has to be known while the events are going past.
@@ -376,6 +415,9 @@ pub fn observe(
             }
         } else if period.contains(date) {
             closing.apply(event)?;
+            if date == period.from {
+                boundary.apply(event)?;
+            }
             if touches_us {
                 totals.within.include(date);
                 accumulate(&mut totals, event, account)?;
@@ -389,6 +431,12 @@ pub fn observe(
     snapshot_cash(&closing, account, &mut totals.cash_closing);
     snapshot_positions(&opening, account, &mut totals.positions_opening);
     snapshot_positions(&closing, account, &mut totals.positions_closing);
+    snapshot_cash(&boundary, account, &mut totals.cash_excluded_from_opening);
+    snapshot_positions(
+        &boundary,
+        account,
+        &mut totals.position_excluded_from_opening,
+    );
     // The anchor is asked of the whole journal, not of the interval: what
     // asserts the state before an account's first movement is a fact about the
     // account, and asking it per interval would make a March figure anchored
@@ -924,6 +972,81 @@ mod tests {
             Some(PostedMinor::new(150_000)),
             "an April event must not be included in the end-of-March balance"
         );
+    }
+
+    #[test]
+    fn an_event_dated_the_start_day_is_retained_as_excluded_from_opening() {
+        // `iaam-k3gh.13`: the opening fold's exclusion of a same-day event is
+        // not only a fact `check_claim` can act on — it is a fact `observe`
+        // must retain, because nothing else in `ObservedTotals` names the
+        // events of exactly this one day apart from the whole interval.
+        let account = AccountId::new_random();
+        let custody = CustodyId::new_random();
+        let instrument = InstrumentId::new_random();
+        let events = vec![
+            event_with(
+                account,
+                date!(2026 - 03 - 01),
+                1,
+                EventKind::OpeningCash {
+                    amount: rub(200_000),
+                },
+                vec![Leg::cash(account, rub(200_000))],
+            ),
+            event_with(
+                account,
+                date!(2026 - 03 - 01),
+                2,
+                EventKind::OpeningPosition {
+                    instrument,
+                    quantity: qty(10),
+                    cost_basis: None,
+                    assertions: crate::event::kind::OpeningAssertions::default(),
+                },
+                vec![Leg::security(account, custody, instrument, qty(10))],
+            ),
+            // A second day's event confirms the retention is exact to the
+            // boundary date and not just «everything within the interval».
+            event_with(
+                account,
+                date!(2026 - 03 - 10),
+                1,
+                EventKind::CashIn {
+                    amount: rub(50_000),
+                },
+                vec![Leg::cash(account, rub(50_000))],
+            ),
+        ];
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(
+            observed.cash_excluded_from_opening(CurrencyCode::Rub),
+            Some(PostedMinor::new(200_000)),
+            "only the March 1 amount, not the March 10 one"
+        );
+        assert_eq!(
+            observed.position_excluded_from_opening(instrument),
+            Some(qty(10))
+        );
+    }
+
+    #[test]
+    fn a_start_day_with_no_events_excludes_nothing_rather_than_zero() {
+        // The same distinction the fold itself draws (`absence_of_movement_is_not_zero`
+        // above): an account that moved nothing on the interval's own start day
+        // had nothing excluded by the boundary, and that is a different claim
+        // from «zero was excluded».
+        let account = AccountId::new_random();
+        let events = vec![event_with(
+            account,
+            date!(2026 - 03 - 10),
+            1,
+            EventKind::CashIn {
+                amount: rub(100_000),
+            },
+            vec![Leg::cash(account, rub(100_000))],
+        )];
+        let observed = observe(&events, account, march()).unwrap();
+        assert_eq!(observed.cash_excluded_from_opening(CurrencyCode::Rub), None);
     }
 
     #[test]

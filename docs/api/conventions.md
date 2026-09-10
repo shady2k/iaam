@@ -237,6 +237,12 @@ things. Read it as the lookup table for §1.
 | `POST /v1/brokers/{broker}/sync` | `SyncOutcomeDto` | object, `recorded` | the duplicate and assertion counts for the run, and `actions` |
 | `POST /v1/import-sessions/{session}/commit` | `ImportCommitDto` | object, `rows` | the session and the revision the commit was planned from |
 | `POST /v1/classification-rules` | `ClassificationRuleChangeDto` | object, `plan.corrections` | `applied: false` — that the plan was not carried out |
+| `POST /v1/classification-rules/batch` | `[VerdictDto]` | bare array | one verdict per submitted rule, in the caller's own order; the plan for the rule set the batch leaves behind is read once afterwards, from the route below, rather than recomputed per row |
+| `GET /v1/classification-rules/plan` | `RecomputePlanDto` | object, `corrections` | `applied: false`; the plan the active rule set implies over the recorded journal, asked for without writing a rule to provoke it |
+| `GET /v1/journal/aggregate` | `JournalAggregateDto` | object, `groups` | the grouping the request asked for, which no group can state on its own |
+| `POST /v1/category-rules/preview` | `CategoryRuleImpactDto` | object, `preview_rows` | the rule's own reach — and note `rows` beside it is a **count**, §1.4b's collision in the one place it was not renamed |
+| `POST /v1/category-rules/preview/batch` | `[CategoryRuleImpactDto]` | bare array | one impact per submitted rule, each shaped as the single form above |
+| `POST /v1/accounts/{id}/transfer-partners/batch` | `AccountTransferPartnersBatchDto` | object, `statements` | one complete `AccountTransferPartnersDto` per account in the batch, each carrying its own `stated` |
 | `DELETE /v1/classification-rules/{id}` | `RecomputePlanDto` | object, `corrections` | `applied: false` |
 
 A batch response — a verdict per submitted row — is a bare array for the same

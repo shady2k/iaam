@@ -26494,6 +26494,355 @@ async fn a_transfer_pairing_is_proposed_with_its_evidence_and_never_confirmed_bl
     );
 }
 
+/// Confirming a pairing writes two corrections, and is reachable by the same
+/// tokens a correction is: an agent may put the record back with another
+/// correction, so joining two legs that are both already recorded — the safer
+/// of the two shapes `relation: reclassification` already lets an agent
+/// perform — is not owner-only either. A read-only token reaches no write at
+/// all (iaam-k3gh.10).
+#[tokio::test]
+async fn a_transfer_pairing_is_confirmed_by_an_agent_and_refused_for_a_read_only_token() {
+    let harness = harness().await;
+    let account = harness.account.inner();
+    let elsewhere = another_account(&harness, "Elsewhere (authority)").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "near-auth" },
+                "operations": [{
+                    "account": account,
+                    "type": "withdrawal",
+                    "amount": "4500.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-04-01" },
+                    "description": "Transfer out",
+                    "idempotency_key": "auth-pairing-out",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let outgoing = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": elsewhere, "channel": "file", "label": "far-auth" },
+                "operations": [{
+                    "account": elsewhere,
+                    "type": "deposit",
+                    "amount": "4500.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-04-01" },
+                    "description": "Transfer in",
+                    "idempotency_key": "auth-pairing-in",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let incoming = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    // A read-only token reaches no write here, exactly as it reaches none of
+    // the correction routes this one shares a floor with.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.readonly_token,
+            &json!({
+                "outgoing": outgoing,
+                "incoming": incoming,
+                "acknowledge_retraction": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    assert_eq!(refused["code"], "forbidden", "{refused}");
+
+    // An agent may join the same pair: the decision behind iaam-k3gh.10 is
+    // that gating this tighter than reclassification, which an agent may
+    // already submit and which invents the far leg outright, would be an
+    // inconsistency rather than a protection.
+    let (status, confirmed) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.agent_token,
+            &json!({
+                "outgoing": outgoing,
+                "incoming": incoming,
+                "acknowledge_retraction": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert!(confirmed["transfer"].is_string(), "{confirmed}");
+}
+
+/// A candidate the matcher would never propose cannot be confirmed by naming
+/// two events directly, either because the two events are on one account or
+/// because their amounts disagree (iaam-k3gh.10). This is the same refusal
+/// the self-paired-event case above exercises, for the two other shapes of a
+/// wrong pair.
+#[tokio::test]
+async fn a_pairing_of_one_account_or_of_mismatched_amounts_is_never_confirmable() {
+    let harness = harness().await;
+    let account = harness.account.inner();
+    let elsewhere = another_account(&harness, "Elsewhere (mismatch)").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "same-account" },
+                "operations": [
+                    {
+                        "account": account,
+                        "type": "withdrawal",
+                        "amount": "7000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-05-01" },
+                        "idempotency_key": "same-account-out",
+                    },
+                    {
+                        "account": account,
+                        "type": "deposit",
+                        "amount": "7000.00",
+                        "currency": "RUB",
+                        "dates": { "cash_posted": "2025-05-01" },
+                        "idempotency_key": "same-account-in",
+                    },
+                ],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let same_account_out = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+    let same_account_in = verdicts[1]["event_id"].as_str().expect("event").to_owned();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "mismatched-out" },
+                "operations": [{
+                    "account": account,
+                    "type": "withdrawal",
+                    "amount": "9000.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-05-02" },
+                    "idempotency_key": "mismatch-out",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let mismatch_out = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": elsewhere, "channel": "file", "label": "mismatched-in" },
+                "operations": [{
+                    "account": elsewhere,
+                    "type": "deposit",
+                    "amount": "9500.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-05-02" },
+                    "idempotency_key": "mismatch-in",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let mismatch_in = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    // Neither pair is among the candidates: one account cannot pair with
+    // itself, and an amount neither leg agrees on is not a transfer.
+    let (status, proposals) = call(
+        &harness.router,
+        get("/v1/transfer-pairings", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{proposals}");
+    assert!(
+        proposals["candidates"]
+            .as_array()
+            .expect("candidates")
+            .is_empty(),
+        "{proposals}"
+    );
+
+    for (outgoing, incoming, reason) in [
+        (&same_account_out, &same_account_in, "same account"),
+        (&mismatch_out, &mismatch_in, "mismatched amount"),
+    ] {
+        let (status, refused) = call(
+            &harness.router,
+            post(
+                "/v1/transfer-pairings",
+                &harness.owner_token,
+                &json!({
+                    "outgoing": outgoing,
+                    "incoming": incoming,
+                    "acknowledge_retraction": true,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{reason}: {refused}");
+    }
+}
+
+/// A leg a confirmed pairing already accounted for cannot be confirmed a
+/// second time under a different partner: the transfer superseded it, so the
+/// journal no longer offers it as a candidate at all (iaam-k3gh.10).
+#[tokio::test]
+async fn a_leg_already_used_by_a_confirmed_pairing_cannot_be_paired_again() {
+    let harness = harness().await;
+    let account = harness.account.inner();
+    let first_partner = another_account(&harness, "First Partner").await;
+    let second_partner = another_account(&harness, "Second Partner").await;
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": account, "channel": "file", "label": "twice-out" },
+                "operations": [{
+                    "account": account,
+                    "type": "withdrawal",
+                    "amount": "6600.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-06-01" },
+                    "idempotency_key": "twice-out",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let outgoing = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": first_partner, "channel": "file", "label": "twice-first" },
+                "operations": [{
+                    "account": first_partner,
+                    "type": "deposit",
+                    "amount": "6600.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-06-01" },
+                    "idempotency_key": "twice-first",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let first_incoming = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source": { "account": second_partner, "channel": "file", "label": "twice-second" },
+                "operations": [{
+                    "account": second_partner,
+                    "type": "deposit",
+                    "amount": "6600.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2025-06-02" },
+                    "idempotency_key": "twice-second",
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    let second_incoming = verdicts[0]["event_id"].as_str().expect("event").to_owned();
+
+    // Both are proposed while nothing is confirmed: the outgoing leg has two
+    // possible counterparts, and neither candidate is the sole one.
+    let (status, proposals) = call(
+        &harness.router,
+        get("/v1/transfer-pairings", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{proposals}");
+    assert_eq!(
+        proposals["candidates"]
+            .as_array()
+            .expect("candidates")
+            .len(),
+        2,
+        "{proposals}"
+    );
+
+    let (status, confirmed) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.owner_token,
+            &json!({
+                "outgoing": outgoing,
+                "incoming": first_incoming,
+                "acknowledge_retraction": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+
+    // The outgoing leg is superseded by the transfer, so the pairing that
+    // also named it is gone, and it cannot be confirmed a second time under a
+    // different partner.
+    let (status, refused) = call(
+        &harness.router,
+        post(
+            "/v1/transfer-pairings",
+            &harness.owner_token,
+            &json!({
+                "outgoing": outgoing,
+                "incoming": second_incoming,
+                "acknowledge_retraction": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+}
+
 // --- Decision 0004: the identity a source prints for an account -------------
 
 #[tokio::test]

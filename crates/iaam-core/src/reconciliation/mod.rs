@@ -1364,6 +1364,7 @@ mod internals {
                     amount: PostedMinor::new(99_999),
                     currency: CurrencyCode::Rub,
                 },
+                reason: None,
             }),
             basis: basis(),
         }];

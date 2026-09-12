@@ -84,6 +84,9 @@ use crate::dto::{
 };
 // Wave U's types, in a block of their own for the reason the block above gives.
 use crate::dto::UnresolvedAccountDto;
+// The reporting default (iaam-14is), in a block of its own for the same
+// reason.
+use crate::dto::{ContourListDto, DeclareReportDefaultContourRequest};
 use crate::error::ApiError;
 use crate::routes::MarketSyncOutcomeDto;
 use crate::vocabulary::{
@@ -485,7 +488,9 @@ fn frequency_refusal(particular: Option<&str>) -> Response {
         ClassificationRuleBatchRequest,
         ComputedDto,
         ContourDto,
+        ContourListDto,
         ContourVersionDto,
+        DeclareReportDefaultContourRequest,
         AddContourVersionRequest,
         CreateAccountRequest,
         CreateContourVersionRequest,

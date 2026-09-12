@@ -6497,6 +6497,62 @@ pub struct ContourDto {
     pub same_title_contours: Vec<Uuid>,
 }
 
+/// The owner's contours, and which of them his reports are about.
+///
+/// **An object, not the bare array this route used to answer with.** «No
+/// contour is declared» is a fact about the whole list that no item in it can
+/// carry, and an empty list has to be able to say it as plainly as a populated
+/// one — the same reason `GET /v1/actions` is a wrapper (§1.4a).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ContourListDto {
+    /// Every contour the owner holds, each at its current version, in the order
+    /// the identifiers sort.
+    pub contours: Vec<ContourDto>,
+    /// The contour the owner's reports are about, or `null` when he has
+    /// declared none.
+    ///
+    /// **A caller reads it and names it; nothing resolves it for him.** A
+    /// report request still carries the contour it is about, and a request that
+    /// omits one is refused exactly as it was before this field existed: no
+    /// report reads this declaration and no route substitutes it for a missing
+    /// parameter. What it removes is the guess — a caller facing two contours
+    /// with one title reads this and knows which to name.
+    ///
+    /// **Undeclared is published rather than omitted.** The field is present and
+    /// `null`; it is never absent, because an absent field cannot be told from
+    /// one a client does not know how to read.
+    ///
+    /// **The identifier and nothing copied beside it.** No title travels here,
+    /// and no item carries a flag saying it is the declaration: the name of
+    /// this contour is the `title` of its own item in `contours`, and a second
+    /// copy of it, or a second way of saying which contour is the default, is a
+    /// second thing that can come to disagree with the first.
+    ///
+    /// **It follows the contour, not a version of it.** A report taken over the
+    /// contour this field names is computed over whatever composition that
+    /// contour stands at when the report is asked for, which is what lets the
+    /// owner widen the perimeter without restating the declaration. It says
+    /// nothing about a report the caller asked about another contour, about
+    /// reconciliation (which takes an account), about the membership of the
+    /// perimeter, or that successive reports are comparable: a caller who needs
+    /// two reports to be comparable keeps the `(contour, version)` pair each
+    /// answer publishes.
+    pub default_contour: Option<Uuid>,
+}
+
+/// Which contour the owner's reports are about.
+///
+/// The contour is named here rather than in the path, so that declaring one and
+/// reading one back are two different routes rather than two readings of one
+/// path, and so that no literal segment sits beside `/v1/contours/{contour}`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeclareReportDefaultContourRequest {
+    /// The contour, by identifier. It must be one the caller holds, and it must
+    /// have a composition: a perimeter covering no account is not a useful
+    /// subject for a report request.
+    pub contour: Uuid,
+}
+
 /// Exchange rate for a date specified by the owner (§6.1).
 ///
 /// The pair is spelled `base`/`quote`, as it is in the `market/fx` query and in

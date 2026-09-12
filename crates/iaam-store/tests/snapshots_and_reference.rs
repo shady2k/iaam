@@ -303,6 +303,180 @@ fn list_contours_returns_latest_version_per_owner_and_contour() {
 }
 
 #[test]
+fn a_declared_report_default_follows_the_contour_and_not_a_version() {
+    // A wider perimeter is written as a new version, and a declaration pinned to
+    // the version it was made at would leave a caller that names it reporting
+    // over the old one — the thing the owner widened the perimeter to stop.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let first = AccountId::new_random();
+    let second = AccountId::new_random();
+    let contour = ContourId::new_random();
+    for account in [first, second] {
+        store
+            .upsert_account(&AccountRecord {
+                id: account,
+                owner,
+                title: "Main".into(),
+                institution: None,
+            })
+            .unwrap();
+    }
+
+    let opening = ContourDefinition::new(contour, ContourVersion(1), [first]);
+    store
+        .insert_contour_version(owner, &opening, "Household", &[first])
+        .unwrap();
+    assert!(store.record_report_default_contour(owner, contour).unwrap());
+
+    let widened = ContourDefinition::new(contour, ContourVersion(2), [first, second]);
+    store
+        .insert_contour_version(owner, &widened, "Household", &[first, second])
+        .unwrap();
+
+    assert_eq!(
+        store.report_default_contour(owner).unwrap(),
+        Some(contour),
+        "the declaration names the contour, so it follows it into its next version"
+    );
+    assert_eq!(
+        store.list_contours(owner).unwrap(),
+        vec![iaam_store::reference::ContourRecord {
+            id: contour,
+            owner,
+            version: ContourVersion(2),
+            title: "Household".into(),
+        }],
+        "and the contrast is the point: the listing moved to version 2 while the \
+         declaration stayed on the contour"
+    );
+}
+
+#[test]
+fn declaring_the_contour_already_declared_writes_nothing() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let stranger = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let contour = ContourId::new_random();
+    let other = ContourId::new_random();
+    store
+        .upsert_account(&AccountRecord {
+            id: account,
+            owner,
+            title: "Main".into(),
+            institution: None,
+        })
+        .unwrap();
+    for id in [contour, other] {
+        let definition = ContourDefinition::new(id, ContourVersion(1), [account]);
+        store
+            .insert_contour_version(owner, &definition, "Main", &[account])
+            .unwrap();
+    }
+
+    assert!(store.record_report_default_contour(owner, contour).unwrap());
+    assert!(
+        !store.record_report_default_contour(owner, contour).unwrap(),
+        "a repeat asked for a state and found it already standing"
+    );
+    assert_eq!(store.report_default_contour(owner).unwrap(), Some(contour));
+    assert_eq!(
+        store.report_default_contour(stranger).unwrap(),
+        None,
+        "one owner's declaration is not another's"
+    );
+
+    assert!(
+        store.record_report_default_contour(owner, other).unwrap(),
+        "restating it on another contour replaces it and is an act"
+    );
+    assert_eq!(store.report_default_contour(owner).unwrap(), Some(other));
+}
+
+#[test]
+fn withdrawing_the_declaration_leaves_nothing_declared() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let contour = ContourId::new_random();
+    store
+        .upsert_account(&AccountRecord {
+            id: account,
+            owner,
+            title: "Main".into(),
+            institution: None,
+        })
+        .unwrap();
+    let definition = ContourDefinition::new(contour, ContourVersion(1), [account]);
+    store
+        .insert_contour_version(owner, &definition, "Main", &[account])
+        .unwrap();
+
+    assert_eq!(
+        store.withdraw_report_default_contour(owner).unwrap(),
+        None,
+        "withdrawing nothing is not an act, and is not a failure either"
+    );
+    assert!(store.record_report_default_contour(owner, contour).unwrap());
+    assert_eq!(
+        store.withdraw_report_default_contour(owner).unwrap(),
+        Some(contour),
+        "the answer names what the withdrawal reached: it is the subject the \
+         owner's review joins the act by"
+    );
+    assert_eq!(store.report_default_contour(owner).unwrap(), None);
+    assert!(
+        store.list_contours(owner).unwrap().len() == 1,
+        "withdrawing the declaration does not touch the contour itself"
+    );
+}
+
+#[test]
+fn a_declaration_naming_a_contour_the_owner_does_not_hold_is_refused() {
+    // The check a foreign key would have made, made by the table's own triggers:
+    // a contour is not a row in this schema, its only key carries a version, and
+    // the version is exactly what a declaration may not name.
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let owner = OwnerId::new_random();
+    let stranger = OwnerId::new_random();
+    let foreign_account = AccountId::new_random();
+    let foreign = ContourId::new_random();
+    store
+        .upsert_account(&AccountRecord {
+            id: foreign_account,
+            owner: stranger,
+            title: "Theirs".into(),
+            institution: None,
+        })
+        .unwrap();
+    let definition = ContourDefinition::new(foreign, ContourVersion(1), [foreign_account]);
+    store
+        .insert_contour_version(stranger, &definition, "Theirs", &[foreign_account])
+        .unwrap();
+
+    let refused = store
+        .record_report_default_contour(owner, foreign)
+        .expect_err("someone else's contour is not a default this owner can declare");
+    assert!(
+        refused.to_string().contains("must name a contour this owner holds"),
+        "the refusal is the table's own, not the caller's: {refused}"
+    );
+    assert!(
+        store
+            .record_report_default_contour(owner, ContourId::new_random())
+            .is_err(),
+        "a contour that never existed is refused the same way"
+    );
+    assert_eq!(store.report_default_contour(owner).unwrap(), None);
+    assert_eq!(
+        store.report_default_contour(stranger).unwrap(),
+        None,
+        "and the refused declaration left nothing behind under the other owner"
+    );
+}
+
+#[test]
 fn accounts_round_trip() {
     let store = SqliteStore::open_in_memory().unwrap();
     let owner = OwnerId::new_random();

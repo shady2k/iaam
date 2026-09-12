@@ -726,6 +726,36 @@ impl Store for SqliteAdapter {
         .await
     }
 
+    async fn report_default_contour(&self, owner: OwnerId) -> Result<Option<ContourId>, AppError> {
+        self.blocking(move |store| store.report_default_contour(owner).map_err(store_error))
+            .await
+    }
+
+    async fn record_report_default_contour(
+        &self,
+        owner: OwnerId,
+        contour: ContourId,
+    ) -> Result<bool, AppError> {
+        self.blocking(move |store| {
+            store
+                .record_report_default_contour(owner, contour)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn withdraw_report_default_contour(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Option<ContourId>, AppError> {
+        self.blocking(move |store| {
+            store
+                .withdraw_report_default_contour(owner)
+                .map_err(store_error)
+        })
+        .await
+    }
+
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError> {
         self.blocking(move |store| {
             let accounts = store.list_accounts(owner).map_err(store_error)?;

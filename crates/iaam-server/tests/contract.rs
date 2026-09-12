@@ -19178,7 +19178,7 @@ async fn creating_a_contour_twice_with_the_same_intent_writes_one_contour() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
-    let listed = listed.as_array().expect("contour list");
+    let listed = listed["contours"].as_array().expect("contour list");
     assert_eq!(listed.len(), 1, "two calls, one contour: {listed:?}");
 }
 
@@ -19221,7 +19221,10 @@ async fn the_create_route_refuses_a_contour_identifier_and_names_the_versions_ro
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert!(
-        listed.as_array().expect("contour list").is_empty(),
+        listed["contours"]
+            .as_array()
+            .expect("contour list")
+            .is_empty(),
         "a refused request writes nothing: {listed}"
     );
 }
@@ -19252,7 +19255,7 @@ async fn a_contour_can_be_listed_and_read_back_with_its_accounts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
-    let listed = listed.as_array().expect("contour list");
+    let listed = listed["contours"].as_array().expect("contour list");
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(listed[0]["contour"], contour, "{listed:?}");
     assert_eq!(listed[0]["title"], "Household", "{listed:?}");
@@ -19355,7 +19358,7 @@ async fn an_account_is_added_to_an_existing_contour_without_a_second_contour() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
-    let listed = listed.as_array().expect("contour list");
+    let listed = listed["contours"].as_array().expect("contour list");
     assert_eq!(listed.len(), 1, "no second perimeter: {listed:?}");
     assert_eq!(listed[0]["version"], 2, "{listed:?}");
     assert_eq!(
@@ -19375,6 +19378,547 @@ async fn an_account_is_added_to_an_existing_contour_without_a_second_contour() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
+}
+
+/// The contour the owner's reports are about (`iaam-14is`).
+///
+/// The defect: two current contours with one title, different versions and
+/// different compositions, and nothing in the answer saying which of them the
+/// owner's reports are about. Every report is taken by contour identifier, so a
+/// caller that asked about the wrong one got a different figure over a
+/// different perimeter and was told nothing. The agent that hit this read both
+/// rows, took the higher-versioned and wider one, and guessed.
+///
+/// These pin what replaces the guess: a statement the owner makes, published
+/// beside the list rather than carried by an item, naming a contour and not a
+/// version of it — and read by a caller, which then names that contour in its
+/// report request, because nothing resolves it on the caller's behalf.
+#[tokio::test]
+async fn the_contour_list_publishes_the_declaration_beside_the_contours() {
+    let harness = harness().await;
+
+    // Nothing declared is published as nothing declared. This is the fact no
+    // item in a bare array could state, and the reason the answer is an object.
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["contours"], json!([]), "{listed}");
+    assert!(
+        listed["default_contour"].is_null(),
+        "undeclared is stated, not omitted: {listed}"
+    );
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+
+    let (status, declared) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.owner_token,
+            &json!({ "contour": contour }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{declared}");
+    assert_eq!(declared["default_contour"], contour, "{declared}");
+    assert_eq!(declared["contours"][0]["contour"], contour, "{declared}");
+    assert_eq!(declared["contours"][0]["version"], 1, "{declared}");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["default_contour"], contour, "{listed}");
+}
+
+/// The declaration names the contour and never a version of it.
+///
+/// An omitted version already means the latest, and adding one replaces the
+/// composition, so a declaration pinned to the version it was made at would
+/// leave a caller that reads it and names that contour reporting over a
+/// perimeter the owner had deliberately widened.
+#[tokio::test]
+async fn the_declaration_follows_the_contour_into_a_wider_version() {
+    let harness = harness().await;
+    let (status, savings) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Savings" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{savings}");
+    let savings = savings["id"].as_str().expect("account id").to_owned();
+
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+
+    let (status, declared) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.owner_token,
+            &json!({ "contour": contour }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{declared}");
+
+    let (status, widened) = call(
+        &harness.router,
+        post(
+            &format!("/v1/contours/{contour}/versions"),
+            &harness.owner_token,
+            &json!({ "accounts": [harness.account.inner().to_string(), savings] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{widened}");
+    assert_eq!(widened["version"], 2, "{widened}");
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed["default_contour"], contour,
+        "the declaration stayed on the contour, so it now covers both accounts: {listed}"
+    );
+    assert_eq!(listed["contours"][0]["version"], 2, "{listed}");
+    assert_eq!(
+        listed["contours"][0]["accounts"].as_array().expect("accounts").len(),
+        2,
+        "{listed}"
+    );
+}
+
+/// Declaring the contour already declared changes nothing and does not fail.
+///
+/// The call is a statement of a state, and the state already stands. It also
+/// writes nothing into the owner's review: an act that did not happen is not an
+/// act, and a review that repeated it would describe decisions nobody made.
+#[tokio::test]
+async fn declaring_the_contour_already_declared_changes_nothing() {
+    let harness = harness().await;
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+    let declared = json!({ "contour": contour });
+
+    for _ in 0..2 {
+        let (status, body) = call(
+            &harness.router,
+            put("/v1/report-default-contour", &harness.owner_token, &declared),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "a repeat is not a failure: {body}");
+        assert_eq!(body["default_contour"], contour, "{body}");
+    }
+
+    let (status, decisions) = call(
+        &harness.router,
+        get("/v1/decisions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{decisions}");
+    let declared_twice: Vec<&Value> = decisions
+        .as_array()
+        .expect("decisions")
+        .iter()
+        .filter(|decision| decision["operation"] == "declare_report_default_contour")
+        .collect();
+    assert_eq!(
+        declared_twice.len(),
+        1,
+        "the second call declared what was already declared, so it recorded no act: {decisions}"
+    );
+    assert_eq!(
+        declared_twice[0]["subject"], contour,
+        "the review joins the act by the contour it named: {decisions}"
+    );
+    assert_eq!(
+        declared_twice[0]["undo"], "withdrawn by DELETE /v1/report-default-contour",
+        "and says what reverses it: {decisions}"
+    );
+}
+
+/// The declaration is withdrawn, and nothing is declared in its place.
+///
+/// Withdrawal is the undo the declaration names, and it is the whole of it:
+/// after it a caller reading the list has nothing to name, nothing is
+/// substituted for what was withdrawn, and nothing is left standing in a third
+/// state.
+#[tokio::test]
+async fn withdrawing_the_declaration_leaves_nothing_declared() {
+    let harness = harness().await;
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+
+    let (status, body) = call(
+        &harness.router,
+        delete("/v1/report-default-contour", &harness.owner_token),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "withdrawing nothing is not a failure: {body}"
+    );
+    assert!(body["default_contour"].is_null(), "{body}");
+
+    let (status, declared) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.owner_token,
+            &json!({ "contour": contour }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{declared}");
+
+    let (status, withdrawn) = call(
+        &harness.router,
+        delete("/v1/report-default-contour", &harness.owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{withdrawn}");
+    assert!(withdrawn["default_contour"].is_null(), "{withdrawn}");
+    assert_eq!(
+        withdrawn["contours"][0]["contour"], contour,
+        "the contour itself is untouched by the withdrawal: {withdrawn}"
+    );
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(listed["default_contour"].is_null(), "{listed}");
+
+    let (status, decisions) = call(
+        &harness.router,
+        get("/v1/decisions", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{decisions}");
+    let withdrawals: Vec<&Value> = decisions
+        .as_array()
+        .expect("decisions")
+        .iter()
+        .filter(|decision| decision["operation"] == "withdraw_report_default_contour")
+        .collect();
+    assert_eq!(
+        withdrawals.len(),
+        1,
+        "the first withdrawal removed nothing and is not an act, the second did and is: {decisions}"
+    );
+    assert_eq!(withdrawals[0]["subject"], contour, "{decisions}");
+}
+
+/// What a declaration may name, and who may make it.
+///
+/// A contour the caller does not hold is refused with the answer the read route
+/// gives for the same identifier — a different answer would tell an outsider
+/// that such a record exists (§14). The floor is the agent's, not the owner's:
+/// the declaration is the owner's answer and an agent that has asked him relays
+/// it, the same way it relays every other standing decision, and what keeps that
+/// honest is that `decision_history` names who declared it.
+#[tokio::test]
+async fn a_contour_the_caller_does_not_hold_cannot_be_declared() {
+    let (harness, path) = harness_on_disk().await;
+    let absent = Uuid::new_v4();
+
+    let (status, refused) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.owner_token,
+            &json!({ "contour": absent }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    let (status, read) = call(
+        &harness.router,
+        get(
+            &format!("/v1/contours/{absent}"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{read}");
+    assert_eq!(
+        refused, read,
+        "the declaration route answers exactly what the read route answers"
+    );
+
+    // A contour that does exist, and is another owner's, is answered the same
+    // way and not told apart: a different answer would tell an outsider that
+    // such a record exists (§14). Seeded through a second connection because no
+    // route of his own writes another owner's contour.
+    let stranger = OwnerId::new_random();
+    let theirs = ContourId::new_random();
+    {
+        let mut store = SqliteStore::open(&path).expect("second connection");
+        let account = AccountId::new_random();
+        store
+            .upsert_account(&AccountRecord {
+                id: account,
+                owner: stranger,
+                title: "Theirs".into(),
+                institution: None,
+            })
+            .expect("their account");
+        let definition = ContourDefinition::new(theirs, ContourVersion(1), [account]);
+        store
+            .insert_contour_version(stranger, &definition, "Theirs", &[account])
+            .expect("their contour");
+    }
+
+    let (status, refused) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.owner_token,
+            &json!({ "contour": theirs.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{refused}");
+    let (status, read) = call(
+        &harness.router,
+        get(
+            &format!("/v1/contours/{}", theirs.0),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{read}");
+    assert_eq!(
+        refused, read,
+        "someone else's contour is refused with the answer a missing one gets"
+    );
+
+    // An agent may declare, and a read-only token may not.
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.agent_token,
+            &json!({ "title": "Relayed", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+
+    let (status, declared) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.agent_token,
+            &json!({ "contour": contour }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{declared}");
+    assert_eq!(declared["default_contour"], contour, "{declared}");
+
+    let (status, refused) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.readonly_token,
+            &json!({ "contour": contour }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    let (status, refused) = call(
+        &harness.router,
+        delete("/v1/report-default-contour", &harness.readonly_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+/// A contour standing at a version with no members cannot be declared.
+///
+/// `POST /v1/contours` refuses an empty composition on the way in, so the
+/// version that stands empty is written below the transport — which is exactly
+/// why the check is made against what the store holds rather than against what
+/// the route accepted. A report over no accounts has no boundary to report
+/// about, so declaring such a contour would publish a name a caller is told to
+/// use and that leads to no answer.
+#[tokio::test]
+async fn a_contour_that_covers_no_account_cannot_be_declared() {
+    let (harness, path) = harness_on_disk().await;
+    let empty = ContourId::new_random();
+    {
+        let mut store = SqliteStore::open(&path).expect("second connection");
+        let definition = ContourDefinition::new(empty, ContourVersion(1), []);
+        store
+            .insert_contour_version(harness.owner, &definition, "Empty", &[])
+            .expect("a version that reached the store empty");
+    }
+
+    let (status, refused) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.owner_token,
+            &json!({ "contour": empty.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    assert_eq!(refused["field"], "contour", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .expect("message")
+            .contains("covers no account"),
+        "the refusal says what is missing rather than that the request was \
+         malformed: {refused}"
+    );
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed["contours"]
+            .as_array()
+            .expect("contours")
+            .iter()
+            .filter(|contour| contour["contour"] == json!(empty.0))
+            .count(),
+        1,
+        "the refused declaration wrote nothing: {listed}"
+    );
+    assert!(listed["default_contour"].is_null(), "{listed}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
+/// A declaration that becomes unusable stands, and nothing is substituted for
+/// it.
+///
+/// The owner declared a contour; the perimeter he declared was later emptied by
+/// a version that reached the store below the transport. He has not withdrawn
+/// it, and this is not that: the declaration is still his declaration, it still
+/// names the contour he chose, and a caller that reads it and names that contour
+/// gets whatever a report over an empty perimeter gives rather than a quiet
+/// answer about a different perimeter. Replacing it or withdrawing it is his to
+/// do.
+#[tokio::test]
+async fn a_declared_contour_that_becomes_empty_keeps_the_declaration() {
+    let (harness, path) = harness_on_disk().await;
+    let (status, created) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Household", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let contour = created["contour"].as_str().expect("contour id").to_owned();
+    let id = ContourId(Uuid::parse_str(&contour).expect("contour uuid"));
+
+    let (status, declared) = call(
+        &harness.router,
+        put(
+            "/v1/report-default-contour",
+            &harness.owner_token,
+            &json!({ "contour": contour }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{declared}");
+
+    {
+        let mut store = SqliteStore::open(&path).expect("second connection");
+        let emptied = ContourDefinition::new(id, ContourVersion(2), []);
+        store
+            .insert_contour_version(harness.owner, &emptied, "Household", &[])
+            .expect("a version that reached the store empty");
+    }
+
+    let (status, listed) = call(
+        &harness.router,
+        get("/v1/contours", Some(&harness.owner_token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["contours"][0]["version"], 2, "{listed}");
+    assert_eq!(
+        listed["contours"][0]["accounts"],
+        json!([]),
+        "the version standing covers nothing: {listed}"
+    );
+    assert_eq!(
+        listed["default_contour"], contour,
+        "the declaration is the owner's to replace or withdraw, not this \
+         system's to clear: {listed}"
+    );
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
 }
 
 /// A caller may state the version it believes is current, and is refused if the
@@ -19536,7 +20080,7 @@ async fn the_queue_points_an_undecided_account_at_an_existing_contour() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
-    let listed = listed.as_array().expect("contour list");
+    let listed = listed["contours"].as_array().expect("contour list");
     assert_eq!(listed.len(), 1, "following the queue mints nothing");
     let accounts = listed[0]["accounts"].as_array().expect("accounts");
     assert!(
@@ -29485,7 +30029,7 @@ async fn a_contour_listing_names_other_contours_with_the_same_title() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
-    let listed = listed.as_array().expect("contour list");
+    let listed = listed["contours"].as_array().expect("contour list");
     let first = listed
         .iter()
         .find(|contour| contour["accounts"] == json!([first_account]))

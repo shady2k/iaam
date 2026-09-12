@@ -141,6 +141,9 @@ use crate::dto::{
 };
 // Types added by wave AB, in a block of their own for the same reason.
 use crate::dto::{ActionsResponseDto, ReportStandingDto};
+// The reporting default (iaam-14is), in a block of its own for the same
+// reason.
+use crate::dto::{ContourListDto, DeclareReportDefaultContourRequest};
 use crate::error::{ApiError, ApiFailure};
 use crate::extract::{ApiBytes, ApiJson, ApiJsonOrDefault, ApiPath, ApiQuery};
 use crate::vocabulary::ProvidedByDto;
@@ -159,6 +162,18 @@ use iaam_core::batch::ControlSection;
 pub const CREATE_ACCOUNT_OPERATION_ID: &str = "create_account";
 pub const CREATE_CONTOUR_VERSION_OPERATION_ID: &str = "create_contour_version";
 pub const ADD_CONTOUR_VERSION_OPERATION_ID: &str = "add_contour_version";
+/// Which contour the owner's reports are about (`iaam-14is`).
+///
+/// Deliberately not an [`OperationKey`]. The queue speaks in work the owner
+/// owes, and this is guidance a caller reads rather than work: an item that
+/// could not close without forcing a declaration the owner may not want is the
+/// failure `iaam_app::actions` is written against. The act is reversible all the
+/// same — withdrawn by the route beside this one — so it is gated by the same
+/// scope predicate an agent-floor key publishes, through [`require_submit`], and
+/// declared in [`WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY`] with that reason.
+pub const DECLARE_REPORT_DEFAULT_CONTOUR_OPERATION_ID: &str = "declare_report_default_contour";
+/// Withdraw that declaration, leaving nothing declared.
+pub const WITHDRAW_REPORT_DEFAULT_CONTOUR_OPERATION_ID: &str = "withdraw_report_default_contour";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
 /// The second axis. Named apart from the scope operation because the two decide
 /// different things about one account, and the report that motivated both needs
@@ -4428,18 +4443,30 @@ pub async fn add_contour_version(
     ))
 }
 
-/// The owner's contours, each at its current version.
+/// The owner's contours, each at its current version, and which of them his
+/// reports are about.
 ///
 /// The composition was write-only over HTTP, so an import skill had to be handed
 /// the perimeter as run-time input and had no way to check it against what the
 /// system believes. This is a view of the same composition the write routes
 /// build — derived from it, never a second copy.
+///
+/// **The declaration is published beside the list and not in it.** Which contour
+/// the reports are about is a fact about the whole list: no contour row can
+/// carry it, and an owner who has declared none has to be told exactly that
+/// rather than left to infer it from rows that say nothing about it (§1.4a). So
+/// the answer is an object, and `default_contour` is present and `null` when
+/// nothing is declared.
+///
+/// **What a caller does with it is name it.** This is the response a caller
+/// reads to decide which contour its report request should carry; the request
+/// still carries one, and no report reads the declaration.
 #[utoipa::path(
     get,
     path = "/v1/contours",
     operation_id = "list_contours",
     responses(
-        (status = 200, description = "Owner's contours", body = Vec<ContourDto>),
+        (status = 200, description = "Owner's contours, and the reporting default", body = ContourListDto),
         (status = 401, description = "Authentication required", body = ApiError)
     ),
     security(("bearer" = []))
@@ -4447,14 +4474,175 @@ pub async fn add_contour_version(
 pub async fn list_contours(
     State(state): State<ServerState>,
     Extension(principal): Extension<Principal>,
-) -> Result<Json<Vec<ContourDto>>, ApiFailure> {
+) -> Result<Json<ContourListDto>, ApiFailure> {
     let contours = state.services.store.list_contours(principal.owner).await?;
-    Ok(Json(
-        contours
-            .iter()
-            .map(|contour| contour_dto(contour, &contours))
-            .collect(),
-    ))
+    let default_contour = state
+        .services
+        .store
+        .report_default_contour(principal.owner)
+        .await?;
+    Ok(Json(contour_list_dto(default_contour, &contours)))
+}
+
+/// Declare which contour the owner's reports are about (`iaam-14is`).
+///
+/// **The answer the collision had no way to give.** `GET /v1/contours` can hold
+/// two contours with one title and different compositions, and every report is
+/// taken by contour identifier, so a caller that asked about the wrong one got a
+/// different figure over a different perimeter and nothing in the answer said
+/// so. The field report's agent picked the higher-versioned, wider one, which is
+/// exactly the guess this route replaces with the owner's statement.
+///
+/// **A statement a caller reads, not a substitution the server performs.** No
+/// report route changed and none of them reads this declaration: `contour` is
+/// still required on the reports that take one, and a request that omits it is
+/// refused exactly as before. What a caller does with the declaration is read it
+/// from the contour list and then name that contour in its report request, which
+/// is what it always had to do — with the difference that it now has something
+/// to decide with.
+///
+/// **Not an exclusive perimeter.** A report request naming another contour keeps
+/// taking that contour and computes exactly what it computed before; this says
+/// nothing about the reports that take an account instead, reconciliation among
+/// them.
+///
+/// **It follows the contour and not a version of it.** An omitted version
+/// already means the latest, and a later version replaces the composition, so
+/// pinning a designation to a version would leave a caller that names it
+/// computing over a perimeter the owner had deliberately widened. Nothing here
+/// promises frozen membership, a date-dependent one, coverage of every account,
+/// or that a report is ready — a caller that needs two reports to be comparable
+/// keeps the `(contour, version)` pair each answer publishes.
+///
+/// **Declaring the contour already declared is not a failure and writes
+/// nothing.** A caller may restate it, and may replace it with another contour;
+/// withdrawal is the route beside this one.
+///
+/// **Authority is attribution, not prohibition.** The owner's answer is relayed
+/// by whoever he told, and the same floor reaches this call as reaches creating
+/// a contour or restating a scope decision. What keeps it honest is
+/// `decision_history`: it names who declared it, so a declaration an agent got
+/// wrong is findable and withdrawable rather than prevented.
+#[utoipa::path(
+    put,
+    path = "/v1/report-default-contour",
+    operation_id = DECLARE_REPORT_DEFAULT_CONTOUR_OPERATION_ID,
+    request_body = DeclareReportDefaultContourRequest,
+    responses(
+        (status = 200, description = "The contours, and the default now standing", body = ContourListDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "Contour does not exist or belongs to someone else", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "The contour covers no account", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn declare_report_default_contour(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiJson(request): ApiJson<DeclareReportDefaultContourRequest>,
+) -> Result<Json<ContourListDto>, ApiFailure> {
+    // Not an `OperationKey` — see `WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY` above:
+    // an optional default is not work the queue may raise, and this route is
+    // the other half of that entry's reason. So the floor is read here rather
+    // than resolved from a key, exactly as `require_submit` exists for, and by
+    // the predicate an agent-floor key publishes — `Scope::Agent` admits
+    // `may_submit` and nothing else — so the two cannot answer «may an agent do
+    // this» differently.
+    require_submit(&principal)?;
+    let (declared, contours) = owned_contour(&state, &principal, ContourId(request.contour)).await?;
+
+    // A contour standing at a version with no members is not one a report may
+    // be computed over: an answer over no accounts is a confident answer about
+    // nothing. `bounded_composition` refuses an empty composition on the way in,
+    // but a version can reach the store empty below the HTTP boundary and
+    // through a bundle restore, so the composition is read here rather than
+    // assumed.
+    if declared.accounts.is_empty() {
+        return Err(unprocessable(
+            "contour",
+            "a contour whose current version names at least one account",
+            &format!("contour {} covers no account", declared.id.0),
+            "a declaration is read by a caller and then named in a report request, \
+             so declaring a contour that covers nothing publishes a name that leads \
+             to no answer: give it a composition, or declare one that has",
+        ));
+    }
+
+    // The act is recorded only when it happened. Declaring the contour already
+    // declared changes nothing, and an owner's review that carried an entry for
+    // every repeat would describe acts that never took place.
+    if state
+        .services
+        .store
+        .record_report_default_contour(principal.owner, declared.id)
+        .await?
+    {
+        record_decision_named(
+            &state,
+            &principal,
+            DECLARE_REPORT_DEFAULT_CONTOUR_OPERATION_ID,
+            declared.id.0.to_string(),
+            serde_json::json!({"report_default": declared.id.0}),
+            "withdrawn by DELETE /v1/report-default-contour",
+        )
+        .await?;
+    }
+
+    Ok(Json(contour_list_dto(Some(declared.id), &contours)))
+}
+
+/// Withdraw the declaration, leaving the owner's reports with nothing declared.
+///
+/// **The other half of the act above, and the whole of its undo.** A declaration
+/// the owner has changed his mind about, or one an agent got wrong, is reversed
+/// here rather than overwritten: after it, a caller reading the contour list is
+/// told that nothing is declared, which is the state an instance nobody has
+/// declared one in is in. Withdrawing when nothing stands is not a failure and
+/// writes nothing.
+///
+/// **An unusable declaration is not an undeclared one.** If the declared contour
+/// later stands at a version covering no account, this route is not the answer
+/// it produces: the declaration stands, and a caller that reads it and names
+/// that contour gets whatever a report over an empty perimeter gives — this
+/// route does not clear it, another contour is not substituted for it, and an
+/// older version of it is not resurrected. The owner replaces it or withdraws
+/// it, deliberately.
+#[utoipa::path(
+    delete,
+    path = "/v1/report-default-contour",
+    operation_id = WITHDRAW_REPORT_DEFAULT_CONTOUR_OPERATION_ID,
+    responses(
+        (status = 200, description = "The contours, and the default now standing", body = ContourListDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn withdraw_report_default_contour(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<ContourListDto>, ApiFailure> {
+    require_submit(&principal)?;
+    if let Some(withdrawn) = state
+        .services
+        .store
+        .withdraw_report_default_contour(principal.owner)
+        .await?
+    {
+        record_decision_named(
+            &state,
+            &principal,
+            WITHDRAW_REPORT_DEFAULT_CONTOUR_OPERATION_ID,
+            withdrawn.0.to_string(),
+            serde_json::json!({"report_default": null}),
+            "restated by PUT /v1/report-default-contour",
+        )
+        .await?;
+    }
+    let contours = state.services.store.list_contours(principal.owner).await?;
+    Ok(Json(contour_list_dto(None, &contours)))
 }
 
 /// One contour, with the composition its current version names.
@@ -4544,6 +4732,27 @@ fn contour_dto(contour: &ContourView, all_contours: &[ContourView]) -> ContourDt
             .filter(|other| other.id != contour.id && other.title == contour.title)
             .map(|other| other.id.0)
             .collect(),
+    }
+}
+
+/// The answer both contour-list routes give: the contours, and the declaration.
+///
+/// Built in one place so that reading the list, declaring a default and
+/// withdrawing one cannot answer with three shapes. `default_contour` is the
+/// declaration the call leaves standing — the contour it declared, or `None`
+/// after a withdrawal — beside the list the call itself read, which is one
+/// statement of that list within one response rather than a second read that
+/// could come to disagree with the first.
+fn contour_list_dto(
+    default_contour: Option<ContourId>,
+    contours: &[ContourView],
+) -> ContourListDto {
+    ContourListDto {
+        contours: contours
+            .iter()
+            .map(|contour| contour_dto(contour, contours))
+            .collect(),
+        default_contour: default_contour.map(|contour| contour.0),
     }
 }
 
@@ -7532,13 +7741,49 @@ async fn record_decision(
     decision: serde_json::Value,
     undo: &str,
 ) -> Result<(), ApiFailure> {
+    record_decision_named(
+        state,
+        principal,
+        operation.as_str(),
+        subject,
+        decision,
+        undo,
+    )
+    .await
+}
+
+/// Record one standing decision under the operation the route that made it
+/// declares, by name.
+///
+/// **[`record_decision`] is this function with a key.** Every operation the
+/// queue offers is an [`OperationKey`], and for those the key's own identifier
+/// is the name — but not every reversible act is one the queue may raise, and
+/// two are not: a route that publishes no floor of its own reads
+/// [`require_submit`] and is declared in
+/// [`WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY`], and the operation it records is
+/// the identifier next to it in this file. Naming that operation by its own
+/// identifier rather than by a key borrowed from a neighbouring act is the
+/// difference between a review that says what happened and one that says
+/// something else did.
+///
+/// The name is not resolved against anything: `decision_history.operation` is a
+/// string, kept so a later contract change cannot rewrite what an earlier
+/// decision was recorded as, and the identifier is the one the route publishes.
+async fn record_decision_named(
+    state: &ServerState,
+    principal: &Principal,
+    operation: &str,
+    subject: String,
+    decision: serde_json::Value,
+    undo: &str,
+) -> Result<(), ApiFailure> {
     state
         .services
         .store
         .record_decision(
             principal.owner,
             iaam_core::ids::PrincipalId(principal.token_id),
-            operation.as_str().to_owned(),
+            operation.to_owned(),
             subject,
             decision,
             undo.to_owned(),
@@ -7627,7 +7872,7 @@ fn require_admin(principal: &Principal) -> Result<(), ApiFailure> {
 /// [`require_admin`] states: the queue and the caveat register are about the
 /// owner's money and these are about the shape of the instance, so there is no
 /// second reader of their authority for a floor to disagree with.
-pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 31] = [
+pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 33] = [
     (
         "rename_account",
         "Nothing computes that a name is wrong, so nothing can offer this. A title is the owner's own word for an account, and only he knows that the one he chose says card where the account holds an institution. A key states the floor of a call some item or caveat points at; there is no state from which a rename follows, and inventing one would mean this system deciding what he should call his own money.",
@@ -7723,6 +7968,14 @@ pub const WRITE_ROUTES_WITHOUT_AN_OPERATION_KEY: [(&str, &str); 31] = [
     (
         "clear_account_transfer_partners",
         "It withdraws the statement record_account_transfer_partners makes, so it uses that key's reversible floor.",
+    ),
+    (
+        "declare_report_default_contour",
+        "Decided not to be a key, and the register is where that argument is made. The queue speaks in work the owner owes, and this is not work: it is guidance a caller reads — which contour the reports are about — and an item that stood until he declared one would be this system asking him to settle a question none of his figures leaves open, which is the failure iaam_app::actions is written against. An optional guide is not unfinished work. The act is reversible all the same — it is withdrawn by the route beside it — so it is not owner-only either, and require_submit reads the same scope predicate an agent-floor key publishes.",
+    ),
+    (
+        "withdraw_report_default_contour",
+        "It withdraws the declaration declare_report_default_contour makes, so it uses that route's floor, by the same predicate rather than a second one: the two routes are two halves of one reversible act and cannot differ about who may perform it.",
     ),
     (
         "revoke_broker_access",

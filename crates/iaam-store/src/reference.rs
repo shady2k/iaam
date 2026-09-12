@@ -1195,6 +1195,102 @@ impl SqliteStore {
         Ok(contours)
     }
 
+    /// The contour the owner's reports are about, when he has declared one
+    /// (`iaam-14is`).
+    ///
+    /// `None` is «he has not said», which is a real answer and not a missing
+    /// one: a caller reading the contours has nothing to name, and is told so
+    /// rather than handed whatever contour looks most likely. Nothing here
+    /// derives one from a version or from a composition — see
+    /// `0006_contour_report_defaults.sql` for why that is the whole point of the
+    /// table — and nothing downstream resolves it on the caller's behalf: a
+    /// report request carries the contour it is about.
+    pub fn report_default_contour(&self, owner: OwnerId) -> Result<Option<ContourId>, StoreError> {
+        let contour: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT contour FROM contour_report_defaults WHERE owner = ?1",
+                [owner.inner().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        contour
+            .map(|value| parse_uuid(&value, "contour").map(ContourId))
+            .transpose()
+    }
+
+    /// Declare, or replace, which contour the owner's reports are about.
+    ///
+    /// An upsert, the shape [`Self::record_account_scope_exclusion`] uses and
+    /// for the same reason: the owner has one reporting perimeter or none, so a
+    /// second declaration replaces the one standing rather than standing beside
+    /// it. The returned flag says whether this call changed the declaration —
+    /// declaring the contour already declared writes nothing at all, and a
+    /// caller that wrote an entry into the owner's review for every call would
+    /// otherwise record an act that never happened.
+    ///
+    /// **Existence and ownership are not checked here.** They are checked by
+    /// the table's own triggers, which refuse a contour this owner holds no
+    /// version of — the check a foreign key would have made, and the reason it
+    /// cannot be a foreign key is written on that migration.
+    pub fn record_report_default_contour(
+        &self,
+        owner: OwnerId,
+        contour: ContourId,
+    ) -> Result<bool, StoreError> {
+        // The guard on the update is what makes a repeat a no-op: `EXCLUDED` is
+        // the row the caller offered, so declaring the same contour again
+        // touches no row and this reports `false`, while restating the
+        // declaration on another contour replaces it and reports `true`.
+        let changed = self.conn.execute(
+            "INSERT INTO contour_report_defaults (owner, contour, recorded_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (owner) DO UPDATE SET
+                 contour = excluded.contour,
+                 recorded_at = excluded.recorded_at
+             WHERE contour_report_defaults.contour IS NOT excluded.contour",
+            params![
+                owner.inner().to_string(),
+                contour.0.to_string(),
+                now()
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Withdraw the declaration, leaving the owner's reports with nothing
+    /// declared.
+    ///
+    /// Deletes the row rather than writing a third value, for
+    /// [`Self::withdraw_account_retraction`]'s reason: the absence of a row is
+    /// what «undeclared» means everywhere this table is read, and two ways of
+    /// spelling one state is how they come to disagree. The answer is the
+    /// contour the withdrawal reached, or `None` when none was standing — the
+    /// subject the owner's review joins the act by, and the reason this is not a
+    /// bare flag.
+    ///
+    /// One statement, with `RETURNING`, rather than a read followed by a delete:
+    /// the contour this reports must be the one this call removed, and two
+    /// statements between which another process could restate the declaration
+    /// would report whichever of them happened to be read.
+    pub fn withdraw_report_default_contour(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Option<ContourId>, StoreError> {
+        let withdrawn: Option<String> = self
+            .conn
+            .query_row(
+                "DELETE FROM contour_report_defaults WHERE owner = ?1
+                 RETURNING contour",
+                [owner.inner().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        withdrawn
+            .map(|value| parse_uuid(&value, "contour").map(ContourId))
+            .transpose()
+    }
+
     /// Circuit composition at a version **for the specified owner**.
     ///
     /// The owner is part of the query rather than checked afterward: a circuit

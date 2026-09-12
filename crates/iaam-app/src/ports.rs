@@ -992,6 +992,46 @@ pub trait Store: Send + Sync {
         declarations: AccountDeclarations,
     ) -> Result<AccountDeclarationsRecorded, AppError>;
     async fn list_contours(&self, owner: OwnerId) -> Result<Vec<ContourView>, AppError>;
+
+    /// The contour the owner's reports are about, or `None` when he has
+    /// declared none (`iaam-14is`).
+    ///
+    /// A stated fact and not an inference: nothing here scores, orders or
+    /// derives a contour from its version or its size, and «he has not said» is
+    /// its own answer. A caller reads it and then names that contour in its
+    /// report request; no report reads it, and `contour` stays required on the
+    /// reports that take one.
+    async fn report_default_contour(&self, owner: OwnerId) -> Result<Option<ContourId>, AppError>;
+
+    /// Declare, or replace, which contour the owner's reports are about.
+    ///
+    /// Returns whether the declaration changed. Declaring the contour already
+    /// declared writes nothing and is not a failure: the caller asked for a
+    /// state, and it is the state that stands.
+    ///
+    /// **Whether the contour may be declared at all is not decided here.** The
+    /// contour must be one this owner holds and must have a composition rather
+    /// than an empty version; the first is refused by the store's own trigger
+    /// and the second by the transport, because an empty composition can reach
+    /// the store below the HTTP boundary and a declaration a caller would name
+    /// in a report is useless over a perimeter that covers no account.
+    async fn record_report_default_contour(
+        &self,
+        owner: OwnerId,
+        contour: ContourId,
+    ) -> Result<bool, AppError>;
+
+    /// Withdraw it, leaving the owner's reports with nothing declared.
+    ///
+    /// Withdrawal deletes the declaration; it is not a third state, and nothing
+    /// is put in its place. The answer is the contour the withdrawal reached, or
+    /// `None` when none was standing — the subject the owner's review joins the
+    /// act by, and the reason this is not a bare flag.
+    async fn withdraw_report_default_contour(
+        &self,
+        owner: OwnerId,
+    ) -> Result<Option<ContourId>, AppError>;
+
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
     async fn list_account_activity(
         &self,

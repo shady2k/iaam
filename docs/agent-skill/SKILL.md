@@ -155,7 +155,7 @@ key you read. Check the schema before you trust a silence.
 Most lists are the array itself, nothing wrapping it: his accounts, his
 categories and their groups, his classification and category rule histories, the
 source-category words he has used, his tokens, his broker access entries, his
-contours, his import sessions, his recorded decisions, and every verdict a batch
+import sessions, his recorded decisions, and every verdict a batch
 call hands back — one per row he submitted, in his own order.
 
 A list comes back wrapped in an object exactly where the answer has something
@@ -174,6 +174,10 @@ named field beside that fact, never at the top level:
   proposed against;
 - an account's transfer partners — `partners`, beside whether the owner has
   ruled at all, which an empty list cannot say on its own;
+- the contours and the one his reports are about — the contours, beside the
+  contour a caller is meant to name in a report request. Which of them he
+  reports over is true of the whole list and of no contour in it, and an owner
+  who has named none has to be able to read exactly that;
 - an import session's contents — `questions`, beside the session's own row
   count;
 - the outstanding-work queue — `items`, beside which of the four reports each
@@ -193,6 +197,22 @@ Look the field up by name from the published schema every time — never assume
 `events`, `data`, or the word the route uses for what it lists in prose. Getting
 that one field right is the only check there is: nothing downstream notices when
 you read the wrong one, and the mistake looks exactly like the truth.
+
+### The contour the reports are about, and who chooses it
+
+A report request carries the contour it is about. Nothing chooses one for you: a
+request that leaves it out is refused, whether or not the owner has said which
+contour his reports are about. So the answer is something you read and then
+name — the list of contours carries the one he says his reports are about, and
+you put that contour in the request yourself.
+
+When he has not said, and more than one contour stands, ask him rather than
+pick. Show him the contours and what each one covers, ask which of them his
+figures are about, record his answer, and then name it. The call that records it
+is published in the contour list's own schema beside the fact, the same way
+every other call in this API is found. This is the whole reason the declaration
+exists: two contours with one title are otherwise indistinguishable in every
+answer, and a choice made without him is a guess about his money.
 
 ## The agent is an external client
 

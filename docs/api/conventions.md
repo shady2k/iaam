@@ -208,8 +208,9 @@ things. Read it as the lookup table for §1.
 | `GET /v1/journal/source-categories` | `[string]` | bare array | exact source vocabulary for the optional account and effective-date scope |
 | `GET /v1/tokens` | `[TokenDto]` | bare array | whole list, revoked included |
 | `GET /v1/broker-access` | `[BrokerAccessDto]` | bare array | whole list, revoked included |
-| `GET /v1/contours` | `[ContourDto]` | bare array | whole list; each contour carries its own version |
+| `GET /v1/contours` | `ContourListDto` | object, `contours` | `default_contour` — the contour the owner's reports are about, and `null` when he has declared none. Which contour his reports are about is a fact about the whole list that no contour row can carry, and an owner who has declared none has to be told exactly that rather than left to infer it from rows that say nothing about it (§1.4a, iaam-14is). **A caller reads it and names it; nothing resolves it for him** — `contour` stays required on the reports that take one, no report reads the declaration, and a request that omits the parameter is refused as it always was. The field is the declaration itself and not a copy of the contour: its name is the `title` of its own item in this same response, so a title copied beside the identifier would be a second place one title lives |
 | `POST /v1/contours` | `ContourVersionDto` | object, `accounts` | `created` — whether this call brought the contour into existence, which no account in the composition can say; `POST /v1/contours/{contour}/versions` answers the same shape for a later version of one already there |
+| `PUT /v1/report-default-contour` | `ContourListDto` | object, `contours` | the same object and the same reason as the read above: declaring which contour the reports are about leaves a state to publish, and `default_contour` is that state. `DELETE /v1/report-default-contour` answers the same shape with `default_contour` `null`, which is how a caller reads back that nothing is declared |
 | `GET /v1/import-sessions` | `[ImportSessionSummaryDto]` | bare array | whole list, newest first; each entry carries `row_count` and `unanswered` beside the header, so «which import is still waiting on me» is one request rather than one per session |
 | `GET /v1/decisions` | `[DecisionDto]` | bare array | the owner's own after-the-fact audit; nothing is true of the whole trail that is not true of one entry — each names its own actor, what it settled and what undoes it |
 | `GET /v1/actions` | `ActionsResponseDto` | object, `items` | `reports` — where each of the four reports stands, which is stated for an unobstructed one by the absence of items and so can be carried by none of them (§1.4a) |
@@ -571,6 +572,17 @@ The undo must be part of the operation's contract:
 - A control balance is restated under the same account and period. It is
   admitted even though it is the owner's assertion about the outside world:
   unlike a credential, it is still a reversible record.
+- The contour the owner's reports are about is declared, restated and withdrawn
+  by `PUT` and `DELETE /v1/report-default-contour`. It carries no
+  `OperationKey`: the queue speaks in work the owner owes, and this is guidance
+  a caller reads rather than work — an item that stood until he declared one
+  would be this system asking him to settle a question none of his figures
+  leaves open. The act is reversible, so it is not owner-only either; the two
+  routes read the same agent floor the keyed acts beside them publish, and the
+  register in `iaam-server::routes` carries that argument beside the route
+  names. It is a statement a caller reads and then names in a report request,
+  not a substitution the server performs: no report reads it, and §2's row for
+  the contour list says so where a client will meet it.
 
 Issuing a token, issuing broker access and changing the encryption key remain
 owner-only because they cannot be put back. Read-only is the absence of every
@@ -597,6 +609,7 @@ write above.
 | Write classification, category and account rules | yes | yes | no |
 | Record or withdraw a product's retirement | yes | yes | no |
 | Record or withdraw that a printed account name is not the owner's | yes | yes | no |
+| Record or withdraw the contour the reports are about | yes | yes | no |
 | Create accounts, contours, categories, instruments | yes | yes | no |
 | Issue and revoke tokens and broker access | yes | no | no |
 

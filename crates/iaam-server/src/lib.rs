@@ -115,6 +115,10 @@ pub fn build(state: ServerState) -> Result<(Router, utoipa::openapi::OpenApi), B
             routes::create_contour_version
         ))
         .routes(routes!(routes::get_contour))
+        .routes(routes!(
+            routes::declare_report_default_contour,
+            routes::withdraw_report_default_contour
+        ))
         .routes(routes!(routes::add_contour_version))
         .routes(routes!(routes::ingest_operations))
         .routes(routes!(

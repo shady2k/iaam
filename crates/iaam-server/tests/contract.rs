@@ -10606,6 +10606,104 @@ async fn the_queue_says_where_each_report_stands_and_names_what_stands_in_the_wa
     }
 }
 
+/// Every report standing names the call that states the rest.
+///
+/// The defect this closes: the queue answered with four standings whose
+/// `blocked_by` were empty, and the same instance's money-flow report came back
+/// `complete: false` with a dozen items needing the owner. An empty
+/// `blocked_by` says only that no item under `items` stands in the way, and a
+/// caller who read it as «this report is ready» had nothing else in the response
+/// to read: the diagnostics a report computes over one contour over one interval
+/// are not work this queue holds. So every standing names the call that carries
+/// them, and the two documents that already state the address are what this
+/// checks it against — the catalog's own goal link, and the GET the contract
+/// declares at that path. Four operation identifiers written out here instead
+/// would be a second copy of the goal-to-route mapping, kept green by being
+/// edited to whatever that mapping became.
+#[tokio::test]
+async fn every_report_standing_names_the_call_that_answers_it() {
+    for harness in [harness().await, empty_owner_harness().await] {
+        let (status, body) = call(
+            &harness.router,
+            get("/v1/actions", Some(&harness.owner_token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (_, _, catalog_body) =
+            call_raw(&harness.router, get("/.well-known/api-catalog", None)).await;
+        let catalog: Value = serde_json::from_slice(&catalog_body).expect("catalog JSON");
+        let linked = |goal: &str| -> String {
+            catalog["linkset"][0]["related"]
+                .as_array()
+                .expect("related links")
+                .iter()
+                .find(|link| link["goal"] == goal)
+                .unwrap_or_else(|| panic!("the catalog links no route for {goal}: {catalog}"))["href"]
+                .as_str()
+                .expect("an href")
+                .to_owned()
+        };
+
+        let reports = body["reports"].as_array().expect("report standings");
+        let mut addressed: BTreeSet<String> = BTreeSet::new();
+        for report in reports {
+            let goal = report["goal"].as_str().expect("a goal name");
+            let answered_by = report["answered_by"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{report} names no call: {body}"));
+            let path = answered_by["path"].as_str().expect("a path");
+            let operation_id = answered_by["operationId"].as_str().expect("an operation id");
+            assert_eq!(
+                path,
+                linked(goal),
+                "{report} is answered somewhere the catalog does not link this goal to: {body}"
+            );
+            assert_eq!(
+                answered_by["method"], "GET",
+                "{report} names a call that is not the read it is answered by: {body}"
+            );
+            assert!(
+                answered_by.get("requestSchema").is_none(),
+                "a report takes its contour and its interval as query parameters and a body \
+                 from nobody: {report}"
+            );
+            // The floor, and the one value a client must not be given wrong: a
+            // report demands no write authority, so every token reaches it.
+            // Publishing `agent` here would tell a read-only caller it cannot
+            // make the one call the queue has just said nothing stands in front
+            // of.
+            assert_eq!(
+                answered_by["requiredScope"], "read_only",
+                "{report} names a floor above a token that can in fact read it: {body}"
+            );
+            // Resolved, not spelled: the address is a GET the contract declares,
+            // so the build that published it would have refused a dead one.
+            let item = harness
+                .api
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("{report} names a path the contract does not declare"));
+            let operation = item
+                .get
+                .as_ref()
+                .unwrap_or_else(|| panic!("{report} names a path that is not a GET in the contract"));
+            assert_eq!(
+                operation.operation_id.as_deref(),
+                Some(operation_id),
+                "{report} names an operation the contract does not declare at {path}"
+            );
+            addressed.insert(operation_id.to_owned());
+        }
+        assert_eq!(
+            addressed.len(),
+            ReportGoal::ALL.len(),
+            "two goals are answered by one call, so a client cannot tell them apart: {body}"
+        );
+    }
+}
+
 /// Every field the published queue asks the owner for carries his question.
 ///
 /// The field report `iaam-ytvf` was filed on is a client-visible one: an agent
@@ -10822,6 +10920,41 @@ async fn action_catalog_rejects_missing_and_duplicate_operation_ids() {
         ActionCatalog::from_openapi(&absent),
         Err(ActionCatalogError::MissingActionOperation { operation_id })
             if operation_id == "create_contour_version"
+    ));
+}
+
+/// A report answer that stops resolving refuses the build, like a key.
+///
+/// The address a standing publishes is resolved at start-up for the reason every
+/// other one is: an entry point that hands a client a call the router no longer
+/// serves is the failure the catalogue exists to refuse, and a report's answer is
+/// the one address a client reaches after the queue has told it that nothing
+/// stands in the way. A route that has moved and a route that has stopped being
+/// a read are both dead to a client following it, so both refuse.
+#[tokio::test]
+async fn action_catalog_rejects_a_report_answer_that_does_not_resolve() {
+    let harness = harness().await;
+
+    let mut absent = harness.api.clone();
+    absent.paths.paths.remove("/v1/reports/flow");
+    assert!(matches!(
+        ActionCatalog::from_openapi(&absent),
+        Err(ActionCatalogError::MissingAnswerOperation { operation_id })
+            if operation_id == "flow_report"
+    ));
+
+    let mut not_a_read = harness.api.clone();
+    let item = not_a_read
+        .paths
+        .paths
+        .get_mut("/v1/reports/flow")
+        .expect("flow report path");
+    let moved = item.get.take();
+    item.post = moved;
+    assert!(matches!(
+        ActionCatalog::from_openapi(&not_a_read),
+        Err(ActionCatalogError::MissingAnswerOperation { operation_id })
+            if operation_id == "flow_report"
     ));
 }
 
@@ -17471,6 +17604,7 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
         "CaveatDto",
         "CaveatSubjectDto",
         "ClosingOperationDto",
+        "ReportStandingDto",
     ] {
         assert!(
             spec["components"]["schemas"][schema].is_object(),
@@ -17499,6 +17633,20 @@ async fn the_openapi_document_declares_the_register_a_report_opens_with() {
     ] {
         assert!(closing[field].is_object(), "{field}: {closing}");
     }
+
+    // The queue publishes the same component for a standing's answer as a
+    // caveat does for its remedy, so a client that generated one reader from
+    // this document has the other. A standing that declared the field under a
+    // schema of its own would read identically on today's wire and stop
+    // matching the moment either shape moved.
+    let standing = &spec["components"]["schemas"]["ReportStandingDto"]["properties"];
+    for field in ["goal", "answers", "blocked_by", "answered_by"] {
+        assert!(standing[field].is_object(), "{field}: {standing}");
+    }
+    assert_eq!(
+        standing["answered_by"]["$ref"], caveat["closed_by"]["items"]["$ref"],
+        "a standing's answer and a caveat's remedy are no longer one published component"
+    );
 
     // `ReturnsAnswerDto` flattens the report into itself, which utoipa renders
     // as a composition rather than one property map, so the search follows

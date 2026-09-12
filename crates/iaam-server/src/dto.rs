@@ -8,7 +8,7 @@
 //! numbers: the JSON number `0.1` in binary floating point is not equal to one
 //! tenth, and a monetary amount passed through it ceases to be a fact.
 
-use crate::action_catalog::ActionCatalog;
+use crate::action_catalog::{ActionCatalog, ActionOperation};
 use crate::error::ApiError;
 use iaam_app::error::AppError;
 use iaam_app::ingest::classification::{
@@ -3086,7 +3086,11 @@ pub struct CaveatDto {
     pub closed_by: Vec<ClosingOperationDto>,
 }
 
-/// One operation a caveat names, addressed against the completed contract.
+/// One operation, addressed against the completed contract.
+///
+/// Two fields publish it, and the same code reads both: a caveat's `closed_by`,
+/// where it names a remedy, and a report standing's `answered_by`, where it names
+/// the call that produces that report.
 ///
 /// `ResolutionOptionDto` without the `request`, and spelled identically in every
 /// field they share so that a client reading an action's target reads this with
@@ -3108,10 +3112,31 @@ pub struct ClosingOperationDto {
     /// takes no body — see [`crate::action_catalog::ActionOperation`].
     #[serde(rename = "requestSchema", skip_serializing_if = "Option::is_none")]
     pub request_schema: Option<String>,
-    /// The narrowest token scope that reaches this call: `owner` or `agent`.
-    /// A floor, exactly as on a resolution — see [`ResolutionOptionDto`].
+    /// The narrowest token scope that reaches this call: `owner`, `agent` or
+    /// `read_only`. A floor, exactly as on a resolution — see
+    /// [`ResolutionOptionDto`]. `read_only` is the third value because a report
+    /// answer is published in the same shape as a remedy and demands no write
+    /// authority: it is the floor `iaam_app::ports` defines as reachable by
+    /// every token.
     #[serde(rename = "requiredScope")]
     pub required_scope: String,
+}
+
+impl ClosingOperationDto {
+    /// Address one operation the catalogue has resolved against the contract.
+    ///
+    /// The one conversion, so that a caveat's remedy and a report standing's
+    /// answer cannot come to spell the same operation differently.
+    #[must_use]
+    pub fn from_operation(resolved: &ActionOperation) -> Self {
+        Self {
+            operation_id: resolved.operation_id.clone(),
+            method: resolved.method.clone(),
+            path: resolved.path.clone(),
+            request_schema: resolved.request_schema.clone(),
+            required_scope: resolved.required_scope.code().to_owned(),
+        }
+    }
 }
 
 /// The typed subject of a caveat.
@@ -3178,16 +3203,7 @@ impl CaveatDto {
             closed_by: caveat
                 .closed_by()
                 .iter()
-                .map(|key| {
-                    let resolved = catalog.operation(*key);
-                    ClosingOperationDto {
-                        operation_id: resolved.operation_id.clone(),
-                        method: resolved.method.clone(),
-                        path: resolved.path.clone(),
-                        request_schema: resolved.request_schema.clone(),
-                        required_scope: resolved.required_scope.code().to_owned(),
-                    }
-                })
+                .map(|key| ClosingOperationDto::from_operation(catalog.operation(*key)))
                 .collect(),
         }
     }
@@ -4990,7 +5006,14 @@ impl NegativeBalanceExpectationDto {
 /// cannot disagree.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ActionsResponseDto {
-    /// Everything outstanding for this owner, most urgent first.
+    /// The work this owner's stored state needs, most urgent first: the fold
+    /// over accounts, contours, scope exclusions, transfer statements, import
+    /// sessions and classification rules — and not the diagnostics a report
+    /// computes over one contour and one interval, which each report publishes
+    /// for itself.
+    ///
+    /// An empty list here therefore says that no such work is outstanding, and
+    /// each standing below names the call that states the rest.
     pub items: Vec<ActionDto>,
     /// The four reports this API computes, each with what stands between the
     /// owner and it. Always all four, in the order `asset_snapshot`,
@@ -5048,15 +5071,33 @@ pub struct ReportStandingDto {
     /// any one report — so it stands in the way of every report by standing in
     /// the way of everything.
     pub blocked_by: Vec<String>,
+    /// The call that produces this report, whose response carries that report's
+    /// own diagnostics and its confidence register.
+    ///
+    /// Every standing names one. The two halves of this response answer
+    /// different questions: `blocked_by` grades the setup work under `items`,
+    /// and the diagnostics standing between the owner and a complete answer are
+    /// computed over one contour and one interval, which this queue holds
+    /// neither of. So a standing with an empty `blocked_by` says that no item
+    /// here stands in the way, and this is where a caller goes to read what the
+    /// report still says about itself.
+    ///
+    /// Addressed and spelled exactly as a caveat's `closed_by`, so a client that
+    /// reads one reads the other with the same code — see [`ClosingOperationDto`].
+    pub answered_by: ClosingOperationDto,
 }
 
 impl ReportStandingDto {
     #[must_use]
-    pub fn from_domain(standing: &ReportStanding) -> Self {
+    pub fn from_domain(standing: &ReportStanding, catalog: &ActionCatalog) -> Self {
         Self {
             goal: standing.goal().code().to_owned(),
             answers: standing.goal().answers().to_owned(),
             blocked_by: standing.blocked_by().to_vec(),
+            // Resolved through the goal-to-route mapping the catalog document
+            // links each goal by, never spelled here: an address a client cannot
+            // follow is the failure `ActionCatalog::from_openapi` refuses.
+            answered_by: ClosingOperationDto::from_operation(catalog.answering(standing.goal())),
         }
     }
 }

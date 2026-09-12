@@ -258,7 +258,7 @@ pub async fn list_actions(
     // states of this instance.
     let reports = iaam_app::actions::report_standings(&actions)
         .iter()
-        .map(ReportStandingDto::from_domain)
+        .map(|standing| ReportStandingDto::from_domain(standing, &catalog))
         .collect();
     Ok(Json(ActionsResponseDto {
         items: actions

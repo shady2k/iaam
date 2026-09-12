@@ -98,7 +98,13 @@ const SCOPES_OPERATION: &str = "list_contours";
 /// names one, the one whose answer is the whole holding at a date; the other is
 /// in the contract, a client that wants it reads it there. Publishing both would
 /// hand a cold client a choice it has no basis to make.
-const fn answering_operation(goal: ReportGoal) -> &'static str {
+///
+/// Two readers, and the visibility is widened for the second: this document
+/// links each goal to its route, and a report standing publishes the same
+/// address as `answered_by`. The two read this one function rather than each
+/// carrying the mapping, so the link a cold client follows and the call a client
+/// holding the queue is told to make cannot come apart.
+pub(crate) const fn answering_operation(goal: ReportGoal) -> &'static str {
     match goal {
         ReportGoal::AssetSnapshot => "asset_snapshot_report",
         ReportGoal::MoneyFlow => "flow_report",
@@ -147,7 +153,8 @@ impl ApiCatalog {
                 "What this instance needs next, computed from its own state. Each item names \
                  the operation that closes it, the fields already decided, and the goals below \
                  it stands in the way of. Work this queue rather than reconstructing an order \
-                 of setup.",
+                 of setup. This queue grades setup work: a goal it leaves unobstructed can \
+                 still have diagnostics and caveats of its own, which that goal's report states.",
                 None,
             ),
             link(

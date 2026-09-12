@@ -5,6 +5,9 @@ use utoipa::openapi::{OpenApi, RefOr, path::Operation};
 
 use iaam_app::actions::OperationKey;
 use iaam_app::ports::{Scope, required_scope};
+use iaam_core::goal::ReportGoal;
+
+use crate::api_catalog::answering_operation;
 
 /// A route address resolved from the completed OpenAPI document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,21 +33,40 @@ pub struct ActionOperation {
     /// schema, and this catalogue reads all three off it; it does not state an
     /// authority. Every route declares the same `security(("bearer" = []))`,
     /// and the prose beside the 403 already disagrees with the handlers.
-    /// So the floor is taken from `iaam_app::ports::required_scope`, which is
-    /// the same statement `iaam_server::routes` gates the route by — see that
-    /// function for why the fact is not written into the document instead.
+    /// So the floor is taken from `iaam_app::ports`, which is the same module
+    /// `iaam_server::routes` gates a write route by — see [`required_scope`] for
+    /// why the fact is not written into the document instead.
+    ///
+    /// Two entries take it two ways, and both are that module's statement. An
+    /// [`OperationKey`] is answered by [`required_scope`], which is total over
+    /// the vocabulary. A report answer is [`Scope::ReadOnly`], the floor that
+    /// module defines as the one every token is admitted to: a report is a read,
+    /// it deliberately has no key, and no write authority stands in front of it.
     ///
     /// It is carried here rather than looked up at each use for the reason the
-    /// address is: an action's target, a caveat's remedy and a refusal's way
-    /// out are all built from an [`ActionOperation`], and a second lookup
-    /// beside one of them is a second answer.
+    /// address is: an action's target, a caveat's remedy, a refusal's way out
+    /// and a standing's answer are all built from an [`ActionOperation`], and a
+    /// second lookup beside one of them is a second answer.
     pub required_scope: Scope,
 }
 
-/// The operation addresses advertised by computed actions.
+/// The operation addresses this transport publishes.
+///
+/// Two readers, holding two kinds of call. A computed action, a caveat's remedy
+/// and a refusal's way out name an [`OperationKey`], which is a call that
+/// changes something and therefore resolves against the whole vocabulary. A
+/// report standing names the call that answers its goal, which is a read: it has
+/// no key, and it resolves through the one goal-to-route mapping the catalog
+/// document also publishes — [`answering_operation`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionCatalog {
     operations: BTreeMap<&'static str, ActionOperation>,
+    /// The call that produces each goal's report, by goal.
+    ///
+    /// A map rather than four fields because the four are read by iterating the
+    /// vocabulary: a goal added to [`ReportGoal`] is resolved here or the build
+    /// fails, exactly as a twenty-first [`OperationKey`] is.
+    answers: BTreeMap<ReportGoal, ActionOperation>,
 }
 
 /// A failure found while resolving action references against OpenAPI.
@@ -56,6 +78,8 @@ pub enum ActionCatalogError {
     MissingActionOperation { operation_id: String },
     #[error("operation_id {operation_id} is declared more than once")]
     DuplicateOperationId { operation_id: String },
+    #[error("report answer {operation_id} does not resolve to an OpenAPI GET operation")]
+    MissingAnswerOperation { operation_id: String },
 }
 
 impl ActionCatalog {
@@ -120,7 +144,42 @@ impl ActionCatalog {
             );
         }
 
-        Ok(Self { operations })
+        // The four reports, through the one mapping that decides which route
+        // answers which goal. Not read from `OperationKey`, which deliberately
+        // holds only calls that change something: a report is a read, so its
+        // address cannot come from the loop above and arriving here through the
+        // catalogue is the only way it reaches a caller. The mapping is not
+        // written out again to get it — [`answering_operation`] is the same
+        // function the catalog document links each goal by, and the build fails
+        // on a goal whose route has gone, exactly as it does for a key.
+        let mut answers = BTreeMap::new();
+        for goal in ReportGoal::ALL {
+            let operation_id = answering_operation(goal);
+            let Some((path, method, operation)) = by_id
+                .get(operation_id)
+                .filter(|resolved| resolved.1 == "GET")
+            else {
+                return Err(ActionCatalogError::MissingAnswerOperation {
+                    operation_id: operation_id.to_owned(),
+                });
+            };
+            answers.insert(
+                goal,
+                ActionOperation {
+                    operation_id: operation_id.to_owned(),
+                    method: method.clone(),
+                    path: path.clone(),
+                    request_schema: request_schema(operation),
+                    // A report takes its contour and its interval as query
+                    // parameters and a body from nobody. Nothing stands between
+                    // a token and it, which is the floor `iaam_app::ports`
+                    // defines as reachable by every token.
+                    required_scope: Scope::ReadOnly,
+                },
+            );
+        }
+
+        Ok(Self { operations, answers })
     }
 
     /// Return the route address for an operation.
@@ -133,6 +192,19 @@ impl ActionCatalog {
     #[must_use]
     pub fn operation(&self, key: OperationKey) -> &ActionOperation {
         &self.operations[key.as_str()]
+    }
+
+    /// Return the route address of the call that produces a goal's report.
+    ///
+    /// Total for the reason [`Self::operation`] is, and made so by the same
+    /// build: the four goals are resolved at start-up or the server does not
+    /// start, so a standing that reaches here has an address rather than a
+    /// field to publish as absent. It is a lookup rather than an `Option` for
+    /// the same reason too — a caller publishing an address a client cannot
+    /// follow is the failure this catalogue exists to refuse.
+    #[must_use]
+    pub fn answering(&self, goal: ReportGoal) -> &ActionOperation {
+        &self.answers[&goal]
     }
 }
 

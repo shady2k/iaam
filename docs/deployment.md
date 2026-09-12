@@ -442,7 +442,7 @@ $ curl -sS http://127.0.0.1:8080/v1/health
 {"status":"ok","schema_version":12,"projection_version":8}
 
 $ curl -sS -H "authorization: Bearer $OWNER" http://127.0.0.1:8080/v1/actions
-{"items":[{"id":"create_first_account","kind":"create_first_account","category":"blocking","goals":[],"state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered. Which accounts to create is a question this instance answers rather than guesses at, …","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","requiredScope":"owner","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}],"reports":[{"goal":"asset_snapshot","answers":"What the owner holds at a date: cash and positions, and the whole.","blocked_by":["create_first_account"]},{"goal":"money_flow","answers":"Where money came from and where it went, over an interval.","blocked_by":["create_first_account"]},{"goal":"returns","answers":"What the money earned, before tax.","blocked_by":["create_first_account"]},{"goal":"reconciliation","answers":"Whether the journal agrees with what the sources say.","blocked_by":["create_first_account"]}]}
+{"items":[{"id":"create_first_account","kind":"create_first_account","category":"blocking","goals":[],"state":"needs_owner_input","reason":"No account exists; create one before portfolio actions can be offered. Which accounts to create is a question this instance answers rather than guesses at, …","required_scope":"owner","target":{"type":"operation","operationId":"create_account","method":"POST","path":"/v1/accounts","requestSchema":"#/components/schemas/CreateAccountRequest","requiredScope":"owner","request":{"missing":[{"pointer":"/title","provided_by":"owner"}]}}}],"reports":[{"goal":"asset_snapshot","answers":"What the owner holds at a date: cash and positions, and the whole.","blocked_by":["create_first_account"],"answered_by":{"operationId":"asset_snapshot_report","method":"GET","path":"/v1/reports/assets","requiredScope":"read_only"}},{"goal":"money_flow","answers":"Where money came from and where it went, over an interval.","blocked_by":["create_first_account"],"answered_by":{"operationId":"flow_report","method":"GET","path":"/v1/reports/flow","requiredScope":"read_only"}},{"goal":"returns","answers":"What the money earned, before tax.","blocked_by":["create_first_account"],"answered_by":{"operationId":"returns_report","method":"GET","path":"/v1/reports/returns","requiredScope":"read_only"}},{"goal":"reconciliation","answers":"Whether the journal agrees with what the sources say.","blocked_by":["create_first_account"],"answered_by":{"operationId":"reconciliation","method":"GET","path":"/v1/reconciliation","requiredScope":"read_only"}}]}
 ```
 
 The first call is the discovery document (RFC 9727) and the entry point for an
@@ -480,7 +480,11 @@ carries what it answers, in a sentence a person can be read, and the identity of
 every item standing in its way, most urgent first. An empty `blocked_by` says
 nothing outstanding stands in the way of that report. It does not say the report
 is complete: a report states what it is silent or partial about in its own
-confidence register, which this queue does not read. Here all four are held up by
+confidence register, which this queue does not read. Each standing names that
+register's own call in `answered_by` — resolved from the contract at start-up,
+and `read_only` because a report demands no write authority — so a caller told
+that nothing stands in the way has the address to go and read what the report
+still says about itself. Here all four are held up by
 the one blocking item, which is what a freshly claimed instance should say — it
 holds no account, no scope and no fact.
 

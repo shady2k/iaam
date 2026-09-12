@@ -757,7 +757,11 @@ would refuse a request the server would have accepted.
 So the item's `requiredScope` is now derived and each **resolution** publishes
 one of its own. A caveat's `closed_by` entries carry the same field, for the
 same reason: a register that names a remedy whose floor is above the caller has
-told it to make a call that will be refused.
+told it to make a call that will be refused. A queue standing's `answered_by`
+carries it too, and it is the one place the value is `read_only`: a report
+demands no write authority, so it is the field that keeps a client from
+filtering out — on the strength of its own token — the one call the standing has
+just said nothing stands in front of.
 
 Two things a client should read off that:
 
@@ -778,7 +782,8 @@ The contract itself does not state the floor: every route declares the same
 bearer requirement, and the prose beside a refusal already disagrees with the
 handlers in places. Publishing it there as well would be a second statement with
 nothing reading it back, which is the defect this section exists to remove. It is
-published where a client chooses a call — on the resolution and on the remedy.
+published where a client chooses a call — on the resolution, on the remedy, and
+on a standing that names the report answering its goal.
 See decision 0021.
 
 ---

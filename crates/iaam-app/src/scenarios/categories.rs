@@ -221,12 +221,14 @@ fn preview_category_rule_from(
     let current = LoadedCategoryIndex {
         rules: active_rules.to_vec(),
         versions: Vec::new(),
+        categories: Vec::new(),
         category_count: 0,
         proposed: None,
     };
     let proposed_index = LoadedCategoryIndex {
         rules: active_rules.to_vec(),
         versions: Vec::new(),
+        categories: Vec::new(),
         category_count: 0,
         proposed: Some(proposed.clone()),
     };
@@ -327,6 +329,17 @@ pub async fn retire_category_rule(
 pub(crate) struct LoadedCategoryIndex {
     rules: Vec<CategoryRule>,
     versions: Vec<u32>,
+    /// The owner's whole category reference exactly as it was read, retired
+    /// included. Held so that an answer folded under the rules above can name
+    /// the categories it decided with, out of the same read that produced
+    /// `category_count` — a second read would be a second statement of what
+    /// his reference holds.
+    categories: Vec<CategoryView>,
+    /// How many of the categories read above are not retired, and nothing else:
+    /// it answers «can spending be filed anywhere», which a retired category
+    /// cannot answer yes to. **It is not `categories.len()`** and must not
+    /// become it — the directory keeps every category he has ever made, because
+    /// a row referencing a retired one still has to be nameable.
     category_count: usize,
     proposed: Option<CategoryRuleProposal>,
 }
@@ -334,6 +347,10 @@ pub(crate) struct LoadedCategoryIndex {
 impl LoadedCategoryIndex {
     pub(crate) fn versions(&self) -> &[u32] {
         &self.versions
+    }
+
+    pub(crate) fn categories(&self) -> &[CategoryView] {
+        &self.categories
     }
 
     pub(crate) fn has_categories(&self) -> bool {
@@ -363,11 +380,9 @@ pub(crate) async fn load_index(
     services: &AppServices,
     principal: &Principal,
 ) -> Result<LoadedCategoryIndex, AppError> {
-    let category_count = services
-        .categories
-        .list_categories(principal.owner)
-        .await?
-        .into_iter()
+    let categories = services.categories.list_categories(principal.owner).await?;
+    let category_count = categories
+        .iter()
         .filter(|category| category.retired_at.is_none())
         .count();
     let stored = services
@@ -383,6 +398,7 @@ pub(crate) async fn load_index(
     Ok(LoadedCategoryIndex {
         rules: active,
         versions,
+        categories,
         category_count,
         proposed: None,
     })

@@ -3558,6 +3558,21 @@ pub struct MoneyFlowReportDto {
     /// include. Always present: the empty block says the figures are the
     /// journal and nothing else.
     pub held_rows: HeldRowsDto,
+    /// The owner's own word for every category this report references — the
+    /// `category` of each row under `went_out_by_category`, and of each
+    /// `earned_by_capital_by_source` that names one. Look a category up here
+    /// rather than calling `GET /v1/categories`.
+    ///
+    /// **A retired category is named here, never dropped.** A breakdown
+    /// legitimately references a category the owner has since retired, and
+    /// `retired` says so; a caller shown only a title would offer him one he
+    /// has said he no longer files under.
+    ///
+    /// A row whose `category` has no entry here names a category this instance
+    /// does not hold — the directory keeps every category he has ever made,
+    /// retirement included. The row is published unchanged, with the identifier
+    /// that is its reference, and no word is invented for it.
+    pub categories: Vec<CategoryNameDto>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -3627,6 +3642,26 @@ pub struct EarningSourceAmountDto {
 pub struct CategoryAmountDto {
     pub category: Uuid,
     pub amount: String,
+}
+
+/// The owner's own word for one category a report references.
+///
+/// The counterpart of `PopulationAccountDto`, for the other thing a breakdown
+/// row names: the row carries the identifier, and this carries what a reader
+/// needs in order to say the row out loud.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CategoryNameDto {
+    /// The category this names, exactly as the rows above print it.
+    pub category: Uuid,
+    /// His word for what money filed here was for. His register rather than a
+    /// vocabulary of ours, and the string a figure is read out to him under —
+    /// never the identifier beside it.
+    pub title: String,
+    /// Whether he has retired it, so that a caller does not offer it as
+    /// somewhere new spending can be filed. Named rather than filtered out:
+    /// the rows that reference it are still part of the answer. When he retired
+    /// it is published by `GET /v1/categories`, whose identifier this is.
+    pub retired: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -3793,6 +3828,15 @@ impl MoneyFlowReportDto {
             actions,
             population: PopulationDto::from_domain(population),
             held_rows: HeldRowsDto::from_domain(&outcome.held_rows),
+            categories: outcome
+                .categories
+                .iter()
+                .map(|category| CategoryNameDto {
+                    category: category.category.inner(),
+                    title: category.title.clone(),
+                    retired: category.retired,
+                })
+                .collect(),
         })
     }
 }

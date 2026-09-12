@@ -7,7 +7,7 @@ use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
 use iaam_core::event::correction::resolve;
 use iaam_core::event::kind::EventKind;
-use iaam_core::ids::{AccountId, ImportSessionId, InstrumentId};
+use iaam_core::ids::{AccountId, CategoryId, ImportSessionId, InstrumentId};
 use iaam_core::instrument::CurrencyRoles;
 use iaam_core::money::{CurrencyCode, PerUnitAmount};
 use iaam_core::numeric::approx::SolverPolicy;
@@ -38,7 +38,7 @@ use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
-use super::categories::load_index;
+use super::categories::{LoadedCategoryIndex, load_index};
 use super::import_session::{SessionRevision, plan_session};
 use crate::AppServices;
 use crate::error::AppError;
@@ -492,6 +492,26 @@ pub struct MoneyFlowReport {
     pub flow: MoneyFlow,
 }
 
+/// The owner's own word for a category a report's rows name.
+///
+/// The rows of a breakdown carry the identifier, because that is what
+/// identifies a category; this is what the identifier is read out under. The
+/// pair is made where the report is folded, out of the same read of his
+/// category reference the fold decided with, and never joined on afterwards by
+/// the transport: a name derived a second time is a name that can disagree with
+/// the answer printed beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryName {
+    pub category: CategoryId,
+    /// His word for what money filed here was for. Never absent, and never
+    /// filtered out because the category is retired: the rows that carry it
+    /// still have to be readable.
+    pub title: String,
+    /// Whether he has retired it — it is no longer somewhere new spending can
+    /// be filed — which a reader of a bare title would otherwise offer him.
+    pub retired: bool,
+}
+
 /// The flow answer: the report, and the population it answered about.
 ///
 /// A wrapper for the reason `ReturnsOutcome` is one — the population is a
@@ -506,6 +526,9 @@ pub struct MoneyFlowOutcome {
     /// The held rows these figures were folded over, and what they could not
     /// include.
     pub held_rows: HeldRows,
+    /// The owner's names for the categories every breakdown in `report` names —
+    /// the identifier each row carries, with the word for it.
+    pub categories: Vec<CategoryName>,
     categories_exist: bool,
 }
 
@@ -793,6 +816,10 @@ pub async fn money_flow(
     for event in effective {
         flow.apply(event, &definition, window, &categories)?;
     }
+    // Paired here, from the same read that produced the rules the fold decided
+    // with, and from what the fold actually referenced. The transport copies
+    // these; it never looks a category up.
+    let category_names = referenced_category_names(&categories, &flow)?;
     Ok(MoneyFlowOutcome {
         report: MoneyFlowReport {
             contour: query.contour,
@@ -804,8 +831,53 @@ pub async fn money_flow(
         },
         population,
         held_rows: held.statement,
+        categories: category_names,
         categories_exist,
     })
+}
+
+/// The owner's names for every category the flow's breakdowns name.
+///
+/// Built from what the report references, not from his whole reference: a table
+/// listing every category he has ever made would name categories no row here
+/// mentions, and a reader would take them for part of the answer.
+///
+/// The directory is the unfiltered read, so a category he has since retired is
+/// named like any other — the rows that reference it are published, and they
+/// still have to be readable. A reference the directory does not hold is left
+/// unnamed rather than given a title nothing holds: the row keeps the identifier
+/// it carries, exactly as every breakdown row did before this table existed, and
+/// no word is invented for it.
+fn referenced_category_names(
+    index: &LoadedCategoryIndex,
+    flow: &MoneyFlow,
+) -> Result<Vec<CategoryName>, AppError> {
+    let directory = index
+        .categories()
+        .iter()
+        .map(|category| (category.id, category))
+        .collect::<BTreeMap<_, _>>();
+    let mut referenced = BTreeSet::new();
+    for currency in flow.currencies() {
+        for (category, _) in flow.went_out_by_category(currency)? {
+            referenced.insert(category);
+        }
+        for (source, _) in flow.earned_by_capital_by_source(currency)? {
+            if let Some(category) = source.category {
+                referenced.insert(category);
+            }
+        }
+    }
+    Ok(referenced
+        .into_iter()
+        .filter_map(|category| {
+            directory.get(&category).map(|held| CategoryName {
+                category,
+                title: held.title.clone(),
+                retired: held.retired_at.is_some(),
+            })
+        })
+        .collect())
 }
 
 /// The balances answer, and the held rows it was folded over.

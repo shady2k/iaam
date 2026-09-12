@@ -100,7 +100,38 @@ use crate::{SqliteStore, StoreError};
 /// comment says a version bump exists to refuse rather than commit quietly,
 /// so the version is bumped for it even though nothing about reading an older
 /// archive under this build needed one.
-pub const BUNDLE_VERSION: u32 = 6;
+///
+/// Version 7 (`iaam-14is.4`) adds [`Bundle::contour_report_defaults`]: the
+/// contour the owner's reports are about, in the shape
+/// `contour_report_defaults` stores it. Reading an older archive needed no
+/// bump either — the section is optional and contributes no bytes when
+/// empty, exactly as version 6's field does — and an older build does not
+/// drop it silently the way version 6's paragraph describes, because a build
+/// that only knows version 6 refuses a version-7 archive outright rather
+/// than restoring it and losing the declaration on its own next export.
+///
+/// What the bump is for is the archive that answers «he has declared none».
+/// That answer is an absent section, and so is the silence of an archive
+/// written before the table existed; the two are the same bytes and mean
+/// opposite things. `bundle_version` is what tells them apart, and only a
+/// bump can, so the rule is stated in both directions and neither may be
+/// read alone:
+///
+/// - **At version 7 and above, an absent section is a statement.** The build
+///   that wrote the archive knew the section exists and would have written it,
+///   so its emptiness is the owner's own «no reporting contour is declared» at
+///   export time.
+/// - **At version 6 and below, the section is unknown and its absence says
+///   nothing.** That archive was written before the table existed; it carries
+///   no declaration because nobody could write one, and whether the owner had
+///   declared a contour is «not recorded», exactly as an absent
+///   [`Bundle::schema_generation`] is not «this build's generation».
+///
+/// A reader must not take the second for the first — a state nobody recorded
+/// is not a decision the owner took — and restoring either leaves the instance
+/// with no declaration, so the difference is in what may be *concluded* about
+/// the owner's intent, not in the row a restore writes.
+pub const BUNDLE_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContourSection {
@@ -271,6 +302,29 @@ pub struct AccountScopeExclusionSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountRetractionSection {
     pub account: uuid::Uuid,
+    pub recorded_at: String,
+}
+
+/// The contour the owner's reports are about, carried the way
+/// `contour_report_defaults` stores it (`iaam-14is.4`).
+///
+/// A current statement, not a history: at most one row per owner, so this
+/// section holds at most one element in an archive this build writes, and a
+/// restore refuses an archive carrying more than one rather than picking. The
+/// absence of the whole section is «he has declared none» in an archive at
+/// version 7 and above, and «not recorded» in one written at version 6 or
+/// below, before the section existed (see [`BUNDLE_VERSION`], which is what
+/// separates the two). No version travels beside the contour: the
+/// declaration is about the contour identity, and one pinned to a version
+/// would keep reporting over a perimeter the owner later widened, which is
+/// the one thing the table exists to prevent.
+///
+/// Like [`AccountRetractionSection`], it carries no actor: who declared it
+/// travels on `decision_history`, joined by subject, which is a section of
+/// its own here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContourReportDefaultSection {
+    pub contour: uuid::Uuid,
     pub recorded_at: String,
 }
 
@@ -778,6 +832,18 @@ pub struct Bundle {
     /// never have existed (`iaam-o0oj`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_retractions: Vec<AccountRetractionSection>,
+    /// The contour the owner's reports are about (`iaam-14is.4`), when he has
+    /// declared one.
+    ///
+    /// Empty is not one fact but two, and [`BUNDLE_VERSION`] is what decides
+    /// which: an archive at version 7 and above with no section is a positive
+    /// «he has declared no reporting contour», and one written at version 6 or
+    /// below — before the section existed — says nothing at all about his
+    /// declaration. The field is `#[serde(default)]` so an older archive still
+    /// deserializes; the version is what keeps its emptiness from being read
+    /// as the owner's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contour_report_defaults: Vec<ContourReportDefaultSection>,
     /// Every account alias.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_aliases: Vec<AccountAliasSection>,
@@ -875,6 +941,8 @@ struct BundleContent<'a> {
     account_retirements: &'a [AccountRetirementSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     account_retractions: &'a [AccountRetractionSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    contour_report_defaults: &'a [ContourReportDefaultSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     account_aliases: &'a [AccountAliasSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -996,6 +1064,7 @@ impl Bundle {
             account_transfers: &self.account_transfers,
             account_retirements: &self.account_retirements,
             account_retractions: &self.account_retractions,
+            contour_report_defaults: &self.contour_report_defaults,
             account_aliases: &self.account_aliases,
             declined_account_names: &self.declined_account_names,
             decision_history: &self.decision_history,
@@ -1186,6 +1255,13 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     // reason: a restore that dropped it would silently un-retract an account
     // an agent had withdrawn from every report (`iaam-o0oj`).
     ("account_retractions", TableDisposition::Carried),
+    // The owner's answer to the question a field report had to guess at: two
+    // contours with one title, and nothing in either row saying which his
+    // reports are about. A restore that dropped it would put the next agent
+    // back in front of the same collision with the same nothing to decide by,
+    // and the guess it would make is a statement about the owner's money that
+    // no response records (`iaam-14is`).
+    ("contour_report_defaults", TableDisposition::Carried),
     ("account_aliases", TableDisposition::Carried),
     ("declined_account_names", TableDisposition::Carried),
     ("decision_history", TableDisposition::Carried),
@@ -1643,6 +1719,26 @@ impl SqliteStore {
             let (account, recorded_at) = row?;
             account_retractions.push(AccountRetractionSection {
                 account: parse(&account, "account")?,
+                recorded_at,
+            });
+        }
+
+        // No `ORDER BY`: the primary key on `owner` admits one row at most, so
+        // there is no order to fix. The absence of a row is the whole of what
+        // "he has declared none" means (`iaam-14is.4`).
+        let mut statement = self.conn.prepare(
+            "SELECT contour, recorded_at
+             FROM contour_report_defaults
+             WHERE owner = ?1",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut contour_report_defaults = Vec::new();
+        for row in rows {
+            let (contour, recorded_at) = row?;
+            contour_report_defaults.push(ContourReportDefaultSection {
+                contour: parse(&contour, "contour")?,
                 recorded_at,
             });
         }
@@ -2509,6 +2605,7 @@ impl SqliteStore {
             account_transfers,
             account_retirements,
             account_retractions,
+            contour_report_defaults,
             account_aliases,
             declined_account_names,
             decision_history,
@@ -2585,6 +2682,55 @@ impl SqliteStore {
             return Err(StoreError::BundleCorrupted {
                 detail: format!("event {} belongs to another owner", foreign.id.inner()),
             });
+        }
+
+        // A declaration names a contour, and this archive must be the one that
+        // carries it (`iaam-14is.4`). Two refusals, and both exist because
+        // neither is left to the write below, which cannot make them:
+        // `ON CONFLICT (owner) DO NOTHING` keeps the first row and drops any
+        // second one without a word, and the table's own trigger refuses an
+        // unknown contour mid-restore with a constraint where the archive is
+        // what is wrong.
+        //
+        // The owner has one reporting perimeter or none, so an archive with
+        // two declarations is two answers to one question — the exporter
+        // writes at most one, and a hand-made archive that carries more is
+        // corrupt rather than ambiguous, because picking one would be the
+        // guess this table exists to remove.
+        if bundle.contour_report_defaults.len() > 1 {
+            return Err(StoreError::BundleCorrupted {
+                detail: format!(
+                    "the archive carries {} declarations of the contour the owner's reports are \
+                     about: the owner has one reporting contour or none",
+                    bundle.contour_report_defaults.len()
+                ),
+            });
+        }
+
+        // Checked against this archive's own `contours` and not against what
+        // the destination happens to hold. A restore into an instance that
+        // already holds a contour of that identifier would satisfy the trigger
+        // while the archive itself carried no version of it — the archive
+        // would be trusted on the strength of a row it never brought, which is
+        // the one thing "the declaration does not arrive with it" means. The
+        // export writes every version of every contour the owner holds, so a
+        // bundle from this build always carries the contour it declares; one
+        // that does not carry it has lost the pair somewhere, and is corrupt.
+        for declaration in &bundle.contour_report_defaults {
+            if !bundle
+                .contours
+                .iter()
+                .any(|section| section.contour == declaration.contour)
+            {
+                return Err(StoreError::BundleCorrupted {
+                    detail: format!(
+                        "the archive declares contour {} as the one the owner's reports are \
+                         about and carries no version of it: a declaration must name a contour \
+                         the archive holds",
+                        declaration.contour
+                    ),
+                });
+            }
         }
 
         let owner = bundle.owner;
@@ -2967,6 +3113,41 @@ impl SqliteStore {
                     ],
                 )?;
             }
+        }
+
+        // The owner's declaration of which contour his reports are about
+        // (`iaam-14is.4`), and it is written here — after the versions above,
+        // not beside the other standing decisions higher up — because the
+        // order is what makes a valid archive restorable rather than a
+        // convention: `contour_report_defaults_name_a_held_contour` is a
+        // `BEFORE INSERT` trigger refusing a declaration whose contour this
+        // owner holds no version of, and a declaration written before the
+        // versions it names is precisely the row that trigger aborts. The check
+        // above rejects an archive whose declaration names a contour it does not
+        // carry, so this loop can rely on the contour being in by now.
+        //
+        // `DO NOTHING` on the conflict, like every other standing decision in
+        // this function and for the module's rule: an archive supplies what is
+        // missing and never overwrites what is there, and the owner's current
+        // declaration is a statement about the machine he is on now, not one an
+        // older archive gets to correct. The withdrawal half follows from the
+        // same rule — an archive carrying no declaration writes nothing, so it
+        // cannot un-declare a contour either, and a restore never leaves the
+        // instance with less than it had. There is one row at most to write:
+        // the primary key on `owner` is what says the owner has one reporting
+        // perimeter or none, so an archive from this build carries one
+        // declaration or none.
+        for declaration in &bundle.contour_report_defaults {
+            transaction.execute(
+                "INSERT INTO contour_report_defaults (owner, contour, recorded_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (owner) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    declaration.contour.to_string(),
+                    declaration.recorded_at,
+                ],
+            )?;
         }
 
         for group in &bundle.category_groups {

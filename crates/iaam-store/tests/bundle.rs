@@ -21,7 +21,7 @@ use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_core::retirement::AccountRetirement;
 use iaam_store::SqliteStore;
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
-use iaam_store::bundle::{Bundle, ImportOutcome};
+use iaam_store::bundle::{Bundle, ContourReportDefaultSection, ImportOutcome};
 use iaam_store::categories::NewCategoryRule;
 use iaam_store::documents::{BrokerCode, NewDocument, RawRow, ReportFormat, RowStatus};
 use iaam_store::import_session::{NewQuestion, StoredControlFigures};
@@ -1439,6 +1439,304 @@ fn an_archive_written_before_account_attribution_existed_still_verifies_and_rest
     assert_eq!(
         accounts[0].declared_by, None,
         "the restored account reads as unknown, never as the owner's own"
+    );
+}
+
+// --- iaam-14is.4: the reporting-contour declaration travels --------------
+
+/// The bundle version at which the archive first carries
+/// `contour_report_defaults`, written as a literal on purpose: the rule the
+/// tests below prove is about the boundary between versions — an archive
+/// below it cannot say what its own emptiness means. `BUNDLE_VERSION` moves
+/// with every later section and would say nothing about where this one began.
+const FIRST_VERSION_CARRYING_THE_DECLARATION: u32 = 7;
+
+/// What an archive says about the contour the owner's reports are about, in
+/// the three states the version mechanism separates (iaam-14is.4, criterion
+/// 2). Two of them are an absent section and carry different answers.
+#[derive(Debug, PartialEq)]
+enum DeclaredContour {
+    /// Written before the section existed: nobody recorded a declaration,
+    /// and the archive cannot say whether the owner had one.
+    NotRecorded,
+    /// Written by a build that knows the section: the owner has declared no
+    /// contour for his reports, and that is his answer rather than silence.
+    None,
+    One(uuid::Uuid),
+}
+
+fn declared_contour(bundle: &Bundle) -> DeclaredContour {
+    if bundle.bundle_version < FIRST_VERSION_CARRYING_THE_DECLARATION {
+        return DeclaredContour::NotRecorded;
+    }
+    match bundle.contour_report_defaults.as_slice() {
+        [] => DeclaredContour::None,
+        [section] => DeclaredContour::One(section.contour),
+        several => panic!(
+            "a bundle carries at most one declaration — the table is keyed by owner — and this \
+             one carries {}",
+            several.len()
+        ),
+    }
+}
+
+#[test]
+fn a_declared_contour_round_trips_into_a_genuinely_empty_database() {
+    let (source, owner, _account, contour) = populated();
+    assert!(
+        source
+            .record_report_default_contour(owner, contour)
+            .unwrap(),
+        "the fixture must actually declare a contour, or this test proves nothing"
+    );
+    let bundle = source.export_bundle(owner).unwrap();
+    assert_eq!(bundle.contour_report_defaults.len(), 1);
+    assert_eq!(bundle.contour_report_defaults[0].contour, contour.0);
+
+    // This restore is also the ordering test: `contour_report_defaults_name_a_held_contour`
+    // refuses a declaration naming a contour this owner holds no version of,
+    // so an import that wrote the declaration before the versions — the
+    // placement its neighbours among the standing decisions would suggest —
+    // would abort here rather than restore.
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("a declaration must restore after the contour versions it names");
+    assert_eq!(
+        restored.report_default_contour(owner).unwrap(),
+        Some(contour),
+        "the restored instance must name the same contour, not merely hold a row"
+    );
+    assert_eq!(
+        restored
+            .export_bundle(owner)
+            .unwrap()
+            .contour_report_defaults,
+        bundle.contour_report_defaults
+    );
+}
+
+#[test]
+fn an_archive_of_an_undeclared_contour_says_so_where_an_older_one_cannot() {
+    // Criterion 2 in one test: two archives carry no declaration and both
+    // restore into no declaration, and the version is what separates the two
+    // readings. The export below was written by a build that knows the
+    // section exists and would have written it, so its emptiness is the
+    // owner's own statement that he has declared none. The fixed archive
+    // predates the section, so its identical emptiness is «nobody wrote it
+    // down» — and a reader that took it for a declaration would turn a fact
+    // nobody recorded into a decision the owner never took.
+    let (source, owner, _, _) = populated();
+    let exported = source.export_bundle(owner).unwrap();
+    assert!(exported.contour_report_defaults.is_empty());
+    assert_eq!(
+        declared_contour(&exported),
+        DeclaredContour::None,
+        "an instance with no declaration exports an archive that states so"
+    );
+
+    let old: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert!(old.contour_report_defaults.is_empty());
+    assert_eq!(
+        declared_contour(&old),
+        DeclaredContour::NotRecorded,
+        "an archive written before the section existed cannot be read as «he declared none»"
+    );
+    assert!(exported.bundle_version >= FIRST_VERSION_CARRYING_THE_DECLARATION);
+    assert!(old.bundle_version < FIRST_VERSION_CARRYING_THE_DECLARATION);
+
+    // Both still restore, and both leave the instance with nothing declared:
+    // what the version separates is what may be concluded about the owner,
+    // not the row a restore writes.
+    let mut from_export = SqliteStore::open_in_memory().unwrap();
+    from_export.import_bundle(&exported).unwrap();
+    assert_eq!(from_export.report_default_contour(owner).unwrap(), None);
+    assert!(
+        from_export
+            .export_bundle(owner)
+            .unwrap()
+            .contour_report_defaults
+            .is_empty(),
+        "and re-exporting must still carry no declaration"
+    );
+    let mut from_old = SqliteStore::open_in_memory().unwrap();
+    from_old.import_bundle(&old).unwrap();
+    assert_eq!(from_old.report_default_contour(old.owner).unwrap(), None);
+}
+
+#[test]
+fn a_declaration_naming_a_contour_the_archive_does_not_carry_is_refused_by_name() {
+    let (source, owner, _, _) = populated();
+    let mut bundle = source.export_bundle(owner).unwrap();
+    let absent = ContourId::new_random();
+    bundle.contour_report_defaults = vec![ContourReportDefaultSection {
+        contour: absent.0,
+        recorded_at: "2026-09-13T00:00:00Z".into(),
+    }];
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let error = restored
+        .import_bundle(&bundle)
+        .expect_err("a declaration whose contour the archive never carried must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&absent.0.to_string()),
+        "the refusal must name the contour the archive failed to carry: {message}"
+    );
+    assert!(
+        !message.contains("SQLite") && !message.contains("trigger"),
+        "the refusal must be the restore path's own, not the table's trigger surfacing as a \
+         constraint: {message}"
+    );
+    assert!(
+        restored.load_events(owner).unwrap().is_empty(),
+        "nothing of an archive refused before it is applied may be in the instance"
+    );
+}
+
+#[test]
+fn a_declaration_is_refused_even_when_the_destination_already_holds_that_contour() {
+    // The trigger on its own would let this one through: the destination
+    // holds the contour, so SQLite has nothing to object to. But the archive
+    // never brought it, and accepting the declaration on the strength of a
+    // row the archive did not carry is precisely the silent acceptance the
+    // refusal exists to prevent — the destination's contour is a different
+    // fact that happens to share an identifier.
+    let (source, owner, account, _contour) = populated();
+    let mut bundle = source.export_bundle(owner).unwrap();
+    let elsewhere = ContourId::new_random();
+    bundle.contour_report_defaults = vec![ContourReportDefaultSection {
+        contour: elsewhere.0,
+        recorded_at: "2026-09-13T00:00:00Z".into(),
+    }];
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut destination = SqliteStore::open_in_memory().unwrap();
+    destination
+        .upsert_account(&AccountRecord {
+            id: account,
+            owner,
+            title: "Brokerage".into(),
+            institution: None,
+        })
+        .unwrap();
+    destination
+        .insert_contour_version(
+            owner,
+            &ContourDefinition::new(elsewhere, ContourVersion(1), [account]),
+            "Somewhere else entirely",
+            &[account],
+        )
+        .unwrap();
+
+    let error = destination
+        .import_bundle(&bundle)
+        .expect_err("the archive must carry the contour it declares, not borrow one");
+    assert!(
+        format!("{error}").contains(&elsewhere.0.to_string()),
+        "the refusal must name the contour the archive failed to carry: {error}"
+    );
+}
+
+#[test]
+fn an_archive_carrying_two_declarations_is_refused_rather_than_reduced_to_one() {
+    // Both contours below are in the archive, so the presence check passes and
+    // only the count can refuse this one. Without it, `ON CONFLICT (owner) DO
+    // NOTHING` would keep the first declaration and drop the other without a
+    // word — the archive's own second answer discarded in silence, and the
+    // reader unable to tell which of the owner's two perimeters the instance
+    // ended up on.
+    let (mut source, owner, account, contour) = populated();
+    let other = ContourId::new_random();
+    source
+        .insert_contour_version(
+            owner,
+            &ContourDefinition::new(other, ContourVersion(1), [account]),
+            "Also held",
+            &[account],
+        )
+        .unwrap();
+    let mut bundle = source.export_bundle(owner).unwrap();
+    assert_eq!(
+        bundle
+            .contours
+            .iter()
+            .filter(|section| section.contour == contour.0 || section.contour == other.0)
+            .count(),
+        2,
+        "both declared contours must be in the archive, or the presence check would be the one \
+         refusing and this test would prove nothing about the count"
+    );
+    bundle.contour_report_defaults = vec![
+        ContourReportDefaultSection {
+            contour: contour.0,
+            recorded_at: "2026-09-13T00:00:00Z".into(),
+        },
+        ContourReportDefaultSection {
+            contour: other.0,
+            recorded_at: "2026-09-13T00:00:01Z".into(),
+        },
+    ];
+    bundle.checksum = bundle.compute_checksum();
+
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    let error = restored
+        .import_bundle(&bundle)
+        .expect_err("an archive answering twice must be refused, not reduced to one answer");
+    let message = error.to_string();
+    assert!(
+        message.contains("2 declarations"),
+        "the refusal must name how many answers the archive carries: {message}"
+    );
+    assert!(
+        !message.contains("SQLite"),
+        "the refusal must be the restore path's own, not a constraint surfacing: {message}"
+    );
+    assert!(
+        restored.load_events(owner).unwrap().is_empty(),
+        "nothing of an archive refused before it is applied may be in the instance"
+    );
+}
+
+#[test]
+fn a_restore_does_not_overwrite_a_declaration_already_in_the_target() {
+    // An archive supplies what is missing and never restates what is there,
+    // the rule every other standing decision in the restore follows. The
+    // declaration is a statement about the machine the owner is on now, and
+    // an older archive is not evidence about it.
+    let (source, owner, account, contour) = populated();
+    assert!(
+        source
+            .record_report_default_contour(owner, contour)
+            .unwrap()
+    );
+    let bundle = source.export_bundle(owner).unwrap();
+
+    let mut destination = SqliteStore::open_in_memory().unwrap();
+    destination.import_bundle(&bundle).unwrap();
+    let since = ContourId::new_random();
+    destination
+        .insert_contour_version(
+            owner,
+            &ContourDefinition::new(since, ContourVersion(1), [account]),
+            "Widened since",
+            &[account],
+        )
+        .unwrap();
+    assert!(
+        destination
+            .record_report_default_contour(owner, since)
+            .unwrap(),
+        "the target must have moved on to another contour, or this test proves nothing"
+    );
+
+    destination.import_bundle(&bundle).unwrap();
+    assert_eq!(
+        destination.report_default_contour(owner).unwrap(),
+        Some(since),
+        "the archive must not restate a declaration over the one standing"
     );
 }
 

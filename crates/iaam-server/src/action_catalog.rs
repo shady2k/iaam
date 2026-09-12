@@ -179,7 +179,10 @@ impl ActionCatalog {
             );
         }
 
-        Ok(Self { operations, answers })
+        Ok(Self {
+            operations,
+            answers,
+        })
     }
 
     /// Return the route address for an operation.

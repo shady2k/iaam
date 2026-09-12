@@ -459,7 +459,9 @@ fn a_declaration_naming_a_contour_the_owner_does_not_hold_is_refused() {
         .record_report_default_contour(owner, foreign)
         .expect_err("someone else's contour is not a default this owner can declare");
     assert!(
-        refused.to_string().contains("must name a contour this owner holds"),
+        refused
+            .to_string()
+            .contains("must name a contour this owner holds"),
         "the refusal is the table's own, not the caller's: {refused}"
     );
     assert!(

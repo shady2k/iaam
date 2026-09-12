@@ -52,6 +52,13 @@ fn has_account_retractions_table(store: &SqliteStore) -> bool {
         .is_ok()
 }
 
+fn has_contour_report_defaults_table(store: &SqliteStore) -> bool {
+    store
+        .connection()
+        .prepare("SELECT contour FROM contour_report_defaults LIMIT 0")
+        .is_ok()
+}
+
 #[test]
 fn a_database_left_at_version_one_gains_the_counterparty_column() {
     let store = SqliteStore::open_in_memory().expect("open");
@@ -68,6 +75,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
              DROP TABLE event_stated_securities_value; \
              ALTER TABLE accounts DROP COLUMN declared_by; \
              DROP TABLE account_retractions; \
+             DROP TABLE contour_report_defaults; \
              PRAGMA user_version = 1;",
         )
         .expect("winding the database back to version 1");
@@ -86,6 +94,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         !has_account_retractions_table(&store),
         "and this table too, or migration 0005 is not actually being exercised"
+    );
+    assert!(
+        !has_contour_report_defaults_table(&store),
+        "and this table too, or migration 0006 is not actually being exercised"
     );
 
     migrate(store.connection()).expect("migrating the wound-back database");
@@ -107,6 +119,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         has_account_retractions_table(&store),
         "and it must gain the table 0005 adds, for the same reason"
+    );
+    assert!(
+        has_contour_report_defaults_table(&store),
+        "and the table 0006 adds, for the same reason"
     );
     assert_eq!(
         user_version(&store),
@@ -153,17 +169,18 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
         .expect("seeding an invented journal");
 
     // Back to the version before the rebuild, so `migrate` performs it again —
-    // this time over a journal that is not empty. `accounts.declared_by` and
-    // `account_retractions` are dropped too: `migrate` still catches this
-    // database up to the current `SCHEMA_VERSION` afterwards, and migrations
-    // 0004 and 0005 would otherwise find the column and the table already
-    // there from the initial `open_in_memory` and fail on a name that already
-    // exists.
+    // this time over a journal that is not empty. `accounts.declared_by`,
+    // `account_retractions` and `contour_report_defaults` are dropped too:
+    // `migrate` still catches this database up to the current `SCHEMA_VERSION`
+    // afterwards, and migrations 0004 to 0006 would otherwise find the column
+    // and the tables already there from the initial `open_in_memory` and fail
+    // on a name that already exists.
     connection
         .execute_batch(
             "DROP TABLE event_stated_securities_value; \
              ALTER TABLE accounts DROP COLUMN declared_by; \
              DROP TABLE account_retractions; \
+             DROP TABLE contour_report_defaults; \
              PRAGMA user_version = 2;",
         )
         .expect("winding the database back to version 2");

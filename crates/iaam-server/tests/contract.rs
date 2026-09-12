@@ -10213,10 +10213,7 @@ async fn the_flow_report_names_the_categories_its_breakdown_references() {
     assert_eq!(status, StatusCode::CREATED, "{earning}");
     let earning_id = earning["id"].as_str().expect("category id");
 
-    for (source_category, category) in [
-        ("Supermarkets", referenced_id),
-        ("Cashback", earning_id),
-    ] {
+    for (source_category, category) in [("Supermarkets", referenced_id), ("Cashback", earning_id)] {
         let (status, created_rule) = call(
             &harness.router,
             post(
@@ -10841,7 +10838,9 @@ async fn every_report_standing_names_the_call_that_answers_it() {
                 .as_object()
                 .unwrap_or_else(|| panic!("{report} names no call: {body}"));
             let path = answered_by["path"].as_str().expect("a path");
-            let operation_id = answered_by["operationId"].as_str().expect("an operation id");
+            let operation_id = answered_by["operationId"]
+                .as_str()
+                .expect("an operation id");
             assert_eq!(
                 path,
                 linked(goal),
@@ -10867,16 +10866,13 @@ async fn every_report_standing_names_the_call_that_answers_it() {
             );
             // Resolved, not spelled: the address is a GET the contract declares,
             // so the build that published it would have refused a dead one.
-            let item = harness
-                .api
-                .paths
-                .paths
-                .get(path)
-                .unwrap_or_else(|| panic!("{report} names a path the contract does not declare"));
-            let operation = item
-                .get
-                .as_ref()
-                .unwrap_or_else(|| panic!("{report} names a path that is not a GET in the contract"));
+            let item =
+                harness.api.paths.paths.get(path).unwrap_or_else(|| {
+                    panic!("{report} names a path the contract does not declare")
+                });
+            let operation = item.get.as_ref().unwrap_or_else(|| {
+                panic!("{report} names a path that is not a GET in the contract")
+            });
             assert_eq!(
                 operation.operation_id.as_deref(),
                 Some(operation_id),
@@ -19514,7 +19510,10 @@ async fn the_declaration_follows_the_contour_into_a_wider_version() {
     );
     assert_eq!(listed["contours"][0]["version"], 2, "{listed}");
     assert_eq!(
-        listed["contours"][0]["accounts"].as_array().expect("accounts").len(),
+        listed["contours"][0]["accounts"]
+            .as_array()
+            .expect("accounts")
+            .len(),
         2,
         "{listed}"
     );
@@ -19544,7 +19543,11 @@ async fn declaring_the_contour_already_declared_changes_nothing() {
     for _ in 0..2 {
         let (status, body) = call(
             &harness.router,
-            put("/v1/report-default-contour", &harness.owner_token, &declared),
+            put(
+                "/v1/report-default-contour",
+                &harness.owner_token,
+                &declared,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "a repeat is not a failure: {body}");
@@ -19824,9 +19827,9 @@ async fn a_contour_that_covers_no_account_cannot_be_declared() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
     assert_eq!(refused["field"], "contour", "{refused}");
     assert!(
-        refused["message"]
+        refused["actual"]
             .as_str()
-            .expect("message")
+            .expect("actual")
             .contains("covers no account"),
         "the refusal says what is missing rather than that the request was \
          malformed: {refused}"

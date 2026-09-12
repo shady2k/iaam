@@ -1249,11 +1249,7 @@ impl SqliteStore {
                  contour = excluded.contour,
                  recorded_at = excluded.recorded_at
              WHERE contour_report_defaults.contour IS NOT excluded.contour",
-            params![
-                owner.inner().to_string(),
-                contour.0.to_string(),
-                now()
-            ],
+            params![owner.inner().to_string(), contour.0.to_string(), now()],
         )?;
         Ok(changed > 0)
     }

@@ -4552,7 +4552,8 @@ pub async fn declare_report_default_contour(
     // `may_submit` and nothing else — so the two cannot answer «may an agent do
     // this» differently.
     require_submit(&principal)?;
-    let (declared, contours) = owned_contour(&state, &principal, ContourId(request.contour)).await?;
+    let (declared, contours) =
+        owned_contour(&state, &principal, ContourId(request.contour)).await?;
 
     // A contour standing at a version with no members is not one a report may
     // be computed over: an answer over no accounts is a confident answer about

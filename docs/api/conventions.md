@@ -406,6 +406,7 @@ And the types that print a bare identifier on purpose.
 | `ActionSubjectDto::Event` | `id` | nothing the owner said names an event; the identifier is the whole of its identity and the item's `reason` states what it was |
 | `ForecastedMovementDto`, `UndecidedDto` | `event` | nothing the owner said names a recorded movement, for the reason above. It is published because it is what `POST /v1/corrections` takes, and the day, the amount and the account's title beside it are what he reads the movement by |
 | `AccountBalanceDto`, `NegativeCashDto`, `AssetAccountDto`, `CashClassTotalDto`, `NotDecomposedAccountDto`, `AccountResidualDto`, `EarningSourceAmountDto`, `CaveatSubjectDto` | `account` | the answer these sit in carries `population`, whose `covered` and `outside` name every account it mentions and every account it left out. The join table is in the same response, computed by the same fold, and one report row cannot disagree with it |
+| `CategoryAmountDto`, `EarningSourceAmountDto` | `category` | the answer these sit in carries `categories`, the name table for every category the report references, computed by the same fold. `retired` travels with each entry, and the table does not filter retired ones out: a breakdown legitimately references a category the owner has since retired, and a caller shown the title alone would offer it as somewhere new spending can be filed |
 | `HeldSessionDto` | `session` | nothing the owner said names an import session. He names an *import* by its label, and a session may declare no source at all; the identifier is the whole of the session's identity, and it addresses `GET /v1/import-sessions/{session}` and its assessment, where everything about it is published |
 | `ReconciliationStatusDto`, `TaintDto` | `account` | the caller named the account in the request; the response answers about that one and no other |
 | `JournalEventReadDto`, `JournalLegDto`, `OperationDto`, `VerdictDto` | `account` | a row-level echo of what the caller submitted or asked for |
@@ -427,6 +428,25 @@ Two things follow for a client. Where a response carries a `population` block, i
 is the name table for every account named anywhere in that response — look the
 account up there rather than calling `GET /v1/accounts`. Where a response carries
 neither the name nor a population, the account is the one the request named.
+
+**The same table exists for categories.** `MoneyFlowReportDto.categories` is the
+name table for every category that response references — the `category` of each
+row under `went_out_by_category`, and of each `earned_by_capital_by_source` that
+names one — so a reader of a breakdown looks its rows up there rather than
+calling `GET /v1/categories`. It is built the way §3.4 requires: by the scenario
+that folded the report, out of the same read of the owner's category reference
+the decomposition rules came from, never joined on by the transport.
+
+**It is scoped to what the response references, and it keeps retired
+categories.** A table of the owner's whole reference would name categories no
+row here mentions, and a caller could not tell one the report is about from one
+merely in his directory. Conversely a breakdown legitimately references a
+category he has since retired — the rows exist and still have to be readable —
+so each entry says whether it is retired instead of the table dropping it: a
+caller shown only the title would offer him a category he has said he no longer
+files under. A category the directory does not hold cannot be named and so gets
+no entry; that row is published unchanged, with the identifier that was its
+reference before this table existed, and nothing invents a word for it.
 
 A caller of the import session assessment should read one more warning here.
 `interpretation.answer_accounts` looks like a name table for that response and is
@@ -456,11 +476,20 @@ prints only its identifier, with no name table beside it in the same response:
   `ContourVersionDto.accounts`, `PopulationDto.contour`,
   `MoneyFlowReportDto.contour`, `AppliedRulesDto.contour`.
 - Category references: `CategoryDto.group`, `CategoryRuleDto.category`,
-  `CategoryAmountDto.category`, `ClassifiedAsDto.to`, `CategoryMoveDto`.
+  `ClassifiedAsDto.to`, `CategoryMoveDto`.
 - Instrument references outside the catalogue: `HoldingValueDto`,
   `PositionQuantityDto`, `CaveatSubjectDto::Instrument` and the position types.
   An instrument is named by a catalogue rather than by the owner, so this is the
   weakest of the five; it is listed because the reader's difficulty is the same.
+
+**One entry has since been closed, and it is recorded here rather than deleted.**
+`CategoryAmountDto.category` stood in the category line above, and the money-flow
+report keeps the rule now: that response carries `categories`, the table §3.5
+describes, so a breakdown row and the word for it travel in one answer. The same
+table names `EarningSourceAmountDto.category` — the earnings rows of that report,
+a reference this list had not reached. A `CategoryAmountDto` published anywhere
+else would be one of these again, which is why the entry is corrected rather than
+dropped.
 
 Each of these is a shape change to a published type, so each is its own decision
 about breaking a client, and none of them is a reason to publish a new type that

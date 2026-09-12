@@ -10146,6 +10146,194 @@ async fn flow_report_exposes_category_decomposition_residual_and_rule_versions()
     let _ = std::fs::remove_file(path);
 }
 
+/// A breakdown row names a category by identifier, and the same response names
+/// it the way the owner does.
+///
+/// This is the join the money-flow report used to hand to its reader: every row
+/// of `went_out_by_category` carried a category identifier and no word for it,
+/// so an agent saying one sentence about the owner's spending had to fetch
+/// `GET /v1/categories` and join by hand. The earnings breakdown is the same
+/// join one axis over — its rows carry the `category` their rule put them in —
+/// so both are covered here. The table is the category counterpart of
+/// `population`, which the report already carries for accounts, and it is built
+/// the same way: by the scenario that folded the report, out of the same read of
+/// his category reference the decomposition rules came from, so the transport
+/// copies it and never looks a category up.
+///
+/// Two things it must not do. It must not name categories no row here mentions:
+/// a caller cannot tell a category the report is about from one merely in his
+/// directory. And it must not drop a retired one: a breakdown legitimately
+/// references a category he has since retired, and a caller shown only a title
+/// would offer it as somewhere new spending can be filed. `retired` is how such
+/// a caller learns not to.
+#[tokio::test]
+async fn the_flow_report_names_the_categories_its_breakdown_references() {
+    let (harness, path) = harness_on_disk().await;
+    let mut store = SqliteStore::open(&path).expect("second connection");
+    let group = store
+        .insert_category_group(harness.owner, "Usual Expenses")
+        .expect("category group");
+    let (status, referenced) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Food"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{referenced}");
+    let referenced_id = referenced["id"].as_str().expect("category id");
+    // Created, never given a rule, and so never referenced by the report: it is
+    // the category the table below must leave out.
+    let (status, unreferenced) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": group, "title": "Travel"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{unreferenced}");
+
+    // The second breakdown's category, on the income side of the same list.
+    let income_group = store
+        .insert_category_group_of_kind(harness.owner, "Income", true)
+        .expect("income category group");
+    let (status, earning) = call(
+        &harness.router,
+        post(
+            "/v1/categories",
+            &harness.owner_token,
+            &json!({"group": income_group, "title": "Cashback"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{earning}");
+    let earning_id = earning["id"].as_str().expect("category id");
+
+    for (source_category, category) in [
+        ("Supermarkets", referenced_id),
+        ("Cashback", earning_id),
+    ] {
+        let (status, created_rule) = call(
+            &harness.router,
+            post(
+                "/v1/category-rules",
+                &harness.owner_token,
+                &json!({
+                    "matcher": {"source_category": source_category},
+                    "category": category,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created_rule}");
+    }
+
+    let contour = json!({
+        "title": "August flow",
+        "accounts": [harness.account.inner()],
+    });
+    let (status, contour_response) = call(
+        &harness.router,
+        post("/v1/contours", &harness.owner_token, &contour),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour_response}");
+    let contour_id = contour_response["contour"].as_str().expect("contour id");
+    let operations = json!({
+        "source_label": "manual entry",
+        "operations": [
+            {
+                "account": harness.account.inner(),
+                "type": "withdrawal",
+                "amount": "1200.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-05"},
+                "source_category": "Supermarkets",
+                "idempotency_key": "food",
+            },
+            {
+                "account": harness.account.inner(),
+                "type": "income",
+                "amount": "300.00",
+                "currency": "RUB",
+                "dates": {"cash_posted": "2026-08-07"},
+                "source_category": "Cashback",
+                "idempotency_key": "cashback",
+            }
+        ]
+    });
+    let (status, verdicts) = call(
+        &harness.router,
+        post("/v1/ingest/operations", &harness.owner_token, &operations),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+
+    // Retired after the rule was written and the spending recorded. The rows
+    // that reference it stand, so the table still has to name it.
+    let (status, retired) = call(
+        &harness.router,
+        delete(
+            &format!("/v1/categories/{referenced_id}"),
+            &harness.owner_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{retired}");
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/flow?contour={contour_id}&from=2026-08-01&to=2026-08-31"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rub = &body["currencies"][0];
+    assert_eq!(rub["went_out_by_category"][0]["category"], referenced_id);
+    assert_eq!(
+        rub["earned_by_capital_by_source"][0]["category"],
+        earning_id
+    );
+
+    let named = body["categories"]
+        .as_array()
+        .expect("the report names the categories it references");
+    assert_eq!(named.len(), 2, "{body}");
+    for entry in named {
+        let title = entry["title"].as_str().expect("title");
+        let retired = entry["retired"].as_bool().expect("retired");
+        match entry["category"].as_str().expect("category identifier") {
+            id if id == referenced_id => {
+                assert_eq!(title, "Food", "{entry}");
+                assert!(retired, "the retired category must be named: {entry}");
+            }
+            id if id == earning_id => {
+                assert_eq!(title, "Cashback", "{entry}");
+                assert!(!retired, "{entry}");
+            }
+            other => panic!("the table names a category no row references: {other}"),
+        }
+    }
+
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = &spec["components"]["schemas"]["CategoryNameDto"]["properties"];
+    assert!(entry["category"].is_object(), "{entry}");
+    assert!(entry["title"].is_object(), "{entry}");
+    assert!(entry["retired"].is_object(), "{entry}");
+    let flow = &spec["components"]["schemas"]["MoneyFlowReportDto"]["properties"];
+    assert!(flow["categories"].is_object(), "{flow}");
+
+    drop(harness);
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn category_routes_cover_matcher_forms_and_reference_refusals() {
     let (harness, path) = harness_on_disk().await;

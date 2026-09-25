@@ -29,8 +29,15 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
-# The project's own hooks first (privacy guard, worktree sweep), then ours into
-# the same directory git actually consults.
+# The tracker first: a fresh clone has the committed export but no database,
+# and every hook below reads the database. Bootstrap never deletes issues.
+bd bootstrap --yes >/dev/null || { echo "CONNECT: bd bootstrap failed; the tracker is not readable in this clone" >&2; exit 1; }
+# Beads points git at .beads/hooks, the committed hooks this installation extends.
+[ "$(git config --get core.hooksPath)" = ".beads/hooks" ] || bd hooks install --beads >/dev/null \
+  || { echo "CONNECT: bd hooks install --beads failed" >&2; exit 1; }
+
+# The project's own hooks (privacy guard, worktree sweep), then ours into the
+# same directory git actually consults.
 ./scripts/install-hooks.sh
 
 hooks_dir=$(git config --get core.hooksPath || echo "$(git rev-parse --git-dir)/hooks")

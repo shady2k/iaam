@@ -98,7 +98,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.stdout.write(JSON.stringify(read(process.argv.slice(2))));
   } catch (e) {
     console.error(`backlog adapter: cannot read the tracker: ${e.message.split('\n')[0]}`);
-    console.error('Is `bd` installed and this clone connected? Run: make hooks');
+    console.error('Is `bd` installed and this clone connected? Run: make backlog-connect');
     process.exit(2);
   }
 }

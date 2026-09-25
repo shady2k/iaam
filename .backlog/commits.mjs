@@ -87,6 +87,6 @@ try {
   process.exitCode = main(process.argv.slice(2));
 } catch (e) {
   console.error(`commit-link check could not run: ${e.message.split('\n')[0]}`);
-  console.error('This refuses the commit rather than passing it unchecked. Connect the clone: make hooks');
+  console.error('This refuses the commit rather than passing it unchecked. Connect the clone: make backlog-connect');
   process.exitCode = 2;
 }

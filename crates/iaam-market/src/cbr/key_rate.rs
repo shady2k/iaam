@@ -42,6 +42,9 @@ pub fn key_rate_request(from: Date, till: Date) -> HttpRequest {
         "/DailyInfoWebServ/DailyInfo.asmx",
         RequestBody::Xml(envelope),
     )
+    // KeyRateXML only reads; a POST is sent once unless marked safe to
+    // repeat, and this one is.
+    .idempotent()
     .with_soap_action(SOAP_ACTION)
 }
 
@@ -236,6 +239,15 @@ mod tests {
             request.soap_action(),
             Some("http://web.cbr.ru/KeyRateXML"),
             "without SOAPAction the service returns a refusal, not a parse error"
+        );
+    }
+
+    #[test]
+    fn the_request_is_marked_safe_to_send_again() {
+        let request = key_rate_request(date!(2026 - 02 - 01), date!(2026 - 04 - 30));
+        assert!(
+            request.is_idempotent(),
+            "a POST not marked idempotent is sent once, and the key rate only reads"
         );
     }
 

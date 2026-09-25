@@ -1,12 +1,9 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::credentials::BrokerToken;
 use crate::environment::{Environment, Method};
-use iaam_http::gateway::Transport;
-use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, HttpResponse, RequestBody};
+use iaam_http::{Destination, GatewayError, HttpRequest, Outbound, RequestBody};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -59,7 +56,9 @@ pub enum TinkoffError {
     /// The request could not be serialized to JSON before sending.
     #[error("could not serialize request to the T-Invest gateway")]
     RequestSerialization,
-    /// The transport could not be set up; retrying would meet the same fault.
+    /// The transport could not be set up — a client or a trust root this
+    /// build could not construct. A fault of this build, not of T-Invest:
+    /// retrying would meet the same fault.
     ///
     /// Contains no token: `HttpError` is designed not to contain one.
     #[error(transparent)]
@@ -69,34 +68,6 @@ pub enum TinkoffError {
     /// fault of this build, not of T-Invest.
     #[error("the outbound gateway refused the call: {0}")]
     Gateway(GatewayError),
-}
-
-/// The outbound gateway, as the T-Invest client sees it.
-///
-/// A trait object rather than a type parameter: the gateway is built once
-/// per process over the production transport and handed down as it is, while
-/// a test hands down one over a scripted T-Invest on a fake clock, and the
-/// channel factory that opens clients should not have to become generic to
-/// allow both.
-pub trait OutboundGateway: Send + Sync {
-    /// `Gateway::send`, boxed.
-    fn send<'a>(
-        &'a self,
-        method: &'static str,
-        request: &'a HttpRequest,
-        deadline: Option<Instant>,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>>;
-}
-
-impl<T: Transport> OutboundGateway for Gateway<T> {
-    fn send<'a>(
-        &'a self,
-        method: &'static str,
-        request: &'a HttpRequest,
-        deadline: Option<Instant>,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>> {
-        Box::pin(Self::send(self, method, request, deadline))
-    }
 }
 
 /// The header T-Invest is believed to name its limit's reset in. Declaring a
@@ -171,17 +142,13 @@ impl GetOperationsByCursorRequest {
 pub struct TinkoffClient {
     environment: Environment,
     token: BrokerToken,
-    gateway: Arc<dyn OutboundGateway>,
+    gateway: Arc<dyn Outbound>,
 }
 
 impl TinkoffClient {
     /// Create a client over the process's gateway.
     #[must_use]
-    pub fn new(
-        environment: Environment,
-        token: BrokerToken,
-        gateway: Arc<dyn OutboundGateway>,
-    ) -> Self {
+    pub fn new(environment: Environment, token: BrokerToken, gateway: Arc<dyn Outbound>) -> Self {
         Self {
             environment,
             token,
@@ -264,8 +231,13 @@ impl TinkoffClient {
     // The environment supplies the base through `Environment`, not
     // `Destination`: sandbox and production are different addresses for
     // one destination, and share a trust anchor.
+    //
+    // Marked idempotent because every RPC this client calls only reads: a
+    // POST is sent once unless its caller says a second copy is harmless. A
+    // write added to this client needs a request of its own, left unmarked.
     fn request(environment: Environment, path: &str, body: String, token: &str) -> HttpRequest {
         HttpRequest::post(destination_for(environment), path, RequestBody::Json(body))
+            .idempotent()
             .with_bearer(token)
             .with_reset_header(RESET_HEADER)
     }
@@ -374,9 +346,11 @@ fn validate_cursor_page(body: &str) -> Result<(), TinkoffError> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Mutex;
 
-    use iaam_http::gateway::{ATTEMPTS, BUDGETS, Clock, FIRST_BACKOFF, Sleeper};
+    use iaam_http::gateway::{ATTEMPTS, BUDGETS, Clock, FIRST_BACKOFF, Sleeper, Transport};
     use iaam_http::resilience::{Outcome, RetryPolicy};
     use iaam_http::{Gateway, HttpError, HttpResponse};
 
@@ -499,6 +473,46 @@ mod tests {
 
         assert_eq!(body, r#"{"accounts":[]}"#);
         assert_eq!(sent(&gateway), 3);
+    }
+
+    /// Every T-Invest call this client makes only reads, so each is marked
+    /// safe to send again and a transient failure is retried.
+    #[tokio::test]
+    async fn a_transient_failure_of_the_portfolio_is_retried() {
+        let (client, gateway, _) = client(vec![answer(503, "{}"), answer(200, "{}")]);
+
+        client
+            .get_portfolio("account", None)
+            .await
+            .expect("the second attempt passes");
+
+        assert_eq!(sent(&gateway), 2);
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_of_an_operations_page_is_retried() {
+        let (client, gateway, _) = client(vec![
+            Err(HttpError::Timeout),
+            answer(200, r#"{"hasNext":false,"items":[]}"#),
+        ]);
+
+        client
+            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"), None)
+            .await
+            .expect("the second attempt passes");
+
+        assert_eq!(sent(&gateway), 2);
+    }
+
+    #[test]
+    fn the_request_is_marked_safe_to_send_again() {
+        let request = TinkoffClient::request(
+            Environment::Prod,
+            "UsersService/GetAccounts",
+            "{}".to_owned(),
+            TOKEN,
+        );
+        assert!(request.is_idempotent());
     }
 
     /// A transient failure that outlasts the retries is "unreachable, try

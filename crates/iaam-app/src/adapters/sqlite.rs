@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_broker::operation_kind::OperationKindDictionary;
-use iaam_broker::tinkoff::{OutboundGateway, TinkoffClient};
+use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::batch::ControlSection;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
@@ -42,6 +42,7 @@ use iaam_core::projection::Snapshot;
 use iaam_core::reconciliation::claim::AssertionPeriod;
 use iaam_core::retirement::{AccountRetirement, RetirementRevision};
 use iaam_core::rules::LotRuleVersion;
+use iaam_http::Outbound;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::profile::UnresolvedAccountName;
 use iaam_store::SqliteStore;
@@ -86,7 +87,7 @@ pub struct SqliteAdapter {
     /// this adapter opens: a gateway per channel would be a budget per
     /// channel, and two channels would spend twice the broker's allowance.
     /// `None` only for an adapter built without broker access at all.
-    gateway: Option<Arc<dyn OutboundGateway>>,
+    gateway: Option<Arc<dyn Outbound>>,
 }
 
 impl SqliteAdapter {
@@ -105,7 +106,7 @@ impl SqliteAdapter {
     pub fn with_broker_key(
         store: SqliteStore,
         key: Option<Key>,
-        gateway: Arc<dyn OutboundGateway>,
+        gateway: Arc<dyn Outbound>,
     ) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),

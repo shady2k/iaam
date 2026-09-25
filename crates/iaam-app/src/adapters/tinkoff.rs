@@ -974,13 +974,6 @@ fn tinkoff_error(error: TinkoffError) -> BrokerError {
             detail,
             retry_after: Some(retry_after),
         },
-        // A network fault the gateway did not retry names no wait: saying one
-        // would be a guess published as the broker's answer.
-        TinkoffError::Transport(_) => BrokerError::Unreachable {
-            broker: BROKER.to_owned(),
-            detail,
-            retry_after: None,
-        },
         TinkoffError::InvalidToken
         | TinkoffError::MethodUnavailable { .. }
         | TinkoffError::UnexpectedStatus { .. } => BrokerError::Refused {
@@ -990,9 +983,10 @@ fn tinkoff_error(error: TinkoffError) -> BrokerError {
         TinkoffError::PartialResponse
         | TinkoffError::MalformedResponse
         | TinkoffError::RequestSerialization => unparsable(detail),
-        // A method key without a budget is this build's fault, not the
-        // broker's: nothing was sent.
-        TinkoffError::Gateway(_) => BrokerError::Adapter {
+        // A method key without a budget, or a client or trust root that could
+        // not be built, is this build's fault, not the broker's: retrying
+        // later meets the same fault.
+        TinkoffError::Gateway(_) | TinkoffError::Transport(_) => BrokerError::Adapter {
             broker: BROKER.to_owned(),
             detail,
         },
@@ -2829,7 +2823,8 @@ mod tests {
 
     use iaam_broker::credentials::{Key, open, seal};
     use iaam_broker::environment::Environment;
-    use iaam_broker::tinkoff::{OutboundGateway, TinkoffClient};
+    use iaam_broker::tinkoff::TinkoffClient;
+    use iaam_http::Outbound;
     use iaam_http::gateway::{ATTEMPTS, Clock, FIRST_BACKOFF};
     use iaam_http::resilience::{Outcome, RetryPolicy};
 
@@ -2838,7 +2833,7 @@ mod tests {
 
     const TOKEN: &str = "secret-token-42";
 
-    fn channel(gateway: Arc<dyn OutboundGateway>) -> super::TinkoffChannel {
+    fn channel(gateway: Arc<dyn Outbound>) -> super::TinkoffChannel {
         let key = Key::from_bytes([5; 32]);
         let token = open(&key, &seal(&key, TOKEN)).expect("token opens");
         super::TinkoffChannel::new(
@@ -3036,14 +3031,17 @@ mod tests {
         assert!(matches!(error, BrokerError::Adapter { .. }), "{error:?}");
     }
 
+    /// A client or trust root this build could not construct is our fault
+    /// (500), not "the broker is unreachable, retry later": retrying meets the
+    /// same fault.
     #[test]
-    fn a_transport_that_cannot_be_built_is_unreachable() {
-        let error = super::tinkoff_error(super::TinkoffError::Transport(
+    fn a_transport_that_cannot_be_built_is_an_adapter_fault() {
+        for fault in [
             iaam_http::HttpError::ClientNotBuilt("no".to_owned()),
-        ));
-        assert!(
-            matches!(error, BrokerError::Unreachable { .. }),
-            "{error:?}"
-        );
+            iaam_http::HttpError::TrustAnchorNotParsed("no".to_owned()),
+        ] {
+            let error = super::tinkoff_error(super::TinkoffError::Transport(fault));
+            assert!(matches!(error, BrokerError::Adapter { .. }), "{error:?}");
+        }
     }
 }

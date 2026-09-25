@@ -88,15 +88,8 @@ impl HttpClient {
         }
         let response = builder.send().await.map_err(classify_transport_error)?;
         let status = response.status().as_u16();
-        // Read before `bytes()` consumes the response: only the delay-seconds
-        // form is understood, so a value in another form (an HTTP-date) or
-        // an absent header both become `None`, and the retry policy falls
-        // back to its computed backoff.
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after);
+        // Read before `bytes()` consumes the response.
+        let retry_after = named_delay(response.headers(), request.reset_header());
         let body = response
             .bytes()
             .await
@@ -108,6 +101,26 @@ impl HttpClient {
             retry_after,
         })
     }
+}
+
+/// The delay the source named: its `Retry-After`, else the reset header the
+/// request declared.
+///
+/// Only the delay-seconds form is understood, so a value in another form (an
+/// HTTP-date) or an absent header both become `None`, and the retry policy
+/// falls back to its computed backoff. Only the parsed delay leaves here, never
+/// the header value.
+fn named_delay(
+    headers: &reqwest::header::HeaderMap,
+    reset_header: Option<&str>,
+) -> Option<Duration> {
+    let seconds = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after)
+    };
+    seconds(reqwest::header::RETRY_AFTER.as_str()).or_else(|| reset_header.and_then(seconds))
 }
 
 fn classify_transport_error(error: reqwest::Error) -> HttpError {
@@ -153,6 +166,48 @@ mod tests {
             2,
             "sandbox and production are different hosts; sharing a client would route the request incorrectly"
         );
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> reqwest::header::HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    reqwest::header::HeaderName::from_static(name),
+                    reqwest::header::HeaderValue::from_static(value),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn retry_after_is_the_named_delay() {
+        let named = named_delay(&headers(&[("retry-after", "12")]), None);
+        assert_eq!(named, Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn a_declared_reset_header_is_read_when_retry_after_is_absent() {
+        let named = named_delay(
+            &headers(&[("x-ratelimit-reset", "17")]),
+            Some("x-ratelimit-reset"),
+        );
+        assert_eq!(named, Some(Duration::from_secs(17)));
+    }
+
+    #[test]
+    fn retry_after_wins_over_a_declared_reset_header() {
+        let named = named_delay(
+            &headers(&[("retry-after", "3"), ("x-ratelimit-reset", "17")]),
+            Some("x-ratelimit-reset"),
+        );
+        assert_eq!(named, Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn an_undeclared_reset_header_is_ignored() {
+        let named = named_delay(&headers(&[("x-ratelimit-reset", "17")]), None);
+        assert_eq!(named, None);
     }
 
     #[test]

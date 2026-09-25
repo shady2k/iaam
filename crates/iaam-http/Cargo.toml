@@ -17,9 +17,14 @@ percent-encoding = "2"
 # Секрет зануляется при уничтожении: копия токена, оставшаяся
 # в освобождённой памяти, — это тот же токен.
 zeroize = { version = "1", features = ["alloc"] }
+# The gateway's production timer and its per-destination async lock. The
+# application already runs tokio; the gateway only borrows its timer.
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `test-util` pauses the tokio timer, so the production sleeper is checked
+# without a real wait.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 sha2 = "0.11"
 
 [lints]

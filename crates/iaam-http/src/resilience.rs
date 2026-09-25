@@ -81,13 +81,15 @@ impl RetryPolicy {
         Retry::After(self.delay(attempt, outcome))
     }
 
-    /// The wait before the next attempt.
+    /// The wait before the next attempt, also when no attempt is left: a
+    /// caller that gave up is told when trying again is worth it.
     ///
     /// A `Retry-After` the source named wins over the guess: the source
     /// knows its own refusal window, we do not. It is still capped at
     /// `MAX_BACKOFF`, so a hostile or mistaken value cannot park the caller
     /// indefinitely.
-    fn delay(&self, attempt: u32, outcome: &Outcome) -> Duration {
+    #[must_use]
+    pub fn delay(&self, attempt: u32, outcome: &Outcome) -> Duration {
         match outcome {
             Outcome::Status {
                 retry_after: Some(interval),
@@ -102,7 +104,8 @@ impl RetryPolicy {
     /// No jitter: jitter spreads out many independent clients converging on
     /// the same refusal at once. This process is the only client of these
     /// destinations, and its outbound calls are already serialised one at a
-    /// time by `RateLimiter` below — there is no thundering herd here to
+    /// time per destination by the gateway (and, for the market adapter not
+    /// yet moved onto it, by `RateLimiter` below) — there is no thundering herd here to
     /// break up, only a single caller whose wait would become less
     /// predictable for no benefit.
     fn backoff(&self, attempt: u32) -> Duration {
@@ -130,14 +133,16 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
 ///
 /// 4xx statuses other than 429 are deliberately excluded: an authorization
 /// refusal or invalid request will be repeated exactly, wasting attempts on a
-/// known response.
-fn is_transient(outcome: &Outcome) -> bool {
+/// known response. 500 is included: the brokers answer a momentary internal
+/// fault with it, and the same request succeeds on the next attempt.
+#[must_use]
+pub fn is_transient(outcome: &Outcome) -> bool {
     match outcome {
         Outcome::Transport(HttpError::Network | HttpError::Timeout) => true,
         Outcome::Transport(HttpError::ClientNotBuilt(_) | HttpError::TrustAnchorNotParsed(_)) => {
             false
         }
-        Outcome::Status { status, .. } => matches!(status, 429 | 502 | 503 | 504),
+        Outcome::Status { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504),
     }
 }
 
@@ -216,6 +221,14 @@ mod tests {
                 "status {status} must be retried"
             );
         }
+    }
+
+    #[test]
+    fn an_internal_server_error_is_retried() {
+        assert!(matches!(
+            policy().decide(1, &Outcome::status(500)),
+            Retry::After(_)
+        ));
     }
 
     #[test]

@@ -82,6 +82,7 @@ pub struct HttpRequest {
     body: Option<RequestBody>,
     bearer: Option<Secret>,
     soap_action: Option<String>,
+    reset_header: Option<&'static str>,
 }
 
 impl HttpRequest {
@@ -109,6 +110,7 @@ impl HttpRequest {
             body,
             bearer: None,
             soap_action: None,
+            reset_header: None,
         }
     }
 
@@ -129,6 +131,16 @@ impl HttpRequest {
     #[must_use]
     pub fn with_soap_action(mut self, action: &str) -> Self {
         self.soap_action = Some(action.to_owned());
+        self
+    }
+
+    /// A response header in which the source names, in seconds, when its
+    /// limit resets (T-Invest's `x-ratelimit-reset`). Read only when the
+    /// response carries no `Retry-After`, and then used the same way: the
+    /// source knows its own window better than our backoff guesses it.
+    #[must_use]
+    pub const fn with_reset_header(mut self, name: &'static str) -> Self {
+        self.reset_header = Some(name);
         self
     }
 
@@ -155,6 +167,11 @@ impl HttpRequest {
     #[must_use]
     pub fn soap_action(&self) -> Option<&str> {
         self.soap_action.as_deref()
+    }
+
+    #[must_use]
+    pub const fn reset_header(&self) -> Option<&'static str> {
+        self.reset_header
     }
 
     /// Complete request URL.
@@ -185,6 +202,19 @@ impl HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_names_no_reset_header_unless_told() {
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+        assert_eq!(request.reset_header(), None);
+    }
+
+    #[test]
+    fn a_declared_reset_header_is_kept_by_name() {
+        let request =
+            HttpRequest::get(Destination::TinkoffProd, "/").with_reset_header("x-ratelimit-reset");
+        assert_eq!(request.reset_header(), Some("x-ratelimit-reset"));
+    }
 
     #[test]
     fn a_url_joins_base_and_path_without_doubling_the_slash() {

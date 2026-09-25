@@ -1,4 +1,5 @@
-//! Outgoing HTTP: transport, trust, resilience.
+//! Outgoing HTTP: transport, trust, resilience, and the gateway every
+//! outbound call goes through.
 //!
 //! The only crate in the tree that declares the HTTP client. Source crates
 //! (`iaam-broker`, `iaam-market`) describe requests and parse responses; neither
@@ -9,11 +10,13 @@
 
 pub mod client;
 pub mod destination;
+pub mod gateway;
 pub mod request;
 pub mod resilience;
 pub mod response;
 pub mod trust;
 
 pub use destination::Destination;
+pub use gateway::{Gateway, GatewayError};
 pub use request::{HttpMethod, HttpRequest, RequestBody, Secret};
 pub use response::{HttpError, HttpResponse};

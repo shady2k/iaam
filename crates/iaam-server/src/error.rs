@@ -484,11 +484,11 @@ impl ApiFailure {
                     ApiError::simple("not_configured", message),
                 )
             }
-            // The broker is down, not our store: 503 says the same call is worth
+            // The source is down, not our store: 503 says the same call is worth
             // making again, and `Retry-After` says when, where the gateway knew.
             // A wait it did not know is left out rather than guessed.
-            AppError::BrokerUnreachable {
-                ref broker,
+            AppError::SourceUnreachable {
+                ref origin,
                 ref detail,
                 retry_after,
             } => {
@@ -503,24 +503,25 @@ impl ApiFailure {
                     StatusCode::SERVICE_UNAVAILABLE,
                     ApiError::simple(
                         error.code(),
-                        format!("broker {broker} is unavailable: {detail}; {advice}"),
+                        format!("{origin} is unavailable: {detail}; {advice}"),
                     ),
                 );
                 failure.retry_after = seconds;
                 failure
             }
-            // The broker answered and said no: repeating the call gets the same
-            // answer, so 502 names what to fix instead of when to come back.
-            AppError::BrokerRefused {
-                ref broker,
+            // The source answered and said no: repeating the call gets the same
+            // answer, so 502 says to fix what the detail names instead of when
+            // to come back.
+            AppError::SourceRefused {
+                ref origin,
                 ref detail,
             } => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ApiError::simple(
                     error.code(),
                     format!(
-                        "broker {broker} rejected the request: {detail}; check the broker access \
-                         configured for this owner before calling again"
+                        "{origin} rejected the request: {detail}; calling again unchanged \
+                         gets the same answer"
                     ),
                 ),
             ),

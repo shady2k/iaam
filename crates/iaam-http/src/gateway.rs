@@ -935,13 +935,38 @@ mod tests {
     #[tokio::test]
     async fn a_destination_missing_from_the_table_is_refused_without_sending() {
         let time = FakeTime::new();
-        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        // Every destination has a row in the documented table, so the missing
+        // one is made with a table that holds only MOEX.
+        let moex_only: &'static [Budget] = Box::leak(Box::new([Budget {
+            destination: Destination::MoexIss,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1,
+            window: Duration::from_millis(100),
+        }]));
+        let gateway = Gateway::with_parts(
+            Scripted::answering(&time, 200),
+            moex_only,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+        )
+        .expect("a one-row table is valid");
         let request = HttpRequest::get(Destination::TinvestContract, "/contract.proto");
 
         let refused = gateway.send("contract", &request, None).await;
 
         assert!(matches!(refused, Err(GatewayError::UnknownBudget { .. })));
         assert_eq!(gateway.transport.sent_count(), 0);
+    }
+
+    #[test]
+    fn every_destination_has_a_row_in_the_documented_table() {
+        for destination in Destination::ALL {
+            assert!(
+                BUDGETS.iter().any(|row| row.destination == destination),
+                "{destination:?} has no budget: every call to it would be refused"
+            );
+        }
     }
 
     fn table_with(row: Budget) -> Result<BudgetTable, GatewayError> {

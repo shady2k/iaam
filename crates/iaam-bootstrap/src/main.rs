@@ -451,11 +451,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // The same adapter serves as both fact storage and broker-access
     // storage: both use one database connection, and a second instance
-    // would mean a second writer.
-    //
-    // The one outbound gateway of this process: every broker channel the
-    // adapter opens sends through it, so they share one budget.
-    let gateway = Arc::new(Gateway::new(HttpClient::new())?);
+    // would mean a second writer. Every broker channel it opens sends through
+    // the process's one gateway, built above, so channels and market sources
+    // draw on the same budgets.
     let adapter = Arc::new(SqliteAdapter::with_broker_key(
         store,
         broker_key,

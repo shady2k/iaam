@@ -2421,3 +2421,45 @@ async fn an_unparsable_broker_answer_is_still_our_failure() {
     .await;
     assert!(matches!(error, AppError::Store(_)), "{error:?}");
 }
+
+/// **Nothing is written until both of the broker's answers are in.** A sync
+/// that recorded the operations and then lost the portfolio would leave a
+/// journal the caller was told had not changed; fetching both first keeps the
+/// refusal honest.
+#[tokio::test]
+async fn a_broker_whose_portfolio_fails_leaves_the_journal_unchanged() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let mut broker = api(
+        account,
+        SourceId::new_random(),
+        trade_without_custody(account, instrument),
+    );
+    broker.portfolio = Err(BrokerError::Unreachable {
+        broker: "test".to_owned(),
+        detail: "offline".to_owned(),
+        retry_after: None,
+    });
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the portfolio request fails");
+
+    assert!(
+        matches!(error, AppError::BrokerUnreachable { .. }),
+        "{error:?}"
+    );
+    assert!(load_all(&services, owner).await.is_empty());
+}

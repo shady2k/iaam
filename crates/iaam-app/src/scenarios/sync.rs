@@ -158,6 +158,20 @@ pub async fn sync_broker(
             .trade
             .is_some_and(|trade| trade < from || trade > to)
     });
+    // Both answers are fetched before the first write: a portfolio that fails
+    // after the operations were recorded would leave a journal the refusal
+    // claims is unchanged. An out-of-interval trade withholds every
+    // assertion, so its portfolio is not asked for at all.
+    let snapshot = if has_out_of_interval_trade {
+        None
+    } else {
+        Some(
+            broker
+                .fetch_portfolio(account, to, deadline)
+                .await
+                .map_err(broker_error)?,
+        )
+    };
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -293,9 +307,10 @@ pub async fn sync_broker(
             recorded.push(verdict);
         }
     }
-    // An out-of-interval trade remains its own early-return condition; refusals
-    // only add the coverage gap above and do not suppress the portfolio answer.
-    if has_out_of_interval_trade {
+    // An out-of-interval trade remains its own early-return condition, which is
+    // why no portfolio was fetched for it; refusals only add the coverage gap
+    // above and do not suppress the portfolio answer.
+    let Some(snapshot) = snapshot else {
         return Ok(SyncOutcome {
             recorded,
             duplicates,
@@ -303,12 +318,7 @@ pub async fn sync_broker(
             assertions: 0,
             assertions_withheld: None,
         });
-    }
-
-    let snapshot = broker
-        .fetch_portfolio(account, to, deadline)
-        .await
-        .map_err(broker_error)?;
+    };
     let assertions_withheld = match snapshot.as_of {
         PortfolioAsOf::Requested => None,
         PortfolioAsOf::Current => {

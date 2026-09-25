@@ -2395,6 +2395,8 @@ mod tests {
         assert!(waits[0].contains("INFO"), "{waits:?}");
         assert!(waits[0].contains("reason=\"backoff\""), "{waits:?}");
         assert!(waits[0].contains("wait_ms=2000"), "{waits:?}");
+        // The wait before the third attempt, after the second failed.
+        assert!(waits[0].contains("attempt=3"), "{waits:?}");
         assert!(waits[1].contains("reason=\"named reset\""), "{waits:?}");
         assert!(waits[1].contains("wait_ms=30000"), "{waits:?}");
     }
@@ -2437,7 +2439,12 @@ mod tests {
         log.assert_line(
             "INFO",
             "outbound call waits",
-            &["reason=\"lane\"", "wait_ms=5000", "method=\"UsersService\""],
+            &[
+                "reason=\"lane\"",
+                "wait_ms=5000",
+                "method=\"UsersService\"",
+                "attempt=1",
+            ],
         );
     }
 

@@ -6,9 +6,10 @@
 //! so a caller cannot forget a rule by calling the transport directly:
 //!
 //! - a **budget** per destination and method, taken from the documented limit;
-//! - **one request in flight** per destination;
+//! - **one request in flight** per host, so two destinations on one host
+//!   (the two CBR services) share one lane and one budget;
 //! - **retries** of transient refusals, with the policy of `resilience`;
-//! - a **circuit breaker** per destination;
+//! - a **circuit breaker** per host;
 //! - an optional **deadline** no attempt or wait may cross.
 //!
 //! Time comes from an injected clock and sleeper, so every rule is checked on
@@ -409,7 +410,12 @@ impl BudgetTable {
     }
 }
 
-/// What the gateway remembers about one destination.
+/// What the gateway remembers about one host.
+///
+/// Kept per host rather than per destination: the host is what sees the
+/// load, and `CbrScripts` and `CbrDailyInfo` are one host. A shared budget
+/// key of either therefore draws on one log, and a failure of either counts
+/// towards one breaker.
 #[derive(Debug, Default)]
 struct Lane {
     /// Start instants of the most recent requests, per budget key: at most
@@ -486,7 +492,8 @@ pub struct Gateway<T> {
     retry: RetryPolicy,
     clock: Arc<dyn Clock>,
     sleeper: Arc<dyn Sleeper>,
-    lanes: HashMap<Destination, Mutex<Lane>>,
+    /// Keyed by `Destination::base_url`, the host a request reaches.
+    lanes: HashMap<&'static str, Mutex<Lane>>,
 }
 
 impl<T: Transport> Gateway<T> {
@@ -521,7 +528,7 @@ impl<T: Transport> Gateway<T> {
             sleeper,
             lanes: Destination::ALL
                 .into_iter()
-                .map(|destination| (destination, Mutex::new(Lane::default())))
+                .map(|destination| (destination.base_url(), Mutex::new(Lane::default())))
                 .collect(),
         })
     }
@@ -542,7 +549,7 @@ impl<T: Transport> Gateway<T> {
     ) -> Result<HttpResponse, GatewayError> {
         let destination = request.destination();
         let (budget, key) = self.budgets.lookup(destination, method)?;
-        let lane = &self.lanes[&destination];
+        let lane = &self.lanes[destination.base_url()];
         let mut attempts = 0_u32;
         let mut status = None;
         // An attempt that would start at or after the deadline would end past
@@ -1025,6 +1032,40 @@ mod tests {
         first.expect("sent");
         second.expect("sent");
         assert_eq!(gateway.transport.most_in_flight.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn the_two_cbr_destinations_share_one_host_and_so_one_lane() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let scripts = HttpRequest::get(Destination::CbrScripts, "/scripts/XML_daily.asp");
+        let daily_info = HttpRequest::get(Destination::CbrDailyInfo, "/DailyInfoWebServ/");
+
+        let (first, second) = tokio::join!(
+            gateway.send("rates", &scripts, None),
+            gateway.send("key_rate", &daily_info, None),
+        );
+
+        first.expect("sent");
+        second.expect("sent");
+        assert_eq!(gateway.transport.most_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_two_cbr_destinations_draw_on_one_budget() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let scripts = HttpRequest::get(Destination::CbrScripts, "/scripts/XML_daily.asp");
+        let daily_info = HttpRequest::get(Destination::CbrDailyInfo, "/DailyInfoWebServ/");
+
+        gateway.send("rates", &scripts, None).await.expect("sent");
+        gateway
+            .send("key_rate", &daily_info, None)
+            .await
+            .expect("sent");
+
+        let sent = gateway.transport.sent_at();
+        assert_eq!(sent[1] - sent[0], Duration::from_millis(100));
     }
 
     // --- retries ----------------------------------------------------------

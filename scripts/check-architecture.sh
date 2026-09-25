@@ -643,7 +643,9 @@ for crate_src in crates/*/src; do
   [ -d "$crate_src" ] && production_src+=("$crate_src")
 done
 found=$(gateway_constructions "${production_src[@]}")
-count=$(printf '%s' "$found" | { grep -c . || true; })
+# Constructions, not lines: `(Gateway::production()?, Gateway::new(t)?)` is one
+# line that rustfmt keeps as it is, and two gateways.
+count=$(printf '%s' "$found" | { grep -oE "$GATEWAY_CONSTRUCTOR" || true; } | { grep -c . || true; })
 located=$(printf '%s' "$found" | cut -d: -f1,3)
 # Captured text is compared, never piped into `grep -q`: an early exit of
 # grep under pipefail reads as "no match" (see guard 4).

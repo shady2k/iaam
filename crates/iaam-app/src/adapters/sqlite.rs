@@ -2573,6 +2573,7 @@ mod tests {
                         iaam_core::ids::AccountId::new_random(),
                         time::macros::date!(2026 - 08 - 01),
                         time::macros::date!(2026 - 08 - 31),
+                        None,
                     )
                     .await
                     .expect("one page")

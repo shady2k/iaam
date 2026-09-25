@@ -28,7 +28,9 @@ use iaam_store::market::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use time::Date;
 use time::OffsetDateTime;
 
@@ -58,6 +60,59 @@ pub struct SyncOutcome {
     pub assertions_withheld: Option<AssertionsWithheld>,
 }
 
+/// How long a whole broker sync may take, from its start.
+///
+/// Every request of the sync — each operations page, then the portfolio —
+/// is made under this one deadline, so a broker that slows to a crawl ends
+/// the sync with a refusal instead of holding its account indefinitely.
+pub const SYNC_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// The accounts a broker sync is running for, in this process.
+///
+/// Two syncs of one account would each read the journal before the other
+/// wrote to it, and each send the broker the same requests against one
+/// budget. In memory is enough: one process serves the instance.
+#[derive(Debug, Default)]
+pub struct RunningSyncs(Mutex<HashSet<(OwnerId, AccountId)>>);
+
+impl RunningSyncs {
+    /// Claims `(owner, account)` for one sync, or refuses while another holds it.
+    fn claim(&self, owner: OwnerId, account: AccountId) -> Result<SyncClaim<'_>, AppError> {
+        if self.running().insert((owner, account)) {
+            Ok(SyncClaim {
+                running: self,
+                key: (owner, account),
+            })
+        } else {
+            Err(AppError::Conflict {
+                what: format!(
+                    "a sync of this account is already running: account {}",
+                    account.inner()
+                ),
+            })
+        }
+    }
+
+    // A panic while the set is held leaves it consistent — every change is
+    // one insert or one remove — so a poisoned lock is still a usable one.
+    fn running(&self) -> MutexGuard<'_, HashSet<(OwnerId, AccountId)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One running sync's hold on its account, released however the sync ends:
+/// an answer, an error or a panic.
+struct SyncClaim<'a> {
+    running: &'a RunningSyncs,
+    key: (OwnerId, AccountId),
+}
+
+impl Drop for SyncClaim<'_> {
+    fn drop(&mut self) {
+        self.running.running().remove(&self.key);
+    }
+}
+
 /// Retrieves the broker's operations and portfolio and records new facts.
 ///
 /// Matching against the existing journal is performed before calling the store:
@@ -81,8 +136,11 @@ pub async fn sync_broker(
         });
     }
 
+    let _claim = services.running_syncs.claim(principal.owner, account)?;
+    let deadline = Some(Instant::now() + SYNC_DEADLINE);
+
     let parsed = broker
-        .fetch_operations(account, from, to)
+        .fetch_operations(account, from, to, deadline)
         .await
         .map_err(broker_error)?;
     let channel = broker.channel();
@@ -248,7 +306,7 @@ pub async fn sync_broker(
     }
 
     let snapshot = broker
-        .fetch_portfolio(account, to)
+        .fetch_portfolio(account, to, deadline)
         .await
         .map_err(broker_error)?;
     let assertions_withheld = match snapshot.as_of {

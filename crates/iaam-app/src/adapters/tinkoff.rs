@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use iaam_broker::operation_kind::OperationKindDictionary;
@@ -73,13 +74,16 @@ impl BrokerChannel for TinkoffChannel {
         account: AccountId,
         from: time::Date,
         to: time::Date,
+        deadline: Option<Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         let mut request = GetOperationsByCursorRequest::new(account.inner().to_string());
         request.from = Some(rfc3339_midnight(from));
         request.to = Some(rfc3339_operation_end(to));
         request.limit = Some(OPERATIONS_PAGE_LIMIT);
         let operations = fetch_operation_pages(request, |request| async move {
-            self.client.get_operations_by_cursor(&request).await
+            self.client
+                .get_operations_by_cursor(&request, deadline)
+                .await
         })
         .await?;
         adapt_operations(account, operations, &self.dictionary)
@@ -89,10 +93,11 @@ impl BrokerChannel for TinkoffChannel {
         &self,
         account: AccountId,
         _at: time::Date,
+        deadline: Option<Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         let body = self
             .client
-            .get_portfolio(&account.inner().to_string())
+            .get_portfolio(&account.inner().to_string(), deadline)
             .await
             .map_err(tinkoff_error)?;
         adapt_portfolio(&body)
@@ -221,8 +226,13 @@ where
     let mut operations = Vec::new();
     let mut seen_cursors = HashSet::new();
 
-    for _ in 1..=MAX_OPERATION_PAGES {
-        let body = fetch(request.clone()).await.map_err(tinkoff_error)?;
+    for fetched in 0..MAX_OPERATION_PAGES {
+        // Every page is refetched on the next try, so the refusal says how
+        // far this one got rather than leaving a slow sync looking like a
+        // dead one.
+        let body = fetch(request.clone())
+            .await
+            .map_err(|error| after_pages(tinkoff_error(error), fetched))?;
         let page = parse_operations(&body).map_err(parse_error)?;
         operations.extend(page.operations);
         if !page.has_next {
@@ -243,6 +253,18 @@ where
     Err(unparsable(format!(
         "operations response exceeded page cap: fetched {MAX_OPERATION_PAGES} pages while hasNext remained true"
     )))
+}
+
+/// Names on an "unreachable, retry later" how many operation pages had
+/// arrived before it. Another refusal is about the request, not the progress.
+fn after_pages(error: BrokerError, fetched: usize) -> BrokerError {
+    match error {
+        BrokerError::Unreachable { broker, detail } => BrokerError::Unreachable {
+            broker,
+            detail: format!("{detail}; operation pages fetched before it: {fetched}"),
+        },
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2795,7 +2817,7 @@ mod tests {
     use iaam_broker::credentials::{Key, open, seal};
     use iaam_broker::environment::Environment;
     use iaam_broker::tinkoff::{OutboundGateway, TinkoffClient};
-    use iaam_http::gateway::{ATTEMPTS, FIRST_BACKOFF};
+    use iaam_http::gateway::{ATTEMPTS, Clock, FIRST_BACKOFF};
     use iaam_http::resilience::{Outcome, RetryPolicy};
 
     use super::fake::{self, Answer};
@@ -2821,6 +2843,7 @@ mod tests {
                 AccountId(Uuid::from_u128(1)),
                 time::macros::date!(2026 - 08 - 01),
                 time::macros::date!(2026 - 08 - 31),
+                None,
             )
             .await
     }
@@ -2892,6 +2915,7 @@ mod tests {
             .fetch_portfolio(
                 AccountId(Uuid::from_u128(1)),
                 time::macros::date!(2026 - 08 - 31),
+                None,
             )
             .await
             .expect_err("every attempt failed");
@@ -2918,6 +2942,74 @@ mod tests {
         fetch(&channel(gateway)).await.expect("the retry passes");
 
         assert_eq!(log.lock().expect("log").len(), 2);
+    }
+
+    /// A wait T-Invest asks for that would end past the sync's deadline is
+    /// not waited: the fetch stops there, as "unreachable, retry later", and
+    /// says how many pages had arrived.
+    #[tokio::test]
+    async fn a_fetch_cut_by_its_deadline_is_unreachable_and_names_the_pages_fetched() {
+        let (gateway, log, time) = fake::gateway(
+            vec![
+                Answer::status(200, &page_json(true, Some("cursor-2"), Some("operation-1"))),
+                Answer::status(200, &page_json(true, Some("cursor-3"), Some("operation-2"))),
+                Answer {
+                    status: 429,
+                    body: "{}".to_owned(),
+                    reset: Some(Duration::from_secs(60)),
+                },
+            ],
+            None,
+        );
+        let deadline = time.now() + Duration::from_secs(30);
+
+        let error = channel(gateway)
+            .fetch_operations(
+                AccountId(Uuid::from_u128(1)),
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                Some(deadline),
+            )
+            .await
+            .expect_err("the named wait crosses the deadline");
+
+        assert_eq!(log.lock().expect("log").len(), 3);
+        assert!(time.slept().is_empty(), "a wait past the deadline was run");
+        assert!(
+            matches!(&error, BrokerError::Unreachable { detail, .. }
+                if detail.contains("retry after")
+                    && detail.ends_with("operation pages fetched before it: 2")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_portfolio_asked_at_its_deadline_sends_nothing() {
+        let (gateway, log, time) = fake::gateway(Vec::new(), None);
+
+        let error = channel(gateway)
+            .fetch_portfolio(
+                AccountId(Uuid::from_u128(1)),
+                time::macros::date!(2026 - 08 - 31),
+                Some(time.now()),
+            )
+            .await
+            .expect_err("the deadline is now");
+
+        assert!(log.lock().expect("log").is_empty());
+        assert!(
+            matches!(error, BrokerError::Unreachable { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_other_than_unreachable_does_not_name_the_pages() {
+        let refused = BrokerError::Refused {
+            broker: "tinkoff".to_owned(),
+            detail: "token".to_owned(),
+        };
+        assert_eq!(super::after_pages(refused.clone(), 3), refused);
     }
 
     #[test]

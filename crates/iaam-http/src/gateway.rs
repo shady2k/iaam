@@ -217,6 +217,19 @@ pub enum GatewayError {
         attempts: u32,
         retry_after: Duration,
     },
+    /// The next attempt, or the wait before it, would have crossed the
+    /// caller's deadline, so the call stopped without it.
+    #[error(
+        "{destination:?}: deadline reached after {attempts} attempts (last status {status:?}); the next could start in {retry_after:?}"
+    )]
+    DeadlineReached {
+        destination: Destination,
+        /// The last status; `None` when no attempt got a response.
+        status: Option<u16>,
+        attempts: u32,
+        /// The wait that did not fit before the deadline.
+        retry_after: Duration,
+    },
     /// The destination failed too many calls in a row; nothing was sent.
     #[error(
         "{destination:?} is refused for {retry_after:?} after repeated failures ({attempts} attempts sent)"
@@ -256,9 +269,9 @@ impl GatewayError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::Exhausted { retry_after, .. } | Self::CircuitOpen { retry_after, .. } => {
-                Some(*retry_after)
-            }
+            Self::Exhausted { retry_after, .. }
+            | Self::DeadlineReached { retry_after, .. }
+            | Self::CircuitOpen { retry_after, .. } => Some(*retry_after),
             Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
             | Self::Rejected { .. }
@@ -270,7 +283,7 @@ impl GatewayError {
     #[must_use]
     pub const fn status(&self) -> Option<u16> {
         match self {
-            Self::Exhausted { status, .. } => *status,
+            Self::Exhausted { status, .. } | Self::DeadlineReached { status, .. } => *status,
             Self::Rejected { status, .. } => Some(*status),
             Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
@@ -284,6 +297,7 @@ impl GatewayError {
     pub const fn attempts(&self) -> u32 {
         match self {
             Self::Exhausted { attempts, .. }
+            | Self::DeadlineReached { attempts, .. }
             | Self::CircuitOpen { attempts, .. }
             | Self::Rejected { attempts, .. }
             | Self::Transport { attempts, .. } => *attempts,
@@ -514,12 +528,22 @@ impl<T: Transport> Gateway<T> {
         &self,
         method: &'static str,
         request: &HttpRequest,
-        _deadline: Option<Instant>,
+        deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
         let destination = request.destination();
         let (budget, key) = self.budgets.lookup(destination, method)?;
         let lane = &self.lanes[&destination];
         let mut attempts = 0_u32;
+        let mut status = None;
+        // An attempt that would start at or after the deadline would end past
+        // it, and so would any wait whose end is the start of that attempt.
+        let crosses = |start: Instant| deadline.is_some_and(|deadline| start >= deadline);
+        let cut = |attempts, status, retry_after| GatewayError::DeadlineReached {
+            destination,
+            status,
+            attempts,
+            retry_after,
+        };
         loop {
             // The lane is held for the breaker check, the budget wait, the
             // request and the breaker update, and released for the backoff:
@@ -535,7 +559,11 @@ impl<T: Transport> Gateway<T> {
                         retry_after,
                     });
                 }
-                let wait = lane.budget_wait(key, &budget, self.clock.now());
+                let now = self.clock.now();
+                let wait = lane.budget_wait(key, &budget, now);
+                if crosses(now + wait) {
+                    return Err(cut(attempts, status, wait));
+                }
                 if !wait.is_zero() {
                     self.sleeper.sleep(wait).await;
                 }
@@ -547,13 +575,17 @@ impl<T: Transport> Gateway<T> {
                         return Ok(response);
                     }
                     Ok(response) => {
+                        status = Some(response.status);
                         let outcome = match response.retry_after {
                             Some(after) => Outcome::status_with_retry_after(response.status, after),
                             None => Outcome::status(response.status),
                         };
                         (outcome, response.body)
                     }
-                    Err(error) => (Outcome::Transport(error), Vec::new()),
+                    Err(error) => {
+                        status = None;
+                        (Outcome::Transport(error), Vec::new())
+                    }
                 };
                 let decision = self.retry.decide(attempts, &outcome);
                 // Only a call that failed transiently to the end counts: a
@@ -565,6 +597,12 @@ impl<T: Transport> Gateway<T> {
                 (decision, outcome, body)
             };
             match decision {
+                // A call cut short by its deadline is left out of the breaker
+                // count: it did not use up its retries, so it proved no more
+                // than one failed attempt does.
+                Retry::After(delay) if crosses(self.clock.now() + delay) => {
+                    return Err(cut(attempts, status, delay));
+                }
                 Retry::After(delay) => self.sleeper.sleep(delay).await,
                 Retry::GiveUp => return Err(self.refusal(destination, attempts, outcome, body)),
             }
@@ -1370,6 +1408,139 @@ mod tests {
             .count();
         assert_eq!(refused, 1);
         assert!(gateway.transport.sent_count() < sent + 2 * ATTEMPTS as usize);
+    }
+
+    // --- deadline ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_deadline_already_reached_sends_nothing() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(time.now()))
+            .await
+            .expect_err("the deadline is now");
+
+        assert!(
+            matches!(refused, GatewayError::DeadlineReached { attempts: 0, .. }),
+            "{refused:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_backoff_that_would_end_past_the_deadline_is_not_waited() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 503));
+        let deadline = time.now() + Duration::from_millis(2500);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await
+            .expect_err("the third attempt would start past the deadline");
+
+        // Attempts at 0 s and 1 s; the third would start at 3 s.
+        assert_eq!(gateway.transport.sent_count(), 2);
+        assert_eq!(time.slept(), [Duration::from_secs(1)]);
+        assert!(gateway.transport.sent_at().iter().all(|at| *at < deadline));
+        assert!(
+            matches!(
+                refused,
+                GatewayError::DeadlineReached {
+                    attempts: 2,
+                    status: Some(503),
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.retry_after(), Some(Duration::from_secs(2)));
+        let message = refused.to_string();
+        assert!(message.contains("deadline reached"), "{message}");
+        assert!(message.contains("2 attempts"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn no_attempt_starts_exactly_at_the_deadline() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 503));
+        let deadline = time.now() + Duration::from_secs(3);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await;
+
+        assert!(matches!(
+            refused,
+            Err(GatewayError::DeadlineReached { attempts: 2, .. })
+        ));
+        assert_eq!(gateway.transport.sent_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_budget_wait_that_would_end_past_the_deadline_is_not_waited() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        for _ in 0..50 {
+            call(&gateway).await.expect("within the budget");
+        }
+        let deadline = time.now() + Duration::from_secs(30);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await
+            .expect_err("the budget frees a request only in a minute");
+
+        assert!(
+            matches!(
+                refused,
+                GatewayError::DeadlineReached {
+                    attempts: 0,
+                    status: None,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.retry_after(), Some(MINUTE));
+        assert_eq!(gateway.transport.sent_count(), 50);
+        assert!(time.slept().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deadline_with_room_leaves_the_retries_alone() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(503))));
+        let deadline = time.now() + Duration::from_millis(1001);
+
+        gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await
+            .expect("the retry starts before the deadline");
+
+        assert_eq!(gateway.transport.sent_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_call_cut_short_by_its_deadline_does_not_count_towards_the_breaker() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 503));
+        for _ in 0..5 {
+            let deadline = time.now() + Duration::from_millis(500);
+            let cut = gateway
+                .send("OperationsService", &operations(), Some(deadline))
+                .await;
+            assert!(
+                matches!(cut, Err(GatewayError::DeadlineReached { .. })),
+                "{cut:?}"
+            );
+        }
+        let sent = gateway.transport.sent_count();
+
+        let _ = call(&gateway).await;
+
+        assert_eq!(gateway.transport.sent_count(), sent + ATTEMPTS as usize);
     }
 
     #[test]

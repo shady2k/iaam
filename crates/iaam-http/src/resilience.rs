@@ -1,10 +1,11 @@
-//! Resilience: when to retry, how long to wait, and how often to call (§12).
+//! Resilience: when to retry and how long to wait (§12). How often to call
+//! is the gateway's budget table.
 //!
 //! The retry decision is a **pure function**. It can then be checked without
 //! a network or sleep: a retry-policy test that sleeps also tests the thread
 //! scheduler and fails mysteriously.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::response::HttpError;
 
@@ -104,8 +105,7 @@ impl RetryPolicy {
     /// No jitter: jitter spreads out many independent clients converging on
     /// the same refusal at once. This process is the only client of these
     /// destinations, and its outbound calls are already serialised one at a
-    /// time per destination by the gateway (and, for the market adapter not
-    /// yet moved onto it, by `RateLimiter` below) — there is no thundering herd here to
+    /// time per host by the gateway — there is no thundering herd here to
     /// break up, only a single caller whose wait would become less
     /// predictable for no benefit.
     fn backoff(&self, attempt: u32) -> Duration {
@@ -146,46 +146,9 @@ pub fn is_transient(outcome: &Outcome) -> bool {
     }
 }
 
-/// Rate limit: no more than one request in the specified interval.
-///
-/// This prevents the initial history load from looking like a request flood
-/// to MOEX: receiving 429 and retrying costs more than waiting.
-pub struct RateLimiter {
-    min_interval: Duration,
-    last: std::sync::Mutex<Option<Instant>>,
-}
-
-impl RateLimiter {
-    #[must_use]
-    pub fn new(min_interval: Duration) -> Self {
-        Self {
-            min_interval,
-            last: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// How long to wait before the next request. Zero means proceed now.
-    #[must_use]
-    pub fn delay_before_next(&self, now: Instant) -> Duration {
-        let mut last = self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let wait = match *last {
-            Some(previous) => self
-                .min_interval
-                .checked_sub(now.saturating_duration_since(previous))
-                .unwrap_or_default(),
-            None => Duration::ZERO,
-        };
-        *last = Some(now + wait);
-        wait
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::*;
     use crate::HttpError;
@@ -370,22 +333,6 @@ mod tests {
         assert_eq!(
             policy.decide(1, &outcome),
             Retry::After(Duration::from_millis(100))
-        );
-    }
-
-    #[test]
-    fn rate_limiter_enforces_the_minimum_interval() {
-        let limiter = RateLimiter::new(Duration::from_millis(100));
-        let start = Instant::now();
-
-        assert_eq!(limiter.delay_before_next(start), Duration::ZERO);
-        assert_eq!(
-            limiter.delay_before_next(start + Duration::from_millis(50)),
-            Duration::from_millis(50)
-        );
-        assert_eq!(
-            limiter.delay_before_next(start + Duration::from_millis(100)),
-            Duration::from_millis(100)
         );
     }
 }

@@ -1082,6 +1082,7 @@ dependencies = [
 name = "iaam-http"
 version = "0.1.0"
 dependencies = [
+ "httpdate",
  "percent-encoding",
  "reqwest",
  "sha2",

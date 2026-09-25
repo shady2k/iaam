@@ -17,6 +17,10 @@ percent-encoding = "2"
 # Секрет зануляется при уничтожении: копия токена, оставшаяся
 # в освобождённой памяти, — это тот же токен.
 zeroize = { version = "1", features = ["alloc"] }
+# A `Retry-After` may name an HTTP-date rather than seconds, and the gateway
+# obeys whichever form the source sends. RFC 9110's three date formats are a
+# parser of their own; this one is already in the tree beneath hyper.
+httpdate = "1"
 # The gateway's production timer and its per-destination async lock. The
 # application already runs tokio; the gateway only borrows its timer.
 tokio = { version = "1", features = ["sync", "time"] }

@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use crate::client::HttpClient;
 use crate::destination::Destination;
 use crate::request::HttpRequest;
-use crate::resilience::{Outcome, Retry, RetryPolicy, is_transient};
+use crate::resilience::{MAX_NAMED_WAIT, Outcome, Retry, RetryPolicy, is_transient};
 use crate::response::{HttpError, HttpResponse};
 
 /// The window every per-minute limit below is stated over.
@@ -252,6 +252,19 @@ pub enum GatewayError {
         attempts: u32,
         retry_after: Duration,
     },
+    /// The destination named a wait longer than the gateway holds a caller
+    /// (`resilience::MAX_NAMED_WAIT`), so the call returned instead of
+    /// waiting it out.
+    #[error(
+        "{destination:?} asked not to be called for {retry_after:?} (last status {status:?}, {attempts} attempts sent)"
+    )]
+    Deferred {
+        destination: Destination,
+        /// The last status; `None` when this call sent nothing.
+        status: Option<u16>,
+        attempts: u32,
+        retry_after: Duration,
+    },
     /// The destination answered with a status a retry would only repeat.
     #[error("{destination:?} refused the request with status {status} after {attempts} attempts")]
     Rejected {
@@ -283,7 +296,8 @@ impl GatewayError {
         match self {
             Self::Exhausted { retry_after, .. }
             | Self::DeadlineReached { retry_after, .. }
-            | Self::CircuitOpen { retry_after, .. } => Some(*retry_after),
+            | Self::CircuitOpen { retry_after, .. }
+            | Self::Deferred { retry_after, .. } => Some(*retry_after),
             Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
             | Self::Rejected { .. }
@@ -295,7 +309,9 @@ impl GatewayError {
     #[must_use]
     pub const fn status(&self) -> Option<u16> {
         match self {
-            Self::Exhausted { status, .. } | Self::DeadlineReached { status, .. } => *status,
+            Self::Exhausted { status, .. }
+            | Self::DeadlineReached { status, .. }
+            | Self::Deferred { status, .. } => *status,
             Self::Rejected { status, .. } => Some(*status),
             Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
@@ -311,6 +327,7 @@ impl GatewayError {
             Self::Exhausted { attempts, .. }
             | Self::DeadlineReached { attempts, .. }
             | Self::CircuitOpen { attempts, .. }
+            | Self::Deferred { attempts, .. }
             | Self::Rejected { attempts, .. }
             | Self::Transport { attempts, .. } => *attempts,
             Self::UnknownBudget { .. } | Self::InvalidBudgets(_) => 0,
@@ -426,6 +443,11 @@ struct Lane {
     failures: u32,
     /// Until when the breaker refuses calls, once it has opened.
     open_until: Option<Instant>,
+    /// Until when the destination asked not to be called: a `Retry-After` or
+    /// reset it named. Every budget key of the host lives in this lane, so
+    /// the one instant holds back every caller of the lane and of each key,
+    /// including one that arrives after the call that learned it returned.
+    not_before: Option<Instant>,
 }
 
 impl Lane {
@@ -459,6 +481,18 @@ impl Lane {
         self.open_until
             .and_then(|until| until.checked_duration_since(now))
             .filter(|left| !left.is_zero())
+    }
+
+    /// How long the destination's named reset still holds calls back.
+    fn named_wait(&self, now: Instant) -> Duration {
+        self.not_before
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+    }
+
+    /// Remember a reset the destination named; an earlier one it named
+    /// before does not shorten a later one.
+    fn hold_until(&mut self, until: Instant) {
+        self.not_before = self.not_before.max(Some(until));
     }
 
     fn record_failure(&mut self, now: Instant) {
@@ -563,11 +597,12 @@ impl<T: Transport> Gateway<T> {
             retry_after,
         };
         loop {
-            // The lane is held for the breaker check, the budget wait, the
-            // request and the breaker update, and released for the backoff:
-            // a destination that is refusing is not made to wait for a call
-            // that is only waiting itself, and a failure that opens the
-            // breaker is recorded before another call can slip in.
+            // The lane is held for the breaker check, the budget and named
+            // waits, the request and the breaker update, and released for
+            // the backoff: a destination that is refusing is not made to wait
+            // for a call that is only waiting itself, and a failure that
+            // opens the breaker is recorded before another call can slip in.
+            // A named reset is waited here, under the lane, by every caller.
             let (decision, outcome, body) = {
                 let mut lane = lane.lock().await;
                 if let Some(retry_after) = lane.refusing(self.clock.now()) {
@@ -578,7 +613,16 @@ impl<T: Transport> Gateway<T> {
                     });
                 }
                 let now = self.clock.now();
-                let wait = lane.budget_wait(key, &budget, now);
+                let named = lane.named_wait(now);
+                if named > MAX_NAMED_WAIT {
+                    return Err(GatewayError::Deferred {
+                        destination,
+                        status,
+                        attempts,
+                        retry_after: named,
+                    });
+                }
+                let wait = named.max(lane.budget_wait(key, &budget, now));
                 if crosses(now + wait) {
                     return Err(cut(attempts, status, wait));
                 }
@@ -616,6 +660,11 @@ impl<T: Transport> Gateway<T> {
                         (Outcome::Transport(error), Vec::new())
                     }
                 };
+                if let Some(named) = outcome.named_delay()
+                    && is_transient(&outcome)
+                {
+                    lane.hold_until(self.clock.now() + named);
+                }
                 // A request that may act is sent once: a lost answer does not
                 // say the action was not taken.
                 let decision = if request.is_idempotent() {
@@ -632,6 +681,9 @@ impl<T: Transport> Gateway<T> {
                 (decision, outcome, body)
             };
             match decision {
+                // Waited at the top of the loop, under the lane, where every
+                // other caller waits it too.
+                Retry::After(_) if outcome.named_delay().is_some() => {}
                 // A call cut short by its deadline is left out of the breaker
                 // count: it did not use up its retries, so it proved no more
                 // than one failed attempt does.
@@ -715,6 +767,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::resilience::MAX_NAMED_WAIT;
 
     /// A clock on tokio's paused timer: it moves only when every task waits
     /// on it, so a sleep of a minute takes no real time, and a request still
@@ -1350,20 +1403,159 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_named_delay_is_still_capped() {
+    async fn a_named_delay_is_waited_in_full_up_to_fifteen_minutes() {
+        for named in [Duration::from_secs(300), MAX_NAMED_WAIT] {
+            let time = FakeTime::new();
+            let gateway = gateway(
+                &time,
+                Scripted::answering(&time, 200).then(Ok(with_retry_after(429, named))),
+            );
+
+            gateway
+                .send("OperationsService", &operations(), None)
+                .await
+                .expect("the retry succeeded");
+
+            assert_eq!(time.slept(), [named]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_delay_over_fifteen_minutes_is_returned_not_waited() {
+        let time = FakeTime::new();
+        let long = MAX_NAMED_WAIT + Duration::from_secs(1);
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(with_retry_after(429, long))),
+        );
+
+        let refused = gateway
+            .send("OperationsService", &operations(), None)
+            .await
+            .expect_err("the gateway holds nobody that long");
+
+        assert!(time.slept().is_empty());
+        assert_eq!(gateway.transport.sent_count(), 1);
+        assert!(
+            matches!(
+                refused,
+                GatewayError::Deferred {
+                    status: Some(429),
+                    attempts: 1,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.retry_after(), Some(long));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_delay_holds_back_every_caller_of_the_lane() {
         let time = FakeTime::new();
         let gateway = gateway(
             &time,
             Scripted::answering(&time, 200)
-                .then(Ok(with_retry_after(429, Duration::from_secs(3600)))),
+                .then(Ok(with_retry_after(429, Duration::from_secs(30)))),
+        );
+        let (operations, users) = (operations(), users());
+        let start = time.now();
+
+        let (first, second) = tokio::join!(
+            gateway.send("OperationsService", &operations, None),
+            gateway.send("UsersService", &users, None),
         );
 
+        first.expect("sent");
+        second.expect("sent");
+        let sent = gateway.transport.sent_at();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0], start);
+        assert!(
+            sent[1..]
+                .iter()
+                .all(|at| *at >= start + Duration::from_secs(30)),
+            "a caller went ahead of the named reset: {:?}",
+            sent.iter().map(|at| *at - start).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_delay_holds_back_a_call_made_after_the_one_that_learned_it() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(with_retry_after(503, Duration::from_secs(20)))),
+        );
+        let start = time.now();
+        let once = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            crate::RequestBody::Json("{}".to_owned()),
+        );
+
+        let refused = gateway
+            .send("OperationsService", &once, None)
+            .await
+            .expect_err("sent once and refused");
+        assert_eq!(refused.retry_after(), Some(Duration::from_secs(20)));
         gateway
             .send("OperationsService", &operations(), None)
             .await
-            .expect("the retry succeeded");
+            .expect("sent after the reset");
 
-        assert_eq!(time.slept(), [crate::resilience::MAX_BACKOFF]);
+        assert_eq!(
+            gateway.transport.sent_at()[1],
+            start + Duration::from_secs(20)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_later_call_is_refused_rather_than_held_past_fifteen_minutes() {
+        let time = FakeTime::new();
+        let long = Duration::from_secs(3600);
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(with_retry_after(429, long))),
+        );
+        let _ = call(&gateway).await;
+        time.advance(Duration::from_secs(600));
+
+        let refused = gateway
+            .send("UsersService", &users(), None)
+            .await
+            .expect_err("the reset is fifty minutes away");
+
+        assert_eq!(gateway.transport.sent_count(), 1);
+        assert!(
+            matches!(refused, GatewayError::Deferred { attempts: 0, .. }),
+            "{refused:?}"
+        );
+        assert_eq!(refused.retry_after(), Some(Duration::from_secs(3000)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_delay_that_would_end_past_the_deadline_is_not_waited() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(with_retry_after(429, Duration::from_secs(90)))),
+        );
+        let deadline = time.now() + Duration::from_secs(60);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await
+            .expect_err("the reset falls after the deadline");
+
+        assert!(time.slept().is_empty());
+        assert!(
+            matches!(refused, GatewayError::DeadlineReached { attempts: 1, .. }),
+            "{refused:?}"
+        );
+        assert_eq!(refused.retry_after(), Some(Duration::from_secs(90)));
     }
 
     #[tokio::test(start_paused = true)]

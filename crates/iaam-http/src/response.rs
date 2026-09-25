@@ -13,10 +13,10 @@ use thiserror::Error;
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
-    /// The `Retry-After` the source named, already parsed as delay-seconds
-    /// (see `resilience::parse_retry_after`). `None` when the header was
-    /// absent or in a form that function does not parse, such as an
-    /// HTTP-date.
+    /// The wait the source named — its `Retry-After`, as delay-seconds or
+    /// an HTTP-date, or the reset header the request declared — already
+    /// parsed (see `resilience::parse_retry_after`). `None` when it named
+    /// none, or in a form that does not parse.
     pub retry_after: Option<Duration>,
 }
 

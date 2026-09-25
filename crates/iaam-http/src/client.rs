@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::destination::Destination;
 use crate::request::{HttpMethod, HttpRequest};
@@ -21,19 +21,18 @@ use crate::trust::{ConfiguredClient, client_for};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Outgoing request client.
+///
+/// Built only inside this crate, so outside it an `HttpClient` exists only
+/// inside the gateway `Gateway::production` returns: a caller holding one
+/// could send through the public `Transport` trait past every rule of the
+/// gateway. For the same reason it has no `Default`.
 pub struct HttpClient {
     pool: Mutex<HashMap<Destination, ConfiguredClient>>,
 }
 
-impl Default for HttpClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HttpClient {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pool: Mutex::new(HashMap::new()),
         }
@@ -92,7 +91,11 @@ impl HttpClient {
         let response = builder.send().await.map_err(classify_transport_error)?;
         let status = response.status().as_u16();
         // Read before `bytes()` consumes the response.
-        let retry_after = named_delay(response.headers(), request.reset_header());
+        let retry_after = named_delay(
+            response.headers(),
+            request.reset_header(),
+            SystemTime::now(),
+        );
         let body = response
             .bytes()
             .await
@@ -109,19 +112,20 @@ impl HttpClient {
 /// The delay the source named: its `Retry-After`, else the reset header the
 /// request declared.
 ///
-/// Only the delay-seconds form is understood, so a value in another form (an
-/// HTTP-date) or an absent header both become `None`, and the retry policy
-/// falls back to its computed backoff. Only the parsed delay leaves here, never
-/// the header value.
+/// Delay-seconds or an HTTP-date, the date read against `now`, the instant
+/// the answer arrived. A value in neither form or an absent header becomes
+/// `None`, and the retry policy falls back to its computed backoff. Only the
+/// parsed delay leaves here, never the header value.
 fn named_delay(
     headers: &reqwest::header::HeaderMap,
     reset_header: Option<&str>,
+    now: SystemTime,
 ) -> Option<Duration> {
     let seconds = |name: &str| {
         headers
             .get(name)
             .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after)
+            .and_then(|value| parse_retry_after(value, now))
     };
     seconds(reqwest::header::RETRY_AFTER.as_str()).or_else(|| reset_header.and_then(seconds))
 }
@@ -136,6 +140,8 @@ fn classify_transport_error(error: reqwest::Error) -> HttpError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
     use crate::request::RequestBody;
 
@@ -185,7 +191,7 @@ mod tests {
 
     #[test]
     fn retry_after_is_the_named_delay() {
-        let named = named_delay(&headers(&[("retry-after", "12")]), None);
+        let named = named_delay(&headers(&[("retry-after", "12")]), None, SystemTime::now());
         assert_eq!(named, Some(Duration::from_secs(12)));
     }
 
@@ -194,6 +200,7 @@ mod tests {
         let named = named_delay(
             &headers(&[("x-ratelimit-reset", "17")]),
             Some("x-ratelimit-reset"),
+            SystemTime::now(),
         );
         assert_eq!(named, Some(Duration::from_secs(17)));
     }
@@ -203,13 +210,30 @@ mod tests {
         let named = named_delay(
             &headers(&[("retry-after", "3"), ("x-ratelimit-reset", "17")]),
             Some("x-ratelimit-reset"),
+            SystemTime::now(),
         );
         assert_eq!(named, Some(Duration::from_secs(3)));
     }
 
     #[test]
+    fn retry_after_as_an_http_date_is_the_named_delay() {
+        // 2026-10-21 07:28:00 UTC.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_567_680);
+        let named = named_delay(
+            &headers(&[("retry-after", "Wed, 21 Oct 2026 07:33:00 GMT")]),
+            None,
+            now,
+        );
+        assert_eq!(named, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
     fn an_undeclared_reset_header_is_ignored() {
-        let named = named_delay(&headers(&[("x-ratelimit-reset", "17")]), None);
+        let named = named_delay(
+            &headers(&[("x-ratelimit-reset", "17")]),
+            None,
+            SystemTime::now(),
+        );
         assert_eq!(named, None);
     }
 

@@ -416,12 +416,14 @@ async fn harness_with_factory_and_provisioning(
 ) -> Harness {
     harness_with_everything(
         store,
-        channel_factory,
-        provisioned,
-        with_account,
-        with_broker_access,
-        rate_limit,
-        Arc::new(UnavailableOutboundHttp),
+        HarnessSetup {
+            channel_factory,
+            provisioned,
+            with_account,
+            with_broker_access,
+            rate_limit,
+            http: Arc::new(UnavailableOutboundHttp),
+        },
     )
     .await
 }
@@ -430,12 +432,14 @@ async fn harness_with_factory_and_provisioning(
 async fn harness_with_http(http: Arc<dyn OutboundHttp>) -> Harness {
     harness_with_everything(
         SqliteStore::open_in_memory().expect("in-memory database"),
-        None,
-        true,
-        true,
-        false,
-        GENEROUS_RATE_LIMIT,
-        http,
+        HarnessSetup {
+            channel_factory: None,
+            provisioned: true,
+            with_account: true,
+            with_broker_access: false,
+            rate_limit: GENEROUS_RATE_LIMIT,
+            http,
+        },
     )
     .await
 }
@@ -457,17 +461,25 @@ impl iaam_http::gateway::Transport for NoNetwork {
 }
 
 /// Every knob of the harness in one place; the narrower builders above name
-/// the ones a test turns, which is why the list is allowed to be long here.
-#[allow(clippy::too_many_arguments)]
-async fn harness_with_everything(
-    mut store: SqliteStore,
+/// the ones a test turns.
+struct HarnessSetup {
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
     provisioned: bool,
     with_account: bool,
     with_broker_access: bool,
     rate_limit: u32,
     http: Arc<dyn OutboundHttp>,
-) -> Harness {
+}
+
+async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) -> Harness {
+    let HarnessSetup {
+        channel_factory,
+        provisioned,
+        with_account,
+        with_broker_access,
+        rate_limit,
+        http,
+    } = setup;
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
 

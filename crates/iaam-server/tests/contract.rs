@@ -93,6 +93,7 @@ impl BrokerChannel for EmptyChannel {
         _account: AccountId,
         _from: Date,
         _to: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
             accepted: Vec::new(),
@@ -104,6 +105,7 @@ impl BrokerChannel for EmptyChannel {
         &self,
         _account: AccountId,
         _at: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -132,6 +134,7 @@ impl BrokerChannel for PopulatedChannel {
         account: AccountId,
         _from: Date,
         _to: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
             accepted: vec![SubmittedOperation {
@@ -163,6 +166,7 @@ impl BrokerChannel for PopulatedChannel {
         &self,
         _account: AccountId,
         _at: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -515,6 +519,7 @@ async fn harness_with_factory_and_provisioning(
         broker_dictionary,
         market_store: market_store.clone(),
         profiles: Arc::new(iaam_app::ingest::profile::ProfileCatalogue::bundled()),
+        running_syncs: iaam_app::sync::RunningSyncs::default(),
     });
     let state = ServerState::new(
         services,
@@ -1945,6 +1950,18 @@ async fn the_openapi_document_declares_bearer_security() {
         .expect("security scheme description");
     assert!(description.contains("iaam claim --label <label>"));
     assert!(description.contains("no API route issues one"));
+}
+
+#[tokio::test]
+async fn the_broker_sync_openapi_declares_the_running_sync_conflict() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let conflict = &spec["paths"]["/v1/brokers/{broker}/sync"]["post"]["responses"]["409"];
+    let description = conflict["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the sync route declares no 409: {conflict}"));
+    assert!(description.contains("already running"), "{description}");
 }
 
 #[tokio::test]
@@ -11985,6 +12002,7 @@ impl BrokerChannel for TwinRowsChannel {
         account: AccountId,
         _from: Date,
         _to: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         let row = |operation_id: &str| SubmittedOperation {
             account,
@@ -12017,6 +12035,7 @@ impl BrokerChannel for TwinRowsChannel {
         &self,
         _account: AccountId,
         _at: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,

@@ -1691,6 +1691,7 @@ pub async fn preview_category_rules_batch_route(
     responses(
         (status = 200, description = "Synchronisation result", body = SyncOutcomeDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 409, description = "A sync of this account is already running; nothing was sent to the broker", body = ApiError),
         (status = 503, description = "Broker channel or access is not configured", body = ApiError),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),

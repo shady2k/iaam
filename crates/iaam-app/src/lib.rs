@@ -80,6 +80,9 @@ pub struct AppServices {
     /// from what this build ships plus whatever directory the operator pointed
     /// at, and it is read-only from here on.
     pub profiles: Arc<iaam_ingest::profile::ProfileCatalogue>,
+    /// The accounts a broker sync is running for; a second sync of one of
+    /// them is refused while the first runs.
+    pub running_syncs: sync::RunningSyncs,
 }
 
 impl AppServices {
@@ -117,6 +120,7 @@ impl AppServices {
             // how every future row of a format is read, and one picked up from
             // a known place would be one nobody chose.
             profiles: Arc::new(iaam_ingest::profile::ProfileCatalogue::bundled()),
+            running_syncs: sync::RunningSyncs::default(),
         }
     }
 }

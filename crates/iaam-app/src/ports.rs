@@ -2158,21 +2158,27 @@ pub struct PortfolioSnapshot {
 #[async_trait]
 pub trait BrokerChannel: Send + Sync {
     /// Account operations for an interval: accepted and sent to quarantine.
+    ///
+    /// `deadline` is the whole sync's: no request starts, and no wait for
+    /// one runs, past it. A channel that reaches it answers `Unreachable`.
     async fn fetch_operations(
         &self,
         account: AccountId,
         from: Date,
         to: Date,
+        deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError>;
 
     /// Portfolio claims for the requested account and their date semantics.
     ///
     /// Returns the source's assertions, not a calculation: the values calculated
-    /// from the journal are subsequently reconciled against them.
+    /// from the journal are subsequently reconciled against them. `deadline`
+    /// is the whole sync's, as for `fetch_operations`.
     async fn fetch_portfolio(
         &self,
         account: AccountId,
         at: Date,
+        deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError>;
 
     /// Exactly how the data was obtained. The parser version and absence

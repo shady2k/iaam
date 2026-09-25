@@ -196,25 +196,36 @@ impl TinkoffClient {
             "UsersService",
             "UsersService/GetAccounts",
             json!({}),
+            None,
         )
         .await
     }
 
     /// Return the raw response body from `OperationsService/GetPortfolio`.
-    pub async fn get_portfolio(&self, account_id: &str) -> Result<String, TinkoffError> {
+    ///
+    /// No attempt starts, and no wait for one runs, past `deadline`.
+    pub async fn get_portfolio(
+        &self,
+        account_id: &str,
+        deadline: Option<Instant>,
+    ) -> Result<String, TinkoffError> {
         self.post(
             Method::Portfolio,
             "OperationsService",
             "OperationsService/GetPortfolio",
             json!({ "accountId": account_id }),
+            deadline,
         )
         .await
     }
 
     /// Return the raw page body from `OperationsService/GetOperationsByCursor`.
+    ///
+    /// No attempt starts, and no wait for one runs, past `deadline`.
     pub async fn get_operations_by_cursor(
         &self,
         request: &GetOperationsByCursorRequest,
+        deadline: Option<Instant>,
     ) -> Result<String, TinkoffError> {
         let body = self
             .post(
@@ -222,6 +233,7 @@ impl TinkoffClient {
                 "OperationsService",
                 "OperationsService/GetOperationsByCursor",
                 serde_json::to_value(request).map_err(|_| TinkoffError::RequestSerialization)?,
+                deadline,
             )
             .await?;
         validate_cursor_page(&body)?;
@@ -236,13 +248,14 @@ impl TinkoffClient {
         service: &'static str,
         path: &str,
         body: Value,
+        deadline: Option<Instant>,
     ) -> Result<String, TinkoffError> {
         ensure_method_available(self.environment, method)?;
         let body = serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?;
         let request = Self::request(self.environment, path, body, self.token.expose());
         let response = self
             .gateway
-            .send(service, &request, None)
+            .send(service, &request, deadline)
             .await
             .map_err(|error| gateway_error(error, self.token.expose()))?;
         String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)
@@ -548,7 +561,10 @@ mod tests {
             &format!(r#"{{"message":"bad field near {TOKEN}"}}"#),
         )]);
 
-        let error = client.get_portfolio("account").await.expect_err("400");
+        let error = client
+            .get_portfolio("account", None)
+            .await
+            .expect_err("400");
 
         assert!(
             matches!(&error, TinkoffError::UnexpectedStatus { status: 400, body }
@@ -569,11 +585,14 @@ mod tests {
             client.get_accounts().await.expect("accounts");
         }
         for _ in 0..25 {
-            client.get_portfolio("account").await.expect("portfolio");
+            client
+                .get_portfolio("account", None)
+                .await
+                .expect("portfolio");
         }
         assert!(time.slept.lock().expect("sleeps").is_empty());
         client
-            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"))
+            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"), None)
             .await
             .expect("operations");
         assert!(
@@ -593,13 +612,13 @@ mod tests {
 
         assert_eq!(
             client
-                .get_operations_by_cursor(&request)
+                .get_operations_by_cursor(&request, None)
                 .await
                 .expect("page"),
             page
         );
         assert!(matches!(
-            client.get_operations_by_cursor(&request).await,
+            client.get_operations_by_cursor(&request, None).await,
             Err(TinkoffError::PartialResponse)
         ));
     }

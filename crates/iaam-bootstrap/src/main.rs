@@ -477,6 +477,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         broker_dictionary,
         market_store: Arc::new(tokio::sync::Mutex::new(market_store)),
         profiles,
+        running_syncs: iaam_app::sync::RunningSyncs::default(),
     });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);

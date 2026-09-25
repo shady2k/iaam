@@ -248,7 +248,11 @@ done
 # other client is refused as well: a second HTTP stack is the same bypass
 # under another name. A `-suffix` crate of one of them (`hyper-util`,
 # `reqwest-middleware`) is the same stack.
-HTTP_CLIENT_CRATES='^(reqwest|hyper|ureq|isahc|surf|curl|attohttpc|awc)(-.*)?$'
+#
+# The limit: the list names the clients known when it was written. A client
+# crate missing from it passes this guard and is left to review; nothing in
+# cargo metadata says that a crate speaks HTTP.
+HTTP_CLIENT_CRATES='^(reqwest|hyper|ureq|isahc|surf|curl|attohttpc|awc|minreq|http_req|ehttp)(-.*)?$'
 http_client_deps() {
   jq -r --arg crates "$HTTP_CLIENT_CRATES" '
     .packages[] | select(.name != "iaam-http") | .name as $package
@@ -298,10 +302,11 @@ http_probe_meta='{"packages":[
   {"name":"renamed","dependencies":[{"name":"reqwest","rename":"wire","kind":null}]},
   {"name":"inherited","dependencies":[{"name":"reqwest","rename":null,"kind":"dev"}]},
   {"name":"other","dependencies":[{"name":"ureq","rename":null,"kind":null},{"name":"hyper-util","rename":null,"kind":"build"}]},
+  {"name":"small","dependencies":[{"name":"minreq","rename":null,"kind":null},{"name":"http_req","rename":null,"kind":null},{"name":"ehttp","rename":null,"kind":"dev"}]},
   {"name":"clean","dependencies":[{"name":"serde","rename":null,"kind":null},{"name":"curlew","rename":null,"kind":null}]}
 ]}'
 http_probe=$(printf '%s' "$http_probe_meta" | http_client_deps | tr '\n' '|')
-expected='plain depends on reqwest (normal)|renamed depends on reqwest renamed wire (normal)|inherited depends on reqwest (dev)|other depends on ureq (normal)|other depends on hyper-util (build)|'
+expected='plain depends on reqwest (normal)|renamed depends on reqwest renamed wire (normal)|inherited depends on reqwest (dev)|other depends on ureq (normal)|other depends on hyper-util (build)|small depends on minreq (normal)|small depends on http_req (normal)|small depends on ehttp (dev)|'
 if [ "$http_probe" != "$expected" ]; then
   err "the HTTP-client dependency guard misclassifies its probe: got '$http_probe'"
 fi
@@ -488,7 +493,13 @@ done
 #
 # "Test code" is an item under `#[cfg(test)]` — a module, a function, an
 # impl — and it ends where its braces close, not at the end of the file:
-# production code placed after a test module is still production code.
+# production code placed after a test module is still production code, on the
+# line the module closes on as well as on the lines after it.
+#
+# The limit: a path is read on one line. `Gateway ::` on one line and
+# `production()` on the next is not chased, because `cargo fmt --check`, which
+# CI runs, joins it back; an alias through a function item is caught only as
+# the constructor named without a call, which is counted below.
 production_code() {
   rust_code $(find "$@" -name '*.rs' | sort) | awk '
     {
@@ -505,7 +516,7 @@ production_code() {
         if (code ~ /^[[:space:]]*$/ || code ~ /^[[:space:]]*#\[.*\][[:space:]]*$/) next
         skip = 1; skip_depth = depth; skip_opened = 0; pending = 0
       }
-      in_test = skip
+      in_test = skip; kept = ""
       # The function a line belongs to: the one open when it starts, or,
       # for a function written on one line, the one it declares.
       enclosing = fns > 0 ? fn_name[fns] : ""; declared = ""
@@ -513,9 +524,13 @@ production_code() {
       while (rest != "") {
         if (match(rest, /^fn[[:space:]]+[A-Za-z0-9_]+/) && (prev == "" || prev !~ /[A-Za-z0-9_]/)) {
           next_fn = substr(rest, 1, RLENGTH); sub(/^fn[[:space:]]+/, "", next_fn)
+          if (!skip) kept = kept substr(rest, 1, RLENGTH)
           prev = "n"; rest = substr(rest, RLENGTH + 1); continue
         }
         c = substr(rest, 1, 1); rest = substr(rest, 2); prev = c
+        # A character belongs to the test item while one is open, the brace
+        # or semicolon that closes it included.
+        if (!skip) kept = kept c
         if (c == "(" || c == "[") nesting++
         else if (c == ")" || c == "]") nesting--
         else if (c == "{") {
@@ -523,7 +538,9 @@ production_code() {
           if (skip) skip_opened = 1
           if (next_fn != "") {
             fns++; fn_name[fns] = next_fn; fn_depth[fns] = depth
-            if (declared == "") declared = next_fn
+            # A function the test item declares is not the one kept code
+            # after it belongs to.
+            if (declared == "" && !skip) declared = next_fn
             next_fn = ""
           }
         } else if (c == "}") {
@@ -536,12 +553,15 @@ production_code() {
         }
       }
       prev = ""
-      if (enclosing == "") enclosing = declared
-      if (!in_test) print file ":" line ":" enclosing ":" code
+      if (enclosing == "" || in_test) enclosing = declared
+      if (!in_test || kept ~ /[^[:space:]]/) print file ":" line ":" enclosing ":" kept
     }
   '
 }
-GATEWAY_CONSTRUCTOR='[^A-Za-z0-9_]Gateway(::)?(<[^;=()]*>)?>?::(production|new|with_parts)[[:space:]]*\('
+# A constructor counts whether it is called, named as a value
+# (`let build = Gateway::production;`) or imported (`use …::Gateway::new`,
+# `use …::Gateway::{new, …}`): each is a way to build one more.
+GATEWAY_CONSTRUCTOR='[^A-Za-z0-9_]Gateway(::)?(<[^;=()]*>)?>?::((production|new|with_parts)([^A-Za-z0-9_]|$)|\{([^}]*[,[:space:]])?(production|new|with_parts)[[:space:]]*[,}])'
 gateway_constructions() {
   production_code "$@" | { grep -E "^[^:]*:[0-9]+:[^:]*.*$GATEWAY_CONSTRUCTOR" || true; }
 }
@@ -589,6 +609,16 @@ fn after_the_tests() {
 impl Holder {
     fn third() -> Self { Self(<Gateway<Fake>>::with_parts(a, b, c)) }
 }
+
+#[cfg(test)] mod inline { fn t() { Gateway::new(Fake); } } fn fourth() { Gateway::production(); }
+
+fn named_not_called() {
+    let build = Gateway::production;
+    let also = Gateway::<HttpClient>::new;
+}
+
+use iaam_http::Gateway::production;
+use iaam_http::Gateway::{new, with_parts};
 PROBE
 cat > "$probe_dir/gateway/alias.rs" <<'PROBE'
 use iaam_http::{Gateway as Front, Outbound};
@@ -597,7 +627,7 @@ type Shared = Arc<Gateway<HttpClient>>;
 fn wrapped(gateway: Arc<Gateway<HttpClient>>) -> Shared { gateway }
 PROBE
 constructions_probe=$(gateway_constructions "$probe_dir/gateway" | sed 's|^.*/||' | cut -d: -f1-3 | tr '\n' ' ')
-if [ "$constructions_probe" != 'main.rs:2:serve main.rs:21:after_the_tests main.rs:25:third ' ]; then
+if [ "$constructions_probe" != 'main.rs:2:serve main.rs:21:after_the_tests main.rs:25:third main.rs:28:fourth main.rs:31:named_not_called main.rs:32:named_not_called main.rs:35: main.rs:36: ' ]; then
   err "the one-gateway guard misclassifies its probe: got '$constructions_probe'"
 fi
 aliases_probe=$(gateway_aliases "$probe_dir/gateway" | sed 's|^.*/||' | cut -d: -f1,2 | tr '\n' ' ')

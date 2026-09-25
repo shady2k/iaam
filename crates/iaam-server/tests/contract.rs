@@ -440,6 +440,22 @@ async fn harness_with_http(http: Arc<dyn OutboundHttp>) -> Harness {
     .await
 }
 
+/// The transport under every harness's gateway: no test goes outside, and
+/// one that tries is told the network refused, as an offline host would.
+///
+/// Not `Gateway::production`: `cargo test` runs this file's tests in one
+/// process, and a process gets one production gateway.
+struct NoNetwork;
+
+impl iaam_http::gateway::Transport for NoNetwork {
+    async fn send(
+        &self,
+        _request: &iaam_http::HttpRequest,
+    ) -> Result<iaam_http::HttpResponse, iaam_http::HttpError> {
+        Err(iaam_http::HttpError::Network)
+    }
+}
+
 /// Every knob of the harness in one place; the narrower builders above name
 /// the ones a test turns, which is why the list is allowed to be long here.
 #[allow(clippy::too_many_arguments)]
@@ -532,7 +548,7 @@ async fn harness_with_everything(
     let adapter = Arc::new(SqliteAdapter::with_broker_key(
         store,
         Some(Key::from_bytes([7; 32])),
-        Arc::new(Gateway::production().expect("the budget table is valid")),
+        Arc::new(Gateway::new(NoNetwork).expect("the budget table is valid")),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> =

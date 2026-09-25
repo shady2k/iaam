@@ -583,6 +583,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_operations_page_is_returned_as_it_came_and_a_truncated_one_refused() {
+        let page = r#"{"hasNext":true,"nextCursor":"next","items":[]}"#;
+        let (client, _, _) = client(vec![
+            answer(200, page),
+            answer(200, r#"{"hasNext":true,"items":[]}"#),
+        ]);
+        let request = GetOperationsByCursorRequest::new("account");
+
+        assert_eq!(
+            client
+                .get_operations_by_cursor(&request)
+                .await
+                .expect("page"),
+            page
+        );
+        assert!(matches!(
+            client.get_operations_by_cursor(&request).await,
+            Err(TinkoffError::PartialResponse)
+        ));
+    }
+
+    #[tokio::test]
     async fn the_twenty_sixth_accounts_call_in_a_minute_waits() {
         let answers = (0..26).map(|_| answer(200, "{}")).collect();
         let (client, _, time) = client(answers);

@@ -35019,3 +35019,146 @@ async fn each_list_wrapper_names_its_row_field_in_the_schema() {
         );
     }
 }
+
+/// A broker channel whose operations request always fails with `error`.
+struct FailingChannel {
+    error: BrokerError,
+}
+
+#[async_trait::async_trait]
+impl BrokerChannel for FailingChannel {
+    async fn fetch_operations(
+        &self,
+        _account: AccountId,
+        _from: Date,
+        _to: Date,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<ParsedOperations, BrokerError> {
+        Err(self.error.clone())
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _at: Date,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Err(self.error.clone())
+    }
+
+    fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
+        iaam_core::reconciliation::evidence::SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("contract-test".to_owned()),
+            document: None,
+        }
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Source
+    }
+}
+
+/// Sync one month through a broker that fails with `error`.
+async fn sync_through_failing_broker(error: BrokerError) -> (StatusCode, HeaderMap, Value) {
+    let channel: Arc<dyn BrokerChannel> = Arc::new(FailingChannel { error });
+    let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
+    let harness = harness_with_factory(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        Some(factory),
+    )
+    .await;
+    let body = json!({
+        "account": harness.account.inner(),
+        "from": "2025-01-01",
+        "to": "2025-01-31",
+    });
+    let (status, headers, bytes) = call_raw(
+        &harness.router,
+        post("/v1/brokers/tinkoff/sync", &harness.owner_token, &body),
+    )
+    .await;
+    let response = serde_json::from_slice(&bytes).expect("a JSON error body");
+    (status, headers, response)
+}
+
+#[tokio::test]
+async fn a_broker_that_stays_unreachable_answers_503_with_when_to_retry() {
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::Unreachable {
+        broker: "tinkoff".to_owned(),
+        detail: "T-Invest is unreachable after 5 attempts".to_owned(),
+        // A fraction past a whole second waits the whole next one.
+        retry_after: Some(Duration::from_millis(2_001)),
+    })
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "broker_unavailable");
+    assert_eq!(
+        headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.contains("retry after 3 seconds"), "{message}");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+}
+
+#[tokio::test]
+async fn an_unreachable_broker_without_a_known_wait_sends_no_retry_after() {
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::Unreachable {
+        broker: "tinkoff".to_owned(),
+        detail: "connection reset".to_owned(),
+        retry_after: None,
+    })
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "broker_unavailable");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+}
+
+#[tokio::test]
+async fn a_broker_that_refuses_answers_502_naming_the_access() {
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::Refused {
+        broker: "tinkoff".to_owned(),
+        detail: "T-Invest token is invalid".to_owned(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+    assert_eq!(response["code"], "broker_refused");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.contains("check the broker access"), "{message}");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+}
+
+#[tokio::test]
+async fn an_unparsable_broker_answer_is_still_500() {
+    let (status, _headers, response) = sync_through_failing_broker(BrokerError::Unparsable {
+        broker: "tinkoff".to_owned(),
+        detail: "not JSON".to_owned(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+    assert_eq!(response["code"], "store_unavailable");
+}
+
+#[tokio::test]
+async fn the_broker_sync_openapi_declares_an_unreachable_and_a_refusing_broker() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let responses = &spec["paths"]["/v1/brokers/{broker}/sync"]["post"]["responses"];
+    let unavailable = responses["503"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the sync route declares no 503: {responses}"));
+    assert!(unavailable.contains("Retry-After"), "{unavailable}");
+    assert!(
+        responses["503"]["headers"]["Retry-After"].is_object(),
+        "{responses}"
+    );
+    let refused = responses["502"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the sync route declares no 502: {responses}"));
+    assert!(refused.contains("refused"), "{refused}");
+}

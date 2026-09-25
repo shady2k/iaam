@@ -123,6 +123,22 @@ pub enum AppError {
     /// and it is their sum that does not fit.
     #[error("import batch not totalled: {0}")]
     BatchTotal(#[source] MoneyError),
+    /// The broker failed transiently and went on failing through the
+    /// gateway's retries, or the sync ran out of its deadline. Separate from
+    /// `Store`, because our store is fine: the same call is worth making again,
+    /// and `retry_after` says when, if the gateway knows.
+    #[error("broker {broker} is unavailable: {detail}")]
+    BrokerUnreachable {
+        broker: String,
+        detail: String,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The broker answered and refused the request: a token it rejects, a
+    /// method it does not offer. Separate from `Store` and from
+    /// `BrokerUnreachable`, because retrying will not help — the access to the
+    /// broker is what has to be fixed.
+    #[error("broker {broker} rejected the request: {detail}")]
+    BrokerRefused { broker: String, detail: String },
 }
 
 /// A rejected request field, and everything the server can say about it.
@@ -315,6 +331,8 @@ impl AppError {
             Self::NotConfigured { .. } => "not_configured",
             Self::Random(_) => "random_unavailable",
             Self::Conflict { .. } => "already_exists",
+            Self::BrokerUnreachable { .. } => "broker_unavailable",
+            Self::BrokerRefused { .. } => "broker_refused",
         }
     }
 }

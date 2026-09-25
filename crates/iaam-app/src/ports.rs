@@ -2084,8 +2084,17 @@ pub enum BrokerError {
     ScopeNotReadOnly { broker: String },
     #[error("broker {broker} rejected the request: {detail}")]
     Refused { broker: String, detail: String },
+    /// The broker failed transiently and went on failing: worth asking again,
+    /// after `retry_after` when the gateway knows how long that is.
+    ///
+    /// Typed rather than left in `detail`, because the caller that has to wait
+    /// is a machine reading a header, not a person reading a sentence.
     #[error("broker {broker} is unavailable: {detail}")]
-    Unreachable { broker: String, detail: String },
+    Unreachable {
+        broker: String,
+        detail: String,
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("response from broker {broker} could not be parsed: {detail}")]
     Unparsable { broker: String, detail: String },
     #[error("the {broker} adapter reached a state it excludes: {detail}")]

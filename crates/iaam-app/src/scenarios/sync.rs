@@ -375,8 +375,30 @@ pub async fn sync_broker(
     })
 }
 
+/// A broker that is down or says no is not our store failing: each is told
+/// apart so the caller learns whether to wait or to fix the access. What stays
+/// `Store` is a failure on our side of the call — an answer we could not read,
+/// an adapter bug, access not set up as it must be.
 fn broker_error(error: crate::ports::BrokerError) -> AppError {
-    AppError::Store(format!("broker synchronisation: {error}"))
+    use crate::ports::BrokerError;
+    match error {
+        BrokerError::Unreachable {
+            broker,
+            detail,
+            retry_after,
+        } => AppError::BrokerUnreachable {
+            broker,
+            detail,
+            retry_after,
+        },
+        BrokerError::Refused { broker, detail } => AppError::BrokerRefused { broker, detail },
+        other @ (BrokerError::Unparsable { .. }
+        | BrokerError::Adapter { .. }
+        | BrokerError::NoAccess { .. }
+        | BrokerError::ScopeNotReadOnly { .. }) => {
+            AppError::Store(format!("broker synchronisation: {other}"))
+        }
+    }
 }
 
 /// Fingerprint of a raw source row, for a row the source did not identify.

@@ -53,11 +53,9 @@ pub const BREAKER_COOL_DOWN: Duration = Duration::from_secs(5 * 60);
 /// Which method keys a budget row covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodScope {
-    /// Exactly this method key, with its own budget.
+    /// Exactly this method key, with its own budget. A key no row names is
+    /// refused: a key invented by a caller would otherwise be a fresh budget.
     Named(&'static str),
-    /// Every method key the caller names, each with its own budget of this
-    /// size. Finam states its limit per method, not per host.
-    EachMethod,
     /// Every method key, all drawing on one budget. The pacing the market
     /// sources had before the gateway was per source, not per method.
     Shared,
@@ -113,10 +111,26 @@ pub const BUDGETS: &[Budget] = &[
         used: 25,
         window: MINUTE,
     },
-    // Finam, any method: documented 200/min per method, use 100/min.
+    // Finam states its limit per method, 200/min each; use 100/min. One row
+    // per method called, so a new call needs a row before it can be sent.
     Budget {
         destination: Destination::FinamApi,
-        scope: MethodScope::EachMethod,
+        scope: MethodScope::Named("AccountsService.GetAccount"),
+        documented: Some(200),
+        used: 100,
+        window: MINUTE,
+    },
+    Budget {
+        destination: Destination::FinamApi,
+        scope: MethodScope::Named("AccountsService.Transactions"),
+        documented: Some(200),
+        used: 100,
+        window: MINUTE,
+    },
+    // The exchange of the secret for a session JWT, which Finam calls next.
+    Budget {
+        destination: Destination::FinamApi,
+        scope: MethodScope::Named("AuthService.Sessions"),
         documented: Some(200),
         used: 100,
         window: MINUTE,
@@ -402,7 +416,7 @@ impl BudgetTable {
 
     /// The row covering a method key, and the key its budget is kept under.
     ///
-    /// A named row wins over a per-method one, which wins over a shared one.
+    /// A named row wins over a shared one.
     fn lookup(
         &self,
         destination: Destination,
@@ -413,9 +427,7 @@ impl BudgetTable {
                 .iter()
                 .find(|row| row.destination == destination && row.scope == wanted)
         };
-        if let Some(row) =
-            find(MethodScope::Named(method)).or_else(|| find(MethodScope::EachMethod))
-        {
+        if let Some(row) = find(MethodScope::Named(method)) {
             return Ok((*row, Some(method)));
         }
         if let Some(row) = find(MethodScope::Shared) {
@@ -1008,15 +1020,18 @@ mod tests {
 
         for _ in 0..100 {
             gateway
-                .send("Accounts", &request, None)
+                .send("AccountsService.GetAccount", &request, None)
                 .await
                 .expect("sent");
         }
         for _ in 0..100 {
-            gateway.send("Trades", &request, None).await.expect("sent");
+            gateway
+                .send("AccountsService.Transactions", &request, None)
+                .await
+                .expect("sent");
         }
         gateway
-            .send("Accounts", &request, None)
+            .send("AccountsService.GetAccount", &request, None)
             .await
             .expect("sent");
 
@@ -1027,6 +1042,47 @@ mod tests {
             start + MINUTE,
             "the 101st call of a method did not wait"
         );
+    }
+
+    #[test]
+    fn finam_budgets_every_method_it_is_called_with_by_name() {
+        for method in [
+            "AccountsService.GetAccount",
+            "AccountsService.Transactions",
+            "AuthService.Sessions",
+        ] {
+            let row = BUDGETS
+                .iter()
+                .find(|row| {
+                    row.destination == Destination::FinamApi
+                        && row.scope == MethodScope::Named(method)
+                })
+                .unwrap_or_else(|| panic!("{method} has no row"));
+            assert_eq!((row.documented, row.used), (Some(200), 100), "{method}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finam_method_missing_from_the_table_is_refused_without_sending() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts");
+
+        let refused = gateway
+            .send("AccountsService.Invented", &request, None)
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::UnknownBudget {
+                    destination: Destination::FinamApi,
+                    method: "AccountsService.Invented"
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1107,7 +1163,7 @@ mod tests {
 
     const ROW: Budget = Budget {
         destination: Destination::FinamApi,
-        scope: MethodScope::EachMethod,
+        scope: MethodScope::Named("AccountsService.GetAccount"),
         documented: Some(10),
         used: 5,
         window: MINUTE,
@@ -1152,7 +1208,7 @@ mod tests {
 
         let (first, second) = tokio::join!(
             gateway.send("OperationsService", &operations, None),
-            gateway.send("Accounts", &finam, None),
+            gateway.send("AccountsService.GetAccount", &finam, None),
         );
 
         first.expect("sent");
@@ -1709,7 +1765,7 @@ mod tests {
         let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts");
 
         gateway
-            .send("Accounts", &finam, None)
+            .send("AccountsService.GetAccount", &finam, None)
             .await
             .expect("Finam is not the destination that failed");
     }

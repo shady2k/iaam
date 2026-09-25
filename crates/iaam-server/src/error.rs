@@ -563,3 +563,24 @@ impl ApiFailure {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_whole_second_wait_is_published_as_it_is() {
+        assert_eq!(retry_after_seconds(Duration::from_secs(4)), 4);
+    }
+
+    #[test]
+    fn a_fraction_past_a_second_waits_the_whole_next_one() {
+        assert_eq!(retry_after_seconds(Duration::from_millis(4_001)), 5);
+    }
+
+    #[test]
+    fn a_wait_under_a_second_is_never_published_as_none() {
+        assert_eq!(retry_after_seconds(Duration::ZERO), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(300)), 1);
+    }
+}

@@ -9,9 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use iaam_http::client::HttpClient;
-use iaam_http::gateway::Transport;
-use iaam_http::{Destination, Gateway, GatewayError, HttpRequest};
+use iaam_http::{Destination, GatewayError, HttpRequest, Outbound};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
@@ -23,19 +21,19 @@ use crate::ports::{OutboundHttp, OutboundResponse};
 const METHOD: &str = "OutboundHttp";
 
 /// Outbound transport over the shared gateway.
-pub struct HttpOutbound<T = HttpClient> {
-    gateway: Arc<Gateway<T>>,
+pub struct HttpOutbound {
+    gateway: Arc<dyn Outbound>,
 }
 
-impl<T> HttpOutbound<T> {
+impl HttpOutbound {
     #[must_use]
-    pub const fn new(gateway: Arc<Gateway<T>>) -> Self {
+    pub fn new(gateway: Arc<dyn Outbound>) -> Self {
         Self { gateway }
     }
 }
 
 #[async_trait]
-impl<T: Transport + 'static> OutboundHttp for HttpOutbound<T> {
+impl OutboundHttp for HttpOutbound {
     async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError> {
         let origin = origin(request.destination());
         let response = self
@@ -55,26 +53,25 @@ impl<T: Transport + 'static> OutboundHttp for HttpOutbound<T> {
 /// the caller learns whether to wait, to fix the request, or to look at us.
 /// The gateway's refusal carries statuses, counts and the delay worth waiting,
 /// never a header or body, so its text is safe to pass on.
+///
+/// Transience is read from `retry_after` rather than from the variants, so a
+/// transient refusal the gateway adds later is "retry later" here too.
 fn source_error(origin: &str, error: &GatewayError) -> AppError {
-    match error {
-        GatewayError::Exhausted { .. }
-        | GatewayError::DeadlineReached { .. }
-        | GatewayError::CircuitOpen { .. } => AppError::SourceUnreachable {
+    if let Some(retry_after) = error.retry_after() {
+        return AppError::SourceUnreachable {
             origin: origin.to_owned(),
             detail: error.to_string(),
-            retry_after: error.retry_after(),
-        },
+            retry_after: Some(retry_after),
+        };
+    }
+    match error {
         GatewayError::Rejected { .. } => AppError::SourceRefused {
             origin: origin.to_owned(),
             detail: error.to_string(),
         },
         // A missing budget, an invalid table, a transport that could not be
         // built: none of them is the source's answer.
-        GatewayError::UnknownBudget { .. }
-        | GatewayError::InvalidBudgets(_)
-        | GatewayError::Transport { .. } => {
-            AppError::Store(format!("market source {origin}: {error}"))
-        }
+        _ => AppError::Store(format!("market source {origin}: {error}")),
     }
 }
 

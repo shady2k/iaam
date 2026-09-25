@@ -16,7 +16,6 @@
 use std::env;
 use std::fs;
 
-use iaam_http::client::HttpClient;
 use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 
 // The ordinary method at the sandbox address is the method recommended by
@@ -28,12 +27,14 @@ const METHOD: &str = "tinkoff.public.invest.api.contract.v1.UsersService/GetAcco
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A separate process, so a gateway of its own: it shares no budget with
     // a running server, and a probe is one request.
-    let gateway = Gateway::new(HttpClient::new())?;
+    let gateway = Gateway::production()?;
+    // GetAccounts only reads, so a second copy of it is harmless.
     let mut request = HttpRequest::post(
         Destination::TinkoffSandbox,
         METHOD,
         RequestBody::Json("{}".to_owned()),
     )
+    .idempotent()
     .with_reset_header("x-ratelimit-reset");
 
     match env::var("IAAM_TINKOFF_SANDBOX_TOKEN_FILE") {
@@ -48,10 +49,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The gateway returns only a success; the expected 401 comes back as a
-    // rejection, and its status is the whole answer.
+    // rejection, and its status is the whole answer. Status and body length
+    // only: a body is the broker's answer about the account, and terminal
+    // output ends up in logs and pasted transcripts.
     match gateway.send("UsersService", &request, None).await {
-        Ok(response) => println!("HTTP {}", response.status),
-        Err(GatewayError::Rejected { status, .. }) => println!("HTTP {status}"),
+        Ok(response) => println!("HTTP {}, {} bytes", response.status, response.body.len()),
+        Err(GatewayError::Rejected { status, body, .. }) => {
+            println!("HTTP {status}, {} bytes", body.as_bytes().len());
+        }
         Err(error) => return Err(error.into()),
     }
     Ok(())

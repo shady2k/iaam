@@ -15,7 +15,7 @@ use iaam_app::ports::{
     PortfolioSnapshot, Principal, Scope,
 };
 use iaam_app::scenarios::ingest::append_checked;
-use iaam_app::sync::{AssertionsWithheld, sync_broker};
+use iaam_app::sync::{AssertionsWithheld, SYNC_DEADLINE, sync_broker};
 use iaam_broker::credentials::{Key, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_broker::operation_kind::{OperationKindDictionary, seed_for};
@@ -2192,18 +2192,34 @@ impl Sleeper for FakeTime {
     }
 }
 
+/// Time on tokio's paused timer: the gateway's clock and sleeps and the slow
+/// T-Invest below all run on it, so a request still in flight at the deadline
+/// loses a real race against it rather than a clock moved by hand.
+struct PausedTime;
+
+impl GatewayClock for PausedTime {
+    fn now(&self) -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
+}
+
+impl Sleeper for PausedTime {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(delay))
+    }
+}
+
 /// A T-Invest that answers every operations page, always with one more to
-/// come, and takes `step` of the fake clock to answer each.
+/// come, `step` after it was asked.
 struct SlowTinvest {
-    time: Arc<FakeTime>,
     step: Duration,
-    answered: Arc<AtomicUsize>,
+    asked: Arc<AtomicUsize>,
 }
 
 impl Transport for SlowTinvest {
     async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        self.time.advance(self.step);
-        let page = self.answered.fetch_add(1, Ordering::SeqCst) + 1;
+        let page = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::time::sleep(self.step).await;
         let body = format!(
             r#"{{"hasNext":true,"nextCursor":"page-{page}","items":[{{"cursor":"row-{page}","brokerAccountId":"account","id":"op-{page}","date":"2026-03-10T10:11:12Z","type":"OPERATION_TYPE_INPUT","state":"OPERATION_STATE_EXECUTED"}}]}}"#
         );
@@ -2215,28 +2231,24 @@ impl Transport for SlowTinvest {
     }
 }
 
-#[tokio::test]
-async fn a_sync_that_outlasts_its_deadline_is_refused_naming_the_pages_and_writes_nothing() {
+#[tokio::test(start_paused = true)]
+async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and_writes_nothing() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
     });
-    let time = Arc::new(FakeTime {
-        now: Mutex::new(Instant::now()),
-    });
-    let answered = Arc::new(AtomicUsize::new(0));
-    // Four minutes a page: pages start at 0, 4, 8 and 12 minutes, and the
-    // fifth would start at 16, past the sync's fifteen.
+    let asked = Arc::new(AtomicUsize::new(0));
+    // Four minutes a page: pages are asked for at 0, 4, 8 and 12 minutes;
+    // the fourth would answer at 16, past the sync's fifteen.
     let gateway = Gateway::with_parts(
         SlowTinvest {
-            time: Arc::clone(&time),
             step: Duration::from_secs(4 * 60),
-            answered: Arc::clone(&answered),
+            asked: Arc::clone(&asked),
         },
         BUDGETS,
-        Arc::clone(&time) as Arc<dyn GatewayClock>,
-        Arc::clone(&time) as Arc<dyn Sleeper>,
+        Arc::new(PausedTime) as Arc<dyn GatewayClock>,
+        Arc::new(PausedTime) as Arc<dyn Sleeper>,
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);
@@ -2247,6 +2259,7 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_naming_the_pages_and_write
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
     let channel = TinkoffChannel::new(client, SourceId::new_random(), dictionary);
     let before = load_all(&services, owner).await;
+    let started = tokio::time::Instant::now();
 
     let refused = sync_broker(
         &services,
@@ -2259,7 +2272,17 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_naming_the_pages_and_write
     .await
     .expect_err("the deadline cuts the sync");
 
-    assert_eq!(answered.load(Ordering::SeqCst), 4);
+    // The sync takes its deadline from the wall clock while the pages run on
+    // the paused one, which the wall clock leads by the real time the test has
+    // taken; a second covers that and is still minutes short of the overrun a
+    // fourth page waited out to its end would show.
+    let took = started.elapsed();
+    assert!(
+        took <= SYNC_DEADLINE + Duration::from_secs(1),
+        "the sync returned {took:?} after it started, past its deadline"
+    );
+    assert!(took >= Duration::from_secs(12 * 60), "{took:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 4, "the fourth page was asked");
     assert!(
         matches!(
             refused,
@@ -2274,7 +2297,7 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_naming_the_pages_and_write
     assert!(message.contains("unreachable"), "{message}");
     assert!(message.contains("retry after"), "{message}");
     assert!(
-        message.contains("operation pages fetched before it: 4"),
+        message.contains("operation pages fetched before it: 3"),
         "{message}"
     );
     assert_eq!(load_all(&services, owner).await, before);

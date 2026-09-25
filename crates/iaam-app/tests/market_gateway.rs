@@ -15,6 +15,8 @@ use iaam_app::error::AppError;
 use iaam_app::ports::OutboundHttp;
 use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
 use iaam_http::{Destination, Gateway, HttpError, HttpRequest, HttpResponse};
+use iaam_market::cbr::key_rate::key_rate_request;
+use time::macros::date;
 
 /// A clock that moves only when something sleeps on it.
 struct FakeTime {
@@ -92,10 +94,7 @@ fn status(status: u16) -> HttpResponse {
 
 /// The adapter over a gateway with the documented budgets and fake time, and
 /// the count of requests that reached the endpoint.
-fn adapter(
-    time: &Arc<FakeTime>,
-    endpoint: Scripted,
-) -> (HttpOutbound<Scripted>, Arc<Mutex<usize>>) {
+fn adapter(time: &Arc<FakeTime>, endpoint: Scripted) -> (HttpOutbound, Arc<Mutex<usize>>) {
     let sent = Arc::clone(&endpoint.sent);
     let gateway = Gateway::with_parts(
         endpoint,
@@ -129,6 +128,62 @@ async fn a_503_from_moex_is_retried_through_the_gateway() {
     assert_eq!(sent(&endpoint), 2);
     // The gateway's first backoff, waited on the gateway's clock.
     assert_eq!(time.slept(), [Duration::from_secs(1)]);
+}
+
+/// The key rate is a SOAP POST, sent once unless marked safe to repeat; it
+/// only reads, so a transient failure of it is retried like a GET.
+#[tokio::test]
+async fn a_503_from_the_cbr_key_rate_is_retried_through_the_gateway() {
+    let time = FakeTime::new();
+    let (adapter, endpoint) = adapter(&time, Scripted::answering(200).then(Ok(status(503))));
+
+    let response = adapter
+        .send(key_rate_request(
+            date!(2026 - 01 - 01),
+            date!(2026 - 02 - 01),
+        ))
+        .await
+        .expect("the retry succeeded");
+
+    assert_eq!(response.status, 200);
+    assert_eq!(sent(&endpoint), 2);
+}
+
+/// A source that names a wait longer than the gateway holds a caller is
+/// deferred: still "unreachable, retry later", with the wait it named.
+#[tokio::test]
+async fn a_source_that_asks_for_a_long_wait_is_unreachable_until_then() {
+    let named = Duration::from_secs(16 * 60);
+    let time = FakeTime::new();
+    let (adapter, endpoint) = adapter(
+        &time,
+        Scripted::answering(200).then(Ok(HttpResponse {
+            retry_after: Some(named),
+            ..status(503)
+        })),
+    );
+    adapter
+        .send(moex())
+        .await
+        .expect_err("the first call learns the wait");
+
+    let deferred = adapter
+        .send(moex())
+        .await
+        .expect_err("the next call is deferred");
+
+    assert_eq!(sent(&endpoint), 1, "nothing is sent while the wait runs");
+    match deferred {
+        AppError::SourceUnreachable {
+            origin,
+            retry_after,
+            ..
+        } => {
+            assert_eq!(origin, "moex-iss");
+            assert_eq!(retry_after, Some(named));
+        }
+        other => panic!("expected an unreachable source, got {other:?}"),
+    }
 }
 
 #[tokio::test]

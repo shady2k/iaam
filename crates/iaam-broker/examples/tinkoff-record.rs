@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
     // A separate process, so a gateway of its own.
-    let gateway = Gateway::new(HttpClient::new())?;
+    let gateway = Gateway::production()?;
 
     // Request only open accounts: a closed account is unsuitable for the
     // following calls and would make the sample set non-deterministic.
@@ -175,20 +175,24 @@ async fn fetch_raw(
     token: &str,
     body: Value,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+    // Every method recorded here only reads, so a second copy is harmless.
     let request = HttpRequest::post(
         destination,
         method,
         RequestBody::Json(serde_json::to_string(&body)?),
     )
+    .idempotent()
     .with_bearer(token)
     .with_reset_header("x-ratelimit-reset");
     match gateway.send(service, &request, None).await {
         Ok(response) => Ok(response.body),
         // The refusal body is written neither to a file nor to the error: the
         // gateway is not required to separate diagnostics from owner data.
-        Err(GatewayError::Rejected { status, .. }) => {
-            Err(io::Error::other(format!("{method} returned HTTP {status}")).into())
-        }
+        Err(GatewayError::Rejected { status, body, .. }) => Err(io::Error::other(format!(
+            "{method} returned HTTP {status}, {} bytes",
+            body.as_bytes().len()
+        ))
+        .into()),
         Err(error) => Err(error.into()),
     }
 }

@@ -419,7 +419,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // state, and a second one would be a second allowance against the same
     // destinations. Every adapter that goes outside is handed this one.
     let gateway = Arc::new(Gateway::production()?);
-    let http = Arc::new(HttpOutbound::new(Arc::clone(&gateway)));
+    let http = Arc::new(HttpOutbound::new(gateway.clone()));
 
     // Assembled once, here, because the catalogue belongs to the deployment.
     // Bundled profiles always; the operator's directory only where he named

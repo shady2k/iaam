@@ -2,9 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::credentials::BrokerToken;
-use iaam_http::client::HttpClient;
-use iaam_http::gateway::Transport;
-use iaam_http::{Destination, Gateway, GatewayError, HttpRequest};
+use iaam_http::{Destination, GatewayError, HttpRequest, Outbound};
 use serde_json::Value;
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
@@ -22,9 +20,11 @@ const TRANSACTIONS: &str = "AccountsService.Transactions";
 /// No variant carries the token: a rejected body is kept with it hidden.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum FinamError {
-    /// The request could not be sent at all; retrying meets the same fault.
-    #[error("Finam gateway network refusal")]
-    Network,
+    /// The transport could not be set up — a client or a trust root this
+    /// build could not construct. A fault of this build, not of Finam or the
+    /// network: retrying meets the same fault.
+    #[error("the transport to Finam could not be built: {reason}")]
+    TransportNotBuilt { reason: String },
     /// Finam kept answering 429 through every retry.
     #[error("Finam gateway rate-limited the request; retry after {retry_after:?}")]
     RateLimited { retry_after: Duration },
@@ -57,16 +57,16 @@ pub enum FinamError {
 /// Every request goes through the process's one outbound gateway, which owns
 /// the budget, the retries and the breaker; this client only describes the
 /// request and classifies what comes back.
-pub struct FinamClient<T = HttpClient> {
+pub struct FinamClient {
     token: BrokerToken,
-    gateway: Arc<Gateway<T>>,
+    gateway: Arc<dyn Outbound>,
 }
 
-impl<T: Transport> FinamClient<T> {
+impl FinamClient {
     /// Create a client over the shared gateway; the token remains in a
     /// zeroizing wrapper.
     #[must_use]
-    pub const fn new(token: BrokerToken, gateway: Arc<Gateway<T>>) -> Self {
+    pub fn new(token: BrokerToken, gateway: Arc<dyn Outbound>) -> Self {
         Self { token, gateway }
     }
 
@@ -140,7 +140,9 @@ fn classify_refusal(error: GatewayError, token: &str) -> FinamError {
         GatewayError::Rejected { status, body, .. } => {
             classify_rejection(status, body.as_bytes(), token)
         }
-        GatewayError::Transport { .. } => FinamError::Network,
+        GatewayError::Transport { error, .. } => FinamError::TransportNotBuilt {
+            reason: error.to_string(),
+        },
         other => FinamError::Gateway {
             reason: other.to_string(),
         },
@@ -296,7 +298,7 @@ mod tests {
     fn client_over(
         budgets: &'static [Budget],
         endpoint: &Arc<Scripted>,
-    ) -> (FinamClient<Shared>, Arc<FakeTime>) {
+    ) -> (FinamClient, Arc<FakeTime>) {
         let time = FakeTime::new();
         let gateway = Gateway::with_parts(
             Shared(Arc::clone(endpoint)),
@@ -409,6 +411,8 @@ mod tests {
         }
     }
 
+    /// The gateway has already cut the bearer out of a rejected body by the
+    /// time the client sees it.
     #[tokio::test]
     async fn a_rejected_body_is_kept_with_the_token_hidden() {
         let endpoint = Arc::new(Scripted::answering(400).then(400, &format!("bad {TOKEN}")));
@@ -423,7 +427,7 @@ mod tests {
             error,
             FinamError::UnexpectedStatus {
                 status: 400,
-                body: "bad <token hidden>".to_owned(),
+                body: "bad <redacted>".to_owned(),
             }
         );
         assert_no_token(&error);
@@ -454,20 +458,31 @@ mod tests {
         }
     }
 
+    /// A client or trust root that could not be built is this build's
+    /// fault: retrying later meets it again, so it is neither "unavailable"
+    /// nor a network refusal.
     #[tokio::test]
-    async fn a_client_that_cannot_be_built_is_a_network_refusal_not_retried() {
-        let endpoint = Arc::new(
-            Scripted::answering(200).then_fault(HttpError::ClientNotBuilt("invented".to_owned())),
-        );
-        let (client, _) = client_over(BUDGETS, &endpoint);
+    async fn a_client_that_cannot_be_built_is_a_fault_of_this_build_not_retried() {
+        for fault in [
+            HttpError::ClientNotBuilt("invented".to_owned()),
+            HttpError::TrustAnchorNotParsed("invented".to_owned()),
+        ] {
+            let expected = FinamError::TransportNotBuilt {
+                reason: fault.to_string(),
+            };
+            let endpoint = Arc::new(Scripted::answering(200).then_fault(fault));
+            let (client, time) = client_over(BUDGETS, &endpoint);
 
-        let error = client
-            .get_portfolio("Main")
-            .await
-            .expect_err("no client, no request");
+            let error = client
+                .get_portfolio("Main")
+                .await
+                .expect_err("no client, no request");
 
-        assert_eq!(error, FinamError::Network);
-        assert_eq!(endpoint.received.lock().expect("received").len(), 1);
+            assert_eq!(error, expected);
+            assert_eq!(endpoint.received.lock().expect("received").len(), 1);
+            assert!(time.slept().is_empty());
+            assert_no_token(&error);
+        }
     }
 
     #[tokio::test]
@@ -523,13 +538,22 @@ mod tests {
 
     /// One Finam request a minute per method: tight enough to show which
     /// budget a call draws on.
-    static ONE_PER_METHOD: &[Budget] = &[Budget {
-        destination: Destination::FinamApi,
-        scope: MethodScope::EachMethod,
-        documented: Some(200),
-        used: 1,
-        window: Duration::from_secs(60),
-    }];
+    static ONE_PER_METHOD: &[Budget] = &[
+        Budget {
+            destination: Destination::FinamApi,
+            scope: MethodScope::Named("AccountsService.GetAccount"),
+            documented: Some(200),
+            used: 1,
+            window: Duration::from_secs(60),
+        },
+        Budget {
+            destination: Destination::FinamApi,
+            scope: MethodScope::Named("AccountsService.Transactions"),
+            documented: Some(200),
+            used: 1,
+            window: Duration::from_secs(60),
+        },
+    ];
 
     #[tokio::test]
     async fn each_method_draws_on_its_own_budget() {

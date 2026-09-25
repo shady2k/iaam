@@ -2275,17 +2275,30 @@ mod tests {
 
     // --- logs -------------------------------------------------------------
 
-    /// Everything logged while it is held, as the operator's log shows it.
-    struct Log {
-        lines: Arc<StdMutex<Vec<u8>>>,
-        _guard: tracing::subscriber::DefaultGuard,
+    thread_local! {
+        /// What this test's thread logged, while a `Log` holds it.
+        static CAPTURED: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
-    struct Sink(Arc<StdMutex<Vec<u8>>>);
+    /// Everything this thread logs while it is held, as the operator's log
+    /// shows it.
+    ///
+    /// One global subscriber writing into a per-thread buffer, rather than a
+    /// subscriber set per test: tracing caches each event's interest for the
+    /// whole process, and a test thread with no subscriber of its own can
+    /// cache "never" for an event another thread's scoped subscriber wants.
+    struct Log;
+
+    struct Sink;
 
     impl std::io::Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log").extend_from_slice(bytes);
+            CAPTURED.with(|captured| {
+                if let Some(lines) = captured.borrow_mut().as_mut() {
+                    lines.extend_from_slice(bytes);
+                }
+            });
             Ok(bytes.len())
         }
 
@@ -2296,22 +2309,24 @@ mod tests {
 
     impl Log {
         fn capture() -> Self {
-            let lines = Arc::new(StdMutex::new(Vec::new()));
-            let sink = Arc::clone(&lines);
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(move || Sink(Arc::clone(&sink)))
-                .with_ansi(false)
-                .without_time()
-                .with_max_level(tracing::Level::INFO)
-                .finish();
-            Self {
-                lines,
-                _guard: tracing::subscriber::set_default(subscriber),
-            }
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(|| Sink)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_max_level(tracing::Level::INFO)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("no other test installs a subscriber");
+            });
+            CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+            Self
         }
 
         fn text(&self) -> String {
-            String::from_utf8(self.lines.lock().expect("log").clone()).expect("UTF-8")
+            let lines = CAPTURED.with(|captured| captured.borrow().clone().unwrap_or_default());
+            String::from_utf8(lines).expect("UTF-8")
         }
 
         /// The one line holding `message`, which must hold every fragment.
@@ -2325,6 +2340,12 @@ mod tests {
             for fragment in fragments {
                 assert!(line.contains(fragment), "no {fragment:?} in {line}");
             }
+        }
+    }
+
+    impl Drop for Log {
+        fn drop(&mut self) {
+            CAPTURED.with(|captured| *captured.borrow_mut() = None);
         }
     }
 

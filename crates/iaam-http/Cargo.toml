@@ -22,7 +22,9 @@ zeroize = { version = "1", features = ["alloc"] }
 tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `test-util` pauses the tokio timer, so the production sleeper is checked
+# without a real wait.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 sha2 = "0.11"
 
 [lints]

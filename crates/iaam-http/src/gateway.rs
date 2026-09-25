@@ -1083,6 +1083,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_rejected_body_prints_its_length_only() {
+        let body = RejectedBody(b"Main".to_vec());
+        assert_eq!(format!("{body:?}"), "RejectedBody(<4 bytes>)");
+    }
+
     #[tokio::test]
     async fn a_transport_that_cannot_be_built_is_not_retried() {
         let time = FakeTime::new();
@@ -1541,6 +1547,36 @@ mod tests {
         let _ = call(&gateway).await;
 
         assert_eq!(gateway.transport.sent_count(), sent + ATTEMPTS as usize);
+    }
+
+    // --- production parts -------------------------------------------------
+
+    #[test]
+    fn the_production_gateway_can_be_shared_between_tasks() {
+        fn shared<T: Send + Sync>(_: &T) {}
+        fn spawnable<F: Future + Send>(_: F) {}
+        let gateway = Gateway::new(HttpClient::new()).expect("the documented table is valid");
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        shared(&gateway);
+        // Built, never polled: nothing is sent.
+        spawnable(gateway.send("history", &request, None));
+    }
+
+    #[test]
+    fn the_system_clock_reads_the_current_instant() {
+        let before = Instant::now();
+        let read = SystemClock.now();
+        assert!(before <= read && read <= Instant::now());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_tokio_sleeper_waits_the_whole_delay() {
+        let before = tokio::time::Instant::now();
+
+        TokioSleeper.sleep(Duration::from_secs(7)).await;
+
+        assert_eq!(before.elapsed(), Duration::from_secs(7));
     }
 
     #[test]

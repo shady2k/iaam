@@ -204,6 +204,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_request_names_no_reset_header_unless_told() {
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+        assert_eq!(request.reset_header(), None);
+    }
+
+    #[test]
+    fn a_declared_reset_header_is_kept_by_name() {
+        let request =
+            HttpRequest::get(Destination::TinkoffProd, "/").with_reset_header("x-ratelimit-reset");
+        assert_eq!(request.reset_header(), Some("x-ratelimit-reset"));
+    }
+
+    #[test]
     fn a_url_joins_base_and_path_without_doubling_the_slash() {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
         assert_eq!(request.url(), "https://iss.moex.com/iss/history.json");

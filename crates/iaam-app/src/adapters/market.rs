@@ -1,102 +1,54 @@
 //! HTTP adapter for market sources.
 //!
-//! This contains all outgoing request policy: rate limiting,
-//! retries for transient failures and body hashing. The use case receives an already
-//! validated response through the port and knows nothing about `reqwest` or sleeps.
+//! Sends through the process's one gateway, which owns every outgoing
+//! request policy — pacing, retries of transient failures, the breaker. What
+//! stays here is hashing the body of a success. The use case receives an
+//! already validated response through the port and knows nothing about
+//! `reqwest` or sleeps.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use iaam_http::client::HttpClient;
-use iaam_http::resilience::{Outcome, RateLimiter, Retry, RetryPolicy};
-use iaam_http::{HttpError, HttpRequest};
+use iaam_http::gateway::Transport;
+use iaam_http::{Gateway, HttpRequest};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::ports::{OutboundHttp, OutboundResponse};
 
-/// Market transport implementation using the shared HTTP client.
-pub struct HttpOutbound {
-    client: HttpClient,
-    retry: RetryPolicy,
-    limiter: Arc<RateLimiter>,
+/// The budget key this port's requests are sent under. The destinations
+/// behind the port (MOEX, the CBR, the published contract) keep one budget
+/// for every method, so the key names the caller rather than a method.
+const METHOD: &str = "OutboundHttp";
+
+/// Outbound transport over the shared gateway.
+pub struct HttpOutbound<T = HttpClient> {
+    gateway: Arc<Gateway<T>>,
 }
 
-impl HttpOutbound {
+impl<T> HttpOutbound<T> {
     #[must_use]
-    pub fn new(client: HttpClient, retry: RetryPolicy, limiter: Arc<RateLimiter>) -> Self {
-        Self {
-            client,
-            retry,
-            limiter,
-        }
+    pub const fn new(gateway: Arc<Gateway<T>>) -> Self {
+        Self { gateway }
     }
 }
 
 #[async_trait]
-impl OutboundHttp for HttpOutbound {
+impl<T: Transport + 'static> OutboundHttp for HttpOutbound<T> {
     async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError> {
-        let mut attempt = 1;
-        loop {
-            let wait = self.limiter.delay_before_next(Instant::now());
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-            }
-
-            match self.client.send(&request).await {
-                Ok(response) if (200..300).contains(&response.status) => {
-                    return Ok(OutboundResponse {
-                        status: response.status,
-                        raw_hash: hash(&response.body),
-                        body: response.body,
-                    });
-                }
-                Ok(response) => {
-                    // The source's own `Retry-After`, where it named one:
-                    // waiting what it said beats waiting our doubling guess,
-                    // and this is the only place the header can still reach the
-                    // decision, which is a pure function over the outcome.
-                    let outcome = match response.retry_after {
-                        Some(after) => Outcome::status_with_retry_after(response.status, after),
-                        None => Outcome::status(response.status),
-                    };
-                    if let Retry::After(delay) = self.retry.decide(attempt, &outcome) {
-                        tokio::time::sleep(delay).await;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    return Err(AppError::Store(format!(
-                        "market source returned HTTP {}",
-                        response.status
-                    )));
-                }
-                Err(error) => {
-                    let retry = match &error {
-                        HttpError::Network => self
-                            .retry
-                            .decide(attempt, &Outcome::Transport(HttpError::Network)),
-                        HttpError::Timeout => self
-                            .retry
-                            .decide(attempt, &Outcome::Transport(HttpError::Timeout)),
-                        HttpError::ClientNotBuilt(message) => self.retry.decide(
-                            attempt,
-                            &Outcome::Transport(HttpError::ClientNotBuilt(message.clone())),
-                        ),
-                        HttpError::TrustAnchorNotParsed(message) => self.retry.decide(
-                            attempt,
-                            &Outcome::Transport(HttpError::TrustAnchorNotParsed(message.clone())),
-                        ),
-                    };
-                    if let Retry::After(delay) = retry {
-                        tokio::time::sleep(delay).await;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    return Err(AppError::Store(format!("market transport: {error}")));
-                }
-            }
-        }
+        // The gateway's refusal carries statuses, counts and the delay worth
+        // waiting, never a header or body, so its text is safe to pass on.
+        let response = self
+            .gateway
+            .send(METHOD, &request, None)
+            .await
+            .map_err(|error| AppError::Store(format!("market source: {error}")))?;
+        Ok(OutboundResponse {
+            status: response.status,
+            raw_hash: hash(&response.body),
+            body: response.body,
+        })
     }
 }
 

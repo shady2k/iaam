@@ -45,3 +45,18 @@ fi
 "$_iaam_root/scripts/check-no-personal-data.sh" --staged || exit 1
 # --- END IAAM PRIVACY GUARD (iaam-rq4h) ---
 
+
+# --- BEGIN IAAM BACKLOG GATE (iaam-oik0) ---
+# Managed by .backlog/connect.sh, outside the beads markers so it survives
+# `bd hooks install`. Acts only in a clone that ran make backlog-connect.
+if [ "$(git config --get iaam.backlog)" = "on" ]; then
+  _iaam_root=$(git rev-parse --show-toplevel) || exit 1
+  if [ ! -r "$_iaam_root/.backlog/gate.mjs" ] || ! command -v node >/dev/null 2>&1; then
+    echo "BACKLOG: this clone is connected but .backlog/gate.mjs or node is missing." >&2
+    echo "         Refusing the commit: a gate that cannot run must not pass. Run: make backlog-connect" >&2
+    exit 1
+  fi
+  node "$_iaam_root/.backlog/gate.mjs" >&2 || exit 1
+fi
+# --- END IAAM BACKLOG GATE (iaam-oik0) ---
+

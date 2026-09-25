@@ -59,6 +59,14 @@ arch: ## Dependency direction, f64, and async in the core
 hooks: ## Install the git hooks, including the privacy guard
 	./scripts/install-hooks.sh
 
+.PHONY: backlog-connect
+backlog-connect: ## Connect this clone to the backlog workflow: backlog gate and commit-link hooks
+	./.backlog/connect.sh
+
+.PHONY: backlog
+backlog: ## The backlog gate against the tracker as committed (BASE=... defaults to HEAD)
+	node .backlog/gate.mjs $(if $(BASE),--base $(BASE))
+
 .PHONY: privacy
 privacy: ## No personal data in the tree (shapes only; needs no configuration)
 	$(RUN) ./scripts/check-no-personal-data.sh $(BASE)

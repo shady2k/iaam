@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+
+# --- BEGIN IAAM COMMIT LINKS (iaam-oik0) ---
+# Managed by .backlog/connect.sh. Acts only in a clone that ran make backlog-connect.
+if [ "$(git config --get iaam.backlog)" = "on" ]; then
+  _iaam_root=$(git rev-parse --show-toplevel) || exit 1
+  if [ ! -r "$_iaam_root/.backlog/commits.mjs" ] || ! command -v node >/dev/null 2>&1; then
+    echo "COMMIT LINKS: this clone is connected but .backlog/commits.mjs or node is missing." >&2
+    echo "              Refusing the commit. Run: make backlog-connect" >&2
+    exit 1
+  fi
+  node "$_iaam_root/.backlog/commits.mjs" --message-file "$1" || exit 1
+fi
+# --- END IAAM COMMIT LINKS (iaam-oik0) ---
+

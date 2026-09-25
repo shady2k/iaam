@@ -1,0 +1,30 @@
+{
+  "strength": "block-new",
+  "currentMilestone": "m-broker-api",
+  "milestoneLabels": ["m-broker-api"],
+  "areaLabels": ["area-broker", "area-journal", "area-reports", "area-process"],
+  "roadmapLabels": [],
+  "triageLabels": ["agent-field-report", "agent-report", "import-field-report", "api-contract", "design", "human"],
+  "ideaLabels": ["idea"],
+  "ideaTitlePrefixes": ["Brainstorming:"],
+  "findingLabels": ["findings"],
+  "findingBudget": 24,
+  "staleDays": 14,
+  "holdDays": 2,
+  "bulkCluster": 20,
+  "execution": {
+    "development": "tdd",
+    "runMode": "worker-sessions",
+    "maxBranchDays": 2,
+    "landing": "push",
+    "maxWorkers": 3,
+    "mutationBudgetMinutes": 10,
+    "mutationFallback": "escalate",
+    "reviewPreference": "different-model",
+    "reviewFallback": "same-model independent reviewer"
+  },
+  "scope": "personal",
+  "artifactLanguage": "en",
+  "projectWords": ["iaam", "IAAM"],
+  "trackerWords": ["beads", "bd "]
+}

@@ -1,5 +1,13 @@
 # Agent Instructions
 
+## Backlog workflow
+
+All retained work and commits belong to tracked tasks. File discoveries through
+`to-backlog`; implement through `take-task`; close only after stage acceptance
+through `close-out`. Read Backlog integration in `docs/backlog-integration.md`
+before writes. When a skill reports the installation is out of date, run
+`setup-shady2k-skills`.
+
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
 > **Architecture in one line:** Issues live in a local Dolt database
@@ -63,11 +71,12 @@ the only copy of the rules; `.claude/skills/` holds pointers to them so that
 Claude Code lists them as skills, and holds no script and no fixture. Do not
 duplicate either — two copies of an importer drift silently.
 
-**The agent does not hold the owner's data.** He runs these himself against his
-own files. Account maps, counterparty maps and database paths are run-time
-arguments living outside this repository; never commit one, and never point a
-script at real data to check that it works. Each tool's fixtures are invented end
-to end and are what you test against.
+**The owner's data never enters the repository.** The agent may run these
+tools on his files when he hands them over (see "The owner's data never enters
+the repository" in `CLAUDE.md`), but account maps, counterparty maps and database
+paths are run-time arguments living outside this repository; never commit one,
+and never point a script at real data to check that it works. Each tool's
+fixtures are invented end to end and are what you test against.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker

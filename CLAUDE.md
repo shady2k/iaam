@@ -2,6 +2,14 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Backlog workflow
+
+All retained work and commits belong to tracked tasks. File discoveries through
+`to-backlog`; implement through `take-task`; close only after stage acceptance
+through `close-out`. Read Backlog integration in `docs/backlog-integration.md`
+before writes. When a skill reports the installation is out of date, run
+`setup-shady2k-skills`.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 

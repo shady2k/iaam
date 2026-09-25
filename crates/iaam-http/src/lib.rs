@@ -31,10 +31,18 @@
 //! What the compiler cannot close is enforced by guards in
 //! `scripts/check-architecture.sh`, run by `make arch`:
 //!
-//! - no crate but this one declares `reqwest` or builds a `reqwest` client;
-//! - production code builds the gateway in one place, `serve` in
-//!   `iaam-bootstrap`: the gateway is one per process and shared, because two
-//!   gateways are two budgets against the same destination.
+//! - no crate but this one depends on `reqwest` or any other HTTP client
+//!   crate, under its own name, under another (`package = "reqwest"`) or
+//!   through the workspace, and none builds a `reqwest` client by path;
+//! - production code builds a gateway once, with [`Gateway::production`] in
+//!   `serve` of `iaam-bootstrap`, and names the type without an alias: the
+//!   gateway is one per process and shared, because two gateways are two
+//!   budgets against the same destination. [`Gateway::new`] and
+//!   `Gateway::with_parts` stay public for tests, which build their own
+//!   over a fake transport and clock.
+//!
+//! The gateway's state lives in the memory of that one process, so an
+//! instance runs one server process: `docs/deployment.md` §1.1.
 
 pub mod client;
 pub mod destination;

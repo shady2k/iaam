@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 use crate::client::HttpClient;
 use crate::destination::Destination;
-use crate::request::HttpRequest;
+use crate::request::{HttpRequest, Secret};
 use crate::resilience::{MAX_NAMED_WAIT, Outcome, Retry, RetryPolicy, is_transient};
 use crate::response::{HttpError, HttpResponse};
 
@@ -353,11 +353,35 @@ impl GatewayError {
 ///
 /// Kept for the source, which alone knows what a broker's refusal body means
 /// (a T-Invest error code, say). `Debug` prints its length only: a refusal is
-/// logged, and a body may carry the owner's data.
+/// logged, and a body may carry the owner's data. The request's bearer secret
+/// is cut out before the body is kept: a destination that echoes the token
+/// back would otherwise hand it to every reader of the error.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RejectedBody(Vec<u8>);
 
+/// What stands in a rejected body where the bearer secret was.
+const REDACTED: &[u8] = b"<redacted>";
+
 impl RejectedBody {
+    fn without_secret(body: &[u8], secret: Option<&Secret>) -> Self {
+        let secret = secret.map_or(&[][..], |secret| secret.expose().as_bytes());
+        if secret.is_empty() {
+            return Self(body.to_vec());
+        }
+        let mut kept = Vec::with_capacity(body.len());
+        let mut rest = body;
+        while let Some((&first, tail)) = rest.split_first() {
+            if let Some(after) = rest.strip_prefix(secret) {
+                kept.extend_from_slice(REDACTED);
+                rest = after;
+            } else {
+                kept.push(first);
+                rest = tail;
+            }
+        }
+        Self(kept)
+    }
+
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
@@ -703,7 +727,10 @@ impl<T: Transport> Gateway<T> {
                     return Err(cut(attempts, status, delay));
                 }
                 Retry::After(delay) => self.sleeper.sleep(delay).await,
-                Retry::GiveUp => return Err(self.refusal(destination, attempts, outcome, body)),
+                Retry::GiveUp => {
+                    let body = RejectedBody::without_secret(&body, request.bearer());
+                    return Err(self.refusal(destination, attempts, outcome, body));
+                }
             }
         }
     }
@@ -744,7 +771,7 @@ impl<T: Transport> Gateway<T> {
         destination: Destination,
         attempts: u32,
         outcome: Outcome,
-        body: Vec<u8>,
+        body: RejectedBody,
     ) -> GatewayError {
         if is_transient(&outcome) {
             return GatewayError::Exhausted {
@@ -762,7 +789,7 @@ impl<T: Transport> Gateway<T> {
                 destination,
                 status,
                 attempts,
-                body: RejectedBody(body),
+                body,
             },
             Outcome::Transport(error) => GatewayError::Transport {
                 destination,
@@ -1339,6 +1366,46 @@ mod tests {
             GatewayError::Rejected { body: kept, .. } => assert_eq!(kept.as_bytes(), body),
             other => panic!("expected a rejection, got {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_body_is_kept_without_the_bearer_secret() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                body: br#"{"token":"t.invented","again":"t.invented"}"#.to_vec(),
+                ..status(400)
+            })),
+        );
+        let request = operations().with_bearer("t.invented");
+
+        let refused = gateway
+            .send("OperationsService", &request, None)
+            .await
+            .expect_err("400 is a refusal");
+
+        match refused {
+            GatewayError::Rejected { body, .. } => assert_eq!(
+                body.as_bytes(),
+                br#"{"token":"<redacted>","again":"<redacted>"}"#
+            ),
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_secret_leaves_a_rejected_body_as_it_came() {
+        let body = RejectedBody::without_secret(b"refused", Some(&Secret::new("")));
+        assert_eq!(body.as_bytes(), b"refused");
+    }
+
+    #[test]
+    fn a_rejected_body_with_no_bearer_is_kept_as_it_came() {
+        assert_eq!(
+            RejectedBody::without_secret(b"refused", None).as_bytes(),
+            b"refused"
+        );
     }
 
     #[test]

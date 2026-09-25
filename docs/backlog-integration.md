@@ -20,6 +20,18 @@ are the repository's installation, and each person's plugin and hooks are theirs
   `.internal/plans/`, linked from their epic's description. Short deltas live on
   the task itself.
 - **Document resources:** none installed; the document gate is not installed.
+- **Tracker layout:** the store is beads' Dolt database, outside every branch
+  (synced through `refs/dolt/data`). Its export, `.beads/issues.jsonl` with
+  `.beads/interactions.jsonl`, is committed on `main` only, in `chore(beads): ...`
+  commits: the pre-commit block `IAAM TRACKER LAYOUT` refuses either file staged
+  on any other branch, so a feature branch never carries the tracker. The
+  tracker at a code revision is that export as committed at it
+  (`adapter.mjs --at <rev>`); transitions over a range are the difference
+  between the exports at its two ends. Known limit: an export committed on
+  `main` still carries the states of runs not landed yet (a claim, a submitted
+  or implemented leaf on another feature's branch): its `implemented` states
+  point at their recorded revision, not at `main`. At the end of a session the
+  export is committed on `main`, never on the working branch.
 - **Workflow ownership:** beads is the one authority for task status. The
   beads-superpowers plugin and its hooks stay as they are; this installation
   adds blocks outside the beads markers and changes none of beads' own.
@@ -60,7 +72,7 @@ are the repository's installation, and each person's plugin and hooks are theirs
   `--at <rev>` reads `.beads/issues.jsonl` as committed at a revision;
   `--jsonl <file>` reads any beads export.
 - **Rules:** `.backlog/rules/check.mjs`, `check-commits.mjs`, `check-docs.mjs`,
-  byte-for-byte copies of shady2k-skills 0.57.1 (setup 0.26.0),
+  byte-for-byte copies of shady2k-skills 0.59.1 (setup 0.28.0),
   `skills/backlog/setup-shady2k-skills/`. Their `--version` is the installation.
 - **Document adapter and gate:** not installed yet: "Install the document gate:
   specs and acceptance evidence checked at each transition" (iaam-46x4).
@@ -74,11 +86,11 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Commit-link input and check:** `node .backlog/commits.mjs --message-file <f>`
   or `--range <base>..<head>`, which builds the normalized input and runs
   `check-commits.mjs`. An empty range fails.
-- **Local entry points:** `.beads/hooks/pre-commit` (backlog gate, after the
-  privacy guard) and `.beads/hooks/commit-msg` (commit links), both in blocks
-  outside the beads markers, acting only when `git config iaam.backlog` is `on`.
+- **Local entry points:** `.beads/hooks/pre-commit` (backlog gate after the
+  privacy guard, then the tracker layout) and `.beads/hooks/commit-msg` (commit
+  links), all in blocks outside the beads markers, acting only when `git config iaam.backlog` is `on`.
 - **Connecting a clone:** `make backlog-connect`. It checks node (18+), bd and
-  every file the hooks read, runs `make hooks`, adds both blocks, sets
+  every file the hooks read, runs `make hooks`, adds the three blocks, sets
   `iaam.backlog=on` and runs the gate once; it refuses with what is missing and
   disconnects again if the gate cannot run.
 - **CI:** none for these checks (personal scope).

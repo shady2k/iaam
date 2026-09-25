@@ -60,3 +60,22 @@ if [ "$(git config --get iaam.backlog)" = "on" ]; then
 fi
 # --- END IAAM BACKLOG GATE (iaam-oik0) ---
 
+
+# --- BEGIN IAAM TRACKER LAYOUT (iaam-zgcu) ---
+# Managed by .backlog/connect.sh. The tracker is one state for every branch, so
+# its export is committed on main only: a branch carries what it delivers.
+if [ "$(git config --get iaam.backlog)" = "on" ]; then
+  _iaam_staged=$(git diff --cached --name-only -- .beads/issues.jsonl .beads/interactions.jsonl)
+  if [ -n "$_iaam_staged" ]; then
+    _iaam_branch=$(git symbolic-ref --quiet --short HEAD || echo "a detached HEAD")
+    if [ "$_iaam_branch" != "main" ]; then
+      echo "TRACKER: the tracker export is staged on $_iaam_branch:" >&2
+      echo "$_iaam_staged" | sed 's/^/         /' >&2
+      echo "         The tracker is shared by every branch; its export is committed on main only." >&2
+      echo "         Unstage it and commit the rest: git restore --staged $(echo $_iaam_staged)" >&2
+      exit 1
+    fi
+  fi
+fi
+# --- END IAAM TRACKER LAYOUT (iaam-zgcu) ---
+

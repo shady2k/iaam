@@ -30,8 +30,10 @@ if [ "$missing" -ne 0 ]; then
 fi
 
 # The tracker first: a fresh clone has the committed export but no database,
-# and every hook below reads the database. Bootstrap never deletes issues.
-bd bootstrap --yes >/dev/null || { echo "CONNECT: bd bootstrap failed; the tracker is not readable in this clone" >&2; exit 1; }
+# and every hook below reads the database. Bootstrap never deletes issues, but
+# it refuses a database that already exists, so a connected clone skips it.
+bd count >/dev/null 2>&1 || bd bootstrap --yes >/dev/null \
+  || { echo "CONNECT: bd bootstrap failed; the tracker is not readable in this clone" >&2; exit 1; }
 # Beads points git at .beads/hooks, the committed hooks this installation extends.
 [ "$(git config --get core.hooksPath)" = ".beads/hooks" ] || bd hooks install --beads >/dev/null \
   || { echo "CONNECT: bd hooks install --beads failed" >&2; exit 1; }
@@ -58,6 +60,27 @@ if [ "$(git config --get iaam.backlog)" = "on" ]; then
   node "$_iaam_root/.backlog/gate.mjs" >&2 || exit 1
 fi
 # --- END IAAM BACKLOG GATE (iaam-oik0) ---
+BLOCK
+
+IFS= read -r -d '' LAYOUT_BLOCK <<'BLOCK' || true
+
+# --- BEGIN IAAM TRACKER LAYOUT (iaam-zgcu) ---
+# Managed by .backlog/connect.sh. The tracker is one state for every branch, so
+# its export is committed on main only: a branch carries what it delivers.
+if [ "$(git config --get iaam.backlog)" = "on" ]; then
+  _iaam_staged=$(git diff --cached --name-only -- .beads/issues.jsonl .beads/interactions.jsonl)
+  if [ -n "$_iaam_staged" ]; then
+    _iaam_branch=$(git symbolic-ref --quiet --short HEAD || echo "a detached HEAD")
+    if [ "$_iaam_branch" != "main" ]; then
+      echo "TRACKER: the tracker export is staged on $_iaam_branch:" >&2
+      echo "$_iaam_staged" | sed 's/^/         /' >&2
+      echo "         The tracker is shared by every branch; its export is committed on main only." >&2
+      echo "         Unstage it and commit the rest: git restore --staged $(echo $_iaam_staged)" >&2
+      exit 1
+    fi
+  fi
+fi
+# --- END IAAM TRACKER LAYOUT (iaam-zgcu) ---
 BLOCK
 
 IFS= read -r -d '' MSG_BLOCK <<'BLOCK' || true
@@ -90,6 +113,7 @@ ensure_block() {
   sh -n "$hook" || { echo "CONNECT: $hook is not a valid shell script" >&2; exit 1; }
 }
 ensure_block "$hooks_dir/pre-commit" '# --- BEGIN IAAM BACKLOG GATE' "$PRE_BLOCK"
+ensure_block "$hooks_dir/pre-commit" '# --- BEGIN IAAM TRACKER LAYOUT' "$LAYOUT_BLOCK"
 ensure_block "$hooks_dir/commit-msg" '# --- BEGIN IAAM COMMIT LINKS' "$MSG_BLOCK"
 
 git config iaam.backlog on
@@ -105,4 +129,4 @@ if [ "$rc" -eq 2 ]; then
   exit 1
 fi
 [ "$rc" -eq 0 ] || echo "note: the backlog gate currently reports NEW problems; run: node .backlog/gate.mjs"
-echo "connected: $hooks_dir/pre-commit runs the backlog gate, $hooks_dir/commit-msg the commit-link check."
+echo "connected: $hooks_dir/pre-commit runs the backlog gate and keeps the tracker export on main, $hooks_dir/commit-msg the commit-link check."

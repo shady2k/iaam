@@ -13,8 +13,8 @@
 //! - an optional **deadline** no attempt or wait may cross, an attempt in
 //!   flight included;
 //! - a **reset the destination named**, obeyed by every caller of its host;
-//! - a **structured event** for every long wait, retry, transient refusal and
-//!   breaker change, carrying no header, body or secret.
+//! - a **structured event** for every long wait, retry, refusal by the
+//!   destination and breaker change, carrying no header, body or secret.
 //!
 //! Time comes from an injected clock and sleeper, so every rule is checked on
 //! a fake clock: a test that sleeps for a minute to prove a per-minute budget
@@ -24,6 +24,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -266,6 +267,11 @@ pub enum GatewayError {
     },
     #[error("the budget table is invalid: {0}")]
     InvalidBudgets(String),
+    /// `Gateway::production` was called before in this process.
+    #[error(
+        "a process has one gateway and this one has built it already: a second would be a second allowance against every destination (docs/deployment.md §1.1)"
+    )]
+    SecondGateway,
     /// Every attempt failed transiently. Worth trying again after
     /// `retry_after`.
     #[error(
@@ -347,6 +353,7 @@ impl GatewayError {
             Self::Deferred { .. } => "deferred",
             Self::UnknownBudget { .. } => "unknown budget",
             Self::InvalidBudgets(_) => "invalid budgets",
+            Self::SecondGateway => "second gateway",
             Self::Rejected { .. } => "rejected",
             Self::Transport { .. } => "transport",
         }
@@ -363,6 +370,7 @@ impl GatewayError {
             | Self::Deferred { retry_after, .. } => Some(*retry_after),
             Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
+            | Self::SecondGateway
             | Self::Rejected { .. }
             | Self::Transport { .. } => None,
         }
@@ -378,6 +386,7 @@ impl GatewayError {
             Self::Rejected { status, .. } => Some(*status),
             Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
+            | Self::SecondGateway
             | Self::CircuitOpen { .. }
             | Self::Transport { .. } => None,
         }
@@ -393,7 +402,7 @@ impl GatewayError {
             | Self::Deferred { attempts, .. }
             | Self::Rejected { attempts, .. }
             | Self::Transport { attempts, .. } => *attempts,
-            Self::UnknownBudget { .. } | Self::InvalidBudgets(_) => 0,
+            Self::UnknownBudget { .. } | Self::InvalidBudgets(_) | Self::SecondGateway => 0,
         }
     }
 }
@@ -610,6 +619,9 @@ fn millis(wait: Duration) -> u64 {
     u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Whether this process has built its production gateway.
+static PRODUCTION_BUILT: AtomicBool = AtomicBool::new(false);
+
 /// The outbound gateway.
 ///
 /// Built once per process and shared: the budgets, the in-flight rule and the
@@ -630,9 +642,22 @@ impl Gateway<HttpClient> {
     /// gets it, because `HttpClient` cannot be built outside this crate.
     /// Called once per process, in `serve`, and shared from there.
     ///
+    /// A second call in the same process is refused with
+    /// `GatewayError::SecondGateway`: the budgets and breakers are state of
+    /// the value, so a second one would be a second allowance against every
+    /// destination. A test that needs several gateways builds them with `new`
+    /// or `with_parts` over its own transport.
+    ///
     /// # Errors
+    /// `GatewayError::SecondGateway` on every call after the first;
     /// `GatewayError::InvalidBudgets` when the table in this module is wrong.
     pub fn production() -> Result<Self, GatewayError> {
+        // Claimed before building: two threads racing here must not both
+        // see the flag clear. A table that fails its checks fails the same
+        // way on a second call, so nothing is lost by not releasing it.
+        if PRODUCTION_BUILT.swap(true, Ordering::SeqCst) {
+            return Err(GatewayError::SecondGateway);
+        }
         Self::new(HttpClient::new())
     }
 }
@@ -690,18 +715,36 @@ impl<T: Transport> Gateway<T> {
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
         let result = self.send_unlogged(method, request, deadline).await;
-        if let Err(refusal) = &result
-            && let Some(wait) = refusal.retry_after()
-        {
-            tracing::warn!(
-                destination = ?request.destination(),
-                method,
-                attempt = refusal.attempts(),
-                wait_ms = millis(wait),
-                status = refusal.status(),
-                refusal = refusal.kind(),
-                "outbound call refused"
-            );
+        if let Err(refusal) = &result {
+            if let Some(wait) = refusal.retry_after() {
+                tracing::warn!(
+                    destination = ?request.destination(),
+                    method,
+                    attempt = refusal.attempts(),
+                    wait_ms = millis(wait),
+                    status = refusal.status(),
+                    refusal = refusal.kind(),
+                    "outbound call refused"
+                );
+            } else if let GatewayError::Rejected {
+                destination,
+                status,
+                attempts,
+                ..
+            } = refusal
+            {
+                // The destination's own "no" (a 401 for a revoked token, a
+                // 404): the body stays out, it may carry the owner's data
+                // or an echoed secret.
+                tracing::warn!(
+                    destination = ?destination,
+                    method,
+                    attempt = attempts,
+                    status,
+                    refusal = refusal.kind(),
+                    "outbound call refused"
+                );
+            }
         }
         result
     }
@@ -759,7 +802,15 @@ impl<T: Transport> Gateway<T> {
             // A named reset is waited here, under the lane, by every caller.
             let (decision, outcome, body) = {
                 let asked = self.clock.now();
-                let mut lane = lane.lock().await;
+                // A caller queued behind a long call or a named wait gives up
+                // at its deadline rather than when the lane frees; dropping
+                // the lock future leaves the queue as it was.
+                let Some(mut lane) = self.by_deadline(lane.lock(), deadline).await else {
+                    let retry_after = self
+                        .retry
+                        .delay(attempts, &Outcome::Transport(HttpError::Timeout));
+                    return Err(cut(attempts, status, retry_after));
+                };
                 waits(
                     attempts + 1,
                     self.clock.now().saturating_duration_since(asked),
@@ -794,7 +845,15 @@ impl<T: Transport> Gateway<T> {
                         "budget"
                     };
                     waits(attempts + 1, wait, reason);
-                    self.sleeper.sleep(wait).await;
+                    // Cut before the start is recorded: a call that did not
+                    // go out spends none of the budget.
+                    if self
+                        .by_deadline(self.sleeper.sleep(wait), deadline)
+                        .await
+                        .is_none()
+                    {
+                        return Err(cut(attempts, status, wait));
+                    }
                 }
                 lane.record_start(key, &budget, self.clock.now());
                 attempts += 1;
@@ -880,7 +939,13 @@ impl<T: Transport> Gateway<T> {
                 Retry::After(delay) => {
                     retries(attempts, delay, status);
                     waits(attempts + 1, delay, "backoff");
-                    self.sleeper.sleep(delay).await;
+                    if self
+                        .by_deadline(self.sleeper.sleep(delay), deadline)
+                        .await
+                        .is_none()
+                    {
+                        return Err(cut(attempts, status, delay));
+                    }
                 }
                 Retry::GiveUp => {
                     let body = RejectedBody::without_secret(&body, request.bearer());
@@ -892,10 +957,15 @@ impl<T: Transport> Gateway<T> {
 
     /// `work`, unless the deadline falls first: then `None`, at the deadline.
     ///
+    /// Every wait of a call goes through here — the lane, a budget, a named
+    /// reset, a backoff and the attempt itself — so none of them outlives the
+    /// deadline. At a tie the deadline wins: it is polled before `work`, and
+    /// what `work` gives at or after the deadline, by the clock, is treated as
+    /// not there, since a transport or a late timer may move a clock without
+    /// waiting on the deadline's sleep.
+    ///
     /// The deadline's sleep is started only once `work` has not finished on
-    /// its first poll, so an answer that is already there costs no timer. An
-    /// answer the clock stamps after the deadline is treated as not there by
-    /// it: a transport may move a clock without waiting on the sleeper.
+    /// its first poll, so an answer that is already there costs no timer.
     async fn by_deadline<F: Future>(
         &self,
         work: F,
@@ -905,10 +975,18 @@ impl<T: Transport> Gateway<T> {
             return Some(work.await);
         };
         let mut work = pin!(work);
-        let mut limit = None;
-        let answer = poll_fn(|context| {
+        let mut limit: Option<Pin<Box<dyn Future<Output = ()> + Send + '_>>> = None;
+        poll_fn(|context| {
+            if let Some(limit) = limit.as_mut()
+                && limit.as_mut().poll(context).is_ready()
+            {
+                return Poll::Ready(None);
+            }
+            if self.clock.now() >= deadline {
+                return Poll::Ready(None);
+            }
             if let Poll::Ready(answer) = work.as_mut().poll(context) {
-                return Poll::Ready(Some(answer));
+                return Poll::Ready((self.clock.now() < deadline).then_some(answer));
             }
             let limit = limit.get_or_insert_with(|| {
                 self.sleeper
@@ -916,8 +994,7 @@ impl<T: Transport> Gateway<T> {
             });
             limit.as_mut().poll(context).map(|()| None)
         })
-        .await;
-        answer.filter(|_| self.clock.now() <= deadline)
+        .await
     }
 
     /// The error for a call that ended on `outcome`.
@@ -958,7 +1035,7 @@ impl<T: Transport> Gateway<T> {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
     use crate::resilience::MAX_NAMED_WAIT;
@@ -971,6 +1048,9 @@ mod tests {
     struct FakeTime {
         offset: StdMutex<Duration>,
         slept: StdMutex<Vec<Duration>>,
+        /// How much later than asked each sleep ends, by the clock: a timer
+        /// that fires late, as one does on a loaded or suspended host.
+        lag: StdMutex<Duration>,
     }
 
     impl FakeTime {
@@ -978,11 +1058,16 @@ mod tests {
             Arc::new(Self {
                 offset: StdMutex::new(Duration::ZERO),
                 slept: StdMutex::new(Vec::new()),
+                lag: StdMutex::new(Duration::ZERO),
             })
         }
 
         fn advance(&self, by: Duration) {
             *self.offset.lock().expect("clock") += by;
+        }
+
+        fn lagging(&self, by: Duration) {
+            *self.lag.lock().expect("lag") = by;
         }
 
         /// The sleeps that ran to their end; one abandoned early (a
@@ -1002,6 +1087,7 @@ mod tests {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
+                self.advance(*self.lag.lock().expect("lag"));
                 self.slept.lock().expect("sleeps").push(delay);
             })
         }
@@ -2239,6 +2325,164 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_answer_at_the_exact_deadline_is_not_taken() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).taking(Duration::from_secs(10)),
+        );
+        let deadline = time.now() + Duration::from_secs(10);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::DeadlineReached { attempts: 1, .. })
+            ),
+            "the deadline did not win the tie: {refused:?}"
+        );
+        assert_eq!(time.now(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_stamped_exactly_at_the_deadline_is_not_taken() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).jumping(Duration::from_secs(60)),
+        );
+        let deadline = time.now() + Duration::from_secs(60);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::DeadlineReached { attempts: 1, .. })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_for_the_lane_ends_at_the_deadline() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).taking(Duration::from_secs(60)),
+        );
+        let (holding, queued) = (operations(), users());
+        let deadline = time.now() + Duration::from_secs(10);
+
+        let (first, (second, returned)) =
+            tokio::join!(gateway.send("OperationsService", &holding, None), async {
+                let refused = gateway.send("UsersService", &queued, Some(deadline)).await;
+                (refused, time.now())
+            },);
+
+        first.expect("the call holding the lane had no deadline");
+        assert_eq!(returned, deadline, "the queued call outlived its deadline");
+        assert!(
+            matches!(
+                second,
+                Err(GatewayError::DeadlineReached {
+                    attempts: 0,
+                    status: None,
+                    ..
+                })
+            ),
+            "{second:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_wait_whose_timer_fires_late_ends_at_the_deadline() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        for _ in 0..50 {
+            call(&gateway).await.expect("within the budget");
+        }
+        let deadline = time.now() + Duration::from_secs(70);
+        time.lagging(Duration::from_secs(30));
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::DeadlineReached {
+                    attempts: 0,
+                    status: None,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_named_reset_whose_timer_fires_late_ends_at_the_deadline() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(with_retry_after(429, MINUTE))),
+        );
+        let deadline = time.now() + Duration::from_secs(100);
+        time.lagging(MINUTE);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::DeadlineReached {
+                    attempts: 1,
+                    status: Some(429),
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_whose_timer_fires_late_ends_at_the_deadline() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(503))));
+        let deadline = time.now() + Duration::from_secs(2);
+        time.lagging(Duration::from_secs(5));
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::DeadlineReached {
+                    attempts: 1,
+                    status: Some(503),
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_deadline_with_room_leaves_the_retries_alone() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(503))));
@@ -2527,6 +2771,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_permanent_refusal_is_logged_once_at_warn_with_its_fields() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 404));
+        let log = Log::capture();
+
+        let _ = call(&gateway).await;
+
+        log.assert_line(
+            "WARN",
+            "refusal=\"rejected\"",
+            &[
+                "outbound call refused",
+                "destination=TinkoffProd",
+                "method=\"OperationsService\"",
+                "status=404",
+                "attempt=1",
+            ],
+        );
+        assert_eq!(log.text().matches("outbound call refused").count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn no_secret_and_no_body_reach_the_log() {
         let time = FakeTime::new();
         let leaking = || {
@@ -2559,17 +2825,45 @@ mod tests {
             text.contains("breaker opened"),
             "the scenario logged nothing: {text}"
         );
+        assert!(
+            text.contains("refusal=\"rejected\""),
+            "the rejection that echoed the token was not logged: {text}"
+        );
         assert!(!text.contains("invented-token"), "{text}");
         assert!(!text.contains("balance"), "{text}");
     }
 
     // --- production parts -------------------------------------------------
 
+    // The only test in this binary that calls `production`: `cargo test`
+    // runs every test of a binary in one process, and the second call in a
+    // process is refused.
+    #[test]
+    fn a_process_builds_one_production_gateway() {
+        let first = Gateway::production();
+        let second = Gateway::production();
+
+        assert!(first.is_ok(), "the first gateway was refused");
+        let Err(refused) = second else {
+            panic!("a second production gateway was built");
+        };
+        assert!(
+            matches!(refused, GatewayError::SecondGateway),
+            "{refused:?}"
+        );
+        assert!(!refused.is_transient());
+        let message = refused.to_string();
+        assert!(message.contains("one gateway"), "{message}");
+        assert!(message.contains("docs/deployment.md §1.1"), "{message}");
+    }
+
     #[test]
     fn the_production_gateway_can_be_shared_between_tasks() {
         fn shared<T: Send + Sync>(_: &T) {}
         fn spawnable<F: Future + Send>(_: F) {}
-        let gateway = Gateway::production().expect("the documented table is valid");
+        // The production type, built as `production` builds it, without
+        // spending this process's one call.
+        let gateway = Gateway::new(HttpClient::new()).expect("the documented table is valid");
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
         shared(&gateway);

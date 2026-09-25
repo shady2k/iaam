@@ -252,6 +252,80 @@ for manifest in crates/*/Cargo.toml; do
   fi
 done
 
+# --- 11a. Nothing outside iaam-http sends HTTP past the gateway ---
+# The audit behind the gateway found callers that reached the transport
+# directly and so skipped its budgets, lanes, retries and breaker without an
+# error. `HttpClient::send` is private to iaam-http now, but the `Transport`
+# trait must stay public for test fakes, and through it an `HttpClient` can
+# still be sent on. So the guard looks for what a bypass needs rather than for
+# `.send(`, which `Gateway::send` shares: an `HttpClient` held outside
+# `Gateway::new(HttpClient::new())`, the transport's `send` named by path, or a
+# `reqwest` client built by hand. Every file is checked, tests and examples
+# included: a live test that skips the budget spends the same real one.
+bypass_hits() {
+  grep -rnE --include='*.rs' \
+    'HttpClient::send|Transport>::send|Transport::send\(|reqwest::|ClientBuilder|HttpClient::(new|default)\(\)|:[[:space:]]*HttpClient[[:space:]]*=' \
+    "$@" \
+    | strip_comments \
+    | { grep -vE 'Gateway::new\(HttpClient::new\(\)\)' || true; }
+}
+# The guard tests its own boundary: the gateway's own `send` and the one
+# permitted construction pass, a held client and a path call do not.
+bypass_probe_dir=$(mktemp -d)
+trap 'rm -f "$meta_err"; rm -rf "$bypass_probe_dir"' EXIT
+cat > "$bypass_probe_dir/allowed.rs" <<'PROBE'
+let gateway = Arc::new(Gateway::new(HttpClient::new())?);
+gateway.send("UsersService", &request, None).await
+PROBE
+cat > "$bypass_probe_dir/bypass.rs" <<'PROBE'
+let client = HttpClient::new();
+Transport::send(&client, &request).await
+PROBE
+bypass_probe=$(bypass_hits "$bypass_probe_dir" | sed 's|^.*/||' | cut -d: -f1,2 | sort | tr '\n' ' ')
+if [ "$bypass_probe" != 'bypass.rs:1 bypass.rs:2 ' ]; then
+  err "the gateway-bypass guard misclassifies its probe: got '$bypass_probe'"
+fi
+for crate_dir in crates/*/; do
+  case "$crate_dir" in
+    crates/iaam-http/) continue ;;
+  esac
+  hits=$(bypass_hits "$crate_dir" || true)
+  if [ -n "$hits" ]; then
+    err "a request can be sent past the gateway in $crate_dir: outbound HTTP goes through Gateway::send (iaam-http module docs)"
+    echo "$hits" >&2
+  fi
+done
+
+# --- 11b. One gateway per process ---
+# Budgets and lanes are per gateway, so a second gateway is a second
+# allowance against the same destination and halves nothing. A merge once
+# left two of them in iaam-bootstrap. Production code — every `src` tree,
+# minus the `#[cfg(test)] mod` that closes a file — builds `Gateway::new` in
+# exactly one place: `serve` in iaam-bootstrap, which shares it as an `Arc`.
+# Tests, examples and live probes build their own; they are not the process.
+gateway_constructions() {
+  find "$@" -name '*.rs' -print0 | sort -z | xargs -0 -r awk '
+    FNR == 1 { in_tests = 0; pending = 0; current_fn = "" }
+    pending && /^[[:space:]]*(pub[^ ]* )?mod[[:space:]]/ { in_tests = 1 }
+    { pending = 0 }
+    /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/ { pending = 1; next }
+    in_tests { next }
+    /^[[:space:]]*(\/\/|\*)/ { next }
+    match($0, /fn[[:space:]]+[A-Za-z0-9_]+/) {
+      current_fn = substr($0, RSTART, RLENGTH); sub(/fn[[:space:]]+/, "", current_fn)
+    }
+    /Gateway::new\(/ { print FILENAME ":" FNR ":" current_fn }
+  '
+}
+found=$(gateway_constructions crates/*/src)
+expected_fn="crates/iaam-bootstrap/src/main.rs:serve"
+count=$(printf '%s' "$found" | { grep -c . || true; })
+located=$(printf '%s' "$found" | cut -d: -f1,3)
+if [ "$count" -ne 1 ] || [ "$located" != "$expected_fn" ]; then
+  err "production code must build Gateway::new exactly once, in serve of iaam-bootstrap; found $count:"
+  printf '%s\n' "$found" >&2
+fi
+
 # --- 12. Transport does not accept policy-derived states as price quality ---
 # `PriceQualityDto` describes only values that an external source can assert.
 # Carry-forward and staleness are computed inside the system and must not

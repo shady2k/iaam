@@ -10,7 +10,11 @@
 //!   (the two CBR services) share one lane and one budget;
 //! - **retries** of transient refusals, with the policy of `resilience`;
 //! - a **circuit breaker** per host;
-//! - an optional **deadline** no attempt or wait may cross.
+//! - an optional **deadline** no attempt or wait may cross, an attempt in
+//!   flight included;
+//! - a **reset the destination named**, obeyed by every caller of its host;
+//! - a **structured event** for every long wait, retry, transient refusal and
+//!   breaker change, carrying no header, body or secret.
 //!
 //! Time comes from an injected clock and sleeper, so every rule is checked on
 //! a fake clock: a test that sleeps for a minute to prove a per-minute budget
@@ -49,6 +53,11 @@ pub const BREAKER_FAILURES: u32 = 5;
 /// for a broker's maintenance window or a lifted ban, short enough that a
 /// daily synchronisation still finishes on the same run.
 pub const BREAKER_COOL_DOWN: Duration = Duration::from_secs(5 * 60);
+
+/// The shortest wait logged. A wait up to it is the ordinary pace of a
+/// call; a longer one is what an operator watching a slow synchronisation
+/// needs to see the reason of.
+const LOGGED_WAIT: Duration = Duration::from_secs(1);
 
 /// Which method keys a budget row covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +338,20 @@ impl GatewayError {
         self.retry_after().is_some()
     }
 
+    /// The refusal's name in the log, for the transient ones logged.
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Exhausted { .. } => "exhausted",
+            Self::DeadlineReached { .. } => "deadline",
+            Self::CircuitOpen { .. } => "circuit open",
+            Self::Deferred { .. } => "deferred",
+            Self::UnknownBudget { .. } => "unknown budget",
+            Self::InvalidBudgets(_) => "invalid budgets",
+            Self::Rejected { .. } => "rejected",
+            Self::Transport { .. } => "transport",
+        }
+    }
+
     /// When a transient refusal is worth trying again; `None` for a
     /// permanent one.
     #[must_use]
@@ -557,16 +580,20 @@ impl Lane {
         self.not_before = self.not_before.max(Some(until));
     }
 
-    fn record_failure(&mut self, now: Instant) {
+    /// Count a failed call; `true` when it opened the breaker.
+    fn record_failure(&mut self, now: Instant) -> bool {
         self.failures = self.failures.saturating_add(1);
-        if self.failures >= BREAKER_FAILURES {
+        let opens = self.failures >= BREAKER_FAILURES;
+        if opens {
             self.open_until = Some(now + BREAKER_COOL_DOWN);
         }
+        opens
     }
 
-    fn record_success(&mut self) {
+    /// Count a success; `true` when it closed a breaker that had opened.
+    fn record_success(&mut self) -> bool {
         self.failures = 0;
-        self.open_until = None;
+        self.open_until.take().is_some()
     }
 
     fn record_start(&mut self, key: Option<&'static str>, budget: &Budget, at: Instant) {
@@ -576,6 +603,11 @@ impl Lane {
             sent.pop_front();
         }
     }
+}
+
+/// A wait in whole milliseconds, as the log carries it.
+fn millis(wait: Duration) -> u64 {
+    u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The outbound gateway.
@@ -657,6 +689,29 @@ impl<T: Transport> Gateway<T> {
         request: &HttpRequest,
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
+        let result = self.send_unlogged(method, request, deadline).await;
+        if let Err(refusal) = &result
+            && let Some(wait) = refusal.retry_after()
+        {
+            tracing::warn!(
+                destination = ?request.destination(),
+                method,
+                attempt = refusal.attempts(),
+                wait_ms = millis(wait),
+                status = refusal.status(),
+                refusal = refusal.kind(),
+                "outbound call refused"
+            );
+        }
+        result
+    }
+
+    async fn send_unlogged(
+        &self,
+        method: &'static str,
+        request: &HttpRequest,
+        deadline: Option<Instant>,
+    ) -> Result<HttpResponse, GatewayError> {
         let destination = request.destination();
         let (budget, key) = self.budgets.lookup(destination, method)?;
         let lane = &self.lanes[destination.base_url()];
@@ -671,6 +726,30 @@ impl<T: Transport> Gateway<T> {
             attempts,
             retry_after,
         };
+        // Destination, method key, attempt, wait and status only: never a
+        // header, a body or the request, so no secret can reach the log.
+        let waits = |attempt: u32, wait: Duration, reason: &'static str| {
+            if wait > LOGGED_WAIT {
+                tracing::info!(
+                    destination = ?destination,
+                    method,
+                    attempt,
+                    wait_ms = millis(wait),
+                    reason,
+                    "outbound call waits"
+                );
+            }
+        };
+        let retries = |attempt: u32, wait: Duration, status: Option<u16>| {
+            tracing::warn!(
+                destination = ?destination,
+                method,
+                attempt,
+                wait_ms = millis(wait),
+                status,
+                "outbound call retries"
+            );
+        };
         loop {
             // The lane is held for the breaker check, the budget and named
             // waits, the request and the breaker update, and released for
@@ -679,7 +758,13 @@ impl<T: Transport> Gateway<T> {
             // opens the breaker is recorded before another call can slip in.
             // A named reset is waited here, under the lane, by every caller.
             let (decision, outcome, body) = {
+                let asked = self.clock.now();
                 let mut lane = lane.lock().await;
+                waits(
+                    attempts + 1,
+                    self.clock.now().saturating_duration_since(asked),
+                    "lane",
+                );
                 if let Some(retry_after) = lane.refusing(self.clock.now()) {
                     return Err(GatewayError::CircuitOpen {
                         destination,
@@ -697,11 +782,18 @@ impl<T: Transport> Gateway<T> {
                         retry_after: named,
                     });
                 }
-                let wait = named.max(lane.budget_wait(key, &budget, now));
+                let budget_wait = lane.budget_wait(key, &budget, now);
+                let wait = named.max(budget_wait);
                 if crosses(now + wait) {
                     return Err(cut(attempts, status, wait));
                 }
                 if !wait.is_zero() {
+                    let reason = if named >= budget_wait {
+                        "named reset"
+                    } else {
+                        "budget"
+                    };
+                    waits(attempts + 1, wait, reason);
                     self.sleeper.sleep(wait).await;
                 }
                 lane.record_start(key, &budget, self.clock.now());
@@ -719,7 +811,15 @@ impl<T: Transport> Gateway<T> {
                 };
                 let (outcome, body) = match answer {
                     Ok(response) if (200..300).contains(&response.status) => {
-                        lane.record_success();
+                        if lane.record_success() {
+                            tracing::info!(
+                                destination = ?destination,
+                                method,
+                                attempt = attempts,
+                                status = response.status,
+                                "breaker closed"
+                            );
+                        }
                         return Ok(response);
                     }
                     Ok(response) => {
@@ -750,22 +850,38 @@ impl<T: Transport> Gateway<T> {
                 // Only a call that failed transiently to the end counts: a
                 // permanent refusal says our request is wrong, not that the
                 // destination is down.
-                if decision == Retry::GiveUp && is_transient(&outcome) {
-                    lane.record_failure(self.clock.now());
+                if decision == Retry::GiveUp
+                    && is_transient(&outcome)
+                    && lane.record_failure(self.clock.now())
+                {
+                    tracing::warn!(
+                        destination = ?destination,
+                        method,
+                        attempt = attempts,
+                        wait_ms = millis(BREAKER_COOL_DOWN),
+                        status,
+                        "breaker opened"
+                    );
                 }
                 (decision, outcome, body)
             };
             match decision {
                 // Waited at the top of the loop, under the lane, where every
                 // other caller waits it too.
-                Retry::After(_) if outcome.named_delay().is_some() => {}
+                Retry::After(delay) if outcome.named_delay().is_some() => {
+                    retries(attempts, delay, status);
+                }
                 // A call cut short by its deadline is left out of the breaker
                 // count: it did not use up its retries, so it proved no more
                 // than one failed attempt does.
                 Retry::After(delay) if crosses(self.clock.now() + delay) => {
                     return Err(cut(attempts, status, delay));
                 }
-                Retry::After(delay) => self.sleeper.sleep(delay).await,
+                Retry::After(delay) => {
+                    retries(attempts, delay, status);
+                    waits(attempts + 1, delay, "backoff");
+                    self.sleeper.sleep(delay).await;
+                }
                 Retry::GiveUp => {
                     let body = RejectedBody::without_secret(&body, request.bearer());
                     return Err(self.refusal(destination, attempts, outcome, body));
@@ -2155,6 +2271,268 @@ mod tests {
         let _ = call(&gateway).await;
 
         assert_eq!(gateway.transport.sent_count(), sent + ATTEMPTS as usize);
+    }
+
+    // --- logs -------------------------------------------------------------
+
+    /// Everything logged while it is held, as the operator's log shows it.
+    struct Log {
+        lines: Arc<StdMutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    struct Sink(Arc<StdMutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Log {
+        fn capture() -> Self {
+            let lines = Arc::new(StdMutex::new(Vec::new()));
+            let sink = Arc::clone(&lines);
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || Sink(Arc::clone(&sink)))
+                .with_ansi(false)
+                .without_time()
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            Self {
+                lines,
+                _guard: tracing::subscriber::set_default(subscriber),
+            }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.lines.lock().expect("log").clone()).expect("UTF-8")
+        }
+
+        /// The one line holding `message`, which must hold every fragment.
+        fn assert_line(&self, level: &str, message: &str, fragments: &[&str]) {
+            let text = self.text();
+            let line = text
+                .lines()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("no {message:?} in the log:\n{text}"));
+            assert!(line.contains(level), "{line}");
+            for fragment in fragments {
+                assert!(line.contains(fragment), "no {fragment:?} in {line}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_is_logged_at_warn_with_its_fields() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(503))));
+
+        call(&gateway).await.expect("the retry succeeded");
+
+        log.assert_line(
+            "WARN",
+            "outbound call retries",
+            &[
+                "destination=TinkoffProd",
+                "method=\"OperationsService\"",
+                "attempt=1",
+                "wait_ms=1000",
+                "status=503",
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_over_a_second_is_logged_at_info_with_its_reason() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(status(503)))
+                .then(Ok(status(503)))
+                .then(Ok(with_retry_after(429, Duration::from_secs(30)))),
+        );
+
+        call(&gateway).await.expect("the fourth attempt succeeded");
+
+        let waits: Vec<String> = log
+            .text()
+            .lines()
+            .filter(|line| line.contains("outbound call waits"))
+            .map(str::to_owned)
+            .collect();
+        // The first backoff is one second, not over it.
+        assert_eq!(waits.len(), 2, "{waits:?}");
+        assert!(waits[0].contains("INFO"), "{waits:?}");
+        assert!(waits[0].contains("reason=\"backoff\""), "{waits:?}");
+        assert!(waits[0].contains("wait_ms=2000"), "{waits:?}");
+        assert!(waits[1].contains("reason=\"named reset\""), "{waits:?}");
+        assert!(waits[1].contains("wait_ms=30000"), "{waits:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_budget_wait_is_logged_with_its_reason() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        for _ in 0..50 {
+            call(&gateway).await.expect("within the budget");
+        }
+        let log = Log::capture();
+
+        call(&gateway).await.expect("sent after the minute");
+
+        log.assert_line(
+            "INFO",
+            "outbound call waits",
+            &["reason=\"budget\"", "wait_ms=60000", "attempt=1"],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_for_the_lane_is_logged_with_its_reason() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).taking(Duration::from_secs(5)),
+        );
+        let (operations, users) = (operations(), users());
+        let log = Log::capture();
+
+        let (first, second) = tokio::join!(
+            gateway.send("OperationsService", &operations, None),
+            gateway.send("UsersService", &users, None),
+        );
+
+        first.expect("sent");
+        second.expect("sent");
+        log.assert_line(
+            "INFO",
+            "outbound call waits",
+            &["reason=\"lane\"", "wait_ms=5000", "method=\"UsersService\""],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_breaker_opening_and_closing_is_logged() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, failing_calls(Scripted::answering(&time, 200), 5));
+        let log = Log::capture();
+        for _ in 0..5 {
+            let _ = call(&gateway).await;
+        }
+        log.assert_line(
+            "WARN",
+            "breaker opened",
+            &["destination=TinkoffProd", "wait_ms=300000", "status=503"],
+        );
+        assert_eq!(log.text().matches("breaker opened").count(), 1);
+
+        time.advance(COOL_DOWN);
+        call(&gateway).await.expect("the cool-down is over");
+
+        log.assert_line("INFO", "breaker closed", &["destination=TinkoffProd"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_success_with_the_breaker_closed_logs_no_closing() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(503))));
+        let log = Log::capture();
+
+        call(&gateway).await.expect("the retry succeeded");
+
+        assert!(!log.text().contains("breaker closed"), "{}", log.text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_transient_refusal_is_logged_at_warn_with_its_kind() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 503));
+        let log = Log::capture();
+        for _ in 0..5 {
+            let _ = call(&gateway).await;
+        }
+        let _ = call(&gateway).await;
+
+        log.assert_line(
+            "WARN",
+            "refusal=\"exhausted\"",
+            &[
+                "outbound call refused",
+                "attempt=5",
+                "wait_ms=16000",
+                "status=503",
+            ],
+        );
+        log.assert_line(
+            "WARN",
+            "refusal=\"circuit open\"",
+            &["outbound call refused", "attempt=0", "wait_ms=300000"],
+        );
+
+        let late = FakeTime::new();
+        let gateway = self::gateway(&late, Scripted::answering(&late, 200));
+        let _ = gateway
+            .send("OperationsService", &operations(), Some(late.now()))
+            .await;
+        log.assert_line("WARN", "refusal=\"deadline\"", &["outbound call refused"]);
+
+        let long = MAX_NAMED_WAIT + Duration::from_secs(1);
+        let gateway = self::gateway(
+            &late,
+            Scripted::answering(&late, 200).then(Ok(with_retry_after(429, long))),
+        );
+        let _ = call(&gateway).await;
+        log.assert_line(
+            "WARN",
+            "refusal=\"deferred\"",
+            &["outbound call refused", "status=429"],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_secret_and_no_body_reach_the_log() {
+        let time = FakeTime::new();
+        let leaking = || {
+            Ok(HttpResponse {
+                body: b"t.invented-token account Main balance".to_vec(),
+                ..with_retry_after(503, Duration::from_secs(2))
+            })
+        };
+        let script = (0..5 * ATTEMPTS).fold(Scripted::answering(&time, 200), |script, _| {
+            script.then(leaking())
+        });
+        let gateway = gateway(
+            &time,
+            script.then(Ok(HttpResponse {
+                body: b"t.invented-token".to_vec(),
+                ..status(401)
+            })),
+        );
+        let request = operations().with_bearer("t.invented-token");
+        let log = Log::capture();
+
+        for _ in 0..6 {
+            let _ = gateway.send("OperationsService", &request, None).await;
+        }
+        time.advance(COOL_DOWN);
+        let _ = gateway.send("OperationsService", &request, None).await;
+
+        let text = log.text();
+        assert!(
+            text.contains("breaker opened"),
+            "the scenario logged nothing: {text}"
+        );
+        assert!(!text.contains("invented-token"), "{text}");
+        assert!(!text.contains("balance"), "{text}");
     }
 
     // --- production parts -------------------------------------------------

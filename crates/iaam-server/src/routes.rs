@@ -1692,7 +1692,13 @@ pub async fn preview_category_rules_batch_route(
         (status = 200, description = "Synchronisation result", body = SyncOutcomeDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 409, description = "A sync of this account is already running; nothing was sent to the broker", body = ApiError),
-        (status = 503, description = "Broker channel or access is not configured", body = ApiError),
+        (status = 502, description = "The broker refused the request (code `broker_refused`): a retry gets the same answer; check the broker access configured for this owner", body = ApiError),
+        (
+            status = 503,
+            description = "Either the broker channel or access is not configured (code `not_configured`), or the broker stayed unreachable through every retry or the sync ran out of its deadline (code `broker_unavailable`): call again after the seconds in Retry-After, which is sent when the wait is known",
+            body = ApiError,
+            headers(("Retry-After" = u64, description = "Whole seconds to wait before calling again; only with `broker_unavailable`, and only when the wait is known"))
+        ),
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),

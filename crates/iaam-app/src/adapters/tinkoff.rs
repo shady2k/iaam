@@ -259,9 +259,14 @@ where
 /// arrived before it. Another refusal is about the request, not the progress.
 fn after_pages(error: BrokerError, fetched: usize) -> BrokerError {
     match error {
-        BrokerError::Unreachable { broker, detail } => BrokerError::Unreachable {
+        BrokerError::Unreachable {
+            broker,
+            detail,
+            retry_after,
+        } => BrokerError::Unreachable {
             broker,
             detail: format!("{detail}; operation pages fetched before it: {fetched}"),
+            retry_after,
         },
         other => other,
     }
@@ -964,9 +969,17 @@ fn rfc3339_operation_end(date: time::Date) -> String {
 fn tinkoff_error(error: TinkoffError) -> BrokerError {
     let detail = error.to_string();
     match error {
-        TinkoffError::Unreachable { .. } | TinkoffError::Transport(_) => BrokerError::Unreachable {
+        TinkoffError::Unreachable { retry_after, .. } => BrokerError::Unreachable {
             broker: BROKER.to_owned(),
             detail,
+            retry_after: Some(retry_after),
+        },
+        // A network fault the gateway did not retry names no wait: saying one
+        // would be a guess published as the broker's answer.
+        TinkoffError::Transport(_) => BrokerError::Unreachable {
+            broker: BROKER.to_owned(),
+            detail,
+            retry_after: None,
         },
         TinkoffError::InvalidToken
         | TinkoffError::MethodUnavailable { .. }

@@ -1676,10 +1676,12 @@ async fn one_broker_failure_does_not_poison_another_sync() {
         operations: Err(BrokerError::Unreachable {
             broker: "finam".to_owned(),
             detail: "offline".to_owned(),
+            retry_after: None,
         }),
         portfolio: Err(BrokerError::Unreachable {
             broker: "finam".to_owned(),
             detail: "offline".to_owned(),
+            retry_after: None,
         }),
     };
     let error = sync_broker(
@@ -2069,6 +2071,7 @@ async fn a_failed_sync_releases_its_account() {
         operations: Err(BrokerError::Unreachable {
             broker: "test".to_owned(),
             detail: "offline".to_owned(),
+            retry_after: None,
         }),
         portfolio: Ok(empty_portfolio()),
     };
@@ -2257,6 +2260,16 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_naming_the_pages_and_write
     .expect_err("the deadline cuts the sync");
 
     assert_eq!(answered.load(Ordering::SeqCst), 4);
+    assert!(
+        matches!(
+            refused,
+            AppError::BrokerUnreachable {
+                retry_after: Some(_),
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
     let message = refused.to_string();
     assert!(message.contains("unreachable"), "{message}");
     assert!(message.contains("retry after"), "{message}");
@@ -2265,4 +2278,146 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_naming_the_pages_and_write
         "{message}"
     );
     assert_eq!(load_all(&services, owner).await, before);
+}
+
+/// A T-Invest that answers every call with 429 and a reset delay of `wait`.
+struct ThrottlingTinvest {
+    wait: Duration,
+}
+
+impl Transport for ThrottlingTinvest {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status: 429,
+            body: b"{}".to_vec(),
+            retry_after: Some(self.wait),
+        })
+    }
+}
+
+fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
+    let time = Arc::new(FakeTime {
+        now: Mutex::new(Instant::now()),
+    });
+    let gateway = Gateway::with_parts(
+        transport,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+    )
+    .expect("the documented table is valid");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-token")).expect("token opens");
+    let client = TinkoffClient::new(Environment::Prod, token, Arc::new(gateway));
+    let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
+    TinkoffChannel::new(client, SourceId::new_random(), dictionary)
+}
+
+#[tokio::test]
+async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let channel = channel_over(ThrottlingTinvest {
+        wait: Duration::from_secs(7),
+    });
+
+    let refused = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("T-Invest never lets the call through");
+
+    match refused {
+        AppError::BrokerUnreachable {
+            broker,
+            retry_after,
+            ..
+        } => {
+            assert_eq!(broker, "tinkoff");
+            assert_eq!(retry_after, Some(Duration::from_secs(7)));
+        }
+        other => panic!("expected an unreachable broker, got {other:?}"),
+    }
+}
+
+/// A broker whose operations request always fails with `error`.
+fn failing_broker(error: BrokerError) -> FakeBroker {
+    FakeBroker {
+        source: held_channel(),
+        identity_scope: IdentityScope::Account,
+        operations: Err(error),
+        portfolio: Ok(empty_portfolio()),
+    }
+}
+
+async fn sync_error(broker: &FakeBroker) -> AppError {
+    let services = services();
+    sync_broker(
+        &services,
+        &principal(OwnerId::new_random()),
+        broker,
+        AccountId::new_random(),
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the broker fails")
+}
+
+#[tokio::test]
+async fn an_unreachable_broker_keeps_its_wait_through_the_scenario() {
+    let error = sync_error(&failing_broker(BrokerError::Unreachable {
+        broker: "test".to_owned(),
+        detail: "offline".to_owned(),
+        retry_after: Some(Duration::from_millis(1_500)),
+    }))
+    .await;
+    match error {
+        AppError::BrokerUnreachable {
+            broker,
+            detail,
+            retry_after,
+        } => {
+            assert_eq!(broker, "test");
+            assert_eq!(detail, "offline");
+            assert_eq!(retry_after, Some(Duration::from_millis(1_500)));
+        }
+        other => panic!("expected an unreachable broker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_broker_refusal_is_not_a_store_failure() {
+    let error = sync_error(&failing_broker(BrokerError::Refused {
+        broker: "test".to_owned(),
+        detail: "token is invalid".to_owned(),
+    }))
+    .await;
+    match error {
+        AppError::BrokerRefused { broker, detail } => {
+            assert_eq!(broker, "test");
+            assert_eq!(detail, "token is invalid");
+        }
+        other => panic!("expected a broker refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unparsable_broker_answer_is_still_our_failure() {
+    let error = sync_error(&failing_broker(BrokerError::Unparsable {
+        broker: "test".to_owned(),
+        detail: "not json".to_owned(),
+    }))
+    .await;
+    assert!(matches!(error, AppError::Store(_)), "{error:?}");
 }

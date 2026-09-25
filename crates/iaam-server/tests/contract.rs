@@ -51,6 +51,8 @@ use iaam_core::returns::{
 };
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
+use iaam_http::Gateway;
+use iaam_http::client::HttpClient;
 use iaam_server::action_catalog::{ActionCatalog, ActionCatalogError};
 use iaam_server::auth::hash_token;
 use iaam_server::dto::{ReturnsReportDto, VerdictDto};
@@ -489,6 +491,7 @@ async fn harness_with_factory_and_provisioning(
     let adapter = Arc::new(SqliteAdapter::with_broker_key(
         store,
         Some(Key::from_bytes([7; 32])),
+        Arc::new(Gateway::new(HttpClient::new()).expect("the budget table is valid")),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> =

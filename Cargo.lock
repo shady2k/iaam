@@ -1145,6 +1145,7 @@ dependencies = [
  "iaam-app",
  "iaam-broker",
  "iaam-core",
+ "iaam-http",
  "iaam-store",
  "insta",
  "rust_decimal",

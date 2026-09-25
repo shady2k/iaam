@@ -155,4 +155,59 @@ enum OperationType {
             request.url()
         );
     }
+
+    /// The contract host is paced by the gateway like any destination: a
+    /// host with no budget row would be refused before anything was sent.
+    #[tokio::test]
+    async fn the_request_is_paced_by_the_gateway_one_a_second() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
+        use iaam_http::{Gateway, HttpError, HttpResponse};
+
+        struct FakeTime(Mutex<Instant>, Mutex<Vec<Duration>>);
+        impl Clock for FakeTime {
+            fn now(&self) -> Instant {
+                *self.0.lock().expect("clock")
+            }
+        }
+        impl Sleeper for FakeTime {
+            fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                self.1.lock().expect("sleeps").push(delay);
+                *self.0.lock().expect("clock") += delay;
+                Box::pin(async {})
+            }
+        }
+        struct Contract;
+        impl Transport for Contract {
+            async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"enum OperationType { OPERATION_TYPE_INPUT = 1; }".to_vec(),
+                    retry_after: None,
+                })
+            }
+        }
+
+        let time = Arc::new(FakeTime(Mutex::new(Instant::now()), Mutex::new(Vec::new())));
+        let gateway = Gateway::with_parts(
+            Contract,
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+        )
+        .expect("the documented table is valid");
+
+        for _ in 0..2 {
+            gateway
+                .send("operations.proto", &operation_types_request(), None)
+                .await
+                .expect("the contract host has a budget");
+        }
+
+        assert_eq!(*time.1.lock().expect("sleeps"), [Duration::from_secs(1)]);
+    }
 }

@@ -908,6 +908,8 @@ supplies what is missing and with which command.
 | `{"code":"unauthorized", …}` (401) | header missing, or the token is unknown or revoked | §7.1 for an agent token; §7.3 for an owner token |
 | `{"code":"not_configured","message":"broker access encryption is not configured: …"}` (503) | the server was started without `IAAM_BROKER_KEY_FILE` | restart it with the key mounted: §6.2 |
 | `{"code":"not_configured","message":"broker access is not configured"}` (503) | same code, different fact: no active access for that broker and environment | the owner, at a console: `iaam broker access add` (§6.3). A restart changes nothing |
+| `{"code":"broker_unavailable", …}` (503, with `Retry-After` when the wait is known) | the broker kept failing transiently (429, 5xx, network) after the gateway's retries, its breaker is open after repeated failures, or the sync reached its 15-minute deadline; nothing was written | wait what `Retry-After` says, then sync again. Repeating sooner is refused by the same budget |
+| `{"code":"broker_refused", …}` (502) | the broker refused the request itself, e.g. a revoked or wrong token | check the access: `iaam broker access` (§6.3). Retrying unchanged gets the same answer |
 | `{"code":"invalid_request","message":"an owner token cannot be issued via the API: …"}` (422) | `scope: owner` requested over HTTP | by design; issue it at the console (§7.3) |
 | `Connection refused` from curl | nothing is listening at that address | container: `IAAM_LISTEN` left at the loopback default while publishing a port (§3.6). Host: `systemctl is-active iaam` |
 

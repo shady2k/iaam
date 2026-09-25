@@ -340,6 +340,10 @@ defect of the comparison.
   поведению: снимок является кэшем, а полный пересчёт воспроизводит то
   же нарушение. Обоснование — в описании бида iaam-1fk.18 и рядом со
   списком модулей в `scripts/check-mutants.sh`.
+- **The mutation guard is not run by CI** (decision 0041). `make mutants`
+  (`scripts/check-mutants.sh`, the per-module thresholds) is run by hand
+  before a change to this core is accepted; `make mutants-diff` runs at every
+  stage's acceptance.
 - **Конкурентная запись закрыта транзакцией с немедленным захватом
   и уникальным индексом** `(owner, effective_date, sequence)`. Тест на
   два одновременных запроса есть:

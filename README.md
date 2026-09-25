@@ -127,6 +127,10 @@ cargo test --workspace
 | Покрытие по диффу | `diff-cover lcov.info --fail-under=90` | непокрытый новый код |
 | Мутации | `./scripts/check-mutants.sh` | тесты, проходящие впустую (порог по каждому модулю) |
 
+Mutation testing does not run in CI (decision 0041): `make mutants-diff` runs
+at each stage's acceptance, and `make mutants`, the per-module thresholds, is run
+by hand, for instance before a change to the irreversible core.
+
 **Заслон не чинится ослаблением.** Если он мешает — либо код неверен, либо
 заслон требует осознанного исключения, вносимого отдельным коммитом
 с обоснованием.

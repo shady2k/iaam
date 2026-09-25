@@ -109,7 +109,7 @@ diff-coverage: coverage ## 90% threshold for added lines (BASE=...)
 	$(RUN) diff-cover lcov.info --compare-branch=$(BASE) --fail-under=90
 
 .PHONY: mutants
-mutants: ## Mutation testing with a threshold for each module (slow)
+mutants: ## Mutation testing with a threshold for each module (slow; run by hand, not in CI)
 	$(RUN) ./scripts/check-mutants.sh
 
 .PHONY: mutants-diff

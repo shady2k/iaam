@@ -590,7 +590,7 @@ async fn serve(config: Config) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
+#[inline]
 fn fake() -> Gateway<Fake> {
     Gateway::with_parts(Fake, clock, sleeper)
 }

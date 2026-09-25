@@ -17,9 +17,10 @@
 //! is a test nobody runs.
 
 use std::collections::{HashMap, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
+use std::future::{Future, poll_fn};
+use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -586,7 +587,18 @@ impl<T: Transport> Gateway<T> {
                 }
                 lane.record_start(key, &budget, self.clock.now());
                 attempts += 1;
-                let (outcome, body) = match self.transport.send(request).await {
+                let Some(answer) = self
+                    .by_deadline(self.transport.send(request), deadline)
+                    .await
+                else {
+                    // Abandoned in flight: dropping the request cancels it.
+                    // The wait offered is the one a timed-out attempt earns.
+                    let retry_after = self
+                        .retry
+                        .delay(attempts, &Outcome::Transport(HttpError::Timeout));
+                    return Err(cut(attempts, status, retry_after));
+                };
+                let (outcome, body) = match answer {
                     Ok(response) if (200..300).contains(&response.status) => {
                         lane.record_success();
                         return Ok(response);
@@ -604,7 +616,13 @@ impl<T: Transport> Gateway<T> {
                         (Outcome::Transport(error), Vec::new())
                     }
                 };
-                let decision = self.retry.decide(attempts, &outcome);
+                // A request that may act is sent once: a lost answer does not
+                // say the action was not taken.
+                let decision = if request.is_idempotent() {
+                    self.retry.decide(attempts, &outcome)
+                } else {
+                    Retry::GiveUp
+                };
                 // Only a call that failed transiently to the end counts: a
                 // permanent refusal says our request is wrong, not that the
                 // destination is down.
@@ -624,6 +642,36 @@ impl<T: Transport> Gateway<T> {
                 Retry::GiveUp => return Err(self.refusal(destination, attempts, outcome, body)),
             }
         }
+    }
+
+    /// `work`, unless the deadline falls first: then `None`, at the deadline.
+    ///
+    /// The deadline's sleep is started only once `work` has not finished on
+    /// its first poll, so an answer that is already there costs no timer. An
+    /// answer the clock stamps after the deadline is treated as not there by
+    /// it: a transport may move a clock without waiting on the sleeper.
+    async fn by_deadline<F: Future>(
+        &self,
+        work: F,
+        deadline: Option<Instant>,
+    ) -> Option<F::Output> {
+        let Some(deadline) = deadline else {
+            return Some(work.await);
+        };
+        let mut work = pin!(work);
+        let mut limit = None;
+        let answer = poll_fn(|context| {
+            if let Poll::Ready(answer) = work.as_mut().poll(context) {
+                return Poll::Ready(Some(answer));
+            }
+            let limit = limit.get_or_insert_with(|| {
+                self.sleeper
+                    .sleep(deadline.saturating_duration_since(self.clock.now()))
+            });
+            limit.as_mut().poll(context).map(|()| None)
+        })
+        .await;
+        answer.filter(|_| self.clock.now() <= deadline)
     }
 
     /// The error for a call that ended on `outcome`.
@@ -668,24 +716,30 @@ mod tests {
 
     use super::*;
 
-    /// A clock that moves only when something sleeps on it.
+    /// A clock on tokio's paused timer: it moves only when every task waits
+    /// on it, so a sleep of a minute takes no real time, and a request still
+    /// in flight really is overtaken by a deadline that falls first.
+    ///
+    /// `advance` jumps the clock between calls, when nothing waits on it.
     struct FakeTime {
-        now: StdMutex<Instant>,
+        offset: StdMutex<Duration>,
         slept: StdMutex<Vec<Duration>>,
     }
 
     impl FakeTime {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                now: StdMutex::new(Instant::now()),
+                offset: StdMutex::new(Duration::ZERO),
                 slept: StdMutex::new(Vec::new()),
             })
         }
 
         fn advance(&self, by: Duration) {
-            *self.now.lock().expect("clock") += by;
+            *self.offset.lock().expect("clock") += by;
         }
 
+        /// The sleeps that ran to their end; one abandoned early (a
+        /// deadline that lost the race) is not a wait anybody made.
         fn slept(&self) -> Vec<Duration> {
             self.slept.lock().expect("sleeps").clone()
         }
@@ -693,15 +747,16 @@ mod tests {
 
     impl Clock for FakeTime {
         fn now(&self) -> Instant {
-            *self.now.lock().expect("clock")
+            tokio::time::Instant::now().into_std() + *self.offset.lock().expect("clock")
         }
     }
 
     impl Sleeper for FakeTime {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            self.slept.lock().expect("sleeps").push(delay);
-            self.advance(delay);
-            Box::pin(async {})
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                self.slept.lock().expect("sleeps").push(delay);
+            })
         }
     }
 
@@ -714,6 +769,11 @@ mod tests {
         sent: StdMutex<Vec<(Destination, Instant)>>,
         in_flight: AtomicUsize,
         most_in_flight: AtomicUsize,
+        /// How long each request stays in flight, on the paused timer.
+        latency: Duration,
+        /// How far the clock jumps while a request is in flight, as a fake
+        /// endpoint elsewhere in the tree moves its clock without waiting.
+        jump: Duration,
     }
 
     impl Scripted {
@@ -725,7 +785,17 @@ mod tests {
                 sent: StdMutex::new(Vec::new()),
                 in_flight: AtomicUsize::new(0),
                 most_in_flight: AtomicUsize::new(0),
+                latency: Duration::ZERO,
+                jump: Duration::ZERO,
             }
+        }
+
+        fn taking(self, latency: Duration) -> Self {
+            Self { latency, ..self }
+        }
+
+        fn jumping(self, jump: Duration) -> Self {
+            Self { jump, ..self }
         }
 
         fn then(self, answer: Result<HttpResponse, HttpError>) -> Self {
@@ -760,6 +830,10 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
+            if !self.latency.is_zero() {
+                tokio::time::sleep(self.latency).await;
+            }
+            self.time.advance(self.jump);
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             self.script
                 .lock()
@@ -793,6 +867,8 @@ mod tests {
             "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
             crate::RequestBody::Json("{}".to_owned()),
         )
+        // A read-only RPC: T-Invest reads over POST.
+        .idempotent()
     }
 
     /// Assert no `window` holds more than `limit` of the instants.
@@ -811,7 +887,7 @@ mod tests {
 
     // --- budget -----------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn operations_service_never_exceeds_fifty_in_any_minute() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -832,15 +908,11 @@ mod tests {
         assert_eq!(sent[50], start + MINUTE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn users_service_never_exceeds_twenty_five_in_any_minute() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
-        let request = HttpRequest::post(
-            Destination::TinkoffProd,
-            "/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
-            crate::RequestBody::Json("{}".to_owned()),
-        );
+        let request = users();
 
         for _ in 0..60 {
             gateway
@@ -854,7 +926,7 @@ mod tests {
         assert_eq!(sent[25], sent[0] + MINUTE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn two_t_invest_services_do_not_share_a_budget() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -874,7 +946,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_at().last(), Some(&start));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn finam_gives_each_method_its_own_hundred_a_minute() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -904,7 +976,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn moex_keeps_one_request_per_hundred_milliseconds() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -919,7 +991,7 @@ mod tests {
         assert_eq!(sent[2] - sent[1], Duration::from_millis(100));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_method_missing_from_the_table_is_refused_without_sending() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -939,7 +1011,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_destination_missing_from_the_table_is_refused_without_sending() {
         let time = FakeTime::new();
         // Every destination has a row in the documented table, so the missing
@@ -996,9 +1068,10 @@ mod tests {
             "/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
             crate::RequestBody::Json("{}".to_owned()),
         )
+        .idempotent()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_second_concurrent_call_to_a_destination_waits_for_the_first() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -1017,7 +1090,7 @@ mod tests {
 
     /// The control for the test above: the fake endpoint does see two
     /// requests at once when the rule allows it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn calls_to_different_destinations_are_in_flight_together() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -1034,7 +1107,7 @@ mod tests {
         assert_eq!(gateway.transport.most_in_flight.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_two_cbr_destinations_share_one_host_and_so_one_lane() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -1051,7 +1124,7 @@ mod tests {
         assert_eq!(gateway.transport.most_in_flight.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_two_cbr_destinations_draw_on_one_budget() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -1077,7 +1150,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn each_transient_status_is_retried_after_the_first_backoff() {
         for transient in [429, 500, 502, 503, 504] {
             let time = FakeTime::new();
@@ -1098,7 +1171,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_network_failure_and_a_timeout_are_retried() {
         for failure in [HttpError::Network, HttpError::Timeout] {
             let time = FakeTime::new();
@@ -1111,7 +1184,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn each_permanent_status_returns_at_once() {
         for permanent in [400, 401, 403, 404, 422] {
             let time = FakeTime::new();
@@ -1136,7 +1209,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_rejection_keeps_the_body_for_the_source_to_read() {
         let time = FakeTime::new();
         let body = br#"{"code":"40003"}"#.to_vec();
@@ -1165,7 +1238,7 @@ mod tests {
         assert_eq!(format!("{body:?}"), "RejectedBody(<4 bytes>)");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_transport_that_cannot_be_built_is_not_retried() {
         let time = FakeTime::new();
         let gateway = gateway(
@@ -1186,7 +1259,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_transient_failure_is_tried_five_times_with_doubling_backoff() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 503));
@@ -1208,7 +1281,36 @@ mod tests {
         assert_eq!(refused.retry_after(), Some(Duration::from_secs(16)));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn a_request_not_marked_idempotent_is_sent_once() {
+        for failure in [Ok(status(503)), Err(HttpError::Timeout)] {
+            let time = FakeTime::new();
+            let gateway = gateway(&time, Scripted::answering(&time, 200).then(failure));
+            let transfer = HttpRequest::post(
+                Destination::FinamApi,
+                "/v1/accounts/transfer",
+                crate::RequestBody::Json("{}".to_owned()),
+            );
+
+            let refused = gateway
+                .send("AccountsService.Transactions", &transfer, None)
+                .await
+                .expect_err("a second send could do the thing twice");
+
+            assert_eq!(gateway.transport.sent_count(), 1);
+            assert!(
+                time.slept().is_empty(),
+                "it waited for a retry it may not make"
+            );
+            assert!(
+                matches!(refused, GatewayError::Exhausted { attempts: 1, .. }),
+                "{refused:?}"
+            );
+            assert_eq!(refused.retry_after(), Some(FIRST_BACKOFF));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn exhausted_network_failures_carry_no_status() {
         let time = FakeTime::new();
         let transport = (0..5).fold(Scripted::answering(&time, 200), |script, _| {
@@ -1226,7 +1328,7 @@ mod tests {
         assert_eq!(refused.attempts(), 5);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_named_delay_wins_over_the_computed_backoff() {
         let time = FakeTime::new();
         let gateway = gateway(
@@ -1247,7 +1349,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_named_delay_is_still_capped() {
         let time = FakeTime::new();
         let gateway = gateway(
@@ -1264,7 +1366,7 @@ mod tests {
         assert_eq!(time.slept(), [crate::resilience::MAX_BACKOFF]);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_success_is_returned_as_it_came() {
         let time = FakeTime::new();
         let answer = HttpResponse {
@@ -1285,7 +1387,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_refusal_carries_neither_the_token_nor_the_body() {
         let time = FakeTime::new();
         let gateway = gateway(
@@ -1320,7 +1422,7 @@ mod tests {
 
     const COOL_DOWN: Duration = Duration::from_secs(5 * 60);
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn five_failed_calls_open_the_breaker_and_it_refuses_without_sending() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 503));
@@ -1353,7 +1455,7 @@ mod tests {
         assert_eq!(refused.retry_after(), Some(COOL_DOWN));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn four_failed_calls_leave_the_breaker_closed() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 503));
@@ -1367,7 +1469,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), sent + ATTEMPTS as usize);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_success_between_failures_starts_the_count_again() {
         let time = FakeTime::new();
         let script = failing_calls(Scripted::answering(&time, 503), 4).then(Ok(status(200)));
@@ -1390,7 +1492,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), sent + ATTEMPTS as usize);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_permanent_refusal_does_not_count_towards_the_breaker() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 404));
@@ -1405,7 +1507,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 6);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_open_breaker_leaves_other_destinations_alone() {
         let time = FakeTime::new();
         let gateway = gateway(&time, failing_calls(Scripted::answering(&time, 200), 5));
@@ -1420,7 +1522,7 @@ mod tests {
             .expect("Finam is not the destination that failed");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_breaker_refuses_for_the_whole_cool_down_and_then_lets_a_call_through() {
         let time = FakeTime::new();
         let gateway = gateway(&time, failing_calls(Scripted::answering(&time, 200), 5));
@@ -1444,7 +1546,7 @@ mod tests {
         call(&gateway).await.expect("a success closed the breaker");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failure_right_after_the_cool_down_opens_the_breaker_again() {
         let time = FakeTime::new();
         let gateway = gateway(&time, failing_calls(Scripted::answering(&time, 200), 6));
@@ -1467,7 +1569,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), sent);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_breaker_that_opens_during_a_call_stops_its_remaining_attempts() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 503));
@@ -1494,7 +1596,7 @@ mod tests {
 
     // --- deadline ---------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_deadline_already_reached_sends_nothing() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -1511,7 +1613,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_backoff_that_would_end_past_the_deadline_is_not_waited() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 503));
@@ -1543,7 +1645,7 @@ mod tests {
         assert!(message.contains("2 attempts"), "{message}");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn no_attempt_starts_exactly_at_the_deadline() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 503));
@@ -1560,7 +1662,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_budget_wait_that_would_end_past_the_deadline_is_not_waited() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -1590,7 +1692,83 @@ mod tests {
         assert!(time.slept().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_in_flight_at_the_deadline_is_abandoned_at_the_deadline() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).taking(Duration::from_secs(30)),
+        );
+        let deadline = time.now() + Duration::from_secs(10);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await
+            .expect_err("the answer would come twenty seconds past the deadline");
+
+        assert_eq!(
+            time.now(),
+            deadline,
+            "the call did not return at its deadline"
+        );
+        assert!(
+            matches!(
+                refused,
+                GatewayError::DeadlineReached {
+                    attempts: 1,
+                    status: None,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert!(refused.is_transient());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_that_answers_before_the_deadline_is_kept() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).taking(Duration::from_secs(9)),
+        );
+        let start = time.now();
+
+        gateway
+            .send(
+                "OperationsService",
+                &operations(),
+                Some(start + Duration::from_secs(10)),
+            )
+            .await
+            .expect("the answer came a second before the deadline");
+
+        assert_eq!(time.now(), start + Duration::from_secs(9));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_stamped_after_the_deadline_is_not_taken() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).jumping(Duration::from_secs(4 * 60)),
+        );
+        let deadline = time.now() + Duration::from_secs(60);
+
+        let refused = gateway
+            .send("OperationsService", &operations(), Some(deadline))
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::DeadlineReached { attempts: 1, .. })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_deadline_with_room_leaves_the_retries_alone() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(503))));
@@ -1604,7 +1782,7 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_call_cut_short_by_its_deadline_does_not_count_towards_the_breaker() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 503));

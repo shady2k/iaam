@@ -83,6 +83,7 @@ pub struct HttpRequest {
     bearer: Option<Secret>,
     soap_action: Option<String>,
     reset_header: Option<&'static str>,
+    idempotent: bool,
 }
 
 impl HttpRequest {
@@ -111,6 +112,9 @@ impl HttpRequest {
             bearer: None,
             soap_action: None,
             reset_header: None,
+            // A GET reads; any other method may act, and acting twice is
+            // not undone by a later success.
+            idempotent: matches!(method, HttpMethod::Get),
         }
     }
 
@@ -142,6 +146,20 @@ impl HttpRequest {
     pub const fn with_reset_header(mut self, name: &'static str) -> Self {
         self.reset_header = Some(name);
         self
+    }
+
+    /// Mark the request as safe to send more than once: the gateway retries
+    /// only such a request. For a POST that only reads, such as a T-Invest
+    /// RPC or a CBR SOAP query; never for one that orders, moves or writes.
+    #[must_use]
+    pub const fn idempotent(mut self) -> Self {
+        self.idempotent = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_idempotent(&self) -> bool {
+        self.idempotent
     }
 
     #[must_use]
@@ -202,6 +220,29 @@ impl HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn post() -> HttpRequest {
+        HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
+            RequestBody::Json("{}".to_owned()),
+        )
+    }
+
+    #[test]
+    fn a_get_is_idempotent_by_default() {
+        assert!(HttpRequest::get(Destination::MoexIss, "/iss/index.json").is_idempotent());
+    }
+
+    #[test]
+    fn a_post_is_not_idempotent_unless_marked() {
+        assert!(!post().is_idempotent());
+    }
+
+    #[test]
+    fn a_post_marked_idempotent_is_idempotent() {
+        assert!(post().idempotent().is_idempotent());
+    }
 
     #[test]
     fn a_request_names_no_reset_header_unless_told() {

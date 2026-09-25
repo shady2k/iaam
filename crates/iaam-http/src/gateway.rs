@@ -218,6 +218,32 @@ impl Transport for HttpClient {
     }
 }
 
+/// The gateway as a caller holds it.
+///
+/// Object-safe, so an adapter stores `Arc<dyn Outbound>` whatever the
+/// gateway's transport is: the production one and a test's scripted one are
+/// one type to it, and no generic climbs through the layers above.
+pub trait Outbound: Send + Sync {
+    /// `Gateway::send`, boxed.
+    fn send<'a>(
+        &'a self,
+        method: &'static str,
+        request: &'a HttpRequest,
+        deadline: Option<Instant>,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>>;
+}
+
+impl<T: Transport> Outbound for Gateway<T> {
+    fn send<'a>(
+        &'a self,
+        method: &'static str,
+        request: &'a HttpRequest,
+        deadline: Option<Instant>,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>> {
+        Box::pin(Self::send(self, method, request, deadline))
+    }
+}
+
 /// Refusal from the gateway.
 ///
 /// Carries statuses, counts and delays only: never a header value and never
@@ -567,8 +593,21 @@ pub struct Gateway<T> {
     lanes: HashMap<&'static str, Mutex<Lane>>,
 }
 
+impl Gateway<HttpClient> {
+    /// The production gateway over the real transport: the one way a process
+    /// gets it, because `HttpClient` cannot be built outside this crate.
+    /// Called once per process, in `serve`, and shared from there.
+    ///
+    /// # Errors
+    /// `GatewayError::InvalidBudgets` when the table in this module is wrong.
+    pub fn production() -> Result<Self, GatewayError> {
+        Self::new(HttpClient::new())
+    }
+}
+
 impl<T: Transport> Gateway<T> {
-    /// The production gateway: documented budgets, system clock, tokio timer.
+    /// A gateway with the documented budgets, system clock and tokio timer
+    /// over `transport`.
     ///
     /// # Errors
     /// `GatewayError::InvalidBudgets` when the table in this module is wrong.
@@ -2124,12 +2163,37 @@ mod tests {
     fn the_production_gateway_can_be_shared_between_tasks() {
         fn shared<T: Send + Sync>(_: &T) {}
         fn spawnable<F: Future + Send>(_: F) {}
-        let gateway = Gateway::new(HttpClient::new()).expect("the documented table is valid");
+        let gateway = Gateway::production().expect("the documented table is valid");
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
         shared(&gateway);
         // Built, never polled: nothing is sent.
         spawnable(gateway.send("history", &request, None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_holds_the_gateway_as_one_object_safe_outbound() {
+        let time = FakeTime::new();
+        let gateway = Arc::new(gateway(&time, Scripted::answering(&time, 200)));
+        let held: Arc<dyn Outbound> = Arc::clone(&gateway) as Arc<dyn Outbound>;
+
+        let response = held
+            .send("OperationsService", &operations(), None)
+            .await
+            .expect("sent");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_outbound_trait_keeps_every_rule_of_the_gateway() {
+        let time = FakeTime::new();
+        let held: Arc<dyn Outbound> = Arc::new(gateway(&time, Scripted::answering(&time, 200)));
+
+        let refused = held.send("InstrumentsService", &operations(), None).await;
+
+        assert!(matches!(refused, Err(GatewayError::UnknownBudget { .. })));
     }
 
     #[test]

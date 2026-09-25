@@ -7,31 +7,32 @@
 //!
 //! # Every outbound call goes through the gateway
 //!
-//! [`Gateway::send`] is the only public way to send a request. Budgets, the
+//! [`Gateway::send`] is the only public way to send a request, and
+//! [`Outbound`] the one type a caller holds it by. Budgets, the
 //! one-request-per-host lane, retries and the circuit breaker live there, and
 //! a caller that reached the transport directly would skip all of them
 //! without a single error: that is how the calls this crate once served
-//! outgrew their limits. So the transport's own `send` is private to this
-//! crate, and outside it this does not compile:
+//! outgrew their limits. So the production transport cannot be built outside
+//! this crate — [`Gateway::production`] is how a process gets it, already
+//! inside its gateway — and outside it neither of these compiles:
 //!
 //! ```compile_fail,E0624
 //! use iaam_http::client::HttpClient;
-//! use iaam_http::{Destination, HttpRequest};
 //!
-//! async fn bypass() {
-//!     let request = HttpRequest::get(Destination::MoexIss, "/iss/index.json");
-//!     let _ = HttpClient::new().send(&request).await;
-//! }
+//! let _ = HttpClient::new();
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use iaam_http::client::HttpClient;
+//!
+//! let _ = HttpClient::default();
 //! ```
 //!
 //! What the compiler cannot close is enforced by guards in
 //! `scripts/check-architecture.sh`, run by `make arch`:
 //!
 //! - no crate but this one declares `reqwest` or builds a `reqwest` client;
-//! - no crate but this one holds a bare `HttpClient` or calls its `send`
-//!   through the public [`gateway::Transport`] trait — an `HttpClient` exists
-//!   outside this crate only as the argument of `Gateway::new`, which keeps it;
-//! - production code builds `Gateway::new` in one place, `serve` in
+//! - production code builds the gateway in one place, `serve` in
 //!   `iaam-bootstrap`: the gateway is one per process and shared, because two
 //!   gateways are two budgets against the same destination.
 
@@ -44,6 +45,6 @@ pub mod response;
 pub mod trust;
 
 pub use destination::Destination;
-pub use gateway::{Gateway, GatewayError};
+pub use gateway::{Gateway, GatewayError, Outbound};
 pub use request::{HttpMethod, HttpRequest, RequestBody, Secret};
 pub use response::{HttpError, HttpResponse};

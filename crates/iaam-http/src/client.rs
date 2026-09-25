@@ -21,19 +21,18 @@ use crate::trust::{ConfiguredClient, client_for};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Outgoing request client.
+///
+/// Built only inside this crate, so outside it an `HttpClient` exists only
+/// inside the gateway `Gateway::production` returns: a caller holding one
+/// could send through the public `Transport` trait past every rule of the
+/// gateway. For the same reason it has no `Default`.
 pub struct HttpClient {
     pool: Mutex<HashMap<Destination, ConfiguredClient>>,
 }
 
-impl Default for HttpClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HttpClient {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pool: Mutex::new(HashMap::new()),
         }

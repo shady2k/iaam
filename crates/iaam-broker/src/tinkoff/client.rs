@@ -1,7 +1,9 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use crate::credentials::BrokerToken;
 use crate::environment::{Environment, Method};
-use iaam_http::client::HttpClient;
-use iaam_http::{Destination, HttpRequest, RequestBody};
+use iaam_http::{Destination, GatewayError, HttpRequest, Outbound, RequestBody};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -12,12 +14,20 @@ use thiserror::Error;
 /// error must not turn a remote refusal into an access leak.
 #[derive(Debug, Error)]
 pub enum TinkoffError {
-    /// Connection was not established or the response body was not read fully.
-    #[error("T-Invest gateway network refusal")]
-    Network,
-    /// The gateway temporarily rate-limited the request.
-    #[error("T-Invest gateway rate-limited the request")]
-    RateLimited,
+    /// T-Invest failed transiently — a 5xx, a 429, a network fault, an open
+    /// breaker, a deadline — and went on failing through the gateway's
+    /// retries. The same call is worth making again after `retry_after`.
+    #[error(
+        "T-Invest is unreachable after {attempts} attempts (last status {status:?}); retry after {retry_after:?}"
+    )]
+    Unreachable {
+        /// The last status T-Invest answered with; `None` when it did not answer.
+        status: Option<u16>,
+        /// Requests actually sent for this call.
+        attempts: u32,
+        /// When trying again is worth it.
+        retry_after: Duration,
+    },
     /// The gateway rejected the presented token.
     #[error("T-Invest token is invalid")]
     InvalidToken,
@@ -46,12 +56,23 @@ pub enum TinkoffError {
     /// The request could not be serialized to JSON before sending.
     #[error("could not serialize request to the T-Invest gateway")]
     RequestSerialization,
-    /// The transport did not deliver the request: network, timeout, or client construction.
+    /// The transport could not be set up — a client or a trust root this
+    /// build could not construct. A fault of this build, not of T-Invest:
+    /// retrying would meet the same fault.
     ///
     /// Contains no token: `HttpError` is designed not to contain one.
     #[error(transparent)]
     Transport(#[from] iaam_http::HttpError),
+    /// The outbound gateway refused the call before sending it: a method key
+    /// without a budget, or a budget table that fails its own checks. A
+    /// fault of this build, not of T-Invest.
+    #[error("the outbound gateway refused the call: {0}")]
+    Gateway(GatewayError),
 }
+
+/// The header T-Invest is believed to name its limit's reset in. Declaring a
+/// header it does not send costs nothing: the retry falls back to backoff.
+const RESET_HEADER: &str = "x-ratelimit-reset";
 
 /// Request an operations page with cursor pagination.
 ///
@@ -115,71 +136,110 @@ impl GetOperationsByCursorRequest {
 }
 
 /// HTTP client for T-Invest REST API methods.
+///
+/// Sends every request through the process's one outbound gateway, which
+/// paces it under the budget of its service and retries transient failures.
 pub struct TinkoffClient {
     environment: Environment,
     token: BrokerToken,
-    http: HttpClient,
+    gateway: Arc<dyn Outbound>,
 }
 
 impl TinkoffClient {
-    /// Create a client with the same pinned trust root as the probe.
-    pub fn new(environment: Environment, token: BrokerToken) -> Result<Self, TinkoffError> {
-        Ok(Self {
+    /// Create a client over the process's gateway.
+    #[must_use]
+    pub fn new(environment: Environment, token: BrokerToken, gateway: Arc<dyn Outbound>) -> Self {
+        Self {
             environment,
             token,
-            http: HttpClient::new(),
-        })
+            gateway,
+        }
     }
 
     /// Return the raw response body from `UsersService/GetAccounts`.
     pub async fn get_accounts(&self) -> Result<String, TinkoffError> {
-        self.post(Method::Accounts, "UsersService/GetAccounts", json!({}))
-            .await
+        self.post(
+            Method::Accounts,
+            "UsersService",
+            "UsersService/GetAccounts",
+            json!({}),
+            None,
+        )
+        .await
     }
 
     /// Return the raw response body from `OperationsService/GetPortfolio`.
-    pub async fn get_portfolio(&self, account_id: &str) -> Result<String, TinkoffError> {
+    ///
+    /// No attempt starts, and no wait for one runs, past `deadline`.
+    pub async fn get_portfolio(
+        &self,
+        account_id: &str,
+        deadline: Option<Instant>,
+    ) -> Result<String, TinkoffError> {
         self.post(
             Method::Portfolio,
+            "OperationsService",
             "OperationsService/GetPortfolio",
             json!({ "accountId": account_id }),
+            deadline,
         )
         .await
     }
 
     /// Return the raw page body from `OperationsService/GetOperationsByCursor`.
+    ///
+    /// No attempt starts, and no wait for one runs, past `deadline`.
     pub async fn get_operations_by_cursor(
         &self,
         request: &GetOperationsByCursorRequest,
+        deadline: Option<Instant>,
     ) -> Result<String, TinkoffError> {
         let body = self
             .post(
                 Method::Operations,
+                "OperationsService",
                 "OperationsService/GetOperationsByCursor",
                 serde_json::to_value(request).map_err(|_| TinkoffError::RequestSerialization)?,
+                deadline,
             )
             .await?;
         validate_cursor_page(&body)?;
         Ok(body)
     }
 
-    async fn post(&self, method: Method, path: &str, body: Value) -> Result<String, TinkoffError> {
+    /// `service` names the budget the call draws on, as T-Invest states its
+    /// limits: per service, not per method.
+    async fn post(
+        &self,
+        method: Method,
+        service: &'static str,
+        path: &str,
+        body: Value,
+        deadline: Option<Instant>,
+    ) -> Result<String, TinkoffError> {
         ensure_method_available(self.environment, method)?;
-        // The environment supplies the base through `Environment`, not
-        // `Destination`: sandbox and production are different addresses for
-        // one destination, and share a trust anchor.
-        let request = HttpRequest::post(
-            destination_for(self.environment),
-            path,
-            RequestBody::Json(
-                serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?,
-            ),
-        )
-        .with_bearer(self.token.expose());
-        let response = self.http.send(&request).await?;
-        let body = String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)?;
-        classify_response_with_token(response.status, &body, self.token.expose())?;
-        Ok(body)
+        let body = serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?;
+        let request = Self::request(self.environment, path, body, self.token.expose());
+        let response = self
+            .gateway
+            .send(service, &request, deadline)
+            .await
+            .map_err(|error| gateway_error(error, self.token.expose()))?;
+        String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)
+    }
+
+    // The environment supplies the base through `Environment`, not
+    // `Destination`: sandbox and production are different addresses for
+    // one destination, and share a trust anchor.
+    //
+    // Marked idempotent because every RPC this client calls only reads: a
+    // POST is sent once unless its caller says a second copy is harmless. A
+    // write added to this client needs a request of its own, left unmarked.
+    fn request(environment: Environment, path: &str, body: String, token: &str) -> HttpRequest {
+        HttpRequest::post(destination_for(environment), path, RequestBody::Json(body))
+            .idempotent()
+            .with_bearer(token)
+            .with_reset_header(RESET_HEADER)
     }
 }
 
@@ -207,26 +267,38 @@ fn ensure_method_available(environment: Environment, method: Method) -> Result<(
     }
 }
 
-fn classify_response(status: u16, body: &str) -> Result<(), TinkoffError> {
-    match status {
-        429 => Err(TinkoffError::RateLimited),
-        401 | 403 => Err(TinkoffError::InvalidToken),
-        200..=299 => Ok(()),
-        _ if body_contains_token_code(body) => Err(TinkoffError::InvalidToken),
-        _ => Err(TinkoffError::UnexpectedStatus {
-            status,
-            body: body.to_owned(),
-        }),
+/// What a gateway refusal means for T-Invest.
+///
+/// A transient failure the gateway gave up on is "unreachable, retry later";
+/// only a permanent refusal is read as T-Invest's own answer.
+fn gateway_error(error: GatewayError, token: &str) -> TinkoffError {
+    if let Some(retry_after) = error.retry_after() {
+        return TinkoffError::Unreachable {
+            status: error.status(),
+            attempts: error.attempts(),
+            retry_after,
+        };
+    }
+    match error {
+        GatewayError::Rejected { status, body, .. } => {
+            classify_rejection(status, &String::from_utf8_lossy(body.as_bytes()), token)
+        }
+        GatewayError::Transport { error, .. } => TinkoffError::Transport(error),
+        other => TinkoffError::Gateway(other),
     }
 }
 
-fn classify_response_with_token(status: u16, body: &str, token: &str) -> Result<(), TinkoffError> {
-    match classify_response(status, body) {
-        Err(TinkoffError::UnexpectedStatus { status, .. }) => Err(TinkoffError::UnexpectedStatus {
+/// A status a retry would only repeat: 401 and 403, or a token code in the
+/// body, name the token; anything else is kept with its body, the token cut
+/// out of it.
+fn classify_rejection(status: u16, body: &str, token: &str) -> TinkoffError {
+    match status {
+        401 | 403 => TinkoffError::InvalidToken,
+        _ if body_contains_token_code(body) => TinkoffError::InvalidToken,
+        _ => TinkoffError::UnexpectedStatus {
             status,
             body: redact_token(body, token),
-        }),
-        result => result,
+        },
     }
 }
 
@@ -273,54 +345,370 @@ fn validate_cursor_page(body: &str) -> Result<(), TinkoffError> {
 }
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+
+    use iaam_http::gateway::{ATTEMPTS, BUDGETS, Clock, FIRST_BACKOFF, Sleeper, Transport};
+    use iaam_http::resilience::{Outcome, RetryPolicy};
+    use iaam_http::{Gateway, HttpError, HttpResponse};
+
     use super::*;
+    use crate::credentials::{Key, open, seal};
+
+    const TOKEN: &str = "secret-token-42";
+
+    /// A clock that moves only when something sleeps on it.
+    struct FakeTime {
+        now: Mutex<Instant>,
+        slept: Mutex<Vec<Duration>>,
+    }
+
+    impl Clock for FakeTime {
+        fn now(&self) -> Instant {
+            *self.now.lock().expect("clock")
+        }
+    }
+
+    impl Sleeper for FakeTime {
+        fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.slept.lock().expect("sleeps").push(delay);
+            *self.now.lock().expect("clock") += delay;
+            Box::pin(async {})
+        }
+    }
+
+    /// A T-Invest that answers from a script and remembers what it was asked.
+    struct FakeTinvest {
+        script: Mutex<VecDeque<Result<HttpResponse, HttpError>>>,
+        paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Transport for FakeTinvest {
+        async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.paths.lock().expect("paths").push(request.url());
+            self.script
+                .lock()
+                .expect("script")
+                .pop_front()
+                .expect("the script ran out: more requests than expected")
+        }
+    }
+
+    fn answer(status: u16, body: &str) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status,
+            body: body.as_bytes().to_vec(),
+            retry_after: None,
+        })
+    }
+
+    fn client(
+        answers: Vec<Result<HttpResponse, HttpError>>,
+    ) -> (TinkoffClient, Arc<Mutex<Vec<String>>>, Arc<FakeTime>) {
+        let time = Arc::new(FakeTime {
+            now: Mutex::new(Instant::now()),
+            slept: Mutex::new(Vec::new()),
+        });
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let gateway = Arc::new(
+            Gateway::with_parts(
+                FakeTinvest {
+                    script: Mutex::new(answers.into()),
+                    paths: Arc::clone(&paths),
+                },
+                BUDGETS,
+                Arc::clone(&time) as Arc<dyn Clock>,
+                Arc::clone(&time) as Arc<dyn Sleeper>,
+            )
+            .expect("the documented table is valid"),
+        );
+        let key = Key::from_bytes([3; 32]);
+        let token = open(&key, &seal(&key, TOKEN)).expect("token opens");
+        let client = TinkoffClient::new(Environment::Prod, token, gateway);
+        (client, paths, time)
+    }
+
+    fn sent(paths: &Mutex<Vec<String>>) -> usize {
+        paths.lock().expect("paths").len()
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_not_retried_and_its_error_carries_no_token() {
+        let (client, gateway, time) =
+            client(vec![answer(401, &format!(r#"{{"message":"{TOKEN}"}}"#))]);
+
+        let error = client.get_accounts().await.expect_err("401 is a refusal");
+
+        assert!(matches!(error, TinkoffError::InvalidToken), "{error:?}");
+        assert_eq!(sent(&gateway), 1, "a rejected token was sent again");
+        assert!(time.slept.lock().expect("sleeps").is_empty());
+        assert!(!error.to_string().contains(TOKEN));
+        assert!(!format!("{error:?}").contains(TOKEN));
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_answer_is_an_invalid_token_too() {
+        let (client, gateway, _) = client(vec![answer(403, "{}")]);
+
+        let error = client.get_accounts().await.expect_err("403 is a refusal");
+
+        assert!(matches!(error, TinkoffError::InvalidToken), "{error:?}");
+        assert_eq!(sent(&gateway), 1);
+    }
+
+    #[tokio::test]
+    async fn a_server_error_is_retried_until_it_passes() {
+        let (client, gateway, _) = client(vec![
+            answer(500, "{}"),
+            answer(500, "{}"),
+            answer(200, r#"{"accounts":[]}"#),
+        ]);
+
+        let body = client
+            .get_accounts()
+            .await
+            .expect("the third attempt passes");
+
+        assert_eq!(body, r#"{"accounts":[]}"#);
+        assert_eq!(sent(&gateway), 3);
+    }
+
+    /// Every T-Invest call this client makes only reads, so each is marked
+    /// safe to send again and a transient failure is retried.
+    #[tokio::test]
+    async fn a_transient_failure_of_the_portfolio_is_retried() {
+        let (client, gateway, _) = client(vec![answer(503, "{}"), answer(200, "{}")]);
+
+        client
+            .get_portfolio("account", None)
+            .await
+            .expect("the second attempt passes");
+
+        assert_eq!(sent(&gateway), 2);
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_of_an_operations_page_is_retried() {
+        let (client, gateway, _) = client(vec![
+            Err(HttpError::Timeout),
+            answer(200, r#"{"hasNext":false,"items":[]}"#),
+        ]);
+
+        client
+            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"), None)
+            .await
+            .expect("the second attempt passes");
+
+        assert_eq!(sent(&gateway), 2);
+    }
 
     #[test]
-    fn classifies_gateway_statuses_and_token_codes() {
+    fn the_request_is_marked_safe_to_send_again() {
+        let request = TinkoffClient::request(
+            Environment::Prod,
+            "UsersService/GetAccounts",
+            "{}".to_owned(),
+            TOKEN,
+        );
+        assert!(request.is_idempotent());
+    }
+
+    /// A transient failure that outlasts the retries is "unreachable, try
+    /// again later", with the time to try again, not a refusal.
+    #[tokio::test]
+    async fn a_server_error_that_outlasts_the_retries_is_unreachable_with_a_time() {
+        let answers = (0..ATTEMPTS).map(|_| answer(503, "{}")).collect();
+        let (client, gateway, _) = client(answers);
+
+        let error = client
+            .get_accounts()
+            .await
+            .expect_err("every attempt failed");
+
+        let expected =
+            RetryPolicy::new(ATTEMPTS, FIRST_BACKOFF).delay(ATTEMPTS, &Outcome::status(503));
+        assert!(
+            matches!(
+                error,
+                TinkoffError::Unreachable {
+                    status: Some(503),
+                    attempts: ATTEMPTS,
+                    retry_after,
+                } if retry_after == expected
+            ),
+            "{error:?}"
+        );
+        assert_eq!(sent(&gateway), ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_network_failure_that_outlasts_the_retries_is_unreachable() {
+        let answers = (0..ATTEMPTS).map(|_| Err(HttpError::Network)).collect();
+        let (client, _, _) = client(answers);
+
+        let error = client
+            .get_accounts()
+            .await
+            .expect_err("every attempt failed");
+
+        assert!(
+            matches!(error, TinkoffError::Unreachable { status: None, .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_that_cannot_be_built_stays_a_transport_error() {
+        let (client, _, _) = client(vec![Err(HttpError::ClientNotBuilt("no".to_owned()))]);
+
+        let error = client.get_accounts().await.expect_err("nothing was sent");
+
+        assert!(matches!(error, TinkoffError::Transport(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn another_client_error_is_an_unexpected_status_with_the_token_hidden() {
+        let (client, _, _) = client(vec![answer(
+            400,
+            &format!(r#"{{"message":"bad field near {TOKEN}"}}"#),
+        )]);
+
+        let error = client
+            .get_portfolio("account", None)
+            .await
+            .expect_err("400");
+
+        assert!(
+            matches!(&error, TinkoffError::UnexpectedStatus { status: 400, body }
+                if body.contains("bad field") && !body.contains(TOKEN)),
+            "{error:?}"
+        );
+    }
+
+    /// Each method draws on the budget T-Invest states for its service.
+    #[tokio::test]
+    async fn each_method_names_its_service_budget() {
+        let answers = (0..51)
+            .map(|_| answer(200, r#"{"hasNext":false,"items":[]}"#))
+            .collect();
+        let (client, _, time) = client(answers);
+
+        for _ in 0..25 {
+            client.get_accounts().await.expect("accounts");
+        }
+        for _ in 0..25 {
+            client
+                .get_portfolio("account", None)
+                .await
+                .expect("portfolio");
+        }
+        assert!(time.slept.lock().expect("sleeps").is_empty());
+        client
+            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"), None)
+            .await
+            .expect("operations");
+        assert!(
+            time.slept.lock().expect("sleeps").is_empty(),
+            "operations waited on the users budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operations_page_is_returned_as_it_came_and_a_truncated_one_refused() {
+        let page = r#"{"hasNext":true,"nextCursor":"next","items":[]}"#;
+        let (client, _, _) = client(vec![
+            answer(200, page),
+            answer(200, r#"{"hasNext":true,"items":[]}"#),
+        ]);
+        let request = GetOperationsByCursorRequest::new("account");
+
+        assert_eq!(
+            client
+                .get_operations_by_cursor(&request, None)
+                .await
+                .expect("page"),
+            page
+        );
         assert!(matches!(
-            classify_response(429, "{}"),
-            Err(TinkoffError::RateLimited)
+            client.get_operations_by_cursor(&request, None).await,
+            Err(TinkoffError::PartialResponse)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_twenty_sixth_accounts_call_in_a_minute_waits() {
+        let answers = (0..26).map(|_| answer(200, "{}")).collect();
+        let (client, _, time) = client(answers);
+
+        for _ in 0..26 {
+            client.get_accounts().await.expect("accounts");
+        }
+
+        assert_eq!(
+            *time.slept.lock().expect("sleeps"),
+            [Duration::from_secs(60)]
+        );
+    }
+
+    #[test]
+    fn the_request_declares_the_reset_header_t_invest_sends() {
+        let request = TinkoffClient::request(
+            Environment::Prod,
+            "UsersService/GetAccounts",
+            "{}".to_owned(),
+            TOKEN,
+        );
+        assert_eq!(request.reset_header(), Some("x-ratelimit-reset"));
+    }
+
+    #[test]
+    fn classifies_rejections_and_token_codes() {
+        assert!(matches!(
+            classify_rejection(401, "{}", TOKEN),
+            TinkoffError::InvalidToken
         ));
         assert!(matches!(
-            classify_response(401, "{}"),
-            Err(TinkoffError::InvalidToken)
+            classify_rejection(403, "{}", TOKEN),
+            TinkoffError::InvalidToken
         ));
         assert!(matches!(
-            classify_response(403, "{}"),
-            Err(TinkoffError::InvalidToken)
+            classify_rejection(400, r#"{"description":"40003"}"#, TOKEN),
+            TinkoffError::InvalidToken
         ));
         assert!(matches!(
-            classify_response(500, r#"{"description":"40003"}"#),
-            Err(TinkoffError::InvalidToken)
+            classify_rejection(400, r#"{"description":"70001"}"#, TOKEN),
+            TinkoffError::InvalidToken
         ));
         assert!(matches!(
-            classify_response(500, r#"{"description":"70001"}"#),
-            Err(TinkoffError::InvalidToken)
+            classify_rejection(400, r#"{"code":70001}"#, TOKEN),
+            TinkoffError::InvalidToken
         ));
-        assert!(classify_response(200, r#"{"code":"40003"}"#).is_ok());
-        assert!(classify_response(200, r#"{"positions":[{"quantity":70001}]}"#).is_ok());
         assert!(matches!(
-            classify_response(500, r#"{"code":70001}"#),
-            Err(TinkoffError::InvalidToken)
+            classify_rejection(400, r#"{"message":"40003"}"#, TOKEN),
+            TinkoffError::InvalidToken
         ));
-        let error = classify_response(500, r#"{"data":{"quantity":70001}}"#)
-            .expect_err("nested value is not a refusal code");
         assert!(matches!(
-            error,
-            TinkoffError::UnexpectedStatus { status: 500, .. }
+            classify_rejection(404, r#"{"data":{"quantity":70001}}"#, TOKEN),
+            TinkoffError::UnexpectedStatus { status: 404, .. }
         ));
     }
 
     #[test]
-    fn preserves_unexpected_status_body_without_treating_success_as_error() {
-        assert!(classify_response(200, r#"{"ok":true}"#).is_ok());
-        let error = classify_response(500, r#"{"message":"gateway failed"}"#)
-            .expect_err("unexpected code must be a refusal");
+    fn preserves_an_unexpected_status_body() {
+        let error = classify_rejection(422, r#"{"message":"gateway failed"}"#, TOKEN);
         assert!(matches!(
             error,
-            TinkoffError::UnexpectedStatus { status: 500, body }
+            TinkoffError::UnexpectedStatus { status: 422, body }
                 if body == r#"{"message":"gateway failed"}"#
         ));
+    }
+
+    #[test]
+    fn an_empty_token_leaves_the_body_as_it_was() {
+        assert_eq!(redact_token("body", ""), "body");
+        assert_eq!(redact_token("a secret b", "secret"), "a <token hidden> b");
     }
 
     #[test]
@@ -363,14 +751,5 @@ mod tests {
         ));
         assert!(validate_cursor_page(r#"{"hasNext":true,"nextCursor":"next"}"#).is_ok());
         assert!(validate_cursor_page(r#"{"hasNext":false,"items":[]}"#).is_ok());
-    }
-
-    #[test]
-    fn error_text_never_contains_the_token() {
-        let token = "secret-token-42";
-        let error =
-            classify_response_with_token(500, &format!(r#"{{"message":"{token}"}}"#), token)
-                .expect_err("response code must be a refusal");
-        assert!(!error.to_string().contains(token));
     }
 }

@@ -254,7 +254,7 @@ impl MarketSyncJob {
             return Ok(None);
         };
         let result = self.run(from, to).await;
-        if result.is_ok() {
+        if spends_the_day(&result) {
             self.state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -298,6 +298,20 @@ impl MarketSyncJob {
         let mut store = self.services.market_store.lock().await;
         sync_market(&mut store, self.services.http.as_ref(), request).await
     }
+}
+
+/// Whether a scheduled run used up the day's attempt.
+///
+/// A source that is down or said no answered the day's attempt as surely as
+/// a partial run does: the gateway already retried it, so trying again at the
+/// scheduler's next minute would only knock on it every minute until
+/// midnight. Tomorrow's run covers the missed day through the correction
+/// window. Any other failure is ours, and the next tick tries again.
+const fn spends_the_day(result: &Result<MarketSyncResult, AppError>) -> bool {
+    matches!(
+        result,
+        Ok(_) | Err(AppError::SourceUnreachable { .. } | AppError::SourceRefused { .. })
+    )
 }
 
 /// Scheduler for market series only. No other job types are added here.
@@ -582,6 +596,22 @@ mod tests {
         );
         let events = vec![bought(instrument, 10), settled];
         assert!(!active_instruments(&events).unwrap().contains(&instrument));
+    }
+
+    #[test]
+    fn only_a_source_failure_spends_the_day_among_failures() {
+        let unreachable = AppError::SourceUnreachable {
+            origin: "cbr".to_owned(),
+            detail: "failed".to_owned(),
+            retry_after: None,
+        };
+        let refused = AppError::SourceRefused {
+            origin: "cbr".to_owned(),
+            detail: "404".to_owned(),
+        };
+        assert!(spends_the_day(&Err(unreachable)));
+        assert!(spends_the_day(&Err(refused)));
+        assert!(!spends_the_day(&Err(AppError::Store("locked".to_owned()))));
     }
 
     #[test]

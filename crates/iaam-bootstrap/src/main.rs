@@ -20,8 +20,7 @@ use iaam_app::ports::{
 };
 use iaam_broker::credentials::Key;
 use iaam_broker::environment::Environment;
-use iaam_http::client::HttpClient;
-use iaam_http::resilience::{RateLimiter as MarketRateLimiter, RetryPolicy};
+use iaam_http::Gateway;
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
@@ -416,13 +415,11 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map(read_broker_key)
         .transpose()?;
     let market_store = SqliteStore::open(&config.database)?;
-    let http = Arc::new(HttpOutbound::new(
-        HttpClient::new(),
-        RetryPolicy::new(4, std::time::Duration::from_millis(100)),
-        Arc::new(MarketRateLimiter::new(std::time::Duration::from_millis(
-            100,
-        ))),
-    ));
+    // The one gateway of the process: its budgets, lanes and breakers are
+    // state, and a second one would be a second allowance against the same
+    // destinations. Every adapter that goes outside is handed this one.
+    let gateway = Arc::new(Gateway::production()?);
+    let http = Arc::new(HttpOutbound::new(gateway.clone()));
 
     // Assembled once, here, because the catalogue belongs to the deployment.
     // Bundled profiles always; the operator's directory only where he named
@@ -453,8 +450,14 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     // The same adapter serves as both fact storage and broker-access
     // storage: both use one database connection, and a second instance
-    // would mean a second writer.
-    let adapter = Arc::new(SqliteAdapter::with_broker_key(store, broker_key));
+    // would mean a second writer. Every broker channel it opens sends through
+    // the process's one gateway, built above, so channels and market sources
+    // draw on the same budgets.
+    let adapter = Arc::new(SqliteAdapter::with_broker_key(
+        store,
+        broker_key,
+        gateway.clone(),
+    ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> = adapter.clone();
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();
@@ -473,6 +476,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         broker_dictionary,
         market_store: Arc::new(tokio::sync::Mutex::new(market_store)),
         profiles,
+        running_syncs: iaam_app::sync::RunningSyncs::default(),
     });
     let limiter = Arc::new(RateLimiter::new(config.rate_limit, config.rate_window));
     let state = ServerState::new(services, limiter);

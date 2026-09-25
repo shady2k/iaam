@@ -82,6 +82,8 @@ pub struct HttpRequest {
     body: Option<RequestBody>,
     bearer: Option<Secret>,
     soap_action: Option<String>,
+    reset_header: Option<&'static str>,
+    idempotent: bool,
 }
 
 impl HttpRequest {
@@ -109,6 +111,10 @@ impl HttpRequest {
             body,
             bearer: None,
             soap_action: None,
+            reset_header: None,
+            // A GET reads; any other method may act, and acting twice is
+            // not undone by a later success.
+            idempotent: matches!(method, HttpMethod::Get),
         }
     }
 
@@ -130,6 +136,30 @@ impl HttpRequest {
     pub fn with_soap_action(mut self, action: &str) -> Self {
         self.soap_action = Some(action.to_owned());
         self
+    }
+
+    /// A response header in which the source names, in seconds, when its
+    /// limit resets (T-Invest's `x-ratelimit-reset`). Read only when the
+    /// response carries no `Retry-After`, and then used the same way: the
+    /// source knows its own window better than our backoff guesses it.
+    #[must_use]
+    pub const fn with_reset_header(mut self, name: &'static str) -> Self {
+        self.reset_header = Some(name);
+        self
+    }
+
+    /// Mark the request as safe to send more than once: the gateway retries
+    /// only such a request. For a POST that only reads, such as a T-Invest
+    /// RPC or a CBR SOAP query; never for one that orders, moves or writes.
+    #[must_use]
+    pub const fn idempotent(mut self) -> Self {
+        self.idempotent = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_idempotent(&self) -> bool {
+        self.idempotent
     }
 
     #[must_use]
@@ -155,6 +185,11 @@ impl HttpRequest {
     #[must_use]
     pub fn soap_action(&self) -> Option<&str> {
         self.soap_action.as_deref()
+    }
+
+    #[must_use]
+    pub const fn reset_header(&self) -> Option<&'static str> {
+        self.reset_header
     }
 
     /// Complete request URL.
@@ -185,6 +220,42 @@ impl HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn post() -> HttpRequest {
+        HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
+            RequestBody::Json("{}".to_owned()),
+        )
+    }
+
+    #[test]
+    fn a_get_is_idempotent_by_default() {
+        assert!(HttpRequest::get(Destination::MoexIss, "/iss/index.json").is_idempotent());
+    }
+
+    #[test]
+    fn a_post_is_not_idempotent_unless_marked() {
+        assert!(!post().is_idempotent());
+    }
+
+    #[test]
+    fn a_post_marked_idempotent_is_idempotent() {
+        assert!(post().idempotent().is_idempotent());
+    }
+
+    #[test]
+    fn a_request_names_no_reset_header_unless_told() {
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+        assert_eq!(request.reset_header(), None);
+    }
+
+    #[test]
+    fn a_declared_reset_header_is_kept_by_name() {
+        let request =
+            HttpRequest::get(Destination::TinkoffProd, "/").with_reset_header("x-ratelimit-reset");
+        assert_eq!(request.reset_header(), Some("x-ratelimit-reset"));
+    }
 
     #[test]
     fn a_url_joins_base_and_path_without_doubling_the_slash() {

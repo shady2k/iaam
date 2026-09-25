@@ -25,7 +25,7 @@ use time::{Duration, OffsetDateTime};
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open};
 use iaam_broker::environment::Environment;
 use iaam_http::client::HttpClient;
-use iaam_http::{Destination, HttpRequest, RequestBody};
+use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::SoleOwner;
 use iaam_store::documents::BrokerCode;
@@ -74,13 +74,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
-    let client = HttpClient::new();
+    // A separate process, so a gateway of its own.
+    let gateway = Gateway::production()?;
 
     // Request only open accounts: a closed account is unsuitable for the
     // following calls and would make the sample set non-deterministic.
     let accounts = fetch_raw(
-        &client,
+        &gateway,
         Destination::TinkoffSandbox,
+        "UsersService",
         ACCOUNTS_METHOD,
         token.expose(),
         json!({"status": "ACCOUNT_STATUS_OPEN"}),
@@ -90,8 +92,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let account_id = account_id(&accounts)?;
 
     let portfolio = fetch_raw(
-        &client,
+        &gateway,
         Destination::TinkoffSandbox,
+        "OperationsService",
         PORTFOLIO_METHOD,
         token.expose(),
         json!({"accountId": account_id.as_str()}),
@@ -100,8 +103,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     write_fixture(&fixtures_dir, "tinkoff-portfolio.json", &portfolio)?;
 
     let operations = fetch_raw(
-        &client,
+        &gateway,
         Destination::TinkoffSandbox,
+        "OperationsService",
         OPERATIONS_METHOD,
         token.expose(),
         json!({
@@ -164,25 +168,33 @@ fn interval(days: u64) -> Result<(String, String), io::Error> {
 }
 
 async fn fetch_raw(
-    client: &HttpClient,
+    gateway: &Gateway<HttpClient>,
     destination: Destination,
+    service: &'static str,
     method: &str,
     token: &str,
     body: Value,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+    // Every method recorded here only reads, so a second copy is harmless.
     let request = HttpRequest::post(
         destination,
         method,
         RequestBody::Json(serde_json::to_string(&body)?),
     )
-    .with_bearer(token);
-    let response = client.send(&request).await?;
-    if !(200..=299).contains(&response.status) {
+    .idempotent()
+    .with_bearer(token)
+    .with_reset_header("x-ratelimit-reset");
+    match gateway.send(service, &request, None).await {
+        Ok(response) => Ok(response.body),
         // The refusal body is written neither to a file nor to the error: the
         // gateway is not required to separate diagnostics from owner data.
-        return Err(io::Error::other(format!("{method} returned HTTP {}", response.status)).into());
+        Err(GatewayError::Rejected { status, body, .. }) => Err(io::Error::other(format!(
+            "{method} returned HTTP {status}, {} bytes",
+            body.as_bytes().len()
+        ))
+        .into()),
+        Err(error) => Err(error.into()),
     }
-    Ok(response.body)
 }
 
 fn account_id(body: &[u8]) -> Result<String, Box<dyn Error>> {

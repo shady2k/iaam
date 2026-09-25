@@ -59,6 +59,58 @@ Three rules follow, and they hold for every step below.
   first owner token exactly once. There is no one-time claim code and no
   `POST /v1/claim`; both were retired with ADR-0003.
 
+### 1.1 One server process per instance
+
+An instance runs **exactly one `iaam serve`** against its database. Not two
+behind a load balancer, not a second one started beside the first "to test",
+not a blue-green overlap where the old one keeps serving while the new one
+starts.
+
+Everything that keeps this instance polite to the brokers, MOEX and the CBR
+lives in the memory of that one process, in its outbound gateway
+(`crates/iaam-http/src/gateway.rs`):
+
+- the **budget** per destination and method, half of the limit the source
+  documents where it documents one;
+- the **lane** that allows one request in flight per host;
+- a **named wait** — a reset time the source itself asked for in
+  `Retry-After` or its reset header — which holds back every later call to
+  that host until it ends;
+- the **circuit breaker** per host, which stops calling a source that keeps
+  failing.
+
+The claim that lets only one broker sync run per account at a time lives there
+too (`crates/iaam-app/src/scenarios/sync.rs`, `RunningSyncs`).
+
+None of this is shared between processes, and none of it survives a restart. A
+second process starts with a full budget of its own, a lane of its own, no
+knowledge of a wait the broker named to the first, and no knowledge of the sync
+the first is running. Two processes are two allowances against the same broker
+token: together they spend the whole documented limit, which leaves no margin,
+and a third exceeds it. They can also sync one account twice at the same time.
+
+Only `serve` talks to an outside source. The administrative commands in the
+table above (`claim`, `token issue`, `broker key …`, `broker access …`,
+`bundle export`, `bundle import`) open the database and nothing else: `serve`
+is the one place in `crates/iaam-bootstrap/src/main.rs` that builds the
+gateway, and `scripts/check-architecture.sh` (guard 11b) refuses a second one.
+At run time `Gateway::production()` refuses every call after the first in one
+process, with an error naming this section.
+So running an administrative command beside the running service is safe, and
+is how §6 and §7 are meant to be done.
+
+```console
+$ pgrep -c -x iaam
+1
+```
+
+More than `1` while no administrative command is running means a second server.
+Stop it before the next sync. A restart does not break the rule, but it drops
+every budget, named wait and open breaker the old process had learned, so do
+not restart the service to "clear" a `source_unavailable`: it removes the one
+thing that kept the next call from reaching a source that asked to be left
+alone.
+
 ---
 
 ## 2. Configuration
@@ -908,6 +960,8 @@ supplies what is missing and with which command.
 | `{"code":"unauthorized", …}` (401) | header missing, or the token is unknown or revoked | §7.1 for an agent token; §7.3 for an owner token |
 | `{"code":"not_configured","message":"broker access encryption is not configured: …"}` (503) | the server was started without `IAAM_BROKER_KEY_FILE` | restart it with the key mounted: §6.2 |
 | `{"code":"not_configured","message":"broker access is not configured"}` (503) | same code, different fact: no active access for that broker and environment | the owner, at a console: `iaam broker access add` (§6.3). A restart changes nothing |
+| `{"code":"source_unavailable", …}` (503, with `Retry-After` when the wait is known) | an outside source — the broker on `POST /v1/brokers/{broker}/sync`, MOEX or the CBR on `POST /v1/market/sync` — could not be reached for now. One of: it kept failing transiently (429, 500, 502, 503, 504, network, timeout) through the gateway's retries; its breaker is open after five calls in a row failed that way, and the call was not sent; it named a wait (`Retry-After` or its reset header) longer than the gateway holds a call (15 minutes), or longer than the call's own deadline allowed; or a broker sync reached its 15-minute deadline. The deadline bounds the sync's contact with the broker: an attempt still in flight at that moment, and a wait for the host's lane, for a budget, for a named reset or for a backoff, all end there. It does not bound the local work after both answers are in: writing them to the journal runs to its end. Nothing was written: a broker sync fetches the operations and the portfolio before its first write, and a market sync records no observation (its run is closed as partial) | wait what `Retry-After` says, then sync again. A repeat inside a wait the source named does not reach it: the gateway holds it until the wait ends, or refuses it at once with this same code when the wait outlasts its deadline or 15 minutes. A repeat inside an open breaker's cool-down (up to 5 minutes) is refused the same way without being sent. Otherwise `Retry-After` is the gateway's own backoff, and a repeat before it **is** sent, paced only by the budget. A restart forgets every wait and breaker (§1.1) |
+| `{"code":"source_refused", …}` (502) | the source answered with a status the gateway does not retry — any failure other than 429, 500, 502, 503 and 504 — so it was sent once: for a broker, e.g. 401 or 403 for a revoked or wrong token; for a market source, e.g. 404 for a security or path it does not know. No fact and no observation was written | broker: check the access, `iaam broker access` (§6.3); market source: check what the request names. Retrying unchanged gets the same answer |
 | `{"code":"invalid_request","message":"an owner token cannot be issued via the API: …"}` (422) | `scope: owner` requested over HTTP | by design; issue it at the console (§7.3) |
 | `Connection refused` from curl | nothing is listening at that address | container: `IAAM_LISTEN` left at the loopback default while publishing a port (§3.6). Host: `systemctl is-active iaam` |
 

@@ -23,8 +23,8 @@ use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    CustodyUpsert, InstrumentDirectory, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Store,
-    TokenAdmin, UnavailableOutboundHttp,
+    CustodyUpsert, InstrumentDirectory, OutboundHttp, OutboundResponse, ParsedOperations,
+    PortfolioAsOf, PortfolioSnapshot, Store, TokenAdmin, UnavailableOutboundHttp,
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
@@ -51,6 +51,7 @@ use iaam_core::returns::{
 };
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
+use iaam_http::Gateway;
 use iaam_server::action_catalog::{ActionCatalog, ActionCatalogError};
 use iaam_server::auth::hash_token;
 use iaam_server::dto::{ReturnsReportDto, VerdictDto};
@@ -91,6 +92,7 @@ impl BrokerChannel for EmptyChannel {
         _account: AccountId,
         _from: Date,
         _to: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
             accepted: Vec::new(),
@@ -102,6 +104,7 @@ impl BrokerChannel for EmptyChannel {
         &self,
         _account: AccountId,
         _at: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -130,6 +133,7 @@ impl BrokerChannel for PopulatedChannel {
         account: AccountId,
         _from: Date,
         _to: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
             accepted: vec![SubmittedOperation {
@@ -161,6 +165,7 @@ impl BrokerChannel for PopulatedChannel {
         &self,
         _account: AccountId,
         _at: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -402,13 +407,79 @@ async fn harness_with_factory(
 const GENEROUS_RATE_LIMIT: u32 = 1_000;
 
 async fn harness_with_factory_and_provisioning(
-    mut store: SqliteStore,
+    store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
     provisioned: bool,
     with_account: bool,
     with_broker_access: bool,
     rate_limit: u32,
 ) -> Harness {
+    harness_with_everything(
+        store,
+        HarnessSetup {
+            channel_factory,
+            provisioned,
+            with_account,
+            with_broker_access,
+            rate_limit,
+            http: Arc::new(UnavailableOutboundHttp),
+        },
+    )
+    .await
+}
+
+/// The default harness, but reaching market sources through `http`.
+async fn harness_with_http(http: Arc<dyn OutboundHttp>) -> Harness {
+    harness_with_everything(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        HarnessSetup {
+            channel_factory: None,
+            provisioned: true,
+            with_account: true,
+            with_broker_access: false,
+            rate_limit: GENEROUS_RATE_LIMIT,
+            http,
+        },
+    )
+    .await
+}
+
+/// The transport under every harness's gateway: no test goes outside, and
+/// one that tries is told the network refused, as an offline host would.
+///
+/// Not `Gateway::production`: `cargo test` runs this file's tests in one
+/// process, and a process gets one production gateway.
+struct NoNetwork;
+
+impl iaam_http::gateway::Transport for NoNetwork {
+    async fn send(
+        &self,
+        _request: &iaam_http::HttpRequest,
+    ) -> Result<iaam_http::HttpResponse, iaam_http::HttpError> {
+        Err(iaam_http::HttpError::Network)
+    }
+}
+
+/// Every knob of the harness in one place; the narrower builders above name
+/// the ones a test turns.
+struct HarnessSetup {
+    channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
+    provisioned: bool,
+    with_account: bool,
+    with_broker_access: bool,
+    rate_limit: u32,
+    http: Arc<dyn OutboundHttp>,
+}
+
+async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) -> Harness {
+    let HarnessSetup {
+        channel_factory,
+        provisioned,
+        with_account,
+        with_broker_access,
+        rate_limit,
+        http,
+    } = setup;
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
 
@@ -489,6 +560,7 @@ async fn harness_with_factory_and_provisioning(
     let adapter = Arc::new(SqliteAdapter::with_broker_key(
         store,
         Some(Key::from_bytes([7; 32])),
+        Arc::new(Gateway::new(NoNetwork).expect("the budget table is valid")),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> =
@@ -508,10 +580,11 @@ async fn harness_with_factory_and_provisioning(
         channels,
         rules,
         categories: adapter.clone(),
-        http: Arc::new(UnavailableOutboundHttp),
+        http,
         broker_dictionary,
         market_store: market_store.clone(),
         profiles: Arc::new(iaam_app::ingest::profile::ProfileCatalogue::bundled()),
+        running_syncs: iaam_app::sync::RunningSyncs::default(),
     });
     let state = ServerState::new(
         services,
@@ -1942,6 +2015,18 @@ async fn the_openapi_document_declares_bearer_security() {
         .expect("security scheme description");
     assert!(description.contains("iaam claim --label <label>"));
     assert!(description.contains("no API route issues one"));
+}
+
+#[tokio::test]
+async fn the_broker_sync_openapi_declares_the_running_sync_conflict() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let conflict = &spec["paths"]["/v1/brokers/{broker}/sync"]["post"]["responses"]["409"];
+    let description = conflict["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the sync route declares no 409: {conflict}"));
+    assert!(description.contains("already running"), "{description}");
 }
 
 #[tokio::test]
@@ -11982,6 +12067,7 @@ impl BrokerChannel for TwinRowsChannel {
         account: AccountId,
         _from: Date,
         _to: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         let row = |operation_id: &str| SubmittedOperation {
             account,
@@ -12014,6 +12100,7 @@ impl BrokerChannel for TwinRowsChannel {
         &self,
         _account: AccountId,
         _at: Date,
+        _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -34996,4 +35083,229 @@ async fn each_list_wrapper_names_its_row_field_in_the_schema() {
             "{schema_name} schema-level description is empty"
         );
     }
+}
+
+/// A broker channel whose operations request always fails with `error`.
+struct FailingChannel {
+    error: BrokerError,
+}
+
+#[async_trait::async_trait]
+impl BrokerChannel for FailingChannel {
+    async fn fetch_operations(
+        &self,
+        _account: AccountId,
+        _from: Date,
+        _to: Date,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<ParsedOperations, BrokerError> {
+        Err(self.error.clone())
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _at: Date,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Err(self.error.clone())
+    }
+
+    fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
+        iaam_core::reconciliation::evidence::SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("contract-test".to_owned()),
+            document: None,
+        }
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Source
+    }
+}
+
+/// Sync one month through a broker that fails with `error`.
+async fn sync_through_failing_broker(error: BrokerError) -> (StatusCode, HeaderMap, Value) {
+    let channel: Arc<dyn BrokerChannel> = Arc::new(FailingChannel { error });
+    let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory { channel });
+    let harness = harness_with_factory(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        Some(factory),
+    )
+    .await;
+    let body = json!({
+        "account": harness.account.inner(),
+        "from": "2025-01-01",
+        "to": "2025-01-31",
+    });
+    let (status, headers, bytes) = call_raw(
+        &harness.router,
+        post("/v1/brokers/tinkoff/sync", &harness.owner_token, &body),
+    )
+    .await;
+    let response = serde_json::from_slice(&bytes).expect("a JSON error body");
+    (status, headers, response)
+}
+
+#[tokio::test]
+async fn a_broker_that_stays_unreachable_answers_503_with_when_to_retry() {
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::Unreachable {
+        broker: "tinkoff".to_owned(),
+        detail: "T-Invest is unreachable after 5 attempts".to_owned(),
+        // A fraction past a whole second waits the whole next one.
+        retry_after: Some(Duration::from_millis(2_001)),
+    })
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "source_unavailable");
+    assert_eq!(
+        headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("3")
+    );
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.contains("retry after 3 seconds"), "{message}");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+}
+
+#[tokio::test]
+async fn an_unreachable_broker_without_a_known_wait_sends_no_retry_after() {
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::Unreachable {
+        broker: "tinkoff".to_owned(),
+        detail: "connection reset".to_owned(),
+        retry_after: None,
+    })
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "source_unavailable");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+}
+
+#[tokio::test]
+async fn a_broker_that_refuses_answers_502_naming_the_access() {
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::Refused {
+        broker: "tinkoff".to_owned(),
+        detail: "T-Invest token is invalid".to_owned(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+    assert_eq!(response["code"], "source_refused");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.contains("check the broker access"), "{message}");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+}
+
+/// A market source that fails every request with `error`.
+struct FailingMarket {
+    error: AppError,
+}
+
+#[async_trait::async_trait]
+impl OutboundHttp for FailingMarket {
+    async fn send(&self, _request: iaam_http::HttpRequest) -> Result<OutboundResponse, AppError> {
+        Err(match &self.error {
+            AppError::SourceUnreachable {
+                origin,
+                detail,
+                retry_after,
+            } => AppError::SourceUnreachable {
+                origin: origin.clone(),
+                detail: detail.clone(),
+                retry_after: *retry_after,
+            },
+            AppError::SourceRefused { origin, detail } => AppError::SourceRefused {
+                origin: origin.clone(),
+                detail: detail.clone(),
+            },
+            other => panic!("a market source fails as unreachable or refusing, not {other:?}"),
+        })
+    }
+}
+
+/// Sync the CBR key rate through a market source that fails with `error`.
+async fn market_sync_through_failing_source(error: AppError) -> (StatusCode, HeaderMap, Value) {
+    let harness = harness_with_http(Arc::new(FailingMarket { error })).await;
+    let body = json!({
+        "source": { "source": "cbr_key_rate" },
+        "from": "2026-02-01",
+        "to": "2026-02-28"
+    });
+    let (status, headers, bytes) = call_raw(
+        &harness.router,
+        post("/v1/market/sync", &harness.owner_token, &body),
+    )
+    .await;
+    let response = serde_json::from_slice(&bytes).expect("a JSON error body");
+    (status, headers, response)
+}
+
+#[tokio::test]
+async fn an_unreachable_market_source_answers_503_with_when_to_retry() {
+    let (status, headers, response) =
+        market_sync_through_failing_source(AppError::SourceUnreachable {
+            origin: "cbr".to_owned(),
+            detail: "failed 5 attempts (last status 503)".to_owned(),
+            retry_after: Some(Duration::from_secs(30)),
+        })
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "source_unavailable");
+    assert_eq!(
+        headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.starts_with("cbr is unavailable"), "{message}");
+}
+
+#[tokio::test]
+async fn a_market_source_that_refuses_answers_502() {
+    let (status, headers, response) = market_sync_through_failing_source(AppError::SourceRefused {
+        origin: "moex-iss".to_owned(),
+        detail: "refused the request with status 404".to_owned(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+    assert_eq!(response["code"], "source_refused");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+    let message = response["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("moex-iss rejected the request"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn an_unparsable_broker_answer_is_still_500() {
+    let (status, _headers, response) = sync_through_failing_broker(BrokerError::Unparsable {
+        broker: "tinkoff".to_owned(),
+        detail: "not JSON".to_owned(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
+    assert_eq!(response["code"], "store_unavailable");
+}
+
+#[tokio::test]
+async fn the_broker_sync_openapi_declares_an_unreachable_and_a_refusing_broker() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let responses = &spec["paths"]["/v1/brokers/{broker}/sync"]["post"]["responses"];
+    let unavailable = responses["503"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the sync route declares no 503: {responses}"));
+    assert!(unavailable.contains("Retry-After"), "{unavailable}");
+    assert!(
+        responses["503"]["headers"]["Retry-After"].is_object(),
+        "{responses}"
+    );
+    let refused = responses["502"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the sync route declares no 502: {responses}"));
+    assert!(refused.contains("refused"), "{refused}");
 }

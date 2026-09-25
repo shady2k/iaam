@@ -38,7 +38,7 @@ zeroize = { version = "1", features = ["alloc"] }
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "test-util"] }
 # `test-support` unlocks `SqliteStore::connection()`/`connection_mut()`
 # (iaam-store spec §D6): this crate's own unit tests use it to set up
 # fixtures and probe the database directly.

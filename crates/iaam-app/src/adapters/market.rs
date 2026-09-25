@@ -1,102 +1,90 @@
 //! HTTP adapter for market sources.
 //!
-//! This contains all outgoing request policy: rate limiting,
-//! retries for transient failures and body hashing. The use case receives an already
-//! validated response through the port and knows nothing about `reqwest` or sleeps.
+//! Sends through the process's one gateway, which owns every outgoing
+//! request policy — pacing, retries of transient failures, the breaker. What
+//! stays here is hashing the body of a success. The use case receives an
+//! already validated response through the port and knows nothing about
+//! `reqwest` or sleeps.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
-use iaam_http::client::HttpClient;
-use iaam_http::resilience::{Outcome, RateLimiter, Retry, RetryPolicy};
-use iaam_http::{HttpError, HttpRequest};
+use iaam_http::{Destination, GatewayError, HttpRequest, Outbound};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::ports::{OutboundHttp, OutboundResponse};
 
-/// Market transport implementation using the shared HTTP client.
+/// The budget key this port's requests are sent under. The destinations
+/// behind the port (MOEX, the CBR, the published contract) keep one budget
+/// for every method, so the key names the caller rather than a method.
+const METHOD: &str = "OutboundHttp";
+
+/// Outbound transport over the shared gateway.
 pub struct HttpOutbound {
-    client: HttpClient,
-    retry: RetryPolicy,
-    limiter: Arc<RateLimiter>,
+    gateway: Arc<dyn Outbound>,
 }
 
 impl HttpOutbound {
     #[must_use]
-    pub fn new(client: HttpClient, retry: RetryPolicy, limiter: Arc<RateLimiter>) -> Self {
-        Self {
-            client,
-            retry,
-            limiter,
-        }
+    pub fn new(gateway: Arc<dyn Outbound>) -> Self {
+        Self { gateway }
     }
 }
 
 #[async_trait]
 impl OutboundHttp for HttpOutbound {
     async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError> {
-        let mut attempt = 1;
-        loop {
-            let wait = self.limiter.delay_before_next(Instant::now());
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-            }
+        let origin = origin(request.destination());
+        let response = self
+            .gateway
+            .send(METHOD, &request, None)
+            .await
+            .map_err(|error| source_error(origin, &error))?;
+        Ok(OutboundResponse {
+            status: response.status,
+            raw_hash: hash(&response.body),
+            body: response.body,
+        })
+    }
+}
 
-            match self.client.send(&request).await {
-                Ok(response) if (200..300).contains(&response.status) => {
-                    return Ok(OutboundResponse {
-                        status: response.status,
-                        raw_hash: hash(&response.body),
-                        body: response.body,
-                    });
-                }
-                Ok(response) => {
-                    // The source's own `Retry-After`, where it named one:
-                    // waiting what it said beats waiting our doubling guess,
-                    // and this is the only place the header can still reach the
-                    // decision, which is a pure function over the outcome.
-                    let outcome = match response.retry_after {
-                        Some(after) => Outcome::status_with_retry_after(response.status, after),
-                        None => Outcome::status(response.status),
-                    };
-                    if let Retry::After(delay) = self.retry.decide(attempt, &outcome) {
-                        tokio::time::sleep(delay).await;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    return Err(AppError::Store(format!(
-                        "market source returned HTTP {}",
-                        response.status
-                    )));
-                }
-                Err(error) => {
-                    let retry = match &error {
-                        HttpError::Network => self
-                            .retry
-                            .decide(attempt, &Outcome::Transport(HttpError::Network)),
-                        HttpError::Timeout => self
-                            .retry
-                            .decide(attempt, &Outcome::Transport(HttpError::Timeout)),
-                        HttpError::ClientNotBuilt(message) => self.retry.decide(
-                            attempt,
-                            &Outcome::Transport(HttpError::ClientNotBuilt(message.clone())),
-                        ),
-                        HttpError::TrustAnchorNotParsed(message) => self.retry.decide(
-                            attempt,
-                            &Outcome::Transport(HttpError::TrustAnchorNotParsed(message.clone())),
-                        ),
-                    };
-                    if let Retry::After(delay) = retry {
-                        tokio::time::sleep(delay).await;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                    return Err(AppError::Store(format!("market transport: {error}")));
-                }
-            }
-        }
+/// Tells a source that is down from one that said no from our own fault, so
+/// the caller learns whether to wait, to fix the request, or to look at us.
+/// The gateway's refusal carries statuses, counts and the delay worth waiting,
+/// never a header or body, so its text is safe to pass on.
+///
+/// Transience is read from `retry_after` rather than from the variants, so a
+/// transient refusal the gateway adds later is "retry later" here too.
+fn source_error(origin: &str, error: &GatewayError) -> AppError {
+    if let Some(retry_after) = error.retry_after() {
+        return AppError::SourceUnreachable {
+            origin: origin.to_owned(),
+            detail: error.to_string(),
+            retry_after: Some(retry_after),
+        };
+    }
+    match error {
+        GatewayError::Rejected { .. } => AppError::SourceRefused {
+            origin: origin.to_owned(),
+            detail: error.to_string(),
+        },
+        // A missing budget, an invalid table, a transport that could not be
+        // built: none of them is the source's answer.
+        _ => AppError::Store(format!("market source {origin}: {error}")),
+    }
+}
+
+/// The source a destination belongs to, spelled as the market store's
+/// `source_id` spells it, so a refusal and the series it stopped name the
+/// same thing.
+const fn origin(destination: Destination) -> &'static str {
+    match destination {
+        Destination::MoexIss => "moex-iss",
+        Destination::CbrScripts | Destination::CbrDailyInfo => "cbr",
+        Destination::TinvestContract => "tinvest-contract",
+        Destination::TinkoffProd | Destination::TinkoffSandbox => "tinkoff",
+        Destination::FinamApi => "finam",
     }
 }
 

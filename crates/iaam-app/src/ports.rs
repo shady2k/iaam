@@ -2084,8 +2084,17 @@ pub enum BrokerError {
     ScopeNotReadOnly { broker: String },
     #[error("broker {broker} rejected the request: {detail}")]
     Refused { broker: String, detail: String },
+    /// The broker failed transiently and went on failing: worth asking again,
+    /// after `retry_after` when the gateway knows how long that is.
+    ///
+    /// Typed rather than left in `detail`, because the caller that has to wait
+    /// is a machine reading a header, not a person reading a sentence.
     #[error("broker {broker} is unavailable: {detail}")]
-    Unreachable { broker: String, detail: String },
+    Unreachable {
+        broker: String,
+        detail: String,
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("response from broker {broker} could not be parsed: {detail}")]
     Unparsable { broker: String, detail: String },
     #[error("the {broker} adapter reached a state it excludes: {detail}")]
@@ -2158,21 +2167,27 @@ pub struct PortfolioSnapshot {
 #[async_trait]
 pub trait BrokerChannel: Send + Sync {
     /// Account operations for an interval: accepted and sent to quarantine.
+    ///
+    /// `deadline` is the whole sync's: no request starts, and no wait for
+    /// one runs, past it. A channel that reaches it answers `Unreachable`.
     async fn fetch_operations(
         &self,
         account: AccountId,
         from: Date,
         to: Date,
+        deadline: Option<std::time::Instant>,
     ) -> Result<ParsedOperations, BrokerError>;
 
     /// Portfolio claims for the requested account and their date semantics.
     ///
     /// Returns the source's assertions, not a calculation: the values calculated
-    /// from the journal are subsequently reconciled against them.
+    /// from the journal are subsequently reconciled against them. `deadline`
+    /// is the whole sync's, as for `fetch_operations`.
     async fn fetch_portfolio(
         &self,
         account: AccountId,
         at: Date,
+        deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError>;
 
     /// Exactly how the data was obtained. The parser version and absence

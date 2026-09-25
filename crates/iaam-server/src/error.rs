@@ -227,7 +227,8 @@ pub struct ApiFailure {
     body: ApiFailureBody,
     challenge: &'static str,
     /// Whole seconds after which the same request would be worth sending again,
-    /// for the one refusal that time alone lifts.
+    /// for the refusals that time alone lifts: our own rate limit, and a broker
+    /// that stayed unreachable for a wait the gateway knows.
     ///
     /// Kept beside the body rather than written into it, for the reason
     /// `challenge` is: it belongs to the response, not to the explanation, and
@@ -295,20 +296,11 @@ impl ApiFailure {
         )
     }
 
-    /// Too many calls with this token, with what is left of the window.
-    ///
-    /// The wait is rounded **up** to a whole second and never down to none:
-    /// `Retry-After` carries seconds, and the fraction of a second at the end of
-    /// a window would round to «now» — which is the immediate repeat the
-    /// refusal exists to stop, published in the very header meant to prevent
-    /// it. A caller waiting one second too long loses a second; one waiting a
-    /// fraction too little is refused again for its trouble.
+    /// Too many calls with this token, with what is left of the window, rounded
+    /// as [`retry_after_seconds`] says.
     #[must_use]
     pub fn too_many_requests(retry_after: Duration) -> Self {
-        let seconds = retry_after
-            .as_secs()
-            .saturating_add(u64::from(retry_after.subsec_nanos() > 0))
-            .max(1);
+        let seconds = retry_after_seconds(retry_after);
         let mut failure = Self::new(
             StatusCode::TOO_MANY_REQUESTS,
             ApiError::simple(
@@ -338,6 +330,20 @@ impl ApiFailure {
             }
         }
     }
+}
+
+/// A wait as `Retry-After` carries it: whole seconds, rounded **up** and never
+/// down to none.
+///
+/// The fraction of a second at the end of a wait would otherwise round to
+/// «now» — which is the immediate repeat the refusal exists to stop, published
+/// in the very header meant to prevent it. A caller waiting one second too long
+/// loses a second; one waiting a fraction too little is refused again for its
+/// trouble.
+fn retry_after_seconds(wait: Duration) -> u64 {
+    wait.as_secs()
+        .saturating_add(u64::from(wait.subsec_nanos() > 0))
+        .max(1)
 }
 
 impl IntoResponse for ApiFailure {
@@ -478,6 +484,47 @@ impl ApiFailure {
                     ApiError::simple("not_configured", message),
                 )
             }
+            // The source is down, not our store: 503 says the same call is worth
+            // making again, and `Retry-After` says when, where the gateway knew.
+            // A wait it did not know is left out rather than guessed.
+            AppError::SourceUnreachable {
+                ref origin,
+                ref detail,
+                retry_after,
+            } => {
+                let seconds = retry_after.map(retry_after_seconds);
+                let advice = match seconds {
+                    Some(seconds) => {
+                        format!("retry after {seconds} seconds, as Retry-After says")
+                    }
+                    None => "retry later".to_owned(),
+                };
+                let mut failure = Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ApiError::simple(
+                        error.code(),
+                        format!("{origin} is unavailable: {detail}; {advice}"),
+                    ),
+                );
+                failure.retry_after = seconds;
+                failure
+            }
+            // The source answered and said no: repeating the call gets the same
+            // answer, so 502 says to fix what the detail names instead of when
+            // to come back.
+            AppError::SourceRefused {
+                ref origin,
+                ref detail,
+            } => Self::new(
+                StatusCode::BAD_GATEWAY,
+                ApiError::simple(
+                    error.code(),
+                    format!(
+                        "{origin} rejected the request: {detail}; calling again unchanged \
+                         gets the same answer"
+                    ),
+                ),
+            ),
             AppError::Store(_)
             | AppError::Projection(_)
             // Money-flow arithmetic overflow makes the journal slice unusable:
@@ -515,5 +562,26 @@ impl ApiFailure {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_whole_second_wait_is_published_as_it_is() {
+        assert_eq!(retry_after_seconds(Duration::from_secs(4)), 4);
+    }
+
+    #[test]
+    fn a_fraction_past_a_second_waits_the_whole_next_one() {
+        assert_eq!(retry_after_seconds(Duration::from_millis(4_001)), 5);
+    }
+
+    #[test]
+    fn a_wait_under_a_second_is_never_published_as_none() {
+        assert_eq!(retry_after_seconds(Duration::ZERO), 1);
+        assert_eq!(retry_after_seconds(Duration::from_millis(300)), 1);
     }
 }

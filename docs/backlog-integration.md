@@ -87,8 +87,15 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Static checks:** `make fmt lint arch privacy skill-doc`.
 - **Related tests:** `nix develop -c cargo nextest run -p <crate>` for each crate
   the change touches and each crate that depends on it.
-- **Full stage checks:** `make check` (inside `nix develop`); CI runs the same
-  steps on every push to main, about ten to twelve minutes.
+- **Full stage checks:** `make check` and `make diff-lint BASE=origin/main`
+  (inside `nix develop`). `make check` does NOT include the diff lint, which CI
+  runs: it refuses new `allow(...)`, `expect(...)`, `#[ignore]` and `todo!` in
+  lines the branch adds, and any change to a quality-policy file (scripts/,
+  .github/workflows, deny.toml, clippy.toml, flake.*, rustfmt.toml, root
+  Cargo.toml, tests/fixtures) unless the PR is labelled `policy-change`, the
+  change is justified in its task, and the owner has set the repository
+  variable `POLICY_CHANGE_APPROVED=1`. It reads committed history, so run it
+  after committing. CI takes about ten to twelve minutes.
 - **Mutation checks:** `make mutants-diff BASE=<stage base>`, within the config's
   budget; over budget or with a meaningful survivor, escalate to the owner.
 - **Reviewer:** Codex (another model), through its MCP server or a herdr worker;

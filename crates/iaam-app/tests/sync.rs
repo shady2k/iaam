@@ -1,16 +1,25 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use iaam_app::AppServices;
 use iaam_app::adapters::sqlite::SqliteAdapter;
+use iaam_app::adapters::tinkoff::TinkoffChannel;
 use iaam_app::error::AppError;
 use iaam_app::ports::{
     BrokerChannel, BrokerError, Clock, CustodyUpsert, ParsedOperations, PortfolioAsOf,
     PortfolioSnapshot, Principal, Scope,
 };
 use iaam_app::scenarios::ingest::append_checked;
-use iaam_app::sync::{AssertionsWithheld, sync_broker};
+use iaam_app::sync::{AssertionsWithheld, SYNC_DEADLINE, sync_broker};
+use iaam_broker::credentials::{Key, open, seal};
+use iaam_broker::environment::Environment;
+use iaam_broker::operation_kind::{OperationKindDictionary, seed_for};
+use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::custody::CustodyOrigin;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::kind::EventKind;
@@ -22,6 +31,8 @@ use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::SourceChannel;
+use iaam_http::gateway::{BUDGETS, Clock as GatewayClock, Sleeper, Transport};
+use iaam_http::{Gateway, HttpError, HttpRequest, HttpResponse};
 use iaam_ingest::dedup::DedupLevel;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
@@ -29,6 +40,7 @@ use iaam_ingest::{SubmittedOperation, Verdict};
 use iaam_store::SqliteStore;
 use time::Date;
 use time::macros::date;
+use tokio::sync::Notify;
 
 struct FixedClock(Date);
 
@@ -52,6 +64,7 @@ impl BrokerChannel for FakeBroker {
         _account: AccountId,
         _from: Date,
         _to: Date,
+        _deadline: Option<Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
         self.operations.clone()
     }
@@ -60,6 +73,7 @@ impl BrokerChannel for FakeBroker {
         &self,
         _account: AccountId,
         _at: Date,
+        _deadline: Option<Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         self.portfolio.clone()
     }
@@ -1662,10 +1676,12 @@ async fn one_broker_failure_does_not_poison_another_sync() {
         operations: Err(BrokerError::Unreachable {
             broker: "finam".to_owned(),
             detail: "offline".to_owned(),
+            retry_after: None,
         }),
         portfolio: Err(BrokerError::Unreachable {
             broker: "finam".to_owned(),
             detail: "offline".to_owned(),
+            retry_after: None,
         }),
     };
     let error = sync_broker(
@@ -1871,4 +1887,605 @@ async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {
                 .expect("requested interval"),
         )
     );
+}
+
+// --- one sync per account, and a deadline on the whole sync -----------------
+
+/// An empty sync source: no operations, and a portfolio with nothing in it.
+fn empty_operations() -> ParsedOperations {
+    ParsedOperations {
+        accepted: Vec::new(),
+        quarantined: Vec::new(),
+    }
+}
+
+fn empty_portfolio() -> PortfolioSnapshot {
+    PortfolioSnapshot {
+        as_of: PortfolioAsOf::Requested,
+        claims: Vec::new(),
+        refused: Vec::new(),
+    }
+}
+
+fn held_channel() -> SourceChannel {
+    SourceChannel {
+        source: SourceId::new_random(),
+        parser_version: ParserVersion("held-api/1".to_owned()),
+        document: None,
+    }
+}
+
+/// A broker that holds its operations request open until it is released,
+/// and counts the requests it was sent.
+struct HeldBroker {
+    source: SourceChannel,
+    calls: AtomicUsize,
+    entered: Notify,
+    release: Notify,
+}
+
+impl HeldBroker {
+    fn new() -> Self {
+        Self {
+            source: held_channel(),
+            calls: AtomicUsize::new(0),
+            entered: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+
+    /// A broker that answers at once: its release is granted in advance.
+    fn released() -> Self {
+        let broker = Self::new();
+        broker.release.notify_one();
+        broker
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl BrokerChannel for HeldBroker {
+    async fn fetch_operations(
+        &self,
+        _account: AccountId,
+        _from: Date,
+        _to: Date,
+        _deadline: Option<Instant>,
+    ) -> Result<ParsedOperations, BrokerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(empty_operations())
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _at: Date,
+        _deadline: Option<Instant>,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Ok(empty_portfolio())
+    }
+
+    fn channel(&self) -> SourceChannel {
+        self.source.clone()
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Account
+    }
+}
+
+#[tokio::test]
+async fn a_second_sync_of_one_account_is_refused_at_once_and_sends_nothing() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let held = HeldBroker::new();
+    let second_broker = HeldBroker::released();
+
+    let principal = principal(owner);
+    let first = sync_broker(
+        &services,
+        &principal,
+        &held,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    );
+    let second = async {
+        held.entered.notified().await;
+        let second = sync_broker(
+            &services,
+            &principal,
+            &second_broker,
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await;
+        held.release.notify_one();
+        second
+    };
+    let (first, second) = tokio::join!(first, second);
+
+    first.unwrap_or_else(|error| panic!("the first sync proceeds: {error}"));
+    match second {
+        Err(AppError::Conflict { what }) => assert!(
+            what.contains("sync of this account is already running"),
+            "{what}"
+        ),
+        other => panic!("the second sync must be refused as a conflict: {other:?}"),
+    }
+    assert_eq!(second_broker.calls(), 0, "the refused sync sent a request");
+}
+
+#[tokio::test]
+async fn syncs_of_two_accounts_do_not_block_each_other() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let held = HeldBroker::new();
+    let other = HeldBroker::released();
+
+    let principal = principal(owner);
+    let first = sync_broker(
+        &services,
+        &principal,
+        &held,
+        AccountId::new_random(),
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    );
+    let second = async {
+        held.entered.notified().await;
+        let second = sync_broker(
+            &services,
+            &principal,
+            &other,
+            AccountId::new_random(),
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await;
+        held.release.notify_one();
+        second
+    };
+    let (first, second) = tokio::join!(first, second);
+
+    first.unwrap_or_else(|error| panic!("the first account syncs: {error}"));
+    second.unwrap_or_else(|error| panic!("the second account syncs: {error}"));
+    assert_eq!(other.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_sync_releases_its_account() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let failing = FakeBroker {
+        source: held_channel(),
+        identity_scope: IdentityScope::Account,
+        operations: Err(BrokerError::Unreachable {
+            broker: "test".to_owned(),
+            detail: "offline".to_owned(),
+            retry_after: None,
+        }),
+        portfolio: Ok(empty_portfolio()),
+    };
+    sync_broker(
+        &services,
+        &principal(owner),
+        &failing,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the broker is offline");
+
+    let after = HeldBroker::released();
+    sync_broker(
+        &services,
+        &principal(owner),
+        &after,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("the sync after a failure proceeds: {error}"));
+    assert_eq!(after.calls(), 1);
+}
+
+/// A broker whose operations request panics.
+struct PanickingBroker(SourceChannel);
+
+#[async_trait]
+impl BrokerChannel for PanickingBroker {
+    async fn fetch_operations(
+        &self,
+        _account: AccountId,
+        _from: Date,
+        _to: Date,
+        _deadline: Option<Instant>,
+    ) -> Result<ParsedOperations, BrokerError> {
+        panic!("the broker adapter panicked");
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _at: Date,
+        _deadline: Option<Instant>,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Ok(empty_portfolio())
+    }
+
+    fn channel(&self) -> SourceChannel {
+        self.0.clone()
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Account
+    }
+}
+
+#[tokio::test]
+async fn a_panicked_sync_releases_its_account() {
+    let services = Arc::new(services());
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+
+    let panicking = Arc::clone(&services);
+    let joined = tokio::spawn(async move {
+        sync_broker(
+            &panicking,
+            &principal(owner),
+            &PanickingBroker(held_channel()),
+            account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+    })
+    .await;
+    assert!(joined.is_err_and(|error| error.is_panic()));
+
+    let after = HeldBroker::released();
+    sync_broker(
+        &services,
+        &principal(owner),
+        &after,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("the sync after a panic proceeds: {error}"));
+}
+
+/// A clock that moves only when something sleeps on it, or when the slow
+/// T-Invest below takes its time to answer.
+struct FakeTime {
+    now: Mutex<Instant>,
+}
+
+impl FakeTime {
+    fn advance(&self, by: Duration) {
+        *self.now.lock().expect("clock") += by;
+    }
+}
+
+impl GatewayClock for FakeTime {
+    fn now(&self) -> Instant {
+        *self.now.lock().expect("clock")
+    }
+}
+
+impl Sleeper for FakeTime {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.advance(delay);
+        Box::pin(async {})
+    }
+}
+
+/// Time on tokio's paused timer: the gateway's clock and sleeps and the slow
+/// T-Invest below all run on it, so a request still in flight at the deadline
+/// loses a real race against it rather than a clock moved by hand.
+struct PausedTime;
+
+impl GatewayClock for PausedTime {
+    fn now(&self) -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
+}
+
+impl Sleeper for PausedTime {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(delay))
+    }
+}
+
+/// A T-Invest that answers every operations page, always with one more to
+/// come, `step` after it was asked.
+struct SlowTinvest {
+    step: Duration,
+    asked: Arc<AtomicUsize>,
+}
+
+impl Transport for SlowTinvest {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let page = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::time::sleep(self.step).await;
+        let body = format!(
+            r#"{{"hasNext":true,"nextCursor":"page-{page}","items":[{{"cursor":"row-{page}","brokerAccountId":"account","id":"op-{page}","date":"2026-03-10T10:11:12Z","type":"OPERATION_TYPE_INPUT","state":"OPERATION_STATE_EXECUTED"}}]}}"#
+        );
+        Ok(HttpResponse {
+            status: 200,
+            body: body.into_bytes(),
+            retry_after: None,
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and_writes_nothing() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let asked = Arc::new(AtomicUsize::new(0));
+    // Four minutes a page: pages are asked for at 0, 4, 8 and 12 minutes;
+    // the fourth would answer at 16, past the sync's fifteen.
+    let gateway = Gateway::with_parts(
+        SlowTinvest {
+            step: Duration::from_secs(4 * 60),
+            asked: Arc::clone(&asked),
+        },
+        BUDGETS,
+        Arc::new(PausedTime) as Arc<dyn GatewayClock>,
+        Arc::new(PausedTime) as Arc<dyn Sleeper>,
+    )
+    .expect("the documented table is valid");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-token")).expect("token opens");
+    let client = TinkoffClient::new(Environment::Prod, token, Arc::new(gateway));
+    let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
+    let channel = TinkoffChannel::new(client, SourceId::new_random(), dictionary);
+    let before = load_all(&services, owner).await;
+    let started = tokio::time::Instant::now();
+
+    let refused = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the deadline cuts the sync");
+
+    // The sync takes its deadline from the wall clock while the pages run on
+    // the paused one, which the wall clock leads by the real time the test has
+    // taken; a second covers that and is still minutes short of the overrun a
+    // fourth page waited out to its end would show.
+    let took = started.elapsed();
+    assert!(
+        took <= SYNC_DEADLINE + Duration::from_secs(1),
+        "the sync returned {took:?} after it started, past its deadline"
+    );
+    assert!(took >= Duration::from_secs(12 * 60), "{took:?}");
+    assert_eq!(asked.load(Ordering::SeqCst), 4, "the fourth page was asked");
+    assert!(
+        matches!(
+            refused,
+            AppError::SourceUnreachable {
+                retry_after: Some(_),
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    let message = refused.to_string();
+    assert!(message.contains("unreachable"), "{message}");
+    assert!(message.contains("retry after"), "{message}");
+    assert!(
+        message.contains("operation pages fetched before it: 3"),
+        "{message}"
+    );
+    assert_eq!(load_all(&services, owner).await, before);
+}
+
+/// A T-Invest that answers every call with 429 and a reset delay of `wait`.
+struct ThrottlingTinvest {
+    wait: Duration,
+}
+
+impl Transport for ThrottlingTinvest {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status: 429,
+            body: b"{}".to_vec(),
+            retry_after: Some(self.wait),
+        })
+    }
+}
+
+fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
+    let time = Arc::new(FakeTime {
+        now: Mutex::new(Instant::now()),
+    });
+    let gateway = Gateway::with_parts(
+        transport,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+    )
+    .expect("the documented table is valid");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-token")).expect("token opens");
+    let client = TinkoffClient::new(Environment::Prod, token, Arc::new(gateway));
+    let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
+    TinkoffChannel::new(client, SourceId::new_random(), dictionary)
+}
+
+#[tokio::test]
+async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let channel = channel_over(ThrottlingTinvest {
+        wait: Duration::from_secs(7),
+    });
+
+    let refused = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("T-Invest never lets the call through");
+
+    match refused {
+        AppError::SourceUnreachable {
+            origin,
+            retry_after,
+            ..
+        } => {
+            assert_eq!(origin, "tinkoff");
+            assert_eq!(retry_after, Some(Duration::from_secs(7)));
+        }
+        other => panic!("expected an unreachable broker, got {other:?}"),
+    }
+}
+
+/// A broker whose operations request always fails with `error`.
+fn failing_broker(error: BrokerError) -> FakeBroker {
+    FakeBroker {
+        source: held_channel(),
+        identity_scope: IdentityScope::Account,
+        operations: Err(error),
+        portfolio: Ok(empty_portfolio()),
+    }
+}
+
+async fn sync_error(broker: &FakeBroker) -> AppError {
+    let services = services();
+    sync_broker(
+        &services,
+        &principal(OwnerId::new_random()),
+        broker,
+        AccountId::new_random(),
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the broker fails")
+}
+
+#[tokio::test]
+async fn an_unreachable_broker_keeps_its_wait_through_the_scenario() {
+    let error = sync_error(&failing_broker(BrokerError::Unreachable {
+        broker: "test".to_owned(),
+        detail: "offline".to_owned(),
+        retry_after: Some(Duration::from_millis(1_500)),
+    }))
+    .await;
+    match error {
+        AppError::SourceUnreachable {
+            origin,
+            detail,
+            retry_after,
+        } => {
+            assert_eq!(origin, "test");
+            assert_eq!(detail, "offline");
+            assert_eq!(retry_after, Some(Duration::from_millis(1_500)));
+        }
+        other => panic!("expected an unreachable broker, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_broker_refusal_is_not_a_store_failure() {
+    let error = sync_error(&failing_broker(BrokerError::Refused {
+        broker: "test".to_owned(),
+        detail: "token is invalid".to_owned(),
+    }))
+    .await;
+    match error {
+        AppError::SourceRefused { origin, detail } => {
+            assert_eq!(origin, "test");
+            assert!(detail.starts_with("token is invalid"), "{detail}");
+            // A source's refusal is general; which access to fix is the
+            // broker's own advice, carried in the detail.
+            assert!(detail.contains("check the broker access"), "{detail}");
+        }
+        other => panic!("expected a broker refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unparsable_broker_answer_is_still_our_failure() {
+    let error = sync_error(&failing_broker(BrokerError::Unparsable {
+        broker: "test".to_owned(),
+        detail: "not json".to_owned(),
+    }))
+    .await;
+    assert!(matches!(error, AppError::Store(_)), "{error:?}");
+}
+
+/// **Nothing is written until both of the broker's answers are in.** A sync
+/// that recorded the operations and then lost the portfolio would leave a
+/// journal the caller was told had not changed; fetching both first keeps the
+/// refusal honest.
+#[tokio::test]
+async fn a_broker_whose_portfolio_fails_leaves_the_journal_unchanged() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let mut broker = api(
+        account,
+        SourceId::new_random(),
+        trade_without_custody(account, instrument),
+    );
+    broker.portfolio = Err(BrokerError::Unreachable {
+        broker: "test".to_owned(),
+        detail: "offline".to_owned(),
+        retry_after: None,
+    });
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the portfolio request fails");
+
+    assert!(
+        matches!(error, AppError::SourceUnreachable { .. }),
+        "{error:?}"
+    );
+    assert!(load_all(&services, owner).await.is_empty());
 }

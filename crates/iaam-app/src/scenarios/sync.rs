@@ -28,7 +28,9 @@ use iaam_store::market::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use time::Date;
 use time::OffsetDateTime;
 
@@ -58,6 +60,59 @@ pub struct SyncOutcome {
     pub assertions_withheld: Option<AssertionsWithheld>,
 }
 
+/// How long a whole broker sync may take, from its start.
+///
+/// Every request of the sync — each operations page, then the portfolio —
+/// is made under this one deadline, so a broker that slows to a crawl ends
+/// the sync with a refusal instead of holding its account indefinitely.
+pub const SYNC_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// The accounts a broker sync is running for, in this process.
+///
+/// Two syncs of one account would each read the journal before the other
+/// wrote to it, and each send the broker the same requests against one
+/// budget. In memory is enough: one process serves the instance.
+#[derive(Debug, Default)]
+pub struct RunningSyncs(Mutex<HashSet<(OwnerId, AccountId)>>);
+
+impl RunningSyncs {
+    /// Claims `(owner, account)` for one sync, or refuses while another holds it.
+    fn claim(&self, owner: OwnerId, account: AccountId) -> Result<SyncClaim<'_>, AppError> {
+        if self.running().insert((owner, account)) {
+            Ok(SyncClaim {
+                running: self,
+                key: (owner, account),
+            })
+        } else {
+            Err(AppError::Conflict {
+                what: format!(
+                    "a sync of this account is already running: account {}",
+                    account.inner()
+                ),
+            })
+        }
+    }
+
+    // A panic while the set is held leaves it consistent — every change is
+    // one insert or one remove — so a poisoned lock is still a usable one.
+    fn running(&self) -> MutexGuard<'_, HashSet<(OwnerId, AccountId)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One running sync's hold on its account, released however the sync ends:
+/// an answer, an error or a panic.
+struct SyncClaim<'a> {
+    running: &'a RunningSyncs,
+    key: (OwnerId, AccountId),
+}
+
+impl Drop for SyncClaim<'_> {
+    fn drop(&mut self) {
+        self.running.running().remove(&self.key);
+    }
+}
+
 /// Retrieves the broker's operations and portfolio and records new facts.
 ///
 /// Matching against the existing journal is performed before calling the store:
@@ -81,8 +136,11 @@ pub async fn sync_broker(
         });
     }
 
+    let _claim = services.running_syncs.claim(principal.owner, account)?;
+    let deadline = Some(Instant::now() + SYNC_DEADLINE);
+
     let parsed = broker
-        .fetch_operations(account, from, to)
+        .fetch_operations(account, from, to, deadline)
         .await
         .map_err(broker_error)?;
     let channel = broker.channel();
@@ -100,6 +158,20 @@ pub async fn sync_broker(
             .trade
             .is_some_and(|trade| trade < from || trade > to)
     });
+    // Both answers are fetched before the first write: a portfolio that fails
+    // after the operations were recorded would leave a journal the refusal
+    // claims is unchanged. An out-of-interval trade withholds every
+    // assertion, so its portfolio is not asked for at all.
+    let snapshot = if has_out_of_interval_trade {
+        None
+    } else {
+        Some(
+            broker
+                .fetch_portfolio(account, to, deadline)
+                .await
+                .map_err(broker_error)?,
+        )
+    };
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -235,9 +307,10 @@ pub async fn sync_broker(
             recorded.push(verdict);
         }
     }
-    // An out-of-interval trade remains its own early-return condition; refusals
-    // only add the coverage gap above and do not suppress the portfolio answer.
-    if has_out_of_interval_trade {
+    // An out-of-interval trade remains its own early-return condition, which is
+    // why no portfolio was fetched for it; refusals only add the coverage gap
+    // above and do not suppress the portfolio answer.
+    let Some(snapshot) = snapshot else {
         return Ok(SyncOutcome {
             recorded,
             duplicates,
@@ -245,12 +318,7 @@ pub async fn sync_broker(
             assertions: 0,
             assertions_withheld: None,
         });
-    }
-
-    let snapshot = broker
-        .fetch_portfolio(account, to)
-        .await
-        .map_err(broker_error)?;
+    };
     let assertions_withheld = match snapshot.as_of {
         PortfolioAsOf::Requested => None,
         PortfolioAsOf::Current => {
@@ -317,8 +385,35 @@ pub async fn sync_broker(
     })
 }
 
+/// A broker that is down or says no is not our store failing: each is told
+/// apart so the caller learns whether to wait or to fix the access. What stays
+/// `Store` is a failure on our side of the call — an answer we could not read,
+/// an adapter bug, access not set up as it must be.
 fn broker_error(error: crate::ports::BrokerError) -> AppError {
-    AppError::Store(format!("broker synchronisation: {error}"))
+    use crate::ports::BrokerError;
+    match error {
+        BrokerError::Unreachable {
+            broker,
+            detail,
+            retry_after,
+        } => AppError::SourceUnreachable {
+            origin: broker,
+            detail,
+            retry_after,
+        },
+        // What to fix is the broker's own advice: the source-general refusal
+        // cannot know that the access configured for the owner is the culprit.
+        BrokerError::Refused { broker, detail } => AppError::SourceRefused {
+            origin: broker,
+            detail: format!("{detail}; check the broker access configured for this owner"),
+        },
+        other @ (BrokerError::Unparsable { .. }
+        | BrokerError::Adapter { .. }
+        | BrokerError::NoAccess { .. }
+        | BrokerError::ScopeNotReadOnly { .. }) => {
+            AppError::Store(format!("broker synchronisation: {other}"))
+        }
+    }
 }
 
 /// Fingerprint of a raw source row, for a row the source did not identify.
@@ -609,6 +704,13 @@ pub async fn sync_market(
 
     let response = match transport.send(http_request).await {
         Ok(response) => response,
+        // A source that is down or says no is the caller's answer, not a run
+        // outcome: it decides whether to wait or to fix the request. The run
+        // is still closed, or the series' lease would stay held.
+        Err(error @ (AppError::SourceUnreachable { .. } | AppError::SourceRefused { .. })) => {
+            partial(store, &handle, error.to_string())?;
+            return Err(error);
+        }
         Err(error) => return partial(store, &handle, error.to_string()),
     };
     if !(200..300).contains(&response.status) {
@@ -1069,6 +1171,60 @@ mod market_tests {
                 })
                 .expect("boundary"),
             Some(date!(2026 - 08 - 21))
+        );
+    }
+
+    /// A source that refused through every retry.
+    struct UnreachableSource;
+
+    #[async_trait]
+    impl OutboundHttp for UnreachableSource {
+        async fn send(&self, _request: HttpRequest) -> Result<OutboundResponse, AppError> {
+            Err(AppError::SourceUnreachable {
+                origin: "cbr".to_owned(),
+                detail: "failed 5 attempts".to_owned(),
+                retry_after: Some(std::time::Duration::from_secs(30)),
+            })
+        }
+    }
+
+    /// An unreachable source reaches the caller as itself, so the route can say
+    /// when to come back; the run it opened is still closed, or the next sync
+    /// of the series would find its lease held.
+    #[tokio::test]
+    async fn an_unreachable_source_is_returned_and_its_run_is_closed() {
+        let mut store = MarketStore::open_in_memory().expect("store");
+        let request = MarketSyncRequest {
+            source: MarketSource::CbrKeyRate,
+            from: date!(2026 - 02 - 01),
+            to: date!(2026 - 02 - 28),
+        };
+
+        for _ in 0..2 {
+            let error = sync_market(&mut store, &UnreachableSource, request.clone())
+                .await
+                .expect_err("the source is unreachable");
+            match error {
+                AppError::SourceUnreachable {
+                    origin,
+                    retry_after,
+                    ..
+                } => {
+                    assert_eq!(origin, "cbr");
+                    assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+                }
+                other => panic!("expected an unreachable source, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            store
+                .complete_through(&SeriesKey {
+                    source_id: "cbr".to_owned(),
+                    dataset: "key_rate".to_owned(),
+                    series_key: "key_rate".to_owned(),
+                })
+                .expect("boundary"),
+            None
         );
     }
 

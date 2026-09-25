@@ -29,8 +29,7 @@ use std::path::PathBuf;
 
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open};
 use iaam_broker::environment::Environment;
-use iaam_http::client::HttpClient;
-use iaam_http::{Destination, HttpRequest, RequestBody};
+use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::SoleOwner;
 use iaam_store::documents::BrokerCode;
@@ -85,20 +84,23 @@ async fn the_sandbox_accepts_the_provisioned_access() {
         "tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
         RequestBody::Json("{}".to_owned()),
     )
+    // GetAccounts only reads, so a second copy of it is harmless.
+    .idempotent()
     .with_bearer(token.expose());
-    let response = HttpClient::new()
-        .send(&request)
-        .await
-        .expect("gateway responded");
+    // A test binary is a process of its own, so a gateway of its own.
+    let gateway = Gateway::production().expect("the budget table is valid");
+    let result = gateway.send("UsersService", &request, None).await;
 
-    // Include the response body deliberately: “HTTP 500” alone cannot
-    // distinguish a broken gateway from an invalid token, and this one message
-    // is all the investigation gets. The body contains no secret: the token is
-    // not returned there.
-    let status = response.status;
-    let body = String::from_utf8(response.body).unwrap_or_default();
-    assert!(
-        status_is_success(status),
-        "sandbox rejected configured access: HTTP {status}: {body}"
-    );
+    // Status and body length only, never the body: test output is kept in
+    // CI logs and transcripts, and nothing guarantees a broker's refusal
+    // carries no account data or secret. The status tells a broken gateway
+    // (5xx) from a refused token (401/403).
+    match result {
+        Ok(response) => assert!(status_is_success(response.status)),
+        Err(GatewayError::Rejected { status, body, .. }) => panic!(
+            "sandbox rejected configured access: HTTP {status}, {} bytes",
+            body.as_bytes().len()
+        ),
+        Err(error) => panic!("sandbox did not answer: {error}"),
+    }
 }

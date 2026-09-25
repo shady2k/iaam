@@ -17,10 +17,25 @@ percent-encoding = "2"
 # Секрет зануляется при уничтожении: копия токена, оставшаяся
 # в освобождённой памяти, — это тот же токен.
 zeroize = { version = "1", features = ["alloc"] }
+# A `Retry-After` may name an HTTP-date rather than seconds, and the gateway
+# obeys whichever form the source sends. RFC 9110's three date formats are a
+# parser of their own; this one is already in the tree beneath hyper.
+httpdate = "1"
+# The gateway's production timer and its per-destination async lock. The
+# application already runs tokio; the gateway only borrows its timer.
+tokio = { version = "1", features = ["sync", "time"] }
+# Waits, retries, refusals and breaker changes as structured events: an
+# operator watching a slow synchronisation must tell a budget wait from an
+# open breaker. The same facade the rest of the tree logs through.
+tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `test-util` pauses the tokio timer, so the production sleeper is checked
+# without a real wait.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 sha2 = "0.11"
+# Captures the gateway's events in a test, to prove what they carry.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [lints]
 workspace = true

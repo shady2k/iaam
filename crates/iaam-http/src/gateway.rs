@@ -40,6 +40,14 @@ pub const ATTEMPTS: u32 = 5;
 /// up to `resilience::MAX_BACKOFF`.
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 
+/// Calls in a row that must fail, after their retries, to open the breaker.
+pub const BREAKER_FAILURES: u32 = 5;
+
+/// How long an open breaker refuses calls without sending them. Long enough
+/// for a broker's maintenance window or a lifted ban, short enough that a
+/// daily synchronisation still finishes on the same run.
+pub const BREAKER_COOL_DOWN: Duration = Duration::from_secs(5 * 60);
+
 /// Which method keys a budget row covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodScope {
@@ -209,6 +217,16 @@ pub enum GatewayError {
         attempts: u32,
         retry_after: Duration,
     },
+    /// The destination failed too many calls in a row; nothing was sent.
+    #[error(
+        "{destination:?} is refused for {retry_after:?} after repeated failures ({attempts} attempts sent)"
+    )]
+    CircuitOpen {
+        destination: Destination,
+        /// Attempts this call had sent before the breaker refused it.
+        attempts: u32,
+        retry_after: Duration,
+    },
     /// The destination answered with a status a retry would only repeat.
     #[error("{destination:?} refused the request with status {status} after {attempts} attempts")]
     Rejected {
@@ -238,7 +256,9 @@ impl GatewayError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::Exhausted { retry_after, .. } => Some(*retry_after),
+            Self::Exhausted { retry_after, .. } | Self::CircuitOpen { retry_after, .. } => {
+                Some(*retry_after)
+            }
             Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
             | Self::Rejected { .. }
@@ -252,7 +272,10 @@ impl GatewayError {
         match self {
             Self::Exhausted { status, .. } => *status,
             Self::Rejected { status, .. } => Some(*status),
-            Self::UnknownBudget { .. } | Self::InvalidBudgets(_) | Self::Transport { .. } => None,
+            Self::UnknownBudget { .. }
+            | Self::InvalidBudgets(_)
+            | Self::CircuitOpen { .. }
+            | Self::Transport { .. } => None,
         }
     }
 
@@ -261,6 +284,7 @@ impl GatewayError {
     pub const fn attempts(&self) -> u32 {
         match self {
             Self::Exhausted { attempts, .. }
+            | Self::CircuitOpen { attempts, .. }
             | Self::Rejected { attempts, .. }
             | Self::Transport { attempts, .. } => *attempts,
             Self::UnknownBudget { .. } | Self::InvalidBudgets(_) => 0,
@@ -367,6 +391,10 @@ struct Lane {
     /// Start instants of the most recent requests, per budget key: at most
     /// `used` of them, the oldest first.
     sent: HashMap<Option<&'static str>, VecDeque<Instant>>,
+    /// Calls in a row that failed transiently after all their attempts.
+    failures: u32,
+    /// Until when the breaker refuses calls, once it has opened.
+    open_until: Option<Instant>,
 }
 
 impl Lane {
@@ -388,6 +416,30 @@ impl Lane {
             }
             _ => Duration::ZERO,
         }
+    }
+
+    /// How long the breaker still refuses calls; `None` when it lets them
+    /// through.
+    ///
+    /// Once the cool-down is over the failure count is left as it was, so the
+    /// first call through decides: a success closes the breaker, and a
+    /// failure opens it again at once rather than after five more.
+    fn refusing(&self, now: Instant) -> Option<Duration> {
+        self.open_until
+            .and_then(|until| until.checked_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= BREAKER_FAILURES {
+            self.open_until = Some(now + BREAKER_COOL_DOWN);
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.open_until = None;
     }
 
     fn record_start(&mut self, key: Option<&'static str>, budget: &Budget, at: Instant) {
@@ -469,31 +521,50 @@ impl<T: Transport> Gateway<T> {
         let lane = &self.lanes[&destination];
         let mut attempts = 0_u32;
         loop {
-            // The lane is held for the budget wait and the request, and
-            // released for the backoff: a destination that is refusing is
-            // not made to wait for a call that is only waiting itself.
-            let result = {
+            // The lane is held for the breaker check, the budget wait, the
+            // request and the breaker update, and released for the backoff:
+            // a destination that is refusing is not made to wait for a call
+            // that is only waiting itself, and a failure that opens the
+            // breaker is recorded before another call can slip in.
+            let (decision, outcome, body) = {
                 let mut lane = lane.lock().await;
+                if let Some(retry_after) = lane.refusing(self.clock.now()) {
+                    return Err(GatewayError::CircuitOpen {
+                        destination,
+                        attempts,
+                        retry_after,
+                    });
+                }
                 let wait = lane.budget_wait(key, &budget, self.clock.now());
                 if !wait.is_zero() {
                     self.sleeper.sleep(wait).await;
                 }
                 lane.record_start(key, &budget, self.clock.now());
                 attempts += 1;
-                self.transport.send(request).await
-            };
-            let (outcome, body) = match result {
-                Ok(response) if (200..300).contains(&response.status) => return Ok(response),
-                Ok(response) => {
-                    let outcome = match response.retry_after {
-                        Some(after) => Outcome::status_with_retry_after(response.status, after),
-                        None => Outcome::status(response.status),
-                    };
-                    (outcome, response.body)
+                let (outcome, body) = match self.transport.send(request).await {
+                    Ok(response) if (200..300).contains(&response.status) => {
+                        lane.record_success();
+                        return Ok(response);
+                    }
+                    Ok(response) => {
+                        let outcome = match response.retry_after {
+                            Some(after) => Outcome::status_with_retry_after(response.status, after),
+                            None => Outcome::status(response.status),
+                        };
+                        (outcome, response.body)
+                    }
+                    Err(error) => (Outcome::Transport(error), Vec::new()),
+                };
+                let decision = self.retry.decide(attempts, &outcome);
+                // Only a call that failed transiently to the end counts: a
+                // permanent refusal says our request is wrong, not that the
+                // destination is down.
+                if decision == Retry::GiveUp && is_transient(&outcome) {
+                    lane.record_failure(self.clock.now());
                 }
-                Err(error) => (Outcome::Transport(error), Vec::new()),
+                (decision, outcome, body)
             };
-            match self.retry.decide(attempts, &outcome) {
+            match decision {
                 Retry::After(delay) => self.sleeper.sleep(delay).await,
                 Retry::GiveUp => return Err(self.refusal(destination, attempts, outcome, body)),
             }
@@ -1114,6 +1185,191 @@ mod tests {
         let rendered = format!("{refused} {refused:?}");
         assert!(!rendered.contains("invented-token"), "{rendered}");
         assert!(!rendered.contains("balance"), "{rendered}");
+    }
+
+    // --- circuit breaker --------------------------------------------------
+
+    /// A script of `calls` calls whose every attempt fails with 503.
+    fn failing_calls(script: Scripted, calls: usize) -> Scripted {
+        (0..calls * ATTEMPTS as usize).fold(script, |script, _| script.then(Ok(status(503))))
+    }
+
+    async fn call(gateway: &Gateway<Scripted>) -> Result<HttpResponse, GatewayError> {
+        gateway.send("OperationsService", &operations(), None).await
+    }
+
+    const COOL_DOWN: Duration = Duration::from_secs(5 * 60);
+
+    #[tokio::test]
+    async fn five_failed_calls_open_the_breaker_and_it_refuses_without_sending() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 503));
+        for _ in 0..5 {
+            assert!(matches!(
+                call(&gateway).await,
+                Err(GatewayError::Exhausted { .. })
+            ));
+        }
+        let sent = gateway.transport.sent_count();
+
+        let refused = call(&gateway).await.expect_err("the breaker is open");
+
+        assert!(
+            matches!(
+                refused,
+                GatewayError::CircuitOpen {
+                    destination: Destination::TinkoffProd,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            gateway.transport.sent_count(),
+            sent,
+            "an open breaker sent a request"
+        );
+        assert!(refused.is_transient());
+        assert_eq!(refused.retry_after(), Some(COOL_DOWN));
+    }
+
+    #[tokio::test]
+    async fn four_failed_calls_leave_the_breaker_closed() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 503));
+        for _ in 0..4 {
+            let _ = call(&gateway).await;
+        }
+        let sent = gateway.transport.sent_count();
+
+        let _ = call(&gateway).await;
+
+        assert_eq!(gateway.transport.sent_count(), sent + ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_success_between_failures_starts_the_count_again() {
+        let time = FakeTime::new();
+        let script = failing_calls(Scripted::answering(&time, 503), 4).then(Ok(status(200)));
+        let gateway = gateway(&time, script);
+        for _ in 0..4 {
+            let _ = call(&gateway).await;
+        }
+        call(&gateway).await.expect("the fifth call succeeds");
+        for _ in 0..4 {
+            let _ = call(&gateway).await;
+        }
+        let sent = gateway.transport.sent_count();
+
+        let tenth = call(&gateway).await;
+
+        assert!(
+            matches!(tenth, Err(GatewayError::Exhausted { .. })),
+            "{tenth:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), sent + ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_refusal_does_not_count_towards_the_breaker() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 404));
+
+        for _ in 0..6 {
+            let refused = call(&gateway).await;
+            assert!(
+                matches!(refused, Err(GatewayError::Rejected { .. })),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(gateway.transport.sent_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn an_open_breaker_leaves_other_destinations_alone() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, failing_calls(Scripted::answering(&time, 200), 5));
+        for _ in 0..5 {
+            let _ = call(&gateway).await;
+        }
+        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts");
+
+        gateway
+            .send("Accounts", &finam, None)
+            .await
+            .expect("Finam is not the destination that failed");
+    }
+
+    #[tokio::test]
+    async fn the_breaker_refuses_for_the_whole_cool_down_and_then_lets_a_call_through() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, failing_calls(Scripted::answering(&time, 200), 5));
+        for _ in 0..5 {
+            let _ = call(&gateway).await;
+        }
+
+        time.advance(COOL_DOWN - Duration::from_millis(1));
+        let early = call(&gateway).await;
+        assert!(
+            matches!(early, Err(GatewayError::CircuitOpen { .. })),
+            "{early:?}"
+        );
+        assert_eq!(
+            early.expect_err("open").retry_after(),
+            Some(Duration::from_millis(1))
+        );
+
+        time.advance(Duration::from_millis(1));
+        call(&gateway).await.expect("the cool-down is over");
+        call(&gateway).await.expect("a success closed the breaker");
+    }
+
+    #[tokio::test]
+    async fn a_failure_right_after_the_cool_down_opens_the_breaker_again() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, failing_calls(Scripted::answering(&time, 200), 6));
+        for _ in 0..5 {
+            let _ = call(&gateway).await;
+        }
+        time.advance(COOL_DOWN);
+        assert!(matches!(
+            call(&gateway).await,
+            Err(GatewayError::Exhausted { .. })
+        ));
+        let sent = gateway.transport.sent_count();
+
+        let refused = call(&gateway).await;
+
+        assert!(
+            matches!(refused, Err(GatewayError::CircuitOpen { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(gateway.transport.sent_count(), sent);
+    }
+
+    #[tokio::test]
+    async fn a_breaker_that_opens_during_a_call_stops_its_remaining_attempts() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 503));
+        let (operations, users) = (operations(), users());
+        for _ in 0..4 {
+            let _ = call(&gateway).await;
+        }
+        let sent = gateway.transport.sent_count();
+
+        // Two calls at once: the first to finish failing opens the breaker,
+        // and the other's next attempt is refused rather than sent.
+        let (first, second) = tokio::join!(
+            gateway.send("OperationsService", &operations, None),
+            gateway.send("UsersService", &users, None),
+        );
+
+        let refused = [first, second]
+            .into_iter()
+            .filter(|result| matches!(result, Err(GatewayError::CircuitOpen { .. })))
+            .count();
+        assert_eq!(refused, 1);
+        assert!(gateway.transport.sent_count() < sent + 2 * ATTEMPTS as usize);
     }
 
     #[test]

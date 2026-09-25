@@ -23,8 +23,8 @@ use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
     BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    CustodyUpsert, InstrumentDirectory, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Store,
-    TokenAdmin, UnavailableOutboundHttp,
+    CustodyUpsert, InstrumentDirectory, OutboundHttp, OutboundResponse, ParsedOperations,
+    PortfolioAsOf, PortfolioSnapshot, Store, TokenAdmin, UnavailableOutboundHttp,
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
@@ -408,12 +408,50 @@ async fn harness_with_factory(
 const GENEROUS_RATE_LIMIT: u32 = 1_000;
 
 async fn harness_with_factory_and_provisioning(
+    store: SqliteStore,
+    channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
+    provisioned: bool,
+    with_account: bool,
+    with_broker_access: bool,
+    rate_limit: u32,
+) -> Harness {
+    harness_with_everything(
+        store,
+        channel_factory,
+        provisioned,
+        with_account,
+        with_broker_access,
+        rate_limit,
+        Arc::new(UnavailableOutboundHttp),
+    )
+    .await
+}
+
+/// The default harness, but reaching market sources through `http`.
+async fn harness_with_http(http: Arc<dyn OutboundHttp>) -> Harness {
+    harness_with_everything(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        None,
+        true,
+        true,
+        false,
+        GENEROUS_RATE_LIMIT,
+        http,
+    )
+    .await
+}
+
+/// Every knob of the harness in one place; the narrower builders above name
+/// the ones a test turns, which is why the list is allowed to be long here.
+#[allow(clippy::too_many_arguments)]
+async fn harness_with_everything(
     mut store: SqliteStore,
     channel_factory: Option<Arc<dyn BrokerChannelFactory>>,
     provisioned: bool,
     with_account: bool,
     with_broker_access: bool,
     rate_limit: u32,
+    http: Arc<dyn OutboundHttp>,
 ) -> Harness {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -515,7 +553,7 @@ async fn harness_with_factory_and_provisioning(
         channels,
         rules,
         categories: adapter.clone(),
-        http: Arc::new(UnavailableOutboundHttp),
+        http,
         broker_dictionary,
         market_store: market_store.clone(),
         profiles: Arc::new(iaam_app::ingest::profile::ProfileCatalogue::bundled()),
@@ -35092,7 +35130,7 @@ async fn a_broker_that_stays_unreachable_answers_503_with_when_to_retry() {
     })
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
-    assert_eq!(response["code"], "broker_unavailable");
+    assert_eq!(response["code"], "source_unavailable");
     assert_eq!(
         headers
             .get("retry-after")
@@ -35113,7 +35151,7 @@ async fn an_unreachable_broker_without_a_known_wait_sends_no_retry_after() {
     })
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
-    assert_eq!(response["code"], "broker_unavailable");
+    assert_eq!(response["code"], "source_unavailable");
     assert!(headers.get("retry-after").is_none(), "{headers:?}");
 }
 
@@ -35125,11 +35163,93 @@ async fn a_broker_that_refuses_answers_502_naming_the_access() {
     })
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
-    assert_eq!(response["code"], "broker_refused");
+    assert_eq!(response["code"], "source_refused");
     assert!(headers.get("retry-after").is_none(), "{headers:?}");
     let message = response["message"].as_str().expect("a message");
     assert!(message.contains("check the broker access"), "{message}");
     assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+}
+
+/// A market source that fails every request with `error`.
+struct FailingMarket {
+    error: AppError,
+}
+
+#[async_trait::async_trait]
+impl OutboundHttp for FailingMarket {
+    async fn send(&self, _request: iaam_http::HttpRequest) -> Result<OutboundResponse, AppError> {
+        Err(match &self.error {
+            AppError::SourceUnreachable {
+                origin,
+                detail,
+                retry_after,
+            } => AppError::SourceUnreachable {
+                origin: origin.clone(),
+                detail: detail.clone(),
+                retry_after: *retry_after,
+            },
+            AppError::SourceRefused { origin, detail } => AppError::SourceRefused {
+                origin: origin.clone(),
+                detail: detail.clone(),
+            },
+            other => panic!("a market source fails as unreachable or refusing, not {other:?}"),
+        })
+    }
+}
+
+/// Sync the CBR key rate through a market source that fails with `error`.
+async fn market_sync_through_failing_source(error: AppError) -> (StatusCode, HeaderMap, Value) {
+    let harness = harness_with_http(Arc::new(FailingMarket { error })).await;
+    let body = json!({
+        "source": { "source": "cbr_key_rate" },
+        "from": "2026-02-01",
+        "to": "2026-02-28"
+    });
+    let (status, headers, bytes) = call_raw(
+        &harness.router,
+        post("/v1/market/sync", &harness.owner_token, &body),
+    )
+    .await;
+    let response = serde_json::from_slice(&bytes).expect("a JSON error body");
+    (status, headers, response)
+}
+
+#[tokio::test]
+async fn an_unreachable_market_source_answers_503_with_when_to_retry() {
+    let (status, headers, response) =
+        market_sync_through_failing_source(AppError::SourceUnreachable {
+            origin: "cbr".to_owned(),
+            detail: "failed 5 attempts (last status 503)".to_owned(),
+            retry_after: Some(Duration::from_secs(30)),
+        })
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "source_unavailable");
+    assert_eq!(
+        headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.starts_with("cbr is unavailable"), "{message}");
+}
+
+#[tokio::test]
+async fn a_market_source_that_refuses_answers_502() {
+    let (status, headers, response) = market_sync_through_failing_source(AppError::SourceRefused {
+        origin: "moex-iss".to_owned(),
+        detail: "refused the request with status 404".to_owned(),
+    })
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+    assert_eq!(response["code"], "source_refused");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+    let message = response["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("moex-iss rejected the request"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

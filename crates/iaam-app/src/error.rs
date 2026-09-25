@@ -123,22 +123,24 @@ pub enum AppError {
     /// and it is their sum that does not fit.
     #[error("import batch not totalled: {0}")]
     BatchTotal(#[source] MoneyError),
-    /// The broker failed transiently and went on failing through the
-    /// gateway's retries, or the sync ran out of its deadline. Separate from
-    /// `Store`, because our store is fine: the same call is worth making again,
-    /// and `retry_after` says when, if the gateway knows.
-    #[error("broker {broker} is unavailable: {detail}")]
-    BrokerUnreachable {
-        broker: String,
+    /// An outside source — a broker, a market source — failed transiently
+    /// and went on failing through the gateway's retries, or the call ran out
+    /// of its deadline. Separate from `Store`, because our store is fine: the
+    /// same call is worth making again, and `retry_after` says when, if the
+    /// gateway knows. `origin` names the source rather than `source`, which
+    /// `thiserror` would take for the cause of the error.
+    #[error("{origin} is unavailable: {detail}")]
+    SourceUnreachable {
+        origin: String,
         detail: String,
         retry_after: Option<std::time::Duration>,
     },
-    /// The broker answered and refused the request: a token it rejects, a
-    /// method it does not offer. Separate from `Store` and from
-    /// `BrokerUnreachable`, because retrying will not help — the access to the
-    /// broker is what has to be fixed.
-    #[error("broker {broker} rejected the request: {detail}")]
-    BrokerRefused { broker: String, detail: String },
+    /// An outside source answered and refused the request: a token it
+    /// rejects, a method it does not offer, a path it does not know. Separate
+    /// from `Store` and from `SourceUnreachable`, because retrying will not
+    /// help — what the request names or carries is what has to be fixed.
+    #[error("{origin} rejected the request: {detail}")]
+    SourceRefused { origin: String, detail: String },
 }
 
 /// A rejected request field, and everything the server can say about it.
@@ -331,8 +333,8 @@ impl AppError {
             Self::NotConfigured { .. } => "not_configured",
             Self::Random(_) => "random_unavailable",
             Self::Conflict { .. } => "already_exists",
-            Self::BrokerUnreachable { .. } => "broker_unavailable",
-            Self::BrokerRefused { .. } => "broker_refused",
+            Self::SourceUnreachable { .. } => "source_unavailable",
+            Self::SourceRefused { .. } => "source_refused",
         }
     }
 }

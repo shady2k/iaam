@@ -2263,7 +2263,7 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_naming_the_pages_and_write
     assert!(
         matches!(
             refused,
-            AppError::BrokerUnreachable {
+            AppError::SourceUnreachable {
                 retry_after: Some(_),
                 ..
             }
@@ -2338,12 +2338,12 @@ async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
     .expect_err("T-Invest never lets the call through");
 
     match refused {
-        AppError::BrokerUnreachable {
-            broker,
+        AppError::SourceUnreachable {
+            origin,
             retry_after,
             ..
         } => {
-            assert_eq!(broker, "tinkoff");
+            assert_eq!(origin, "tinkoff");
             assert_eq!(retry_after, Some(Duration::from_secs(7)));
         }
         other => panic!("expected an unreachable broker, got {other:?}"),
@@ -2383,12 +2383,12 @@ async fn an_unreachable_broker_keeps_its_wait_through_the_scenario() {
     }))
     .await;
     match error {
-        AppError::BrokerUnreachable {
-            broker,
+        AppError::SourceUnreachable {
+            origin,
             detail,
             retry_after,
         } => {
-            assert_eq!(broker, "test");
+            assert_eq!(origin, "test");
             assert_eq!(detail, "offline");
             assert_eq!(retry_after, Some(Duration::from_millis(1_500)));
         }
@@ -2404,9 +2404,12 @@ async fn a_broker_refusal_is_not_a_store_failure() {
     }))
     .await;
     match error {
-        AppError::BrokerRefused { broker, detail } => {
-            assert_eq!(broker, "test");
-            assert_eq!(detail, "token is invalid");
+        AppError::SourceRefused { origin, detail } => {
+            assert_eq!(origin, "test");
+            assert!(detail.starts_with("token is invalid"), "{detail}");
+            // A source's refusal is general; which access to fix is the
+            // broker's own advice, carried in the detail.
+            assert!(detail.contains("check the broker access"), "{detail}");
         }
         other => panic!("expected a broker refusal, got {other:?}"),
     }
@@ -2420,4 +2423,46 @@ async fn an_unparsable_broker_answer_is_still_our_failure() {
     }))
     .await;
     assert!(matches!(error, AppError::Store(_)), "{error:?}");
+}
+
+/// **Nothing is written until both of the broker's answers are in.** A sync
+/// that recorded the operations and then lost the portfolio would leave a
+/// journal the caller was told had not changed; fetching both first keeps the
+/// refusal honest.
+#[tokio::test]
+async fn a_broker_whose_portfolio_fails_leaves_the_journal_unchanged() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let mut broker = api(
+        account,
+        SourceId::new_random(),
+        trade_without_custody(account, instrument),
+    );
+    broker.portfolio = Err(BrokerError::Unreachable {
+        broker: "test".to_owned(),
+        detail: "offline".to_owned(),
+        retry_after: None,
+    });
+
+    let error = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect_err("the portfolio request fails");
+
+    assert!(
+        matches!(error, AppError::SourceUnreachable { .. }),
+        "{error:?}"
+    );
+    assert!(load_all(&services, owner).await.is_empty());
 }

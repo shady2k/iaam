@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use iaam_http::client::HttpClient;
 use iaam_http::gateway::Transport;
-use iaam_http::{Gateway, HttpRequest};
+use iaam_http::{Destination, Gateway, GatewayError, HttpRequest};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
@@ -37,18 +37,57 @@ impl<T> HttpOutbound<T> {
 #[async_trait]
 impl<T: Transport + 'static> OutboundHttp for HttpOutbound<T> {
     async fn send(&self, request: HttpRequest) -> Result<OutboundResponse, AppError> {
-        // The gateway's refusal carries statuses, counts and the delay worth
-        // waiting, never a header or body, so its text is safe to pass on.
+        let origin = origin(request.destination());
         let response = self
             .gateway
             .send(METHOD, &request, None)
             .await
-            .map_err(|error| AppError::Store(format!("market source: {error}")))?;
+            .map_err(|error| source_error(origin, &error))?;
         Ok(OutboundResponse {
             status: response.status,
             raw_hash: hash(&response.body),
             body: response.body,
         })
+    }
+}
+
+/// Tells a source that is down from one that said no from our own fault, so
+/// the caller learns whether to wait, to fix the request, or to look at us.
+/// The gateway's refusal carries statuses, counts and the delay worth waiting,
+/// never a header or body, so its text is safe to pass on.
+fn source_error(origin: &str, error: &GatewayError) -> AppError {
+    match error {
+        GatewayError::Exhausted { .. }
+        | GatewayError::DeadlineReached { .. }
+        | GatewayError::CircuitOpen { .. } => AppError::SourceUnreachable {
+            origin: origin.to_owned(),
+            detail: error.to_string(),
+            retry_after: error.retry_after(),
+        },
+        GatewayError::Rejected { .. } => AppError::SourceRefused {
+            origin: origin.to_owned(),
+            detail: error.to_string(),
+        },
+        // A missing budget, an invalid table, a transport that could not be
+        // built: none of them is the source's answer.
+        GatewayError::UnknownBudget { .. }
+        | GatewayError::InvalidBudgets(_)
+        | GatewayError::Transport { .. } => {
+            AppError::Store(format!("market source {origin}: {error}"))
+        }
+    }
+}
+
+/// The source a destination belongs to, spelled as the market store's
+/// `source_id` spells it, so a refusal and the series it stopped name the
+/// same thing.
+const fn origin(destination: Destination) -> &'static str {
+    match destination {
+        Destination::MoexIss => "moex-iss",
+        Destination::CbrScripts | Destination::CbrDailyInfo => "cbr",
+        Destination::TinvestContract => "tinvest-contract",
+        Destination::TinkoffProd | Destination::TinkoffSandbox => "tinkoff",
+        Destination::FinamApi => "finam",
     }
 }
 

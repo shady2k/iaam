@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iaam_app::adapters::market::HttpOutbound;
+use iaam_app::error::AppError;
 use iaam_app::ports::OutboundHttp;
 use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
 use iaam_http::{Destination, Gateway, HttpError, HttpRequest, HttpResponse};
@@ -159,7 +160,13 @@ async fn a_permanent_refusal_is_reported_with_its_status_and_not_retried() {
     let refused = adapter.send(moex()).await.expect_err("404 is a refusal");
 
     assert_eq!(sent(&endpoint), 1);
-    assert!(refused.to_string().contains("404"), "{refused}");
+    match refused {
+        AppError::SourceRefused { origin, detail } => {
+            assert_eq!(origin, "moex-iss");
+            assert!(detail.contains("404"), "{detail}");
+        }
+        other => panic!("expected a refusal by the source, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -173,9 +180,49 @@ async fn a_source_that_keeps_failing_is_reported_as_worth_retrying_later() {
         .expect_err("every attempt failed");
 
     assert_eq!(sent(&endpoint), 5);
-    let message = refused.to_string();
-    assert!(message.contains("retry after"), "{message}");
-    assert!(message.contains("503"), "{message}");
+    match refused {
+        AppError::SourceUnreachable {
+            origin,
+            detail,
+            retry_after,
+        } => {
+            assert_eq!(origin, "moex-iss");
+            assert!(detail.contains("503"), "{detail}");
+            // The gateway's own wait survives the adapter rather than a guess.
+            assert!(retry_after.is_some_and(|wait| wait > Duration::ZERO));
+        }
+        other => panic!("expected an unreachable source, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn each_market_destination_is_named_after_its_source() {
+    let time = FakeTime::new();
+    let (adapter, _) = adapter(&time, Scripted::answering(404));
+    let requests = [
+        (
+            HttpRequest::get(Destination::CbrScripts, "/scripts/XML_daily.asp"),
+            "cbr",
+        ),
+        (
+            HttpRequest::get(
+                Destination::CbrDailyInfo,
+                "/DailyInfoWebServ/DailyInfo.asmx",
+            ),
+            "cbr",
+        ),
+        (
+            HttpRequest::get(Destination::TinvestContract, "/contracts/operations.proto"),
+            "tinvest-contract",
+        ),
+    ];
+
+    for (request, expected) in requests {
+        match adapter.send(request).await {
+            Err(AppError::SourceRefused { origin, .. }) => assert_eq!(origin, expected),
+            other => panic!("expected a refusal by {expected}, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -187,5 +234,7 @@ async fn a_request_without_a_budget_is_refused_without_sending() {
     let refused = adapter.send(broker).await.expect_err("no budget for it");
 
     assert_eq!(sent(&endpoint), 0);
+    // A request without a budget is our defect, not the source's answer.
+    assert!(matches!(refused, AppError::Store(_)), "{refused:?}");
     assert!(refused.to_string().contains("no budget"), "{refused}");
 }

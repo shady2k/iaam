@@ -68,7 +68,10 @@ impl HttpClient {
     /// The response status is **not classified** here: 401 has different
     /// meaning at a broker gateway and an exchange, and interpretation
     /// belongs to the source.
-    pub async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+    ///
+    /// Private to this crate: outside it the only way to send is
+    /// `Gateway::send`, which the `Transport` impl serves.
+    pub(crate) async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let client = self.client_for(request.destination())?;
         let mut builder = match request.method() {
             HttpMethod::Get => client.0.get(request.url()),

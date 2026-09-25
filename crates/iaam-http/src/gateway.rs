@@ -142,6 +142,16 @@ pub const BUDGETS: &[Budget] = &[
         used: 1,
         window: Duration::from_millis(100),
     },
+    // The published T-Invest contract on raw.githubusercontent.com documents
+    // no limit. It is read rarely and by hand, and one request a second
+    // cannot load anybody; a destination with no row is refused outright.
+    Budget {
+        destination: Destination::TinvestContract,
+        scope: MethodScope::Shared,
+        documented: None,
+        used: 1,
+        window: Duration::from_secs(1),
+    },
 ];
 
 /// Source of the current instant.

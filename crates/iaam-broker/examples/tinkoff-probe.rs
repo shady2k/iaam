@@ -17,7 +17,7 @@ use std::env;
 use std::fs;
 
 use iaam_http::client::HttpClient;
-use iaam_http::{Destination, HttpRequest, RequestBody};
+use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 
 // The ordinary method at the sandbox address is the method recommended by
 // T-Invest. The sandbox method at this same address returns `40003`, namely a
@@ -26,12 +26,15 @@ const METHOD: &str = "tinkoff.public.invest.api.contract.v1.UsersService/GetAcco
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = HttpClient::new();
+    // A separate process, so a gateway of its own: it shares no budget with
+    // a running server, and a probe is one request.
+    let gateway = Gateway::new(HttpClient::new())?;
     let mut request = HttpRequest::post(
         Destination::TinkoffSandbox,
         METHOD,
         RequestBody::Json("{}".to_owned()),
-    );
+    )
+    .with_reset_header("x-ratelimit-reset");
 
     match env::var("IAAM_TINKOFF_SANDBOX_TOKEN_FILE") {
         Ok(path) => {
@@ -44,7 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let response = client.send(&request).await?;
-    println!("HTTP {}", response.status);
+    // The gateway returns only a success; the expected 401 comes back as a
+    // rejection, and its status is the whole answer.
+    match gateway.send("UsersService", &request, None).await {
+        Ok(response) => println!("HTTP {}", response.status),
+        Err(GatewayError::Rejected { status, .. }) => println!("HTTP {status}"),
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }

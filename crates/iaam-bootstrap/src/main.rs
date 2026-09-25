@@ -452,7 +452,15 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // The same adapter serves as both fact storage and broker-access
     // storage: both use one database connection, and a second instance
     // would mean a second writer.
-    let adapter = Arc::new(SqliteAdapter::with_broker_key(store, broker_key));
+    //
+    // The one outbound gateway of this process: every broker channel the
+    // adapter opens sends through it, so they share one budget.
+    let gateway = Arc::new(Gateway::new(HttpClient::new())?);
+    let adapter = Arc::new(SqliteAdapter::with_broker_key(
+        store,
+        broker_key,
+        gateway.clone(),
+    ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> = adapter.clone();
     let rules: Arc<dyn ClassificationRuleStore> = adapter.clone();

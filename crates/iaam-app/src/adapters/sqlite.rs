@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_broker::operation_kind::OperationKindDictionary;
-use iaam_broker::tinkoff::TinkoffClient;
+use iaam_broker::tinkoff::{OutboundGateway, TinkoffClient};
 use iaam_core::batch::ControlSection;
 use iaam_core::contour::{ContourDefinition, ContourId, ContourVersion};
 use iaam_core::event::Event;
@@ -82,20 +82,35 @@ pub struct SqliteAdapter {
     /// them «without encryption for now» would mean storing someone else's token
     /// in plaintext and discovering this through a database leak (§14).
     broker_key: Option<Key>,
+    /// The process's one outbound gateway, shared by every broker channel
+    /// this adapter opens: a gateway per channel would be a budget per
+    /// channel, and two channels would spend twice the broker's allowance.
+    /// `None` only for an adapter built without broker access at all.
+    gateway: Option<Arc<dyn OutboundGateway>>,
 }
 
 impl SqliteAdapter {
     #[must_use]
     pub fn new(store: SqliteStore) -> Self {
-        Self::with_broker_key(store, None)
+        Self {
+            store: Arc::new(Mutex::new(store)),
+            broker_key: None,
+            gateway: None,
+        }
     }
 
-    /// The same adapter with an encryption key for broker credentials.
+    /// The same adapter with an encryption key for broker credentials and
+    /// the gateway broker channels send through.
     #[must_use]
-    pub fn with_broker_key(store: SqliteStore, key: Option<Key>) -> Self {
+    pub fn with_broker_key(
+        store: SqliteStore,
+        key: Option<Key>,
+        gateway: Arc<dyn OutboundGateway>,
+    ) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
             broker_key: key,
+            gateway: Some(gateway),
         }
     }
 
@@ -1836,8 +1851,10 @@ impl BrokerChannelFactory for SqliteAdapter {
                     what: "broker access",
                 }
             })?;
-        let client = TinkoffClient::new(environment, token)
-            .map_err(|error| AppError::Store(format!("failed to create broker client: {error}")))?;
+        let gateway = self.gateway.clone().ok_or(AppError::NotConfigured {
+            what: "outbound gateway",
+        })?;
+        let client = TinkoffClient::new(environment, token, gateway);
         // The dictionary is read here, not during parsing: `iaam-broker` intentionally
         // knows nothing about storage (see its `lib.rs`), and the adapter links
         // them — using the same approach already used for SQLite.
@@ -2512,5 +2529,64 @@ mod tests {
         assert!(message.contains("ticker:ABC"));
         assert!(message.contains("2026-08-25"));
         assert!(message.contains("2"));
+    }
+
+    /// Two channels the factory opens in one process draw on one budget:
+    /// OperationsService allows this process 50 calls a minute, so the 51st
+    /// waits for the minute whichever channel makes it.
+    #[tokio::test]
+    async fn channels_opened_by_the_factory_share_one_budget() {
+        use std::time::Duration;
+
+        use crate::adapters::tinkoff::fake::{self, Answer};
+        use crate::ports::{BrokerEnvironment, BrokerVault};
+
+        let (gateway, log, time) = fake::gateway(
+            Vec::new(),
+            Some(Answer::status(200, r#"{"hasNext":false,"items":[]}"#)),
+        );
+        let adapter = SqliteAdapter::with_broker_key(
+            SqliteStore::open_in_memory().expect("memory store"),
+            Some(Key::from_bytes([7; 32])),
+            gateway,
+        );
+        let owner = OwnerId::new_random();
+        adapter
+            .add_access(
+                owner,
+                "tinkoff".to_owned(),
+                BrokerEnvironment::Prod,
+                zeroize::Zeroizing::new("invented-token".to_owned()),
+            )
+            .await
+            .expect("access is set up");
+        let first = adapter.open(owner, "tinkoff").await.expect("first channel");
+        let second = adapter
+            .open(owner, "tinkoff")
+            .await
+            .expect("second channel");
+        let fetch = |channel: &Arc<dyn BrokerChannel>| {
+            let channel = Arc::clone(channel);
+            async move {
+                channel
+                    .fetch_operations(
+                        iaam_core::ids::AccountId::new_random(),
+                        time::macros::date!(2026 - 08 - 01),
+                        time::macros::date!(2026 - 08 - 31),
+                    )
+                    .await
+                    .expect("one page")
+            }
+        };
+
+        for _ in 0..25 {
+            fetch(&first).await;
+            fetch(&second).await;
+        }
+        assert!(time.slept().is_empty(), "fifty calls fit the minute");
+        fetch(&second).await;
+
+        assert_eq!(time.slept(), [Duration::from_secs(60)]);
+        assert_eq!(log.lock().expect("log").len(), 51);
     }
 }

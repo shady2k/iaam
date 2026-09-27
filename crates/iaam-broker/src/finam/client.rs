@@ -70,12 +70,13 @@ pub enum FinamError {
     MalformedResponse,
 }
 
-/// A session token of the Trade API and the moment it stops working, both
-/// read against the client's own clock.
+/// A session token of the Trade API, the moment it stops working, and the
+/// moment it was issued — all read against the client's own clock.
 #[derive(Clone)]
 struct Session {
     token: Secret,
     expires_at: Instant,
+    issued_at: Instant,
 }
 
 /// Finam HTTP client returning raw response bodies.
@@ -159,6 +160,13 @@ impl FinamClient {
             .await?;
         let value: Value =
             serde_json::from_str(&body).map_err(|_| FinamError::MalformedResponse)?;
+        // The details answer describes the very token the call carried:
+        // its created/expires span is that token's true lifetime. The span
+        // is a duration, so it corrects the remembered expiry on the
+        // client's own clock, with no wall clock crossing here.
+        if let Some(lifetime) = lifetime_of(&value) {
+            self.correct_session_lifetime(lifetime);
+        }
         let ids = value
             .get("account_ids")
             .and_then(Value::as_array)
@@ -249,13 +257,28 @@ impl FinamClient {
         }
     }
 
+    /// Re-anchor the live session's end on the lifetime its details answer
+    /// stated. The anchor stays the session's own issuance moment, so a
+    /// correction moves only the end, and only on the client's clock.
+    fn correct_session_lifetime(&self, lifetime: Duration) {
+        let mut guard = self.session.lock().expect("session lock");
+        if let Some(session) = guard.as_mut() {
+            session.expires_at = session.issued_at + lifetime;
+        }
+    }
+
     /// Exchange the secret for a session token (`POST /v1/sessions`): the
     /// one call that carries the secret, in the body alone, as the method's
     /// page shows (https://api.finam.ru/docs/rest/authservice_auth.md/).
     /// The answer names the token and nothing else, so its lifetime is the
-    /// documented one. Minting a session has no effect on the account, so
-    /// the gateway may repeat it like any read.
+    /// documented one until a details answer corrects it. Minting a
+    /// session has no effect on the account, so the gateway may repeat it
+    /// like any read.
     async fn exchange(&self) -> Result<Session, FinamError> {
+        // The anchor precedes the send: Finam creates the token between
+        // the request and the answer, so measuring its life from the
+        // request can only renew early, never late.
+        let issued_at = self.clock.now();
         let request = HttpRequest::post(
             Destination::FinamApi,
             "/v1/sessions",
@@ -278,7 +301,8 @@ impl FinamClient {
         }
         Ok(Session {
             token: Secret::new(token),
-            expires_at: self.clock.now() + SESSION_LIFETIME,
+            issued_at,
+            expires_at: issued_at + SESSION_LIFETIME,
         })
     }
 
@@ -323,6 +347,15 @@ fn rfc3339_midnight(date: Date) -> String {
     OffsetDateTime::new_utc(date, Time::MIDNIGHT)
         .format(&Rfc3339)
         .unwrap_or_else(|_| format!("{date}T00:00:00Z"))
+}
+
+/// The lifetime a details answer states for the token it describes: the
+/// span from `created_at` to `expires_at`, both RFC 3339. `None` when the
+/// answer names either end unreadably — the documented lifetime stands.
+fn lifetime_of(value: &Value) -> Option<Duration> {
+    let created = OffsetDateTime::parse(value.get("created_at")?.as_str()?, &Rfc3339).ok()?;
+    let expires = OffsetDateTime::parse(value.get("expires_at")?.as_str()?, &Rfc3339).ok()?;
+    Duration::try_from(expires - created).ok()
 }
 
 /// Finam's meaning of a call the gateway did not complete. The refused body
@@ -714,6 +747,7 @@ mod tests {
 
         client.keep(super::Session {
             token: iaam_http::Secret::new(JWT_TWO),
+            issued_at: time.now(),
             expires_at: time.now() + Duration::from_secs(60),
         });
 
@@ -1118,6 +1152,84 @@ mod tests {
         assert_eq!(error, FinamError::MalformedResponse);
     }
 
+    /// The details answer describes the very token the call carried: a
+    /// ten-minute span there means the session dies ten minutes in, not
+    /// the documented fifteen.
+    #[tokio::test]
+    async fn the_details_answer_corrects_the_session_s_lifetime() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, "{}")
+                .then(
+                    200,
+                    r#"{"account_ids":["One"],"created_at":"2026-01-01T00:00:00Z",
+                       "expires_at":"2026-01-01T00:10:00Z"}"#,
+                )
+                .then(200, &session_answer(JWT_TWO))
+                .then(200, "{}"),
+        );
+        let (client, time) = client_over(BUDGETS, &endpoint);
+
+        client
+            .get_portfolio("Main")
+            .await
+            .expect("the first session");
+        client.get_account_ids().await.expect("the accounts");
+
+        // One second inside the corrected margin: the ten-minute token is
+        // exchanged anew, though the uncorrected fifteen-minute assumption
+        // would still call it good for four more minutes and reuse it.
+        let corrected = Duration::from_secs(10 * 60);
+        time.advance(corrected - RENEW_BEFORE + Duration::from_secs(1));
+
+        client
+            .get_portfolio("Main")
+            .await
+            .expect("the renewed session");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 5);
+        assert_eq!(received[3].url(), "https://api.finam.ru/v1/sessions");
+        assert_eq!(
+            received[4].bearer().map(|token| token.expose()),
+            Some(JWT_TWO)
+        );
+    }
+
+    /// The answer naming the documented lifetime leaves the session exactly
+    /// as alive as the default did: no early renewal may creep in.
+    #[tokio::test]
+    async fn a_full_lifetime_details_answer_leaves_the_session_alive() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, "{}")
+                .then(
+                    200,
+                    r#"{"account_ids":["One"],"created_at":"2026-01-01T00:00:00Z",
+                       "expires_at":"2026-01-01T00:15:00Z"}"#,
+                )
+                .then(200, "{}"),
+        );
+        let (client, time) = client_over(BUDGETS, &endpoint);
+
+        client
+            .get_portfolio("Main")
+            .await
+            .expect("the first session");
+        client.get_account_ids().await.expect("the accounts");
+
+        time.advance(Duration::from_secs(60));
+        client.get_portfolio("Main").await.expect("portfolio");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 4);
+        assert_eq!(
+            received[3].bearer().map(|token| token.expose()),
+            Some(JWT_ONE)
+        );
+    }
     #[tokio::test]
     async fn a_401_before_the_details_is_renewed_and_retried_once() {
         let endpoint = Arc::new(

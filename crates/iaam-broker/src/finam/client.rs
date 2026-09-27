@@ -144,7 +144,7 @@ impl FinamClient {
 
     /// The account ids the access sees, from `POST /v1/sessions/details`.
     pub async fn get_account_ids(&self) -> Result<Vec<String>, FinamError> {
-        let body = self
+        let (body, token) = self
             .authorized(SESSIONS, |token| {
                 // The token rides the body, as the method's page passes it,
                 // and the bearer, as the API's authentication asks of every
@@ -160,24 +160,26 @@ impl FinamClient {
             .await?;
         let value: Value =
             serde_json::from_str(&body).map_err(|_| FinamError::MalformedResponse)?;
-        // The details answer describes the very token the call carried:
-        // its created/expires span is that token's true lifetime. The span
-        // is a duration, so it corrects the remembered expiry on the
-        // client's own clock, with no wall clock crossing here.
-        if let Some(lifetime) = lifetime_of(&value) {
-            self.correct_session_lifetime(lifetime);
-        }
         let ids = value
             .get("account_ids")
             .and_then(Value::as_array)
             .ok_or(FinamError::MalformedResponse)?;
-        ids.iter()
+        let ids: Vec<String> = ids
+            .iter()
             .map(|id| {
                 id.as_str()
                     .map(str::to_owned)
                     .ok_or(FinamError::MalformedResponse)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        // The answer describes the very token the call carried, so its
+        // created/expires span is that token's true lifetime — applied only
+        // after the answer has fully checked out, and only to the session
+        // that still holds that token.
+        if let Some(lifetime) = lifetime_of(&value) {
+            self.correct_session_lifetime(token.expose(), lifetime);
+        }
+        Ok(ids)
     }
 
     /// Send a reading call over the session token.
@@ -196,19 +198,21 @@ impl FinamClient {
             request
         })
         .await
+        .map(|(body, _)| body)
     }
 
     /// Send an authorized call: the session token is the bearer. A 401 to
     /// that token is answered with one fresh exchange and one retry; the
-    /// second 401 is a refusal.
+    /// second 401 is a refusal. Returns the body and the token that
+    /// finally carried it.
     async fn authorized(
         &self,
         method: &'static str,
         build: impl Fn(&str) -> HttpRequest,
-    ) -> Result<String, FinamError> {
+    ) -> Result<(String, Secret), FinamError> {
         let session = self.session().await?;
         let step = match self.raw(method, &build(session.token.expose())).await {
-            Ok(body) => return Ok(body),
+            Ok(body) => return Ok((body, session.token.clone())),
             Err(step) => step,
         };
         if !step.is_unauthorized() {
@@ -217,7 +221,7 @@ impl FinamClient {
         let fresh = self.exchange().await?;
         self.keep(fresh.clone());
         match self.raw(method, &build(fresh.token.expose())).await {
-            Ok(body) => Ok(body),
+            Ok(body) => Ok((body, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
         }
     }
@@ -256,14 +260,18 @@ impl FinamClient {
             *guard = Some(fresh);
         }
     }
-
     /// Re-anchor the live session's end on the lifetime its details answer
     /// stated. The anchor stays the session's own issuance moment, so a
-    /// correction moves only the end, and only on the client's clock.
-    fn correct_session_lifetime(&self, lifetime: Duration) {
+    /// correction moves only the end, and only on the client's clock. The
+    /// answer names the token it described: a concurrent renewal may have
+    /// replaced that session since, and a stranger's end is not ours to
+    /// write.
+    fn correct_session_lifetime(&self, token: &str, lifetime: Duration) {
         let mut guard = self.session.lock().expect("session lock");
         if let Some(session) = guard.as_mut() {
-            session.expires_at = session.issued_at + lifetime;
+            if session.token.expose() == token {
+                session.expires_at = session.issued_at + lifetime;
+            }
         }
     }
 
@@ -446,6 +454,7 @@ mod tests {
     const SECRET: &str = "finam-invented-secret";
     const JWT_ONE: &str = "invented.jwt.one";
     const JWT_TWO: &str = "invented.jwt.two";
+    const JWT_THREE: &str = "invented.jwt.three";
 
     /// An exchange answer naming the given session token.
     fn session_answer(token: &str) -> String {
@@ -1230,6 +1239,51 @@ mod tests {
             Some(JWT_ONE)
         );
     }
+
+    /// A correction names the token its answer described: a stale answer
+    /// for the long-gone first token must not rewrite a newer session's
+    /// end, even with a span that expired long ago.
+    #[tokio::test]
+    async fn a_stale_correction_leaves_a_newer_session_alone() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, "{}")
+                .then(200, &session_answer(JWT_TWO))
+                .then(200, "{}")
+                .then(200, &session_answer(JWT_THREE))
+                .then(200, "{}"),
+        );
+        let (client, time) = client_over(BUDGETS, &endpoint);
+
+        client
+            .get_portfolio("Main")
+            .await
+            .expect("the first session");
+
+        // Past the margin: the renewal puts the second token in the cache.
+        time.advance(SESSION_LIFETIME - RENEW_BEFORE + Duration::from_secs(1));
+        client
+            .get_portfolio("Main")
+            .await
+            .expect("the renewed session");
+
+        // A stale answer for the long-gone first token names that token's
+        // long-over span. It is not this session's to inherit: left
+        // unguarded it would drag the second token's end to now.
+        client.correct_session_lifetime(JWT_ONE, Duration::from_secs(60));
+
+        time.advance(Duration::from_secs(60));
+        client.get_portfolio("Main").await.expect("portfolio");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 5);
+        assert_eq!(
+            received[4].bearer().map(|token| token.expose()),
+            Some(JWT_TWO)
+        );
+    }
+
     #[tokio::test]
     async fn a_401_before_the_details_is_renewed_and_retried_once() {
         let endpoint = Arc::new(

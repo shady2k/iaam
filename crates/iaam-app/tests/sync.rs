@@ -2745,6 +2745,98 @@ async fn an_unbound_account_is_bound_to_the_one_account_the_access_sees() {
         ["solo", "solo"],
     );
 }
+/// **A sync that fails after discovering the account leaves no binding.**
+/// The binding is written only once both of the broker's answers are in:
+/// a number whose operations or portfolio never arrived has proven
+/// nothing, and a binding recorded anyway would make the next sync skip
+/// the discovery and trust a number nothing confirmed.
+#[tokio::test]
+async fn a_sync_that_fails_after_discovery_leaves_no_binding() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    services
+        .store
+        .upsert_account(
+            owner,
+            iaam_app::ports::AccountView {
+                id: account,
+                title: "Main".to_owned(),
+                institution: Some("Test Bank".to_owned()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed account: {error}"));
+    let mut broker = quiet_broker(vec!["solo".to_owned()]);
+    broker.operations = Err(BrokerError::Unreachable {
+        broker: "test".to_owned(),
+        detail: "offline".to_owned(),
+        retry_after: None,
+    });
+
+    let error = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .expect_err("the operations request fails");
+
+    assert!(
+        matches!(error, AppError::SourceUnreachable { .. }),
+        "{error:?}"
+    );
+    assert!(
+        load_all(&services, owner).await.is_empty(),
+        "the journal is unchanged"
+    );
+    assert_eq!(
+        services
+            .store
+            .broker_account_binding(owner, account, &broker_code())
+            .await
+            .unwrap_or_else(|error| panic!("binding read: {error}")),
+        None,
+        "no binding stands behind a failed sync"
+    );
+
+    // The next sync asks the access again and binds on its own success.
+    broker.operations = Ok(empty_operations());
+    let outcome = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("the retry: {error}"));
+
+    assert!(outcome.binding_recorded, "the retry binds it");
+    assert_eq!(
+        services
+            .store
+            .broker_account_binding(owner, account, &broker_code())
+            .await
+            .unwrap_or_else(|error| panic!("binding read: {error}")),
+        Some("solo".to_owned()),
+    );
+    assert_eq!(
+        broker.accounts_requests.load(Ordering::SeqCst),
+        2,
+        "the retry discovered the account again"
+    );
+}
 
 #[tokio::test]
 async fn several_candidates_refuse_the_sync_before_anything_is_fetched() {

@@ -12,6 +12,7 @@
   "staleDays": 14,
   "holdDays": 2,
   "bulkCluster": 20,
+  "timeRecordsExempt": [],
   "execution": {
     "development": "tdd",
     "runMode": "worker-sessions",

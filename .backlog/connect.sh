@@ -17,7 +17,8 @@ need() { if ! "$@" >/dev/null 2>&1; then echo "CONNECT: missing: $*" >&2; missin
 need command -v node
 need command -v bd
 for f in .backlog/config.json .backlog/adapter.mjs .backlog/gate.mjs .backlog/commits.mjs \
-         .backlog/rules/check.mjs .backlog/rules/check-commits.mjs .backlog/rules/check-docs.mjs; do
+         .backlog/rules/check.mjs .backlog/rules/time-format.mjs .backlog/rules/check-commits.mjs \
+         .backlog/rules/check-docs.mjs; do
   need test -r "$f"
 done
 if command -v node >/dev/null 2>&1; then

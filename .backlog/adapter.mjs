@@ -62,12 +62,23 @@ export function normalize(rows, source) {
         updatedAt: r.updated_at,
         createdAt: r.created_at,
         holder: r.assignee || null,
+        comments: records(r),
       };
       if (s === 'submitted') out.delivery = { revision: meta.shady2k_revision || '', evidence: meta.shady2k_evidence || '' };
       if (s === 'implemented') out.integration = { revision: meta.shady2k_revision || '', evidence: meta.shady2k_evidence || '' };
       return out;
     });
   return { generatedAt: new Date().toISOString(), source, issues };
+}
+
+// The set's work records (claims, receipts, stops) are comments whose text
+// starts with `[shady2k-time`. They go out raw and whole, damaged or not, with
+// beads' own comment id: the gate judges them and the run script reads them, so
+// a record dropped here is time lost with nothing to say so.
+function records(r) {
+  return (r.comments || [])
+    .filter((c) => (c.text || '').startsWith('[shady2k-time'))
+    .map((c) => ({ id: c.id, at: c.created_at, author: c.author, body: c.text }));
 }
 
 function parseJsonl(text) {

@@ -63,7 +63,12 @@ pub struct ChannelOperation {
     pub payment: Option<ChannelMoney>,
     pub price: Option<Dec>,
     pub accrued_interest: Option<Dec>,
-    pub transaction_category: String,
+    /// The transaction's own grouping, verbatim, when the wire printed one.
+    ///
+    /// Deliberately NOT defaulted to `category`: the category is the
+    /// operation's word, and a consumer that files the two into one slot
+    /// makes a rule written on the grouping fire on rows it never described.
+    pub transaction_category: Option<String>,
     pub transaction_name: Option<String>,
     pub deduplication_key: String,
     pub parser_version: ParserVersion,
@@ -187,7 +192,7 @@ fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {
         payment,
         price,
         accrued_interest,
-        transaction_category: item.transaction_category.unwrap_or(category),
+        transaction_category: nonempty(item.transaction_category),
         transaction_name: nonempty(item.transaction_name),
         deduplication_key: operation_id.clone(),
         parser_version: ParserVersion(FINAM_PARSER_VERSION.to_owned()),
@@ -206,7 +211,7 @@ fn rejected_operation(raw: Value, reason: ParseError) -> ChannelOperation {
         payment: None,
         price: None,
         accrued_interest: None,
-        transaction_category: String::new(),
+        transaction_category: None,
         transaction_name: None,
         deduplication_key: String::new(),
         parser_version: ParserVersion(FINAM_PARSER_VERSION.to_owned()),

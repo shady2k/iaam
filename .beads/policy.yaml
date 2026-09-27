@@ -1,0 +1,8 @@
+# Statuses of this project. `submitted` (a worker's result, awaiting merge) and
+# `implemented` (merged into its stage, awaiting acceptance) are the backlog
+# protocol's; the transition that sets one carries "<status>: <rev> -- <evidence>"
+# as its comment. Neither is ready: `br ready` offers `open` only.
+workflow:
+  statuses: [open, in_progress, blocked, deferred, submitted, implemented, closed]
+  status_groups:
+    ready: [open]

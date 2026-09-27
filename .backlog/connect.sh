@@ -15,7 +15,7 @@ cd "$REPO_ROOT"
 missing=0
 need() { if ! "$@" >/dev/null 2>&1; then echo "CONNECT: missing: $*" >&2; missing=1; fi; }
 need command -v node
-need command -v bd
+need command -v br
 for f in .backlog/config.json .backlog/adapter.mjs .backlog/gate.mjs .backlog/commits.mjs \
          .backlog/rules/check.mjs .backlog/rules/time-format.mjs .backlog/rules/check-commits.mjs \
          .backlog/rules/check-docs.mjs; do
@@ -30,14 +30,14 @@ if [ "$missing" -ne 0 ]; then
   exit 1
 fi
 
-# The tracker first: a fresh clone has the committed export but no database,
-# and every hook below reads the database. Bootstrap never deletes issues, but
-# it refuses a database that already exists, so a connected clone skips it.
-bd count >/dev/null 2>&1 || bd bootstrap --yes >/dev/null \
-  || { echo "CONNECT: bd bootstrap failed; the tracker is not readable in this clone" >&2; exit 1; }
-# Beads points git at .beads/hooks, the committed hooks this installation extends.
-[ "$(git config --get core.hooksPath)" = ".beads/hooks" ] || bd hooks install --beads >/dev/null \
-  || { echo "CONNECT: bd hooks install --beads failed" >&2; exit 1; }
+# The tracker first: a fresh clone has the committed export but no database, and
+# every hook below reads the database. br builds it from the export; a connected
+# clone already has one and is left alone. br never runs git.
+br count >/dev/null 2>&1 || br sync --import-only --quiet >/dev/null \
+  || { echo "CONNECT: br could not build its database from .beads/issues.jsonl" >&2; exit 1; }
+# The committed hooks live in .beads/hooks; br does not manage hooks, so git is
+# pointed there once and nothing regenerates them.
+[ "$(git config --get core.hooksPath)" = ".beads/hooks" ] || git config core.hooksPath .beads/hooks
 
 # The project's own hooks (privacy guard, worktree sweep), then ours into the
 # same directory git actually consults.
@@ -49,8 +49,7 @@ case "$hooks_dir" in /*) ;; *) hooks_dir="$REPO_ROOT/$hooks_dir" ;; esac
 IFS= read -r -d '' PRE_BLOCK <<'BLOCK' || true
 
 # --- BEGIN IAAM BACKLOG GATE (iaam-oik0) ---
-# Managed by .backlog/connect.sh, outside the beads markers so it survives
-# `bd hooks install`. Acts only in a clone that ran make backlog-connect.
+# Managed by .backlog/connect.sh. Acts only in a clone that ran make backlog-connect.
 if [ "$(git config --get iaam.backlog)" = "on" ]; then
   _iaam_root=$(git rev-parse --show-toplevel) || exit 1
   if [ ! -r "$_iaam_root/.backlog/gate.mjs" ] || ! command -v node >/dev/null 2>&1; then
@@ -69,7 +68,7 @@ IFS= read -r -d '' LAYOUT_BLOCK <<'BLOCK' || true
 # Managed by .backlog/connect.sh. The tracker is one state for every branch, so
 # its export is committed on main only: a branch carries what it delivers.
 if [ "$(git config --get iaam.backlog)" = "on" ]; then
-  _iaam_staged=$(git diff --cached --name-only -- .beads/issues.jsonl .beads/interactions.jsonl)
+  _iaam_staged=$(git diff --cached --name-only -- .beads/issues.jsonl)
   if [ -n "$_iaam_staged" ]; then
     _iaam_branch=$(git symbolic-ref --quiet --short HEAD || echo "a detached HEAD")
     if [ "$_iaam_branch" != "main" ]; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// What a worker may take now, in one stage and one checkout. `bd ready` alone is
-// not this: it offers submitted and implemented leaves again (beads keeps them
-// `open`), and it cannot tell whether an implemented prerequisite is merged here.
+// What a worker may take now, in one stage and one checkout. `br ready` alone is
+// not this: it never releases a dependant whose prerequisite is `implemented`
+// and merged here, since br releases only on close.
 //
 //   ready.mjs [--stage <id>] [--checkout <rev>]   (checkout defaults to HEAD)
 //

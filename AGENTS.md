@@ -8,28 +8,67 @@ through `close-out`. Read Backlog integration in `docs/backlog-integration.md`
 before writes. When a skill reports the installation is out of date, run
 `setup-shady2k-skills`.
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+## The tracker: `br`
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
-
-## Quick Reference
+The backlog lives in **`br`** (beads_rust): one SQLite database per machine plus
+the tracked export `.beads/issues.jsonl`. Filing, taking and closing work go
+through the skills above; the commands below are how the tracker works, not a
+way around them. `bd` (beads with Dolt) was this project's tracker until
+2026-09-27 and is not used any more.
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+br ready --json                              # what can start (see ready.mjs below)
+br show <id>                                 # one item, with comments
+br update <id> --claim --actor "<agent>"     # atomic, exclusive claim
+br close <id> --reason "..."                 # after stage acceptance only
+br sync --flush-only                         # db -> .beads/issues.jsonl
 ```
+
+**`br` never runs git.** Nothing commits, pushes or pulls the backlog for you.
+The export is committed **on `main` only**, in `chore(beads): ...` commits: the
+pre-commit hook refuses `.beads/issues.jsonl` staged on any other branch, so a
+feature branch carries what it delivers and never the tracker. `br` resolves
+the database of the **main checkout** even from a worktree, so every worktree
+sees one tracker. A `git pull` that brings a newer export is imported by the
+next `br` command on its own.
+
+**Publish every backlog write promptly** — on `main`: `br sync --flush-only`,
+commit `.beads/issues.jsonl`, push. An unpublished item exists for nobody else.
+
+**Never run `br sync --merge` to catch up.** It tombstones every issue the
+database holds and the export does not — measured in a sibling project on
+2026-09-11: 70 records killed by one run after a fast-forward. For a database
+that is merely ahead, `br sync --reconcile-additive` adds without deleting. A
+tombstone is not undone by `br update`; the repair is to rebuild the lines from
+`git show`, `br delete --hard` the ids, and `br sync --import-only`.
+
+**Always claim with `--actor`**, the agent's full name
+(`<harness>-<role>:<person>@<machine>:<branch>#<session>`); without it `br`
+records the person. `claim_exclusive` refuses a claim while another actor holds
+the item. A same-stage dependant of an `implemented` prerequisite is still
+blocked to `br`: claim it with `--claim --force --actor ...`, which stays atomic
+and keeps the edge. `br ready` alone does not know that case: the integration's
+`node .backlog/ready.mjs --stage <id>` does.
+
+**`submitted` and `implemented` are statuses of this project**
+(`.beads/policy.yaml`), set with the evidence bound to the transition:
+`br update <id> --status implemented --transition-comment "implemented: <rev> -- <checks>"`.
+
+**TodoWrite, TaskCreate and markdown TODO lists are forbidden.** `br` is the
+tracker for all work, including your own checklists.
+
+**Recall is `deja`, not the tracker.** `br` has no memory store. A lesson every
+agent must follow goes into **Lessons** below, through a commit someone reads;
+what you personally worked out is found again through `deja`.
+
+## Session completion
+
+1. File what remains through `to-backlog`.
+2. Run the quality gates if code changed.
+3. Update item status: close accepted work, release what you hold and did not finish.
+4. On `main`: `br sync --flush-only`, commit `.beads/issues.jsonl`, `git push`
+   (this repository opts in to committing and pushing; see `CLAUDE.md`).
+5. Hand off: changes, validation, item status, and any blocked step with its exact error.
 
 ## Non-Interactive Shell Commands
 
@@ -78,82 +117,96 @@ paths are run-time arguments living outside this repository; never commit one,
 and never point a script at real data to check that it works. Each tool's
 fixtures are invented end to end and are what you test against.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
-## Beads Issue Tracker
+## Lessons
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+What earlier sessions paid for, kept where every agent reads it. Each entry
+stays only while its cause does: a change that removes the cause removes the
+entry in the same commit. Moved here from the tracker's memory store on
+2026-09-27.
 
-### Quick Reference
+### Tracker items
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
+- **Title:** one sentence naming the defect or the goal, with no type or
+  priority prefix; those are fields.
+- **Substance goes in the description**, never only in notes: search reads the
+  description, and evidence kept in notes is what produced duplicate items here.
+  Notes are a running log.
+- **Criteria go in `--acceptance`**, not a heading typed into the description; a
+  bug also carries `## Steps to Reproduce` in its description.
+- **Labels are only the config's vocabulary** (`.backlog/config.json`); never a
+  label for what a field already says (type, parent, priority).
+- **Defer, do not block, on an epic or on work not filed yet:** a dependency
+  names a real task.
 
-### Rules
+### What a worker's check must include
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- `cargo clippy --workspace --all-targets`, `cargo nextest run --workspace` and
+  `./scripts/check-architecture.sh`. The last runs in seconds and catches what
+  clippy and the tests pass: a crate depending on a higher layer, and checked
+  arithmetic in the shell crates, where every number comes from core. A type
+  both the store and ingest consume belongs in `iaam-core`.
+- A crate subset is not enough: `SCHEMA_VERSION` of `iaam-core` is pinned in
+  `crates/iaam-server/tests/contract.rs`.
+- `cargo check -p` does not build test targets: a task touching `EventKind` runs
+  the tests of every crate with integration tests on that variant.
+- A brief for a change to a public type or signature lists files by where the
+  type is **used** (grep the constructors), not only where it is defined, and
+  separates mechanical adaptation of a test (allowed) from changing what it
+  asserts (not allowed).
+- A plan's code blocks name only functions that exist: grep each name before
+  the plan is handed over.
 
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
+### Domain traps
 
-## Agent Context Profiles
+- **A new `EventKind` variant breaks seven exhaustive dispatchers**
+  (`event/kind.rs` discriminant and `flow_endpoints`, `event/mod.rs`
+  `validate_structure`, `projection/lots.rs` `LotBook::apply`,
+  `iaam-app` `jobs.rs` `active_instruments` and `scenarios/classification.rs`
+  `subject`, `iaam-ingest` `classification.rs` `classification_of`). Three need
+  a decision and corrupt figures silently when guessed: `flow_endpoints`,
+  `classification_of` and `subject`. An event that moves money but is not the
+  owner's decision (amortisation, say) returns `None` from both classifiers.
+  Adding the variant is one task, or the workspace stays red for several commits.
+- **Migration `0008_quotation_basis`** gives every older observation the basis
+  `unknown` with an empty `basis_evidence`. That is a valid unproven record, not
+  a defect: a check that rejects the empty evidence breaks every migrated
+  database, and tests seed fresh rows, so they do not see it.
+- **One document, one `SourceId`** for all its events in reconciliation tests,
+  or grouping by document falls apart silently (`crates/iaam-core/tests/support/mod.rs::TestChannel`).
+- **A defective past fact is found by the defect's own shape**, never by parser
+  version or source channel: versions are bumped by sibling work, and a
+  channel's `SourceId` names the currently active broker access.
+- **A broker-channel fact is not repaired by importing it again:** the new
+  reading differs by fingerprint and is inserted beside the old one. Repair is a
+  reversal or a maintenance entry point.
+- **MOEX ISS gives no cursor and no count**, so completeness is proved by
+  structure (`crates/iaam-market/src/schedule/completeness.rs`): a closed chain
+  of coupon periods, a tail matching the last principal repayment, repayment
+  shares summing to exactly 100%. The second is the only one that catches a
+  truncated page.
+- **utoipa 5 registers nested schemas transitively:** removing a type from
+  `components(schemas(...))` does not remove it from the document while another
+  schema reaches it, and nothing in `contract.rs` checks for dangling `$ref`.
+- **T-Invest's sandbox needs its own token** (a production token gets
+  401/40003 there); the sandbox returns no coupons, dividends or taxes, and the
+  token expires three months after last use. `GetBrokerReport` is the reports
+  channel, not a second independent channel.
 
-The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
+### Tests and tools
 
-- **Conservative (default)**: Use `bd` for task tracking. Do not run git commits, git pushes, or Dolt remote sync unless explicitly asked. At handoff, report changed files, validation, and suggested next commands.
-- **Minimal**: Keep tool instruction files as pointers to `bd prime`; use the same conservative git policy unless active instructions say otherwise.
-- **Team-maintainer**: Only when the repository explicitly opts in, agents may close beads, run quality gates, commit, and push as part of session close. A current "do not commit" or "do not push" instruction still wins.
-
-## Session Completion
-
-This protocol applies when ending a Beads implementation workflow. It is subordinate to explicit user, repository, and orchestrator instructions.
-
-1. **File issues for remaining work** - Create beads for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **Handle git/sync by active profile**:
-   ```bash
-   # Conservative/minimal/default: report status and proposed commands; wait for approval.
-   git status
-
-   # Team-maintainer opt-in only, unless current instructions forbid it:
-   git pull --rebase
-   bd dolt push
-   git push
-   git status
-   ```
-5. **Hand off** - Summarize changes, validation, issue status, and any blocked sync/commit/push step
-
-**Critical rules:**
-- Explicit user or orchestrator instructions override this Beads block.
-- Do not commit or push without clear authority from the active profile or the current user request.
-- If a required sync or push is blocked, stop and report the exact command and error.
-<!-- END BEADS INTEGRATION -->
-
-<!-- BEGIN BEADS CODEX SETUP: generated by bd setup codex -->
-## Beads Issue Tracker
-
-Use Beads (`bd`) for durable task tracking in repositories that include it. Use the `beads` skill at `.agents/skills/beads/SKILL.md` (project install) or `~/.agents/skills/beads/SKILL.md` (global install) for Beads workflow guidance, then use the `bd` CLI for issue operations.
-
-### Quick Reference
-
-```bash
-bd ready                # Find available work
-bd show <id>            # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>           # Complete work
-bd prime                # Refresh Beads context
-```
-
-### Rules
-
-- Use `bd` for all task tracking; do not create markdown TODO lists.
-- Run `bd prime` when Beads context is missing or stale. Codex 0.129.0+ can load Beads context automatically through native hooks; use `/hooks` to inspect or toggle them.
-- Keep persistent project memory in Beads via `bd remember`; do not create ad hoc memory files.
-
-**Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
-<!-- END BEADS CODEX SETUP -->
+- **A literal moment in a test is a time bomb** when it is compared with
+  `now_utc()`: build it as `OffsetDateTime::now_utc() + Duration`. Before
+  touching code, `grep -rn 'datetime!(20' crates/*/tests/`. A red test on a clean
+  tree is checked against `git stash` before blaming your change.
+- **A SQLite `STRICT` primary key is implicitly `NOT NULL`:** for a key with an
+  optional column use a `UNIQUE INDEX` over `ifnull(col, '')`.
+- **Never copy a live iaam database with `cp`:** it runs in WAL mode. Use
+  `sqlite3 <db> ".backup <dest>"`, or checkpoint first and move `.db`, `-wal`
+  and `-shm` together.
+- **`scripts/check-mutants.sh` writes per module** under
+  `target/mutants/<module>/mutants.out/`; the survivors are
+  `cat target/mutants/*/mutants.out/missed.txt`. Judge a run by its exit code
+  and those files, never by the tail of its output.
+- **Every worktree builds its own `target/`**, 15–20 GB each; a full disk shows
+  up as an opaque rustc exit 101. Remove a worktree as soon as its branch is
+  merged (`make sweep`), and keep at most a few alive.

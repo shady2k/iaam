@@ -79,7 +79,7 @@ function main(argv) {
     console.error(`  ${v.id.slice(0, 12)}: ${what}`);
   }
   console.error('Fix: put the task id in parentheses in the message, e.g. "Fix the thing (iaam-abcd)".');
-  console.error('No task yet? File one first (bd create ..., or the to-backlog skill).');
+  console.error('No task yet? File one first through the to-backlog skill.');
   return 1;
 }
 

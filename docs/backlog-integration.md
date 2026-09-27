@@ -20,21 +20,24 @@ are the repository's installation, and each person's plugin and hooks are theirs
   `.internal/plans/`, linked from their epic's description. Short deltas live on
   the task itself.
 - **Document resources:** none installed; the document gate is not installed.
-- **Tracker layout:** the store is beads' Dolt database, outside every branch
-  (synced through `refs/dolt/data`). Its export, `.beads/issues.jsonl` with
-  `.beads/interactions.jsonl`, is committed on `main` only, in `chore(beads): ...`
-  commits: the pre-commit block `IAAM TRACKER LAYOUT` refuses either file staged
-  on any other branch, so a feature branch never carries the tracker. The
-  tracker at a code revision is that export as committed at it
+- **Tracker layout:** the store is `br` (beads_rust, 0.7+): one SQLite database
+  per machine under `.beads/`, which `br` resolves to the main checkout's even
+  from a worktree, and its JSONL export `.beads/issues.jsonl`. Until 2026-09-27
+  it was bd with Dolt (iaam-r1v7); the export format is the same, so revisions
+  from before read alike. The export is committed on `main` only, in
+  `chore(beads): ...` commits: the pre-commit block `IAAM TRACKER LAYOUT` refuses
+  it staged on any other branch, so a feature branch never carries the tracker.
+  `br` never runs git: publishing is `br sync --flush-only`, a commit on `main`
+  and a push. The tracker at a code revision is that export as committed at it
   (`adapter.mjs --at <rev>`); transitions over a range are the difference
   between the exports at its two ends. Known limit: an export committed on
   `main` still carries the states of runs not landed yet (a claim, a submitted
-  or implemented leaf on another feature's branch): its `implemented` states
-  point at their recorded revision, not at `main`. At the end of a session the
-  export is committed on `main`, never on the working branch.
-- **Workflow ownership:** beads is the one authority for task status. The
-  beads-superpowers plugin and its hooks stay as they are; this installation
-  adds blocks outside the beads markers and changes none of beads' own.
+  or implemented leaf on another feature's branch). `br sync --merge` is never
+  used to catch up: it tombstones what the export lacks; `--reconcile-additive`
+  is (AGENTS.md, The tracker: br).
+- **Workflow ownership:** `br` is the one authority for task status. `br` manages
+  no hooks and no agent context: the hooks in `.beads/hooks` are this project's,
+  and the agent docs carry the tracker's rules (AGENTS.md).
 - **Architecture and explorations:** `scripts/check-architecture.sh` guards the
   dependency direction; the crate docs describe the rest.
 - **Glossary and decisions:** `docs/glossary-ru-en.md`; `docs/decisions/`
@@ -45,11 +48,13 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Features and stages:** beads `epic`. A feature is a root epic wearing the
   milestone label; a stage is an epic under it. A stage's coordinator holds it
   (assignee) while it is being integrated.
-- **Implemented:** beads status stays `open`; metadata `shady2k_state=implemented`,
-  `shady2k_revision=<merge revision>`, `shady2k_evidence=<checks run>`, set by the
-  coordinator with `bd update <id> --set-metadata ...`. Neither ready nor closed.
-- **Submitted:** the same, with `shady2k_state=submitted` and the result's
-  branch and revision; the worker's hold is cleared. Resumes at integration.
+- **Implemented:** the `br` status `implemented`, declared in `.beads/policy.yaml`,
+  set by the coordinator with the transition comment
+  `implemented: <merge revision> -- <checks run>`. Neither ready nor closed.
+- **Submitted:** the status `submitted`, with the comment
+  `submitted: <branch>@<revision> -- <local evidence>`; the worker's hold is
+  cleared. Resumes at integration. The adapter reads the latest such comment;
+  for revisions from the bd era it reads bd's `shady2k_*` metadata instead.
 - **Commit task links:** the task id in parentheses in the message, as this
   repository always did: `Carry the blocked quantity (iaam-1u7b)`, or
   `(iaam-a, iaam-b.2)`. Only ids inside parentheses count, so crate names in
@@ -63,24 +68,30 @@ are the repository's installation, and each person's plugin and hooks are theirs
   field-level journal (`rollback-2026-09-25.json`), are in `.git/shady2k/` of
   the owner's clone and are not committed: they hold the whole tracker. To
   restore an issue, compare its current fields with the journal's `after` and
-  only then set `before` (`bd undefer`, `bd update --remove-label`,
-  `bd update --parent`), so later work is not overwritten.
+  only then set `before` (`br undefer`, `br update --remove-label`,
+  `br update --parent`), so later work is not overwritten.
+- **Rollback of the move to br:** bd's database is intact on the remote
+  (`refs/dolt/data`, pushed 2026-09-27 before the move) and its local files,
+  final export and memories are in `.git/shady2k/bd-archive-2026-09-27/` of the
+  owner's clone. Fields br does not keep (bd metadata, `started_at`, `spec_id`)
+  are on each item that had them, as a comment by `migration-from-bd`.
 
 ### Checks and execution
 
-- **Backlog adapter:** `node .backlog/adapter.mjs` (live, through `bd export`);
-  `--at <rev>` reads `.beads/issues.jsonl` as committed at a revision;
-  `--jsonl <file>` reads any beads export.
+- **Backlog adapter:** `node .backlog/adapter.mjs` (live: `br sync --flush-only`,
+  then the export `br where` names); `--at <rev>` reads `.beads/issues.jsonl`
+  as committed at a revision; `--jsonl <file>` reads any beads-format export.
+  A status the project does not use is refused (exit 2); tombstones are dropped.
 - **Rules:** `.backlog/rules/check.mjs` with `time-format.mjs` beside it,
   `check-commits.mjs`, `check-docs.mjs`, byte-for-byte copies of shady2k-skills
   0.65.1 (setup 0.33.0), `skills/backlog/setup-shady2k-skills/`. Their
   `--version` is the installation.
-- **Work records:** a run's claims, receipts and stops are beads comments whose
-  text starts with `[shady2k-time`. `bd export` carries every comment; the
-  adapter passes those raw and whole as `comments` (`id` is beads' comment id,
-  `at` its `created_at`, `author`, `body` its text), damaged or not. The run
+- **Work records:** a run's claims, receipts and stops are `br` comments whose
+  text starts with `[shady2k-time`. The export carries every comment; the
+  adapter passes those raw and whole as `comments` (`id` is br's comment id as
+  a string, `at` its `created_at`, `author`, `body` its text), damaged or not. The run
   script reads `--backlog` from `node .backlog/adapter.mjs` written to a file.
-  A record is posted unchanged with `bd comments add <id> -f <file>` holding
+  A record is posted unchanged with `br comments add <id> -f <file>` holding
   exactly what the script printed. `timeRecordsExempt` in the config was
   adopted empty on 2026-09-27: no work was in flight unclaimed.
 - **Document adapter and gate:** not installed yet: "Install the document gate:
@@ -98,10 +109,11 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Local entry points:** `.beads/hooks/pre-commit` (backlog gate after the
   privacy guard, then the tracker layout) and `.beads/hooks/commit-msg` (commit
   links), all in blocks outside the beads markers, acting only when `git config iaam.backlog` is `on`.
-- **Connecting a clone:** `make backlog-connect`. It checks node (18+), bd and
-  every file the hooks read, runs `make hooks`, adds the three blocks, sets
-  `iaam.backlog=on` and runs the gate once; it refuses with what is missing and
-  disconnects again if the gate cannot run.
+- **Connecting a clone:** `make backlog-connect`. It checks node (18+), br and
+  every file the hooks read, builds br's database from the export when the
+  clone has none, points `core.hooksPath` at `.beads/hooks`, runs `make hooks`,
+  adds the three blocks, sets `iaam.backlog=on` and runs the gate once; it
+  refuses with what is missing and disconnects again if the gate cannot run.
 - **CI:** none for these checks (personal scope).
 - **Bulk-edit age correction:** `gate.mjs` passes `--ages-from` and
   `--ages-through` from the two `.git/shady2k/` snapshots when the clone has them.
@@ -122,34 +134,37 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Reviewer:** Codex (another model), through its MCP server or a herdr worker;
   if neither starts, an independent Claude reviewer, disclosed as same-model.
 - **Parallel execution:** one git worktree per worker (`make sweep` retires merged
-  ones), up to the config's `maxWorkers`, dispatched as herdr worker sessions.
-  Claims are atomic through `bd update <id> --claim` with `BEADS_ACTOR` set to the
-  agent's full name; the stage's coordinator merges and records `implemented`.
+  ones), up to the config's `maxWorkers`. Workers are **omp agents in herdr
+  worktrees** (`herdr worktree create`, `herdr agent start --kind omp`), the
+  owner's choice of 2026-09-27; they never touch the tracker. Claims are atomic
+  and exclusive (`claim_exclusive` in `.beads/config.yaml`) through
+  `br update <id> --claim --actor '<full agent name>'`; the stage's coordinator
+  merges and records `implemented`.
 
 ### Tracker operations
 
-The tracker's own reference is `bd prime` and `bd <command> --help`; only what
-this protocol adds is listed.
+The tracker's own reference is `br robot-docs guide` and `br <command> --help`;
+only what this protocol adds is listed.
 
 | operation | project implementation |
 | --- | --- |
-| create | `bd create -t task\|bug\|epic --parent <id> -l <milestone>,<area> --acceptance ...`; a feature's epic carries `## Success Criteria` or `--acceptance`. A child inherits its parent's labels: pass `--no-inherit-labels` when its area differs, or it carries two areas and the gate refuses it |
-| link / unlink | `bd dep add <needs> <produces>` (`blocks`) with the reason in a comment; provenance is `discovered-from`, which the adapter never reads as a dependency |
-| claim | `BEADS_ACTOR='<harness>-<role>:<person>@<machine>:<branch>#<session>' bd update <id> --claim` (atomic; sets assignee and in_progress), then a comment with start time and checkout path. A same-stage dependant of an implemented prerequisite is claimed the same way: beads does not refuse claims on blocked issues, and the edge stays |
-| release | `bd update <id> --status open --assignee ''`; implemented and submitted metadata stays |
-| implemented | coordinator: `bd update <id> --status open --assignee '' --set-metadata shady2k_state=implemented --set-metadata shady2k_revision=<rev> --set-metadata shady2k_evidence='<checks>'` |
-| submitted | worker: the same with `shady2k_state=submitted` and the result's branch and revision |
-| reopen | `bd update <id> --unset-metadata shady2k_state --unset-metadata shady2k_revision --unset-metadata shady2k_evidence`, then recheck dependants |
-| close | `bd close <id> --reason ...` after stage acceptance; cancellation or duplicate says so in the reason |
-| comment / edit | `bd comments add`, `bd update`; a work record with `bd comments add <id> -f <file>`, the file exactly as the run script printed it, never reflowed or edited |
-| defer / undefer | `bd defer <id> --until <date> --reason ...`; `bd undefer <id>` |
-| milestone / label | `bd update <id> --add-label` with values from the config |
-| ready | `node .backlog/ready.mjs [--stage <id>] [--checkout <rev>]`: open unheld leaves whose prerequisites are closed, or implemented in the same stage with the recorded revision contained in the checkout. Not `bd ready`, which offers submitted and implemented leaves again |
-| holds | `bd list --status in_progress` |
-| pending integration / acceptance | `node .backlog/adapter.mjs` and filter status `submitted` / `implemented` |
-| children | `bd children <id>` (every status) |
-| search / show | `bd search`, `bd show <id>`, `bd list -l <area>` |
-| publish | `bd dolt push` after the gate is clean |
+| create | `br create -t task\|bug\|epic --parent <id> -l <milestone>,<area> --acceptance ... --silent "<title>"`; a feature's epic carries `## Success Criteria` or `--acceptance` |
+| link / unlink | `br dep add <needs> <produces>` (`blocks`) with the reason in a comment; provenance is `discovered-from`, which the adapter never reads as a dependency |
+| claim | `br update <id> --claim --actor '<harness>-<role>:<person>@<machine>:<branch>#<session>'` (atomic, exclusive; sets assignee and `in_progress`), then the record `runs.mjs claim` prints. A same-stage dependant of an implemented prerequisite is blocked to br: claim it with `--claim --force --actor ...`, which stays exclusive and keeps the edge |
+| release | `br update <id> --status open --assignee '' --actor ...`; submitted and implemented work keeps its status |
+| implemented | coordinator: `br update <id> --status implemented --assignee '' --transition-comment 'implemented: <rev> -- <checks>' --actor ...` |
+| submitted | worker: `br update <id> --status submitted --assignee '' --transition-comment 'submitted: <branch>@<rev> -- <evidence>' --actor ...` |
+| reopen | `br update <id> --status open --transition-comment 'reopened: <why>'`, then recheck dependants |
+| close | `br close <id> --reason ...` after stage acceptance; cancellation or duplicate says so in the reason |
+| comment / edit | `br comments add <id> ...`, `br update`; a work record with `br comments add <id> -f <file>`, the file exactly as the run script printed it, never reflowed or edited |
+| defer / undefer | `br defer <id> --until <date>` (the reason in a comment); `br undefer <id>` |
+| milestone / label | `br update <id> --add-label` with values from the config |
+| ready | `node .backlog/ready.mjs [--stage <id>] [--checkout <rev>]`: open unheld leaves whose prerequisites are closed, or implemented in the same stage with the recorded revision contained in the checkout. `br ready` alone never releases a dependant of an implemented prerequisite |
+| holds | `br list --status in_progress` |
+| pending integration / acceptance | `br list --status submitted` / `br list --status implemented` |
+| children | `br show <id>` lists them (`<- … (parent-child)`), every status; or the adapter's export filtered on `parent` |
+| search / show | `br search`, `br show <id>`, `br list -l <area>` |
+| publish | on `main`, after the gate is clean: `br sync --flush-only`, commit `.beads/issues.jsonl` as `chore(beads): ... (<task>)`, `git push` |
 
 When a skill reports the installation is out of date, run `setup-shady2k-skills`. An explicit
 setup invocation rechecks everything even if its recorded version matches.

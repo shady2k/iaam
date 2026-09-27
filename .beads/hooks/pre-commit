@@ -1,36 +1,4 @@
 #!/usr/bin/env sh
-# --- BEGIN BEADS INTEGRATION v1.1.0 ---
-# This section is managed by beads. Do not remove these markers.
-if command -v bd >/dev/null 2>&1; then
-  export BD_GIT_HOOK=1
-  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
-  _bd_used_perl=0
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$_bd_timeout" bd hooks run pre-commit "$@"
-    _bd_exit=$?
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$_bd_timeout" bd hooks run pre-commit "$@"
-    _bd_exit=$?
-  elif command -v perl >/dev/null 2>&1; then
-    _bd_used_perl=1
-    perl -e 'alarm shift; exec @ARGV' "$_bd_timeout" bd hooks run pre-commit "$@"
-    _bd_exit=$?
-  else
-    echo >&2 "beads: hook 'pre-commit' running without timeout; install coreutils or perl to enable BEADS_HOOK_TIMEOUT"
-    bd hooks run pre-commit "$@"
-    _bd_exit=$?
-  fi
-  if [ $_bd_exit -eq 124 ] || { [ $_bd_used_perl -eq 1 ] && [ $_bd_exit -eq 142 ]; }; then
-    echo >&2 "beads: hook 'pre-commit' timed out after ${_bd_timeout}s — continuing without beads"
-    _bd_exit=0
-  fi
-  if [ $_bd_exit -eq 3 ]; then
-    echo >&2 "beads: database not initialized — skipping hook 'pre-commit'"
-    _bd_exit=0
-  fi
-  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
-fi
-# --- END BEADS INTEGRATION v1.1.0 ---
 
 # --- BEGIN IAAM PRIVACY GUARD (iaam-rq4h) ---
 # Managed by scripts/install-hooks.sh. Kept OUTSIDE the beads section markers on
@@ -47,8 +15,7 @@ fi
 
 
 # --- BEGIN IAAM BACKLOG GATE (iaam-oik0) ---
-# Managed by .backlog/connect.sh, outside the beads markers so it survives
-# `bd hooks install`. Acts only in a clone that ran make backlog-connect.
+# Managed by .backlog/connect.sh. Acts only in a clone that ran make backlog-connect.
 if [ "$(git config --get iaam.backlog)" = "on" ]; then
   _iaam_root=$(git rev-parse --show-toplevel) || exit 1
   if [ ! -r "$_iaam_root/.backlog/gate.mjs" ] || ! command -v node >/dev/null 2>&1; then
@@ -65,7 +32,7 @@ fi
 # Managed by .backlog/connect.sh. The tracker is one state for every branch, so
 # its export is committed on main only: a branch carries what it delivers.
 if [ "$(git config --get iaam.backlog)" = "on" ]; then
-  _iaam_staged=$(git diff --cached --name-only -- .beads/issues.jsonl .beads/interactions.jsonl)
+  _iaam_staged=$(git diff --cached --name-only -- .beads/issues.jsonl)
   if [ -n "$_iaam_staged" ]; then
     _iaam_branch=$(git symbolic-ref --quiet --short HEAD || echo "a detached HEAD")
     if [ "$_iaam_branch" != "main" ]; then

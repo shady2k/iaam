@@ -20,7 +20,13 @@ import { read } from './adapter.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const git = (...a) => execFileSync('git', a, { encoding: 'utf8', maxBuffer: 1 << 30, stdio: ['ignore', 'pipe', 'ignore'] });
 
+// A rules file the check imports and cannot find crashes node with exit 1, which
+// would read as "this change adds a problem". It is a missing input, said as one.
+const RULES = ['check.mjs', 'time-format.mjs'];
+
 function main(argv) {
+  const gone = RULES.filter((f) => !existsSync(join(HERE, 'rules', f)));
+  if (gone.length) throw new Error(`missing .backlog/rules/${gone.join(', .backlog/rules/')}`);
   const b = argv.indexOf('--base');
   const base = b >= 0 ? argv[b + 1] : 'HEAD';
   const dir = mkdtempSync(join(tmpdir(), 'iaam-gate-'));

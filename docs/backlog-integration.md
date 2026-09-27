@@ -71,9 +71,18 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Backlog adapter:** `node .backlog/adapter.mjs` (live, through `bd export`);
   `--at <rev>` reads `.beads/issues.jsonl` as committed at a revision;
   `--jsonl <file>` reads any beads export.
-- **Rules:** `.backlog/rules/check.mjs`, `check-commits.mjs`, `check-docs.mjs`,
-  byte-for-byte copies of shady2k-skills 0.59.1 (setup 0.28.0),
-  `skills/backlog/setup-shady2k-skills/`. Their `--version` is the installation.
+- **Rules:** `.backlog/rules/check.mjs` with `time-format.mjs` beside it,
+  `check-commits.mjs`, `check-docs.mjs`, byte-for-byte copies of shady2k-skills
+  0.65.1 (setup 0.33.0), `skills/backlog/setup-shady2k-skills/`. Their
+  `--version` is the installation.
+- **Work records:** a run's claims, receipts and stops are beads comments whose
+  text starts with `[shady2k-time`. `bd export` carries every comment; the
+  adapter passes those raw and whole as `comments` (`id` is beads' comment id,
+  `at` its `created_at`, `author`, `body` its text), damaged or not. The run
+  script reads `--backlog` from `node .backlog/adapter.mjs` written to a file.
+  A record is posted unchanged with `bd comments add <id> -f <file>` holding
+  exactly what the script printed. `timeRecordsExempt` in the config was
+  adopted empty on 2026-09-27: no work was in flight unclaimed.
 - **Document adapter and gate:** not installed yet: "Install the document gate:
   specs and acceptance evidence checked at each transition" (iaam-46x4).
 - **Document policy / baseline / evidence:** not applicable until iaam-46x4.
@@ -132,7 +141,7 @@ this protocol adds is listed.
 | submitted | worker: the same with `shady2k_state=submitted` and the result's branch and revision |
 | reopen | `bd update <id> --unset-metadata shady2k_state --unset-metadata shady2k_revision --unset-metadata shady2k_evidence`, then recheck dependants |
 | close | `bd close <id> --reason ...` after stage acceptance; cancellation or duplicate says so in the reason |
-| comment / edit | `bd comments add`, `bd update` |
+| comment / edit | `bd comments add`, `bd update`; a work record with `bd comments add <id> -f <file>`, the file exactly as the run script printed it, never reflowed or edited |
 | defer / undefer | `bd defer <id> --until <date> --reason ...`; `bd undefer <id>` |
 | milestone / label | `bd update <id> --add-label` with values from the config |
 | ready | `node .backlog/ready.mjs [--stage <id>] [--checkout <rev>]`: open unheld leaves whose prerequisites are closed, or implemented in the same stage with the recorded revision contained in the checkout. Not `bd ready`, which offers submitted and implemented leaves again |

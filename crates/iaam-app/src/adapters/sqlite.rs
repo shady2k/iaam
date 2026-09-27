@@ -2664,7 +2664,11 @@ mod tests {
             ],
         })
         .to_string();
-        let (gateway, log, _time) = fake::gateway(vec![Answer::status(200, &page)], None);
+        // The channel's first request is the session exchange: the secret
+        // becomes a session token before the transactions page is asked
+        // for, so the double answers that exchange too.
+        let exchange = Answer::status(200, r#"{"token":"invented-finam-session-token"}"#);
+        let (gateway, log, _time) = fake::gateway(vec![exchange, Answer::status(200, &page)], None);
         let adapter = SqliteAdapter::with_broker_key(
             SqliteStore::open_in_memory().expect("memory store"),
             Some(Key::from_bytes([7; 32])),
@@ -2700,7 +2704,11 @@ mod tests {
             channel.channel().parser_version.0,
             iaam_broker::finam::FINAM_PARSER_VERSION
         );
-        assert_eq!(log.lock().expect("log").len(), 1, "one request answered");
+        assert_eq!(
+            log.lock().expect("log").len(),
+            2,
+            "the exchange and the page: two requests answered"
+        );
     }
 
     /// A broker the registry has no row for is refused by name, with the

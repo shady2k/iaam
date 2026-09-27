@@ -672,6 +672,15 @@ mod tests {
         Answer::status(200, body)
     }
 
+    /// The session exchange's answer: Finam trades the access's secret for
+    /// a session token (`POST /v1/sessions`, `{"token": "..."}`), which the
+    /// first data call then carries as its bearer. The invented token never
+    /// leaves this module. Every scripted data page is therefore preceded
+    /// by one exchange answer.
+    fn session_answer() -> Answer {
+        Answer::status(200, r#"{"token":"invented-finam-session-token"}"#)
+    }
+
     /// An invented June 2025 page: a dividend with an instrument, a purchase
     /// with price and quantity, a bare fee. No real account, instrument or
     /// amount.
@@ -711,7 +720,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_finam_page_becomes_operations_through_the_channel_dictionary() {
-        let channel = channel(fake::gateway(vec![page(&transactions_page())], None).0);
+        let channel =
+            channel(fake::gateway(vec![session_answer(), page(&transactions_page())], None).0);
 
         let parsed = channel
             .fetch_operations(
@@ -810,7 +820,7 @@ mod tests {
             ],
         })
         .to_string();
-        let channel = channel(fake::gateway(vec![page(&body)], None).0);
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
 
         let parsed = channel
             .fetch_operations(
@@ -847,7 +857,7 @@ mod tests {
             ],
         })
         .to_string();
-        let channel = channel(fake::gateway(vec![page(&body)], None).0);
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
 
         let parsed = channel
             .fetch_operations(
@@ -901,7 +911,7 @@ mod tests {
             ],
         })
         .to_string();
-        let channel = channel(fake::gateway(vec![page(&body)], None).0);
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
 
         let parsed = channel
             .fetch_operations(
@@ -957,7 +967,7 @@ mod tests {
             ],
         })
         .to_string();
-        let channel = channel(fake::gateway(vec![page(&body)], None).0);
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
 
         let parsed = channel
             .fetch_operations(
@@ -999,7 +1009,10 @@ mod tests {
     async fn an_empty_page_over_an_empty_dictionary_is_an_empty_sync() {
         let body = json!({ "hasMore": false, "transactions": [] }).to_string();
         let channel = FinamChannel::new(
-            FinamClient::new(token(), fake::gateway(vec![page(&body)], None).0),
+            FinamClient::new(
+                token(),
+                fake::gateway(vec![session_answer(), page(&body)], None).0,
+            ),
             SourceId::new_random(),
             OperationKindDictionary::default(),
         );
@@ -1052,7 +1065,10 @@ mod tests {
         ]);
         assert!(unreadable.is_empty(), "{unreadable:?}");
         let channel = FinamChannel::new(
-            FinamClient::new(token(), fake::gateway(vec![page(&body)], None).0),
+            FinamClient::new(
+                token(),
+                fake::gateway(vec![session_answer(), page(&body)], None).0,
+            ),
             SourceId::new_random(),
             dictionary,
         );
@@ -1171,7 +1187,7 @@ mod tests {
             "positions": [ { "symbol": SYMBOL, "quantity": { "value": "7" } } ],
         })
         .to_string();
-        let channel = channel(fake::gateway(vec![page(&body)], None).0);
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
 
         let snapshot = channel
             .fetch_portfolio(account(), date!(2025 - 06 - 30), None)

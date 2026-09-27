@@ -6482,12 +6482,25 @@ fn finam_portfolio() -> String {
     .to_string()
 }
 
+/// The session exchange's answer: the sync's first request trades the
+/// access's secret for a session token (`POST /v1/sessions`), which both
+/// data calls of the sync then carry as their bearer.
+fn finam_session_token() -> String {
+    json!({ "token": "invented-finam-session-token" }).to_string()
+}
+
 /// `POST /v1/brokers/finam/sync` reaches the registry's Finam channel: the
 /// invented page comes back as recorded operations, and the broker token
-/// stays off the response.
+/// stays off the response. The script answers three requests: the session
+/// exchange, the transactions page, then the portfolio.
 #[tokio::test]
 async fn the_finam_sync_route_records_operations_from_the_finam_channel() {
-    let harness = finam_sync_harness(vec![finam_transactions_page(), finam_portfolio()]).await;
+    let harness = finam_sync_harness(vec![
+        finam_session_token(),
+        finam_transactions_page(),
+        finam_portfolio(),
+    ])
+    .await;
     let body = json!({
         "account": harness.account.inner(),
         "from": "2025-06-01",

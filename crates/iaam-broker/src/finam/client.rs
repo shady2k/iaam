@@ -16,15 +16,13 @@ const GET_ACCOUNT: &str = "AccountsService.GetAccount";
 /// Budget key of `AccountsService/Transactions`.
 const TRANSACTIONS: &str = "AccountsService.Transactions";
 
-/// Budget key of the exchange of the secret for a session token
-/// (`POST /v1/sessions`).
+/// Budget key of the session methods: the exchange of the secret for a
+/// session token (`POST /v1/sessions`) and the details of that token
+/// (`POST /v1/sessions/details`, `TokenDetails` in Finam's REST docs). One
+/// row budgets both: Finam documents 200 requests a minute for each
+/// method, and the row grants the conservative half of that to the two of
+/// them together.
 const SESSIONS: &str = "AuthService.Sessions";
-
-/// Budget key of `POST /v1/sessions/details` — `TokenDetails` in Finam's
-/// REST docs (https://api.finam.ru/docs/rest/authservice_tokendetails.md/).
-/// One row per method called: the key sends only once the gateway's table
-/// names it.
-const TOKEN_DETAILS: &str = "AuthService.TokenDetails";
 
 /// What Finam answers with when it names no other lifetime (it names none
 /// today): the portal's FAQ states a session token lives 15 minutes
@@ -146,7 +144,7 @@ impl FinamClient {
     /// The account ids the access sees, from `POST /v1/sessions/details`.
     pub async fn get_account_ids(&self) -> Result<Vec<String>, FinamError> {
         let body = self
-            .authorized(TOKEN_DETAILS, |token| {
+            .authorized(SESSIONS, |token| {
                 // The token rides the body, as the method's page passes it,
                 // and the bearer, as the API's authentication asks of every
                 // method. Reading twice changes nothing.
@@ -1080,32 +1078,6 @@ mod tests {
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
     }
 
-    /// The gateway's table names the details method beside the other Finam
-    /// ones; one row per method called.
-    static WITH_DETAILS: &[Budget] = &[
-        Budget {
-            destination: Destination::FinamApi,
-            scope: MethodScope::Named("AccountsService.GetAccount"),
-            documented: Some(200),
-            used: 1,
-            window: Duration::from_secs(60),
-        },
-        Budget {
-            destination: Destination::FinamApi,
-            scope: MethodScope::Named("AuthService.Sessions"),
-            documented: Some(200),
-            used: 1,
-            window: Duration::from_secs(60),
-        },
-        Budget {
-            destination: Destination::FinamApi,
-            scope: MethodScope::Named("AuthService.TokenDetails"),
-            documented: Some(200),
-            used: 1,
-            window: Duration::from_secs(60),
-        },
-    ];
-
     #[tokio::test]
     async fn account_ids_come_from_the_details_answer() {
         let endpoint = Arc::new(
@@ -1113,7 +1085,7 @@ mod tests {
                 .then(200, &session_answer(JWT_ONE))
                 .then(200, r#"{"account_ids":["One","Two"],"readonly":true}"#),
         );
-        let (client, _) = client_over(WITH_DETAILS, &endpoint);
+        let (client, _) = client_over(BUDGETS, &endpoint);
 
         let ids = client.get_account_ids().await.expect("the accounts");
 
@@ -1136,7 +1108,7 @@ mod tests {
                 .then(200, &session_answer(JWT_ONE))
                 .then(200, r#"{"readonly":true}"#),
         );
-        let (client, _) = client_over(WITH_DETAILS, &endpoint);
+        let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
             .get_account_ids()
@@ -1155,7 +1127,7 @@ mod tests {
                 .then(200, &session_answer(JWT_TWO))
                 .then(200, r#"{"account_ids":["Three"]}"#),
         );
-        let (client, _) = client_over(WITH_DETAILS, &endpoint);
+        let (client, _) = client_over(BUDGETS, &endpoint);
 
         let ids = client.get_account_ids().await.expect("the retry succeeds");
 

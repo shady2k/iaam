@@ -51,7 +51,7 @@ use iaam_core::returns::{
 };
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
-use iaam_http::Gateway;
+use iaam_http::{Gateway, Outbound};
 use iaam_server::action_catalog::{ActionCatalog, ActionCatalogError};
 use iaam_server::auth::hash_token;
 use iaam_server::dto::{ReturnsReportDto, VerdictDto};
@@ -421,8 +421,10 @@ async fn harness_with_factory_and_provisioning(
             provisioned,
             with_account,
             with_broker_access,
+            broker_access_broker: None,
             rate_limit,
             http: Arc::new(UnavailableOutboundHttp),
+            broker_gateway: None,
         },
     )
     .await
@@ -437,8 +439,10 @@ async fn harness_with_http(http: Arc<dyn OutboundHttp>) -> Harness {
             provisioned: true,
             with_account: true,
             with_broker_access: false,
+            broker_access_broker: None,
             rate_limit: GENEROUS_RATE_LIMIT,
             http,
+            broker_gateway: None,
         },
     )
     .await
@@ -460,6 +464,72 @@ impl iaam_http::gateway::Transport for NoNetwork {
     }
 }
 
+/// A Finam Trade API on a script: every request is answered with the next
+/// body in order, and one more request than scripted fails the test.
+struct FinamScript(std::sync::Mutex<std::collections::VecDeque<String>>);
+
+impl FinamScript {
+    /// A gateway over the script, for a harness's broker channels.
+    fn gateway(script: Vec<String>) -> Arc<dyn Outbound> {
+        Arc::new(
+            Gateway::new(FinamScript(std::sync::Mutex::new(script.into())))
+                .expect("the budget table is valid"),
+        )
+    }
+}
+
+impl iaam_http::gateway::Transport for FinamScript {
+    async fn send(
+        &self,
+        _request: &iaam_http::HttpRequest,
+    ) -> Result<iaam_http::HttpResponse, iaam_http::HttpError> {
+        let body = self
+            .0
+            .lock()
+            .expect("script")
+            .pop_front()
+            .expect("the script ran out: more requests than expected");
+        Ok(iaam_http::HttpResponse {
+            status: 200,
+            body: body.into_bytes(),
+            retry_after: None,
+        })
+    }
+}
+
+/// A harness whose real registry factory opens the Finam channel through the
+/// scripted Finam API: access for `finam` is seeded with the channel's own
+/// operation-kind dictionary, so `open` takes the registry's Finam row.
+async fn finam_sync_harness(script: Vec<String>) -> Harness {
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
+    // The instrument the Finam rows name must exist before the journal will
+    // accept an event that moves it.
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: InstrumentId(Uuid::parse_str(FINAM_SYMBOL).expect("invented UUID")),
+            kind: Some(InstrumentKind::Share),
+            symbol: "IZPA".into(),
+            title: "Invented issuer".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("invented instrument");
+    harness_with_everything(
+        store,
+        HarnessSetup {
+            channel_factory: None,
+            provisioned: true,
+            with_account: true,
+            with_broker_access: false,
+            broker_access_broker: Some("finam"),
+            rate_limit: GENEROUS_RATE_LIMIT,
+            http: Arc::new(UnavailableOutboundHttp),
+            broker_gateway: Some(FinamScript::gateway(script)),
+        },
+    )
+    .await
+}
+
 /// Every knob of the harness in one place; the narrower builders above name
 /// the ones a test turns.
 struct HarnessSetup {
@@ -467,8 +537,14 @@ struct HarnessSetup {
     provisioned: bool,
     with_account: bool,
     with_broker_access: bool,
+    /// Access seeded for another registered broker, with its channel
+    /// dictionary: the real registry factory can then open that channel.
+    broker_access_broker: Option<&'static str>,
     rate_limit: u32,
     http: Arc<dyn OutboundHttp>,
+    /// The gateway the storage adapter's own broker channels use; `None`
+    /// keeps the harness's no-network transport.
+    broker_gateway: Option<Arc<dyn Outbound>>,
 }
 
 async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) -> Harness {
@@ -477,8 +553,10 @@ async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) ->
         provisioned,
         with_account,
         with_broker_access,
+        broker_access_broker,
         rate_limit,
         http,
+        broker_gateway,
     } = setup;
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -553,6 +631,36 @@ async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) ->
             .expect("broker access");
     }
 
+    if let Some(broker) = broker_access_broker {
+        let sealed = iaam_broker::credentials::seal(&Key::from_bytes([7; 32]), BROKER_TOKEN);
+        let (dictionary, entries) = iaam_broker::operation_kind::seed_for(broker)
+            .expect("the seeded broker has an operation-kind dictionary");
+        let entries = entries
+            .iter()
+            .map(
+                |(source_kind, kind)| iaam_store::broker_operation_kinds::BrokerOperationKind {
+                    source_kind: (*source_kind).to_owned(),
+                    kind: (*kind).to_owned(),
+                },
+            )
+            .collect::<Vec<_>>();
+        store
+            .insert_broker_access_with_operation_kinds(
+                &NewBrokerAccess {
+                    id: Uuid::new_v4(),
+                    owner,
+                    broker: BrokerCode::parse(broker).expect("broker code"),
+                    environment: "prod".to_owned(),
+                    scope: "read_only".to_owned(),
+                    nonce: sealed.nonce().to_vec(),
+                    ciphertext: sealed.ciphertext().to_vec(),
+                },
+                dictionary,
+                &entries,
+            )
+            .expect("broker access with dictionary");
+    }
+
     // The key is created directly from bytes, not from a file: a file in a temporary directory
     // would have to be deleted, and a test that failed before deletion would leave
     // the key behind. Fixed bytes are safe here — the database lives
@@ -560,7 +668,9 @@ async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) ->
     let adapter = Arc::new(SqliteAdapter::with_broker_key(
         store,
         Some(Key::from_bytes([7; 32])),
-        Arc::new(Gateway::new(NoNetwork).expect("the budget table is valid")),
+        broker_gateway.unwrap_or_else(|| {
+            Arc::new(Gateway::new(NoNetwork).expect("the budget table is valid"))
+        }),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> =
@@ -6326,6 +6436,77 @@ async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() 
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
     assert_eq!(response["code"], "forbidden");
+}
+
+/// The instrument every invented Finam row names; registered by the harness
+/// before the sync runs.
+const FINAM_SYMBOL: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+
+/// An invented June 2025 Finam answer: a dividend and a purchase on one
+/// transactions page, then a portfolio of cash and one position. No real
+/// account, instrument or amount.
+fn finam_transactions_page() -> String {
+    json!({
+        "hasMore": false,
+        "transactions": [
+            {
+                "id": "3f2b8c5e-1a4d-4f6b-9c2e-5a7d8e1f4a3b",
+                "timestamp": "2025-06-10T10:00:00Z",
+                "category": "DIVIDEND",
+                "symbol": FINAM_SYMBOL,
+                "change": { "units": "12", "nanos": 500_000_000, "currencyCode": "rub" },
+            },
+            {
+                "id": "8d1c2f3a-4b5e-4c6d-9a0b-1c2d3e4f5a6b",
+                "timestamp": "2025-06-12T00:00:00Z",
+                "category": "TRADE_BUY",
+                "symbol": FINAM_SYMBOL,
+                "change": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
+                "changeQty": { "value": "10" },
+                "trade": { "price": { "value": "100.50" } },
+            },
+        ],
+    })
+    .to_string()
+}
+
+fn finam_portfolio() -> String {
+    json!({
+        "accountId": "d0c7aa0f-6f2e-4a5b-8c3d-9e0f1a2b3c4d",
+        "cash": [ { "units": "15432", "nanos": 560_000_000, "currencyCode": "rub" } ],
+        "positions": [ {
+            "symbol": FINAM_SYMBOL,
+            "quantity": { "value": "10" },
+        } ],
+    })
+    .to_string()
+}
+
+/// `POST /v1/brokers/finam/sync` reaches the registry's Finam channel: the
+/// invented page comes back as recorded operations, and the broker token
+/// stays off the response.
+#[tokio::test]
+async fn the_finam_sync_route_records_operations_from_the_finam_channel() {
+    let harness = finam_sync_harness(vec![finam_transactions_page(), finam_portfolio()]).await;
+    let body = json!({
+        "account": harness.account.inner(),
+        "from": "2025-06-01",
+        "to": "2025-06-30",
+    });
+
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/brokers/finam/sync", &harness.owner_token, &body),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let recorded = response["recorded"].as_array().expect("verdicts");
+    assert_eq!(recorded.len(), 2, "{response}");
+    assert_eq!(recorded[0]["verdict"], "provisional", "{response}");
+    assert_eq!(recorded[1]["verdict"], "provisional", "{response}");
+    assert_eq!(response["duplicates"], 0, "{response}");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
 }
 
 #[tokio::test]

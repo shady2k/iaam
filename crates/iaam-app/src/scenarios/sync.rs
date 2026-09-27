@@ -24,6 +24,7 @@ use iaam_market::moex::{HistoryQuery, history_request};
 use iaam_market::{
     AccruedInterestObservation, FxObservation, KeyRateObservation, PriceKind, PriceObservation,
 };
+use iaam_store::documents::BrokerCode;
 use iaam_store::market::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
@@ -58,6 +59,10 @@ pub struct SyncOutcome {
     pub possible_duplicates: usize,
     pub assertions: usize,
     pub assertions_withheld: Option<AssertionsWithheld>,
+    /// True when this sync recorded the binding itself: no binding stood,
+    /// the access saw exactly one account, and it was taken. The binding
+    /// itself is read through the account's own route, not repeated here.
+    pub binding_recorded: bool,
 }
 
 /// How long a whole broker sync may take, from its start.
@@ -120,10 +125,12 @@ impl Drop for SyncClaim<'_> {
 /// Reconciliation of two independent channels must still recognise the same operation even
 /// from different sources. A probable duplicate is not removed: it is only a hint
 /// at the §10.6 level, so it enters the journal as a new fact.
+#[allow(clippy::too_many_arguments)]
 pub async fn sync_broker(
     services: &AppServices,
     principal: &Principal,
     broker: &dyn BrokerChannel,
+    broker_code: &BrokerCode,
     account: AccountId,
     from: Date,
     to: Date,
@@ -139,8 +146,54 @@ pub async fn sync_broker(
     let _claim = services.running_syncs.claim(principal.owner, account)?;
     let deadline = Some(Instant::now() + SYNC_DEADLINE);
 
+    // The account the broker is asked for is its own number, never our
+    // identifier (`iaam-xzz5.3.2`). A stored binding is the word that stands;
+    // without one the access is asked what it sees: exactly one number is
+    // taken and recorded as the binding, several are refused with the
+    // candidates named — the owner binds one, the sync never guesses — and
+    // none is refused too. Every refusal below happens before anything is
+    // fetched for the interval or written to the journal.
+    let binding = services
+        .store
+        .broker_account_binding(principal.owner, account, broker_code)
+        .await?;
+    let (broker_account, binding_recorded) = match binding {
+        Some(number) => (number, false),
+        None => {
+            let candidates = broker
+                .fetch_account_numbers(deadline)
+                .await
+                .map_err(broker_error)?;
+            match candidates.as_slice() {
+                [] => {
+                    return Err(AppError::BrokerAccountUnseen {
+                        broker: broker_code.as_str().to_owned(),
+                    });
+                }
+                [one] => {
+                    services
+                        .store
+                        .record_broker_account_binding(
+                            principal.owner,
+                            account,
+                            broker_code,
+                            (*one).clone(),
+                        )
+                        .await?;
+                    (one.clone(), true)
+                }
+                several => {
+                    return Err(AppError::BrokerAccountAmbiguous {
+                        broker: broker_code.as_str().to_owned(),
+                        candidates: several.to_vec(),
+                    });
+                }
+            }
+        }
+    };
+
     let parsed = broker
-        .fetch_operations(account, from, to, deadline)
+        .fetch_operations(account, &broker_account, from, to, deadline)
         .await
         .map_err(broker_error)?;
     let channel = broker.channel();
@@ -167,7 +220,7 @@ pub async fn sync_broker(
     } else {
         Some(
             broker
-                .fetch_portfolio(account, to, deadline)
+                .fetch_portfolio(account, &broker_account, to, deadline)
                 .await
                 .map_err(broker_error)?,
         )
@@ -317,6 +370,7 @@ pub async fn sync_broker(
             possible_duplicates,
             assertions: 0,
             assertions_withheld: None,
+            binding_recorded,
         });
     };
     let assertions_withheld = match snapshot.as_of {
@@ -333,6 +387,7 @@ pub async fn sync_broker(
             possible_duplicates,
             assertions: 0,
             assertions_withheld,
+            binding_recorded,
         });
     }
 
@@ -382,6 +437,7 @@ pub async fn sync_broker(
         possible_duplicates,
         assertions,
         assertions_withheld: None,
+        binding_recorded,
     })
 }
 

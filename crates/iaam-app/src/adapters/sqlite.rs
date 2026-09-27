@@ -303,7 +303,18 @@ fn import_session_error(error: iaam_store::StoreError) -> AppError {
 }
 
 fn store_error(error: iaam_store::StoreError) -> AppError {
-    AppError::Store(error.to_string())
+    match error {
+        // A broker number another of the owner's accounts already holds is
+        // his answer, not a fault: a `500` would send him looking for a
+        // failure instead of at the account that holds the number
+        // (`iaam-xzz5.3.2`). This is the one place every port method's
+        // refusal passes through, so the arm here covers both the route that
+        // sets a binding and the sync that records one.
+        iaam_store::StoreError::BrokerAccountBindingHeld { account } => AppError::Conflict {
+            what: format!("broker account is already bound to account {account}"),
+        },
+        other => AppError::Store(other.to_string()),
+    }
 }
 
 /// The three resolution cases must remain distinguishable on this side
@@ -769,6 +780,47 @@ impl Store for SqliteAdapter {
             store
                 .withdraw_report_default_contour(owner)
                 .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+    ) -> Result<Option<String>, AppError> {
+        let broker = broker.clone();
+        self.blocking(move |store| {
+            store
+                .broker_account_binding(owner, account, &broker)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn record_broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: String,
+    ) -> Result<(), AppError> {
+        let broker = broker.clone();
+        self.blocking(move |store| {
+            store
+                .record_broker_account_binding(owner, account, &broker, &broker_account)
+                .map_err(|error| match error {
+                    // The binding named an account this owner does not hold.
+                    // Unreachable behind a route that checks ownership first,
+                    // but the sync resolves the account straight from the
+                    // request, so the not-found refusal reaches the caller
+                    // typed rather than as a fault.
+                    iaam_store::StoreError::NotFound { what, id } => {
+                        AppError::NotFound { what, id }
+                    }
+                    other => store_error(other),
+                })
         })
         .await
     }
@@ -1824,6 +1876,15 @@ const CHANNEL_REGISTRY: &[(&str, ChannelBuilder)] = &[
     ("tinkoff", build_tinkoff_channel),
 ];
 
+/// The broker codes this build opens a channel for, read straight off
+/// [`CHANNEL_REGISTRY`] so the two cannot disagree. The sync's factory and
+/// the binding route check the same vocabulary with it: a binding kept for a
+/// broker no channel can open would stand silently while every sync of it
+/// failed.
+pub fn supported_brokers() -> impl Iterator<Item = &'static str> {
+    CHANNEL_REGISTRY.iter().map(|(name, _)| *name)
+}
+
 #[async_trait]
 impl BrokerChannelFactory for SqliteAdapter {
     async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError> {
@@ -1841,11 +1902,7 @@ impl BrokerChannelFactory for SqliteAdapter {
                 field: "broker".to_owned(),
                 expected: format!(
                     "a broker this build opens a channel for: {}",
-                    CHANNEL_REGISTRY
-                        .iter()
-                        .map(|(name, _)| *name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    supported_brokers().collect::<Vec<_>>().join(", ")
                 ),
                 actual: broker.to_owned(),
             });
@@ -2624,6 +2681,7 @@ mod tests {
                 channel
                     .fetch_operations(
                         iaam_core::ids::AccountId::new_random(),
+                        "invented-one",
                         time::macros::date!(2026 - 08 - 01),
                         time::macros::date!(2026 - 08 - 31),
                         None,
@@ -2693,6 +2751,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 iaam_core::ids::AccountId::new_random(),
+                "invented-one",
                 time::macros::date!(2025 - 06 - 01),
                 time::macros::date!(2025 - 06 - 30),
                 None,

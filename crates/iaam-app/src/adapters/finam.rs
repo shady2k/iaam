@@ -59,20 +59,32 @@ impl FinamChannel {
 
 #[async_trait]
 impl BrokerChannel for FinamChannel {
+    async fn fetch_account_numbers(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        bounded(
+            deadline,
+            "the Finam sessions request",
+            self.client.get_account_ids(),
+        )
+        .await
+    }
+
     async fn fetch_operations(
         &self,
         account: AccountId,
+        broker_account: &str,
         from: Date,
         to: Date,
         deadline: Option<Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
-        // The account id is taken exactly as the T-Invest channel takes it
-        // today; a later task replaces that for both channels.
+        // The broker is asked for its own account number; the returned rows
+        // are stamped with the owner's account in this system.
         let body = bounded(
             deadline,
             "the Finam transactions request",
-            self.client
-                .get_transactions(&account.inner().to_string(), from, to),
+            self.client.get_transactions(broker_account, from, to),
         )
         .await?;
         let operations = parse_operations(&body).map_err(parse_error)?;
@@ -82,13 +94,15 @@ impl BrokerChannel for FinamChannel {
     async fn fetch_portfolio(
         &self,
         account: AccountId,
+        broker_account: &str,
         _at: Date,
         deadline: Option<Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
+        let _ = account;
         let body = bounded(
             deadline,
             "the Finam portfolio request",
-            self.client.get_portfolio(&account.inner().to_string()),
+            self.client.get_portfolio(broker_account),
         )
         .await?;
         adapt_portfolio(&body)
@@ -116,11 +130,11 @@ impl BrokerChannel for FinamChannel {
 /// Dropping the future cancels the in-flight gateway call, so no wait for
 /// Finam outlives the sync. Both cases answer `Unreachable`: the sync ran
 /// out of its time, and asking again later is exactly the advice.
-async fn bounded(
+async fn bounded<T>(
     deadline: Option<Instant>,
     request: &'static str,
-    call: impl Future<Output = Result<String, FinamError>>,
-) -> Result<String, BrokerError> {
+    call: impl Future<Output = Result<T, FinamError>>,
+) -> Result<T, BrokerError> {
     let call = async { call.await.map_err(finam_error) };
     let Some(at) = deadline else {
         return call.await;
@@ -718,6 +732,29 @@ mod tests {
         .to_string()
     }
 
+    /// The accounts listing is what a sync without a binding binds from, so
+    /// the ids must be exactly what the broker named, in his order.
+    #[tokio::test]
+    async fn the_accounts_listing_becomes_the_ids_the_sync_binds() {
+        let channel = channel(
+            fake::gateway(
+                vec![
+                    session_answer(),
+                    page(r#"{"account_ids":["invented-one","invented-two"]}"#),
+                ],
+                None,
+            )
+            .0,
+        );
+
+        let ids = channel
+            .fetch_account_numbers(None)
+            .await
+            .expect("the listing parses");
+
+        assert_eq!(ids, ["invented-one", "invented-two"]);
+    }
+
     #[tokio::test]
     async fn a_finam_page_becomes_operations_through_the_channel_dictionary() {
         let channel =
@@ -726,6 +763,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 None,
@@ -825,6 +863,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 None,
@@ -862,6 +901,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 None,
@@ -916,6 +956,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 None,
@@ -972,6 +1013,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 None,
@@ -1020,6 +1062,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 None,
@@ -1076,6 +1119,7 @@ mod tests {
         let parsed = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 None,
@@ -1131,6 +1175,7 @@ mod tests {
         let error = channel
             .fetch_operations(
                 account(),
+                account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
                 Some(past),
@@ -1169,7 +1214,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15 * 60);
 
         let error = channel
-            .fetch_portfolio(account(), date!(2025 - 06 - 30), Some(deadline))
+            .fetch_portfolio(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 30),
+                Some(deadline),
+            )
             .await
             .expect_err("the deadline fires although Finam never answers");
 
@@ -1190,7 +1240,12 @@ mod tests {
         let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
 
         let snapshot = channel
-            .fetch_portfolio(account(), date!(2025 - 06 - 30), None)
+            .fetch_portfolio(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 30),
+                None,
+            )
             .await
             .expect("the portfolio is parsed");
 
@@ -1220,7 +1275,12 @@ mod tests {
             channel(fake::gateway(Vec::new(), Some(Answer::status(401, "unauthorized"))).0);
 
         let error = channel
-            .fetch_portfolio(account(), date!(2025 - 06 - 30), None)
+            .fetch_portfolio(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 30),
+                None,
+            )
             .await
             .expect_err("a rejected token");
 

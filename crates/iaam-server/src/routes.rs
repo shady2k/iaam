@@ -52,6 +52,7 @@ use iaam_app::scenarios::reconciliation::{OwnerBalance, record_owner_balance, re
 use iaam_app::scenarios::reports::{
     HeldScope, MoneyFlowQuery, ReturnsQuery, account_balances, asset_snapshot, money_flow, returns,
 };
+use iaam_app::storage::BrokerCode;
 use iaam_app::sync::{
     MarketSource, MarketSyncRequest as AppMarketSyncRequest, sync_broker as run_sync_broker,
     sync_market_with_services as run_market_sync,
@@ -91,8 +92,9 @@ use crate::dto::{
     AccountTransferPartnersBatchDto, AccountTransferPartnersDto, ActionDto, ActionSubjectDto,
     ActionTargetDto, AddContourVersionRequest, AssetSnapshotDto, AssetSnapshotSeriesDto,
     AssetSnapshotSeriesEntryDto, BalancesReportDto, BalancesReportSeriesDto,
-    BalancesReportSeriesEntryDto, BrokerAccessDto, BrokerSyncRequest, CashAssetClassDto,
-    CategoryDto, CategoryGroupDto, CategoryGroupRequest, CategoryMatcherDto, CategoryRequest,
+    BalancesReportSeriesEntryDto, BrokerAccessDto, BrokerAccountBindingDto,
+    BrokerAccountBindingRequest, BrokerSyncRequest, CashAssetClassDto, CategoryDto,
+    CategoryGroupDto, CategoryGroupRequest, CategoryMatcherDto, CategoryRequest,
     CategoryRuleBatchRequest, CategoryRuleDto, CategoryRuleImpactDto, CategoryRuleRequest,
     ClassificationRuleBatchRequest, ClassificationRuleChangeDto, ClassificationRuleDto,
     ClassificationRuleRequest, ContourDto, ContourVersionDto, CorrectImportRequest,
@@ -175,6 +177,7 @@ pub const DECLARE_REPORT_DEFAULT_CONTOUR_OPERATION_ID: &str = "declare_report_de
 /// Withdraw that declaration, leaving nothing declared.
 pub const WITHDRAW_REPORT_DEFAULT_CONTOUR_OPERATION_ID: &str = "withdraw_report_default_contour";
 pub const RECORD_ACCOUNT_SCOPE_OPERATION_ID: &str = "record_account_scope";
+pub const RECORD_BROKER_ACCOUNT_BINDING_OPERATION_ID: &str = "record_broker_account_binding";
 /// The second axis. Named apart from the scope operation because the two decide
 /// different things about one account, and the report that motivated both needs
 /// a closed product to stay *inside* the perimeter.
@@ -1714,6 +1717,7 @@ pub async fn sync_broker(
     ApiJson(request): ApiJson<BrokerSyncRequest>,
 ) -> Result<Json<SyncOutcomeDto>, ApiFailure> {
     require(&principal, OperationKey::SyncBroker)?;
+    let code = broker_code(&broker)?;
     let channel = state
         .services
         .channels
@@ -1723,6 +1727,7 @@ pub async fn sync_broker(
         &state.services,
         &principal,
         channel.as_ref(),
+        &code,
         AccountId(request.account),
         request.from,
         request.to,
@@ -1733,6 +1738,149 @@ pub async fn sync_broker(
         .map(|action| action_dto(action, &catalog))
         .collect();
     Ok(Json(SyncOutcomeDto::from_domain(outcome, actions)))
+}
+
+/// The broker code a path named, as the store and the sync spell it.
+///
+/// The code must name a broker this build opens a channel for -- the same
+/// vocabulary the sync's factory checks -- because a binding kept for a
+/// broker no channel can open would stand silently while every sync of it
+/// failed at the factory.
+fn broker_code(broker: &str) -> Result<BrokerCode, ApiFailure> {
+    let code = BrokerCode::parse(broker).ok_or_else(|| {
+        unprocessable(
+            "broker",
+            "a non-empty broker code",
+            broker,
+            "the broker names the channel a binding is kept for",
+        )
+    })?;
+    let supported = iaam_app::storage::supported_brokers()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !supported.split(", ").any(|name| name == code.as_str()) {
+        return Err(unprocessable(
+            "broker",
+            format!("a broker this build opens a channel for: {supported}").as_str(),
+            broker,
+            "a binding for another broker could never be read by a sync",
+        ));
+    }
+    Ok(code)
+}
+
+/// Read the binding between one of the owner's accounts and the broker's own
+/// account number for it (`iaam-xzz5.3.2`).
+///
+/// The absence of a binding is an answer, not an error of the request: the
+/// sync that finds none asks the access what it sees, and a client reading
+/// `404` here knows a first sync will bind the account by itself when the
+/// access sees exactly one account.
+#[utoipa::path(
+    get,
+    path = "/v1/accounts/{id}/broker-binding/{broker}",
+    params(
+        ("id" = Uuid, Path, description = "Account identifier"),
+        ("broker" = String, Path, description = "Broker code")
+    ),
+    responses(
+        (status = 200, description = "The binding", body = BrokerAccountBindingDto),
+        (status = 404, description = "The account does not exist or belongs to someone else, or no binding stands for it at this broker (code `not_found`)", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn get_broker_account_binding(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath((id, broker)): ApiPath<(Uuid, String)>,
+) -> Result<Json<BrokerAccountBindingDto>, ApiFailure> {
+    let account = owned_account(&state, &principal, AccountId(id)).await?;
+    let code = broker_code(&broker)?;
+    let number = state
+        .services
+        .store
+        .broker_account_binding(principal.owner, account.id, &code)
+        .await?
+        .ok_or_else(|| {
+            ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                ApiError::simple(
+                    "not_found",
+                    format!(
+                        "not found: a binding of account {} at broker {broker}",
+                        account.id.inner()
+                    ),
+                ),
+            )
+        })?;
+    Ok(Json(BrokerAccountBindingDto {
+        account: id,
+        broker,
+        broker_account: number,
+    }))
+}
+
+/// Bind one of the owner's accounts to the broker's own account number for
+/// it (`iaam-xzz5.3.2`).
+///
+/// The number is what a sync asks the broker for; without a binding the sync
+/// can only take an access that sees exactly one account, and refuses an
+/// ambiguous one naming the candidates. Restating the binding replaces the
+/// number; binding a number another of the owner's accounts already holds is
+/// refused with the account that holds it named, because one broker account
+/// is at most one iaam account.
+#[utoipa::path(
+    put,
+    path = "/v1/accounts/{id}/broker-binding/{broker}",
+    operation_id = RECORD_BROKER_ACCOUNT_BINDING_OPERATION_ID,
+    params(
+        ("id" = Uuid, Path, description = "Account identifier"),
+        ("broker" = String, Path, description = "Broker code")
+    ),
+    request_body = BrokerAccountBindingRequest,
+    responses(
+        (status = 200, description = "Binding recorded", body = BrokerAccountBindingDto),
+        (status = 403, description = "Insufficient permissions", body = ApiError),
+        (status = 404, description = "Account does not exist or belongs to someone else", body = ApiError),
+        (status = 409, description = "The broker account is already bound to another of the owner's accounts (code `already_exists`)", body = ApiError),
+        (status = 400, description = "Request body could not be read", body = ApiError),
+        (status = 413, description = "Request body exceeds the limit", body = ApiError),
+        (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
+        (status = 422, description = "Request could not be read", body = ApiError)
+    ),
+    security(("bearer" = []))
+)]
+pub async fn record_broker_account_binding(
+    State(state): State<ServerState>,
+    Extension(principal): Extension<Principal>,
+    ApiPath((id, broker)): ApiPath<(Uuid, String)>,
+    ApiJson(request): ApiJson<BrokerAccountBindingRequest>,
+) -> Result<Json<BrokerAccountBindingDto>, ApiFailure> {
+    // A binding is a reversible statement: restating it replaces the number,
+    // so the floor is the agent's, like every other PUT-style word.
+    require(&principal, OperationKey::RecordBrokerAccountBinding)?;
+    let account = owned_account(&state, &principal, AccountId(id)).await?;
+    let code = broker_code(&broker)?;
+    let number = request.broker_account.trim();
+    if number.is_empty() {
+        return Err(unprocessable(
+            "broker_account",
+            "a non-empty account number",
+            "nothing",
+            "an empty number binds the account to nothing and is indistinguishable from no              binding at all",
+        ));
+    }
+    state
+        .services
+        .store
+        .record_broker_account_binding(principal.owner, account.id, &code, number.to_owned())
+        .await?;
+    Ok(Json(BrokerAccountBindingDto {
+        account: id,
+        broker,
+        broker_account: number.to_owned(),
+    }))
 }
 
 /// Manually synchronise one market series.

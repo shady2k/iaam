@@ -5694,6 +5694,29 @@ pub struct RecordAccountScopeRequest {
     pub reason: Option<String>,
 }
 
+/// The binding between one of the owner's accounts and the broker's own
+/// account number for it (`iaam-xzz5.3.2`).
+///
+/// The number is the broker's own word for the account, carried exactly as he
+/// prints it: opaque here, shape-checked by nobody, and the only thing a
+/// broker channel can be asked for. One number names at most one of the
+/// owner's accounts per broker — binding it elsewhere is refused, which is
+/// what keeps a sync from filing one broker's rows onto two accounts.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BrokerAccountBindingDto {
+    pub account: Uuid,
+    pub broker: String,
+    pub broker_account: String,
+}
+
+/// The number to bind. Restating it replaces the number that stood: the
+/// owner's correction is the word that stands, the same upsert the contour
+/// declaration and the scope decision use.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct BrokerAccountBindingRequest {
+    pub broker_account: String,
+}
+
 /// What a name a document printed turned out to be.
 ///
 /// **Three values, and the first is refused by the route** — the same shape
@@ -9494,6 +9517,11 @@ pub struct SyncOutcomeDto {
     pub assertions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assertions_withheld: Option<AssertionsWithheldDto>,
+    /// True when this synchronisation recorded the binding itself: no binding
+    /// stood, the access saw exactly one account, and it was taken. The
+    /// binding's number is read through the account's own broker-binding
+    /// route, not repeated here.
+    pub binding_recorded: bool,
     /// What this synchronisation's own verdicts leave outstanding. Always
     /// present, empty included.
     pub actions: Vec<ActionDto>,
@@ -9520,6 +9548,7 @@ impl SyncOutcomeDto {
                     }
                 }
             }),
+            binding_recorded: outcome.binding_recorded,
             actions,
         }
     }

@@ -131,7 +131,27 @@ use crate::{SqliteStore, StoreError};
 /// is not a decision the owner took — and restoring either leaves the instance
 /// with no declaration, so the difference is in what may be *concluded* about
 /// the owner's intent, not in the row a restore writes.
-pub const BUNDLE_VERSION: u32 = 7;
+///
+/// Version 8 (`iaam-xzz5.3.2`) adds [`Bundle::broker_account_bindings`]: the
+/// binding between one of the owner's accounts and the broker's own account
+/// number for it, in the shape `broker_account_bindings` stores it. The
+/// reasoning is version 7's, and the rule is stated in both directions
+/// because the two readings are opposite and both restore to no row:
+///
+/// - **At version 8 and above, an absent section is a statement.** The build
+///   that wrote the archive knew the section exists and would have written
+///   it, so its emptiness is «this owner holds no broker account binding» at
+///   export time.
+/// - **At version 7 and below, the section is unknown and its absence says
+///   nothing.** That archive was written before the table existed; whether
+///   the owner had bound an account is «not recorded», exactly as a contour
+///   declaration is in a version-6 archive.
+///
+/// The difference is in what may be *concluded* about the owner's intent,
+/// not in the row a restore writes: an older archive restores to no binding
+/// and so does one that states he has none, but only `bundle_version` tells
+/// a reader which of the two the archive meant.
+pub const BUNDLE_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContourSection {
@@ -325,6 +345,25 @@ pub struct AccountRetractionSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContourReportDefaultSection {
     pub contour: uuid::Uuid,
+    pub recorded_at: String,
+}
+
+/// The broker's own account number one of the owner's accounts is bound to,
+/// carried the way `broker_account_bindings` stores it (`iaam-xzz5.3.2`).
+///
+/// A current statement, not a history: a rebinding replaces the number, and
+/// the archive carries the word that stands. One row per (account, broker) —
+/// the primary key — so an archive naming one binding twice is corrupt
+/// rather than ambiguous, and a restore refuses it instead of letting
+/// `DO NOTHING` quietly decide. The absence of the whole section is «this
+/// owner holds no binding» in an archive at version 8 and above, and «not
+/// recorded» in one written at version 7 or below (see
+/// [`BUNDLE_VERSION`], which is what separates the two).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrokerAccountBindingSection {
+    pub account: uuid::Uuid,
+    pub broker: String,
+    pub broker_account: String,
     pub recorded_at: String,
 }
 
@@ -828,6 +867,11 @@ pub struct Bundle {
     /// The full `account_retirements` history, every revision.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_retirements: Vec<AccountRetirementSection>,
+    /// Every binding between one of the owner's accounts and the broker's
+    /// own account number for it (`iaam-xzz5.3.2`). The `#[serde(default)]`
+    /// reasoning above `contour_report_defaults` applies here too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broker_account_bindings: Vec<BrokerAccountBindingSection>,
     /// The owner's or an agent's standing declarations that an account should
     /// never have existed (`iaam-o0oj`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -931,6 +975,8 @@ struct BundleContent<'a> {
     categories: &'a [CategorySection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     category_rules: &'a [CategoryRuleSection],
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    broker_account_bindings: &'a [BrokerAccountBindingSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     event_category_assignments: &'a [EventCategoryAssignmentSection],
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -1055,6 +1101,7 @@ impl Bundle {
             contours: &self.contours,
             custody_places: &self.custody_places,
             instruments: &self.instruments,
+            broker_account_bindings: &self.broker_account_bindings,
             classification_rules: &self.classification_rules,
             category_groups: &self.category_groups,
             categories: &self.categories,
@@ -1262,6 +1309,13 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     // and the guess it would make is a statement about the owner's money that
     // no response records (`iaam-14is`).
     ("contour_report_defaults", TableDisposition::Carried),
+    // The owner's word about which of the broker's accounts is an account of
+    // his. A restore that dropped it would send the next sync back to the
+    // broker with no number to name — the exact defect the binding exists to
+    // prevent — and the sync would either refuse or re-derive it by asking
+    // the channel, which is a round trip an archive should have spared
+    // (`iaam-xzz5.3.2`).
+    ("broker_account_bindings", TableDisposition::Carried),
     ("account_aliases", TableDisposition::Carried),
     ("declined_account_names", TableDisposition::Carried),
     ("decision_history", TableDisposition::Carried),
@@ -1739,6 +1793,34 @@ impl SqliteStore {
             let (contour, recorded_at) = row?;
             contour_report_defaults.push(ContourReportDefaultSection {
                 contour: parse(&contour, "contour")?,
+                recorded_at,
+            });
+        }
+
+        // `ORDER BY` on the primary key's columns: a binding per account and
+        // broker, and the fixed order is what makes two exports of one state
+        // byte-comparable.
+        let mut statement = self.conn.prepare(
+            "SELECT account, broker, broker_account, recorded_at
+             FROM broker_account_bindings
+             WHERE owner = ?1
+             ORDER BY account, broker",
+        )?;
+        let rows = statement.query_map([owner.inner().to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut broker_account_bindings = Vec::new();
+        for row in rows {
+            let (account, broker, broker_account, recorded_at) = row?;
+            broker_account_bindings.push(BrokerAccountBindingSection {
+                account: parse(&account, "account")?,
+                broker,
+                broker_account,
                 recorded_at,
             });
         }
@@ -2606,6 +2688,7 @@ impl SqliteStore {
             account_retirements,
             account_retractions,
             contour_report_defaults,
+            broker_account_bindings,
             account_aliases,
             declined_account_names,
             decision_history,
@@ -2728,6 +2811,61 @@ impl SqliteStore {
                          about and carries no version of it: a declaration must name a contour \
                          the archive holds",
                         declaration.contour
+                    ),
+                });
+            }
+        }
+
+        // Three structural contradictions a restore would otherwise answer by
+        // dropping a row in silence, each checked against the archive's own
+        // carried sections and never against what the destination happens to
+        // hold (`iaam-xzz5.3.2`):
+        //
+        // - one binding per (account, broker) is the table's primary key, so
+        //   an archive naming one pair twice is two answers to one question —
+        //   `DO NOTHING` would pick the first and lose the second without a
+        //   word;
+        // - one broker account bound to two iaam accounts is the unique index
+        //   the table exists to enforce, and the same silence would drop the
+        //   second binding instead of refusing the archive;
+        // - a binding naming an account the archive does not carry would make
+        //   `broker_account_bindings_name_a_held_account` abort mid-restore,
+        //   with a message that names no account — the refusal below names it,
+        //   and is checked here so the failure happens before any row is
+        //   applied. The export writes every account the owner holds, so a
+        //   bundle from this build always carries the account it binds; one
+        //   that does not has lost the pair somewhere, and is corrupt.
+        let mut binding_keys = std::collections::BTreeSet::new();
+        let mut binding_numbers = std::collections::BTreeSet::new();
+        for binding in &bundle.broker_account_bindings {
+            if !binding_keys.insert((binding.account, binding.broker.clone())) {
+                return Err(StoreError::BundleCorrupted {
+                    detail: format!(
+                        "the archive binds account {} at broker {} twice: one account carries \
+                         one number per broker",
+                        binding.account, binding.broker
+                    ),
+                });
+            }
+            if !binding_numbers.insert((binding.broker.clone(), binding.broker_account.clone())) {
+                return Err(StoreError::BundleCorrupted {
+                    detail: format!(
+                        "the archive binds broker account {} at broker {} to more than one of \
+                         the owner's accounts: one broker account is one iaam account",
+                        binding.broker_account, binding.broker
+                    ),
+                });
+            }
+            if !bundle
+                .accounts
+                .iter()
+                .any(|account| account.id == binding.account)
+            {
+                return Err(StoreError::BundleCorrupted {
+                    detail: format!(
+                        "the archive binds account {} at broker {} and carries no such account: \
+                         a binding must name an account the archive holds",
+                        binding.account, binding.broker
                     ),
                 });
             }
@@ -3146,6 +3284,38 @@ impl SqliteStore {
                     owner.inner().to_string(),
                     declaration.contour.to_string(),
                     declaration.recorded_at,
+                ],
+            )?;
+        }
+
+        // The bindings (`iaam-xzz5.3.2`), written here — after the accounts,
+        // far above — because the order is what makes a valid archive
+        // restorable rather than a convention:
+        // `broker_account_bindings_name_a_held_account` is a `BEFORE INSERT`
+        // trigger refusing a binding whose account this owner does not hold,
+        // and a binding written before the accounts it names is precisely the
+        // row that trigger aborts. The archive's own accounts were checked
+        // against its bindings before the transaction opened, so this loop
+        // can rely on the account being in by now.
+        //
+        // `DO NOTHING` on the conflict, like every other standing statement
+        // in this function: an archive supplies what is missing and never
+        // overwrites what is there — the owner's current binding is a word
+        // about the machine he is on now, not one an older archive gets to
+        // correct. An archive carrying no bindings writes nothing, so a
+        // restore cannot unbind an account either.
+        for binding in &bundle.broker_account_bindings {
+            transaction.execute(
+                "INSERT INTO broker_account_bindings
+                     (owner, account, broker, broker_account, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (owner, account, broker) DO NOTHING",
+                params![
+                    owner.inner().to_string(),
+                    binding.account.to_string(),
+                    binding.broker,
+                    binding.broker_account,
+                    binding.recorded_at,
                 ],
             )?;
         }

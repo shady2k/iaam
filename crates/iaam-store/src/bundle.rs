@@ -2838,6 +2838,22 @@ impl SqliteStore {
         let mut binding_keys = std::collections::BTreeSet::new();
         let mut binding_numbers = std::collections::BTreeSet::new();
         for binding in &bundle.broker_account_bindings {
+            // The schema's own `CHECK (length(broker_account) > 0)` names a
+            // value it forbids, and a forbidden value is refused here — by
+            // name, before the transaction — rather than letting the CHECK
+            // abort the restore from inside it with an error that names no
+            // binding. An empty number is indistinguishable from "we don't
+            // know" on the broker's side and is the owner's word never being
+            // a placeholder.
+            if binding.broker_account.is_empty() {
+                return Err(StoreError::BundleCorrupted {
+                    detail: format!(
+                        "the archive binds account {} at broker {} to an empty number: a \
+                         binding carries the broker's own account number",
+                        binding.account, binding.broker
+                    ),
+                });
+            }
             if !binding_keys.insert((binding.account, binding.broker.clone())) {
                 return Err(StoreError::BundleCorrupted {
                     detail: format!(

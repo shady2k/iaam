@@ -2509,6 +2509,35 @@ fn an_archive_without_bindings_says_so_where_an_older_one_cannot() {
 }
 
 #[test]
+fn an_archive_binding_an_empty_number_is_refused_by_name() {
+    // The schema's CHECK refuses an empty number from inside the restore;
+    // this refusal says the same thing before it, naming the binding, the
+    // way every other structural contradiction here is named.
+    let (source, owner, account, _) = populated();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut corrupt = bundle;
+    corrupt.broker_account_bindings = vec![iaam_store::bundle::BrokerAccountBindingSection {
+        account: account.inner(),
+        broker: "tinkoff".into(),
+        broker_account: String::new(),
+        recorded_at: "2026-09-27T00:00:00Z".into(),
+    }];
+    corrupt.checksum = corrupt.compute_checksum();
+    let error = SqliteStore::open_in_memory()
+        .unwrap()
+        .import_bundle(&corrupt)
+        .expect_err("an empty number is not the owner's word");
+    let StoreError::BundleCorrupted { detail } = error else {
+        panic!("expected a corruption refusal, got {error}");
+    };
+    assert!(
+        detail.contains("empty number") && detail.contains("tinkoff"),
+        "the refusal names the binding and the forbidden value: {detail}"
+    );
+    assert!(!detail.contains("SQLite") && !detail.contains("trigger"));
+}
+
+#[test]
 fn an_archive_binding_one_broker_number_to_two_accounts_is_refused_by_name() {
     let (source, owner, account, _) = populated();
     let other = AccountId::new_random();

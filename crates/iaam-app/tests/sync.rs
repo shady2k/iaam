@@ -121,7 +121,6 @@ fn broker_code() -> iaam_store::documents::BrokerCode {
 /// (seeding the account row it needs), so these tests go on exercising the
 /// fetch path and nothing else. The binding behaviours themselves are tested
 /// against [`iaam_app::sync::sync_broker`] directly, below.
-#[allow(clippy::too_many_arguments)]
 async fn sync_broker(
     services: &AppServices,
     principal: &Principal,
@@ -165,7 +164,13 @@ async fn sync_broker(
             .await
             .unwrap_or_else(|error| panic!("seed binding: {error}"));
     }
-    iaam_app::sync::sync_broker(services, principal, broker, &code, account, from, to).await
+    let request = iaam_app::sync::BrokerSyncRequest {
+        broker_code: code,
+        account,
+        from,
+        to,
+    };
+    iaam_app::sync::sync_broker(services, principal, broker, request).await
 }
 
 fn principal(owner: OwnerId) -> Principal {
@@ -2659,10 +2664,12 @@ async fn a_bound_account_syncs_with_the_brokers_own_number() {
         &services,
         &principal(owner),
         &broker,
-        &broker_code(),
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
     )
     .await
     .unwrap_or_else(|error| panic!("sync: {error}"));
@@ -2707,10 +2714,12 @@ async fn an_unbound_account_is_bound_to_the_one_account_the_access_sees() {
         &services,
         &principal(owner),
         &broker,
-        &broker_code(),
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
     )
     .await
     .unwrap_or_else(|error| panic!("sync: {error}"));
@@ -2760,10 +2769,12 @@ async fn several_candidates_refuse_the_sync_before_anything_is_fetched() {
         &services,
         &principal(owner),
         &broker,
-        &broker_code(),
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
     )
     .await
     .expect_err("the sync must refuse, not guess");
@@ -2823,10 +2834,12 @@ async fn an_access_that_sees_no_account_refuses_the_sync() {
         &services,
         &principal(owner),
         &broker,
-        &broker_code(),
-        account,
-        date!(2026 - 03 - 01),
-        date!(2026 - 03 - 31),
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
     )
     .await
     .expect_err("the sync must refuse");

@@ -125,16 +125,35 @@ impl Drop for SyncClaim<'_> {
 /// Reconciliation of two independent channels must still recognise the same operation even
 /// from different sources. A probable duplicate is not removed: it is only a hint
 /// at the §10.6 level, so it enters the journal as a new fact.
-#[allow(clippy::too_many_arguments)]
+/// One broker synchronisation, whole: which broker the binding is kept
+/// under, whose account the facts belong to, and the interval to read.
+///
+/// A struct rather than five loose arguments so that adding one does not
+/// silently reorder the ones already there (§15.1), the way
+/// [`MarketSyncRequest`] does for the market sync beside it. The channel is
+/// deliberately not a field: it is a live connection the caller opened, not
+/// a description of what is being asked.
+#[derive(Debug, Clone)]
+pub struct BrokerSyncRequest {
+    pub broker_code: BrokerCode,
+    pub account: AccountId,
+    pub from: Date,
+    pub to: Date,
+}
+
+/// Retrieves the broker's operations and portfolio and records new facts.
 pub async fn sync_broker(
     services: &AppServices,
     principal: &Principal,
     broker: &dyn BrokerChannel,
-    broker_code: &BrokerCode,
-    account: AccountId,
-    from: Date,
-    to: Date,
+    request: BrokerSyncRequest,
 ) -> Result<SyncOutcome, AppError> {
+    let BrokerSyncRequest {
+        broker_code,
+        account,
+        from,
+        to,
+    } = request;
     if !principal.scope.may_submit() {
         return Err(AppError::Invalid {
             field: "scope".to_owned(),
@@ -155,7 +174,7 @@ pub async fn sync_broker(
     // fetched for the interval or written to the journal.
     let binding = services
         .store
-        .broker_account_binding(principal.owner, account, broker_code)
+        .broker_account_binding(principal.owner, account, &broker_code)
         .await?;
     let (broker_account, binding_recorded) = match binding {
         Some(number) => (number, false),
@@ -176,7 +195,7 @@ pub async fn sync_broker(
                         .record_broker_account_binding(
                             principal.owner,
                             account,
-                            broker_code,
+                            &broker_code,
                             (*one).clone(),
                         )
                         .await?;

@@ -1727,10 +1727,12 @@ pub async fn sync_broker(
         &state.services,
         &principal,
         channel.as_ref(),
-        &code,
-        AccountId(request.account),
-        request.from,
-        request.to,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: code,
+            account: AccountId(request.account),
+            from: request.from,
+            to: request.to,
+        },
     )
     .await?;
     let actions = iaam_app::actions::verdicts_diagnostics(&outcome.recorded)

@@ -525,6 +525,17 @@ impl ApiFailure {
                     ),
                 ),
             ),
+            // The broker answered, but its access cannot name one account:
+            // nothing is wrong with the request, and a retry cannot help.
+            // The remedy is the owner's binding, which the 409 names in
+            // prose — the candidates in an ambiguity are exactly what he
+            // needs to choose from.
+            AppError::BrokerAccountUnseen { .. } | AppError::BrokerAccountAmbiguous { .. } => {
+                Self::new(
+                    StatusCode::CONFLICT,
+                    ApiError::simple(error.code(), error.to_string()),
+                )
+            }
             AppError::Store(_)
             | AppError::Projection(_)
             // Money-flow arithmetic overflow makes the journal slice unusable:

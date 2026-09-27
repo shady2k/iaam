@@ -13,7 +13,8 @@ use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, ChannelOrderState,
     ChannelPortfolioPosition, GetOperationsByCursorRequest, ParseError, TINKOFF_PARSER_VERSION,
-    TinkoffClient, TinkoffError, parse_operations, parse_portfolio, parse_portfolio_positions,
+    TinkoffClient, TinkoffError, parse_account_ids, parse_operations, parse_portfolio,
+    parse_portfolio_positions,
 };
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::ParserVersion;
@@ -69,14 +70,28 @@ impl TinkoffChannel {
 
 #[async_trait]
 impl BrokerChannel for TinkoffChannel {
+    async fn fetch_account_numbers(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        // The accounts listing has no deadline parameter on the client — its
+        // frozen signature predates the sync's deadline — so the bound is
+        // taken here, the way the Finam channel bounds every call.
+        let body = bounded(deadline, self.client.get_accounts()).await?;
+        parse_account_ids(&body).map_err(parse_error)
+    }
+
     async fn fetch_operations(
         &self,
         account: AccountId,
+        broker_account: &str,
         from: time::Date,
         to: time::Date,
         deadline: Option<Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
-        let mut request = GetOperationsByCursorRequest::new(account.inner().to_string());
+        // The broker is asked for its own account number; the returned rows
+        // are stamped with the owner's account in this system.
+        let mut request = GetOperationsByCursorRequest::new(broker_account.to_owned());
         request.from = Some(rfc3339_midnight(from));
         request.to = Some(rfc3339_operation_end(to));
         request.limit = Some(OPERATIONS_PAGE_LIMIT);
@@ -92,12 +107,14 @@ impl BrokerChannel for TinkoffChannel {
     async fn fetch_portfolio(
         &self,
         account: AccountId,
+        broker_account: &str,
         _at: time::Date,
         deadline: Option<Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
+        let _ = account;
         let body = self
             .client
-            .get_portfolio(&account.inner().to_string(), deadline)
+            .get_portfolio(broker_account, deadline)
             .await
             .map_err(tinkoff_error)?;
         adapt_portfolio(&body)
@@ -212,6 +229,38 @@ fn duplicate_position_refusal(
             rows.len()
         ),
         dimensions: [Dimension::Positions].into_iter().collect(),
+    }
+}
+
+/// Runs one client call under the sync's deadline.
+///
+/// The accounts listing carries no deadline on the client, so the bound is
+/// taken here, twice, exactly as the Finam channel takes it: a call whose
+/// deadline has already passed never starts, and one still running is
+/// dropped the moment the deadline fires — which cancels the in-flight
+/// gateway call, so no wait outlives the sync.
+async fn bounded(
+    deadline: Option<Instant>,
+    call: impl Future<Output = Result<String, TinkoffError>>,
+) -> Result<String, BrokerError> {
+    let call = async { call.await.map_err(tinkoff_error) };
+    let Some(at) = deadline else {
+        return call.await;
+    };
+    if Instant::now() >= at {
+        return Err(unreachable_after_deadline());
+    }
+    match tokio::time::timeout_at(tokio::time::Instant::from(at), call).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(unreachable_after_deadline()),
+    }
+}
+
+fn unreachable_after_deadline() -> BrokerError {
+    BrokerError::Unreachable {
+        broker: BROKER.to_owned(),
+        detail: "the accounts request did not finish within the sync's deadline".to_owned(),
+        retry_after: None,
     }
 }
 
@@ -1149,10 +1198,89 @@ mod tests {
 
     use super::{
         BrokerError, GetOperationsByCursorRequest, PortfolioAsOf, Quarantined, RowRefusal,
-        adapt_operations, adapt_portfolio, fetch_operation_pages, operation_to_submitted,
+        adapt_operations, adapt_portfolio, bounded, fetch_operation_pages, operation_to_submitted,
         order_state_reason, rfc3339_operation_end, trade_operations,
     };
     use iaam_broker::operation_kind::OperationKindDictionary;
+
+    /// A future that marks itself the first time it is polled and then never
+    /// finishes: the probe for the deadline branch that must never even start
+    /// the call.
+    struct NeverReady(Arc<AtomicBool>);
+
+    impl Future for NeverReady {
+        type Output = Result<String, TinkoffError>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.0.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    /// The accounts listing is what a sync without a binding binds from, so
+    /// the ids must be exactly what the broker named, in his order.
+    #[tokio::test]
+    async fn the_accounts_listing_becomes_the_ids_the_sync_binds() {
+        let (gateway, log, _) = fake::gateway(
+            vec![Answer::status(
+                200,
+                r#"{"accounts":[{"id":"first"},{"id":"second"}]}"#,
+            )],
+            None,
+        );
+
+        let ids = channel(gateway)
+            .fetch_account_numbers(None)
+            .await
+            .expect("the listing parses");
+
+        assert_eq!(ids, ["first", "second"]);
+        assert_eq!(log.lock().expect("log").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_passes_the_answer_through_when_no_deadline_is_set() {
+        let body = bounded(None, async { Ok::<_, TinkoffError>("the-body".to_owned()) })
+            .await
+            .expect("no deadline, no bound");
+        assert_eq!(body, "the-body");
+    }
+
+    #[tokio::test]
+    async fn an_expired_deadline_never_starts_the_call() {
+        let polled = Arc::new(AtomicBool::new(false));
+
+        let error = bounded(
+            Some(Instant::now() - Duration::from_secs(1)),
+            NeverReady(Arc::clone(&polled)),
+        )
+        .await
+        .expect_err("an expired deadline refuses");
+
+        assert!(
+            matches!(error, BrokerError::Unreachable { .. }),
+            "{error:?}"
+        );
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "the call whose deadline has passed is never started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_outliving_its_deadline_is_dropped_and_refused() {
+        let error = bounded(
+            Some(Instant::now() + Duration::from_millis(20)),
+            NeverReady(Arc::new(AtomicBool::new(false))),
+        )
+        .await
+        .expect_err("the deadline fires");
+
+        assert!(
+            matches!(error, BrokerError::Unreachable { .. }),
+            "{error:?}"
+        );
+    }
 
     #[test]
     fn an_executed_state_has_no_quarantine_reason() {
@@ -2818,12 +2946,15 @@ mod tests {
 
     // --- through the gateway ------------------------------------------------
 
+    use std::pin::Pin;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
 
     use iaam_broker::credentials::{Key, open, seal};
     use iaam_broker::environment::Environment;
-    use iaam_broker::tinkoff::TinkoffClient;
+    use iaam_broker::tinkoff::{TinkoffClient, TinkoffError};
     use iaam_http::Outbound;
     use iaam_http::gateway::{ATTEMPTS, Clock, FIRST_BACKOFF};
     use iaam_http::resilience::{Outcome, RetryPolicy};
@@ -2849,6 +2980,7 @@ mod tests {
         channel
             .fetch_operations(
                 AccountId(Uuid::from_u128(1)),
+                "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 01),
                 time::macros::date!(2026 - 08 - 31),
                 None,
@@ -2922,6 +3054,7 @@ mod tests {
         let error = channel(gateway)
             .fetch_portfolio(
                 AccountId(Uuid::from_u128(1)),
+                "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 31),
                 None,
             )
@@ -2974,6 +3107,7 @@ mod tests {
         let error = channel(gateway)
             .fetch_operations(
                 AccountId(Uuid::from_u128(1)),
+                "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 01),
                 time::macros::date!(2026 - 08 - 31),
                 Some(deadline),
@@ -2998,6 +3132,7 @@ mod tests {
         let error = channel(gateway)
             .fetch_portfolio(
                 AccountId(Uuid::from_u128(1)),
+                "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 31),
                 Some(time.now()),
             )

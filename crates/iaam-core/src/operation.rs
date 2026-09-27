@@ -246,6 +246,17 @@ pub enum OperationKey {
     /// state a mistaken creation leaves behind, and retraction is the call that
     /// removes the row rather than annotating it.
     RetractAccount,
+    /// Bind one of the owner's accounts to the broker's own account number
+    /// for it (`iaam-xzz5.3.2`).
+    ///
+    /// A sync asks the broker for its own number, never for this system's
+    /// identifier, so a stored binding is the word that decides which of the
+    /// broker's accounts is this account of his. Without one the sync asks
+    /// the access what it sees and takes exactly one account; several are
+    /// refused with the candidates named, and this call is the way out.
+    /// Restating the binding replaces the number, so the act is reversible in
+    /// the same sense every other agent-reachable statement is.
+    RecordBrokerAccountBinding,
 }
 
 impl OperationKey {
@@ -256,10 +267,10 @@ impl OperationKey {
     /// checks against the contract, and a caveat or an action naming it would
     /// have found out at the moment a caller asked for it.
     ///
-    /// The declared length is the only thing holding the twenty-second variant to
+    /// The declared length is the only thing holding the twenty-fourth variant to
     /// this list: adding one without extending `ALL` leaves it unresolved
     /// against the contract, so extend both in the same edit.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::CreateAccount,
         Self::CreateContour,
         Self::AddContourVersion,
@@ -283,6 +294,7 @@ impl OperationKey {
         Self::AbandonImportSession,
         Self::SubmitCorrections,
         Self::RetractAccount,
+        Self::RecordBrokerAccountBinding,
     ];
 
     /// The route operation identifier declared by the transport.
@@ -312,6 +324,7 @@ impl OperationKey {
             Self::AbandonImportSession => "abandon_import_session",
             Self::SubmitCorrections => "submit_corrections",
             Self::RetractAccount => "record_account_retraction",
+            Self::RecordBrokerAccountBinding => "record_broker_account_binding",
         }
     }
 }

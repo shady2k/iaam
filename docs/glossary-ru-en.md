@@ -86,6 +86,7 @@ is how you match a term in them to the code.
 | дельта | delta | |
 | порядок (внутри дня) | effective order | |
 | состояние поручения | order state | `ChannelOrderState`; the broker channel's own state, not ours |
+| привязка счёта | broker account binding | `broker_account_bindings`; the owner's word about which of the broker's own accounts is this account of his (`iaam-xzz5.3.2`). A sync asks the broker for **its** number, never for this system's identifier, so the binding is what a sync resolves first. One number names at most one iaam account per broker — binding it elsewhere is refused, never re-pointed — and restating the binding replaces the number rather than standing beside it |
 | ключ идемпотентности | idempotency key | `idempotency_key` |
 | утверждение (владельца) | assertion | `assertions`; what the owner states — never a second source |
 | восстановленное начало | reconstructed opening | a position that existed before the journal began |

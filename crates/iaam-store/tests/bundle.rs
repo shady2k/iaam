@@ -19,7 +19,6 @@ use iaam_core::money::{CurrencyCode, Money, PerUnitAmount, PostedMinor, Quantity
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::evidence::IdentityScope;
 use iaam_core::retirement::AccountRetirement;
-use iaam_store::SqliteStore;
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::bundle::{Bundle, ContourReportDefaultSection, ImportOutcome};
 use iaam_store::categories::NewCategoryRule;
@@ -33,6 +32,7 @@ use iaam_store::reference::{
 };
 use iaam_store::rules::NewRule;
 use iaam_store::schedule::IssueTermsRow;
+use iaam_store::{SqliteStore, StoreError};
 use time::macros::date;
 
 fn deposit(owner: OwnerId, account: AccountId, sequence: u32, minor: i64) -> Event {
@@ -2394,4 +2394,241 @@ fn measure_the_size_of_a_realistic_export() {
         json.len(),
         f64::from(u32::try_from(json.len()).unwrap_or(u32::MAX)) / (1024.0 * 1024.0)
     );
+}
+
+// --- iaam-xzz5.3.2: the broker account binding travels -------------------
+
+/// The bundle version at which the archive first carries
+/// `broker_account_bindings`, a literal for the same reason
+/// `FIRST_VERSION_CARRYING_THE_DECLARATION` is: the rule is about the
+/// boundary, and `BUNDLE_VERSION` has moved on.
+const FIRST_VERSION_CARRYING_A_BINDING: u32 = 8;
+
+/// What an archive says about the owner's broker account bindings, in the
+/// three states the version mechanism separates.
+#[derive(Debug, PartialEq)]
+enum DeclaredBindings {
+    /// Written before the section existed: nobody recorded whether the
+    /// owner had bound an account.
+    NotRecorded,
+    /// Written by a build that knows the section: he holds none.
+    None,
+    One,
+}
+
+fn declared_bindings(bundle: &Bundle) -> DeclaredBindings {
+    if bundle.bundle_version < FIRST_VERSION_CARRYING_A_BINDING {
+        return DeclaredBindings::NotRecorded;
+    }
+    match bundle.broker_account_bindings.as_slice() {
+        [] => DeclaredBindings::None,
+        [..] => DeclaredBindings::One,
+    }
+}
+
+fn tinkoff() -> BrokerCode {
+    BrokerCode::parse("tinkoff").expect("broker code")
+}
+
+#[test]
+fn a_binding_round_trips_into_a_genuinely_empty_database() {
+    let (source, owner, account, _) = populated();
+    source
+        .record_broker_account_binding(owner, account, &tinkoff(), "invented-one")
+        .expect("the fixture must actually bind the account, or this test proves nothing");
+    let bundle = source.export_bundle(owner).unwrap();
+    assert_eq!(bundle.broker_account_bindings.len(), 1);
+    assert_eq!(bundle.broker_account_bindings[0].account, account.inner());
+    assert_eq!(bundle.broker_account_bindings[0].broker, "tinkoff");
+    assert_eq!(
+        bundle.broker_account_bindings[0].broker_account,
+        "invented-one"
+    );
+
+    // This restore is also the ordering test:
+    // `broker_account_bindings_name_a_held_account` refuses a binding whose
+    // account this owner does not hold, so an import that wrote the binding
+    // before the accounts would abort here rather than restore.
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored
+        .import_bundle(&bundle)
+        .expect("a binding must restore after the accounts it names");
+    assert_eq!(
+        restored
+            .broker_account_binding(owner, account, &tinkoff())
+            .unwrap(),
+        Some("invented-one".to_owned()),
+        "the restored instance must name the same number, not merely hold a row"
+    );
+    assert_eq!(
+        restored
+            .export_bundle(owner)
+            .unwrap()
+            .broker_account_bindings,
+        bundle.broker_account_bindings
+    );
+}
+
+#[test]
+fn an_archive_without_bindings_says_so_where_an_older_one_cannot() {
+    // The version separates the two readings of an absent section, exactly
+    // as it does for the contour declaration: a fresh export states «this
+    // owner holds no binding», the fixed old archive predates the section
+    // and says nothing at all. Both restore to no binding; what differs is
+    // what a reader may conclude about the owner's intent.
+    let (source, owner, account, _) = populated();
+    let exported = source.export_bundle(owner).unwrap();
+    assert!(exported.broker_account_bindings.is_empty());
+    assert_eq!(
+        declared_bindings(&exported),
+        DeclaredBindings::None,
+        "an instance with no binding exports an archive that states so"
+    );
+
+    let old: Bundle = serde_json::from_str(ARCHIVE_WITHOUT_REFERENCE_SECTIONS)
+        .expect("an old archive still reads");
+    assert!(old.broker_account_bindings.is_empty());
+    assert_eq!(
+        declared_bindings(&old),
+        DeclaredBindings::NotRecorded,
+        "an archive written before the section existed cannot be read as «he bound none»"
+    );
+    assert!(exported.bundle_version >= FIRST_VERSION_CARRYING_A_BINDING);
+    assert!(old.bundle_version < FIRST_VERSION_CARRYING_A_BINDING);
+
+    let mut from_export = SqliteStore::open_in_memory().unwrap();
+    from_export.import_bundle(&exported).unwrap();
+    assert_eq!(
+        from_export
+            .broker_account_binding(owner, account, &tinkoff())
+            .unwrap(),
+        None
+    );
+    let mut from_old = SqliteStore::open_in_memory().unwrap();
+    from_old.import_bundle(&old).unwrap();
+}
+
+#[test]
+fn an_archive_binding_an_empty_number_is_refused_by_name() {
+    // The schema's CHECK refuses an empty number from inside the restore;
+    // this refusal says the same thing before it, naming the binding, the
+    // way every other structural contradiction here is named.
+    let (source, owner, account, _) = populated();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut corrupt = bundle;
+    corrupt.broker_account_bindings = vec![iaam_store::bundle::BrokerAccountBindingSection {
+        account: account.inner(),
+        broker: "tinkoff".into(),
+        broker_account: String::new(),
+        recorded_at: "2026-09-27T00:00:00Z".into(),
+    }];
+    corrupt.checksum = corrupt.compute_checksum();
+    let error = SqliteStore::open_in_memory()
+        .unwrap()
+        .import_bundle(&corrupt)
+        .expect_err("an empty number is not the owner's word");
+    let StoreError::BundleCorrupted { detail } = error else {
+        panic!("expected a corruption refusal, got {error}");
+    };
+    assert!(
+        detail.contains("empty number") && detail.contains("tinkoff"),
+        "the refusal names the binding and the forbidden value: {detail}"
+    );
+    assert!(!detail.contains("SQLite") && !detail.contains("trigger"));
+}
+
+#[test]
+fn an_archive_binding_one_broker_number_to_two_accounts_is_refused_by_name() {
+    let (source, owner, account, _) = populated();
+    let other = AccountId::new_random();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut corrupt = bundle.clone();
+    corrupt.broker_account_bindings = vec![
+        iaam_store::bundle::BrokerAccountBindingSection {
+            account: account.inner(),
+            broker: "tinkoff".into(),
+            broker_account: "invented-one".into(),
+            recorded_at: "2026-09-27T00:00:00Z".into(),
+        },
+        iaam_store::bundle::BrokerAccountBindingSection {
+            account: other.inner(),
+            broker: "tinkoff".into(),
+            broker_account: "invented-one".into(),
+            recorded_at: "2026-09-27T00:00:00Z".into(),
+        },
+    ];
+    corrupt.checksum = corrupt.compute_checksum();
+    let error = SqliteStore::open_in_memory()
+        .unwrap()
+        .import_bundle(&corrupt)
+        .expect_err("one number, two accounts: the archive is refused");
+    let StoreError::BundleCorrupted { detail } = error else {
+        panic!("expected a corruption refusal, got {error}");
+    };
+    assert!(
+        detail.contains("invented-one") && detail.contains("more than one"),
+        "the refusal names the number and the contradiction: {detail}"
+    );
+    assert!(!detail.contains("SQLite") && !detail.contains("trigger"));
+}
+
+#[test]
+fn an_archive_naming_one_binding_twice_is_refused_by_name() {
+    let (source, owner, account, _) = populated();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut corrupt = bundle;
+    corrupt.broker_account_bindings = vec![
+        iaam_store::bundle::BrokerAccountBindingSection {
+            account: account.inner(),
+            broker: "tinkoff".into(),
+            broker_account: "invented-one".into(),
+            recorded_at: "2026-09-27T00:00:00Z".into(),
+        },
+        iaam_store::bundle::BrokerAccountBindingSection {
+            account: account.inner(),
+            broker: "tinkoff".into(),
+            broker_account: "invented-two".into(),
+            recorded_at: "2026-09-27T00:00:00Z".into(),
+        },
+    ];
+    corrupt.checksum = corrupt.compute_checksum();
+    let error = SqliteStore::open_in_memory()
+        .unwrap()
+        .import_bundle(&corrupt)
+        .expect_err("one account, one broker, two numbers: the archive is refused");
+    let StoreError::BundleCorrupted { detail } = error else {
+        panic!("expected a corruption refusal, got {error}");
+    };
+    assert!(
+        detail.contains("twice"),
+        "the refusal names the contradiction: {detail}"
+    );
+    assert!(!detail.contains("SQLite") && !detail.contains("trigger"));
+}
+
+#[test]
+fn a_binding_naming_an_account_the_archive_does_not_carry_is_refused_by_name() {
+    let (source, owner, _, _) = populated();
+    let bundle = source.export_bundle(owner).unwrap();
+    let absent = AccountId::new_random();
+    let mut corrupt = bundle;
+    corrupt.broker_account_bindings = vec![iaam_store::bundle::BrokerAccountBindingSection {
+        account: absent.inner(),
+        broker: "tinkoff".into(),
+        broker_account: "invented-one".into(),
+        recorded_at: "2026-09-27T00:00:00Z".into(),
+    }];
+    corrupt.checksum = corrupt.compute_checksum();
+    let error = SqliteStore::open_in_memory()
+        .unwrap()
+        .import_bundle(&corrupt)
+        .expect_err("a binding naming no carried account is refused");
+    let StoreError::BundleCorrupted { detail } = error else {
+        panic!("expected a corruption refusal, got {error}");
+    };
+    assert!(
+        detail.contains(&absent.inner().to_string()),
+        "the refusal names the account the archive does not hold: {detail}"
+    );
+    assert!(!detail.contains("SQLite") && !detail.contains("trigger"));
 }

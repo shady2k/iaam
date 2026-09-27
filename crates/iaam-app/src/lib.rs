@@ -27,6 +27,7 @@ pub mod tokens;
 /// The server does not import them directly: routes access data
 /// through application use cases.
 pub mod storage {
+    pub use crate::adapters::sqlite::supported_brokers;
     pub use iaam_store::SqliteStore;
     pub use iaam_store::documents::BrokerCode;
     pub use iaam_store::market::{Coverage, FxRow, KeyRateRow, PriceRow, RunOutcome, SeriesKey};

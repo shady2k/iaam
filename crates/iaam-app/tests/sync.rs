@@ -15,7 +15,7 @@ use iaam_app::ports::{
     PortfolioSnapshot, Principal, Scope,
 };
 use iaam_app::scenarios::ingest::append_checked;
-use iaam_app::sync::{AssertionsWithheld, SYNC_DEADLINE, sync_broker};
+use iaam_app::sync::{AssertionsWithheld, SYNC_DEADLINE};
 use iaam_broker::credentials::{Key, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_broker::operation_kind::{OperationKindDictionary, seed_for};
@@ -55,26 +55,51 @@ struct FakeBroker {
     identity_scope: IdentityScope,
     operations: Result<ParsedOperations, BrokerError>,
     portfolio: Result<PortfolioSnapshot, BrokerError>,
+    /// The account numbers the access sees. Empty is empty: the access sees
+    /// none, and a sync that asks is refused rather than left to guess.
+    accounts: Vec<String>,
+    /// The broker numbers the double was actually asked for, in order.
+    requested_numbers: Mutex<Vec<String>>,
+    /// How many times the access was asked what it sees.
+    accounts_requests: AtomicUsize,
 }
 
 #[async_trait]
 impl BrokerChannel for FakeBroker {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        self.accounts_requests.fetch_add(1, Ordering::SeqCst);
+        Ok(self.accounts.clone())
+    }
+
     async fn fetch_operations(
         &self,
         _account: AccountId,
+        broker_account: &str,
         _from: Date,
         _to: Date,
         _deadline: Option<Instant>,
     ) -> Result<ParsedOperations, BrokerError> {
+        self.requested_numbers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(broker_account.to_owned());
         self.operations.clone()
     }
 
     async fn fetch_portfolio(
         &self,
         _account: AccountId,
+        broker_account: &str,
         _at: Date,
         _deadline: Option<Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
+        self.requested_numbers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(broker_account.to_owned());
         self.portfolio.clone()
     }
 
@@ -85,6 +110,67 @@ impl BrokerChannel for FakeBroker {
     fn identity_scope(&self) -> IdentityScope {
         self.identity_scope
     }
+}
+
+fn broker_code() -> iaam_store::documents::BrokerCode {
+    iaam_store::documents::BrokerCode::parse("tinkoff").expect("broker code")
+}
+
+/// The old one-account shape every existing test was written against, kept
+/// as a harness helper: the binding the scenario now reads is pre-recorded
+/// (seeding the account row it needs), so these tests go on exercising the
+/// fetch path and nothing else. The binding behaviours themselves are tested
+/// against [`iaam_app::sync::sync_broker`] directly, below.
+async fn sync_broker(
+    services: &AppServices,
+    principal: &Principal,
+    broker: &impl BrokerChannel,
+    account: AccountId,
+    from: Date,
+    to: Date,
+) -> Result<iaam_app::sync::SyncOutcome, AppError> {
+    let code = broker_code();
+    if services
+        .store
+        .broker_account_binding(principal.owner, account, &code)
+        .await
+        .unwrap_or_else(|error| panic!("binding read: {error}"))
+        .is_none()
+    {
+        services
+            .store
+            .upsert_account(
+                principal.owner,
+                iaam_app::ports::AccountView {
+                    id: account,
+                    title: "Main".to_owned(),
+                    institution: Some("Test Bank".to_owned()),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("seed account: {error}"));
+        services
+            .store
+            .record_broker_account_binding(
+                principal.owner,
+                account,
+                &code,
+                // Per-account, because one broker number is bound to at most
+                // one iaam account and a helper shared by tests syncing two
+                // accounts must not bind the same number twice. The value is
+                // invented either way: the doubles never read it.
+                account.inner().to_string(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("seed binding: {error}"));
+    }
+    let request = iaam_app::sync::BrokerSyncRequest {
+        broker_code: code,
+        account,
+        from,
+        to,
+    };
+    iaam_app::sync::sync_broker(services, principal, broker, request).await
 }
 
 fn principal(owner: OwnerId) -> Principal {
@@ -399,6 +485,9 @@ fn api_with_claims(
     claims: Vec<ControlClaim>,
 ) -> FakeBroker {
     FakeBroker {
+        accounts: vec!["invented-one".to_owned()],
+        requested_numbers: Mutex::new(Vec::new()),
+        accounts_requests: AtomicUsize::new(0),
         source: SourceChannel {
             source,
             parser_version: ParserVersion("finam-api/1".to_owned()),
@@ -506,6 +595,9 @@ async fn a_position_with_no_trade_in_the_interval_registers_no_custody() {
     });
 
     let broker = FakeBroker {
+        accounts: vec!["invented-one".to_owned()],
+        requested_numbers: Mutex::new(Vec::new()),
+        accounts_requests: AtomicUsize::new(0),
         source: SourceChannel {
             source: SourceId::new_random(),
             parser_version: ParserVersion("finam-api/1".to_owned()),
@@ -563,6 +655,9 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
     let first_operation = trade_without_custody(first_account, instrument);
     let second_operation = trade_without_custody(second_account, instrument);
     let make_broker = |operation| FakeBroker {
+        accounts: vec!["invented-one".to_owned()],
+        requested_numbers: Mutex::new(Vec::new()),
+        accounts_requests: AtomicUsize::new(0),
         source: SourceChannel {
             source,
             parser_version: ParserVersion("account-scoped/1".to_owned()),
@@ -1667,6 +1762,9 @@ async fn one_broker_failure_does_not_poison_another_sync() {
     });
 
     let failed = FakeBroker {
+        accounts: vec!["invented-one".to_owned()],
+        requested_numbers: Mutex::new(Vec::new()),
+        accounts_requests: AtomicUsize::new(0),
         source: SourceChannel {
             source: SourceId::new_random(),
             parser_version: ParserVersion("finam-api/1".to_owned()),
@@ -1948,9 +2046,17 @@ impl HeldBroker {
 
 #[async_trait]
 impl BrokerChannel for HeldBroker {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Ok(Vec::new())
+    }
+
     async fn fetch_operations(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _from: Date,
         _to: Date,
         _deadline: Option<Instant>,
@@ -1964,6 +2070,7 @@ impl BrokerChannel for HeldBroker {
     async fn fetch_portfolio(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _at: Date,
         _deadline: Option<Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
@@ -2066,6 +2173,9 @@ async fn a_failed_sync_releases_its_account() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let failing = FakeBroker {
+        accounts: vec!["invented-one".to_owned()],
+        requested_numbers: Mutex::new(Vec::new()),
+        accounts_requests: AtomicUsize::new(0),
         source: held_channel(),
         identity_scope: IdentityScope::Account,
         operations: Err(BrokerError::Unreachable {
@@ -2105,9 +2215,17 @@ struct PanickingBroker(SourceChannel);
 
 #[async_trait]
 impl BrokerChannel for PanickingBroker {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Ok(Vec::new())
+    }
+
     async fn fetch_operations(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _from: Date,
         _to: Date,
         _deadline: Option<Instant>,
@@ -2118,6 +2236,7 @@ impl BrokerChannel for PanickingBroker {
     async fn fetch_portfolio(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _at: Date,
         _deadline: Option<Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
@@ -2376,6 +2495,9 @@ async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
 /// A broker whose operations request always fails with `error`.
 fn failing_broker(error: BrokerError) -> FakeBroker {
     FakeBroker {
+        accounts: vec!["invented-one".to_owned()],
+        requested_numbers: Mutex::new(Vec::new()),
+        accounts_requests: AtomicUsize::new(0),
         source: held_channel(),
         identity_scope: IdentityScope::Account,
         operations: Err(error),
@@ -2486,6 +2608,245 @@ async fn a_broker_whose_portfolio_fails_leaves_the_journal_unchanged() {
     assert!(
         matches!(error, AppError::SourceUnreachable { .. }),
         "{error:?}"
+    );
+    assert!(load_all(&services, owner).await.is_empty());
+}
+
+// --- iaam-xzz5.3.2: a sync reaches the broker's own account --------------
+
+/// A channel with nothing to say but an access that sees `accounts`.
+fn quiet_broker(accounts: Vec<String>) -> FakeBroker {
+    FakeBroker {
+        source: held_channel(),
+        identity_scope: IdentityScope::Account,
+        operations: Ok(empty_operations()),
+        portfolio: Ok(empty_portfolio()),
+        accounts,
+        requested_numbers: Mutex::new(Vec::new()),
+        accounts_requests: AtomicUsize::new(0),
+    }
+}
+
+async fn seed_bound_account(
+    services: &AppServices,
+    owner: OwnerId,
+    account: AccountId,
+    number: &str,
+) {
+    services
+        .store
+        .upsert_account(
+            owner,
+            iaam_app::ports::AccountView {
+                id: account,
+                title: "Main".to_owned(),
+                institution: Some("Test Bank".to_owned()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed account: {error}"));
+    services
+        .store
+        .record_broker_account_binding(owner, account, &broker_code(), number.to_owned())
+        .await
+        .unwrap_or_else(|error| panic!("seed binding: {error}"));
+}
+
+#[tokio::test]
+async fn a_bound_account_syncs_with_the_brokers_own_number() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    seed_bound_account(&services, owner, account, "bound-7").await;
+    let broker = quiet_broker(vec!["seen-1".to_owned(), "seen-2".to_owned()]);
+
+    let outcome = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    assert_eq!(
+        broker
+            .requested_numbers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_slice(),
+        ["bound-7", "bound-7"],
+        "both requests carry the bound number, and only it"
+    );
+    assert_eq!(
+        broker.accounts_requests.load(Ordering::SeqCst),
+        0,
+        "a stored binding means the access is never asked what it sees"
+    );
+    assert!(!outcome.binding_recorded, "the binding already stood");
+}
+
+#[tokio::test]
+async fn an_unbound_account_is_bound_to_the_one_account_the_access_sees() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    services
+        .store
+        .upsert_account(
+            owner,
+            iaam_app::ports::AccountView {
+                id: account,
+                title: "Main".to_owned(),
+                institution: Some("Test Bank".to_owned()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed account: {error}"));
+    let broker = quiet_broker(vec!["solo".to_owned()]);
+
+    let outcome = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    assert!(
+        outcome.binding_recorded,
+        "the answer says the sync bound it"
+    );
+    assert_eq!(
+        services
+            .store
+            .broker_account_binding(owner, account, &broker_code())
+            .await
+            .unwrap_or_else(|error| panic!("binding read: {error}")),
+        Some("solo".to_owned()),
+    );
+    assert_eq!(
+        broker
+            .requested_numbers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_slice(),
+        ["solo", "solo"],
+    );
+}
+
+#[tokio::test]
+async fn several_candidates_refuse_the_sync_before_anything_is_fetched() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    services
+        .store
+        .upsert_account(
+            owner,
+            iaam_app::ports::AccountView {
+                id: account,
+                title: "Main".to_owned(),
+                institution: Some("Test Bank".to_owned()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed account: {error}"));
+    let broker = quiet_broker(vec!["one".to_owned(), "two".to_owned(), "three".to_owned()]);
+
+    let error = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .expect_err("the sync must refuse, not guess");
+
+    let AppError::BrokerAccountAmbiguous {
+        broker: code,
+        candidates,
+    } = error
+    else {
+        panic!("expected the ambiguity refusal, got {error:?}");
+    };
+    assert_eq!(code, "tinkoff");
+    assert_eq!(
+        candidates,
+        ["one", "two", "three"],
+        "the refusal names them"
+    );
+    assert_eq!(
+        broker.accounts_requests.load(Ordering::SeqCst),
+        1,
+        "the access was asked once, to learn the candidates"
+    );
+    assert!(
+        broker
+            .requested_numbers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty(),
+        "nothing was fetched for the interval"
+    );
+    assert!(
+        load_all(&services, owner).await.is_empty(),
+        "and nothing was written"
+    );
+}
+
+#[tokio::test]
+async fn an_access_that_sees_no_account_refuses_the_sync() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    services
+        .store
+        .upsert_account(
+            owner,
+            iaam_app::ports::AccountView {
+                id: account,
+                title: "Main".to_owned(),
+                institution: Some("Test Bank".to_owned()),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed account: {error}"));
+    let broker = quiet_broker(Vec::new());
+
+    let error = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: broker_code(),
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .expect_err("the sync must refuse");
+
+    assert!(
+        matches!(error, AppError::BrokerAccountUnseen { ref broker } if broker == "tinkoff"),
+        "expected the unseen refusal, got {error:?}"
     );
     assert!(load_all(&services, owner).await.is_empty());
 }

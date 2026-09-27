@@ -135,6 +135,26 @@ pub enum AppError {
         detail: String,
         retry_after: Option<std::time::Duration>,
     },
+    /// The broker access sees no account at all to bind the requested
+    /// account against, so the sync refuses before it fetches or writes
+    /// anything. Separate from `SourceRefused`, because the broker answered
+    /// correctly: what is missing is an account on his side, and the fix is
+    /// his access, not this request.
+    #[error("the {broker} access sees no account to sync this account against")]
+    BrokerAccountUnseen { broker: String },
+    /// The broker access sees several accounts and no binding stands. The
+    /// sync refuses rather than guessing between them — a wrong guess files
+    /// one broker's rows onto another of the owner's accounts — and the
+    /// candidates name what the access sees, so the owner can bind one and
+    /// send the sync again.
+    #[error(
+        "the {broker} access sees several accounts ({}); bind this account to one of them first",
+        .candidates.join(", ")
+    )]
+    BrokerAccountAmbiguous {
+        broker: String,
+        candidates: Vec<String>,
+    },
     /// An outside source answered and refused the request: a token it
     /// rejects, a method it does not offer, a path it does not know. Separate
     /// from `Store` and from `SourceUnreachable`, because retrying will not
@@ -335,6 +355,8 @@ impl AppError {
             Self::Conflict { .. } => "already_exists",
             Self::SourceUnreachable { .. } => "source_unavailable",
             Self::SourceRefused { .. } => "source_refused",
+            Self::BrokerAccountUnseen { .. } => "broker_account_unseen",
+            Self::BrokerAccountAmbiguous { .. } => "broker_account_ambiguous",
         }
     }
 }

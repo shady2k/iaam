@@ -59,6 +59,13 @@ fn has_contour_report_defaults_table(store: &SqliteStore) -> bool {
         .is_ok()
 }
 
+fn has_broker_account_bindings_table(store: &SqliteStore) -> bool {
+    store
+        .connection()
+        .prepare("SELECT broker_account FROM broker_account_bindings LIMIT 0")
+        .is_ok()
+}
+
 #[test]
 fn a_database_left_at_version_one_gains_the_counterparty_column() {
     let store = SqliteStore::open_in_memory().expect("open");
@@ -76,6 +83,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
              ALTER TABLE accounts DROP COLUMN declared_by; \
              DROP TABLE account_retractions; \
              DROP TABLE contour_report_defaults; \
+             DROP TABLE broker_account_bindings; \
              PRAGMA user_version = 1;",
         )
         .expect("winding the database back to version 1");
@@ -98,6 +106,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         !has_contour_report_defaults_table(&store),
         "and this table too, or migration 0006 is not actually being exercised"
+    );
+    assert!(
+        !has_broker_account_bindings_table(&store),
+        "and this table too, or migration 0007 is not actually being exercised"
     );
 
     migrate(store.connection()).expect("migrating the wound-back database");
@@ -123,6 +135,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         has_contour_report_defaults_table(&store),
         "and the table 0006 adds, for the same reason"
+    );
+    assert!(
+        has_broker_account_bindings_table(&store),
+        "and the table 0007 adds, for the same reason"
     );
     assert_eq!(
         user_version(&store),
@@ -172,7 +188,7 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
     // this time over a journal that is not empty. `accounts.declared_by`,
     // `account_retractions` and `contour_report_defaults` are dropped too:
     // `migrate` still catches this database up to the current `SCHEMA_VERSION`
-    // afterwards, and migrations 0004 to 0006 would otherwise find the column
+    // afterwards, and migrations 0004 to 0007 would otherwise find the column
     // and the tables already there from the initial `open_in_memory` and fail
     // on a name that already exists.
     connection
@@ -181,6 +197,7 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
              ALTER TABLE accounts DROP COLUMN declared_by; \
              DROP TABLE account_retractions; \
              DROP TABLE contour_report_defaults; \
+             DROP TABLE broker_account_bindings; \
              PRAGMA user_version = 2;",
         )
         .expect("winding the database back to version 2");

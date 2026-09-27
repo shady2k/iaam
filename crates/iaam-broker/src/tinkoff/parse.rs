@@ -316,6 +316,42 @@ pub fn parse_portfolio_positions(body: &str) -> Result<Vec<ChannelPortfolioPosit
         .collect()
 }
 
+/// The account identifiers this access sees, from `UsersService/GetAccounts`
+/// (`iaam-xzz5.3.2`).
+///
+/// The answer's `accounts` array is the whole of what this parser reads: an
+/// entry is an object carrying a non-empty string `id`. An entry that does
+/// not refuses the whole answer rather than shrinking the list — a silently
+/// missing identifier is exactly the ambiguity a binding must not be recorded
+/// over. Nothing else about an entry interests this system, and none of it is
+/// validated: the id is opaque here the way it is opaque in the binding.
+pub fn parse_account_ids(body: &str) -> Result<Vec<String>, ParseError> {
+    let value: Value =
+        serde_json::from_str(body).map_err(|error| ParseError::Json(error.to_string()))?;
+    let accounts = value
+        .get("accounts")
+        .and_then(Value::as_array)
+        .ok_or(ParseError::MissingField { field: "accounts" })?;
+    accounts
+        .iter()
+        .map(|account| {
+            let id = account.get("id").and_then(Value::as_str).ok_or_else(|| {
+                ParseError::InvalidField {
+                    field: "accounts.id",
+                    value: account.to_string(),
+                }
+            })?;
+            if id.is_empty() {
+                return Err(ParseError::InvalidField {
+                    field: "accounts.id",
+                    value: id.to_owned(),
+                });
+            }
+            Ok(id.to_owned())
+        })
+        .collect()
+}
+
 fn parse_portfolio_position_row(
     position: &RawPortfolioPosition,
 ) -> Result<ChannelPortfolioPosition, ParseError> {
@@ -904,7 +940,7 @@ struct RawQuotation {
 }
 #[cfg(test)]
 mod tests {
-    use super::{ChannelOrderState, ParseError, parse_operations as parse_page};
+    use super::{ChannelOrderState, ParseError, parse_account_ids, parse_operations as parse_page};
 
     fn parse_operations(body: &str) -> Result<Vec<super::ChannelOperation>, ParseError> {
         parse_page(body).map(|page| page.operations)
@@ -925,6 +961,41 @@ mod tests {
             }}"#
         )
     }
+    #[test]
+    fn the_accounts_listing_becomes_the_ids_it_names() {
+        let ids = parse_account_ids(
+            r#"{"accounts":[{"id":"first","type":"ACCOUNT_TYPE_INVEST"},{"id":"second"}]}"#,
+        )
+        .expect("the listing parses");
+        assert_eq!(ids, ["first", "second"], "only the id is read, verbatim");
+    }
+
+    #[test]
+    fn an_entry_without_an_id_refuses_the_whole_listing() {
+        let refused =
+            parse_account_ids(r#"{"accounts":[{"id":"first"},{"type":"ACCOUNT_TYPE_INVEST"}]}"#)
+                .expect_err("a silently missing id is the ambiguity a binding cannot stand on");
+        assert!(
+            matches!(
+                refused,
+                ParseError::InvalidField {
+                    field: "accounts.id",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_without_accounts_refuses() {
+        let refused = parse_account_ids(r#"{"something":[]}"#).expect_err("no accounts, no ids");
+        assert!(
+            matches!(refused, ParseError::MissingField { field: "accounts" }),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn preserves_pagination_metadata_for_the_caller() {
         let page = parse_page(r#"{"hasNext":true,"nextCursor":"cursor-2","items":[]}"#)

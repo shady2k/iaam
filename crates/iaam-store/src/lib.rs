@@ -109,6 +109,14 @@ pub enum StoreError {
     CategoryGroupRetired { id: String },
     #[error("invalid value for {field}: {value}")]
     InvalidValue { field: &'static str, value: String },
+    /// The broker account number the caller offered is already bound to
+    /// another of the same owner's accounts. Separate from `Sqlite` because
+    /// this is the owner's answer, not a failure: the sync and the binding
+    /// route both exist to keep one broker number on one iaam account, and
+    /// the account that holds the binding is named so the caller can read
+    /// where the number already points.
+    #[error("broker account is already bound to account {account}")]
+    BrokerAccountBindingHeld { account: String },
     #[error("a synchronization run is already in progress for {source_id}/{dataset}/{series_key}")]
     LeaseHeld {
         source_id: String,

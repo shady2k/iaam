@@ -535,6 +535,156 @@ mod tests {
     }
 
     #[test]
+    fn a_complete_header_past_the_bound_is_refused() {
+        let (mut writer, reader) = tcp_pair();
+        let (events, handle) = parse_in_thread(reader);
+        let mut request = b"GET /too-large HTTP/1.1\r\n".to_vec();
+        request.resize(64 * 1024 - 3, b'a');
+        request.extend_from_slice(b"\r\n\r\n");
+        writer.write_all(&request).expect("oversized request");
+
+        let error = loop {
+            match events.recv().expect("parser result") {
+                ParseEvent::Incomplete(_) => {}
+                ParseEvent::Complete(result) => break result.expect_err("oversized header"),
+            }
+        };
+        handle.join().expect("parser thread");
+        assert_eq!(error, std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn reply_gate_consumes_exactly_one_permit_per_wait() {
+        let gate = Arc::new(ReplyGate::default());
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_gate = Arc::clone(&gate);
+        let worker_stopping = Arc::clone(&stopping);
+        let (events, observed) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            worker_gate.wait(&worker_stopping);
+            events.send(1).expect("first wake observer");
+            worker_gate.wait(&worker_stopping);
+            events.send(2).expect("second wake observer");
+        });
+
+        assert!(
+            observed.recv_timeout(Duration::from_millis(20)).is_err(),
+            "a waiter woke without a permit"
+        );
+        gate.release();
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first permit wakes one wait"),
+            1
+        );
+        assert!(
+            observed.recv_timeout(Duration::from_millis(20)).is_err(),
+            "one permit woke two waits"
+        );
+        gate.release();
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second permit wakes second wait"),
+            2
+        );
+        handle.join().expect("reply gate worker");
+    }
+
+    #[test]
+    fn reply_gate_stop_wakes_a_waiter_without_a_permit() {
+        let gate = Arc::new(ReplyGate::default());
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_gate = Arc::clone(&gate);
+        let worker_stopping = Arc::clone(&stopping);
+        let (events, observed) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            worker_gate.wait(&worker_stopping);
+            events.send(()).expect("stop observer");
+        });
+
+        assert!(
+            observed.recv_timeout(Duration::from_millis(20)).is_err(),
+            "a waiter woke before stop"
+        );
+        stopping.store(true, Ordering::SeqCst);
+        gate.stop();
+        let woke = observed.recv_timeout(Duration::from_secs(1));
+        if woke.is_err() {
+            gate.release();
+        }
+        handle.join().expect("reply gate worker");
+        woke.expect("stop wakes a waiter");
+    }
+
+    #[test]
+    fn release_one_delivers_one_held_response() {
+        let server =
+            LoopbackServer::start([LoopbackReply::held(200, "held")]).expect("loopback server");
+        let address = server.address;
+        let (events, observed) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect held request");
+            stream
+                .write_all(b"GET /held HTTP/1.1\r\nHost: loopback\r\n\r\n")
+                .expect("write held request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("bound held read");
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .expect("read held response");
+            events.send(response).expect("held response observer");
+        });
+        while server.requests_received() == 0 {
+            thread::yield_now();
+        }
+        assert!(
+            observed.recv_timeout(Duration::from_millis(20)).is_err(),
+            "held response arrived before release"
+        );
+        server.release_one();
+        let response = observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("released response arrives");
+        handle.join().expect("held response worker");
+        assert!(
+            response.starts_with(b"HTTP/1.1 200 "),
+            "unexpected response: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    #[test]
+    fn dropping_an_idle_server_is_clean() {
+        let server = LoopbackServer::start([]).expect("loopback server");
+        drop(server);
+    }
+
+    #[test]
+    fn an_incomplete_request_failure_is_propagated_when_the_server_is_dropped() {
+        let server =
+            LoopbackServer::start([LoopbackReply::complete(200, "")]).expect("loopback server");
+        let mut stream = TcpStream::connect(server.address).expect("connect incomplete request");
+        stream
+            .write_all(b"GET /partial HTTP/1.1\r\n")
+            .expect("write incomplete request");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("finish incomplete request");
+        while server.accepted.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(20));
+
+        let dropped = std::panic::catch_unwind(AssertUnwindSafe(|| drop(server)));
+
+        assert!(dropped.is_err(), "incomplete request failure was discarded");
+    }
+
+    #[test]
     fn eof_before_the_header_terminator_is_refused() {
         let (mut writer, reader) = tcp_pair();
         let (events, handle) = parse_in_thread(reader);

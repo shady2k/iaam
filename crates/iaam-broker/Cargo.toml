@@ -29,6 +29,11 @@ zeroize = { version = "1", features = ["alloc"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The exchange gate of the Finam session cache: an async mutex serialises
+# the exchange of the secret for a session token, so simultaneous callers
+# share one exchange and one renewal. The application already runs tokio;
+# this adapter only borrows the lock.
+tokio = { version = "1", features = ["sync"] }
 
 [features]
 # Живая проверка на песочнице брокера. Выключена по умолчанию: обычный

@@ -2471,8 +2471,14 @@ impl GatewayClock for FakeTime {
         *self.now.lock().expect("clock")
     }
 
-    fn now_utc(&self) -> SystemTime {
-        *self.wall.lock().expect("wall clock")
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        let elapsed = self
+            .wall
+            .lock()
+            .expect("wall clock")
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?;
+        Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
     }
 }
 
@@ -2495,10 +2501,11 @@ impl GatewayClock for PausedTime {
         tokio::time::Instant::now().into_std()
     }
 
-    fn now_utc(&self) -> SystemTime {
-        SystemTime::UNIX_EPOCH
-            + Duration::from_secs(1_800_000_000)
-            + self.now().duration_since(self.start)
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        Ok(iaam_http::gateway::BootTime::new(
+            "test-boot",
+            Duration::from_secs(1_800_000_000) + self.now().duration_since(self.start),
+        ))
     }
 }
 

@@ -74,7 +74,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
-    // The recorder shares the same per-machine tally as the server and probes.
+    // The recorder must acquire the sandbox endpoint for its lifetime and
+    // records every send in the same canonical tally as the server and probes.
     let gateway = Gateway::production(BrokerEgress::from_env()?)?;
 
     // Request only open accounts: a closed account is unsuitable for the

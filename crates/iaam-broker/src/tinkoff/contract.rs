@@ -163,7 +163,7 @@ enum OperationType {
         use std::future::Future;
         use std::pin::Pin;
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant, SystemTime};
+        use std::time::{Duration, Instant};
 
         use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
         use iaam_http::{Gateway, HttpError, HttpResponse};
@@ -174,8 +174,11 @@ enum OperationType {
                 *self.0.lock().expect("clock")
             }
 
-            fn now_utc(&self) -> SystemTime {
-                SystemTime::UNIX_EPOCH
+            fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+                Ok(iaam_http::gateway::BootTime::new(
+                    "test-boot",
+                    Duration::ZERO,
+                ))
             }
         }
         impl Sleeper for FakeTime {

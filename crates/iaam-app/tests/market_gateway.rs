@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use iaam_app::adapters::market::HttpOutbound;
 use iaam_app::error::AppError;
@@ -42,8 +42,11 @@ impl Clock for FakeTime {
         *self.now.lock().expect("clock")
     }
 
-    fn now_utc(&self) -> SystemTime {
-        SystemTime::UNIX_EPOCH
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        Ok(iaam_http::gateway::BootTime::new(
+            "test-boot",
+            Duration::ZERO,
+        ))
     }
 }
 

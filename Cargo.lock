@@ -1097,6 +1097,7 @@ dependencies = [
  "iaam-http",
  "percent-encoding",
  "reqwest",
+ "rustix",
  "sha2",
  "thiserror",
  "tokio",

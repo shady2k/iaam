@@ -421,8 +421,14 @@ mod tests {
             *self.now.lock().expect("clock")
         }
 
-        fn now_utc(&self) -> SystemTime {
-            *self.wall.lock().expect("wall clock")
+        fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+            let elapsed = self
+                .wall
+                .lock()
+                .expect("wall clock")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?;
+            Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
         }
     }
 
@@ -522,7 +528,10 @@ mod tests {
 
         assert!(matches!(error, TinkoffError::InvalidToken), "{error:?}");
         assert_eq!(sent(&gateway), 1, "a rejected token was sent again");
-        assert!(time.slept.lock().expect("sleeps").is_empty());
+        assert_eq!(
+            *time.slept.lock().expect("sleeps"),
+            [Duration::from_secs(60)]
+        );
         assert!(!error.to_string().contains(TOKEN));
         assert!(!format!("{error:?}").contains(TOKEN));
     }
@@ -719,7 +728,9 @@ mod tests {
         }
         assert_eq!(
             *time.slept.lock().expect("sleeps"),
-            vec![Duration::from_millis(1_100); 49]
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 49))
+                .collect::<Vec<_>>()
         );
         client
             .get_operations_by_cursor(
@@ -730,8 +741,8 @@ mod tests {
             .await
             .expect("operations");
         let sleeps = time.slept.lock().expect("sleeps");
-        assert_eq!(sleeps.len(), 50, "operations waited on the users budget");
-        assert_eq!(sleeps.last(), Some(&Duration::from_millis(1_100)));
+        assert_eq!(sleeps.len(), 51, "operations waited for host spacing");
+        assert_eq!(sleeps.last(), Some(&Duration::from_secs(1)));
     }
 
     #[tokio::test]
@@ -778,8 +789,9 @@ mod tests {
                 .expect("accounts");
         }
 
-        let mut expected = vec![Duration::from_millis(1_100); 24];
-        expected.push(Duration::from_millis(33_700));
+        let mut expected = vec![Duration::from_secs(60)];
+        expected.extend(std::iter::repeat_n(Duration::from_secs(1), 24));
+        expected.push(Duration::from_secs(36));
         assert_eq!(*time.slept.lock().expect("sleeps"), expected);
     }
 

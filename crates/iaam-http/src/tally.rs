@@ -3,28 +3,26 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use thiserror::Error;
 
-const HEADER: &str = "iaam-outbound-tally-v1";
+use crate::gateway::BootTime;
+
+const HEADER_V1: &str = "iaam-outbound-tally-v1";
+const HEADER: &str = "iaam-outbound-tally-v2";
 const MINUTE_NANOS: u128 = 60_000_000_000;
 const SECOND_NANOS: u128 = 1_000_000_000;
-/// Maximum time from the timestamp reserved in this tally to the transport
-/// hand-off. Decisions are spaced by `1s + 100ms`: the earlier departure may
-/// use its whole 100ms bound while the later one departs immediately, leaving
-/// at least 1s between departures. Method windows are widened by the same
-/// 100ms, so even those two extremes cannot place request `limit + 1` inside
-/// any 60s departure window.
-pub(crate) const HANDOFF_BOUND: Duration = Duration::from_millis(100);
-const HANDOFF_BOUND_NANOS: u128 = 100_000_000;
-const DEPARTURE_SPACING_NANOS: u128 = SECOND_NANOS + HANDOFF_BOUND_NANOS;
-const BUDGET_RETENTION_NANOS: u128 = MINUTE_NANOS + HANDOFF_BOUND_NANOS;
+const DEPARTURE_SPACING_NANOS: u128 = SECOND_NANOS;
 const REFUSAL_WINDOW_NANOS: u128 = 10 * MINUTE_NANOS;
 const RATE_LIMIT_PAUSE_NANOS: u128 = MINUTE_NANOS;
 const CLOSURE_NANOS: u128 = 30 * MINUTE_NANOS;
-const DAY_NANOS: u128 = 86_400_000_000_000;
+const DAY_NANOS: u128 = 24 * 60 * MINUTE_NANOS;
+const FIRST_SEND_WAIT_NANOS: u128 = MINUTE_NANOS;
+pub(crate) const TALLY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const DAILY_CEILING: u32 = 1_000;
 
 #[derive(Debug, Error)]
@@ -35,36 +33,34 @@ pub(crate) enum TallyError {
         #[source]
         source: std::io::Error,
     },
+    #[error("the tally path is invalid: {0}")]
+    InvalidPath(String),
     #[error("the file is corrupt: {0}")]
     Corrupt(String),
-    #[error("the UTC clock is before the Unix epoch")]
-    ClockBeforeEpoch,
+    #[error("could not read the boot clock: {0}")]
+    Clock(String),
+    #[error("endpoint {endpoint} is owned by another process")]
+    EndpointOwned { endpoint: &'static str },
 }
 
 pub(crate) enum TallyDecision {
     Send,
     Wait(Duration),
     Paused {
-        reopens_at: SystemTime,
         retry_after: Duration,
     },
     Closed {
         reason: ClosureReason,
-        reopens_at: SystemTime,
         retry_after: Duration,
     },
     DailyCeiling {
-        reset_at: SystemTime,
         retry_after: Duration,
     },
 }
 
 pub(crate) enum TallyResponseDecision {
     Recorded,
-    RateLimited {
-        reopens_at: SystemTime,
-        retry_after: Duration,
-    },
+    RateLimited { retry_after: Duration },
 }
 
 #[derive(Clone, Copy)]
@@ -95,54 +91,90 @@ impl ClosureReason {
 #[derive(Default)]
 struct HostState {
     last_send: Option<u128>,
-    day: u64,
-    count: u32,
+    daily_sends: Vec<u128>,
     closed_until: Option<u128>,
     closed_reason: Option<ClosureReason>,
     paused_until: Option<u128>,
+    paused_for: Option<u128>,
     refusals: Vec<u128>,
     rate_limits: Vec<u128>,
+    boot_wait_until: Option<u128>,
 }
 
 #[derive(Default)]
 struct State {
+    boot_id: Option<String>,
     hosts: BTreeMap<String, HostState>,
     sends: BTreeMap<(String, String), Vec<u128>>,
 }
 
+#[derive(Debug)]
 pub(crate) struct OutboundTally {
     path: PathBuf,
 }
+
+/// The process's lifetime ownership of one broker endpoint.
+///
+/// The lock is acquired without waiting. It remains in this value beside the
+/// validated tally path, so a process cannot decide under one path spelling and
+/// send under another.
+#[derive(Debug)]
+pub(crate) struct EndpointOwner {
+    tally: OutboundTally,
+    _lock: File,
+}
+
 struct DecisionRequest<'a> {
     host: &'a str,
     budget_key: &'a str,
     budget_limit: u32,
     budget_window: Duration,
-    now: SystemTime,
+    boot: &'a BootTime,
 }
 
-impl OutboundTally {
-    pub(crate) fn new(path: &Path) -> Self {
-        Self {
-            path: path.to_owned(),
+impl EndpointOwner {
+    pub(crate) fn acquire(
+        path: &Path,
+        endpoint: &'static str,
+        lock_name: &str,
+    ) -> Result<Self, TallyError> {
+        let tally = OutboundTally::new(path)?;
+        let lock_path = sibling_with_suffix(&tally.path, &format!(".{lock_name}.owner"))?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| TallyError::File {
+                action: "open the endpoint owner lock",
+                source,
+            })?;
+        match FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => Ok(Self { tally, _lock: lock }),
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(TallyError::EndpointOwned { endpoint })
+            }
+            Err(source) => Err(TallyError::File {
+                action: "lock the endpoint owner lock",
+                source,
+            }),
         }
     }
 
-    pub(crate) fn check_host(
-        &self,
-        host: &str,
-        now: SystemTime,
-    ) -> Result<Option<TallyDecision>, TallyError> {
-        let now_nanos = unix_nanos(now)?;
-        self.transact(|state| {
-            let changed = state.prune(now_nanos);
-            let decision = state
-                .hosts
-                .get(host)
-                .map(|host_state| Self::active_refusal(host_state, now_nanos))
-                .transpose()?
-                .flatten();
-            Ok((decision, changed))
+    pub(crate) const fn tally(&self) -> &OutboundTally {
+        &self.tally
+    }
+}
+
+impl OutboundTally {
+    pub(crate) fn validate(path: &Path) -> Result<(), TallyError> {
+        validate_tally_path(path).map(|_| ())
+    }
+
+    fn new(path: &Path) -> Result<Self, TallyError> {
+        Ok(Self {
+            path: validate_tally_path(path)?,
         })
     }
 
@@ -152,14 +184,14 @@ impl OutboundTally {
         budget_key: &str,
         budget_limit: u32,
         budget_window: Duration,
-        now: SystemTime,
+        boot: &BootTime,
     ) -> Result<TallyDecision, TallyError> {
         let request = DecisionRequest {
             host,
             budget_key,
             budget_limit,
             budget_window,
-            now,
+            boot,
         };
         self.transact(|state| Self::decide(state, &request))
     }
@@ -169,25 +201,27 @@ impl OutboundTally {
         host: &str,
         status: u16,
         retry_after: Option<Duration>,
-        now: SystemTime,
+        boot: &BootTime,
     ) -> Result<TallyResponseDecision, TallyError> {
-        let now_nanos = unix_nanos(now)?;
+        let now_nanos = boot.elapsed().as_nanos();
         self.transact(|state| {
-            let changed = state.prune(now_nanos);
-            let host_state = state.hosts.entry(host.to_owned()).or_default();
+            let mut changed = state.prepare_boot(boot)?;
+            changed |= state.prune(now_nanos);
+            let host_state = state.host_for_boot(host, now_nanos);
             match status {
                 429 => {
                     host_state.rate_limits.push(now_nanos);
                     let pause = retry_after
                         .map_or(RATE_LIMIT_PAUSE_NANOS, |delay| delay.as_nanos())
-                        .max(RATE_LIMIT_PAUSE_NANOS);
+                        .clamp(RATE_LIMIT_PAUSE_NANOS, DAY_NANOS);
                     let paused_until = now_nanos.saturating_add(pause);
-                    host_state.paused_until = Some(
-                        host_state
-                            .paused_until
-                            .unwrap_or_default()
-                            .max(paused_until),
-                    );
+                    if host_state
+                        .paused_until
+                        .is_none_or(|until| paused_until >= until)
+                    {
+                        host_state.paused_until = Some(paused_until);
+                        host_state.paused_for = Some(pause);
+                    }
                     if host_state.rate_limits.len() >= 2 {
                         let closed_until = now_nanos.saturating_add(CLOSURE_NANOS);
                         host_state.closed_until = Some(
@@ -206,7 +240,6 @@ impl OutboundTally {
                         .unwrap_or(paused_until);
                     Ok((
                         TallyResponseDecision::RateLimited {
-                            reopens_at: system_time_from_nanos(reopens_nanos)?,
                             retry_after: duration_from_nanos(
                                 reopens_nanos.saturating_sub(now_nanos),
                             ),
@@ -242,26 +275,33 @@ impl OutboundTally {
             budget_key,
             budget_limit,
             budget_window,
-            now,
+            boot,
         } = *request;
-        let now_nanos = unix_nanos(now)?;
-        let day = u64::try_from(now_nanos / DAY_NANOS)
-            .map_err(|_| TallyError::Corrupt("UTC day does not fit in the tally".to_owned()))?;
-        let changed = state.prune(now_nanos);
+        let now_nanos = boot.elapsed().as_nanos();
+        let mut changed = state.prepare_boot(boot)?;
+        changed |= state.prune(now_nanos);
 
-        let host_state = state.hosts.entry(host.to_owned()).or_default();
-        if let Some(decision) = Self::active_refusal(host_state, now_nanos)? {
-            return Ok((decision, changed));
+        state.host_for_boot(host, now_nanos);
+        let host_state = state
+            .hosts
+            .get(host)
+            .ok_or_else(|| TallyError::Corrupt("the endpoint state was not created".to_owned()))?;
+        if let Some(decision) = Self::active_refusal(host_state, now_nanos) {
+            return Ok((decision, true));
         }
-        if host_state.day != day {
-            host_state.day = day;
-            host_state.count = 0;
+        if let Some(until) = host_state
+            .boot_wait_until
+            .filter(|until| *until > now_nanos)
+        {
+            return Ok((
+                TallyDecision::Wait(duration_from_nanos(until - now_nanos)),
+                true,
+            ));
         }
-        if host_state.count >= DAILY_CEILING {
-            let reset_nanos = u128::from(day + 1) * DAY_NANOS;
+        if host_state.daily_sends.len() >= DAILY_CEILING as usize {
+            let reset_nanos = host_state.daily_sends[0].saturating_add(DAY_NANOS);
             return Ok((
                 TallyDecision::DailyCeiling {
-                    reset_at: system_time_from_nanos(reset_nanos)?,
                     retry_after: duration_from_nanos(reset_nanos.saturating_sub(now_nanos)),
                 },
                 changed,
@@ -275,7 +315,7 @@ impl OutboundTally {
         let key = (host.to_owned(), budget_key.to_owned());
         let sent = state.sends.entry(key).or_default();
         let budget_wait = if sent.len() >= budget_limit as usize {
-            sent[0]
+            sent[sent.len() - budget_limit as usize]
                 .saturating_add(budget_window.as_nanos())
                 .saturating_sub(now_nanos)
         } else {
@@ -287,37 +327,38 @@ impl OutboundTally {
         }
 
         sent.push(now_nanos);
+        let host_state = state
+            .hosts
+            .get_mut(host)
+            .ok_or_else(|| TallyError::Corrupt("the endpoint state disappeared".to_owned()))?;
         host_state.last_send = Some(now_nanos);
-        host_state.count += 1;
+        host_state.daily_sends.push(now_nanos);
+        host_state.boot_wait_until = None;
         Ok((TallyDecision::Send, true))
     }
 
-    fn active_refusal(
-        host_state: &HostState,
-        now_nanos: u128,
-    ) -> Result<Option<TallyDecision>, TallyError> {
+    fn active_refusal(host_state: &HostState, now_nanos: u128) -> Option<TallyDecision> {
         if let Some(until) = host_state.closed_until.filter(|until| *until > now_nanos) {
-            return Ok(Some(TallyDecision::Closed {
+            return Some(TallyDecision::Closed {
                 reason: host_state
                     .closed_reason
                     .unwrap_or(ClosureReason::RepeatedResponses),
-                reopens_at: system_time_from_nanos(until)?,
                 retry_after: duration_from_nanos(until - now_nanos),
-            }));
+            });
         }
-        if let Some(until) = host_state.paused_until.filter(|until| *until > now_nanos) {
-            return Ok(Some(TallyDecision::Paused {
-                reopens_at: system_time_from_nanos(until)?,
+        host_state
+            .paused_until
+            .filter(|until| *until > now_nanos)
+            .map(|until| TallyDecision::Paused {
                 retry_after: duration_from_nanos(until - now_nanos),
-            }));
-        }
-        Ok(None)
+            })
     }
 
     fn transact<R>(
         &self,
         update: impl FnOnce(&mut State) -> Result<(R, bool), TallyError>,
     ) -> Result<R, TallyError> {
+        validate_tally_path(&self.path)?;
         let lock_path = sibling_with_suffix(&self.path, ".lock")?;
         let lock = OpenOptions::new()
             .read(true)
@@ -326,11 +367,11 @@ impl OutboundTally {
             .truncate(false)
             .open(&lock_path)
             .map_err(|source| TallyError::File {
-                action: "open the lock file",
+                action: "open the tally lock file",
                 source,
             })?;
         FileExt::lock_exclusive(&lock).map_err(|source| TallyError::File {
-            action: "lock the lock file",
+            action: "lock the tally lock file",
             source,
         })?;
 
@@ -343,7 +384,7 @@ impl OutboundTally {
             Ok(value)
         })();
         let unlocked = FileExt::unlock(&lock).map_err(|source| TallyError::File {
-            action: "unlock the lock file",
+            action: "unlock the tally lock file",
             source,
         });
         match (result, unlocked) {
@@ -354,6 +395,7 @@ impl OutboundTally {
     }
 
     fn read_state(&self) -> Result<State, TallyError> {
+        validate_tally_path(&self.path)?;
         let mut file = File::open(&self.path).map_err(|source| TallyError::File {
             action: "open the tally file",
             source,
@@ -425,24 +467,33 @@ impl State {
             return Ok(Self::default());
         }
         let mut lines = text.lines();
-        if lines.next() != Some(HEADER) {
+        let header = lines.next();
+        if header != Some(HEADER) && header != Some(HEADER_V1) {
             return Err(TallyError::Corrupt(format!("missing header {HEADER:?}")));
         }
         let mut state = Self::default();
+        let mut first_record = true;
         for (index, line) in lines.enumerate() {
             let number = index + 2;
             let fields: Vec<_> = line.split('\t').collect();
             match fields.as_slice() {
-                ["host", host, last_send, day, count, closed_until] => {
+                ["boot", boot_id] if first_record && header == Some(HEADER) => {
+                    validate_atom(boot_id, number)?;
+                    state.boot_id = Some((*boot_id).to_owned());
+                }
+                ["host", host, last_send, day, count, closed_until]
+                    if header == Some(HEADER_V1) =>
+                {
                     let closed_until = parse_optional_nanos(closed_until, number)?;
+                    let count = parse_number::<usize>(count, number, "daily count")?;
+                    let _ = parse_number::<u64>(day, number, "UTC day")?;
                     Self::insert_host(
                         &mut state,
                         host,
                         number,
                         HostState {
                             last_send: parse_optional_nanos(last_send, number)?,
-                            day: parse_number(day, number, "UTC day")?,
-                            count: parse_number(count, number, "daily count")?,
+                            daily_sends: vec![0; count],
                             closed_until,
                             closed_reason: closed_until.map(|_| ClosureReason::RepeatedResponses),
                             ..HostState::default()
@@ -460,12 +511,59 @@ impl State {
                     paused_until,
                     refusals,
                     rate_limits,
-                ] => {
+                ] if header == Some(HEADER_V1) => {
                     let closed_until = parse_optional_nanos(closed_until, number)?;
                     let closed_reason = parse_optional_reason(closed_reason, number)?;
                     if closed_until.is_some() != closed_reason.is_some() {
                         return Err(TallyError::Corrupt(format!(
                             "line {number} must carry a closure time and reason together"
+                        )));
+                    }
+                    let count = parse_number::<usize>(count, number, "daily count")?;
+                    let _ = parse_number::<u64>(day, number, "UTC day")?;
+                    let paused_until = parse_optional_nanos(paused_until, number)?;
+                    Self::insert_host(
+                        &mut state,
+                        host,
+                        number,
+                        HostState {
+                            last_send: parse_optional_nanos(last_send, number)?,
+                            daily_sends: vec![0; count],
+                            closed_until,
+                            closed_reason,
+                            paused_until,
+                            paused_for: paused_until.map(|_| RATE_LIMIT_PAUSE_NANOS),
+                            refusals: parse_timestamps(refusals, number, "refusal time")?,
+                            rate_limits: parse_timestamps(rate_limits, number, "rate-limit time")?,
+                            boot_wait_until: None,
+                        },
+                    )?;
+                }
+                [
+                    "host",
+                    host,
+                    last_send,
+                    daily_sends,
+                    closed_until,
+                    closed_reason,
+                    paused_until,
+                    paused_for,
+                    refusals,
+                    rate_limits,
+                    boot_wait_until,
+                ] if header == Some(HEADER) => {
+                    let closed_until = parse_optional_nanos(closed_until, number)?;
+                    let closed_reason = parse_optional_reason(closed_reason, number)?;
+                    let paused_until = parse_optional_nanos(paused_until, number)?;
+                    let paused_for = parse_optional_nanos(paused_for, number)?;
+                    if closed_until.is_some() != closed_reason.is_some() {
+                        return Err(TallyError::Corrupt(format!(
+                            "line {number} must carry a closure time and reason together"
+                        )));
+                    }
+                    if paused_until.is_some() != paused_for.is_some() {
+                        return Err(TallyError::Corrupt(format!(
+                            "line {number} must carry a pause time and duration together"
                         )));
                     }
                     Self::insert_host(
@@ -474,13 +572,14 @@ impl State {
                         number,
                         HostState {
                             last_send: parse_optional_nanos(last_send, number)?,
-                            day: parse_number(day, number, "UTC day")?,
-                            count: parse_number(count, number, "daily count")?,
+                            daily_sends: parse_timestamps(daily_sends, number, "daily send time")?,
                             closed_until,
                             closed_reason,
-                            paused_until: parse_optional_nanos(paused_until, number)?,
+                            paused_until,
+                            paused_for,
                             refusals: parse_timestamps(refusals, number, "refusal time")?,
                             rate_limits: parse_timestamps(rate_limits, number, "rate-limit time")?,
+                            boot_wait_until: parse_optional_nanos(boot_wait_until, number)?,
                         },
                     )?;
                 }
@@ -503,6 +602,12 @@ impl State {
                     )));
                 }
             }
+            first_record = false;
+        }
+        if header == Some(HEADER) && state.boot_id.is_none() {
+            return Err(TallyError::Corrupt(
+                "the v2 tally has no boot id".to_owned(),
+            ));
         }
         Ok(state)
     }
@@ -522,25 +627,67 @@ impl State {
         Ok(())
     }
 
+    fn prepare_boot(&mut self, boot: &BootTime) -> Result<bool, TallyError> {
+        validate_atom(boot.id(), 0)?;
+        if self.boot_id.as_deref() == Some(boot.id()) {
+            return Ok(false);
+        }
+        let now = boot.elapsed().as_nanos();
+        self.boot_id = Some(boot.id().to_owned());
+        for host in self.hosts.values_mut() {
+            host.last_send = host.last_send.map(|_| now);
+            host.daily_sends.fill(now);
+            host.closed_until = host.closed_until.map(|_| now.saturating_add(CLOSURE_NANOS));
+            host.paused_until = host
+                .paused_until
+                .map(|_| now.saturating_add(host.paused_for.unwrap_or(RATE_LIMIT_PAUSE_NANOS)));
+            host.refusals.fill(now);
+            host.rate_limits.fill(now);
+            host.boot_wait_until = Some(now.saturating_add(FIRST_SEND_WAIT_NANOS));
+        }
+        for sent in self.sends.values_mut() {
+            sent.fill(now);
+        }
+        Ok(true)
+    }
+
+    fn host_for_boot(&mut self, host: &str, now_nanos: u128) -> &mut HostState {
+        self.hosts
+            .entry(host.to_owned())
+            .or_insert_with(|| HostState {
+                boot_wait_until: Some(now_nanos.saturating_add(FIRST_SEND_WAIT_NANOS)),
+                ..HostState::default()
+            })
+    }
+
     fn prune(&mut self, now_nanos: u128) -> bool {
         let mut changed = false;
-        let send_cutoff = now_nanos.saturating_sub(BUDGET_RETENTION_NANOS);
-        self.sends.retain(|_, sent| {
-            let previous = sent.len();
-            sent.retain(|at| *at > send_cutoff);
-            changed |= sent.len() != previous;
-            let keep = !sent.is_empty();
-            changed |= !keep;
-            keep
-        });
-        let refusal_cutoff = now_nanos.saturating_sub(REFUSAL_WINDOW_NANOS);
+        let send_cutoff = now_nanos.checked_sub(TALLY_RETENTION.as_nanos());
+        if let Some(send_cutoff) = send_cutoff {
+            self.sends.retain(|_, sent| {
+                let previous = sent.len();
+                sent.retain(|at| *at > send_cutoff);
+                changed |= sent.len() != previous;
+                let keep = !sent.is_empty();
+                changed |= !keep;
+                keep
+            });
+        }
+        let refusal_cutoff = now_nanos.checked_sub(REFUSAL_WINDOW_NANOS);
         for state in self.hosts.values_mut() {
-            let previous_refusals = state.refusals.len();
-            state.refusals.retain(|at| *at > refusal_cutoff);
-            changed |= state.refusals.len() != previous_refusals;
-            let previous_rate_limits = state.rate_limits.len();
-            state.rate_limits.retain(|at| *at > refusal_cutoff);
-            changed |= state.rate_limits.len() != previous_rate_limits;
+            if let Some(send_cutoff) = send_cutoff {
+                let previous_daily = state.daily_sends.len();
+                state.daily_sends.retain(|at| *at > send_cutoff);
+                changed |= state.daily_sends.len() != previous_daily;
+            }
+            if let Some(refusal_cutoff) = refusal_cutoff {
+                let previous_refusals = state.refusals.len();
+                state.refusals.retain(|at| *at > refusal_cutoff);
+                changed |= state.refusals.len() != previous_refusals;
+                let previous_rate_limits = state.rate_limits.len();
+                state.rate_limits.retain(|at| *at > refusal_cutoff);
+                changed |= state.rate_limits.len() != previous_rate_limits;
+            }
             if state.closed_until.is_some_and(|until| until <= now_nanos) {
                 state.closed_until = None;
                 state.closed_reason = None;
@@ -548,6 +695,14 @@ impl State {
             }
             if state.paused_until.is_some_and(|until| until <= now_nanos) {
                 state.paused_until = None;
+                state.paused_for = None;
+                changed = true;
+            }
+            if state
+                .boot_wait_until
+                .is_some_and(|until| until <= now_nanos)
+            {
+                state.boot_wait_until = None;
                 changed = true;
             }
         }
@@ -555,7 +710,15 @@ impl State {
     }
 
     fn encode(&self) -> Result<String, TallyError> {
+        let boot_id = self
+            .boot_id
+            .as_deref()
+            .ok_or_else(|| TallyError::Corrupt("the tally has no boot id".to_owned()))?;
+        validate_atom(boot_id, 0)?;
         let mut text = String::from(HEADER);
+        text.push('\n');
+        text.push_str("boot\t");
+        text.push_str(boot_id);
         text.push('\n');
         for (host, state) in &self.hosts {
             validate_atom(host, 0)?;
@@ -564,9 +727,7 @@ impl State {
             text.push('\t');
             text.push_str(&format_optional_nanos(state.last_send));
             text.push('\t');
-            text.push_str(&state.day.to_string());
-            text.push('\t');
-            text.push_str(&state.count.to_string());
+            format_timestamps(&mut text, &state.daily_sends);
             text.push('\t');
             text.push_str(&format_optional_nanos(state.closed_until));
             text.push('\t');
@@ -574,9 +735,13 @@ impl State {
             text.push('\t');
             text.push_str(&format_optional_nanos(state.paused_until));
             text.push('\t');
+            text.push_str(&format_optional_nanos(state.paused_for));
+            text.push('\t');
             format_timestamps(&mut text, &state.refusals);
             text.push('\t');
             format_timestamps(&mut text, &state.rate_limits);
+            text.push('\t');
+            text.push_str(&format_optional_nanos(state.boot_wait_until));
             text.push('\n');
         }
         for ((host, budget_key), sent) in &self.sends {
@@ -594,10 +759,43 @@ impl State {
     }
 }
 
-fn unix_nanos(now: SystemTime) -> Result<u128, TallyError> {
-    now.duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .map_err(|_| TallyError::ClockBeforeEpoch)
+fn validate_tally_path(path: &Path) -> Result<PathBuf, TallyError> {
+    if !path.is_absolute() {
+        return Err(TallyError::InvalidPath(
+            "use an absolute canonical path".to_owned(),
+        ));
+    }
+    let link_metadata = fs::symlink_metadata(path).map_err(|source| TallyError::File {
+        action: "inspect the tally path",
+        source,
+    })?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(TallyError::InvalidPath(
+            "the tally file must not be a symbolic link".to_owned(),
+        ));
+    }
+    if !link_metadata.is_file() {
+        return Err(TallyError::InvalidPath(
+            "the tally path must name an ordinary file".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    if link_metadata.nlink() != 1 {
+        return Err(TallyError::InvalidPath(
+            "the tally file must have exactly one hard link".to_owned(),
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|source| TallyError::File {
+        action: "canonicalize the tally path",
+        source,
+    })?;
+    if canonical != path {
+        return Err(TallyError::InvalidPath(format!(
+            "use its canonical spelling {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 fn duration_from_nanos(nanos: u128) -> Duration {
@@ -608,14 +806,6 @@ fn duration_from_nanos(nanos: u128) -> Duration {
         u32::try_from(nanos % SECOND_NANOS).unwrap_or(999_999_999)
     };
     Duration::new(seconds, subsecond)
-}
-
-fn system_time_from_nanos(nanos: u128) -> Result<SystemTime, TallyError> {
-    UNIX_EPOCH
-        .checked_add(duration_from_nanos(nanos))
-        .ok_or_else(|| {
-            TallyError::Corrupt("a recorded time is outside the system clock".to_owned())
-        })
 }
 
 fn sibling_with_suffix(path: &Path, suffix: &str) -> Result<PathBuf, TallyError> {

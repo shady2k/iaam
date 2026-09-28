@@ -415,9 +415,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map(read_broker_key)
         .transpose()?;
     let market_store = SqliteStore::open(&config.database)?;
-    // The one gateway of the process. Broker budgets, host spacing and the
-    // UTC-day ceiling are shared with every process through the configured
-    // outbound tally; lanes and breakers remain local to this process.
+    // The one gateway of the process. Each broker endpoint is owned by one
+    // process for this gateway's lifetime; boot-clock budgets, spacing and the
+    // rolling 24-hour ceiling persist in the configured outbound tally.
     let broker_egress = BrokerEgress::from_env()?;
     let gateway = Arc::new(Gateway::production(broker_egress)?);
     let http = Arc::new(HttpOutbound::new(gateway.clone()));

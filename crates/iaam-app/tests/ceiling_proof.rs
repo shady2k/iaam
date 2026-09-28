@@ -369,8 +369,12 @@ impl Clock for FakeTime {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    fn now_utc(&self) -> SystemTime {
-        self.wall()
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        let elapsed = self
+            .wall()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?;
+        Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
     }
 }
 
@@ -812,42 +816,69 @@ async fn endless_full_pages_stop_inside_the_sync_ceiling() {
 }
 
 #[tokio::test]
-async fn two_gateways_and_a_rebuild_share_one_tally() {
+async fn endpoint_owner_is_exclusive_and_a_rebuild_keeps_the_tally() {
     let directory = TempDir::new("gateways");
     let tally = directory.path("tally");
     let first = harness(AnswerMode::Success, &tally, true);
-    let (second, second_records) = shared_outbound(&first.time, &first.context, &tally);
-    let allowance = RequestAllowance::new(10);
-    let request = HttpRequest::post(
+    let time = Arc::clone(&first.time);
+    let context = Arc::clone(&first.context);
+    let first_records = Arc::clone(&first.records);
+    let (second, second_records) = shared_outbound(&time, &context, &tally);
+    let tinkoff_request = HttpRequest::post(
         Destination::TinkoffProd,
         "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
         RequestBody::Json("{}".to_owned()),
     )
     .idempotent()
-    .with_request_allowance(allowance);
+    .with_request_allowance(RequestAllowance::new(10));
     first
         .outbound
-        .send("OperationsService", &request, None)
+        .send("OperationsService", &tinkoff_request, None)
         .await
         .unwrap_or_else(|error| panic!("first gateway: {error}"));
-    second
-        .send("OperationsService", &request, None)
+
+    let owned = second
+        .send("OperationsService", &tinkoff_request, None)
         .await
-        .unwrap_or_else(|error| panic!("second gateway: {error}"));
-    let (rebuilt, rebuilt_records) = shared_outbound(&first.time, &first.context, &tally);
+        .expect_err("the second gateway cannot own T-Invest production");
+    assert!(
+        matches!(
+            owned,
+            GatewayError::BrokerEndpointOwned {
+                destination: Destination::TinkoffProd,
+                endpoint,
+            } if endpoint == Destination::TinkoffProd.base_url()
+        ),
+        "unexpected ownership refusal: {owned}"
+    );
+    let finam_request = HttpRequest::get(Destination::FinamApi, "/v1/sessions")
+        .with_request_allowance(RequestAllowance::new(10));
+    second
+        .send("AuthService.Sessions", &finam_request, None)
+        .await
+        .unwrap_or_else(|error| panic!("another endpoint remains available: {error}"));
+
+    drop(first);
+    second
+        .send("OperationsService", &tinkoff_request, None)
+        .await
+        .unwrap_or_else(|error| panic!("released endpoint can be acquired: {error}"));
+    drop(second);
+
+    let (rebuilt, rebuilt_records) = shared_outbound(&time, &context, &tally);
     rebuilt
-        .send("OperationsService", &request, None)
+        .send("OperationsService", &tinkoff_request, None)
         .await
         .unwrap_or_else(|error| panic!("rebuilt gateway send: {error}"));
 
-    let mut records = snapshot(&first.records);
+    let mut records = snapshot(&first_records);
     records.extend(snapshot(&second_records));
     records.extend(snapshot(&rebuilt_records));
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 4);
     let measured = measure(&records);
-    assert_within_ceilings("shared-tally-rebuild", &measured);
+    assert_within_ceilings("owned-endpoint-rebuild", &measured);
     print_row(
-        "shared-tally-rebuild",
+        "owned-endpoint-rebuild",
         Destination::TinkoffProd.base_url(),
         &measured,
     );
@@ -1018,12 +1049,15 @@ async fn the_real_sync_mints_exactly_one_three_hundred_attempt_allowance() {
 #[derive(Clone)]
 struct ProcessTransport {
     record: PathBuf,
+    time: Arc<FakeTime>,
 }
 
 impl Transport for ProcessTransport {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         use std::io::Write;
-        let now = SystemTime::now()
+        let now = self
+            .time
+            .wall()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_nanos();
@@ -1051,33 +1085,69 @@ async fn two_process_child() {
         std::env::var("IAAM_CEILING_CHILD_RECORD")
             .unwrap_or_else(|error| panic!("child record path: {error}")),
     );
-    let gateway = Gateway::new(
-        ProcessTransport { record },
+    let barrier = PathBuf::from(
+        std::env::var("IAAM_CEILING_CHILD_BARRIER")
+            .unwrap_or_else(|error| panic!("child barrier path: {error}")),
+    );
+    let time = FakeTime::new();
+    let gateway = Gateway::with_parts(
+        ProcessTransport {
+            record,
+            time: Arc::clone(&time),
+        },
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn Clock>,
+        Arc::clone(&time) as Arc<dyn Sleeper>,
         BrokerEgress::On {
             tally: PathBuf::from(tally),
         },
     )
     .unwrap_or_else(|error| panic!("child gateway: {error}"));
-    let allowance = RequestAllowance::new(3);
     let request = HttpRequest::post(
         Destination::TinkoffProd,
         "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
         RequestBody::Json("{}".to_owned()),
     )
     .idempotent()
-    .with_request_allowance(allowance);
-    for _ in 0..3 {
+    .with_request_allowance(RequestAllowance::new(3));
+
+    match gateway.send("OperationsService", &request, None).await {
+        Ok(_) => {}
+        Err(error @ GatewayError::BrokerEndpointOwned { .. }) => {
+            let message = error.to_string();
+            assert!(
+                message.contains(Destination::TinkoffProd.base_url()),
+                "{message}"
+            );
+            assert!(message.contains("stop it"), "{message}");
+            std::fs::write(&barrier, message)
+                .unwrap_or_else(|write_error| panic!("write ownership barrier: {write_error}"));
+            return;
+        }
+        Err(error) => panic!("first child send: {error}"),
+    }
+
+    let wait_until = Instant::now() + Duration::from_secs(5);
+    while !barrier.exists() {
+        assert!(
+            Instant::now() < wait_until,
+            "the competing process did not report its ownership refusal"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for _ in 1..3 {
         gateway
             .send("OperationsService", &request, None)
             .await
-            .unwrap_or_else(|error| panic!("child send: {error}"));
+            .unwrap_or_else(|error| panic!("owner child send: {error}"));
     }
 }
 
 #[test]
-fn two_real_processes_share_spacing_and_budget() {
+fn two_real_processes_refuse_a_second_endpoint_owner() {
     let directory = TempDir::new("processes");
     let tally = directory.path("tally");
+    let barrier = directory.path("owned");
     std::fs::write(&tally, "").unwrap_or_else(|error| panic!("create tally: {error}"));
     let executable = std::env::current_exe().unwrap_or_else(|error| panic!("test binary: {error}"));
     let mut children = Vec::new();
@@ -1087,6 +1157,7 @@ fn two_real_processes_share_spacing_and_budget() {
             .args(["--exact", "two_process_child", "--nocapture"])
             .env("IAAM_CEILING_CHILD_TALLY", &tally)
             .env("IAAM_CEILING_CHILD_RECORD", &record)
+            .env("IAAM_CEILING_CHILD_BARRIER", &barrier)
             .spawn()
             .unwrap_or_else(|error| panic!("spawn child {number}: {error}"));
         children.push((child, record));
@@ -1097,8 +1168,11 @@ fn two_real_processes_share_spacing_and_budget() {
             .wait()
             .unwrap_or_else(|error| panic!("wait child: {error}"));
         assert!(status.success(), "child failed: {status}");
-        let text = std::fs::read_to_string(&record)
-            .unwrap_or_else(|error| panic!("read {}: {error}", record.display()));
+        let text = match std::fs::read_to_string(&record) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("read {}: {error}", record.display()),
+        };
         for line in text.lines() {
             let (host, at) = line
                 .split_once('\t')
@@ -1119,6 +1193,14 @@ fn two_real_processes_share_spacing_and_budget() {
             });
         }
     }
+    let ownership_refusal = std::fs::read_to_string(&barrier)
+        .unwrap_or_else(|error| panic!("read ownership refusal: {error}"));
+    assert!(
+        ownership_refusal.contains(Destination::TinkoffProd.base_url()),
+        "{ownership_refusal}"
+    );
+    assert!(ownership_refusal.contains("stop it"), "{ownership_refusal}");
+
     records.sort_by_key(|record| nanos(record.at));
     let minimum_gap = records
         .windows(2)
@@ -1132,13 +1214,13 @@ fn two_real_processes_share_spacing_and_budget() {
         .unwrap_or(Duration::ZERO);
     assert!(
         minimum_gap >= Duration::from_secs(1),
-        "two-processes: recording doubles observed a minimum broker-send gap of {minimum_gap:?}, below the 1s ceiling"
+        "the owner emitted broker sends only {minimum_gap:?} apart"
     );
     let measured = measure(&records);
-    assert_within_ceilings("two-processes", &measured);
-    assert_eq!(records.len(), 6);
+    assert_within_ceilings("endpoint-owner", &measured);
+    assert_eq!(records.len(), 3);
     print_row(
-        "two-processes",
+        "endpoint-owner",
         Destination::TinkoffProd.base_url(),
         &measured,
     );

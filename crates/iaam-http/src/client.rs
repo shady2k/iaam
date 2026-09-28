@@ -20,6 +20,9 @@ use crate::trust::{ConfiguredClient, client_for};
 /// endpoint would become a background job that hangs forever.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// No server-named wait can extend gateway arithmetic beyond one day.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Outgoing request client.
 ///
 /// Built only inside this crate, so outside it an `HttpClient` exists only
@@ -71,7 +74,16 @@ impl HttpClient {
     /// Private to this crate: outside it the only way to send is
     /// `Gateway::send`, which the `Transport` impl serves.
     pub(crate) async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        self.send_to_url(request, request.url(), REQUEST_TIMEOUT)
+        self.send_observed(request, Box::new(|_, _| {})).await
+    }
+
+    /// Send while publishing status and Retry-After before consuming the body.
+    pub(crate) async fn send_observed(
+        &self,
+        request: &HttpRequest,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+    ) -> Result<HttpResponse, HttpError> {
+        self.send_to_url(request, request.url(), REQUEST_TIMEOUT, observe)
             .await
     }
 
@@ -88,7 +100,8 @@ impl HttpClient {
             .strip_prefix(destination_base)
             .unwrap_or(request_url.as_str());
         let url = format!("{}{suffix}", base_url.trim_end_matches('/'));
-        self.send_to_url(request, url, timeout).await
+        self.send_to_url(request, url, timeout, Box::new(|_, _| {}))
+            .await
     }
 
     async fn send_to_url(
@@ -96,6 +109,7 @@ impl HttpClient {
         request: &HttpRequest,
         url: String,
         timeout: Duration,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
     ) -> Result<HttpResponse, HttpError> {
         let client = self.client_for(request.destination())?;
         let built = build_at(&client.0, request, &url, timeout)?;
@@ -111,6 +125,9 @@ impl HttpClient {
             request.reset_header(),
             SystemTime::now(),
         );
+        observe(status, retry_after);
+        // A status line that arrived is never lost: after a non-2xx status a
+        // body that fails or stalls ends the read with what arrived.
         let mut body = Vec::new();
         loop {
             match response.chunk().await {
@@ -145,6 +162,7 @@ fn named_delay(
             .get(name)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_retry_after(value, now))
+            .map(|delay| delay.min(MAX_RETRY_AFTER))
     };
     seconds(reqwest::header::RETRY_AFTER.as_str()).or_else(|| reset_header.and_then(seconds))
 }
@@ -264,6 +282,16 @@ mod tests {
     fn retry_after_is_the_named_delay() {
         let named = named_delay(&headers(&[("retry-after", "12")]), None, SystemTime::now());
         assert_eq!(named, Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn retry_after_is_clamped_before_gateway_time_arithmetic() {
+        let named = named_delay(
+            &headers(&[("retry-after", "18446744073709551615")]),
+            None,
+            SystemTime::now(),
+        );
+        assert_eq!(named, Some(MAX_RETRY_AFTER));
     }
 
     #[test]

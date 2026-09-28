@@ -6,8 +6,8 @@
 //! cannot forget a rule by calling the transport directly:
 //!
 //! - a **budget** per destination and method, taken from the documented limit;
-//! - for brokers, a locked **outbound tally** sharing the budget, one-second
-//!   host spacing and UTC daily ceiling across processes and restarts;
+//! - for brokers, a boot-clock **outbound tally**, one-second host spacing,
+//!   rolling 24-hour ceiling and one lifetime owner per endpoint;
 //! - for MOEX and the CBR, **one request in flight** per host;
 //! - **retries** of transient refusals, with the policy of `resilience`;
 //! - an in-process **circuit breaker** per host;
@@ -29,7 +29,7 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -41,8 +41,8 @@ use crate::request::{HttpRequest, Secret};
 use crate::resilience::{MAX_NAMED_WAIT, Outcome, Retry, RetryPolicy, is_transient};
 use crate::response::{HttpError, HttpResponse};
 use crate::tally::{
-    ClosureReason, DAILY_CEILING, HANDOFF_BOUND, OutboundTally, TallyDecision, TallyError,
-    TallyResponseDecision,
+    ClosureReason, DAILY_CEILING, EndpointOwner, OutboundTally, TALLY_RETENTION, TallyDecision,
+    TallyError, TallyResponseDecision,
 };
 
 /// The window every per-minute limit below is stated over.
@@ -191,13 +191,37 @@ pub const BUDGETS: &[Budget] = &[
     },
 ];
 
-/// Sources the monotonic and UTC instants of one decision.
-///
-/// Monotonic time owns deadlines, backoffs and in-process state. UTC time
-/// crosses process boundaries in the outbound tally.
+/// One reading of Linux's boot clock and the boot it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootTime {
+    id: String,
+    elapsed: Duration,
+}
+
+impl BootTime {
+    #[must_use]
+    pub fn new(id: impl Into<String>, elapsed: Duration) -> Self {
+        Self {
+            id: id.into(),
+            elapsed,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+}
+
+/// Sources in-process monotonic time and persistent Linux boot time.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
-    fn now_utc(&self) -> SystemTime;
+    fn now_boot(&self) -> Result<BootTime, String>;
 }
 
 /// Waits out a delay.
@@ -214,8 +238,29 @@ impl Clock for SystemClock {
         Instant::now()
     }
 
-    fn now_utc(&self) -> SystemTime {
-        SystemTime::now()
+    fn now_boot(&self) -> Result<BootTime, String> {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| format!("read /proc/sys/kernel/random/boot_id: {error}"))?;
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("/proc/sys/kernel/random/boot_id is empty".to_owned());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let reading = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+            let seconds = u64::try_from(reading.tv_sec)
+                .map_err(|_| "CLOCK_BOOTTIME returned negative seconds".to_owned())?;
+            let nanos = u32::try_from(reading.tv_nsec)
+                .map_err(|_| "CLOCK_BOOTTIME returned invalid nanoseconds".to_owned())?;
+            Ok(BootTime::new(id, Duration::new(seconds, nanos)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(
+                "CLOCK_BOOTTIME is required and this operating system does not provide it"
+                    .to_owned(),
+            )
+        }
     }
 }
 
@@ -229,13 +274,30 @@ impl Sleeper for TokioSleeper {
     }
 }
 
-/// What the gateway sends through. `HttpClient` in production; a scripted
-/// endpoint in tests, so no test touches the network.
+/// What the gateway sends through. `HttpClient` in production; scripted
+/// endpoints in gateway tests.
 pub trait Transport: Send + Sync {
     fn send<'a>(
         &'a self,
         request: &'a HttpRequest,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a;
+
+    /// Send while exposing the response status before the body is consumed.
+    ///
+    /// Scripted transports get the safe default. `HttpClient` overrides it so
+    /// a broker stop signal is persisted from the status line even when the
+    /// body later stalls or fails.
+    fn send_observed<'a>(
+        &'a self,
+        request: &'a HttpRequest,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+    ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
+        async move {
+            let response = self.send(request).await?;
+            observe(response.status, response.retry_after);
+            Ok(response)
+        }
+    }
 }
 
 impl Transport for HttpClient {
@@ -244,6 +306,14 @@ impl Transport for HttpClient {
         request: &'a HttpRequest,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         Self::send(self, request)
+    }
+
+    fn send_observed<'a>(
+        &'a self,
+        request: &'a HttpRequest,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+    ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
+        Self::send_observed(self, request, observe)
     }
 }
 
@@ -308,7 +378,15 @@ pub enum GatewayError {
         path = .path.display()
     )]
     TallyCorrupt { path: PathBuf, reason: String },
-    /// This host has spent its UTC calendar-day allowance.
+    /// Another process owns this endpoint's lifetime lock.
+    #[error(
+        "broker endpoint {endpoint} is owned by another iaam process; use that process or stop it before retrying"
+    )]
+    BrokerEndpointOwned {
+        destination: Destination,
+        endpoint: &'static str,
+    },
+    /// This host has spent its rolling 24-hour allowance.
     #[error(
         "{destination:?} reached the daily ceiling of {ceiling} broker requests; it resets at {resets_at}"
     )]
@@ -444,6 +522,7 @@ impl GatewayError {
             Self::BrokerEgressOff => "broker egress off",
             Self::TallyUnavailable { .. } => "tally unavailable",
             Self::TallyCorrupt { .. } => "tally corrupt",
+            Self::BrokerEndpointOwned { .. } => "broker endpoint owned",
             Self::UnknownBudget { .. } => "unknown budget",
             Self::InvalidBudgets(_) => "invalid budgets",
             Self::SecondGateway => "second gateway",
@@ -467,6 +546,7 @@ impl GatewayError {
             Self::BrokerEgressOff
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::BrokerEndpointOwned { .. }
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
             | Self::SecondGateway
@@ -490,6 +570,7 @@ impl GatewayError {
             Self::BrokerEgressOff
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::BrokerEndpointOwned { .. }
             | Self::DailyCeiling { .. }
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
@@ -516,6 +597,7 @@ impl GatewayError {
             Self::BrokerEgressOff
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::BrokerEndpointOwned { .. }
             | Self::DailyCeiling { .. }
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
@@ -533,6 +615,7 @@ impl GatewayError {
             Self::BrokerEgressOff
                 | Self::TallyUnavailable { .. }
                 | Self::TallyCorrupt { .. }
+                | Self::BrokerEndpointOwned { .. }
                 | Self::DailyCeiling { .. }
                 | Self::BrokerHostPaused { .. }
                 | Self::BrokerHostClosed { .. }
@@ -616,6 +699,12 @@ impl BudgetTable {
                     row.destination, row.scope
                 )));
             }
+            if is_broker_destination(row.destination) && row.window > TALLY_RETENTION {
+                return Err(GatewayError::InvalidBudgets(format!(
+                    "{:?} {:?} has a window longer than the outbound tally retention",
+                    row.destination, row.scope
+                )));
+            }
             if rows[..index]
                 .iter()
                 .any(|earlier| earlier.destination == row.destination && earlier.scope == row.scope)
@@ -675,6 +764,10 @@ struct Lane {
     /// the one instant holds back every caller of the lane and of each key,
     /// including one that arrives after the call that learned it returned.
     not_before: Option<Instant>,
+    /// The endpoint owner lock. Broker decisions, transport and response-status
+    /// recording all run while this lane is held, so the next decision cannot
+    /// overtake the previous response.
+    owner: Option<EndpointOwner>,
 }
 
 impl Lane {
@@ -753,17 +846,39 @@ fn millis(wait: Duration) -> u64 {
 }
 
 const fn is_broker_destination(destination: Destination) -> bool {
-    matches!(
-        destination,
-        Destination::TinkoffProd | Destination::TinkoffSandbox | Destination::FinamApi
-    )
+    match destination {
+        Destination::TinkoffProd | Destination::TinkoffSandbox | Destination::FinamApi => true,
+        Destination::MoexIss
+        | Destination::CbrScripts
+        | Destination::CbrDailyInfo
+        | Destination::TinvestContract => false,
+    }
+}
+const fn endpoint_lock_name(destination: Destination) -> Option<&'static str> {
+    match destination {
+        Destination::TinkoffProd => Some("tinkoff-prod"),
+        Destination::TinkoffSandbox => Some("tinkoff-sandbox"),
+        Destination::FinamApi => Some("finam"),
+        Destination::MoexIss
+        | Destination::CbrScripts
+        | Destination::CbrDailyInfo
+        | Destination::TinvestContract => None,
+    }
 }
 
-fn tally_gateway_error(path: &std::path::Path, error: TallyError) -> GatewayError {
+fn tally_gateway_error(
+    path: &std::path::Path,
+    destination: Destination,
+    error: TallyError,
+) -> GatewayError {
     match error {
         TallyError::Corrupt(reason) => GatewayError::TallyCorrupt {
             path: path.to_owned(),
             reason,
+        },
+        TallyError::EndpointOwned { endpoint } => GatewayError::BrokerEndpointOwned {
+            destination,
+            endpoint,
         },
         other => GatewayError::TallyUnavailable {
             path: path.to_owned(),
@@ -778,8 +893,8 @@ static PRODUCTION_BUILT: AtomicBool = AtomicBool::new(false);
 /// The outbound gateway.
 ///
 /// Built once per server process and shared: non-broker pacing, named waits
-/// and breakers are state of this value. Broker accounting instead belongs to
-/// the locked tally named by `broker_egress`.
+/// and breakers are state of this value. Broker accounting and each endpoint's
+/// lifetime owner instead belong to the tally named by `broker_egress`.
 pub struct Gateway<T> {
     transport: T,
     budgets: BudgetTable,
@@ -843,6 +958,12 @@ impl<T: Transport> Gateway<T> {
         sleeper: Arc<dyn Sleeper>,
         broker_egress: BrokerEgress,
     ) -> Result<Self, GatewayError> {
+        if let BrokerEgress::On { tally } = &broker_egress {
+            OutboundTally::validate(tally).map_err(|error| GatewayError::TallyUnavailable {
+                path: tally.clone(),
+                reason: error.to_string(),
+            })?;
+        }
         Ok(Self {
             transport,
             budgets: BudgetTable::new(budgets)?,
@@ -970,52 +1091,12 @@ impl<T: Transport> Gateway<T> {
             );
         };
         loop {
-            if broker {
-                let BrokerEgress::On { tally } = &self.broker_egress else {
-                    return Err(GatewayError::BrokerEgressOff);
-                };
-                if let Some(refusal) = OutboundTally::new(tally)
-                    .check_host(destination.base_url(), self.clock.now_utc())
-                    .map_err(|error| tally_gateway_error(tally, error))?
-                {
-                    match refusal {
-                        TallyDecision::Paused {
-                            reopens_at,
-                            retry_after,
-                        } => {
-                            return Err(GatewayError::BrokerHostPaused {
-                                destination,
-                                host: destination.base_url(),
-                                reopens_at: httpdate::fmt_http_date(reopens_at),
-                                retry_after,
-                                attempts,
-                            });
-                        }
-                        TallyDecision::Closed {
-                            reason,
-                            reopens_at,
-                            retry_after,
-                        } => {
-                            return Err(GatewayError::BrokerHostClosed {
-                                destination,
-                                host: destination.base_url(),
-                                reason: reason.description(),
-                                reopens_at: httpdate::fmt_http_date(reopens_at),
-                                retry_after,
-                                status: matches!(reason, ClosureReason::RateLimits).then_some(429),
-                                attempts,
-                            });
-                        }
-                        TallyDecision::Send
-                        | TallyDecision::Wait(_)
-                        | TallyDecision::DailyCeiling { .. } => {}
-                    }
-                }
-            }
-            // The in-process lane owns the breaker and named waits. It also
-            // stays held through non-broker transport. A broker tally decision
-            // takes its own OS lock only for read/decide/write; every wait and
-            // the transport happen after both locks are released.
+            // The in-process lane is the endpoint permit. Broker ownership,
+            // tally decision, transport and response-status recording all
+            // happen while it is held; waits release it. The former 100 ms
+            // decision-to-handoff bound is unnecessary: another process
+            // cannot own this endpoint, and another local call cannot enter
+            // until the status has been recorded.
             let (decision, outcome, body) = {
                 let asked = self.clock.now();
                 // A caller queued behind a long call or a named wait gives up
@@ -1031,6 +1112,17 @@ impl<T: Transport> Gateway<T> {
                     self.clock.now().saturating_duration_since(asked),
                     "lane",
                 );
+                if broker && lane.owner.is_none() {
+                    let BrokerEgress::On { tally } = &self.broker_egress else {
+                        return Err(GatewayError::BrokerEgressOff);
+                    };
+                    let lock_name =
+                        endpoint_lock_name(destination).ok_or(GatewayError::BrokerEgressOff)?;
+                    lane.owner = Some(
+                        EndpointOwner::acquire(tally, destination.base_url(), lock_name)
+                            .map_err(|error| tally_gateway_error(tally, destination, error))?,
+                    );
+                }
                 if let Some(retry_after) = lane.refusing(self.clock.now()) {
                     return Err(GatewayError::CircuitOpen {
                         destination,
@@ -1083,7 +1175,6 @@ impl<T: Transport> Gateway<T> {
                         return Err(cut(attempts, status, wait));
                     }
                 }
-                let mut tally_decided_at = None;
                 if broker {
                     let BrokerEgress::On { tally } = &self.broker_egress else {
                         return Err(GatewayError::BrokerEgressOff);
@@ -1097,38 +1188,45 @@ impl<T: Transport> Gateway<T> {
                             ceiling: allowance.ceiling(),
                         });
                     }
-                    let decided_at = self.clock.now();
-                    let tally_decision = match OutboundTally::new(tally).decide_and_record(
+                    let boot = match self.clock.now_boot() {
+                        Ok(boot) => boot,
+                        Err(reason) => {
+                            allowance.give_back();
+                            return Err(tally_gateway_error(
+                                tally,
+                                destination,
+                                TallyError::Clock(reason),
+                            ));
+                        }
+                    };
+                    let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
+                    let tally_decision = match owner.tally().decide_and_record(
                         destination.base_url(),
                         key.unwrap_or("*"),
                         budget.used,
-                        budget.window.saturating_add(HANDOFF_BOUND),
-                        self.clock.now_utc(),
+                        budget.window,
+                        &boot,
                     ) {
                         Ok(decision) => decision,
                         Err(error) => {
                             allowance.give_back();
-                            return Err(tally_gateway_error(tally, error));
+                            return Err(tally_gateway_error(tally, destination, error));
                         }
                     };
                     match tally_decision {
-                        TallyDecision::Send => tally_decided_at = Some(decided_at),
-                        TallyDecision::Paused {
-                            reopens_at,
-                            retry_after,
-                        } => {
+                        TallyDecision::Send => {}
+                        TallyDecision::Paused { retry_after } => {
                             allowance.give_back();
                             return Err(GatewayError::BrokerHostPaused {
                                 destination,
                                 host: destination.base_url(),
-                                reopens_at: httpdate::fmt_http_date(reopens_at),
+                                reopens_at: format!("{retry_after:?} on the boot clock"),
                                 retry_after,
                                 attempts,
                             });
                         }
                         TallyDecision::Closed {
                             reason,
-                            reopens_at,
                             retry_after,
                         } => {
                             allowance.give_back();
@@ -1136,21 +1234,18 @@ impl<T: Transport> Gateway<T> {
                                 destination,
                                 host: destination.base_url(),
                                 reason: reason.description(),
-                                reopens_at: httpdate::fmt_http_date(reopens_at),
+                                reopens_at: format!("{retry_after:?} on the boot clock"),
                                 retry_after,
                                 status: matches!(reason, ClosureReason::RateLimits).then_some(429),
                                 attempts,
                             });
                         }
-                        TallyDecision::DailyCeiling {
-                            reset_at,
-                            retry_after,
-                        } => {
+                        TallyDecision::DailyCeiling { retry_after } => {
                             allowance.give_back();
                             return Err(GatewayError::DailyCeiling {
                                 destination,
                                 ceiling: DAILY_CEILING,
-                                resets_at: httpdate::fmt_http_date(reset_at),
+                                resets_at: format!("{retry_after:?} on the boot clock"),
                                 retry_after,
                             });
                         }
@@ -1174,76 +1269,105 @@ impl<T: Transport> Gateway<T> {
                 } else {
                     lane.record_start(key, &budget, self.clock.now());
                 }
-                let held_lane = if broker {
-                    drop(lane);
-                    None
-                } else {
-                    Some(lane)
-                };
-                if let Some(decided_at) = tally_decided_at
-                    && self.clock.now().saturating_duration_since(decided_at) > HANDOFF_BOUND
-                {
-                    // The tally reservation remains spent: forgetting it
-                    // would let another process use the same slot. No request
-                    // left this process, so the sync's transport allowance is
-                    // returned before this call decides again.
-                    if let Some(allowance) = allowance {
-                        allowance.give_back();
-                    }
-                    continue;
-                }
                 attempts += 1;
-                let Some(answer) = self
-                    .by_deadline(self.transport.send(request), deadline)
-                    .await
-                else {
+                let observed = std::sync::Mutex::new(
+                    None::<(
+                        u16,
+                        Option<Duration>,
+                        Result<TallyResponseDecision, GatewayError>,
+                    )>,
+                );
+                let answer = if broker {
+                    let BrokerEgress::On { tally } = &self.broker_egress else {
+                        return Err(GatewayError::BrokerEgressOff);
+                    };
+                    let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
+                    let observe = Box::new(|status, retry_after: Option<Duration>| {
+                        let retry_after = retry_after.map(|delay| delay.min(TALLY_RETENTION));
+                        let recorded = self
+                            .clock
+                            .now_boot()
+                            .map_err(|reason| {
+                                tally_gateway_error(tally, destination, TallyError::Clock(reason))
+                            })
+                            .and_then(|boot| {
+                                owner
+                                    .tally()
+                                    .record_response(
+                                        destination.base_url(),
+                                        status,
+                                        retry_after,
+                                        &boot,
+                                    )
+                                    .map_err(|error| tally_gateway_error(tally, destination, error))
+                            });
+                        *observed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some((status, retry_after, recorded));
+                    });
+                    self.by_deadline(self.transport.send_observed(request, observe), deadline)
+                        .await
+                } else {
+                    self.by_deadline(self.transport.send(request), deadline)
+                        .await
+                };
+                let observed = observed
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut answer = answer.map(|result| {
+                    result.map(|mut response| {
+                        response.retry_after =
+                            response.retry_after.map(|delay| delay.min(TALLY_RETENTION));
+                        response
+                    })
+                });
+                if let Some((observed_status, observed_retry_after, recorded)) = observed {
+                    match recorded? {
+                        TallyResponseDecision::Recorded => {}
+                        TallyResponseDecision::RateLimited { retry_after } => {
+                            return Err(GatewayError::BrokerHostPaused {
+                                destination,
+                                host: destination.base_url(),
+                                reopens_at: format!("{retry_after:?} on the boot clock"),
+                                retry_after,
+                                attempts,
+                            });
+                        }
+                    }
+                    // A status line is an endpoint answer even when its body
+                    // later stalls or fails. Keep a 4xx/5xx from becoming a
+                    // retryable transport error and losing the broker's stop
+                    // signal.
+                    if !(200..300).contains(&observed_status) && !matches!(answer, Some(Ok(_))) {
+                        answer = Some(Ok(HttpResponse {
+                            status: observed_status,
+                            body: Vec::new(),
+                            retry_after: observed_retry_after,
+                        }));
+                    }
+                } else if broker && matches!(answer, Some(Ok(_))) {
+                    return Err(tally_gateway_error(
+                        match &self.broker_egress {
+                            BrokerEgress::On { tally } => tally,
+                            BrokerEgress::Off => return Err(GatewayError::BrokerEgressOff),
+                        },
+                        destination,
+                        TallyError::Corrupt(
+                            "the transport returned a response without exposing its status"
+                                .to_owned(),
+                        ),
+                    ));
+                }
+                let Some(answer) = answer else {
                     // Abandoned in flight: dropping the request cancels it.
                     // The wait offered is the one a timed-out attempt earns.
                     let retry_after =
                         retry.delay(attempts, &Outcome::Transport(HttpError::Timeout));
                     return Err(cut(attempts, status, retry_after));
                 };
-                let mut lane = match held_lane {
-                    Some(lane) => lane,
-                    None => {
-                        let Some(lane) = self.by_deadline(lane_lock.lock(), deadline).await else {
-                            let retry_after =
-                                retry.delay(attempts, &Outcome::Transport(HttpError::Timeout));
-                            return Err(cut(attempts, status, retry_after));
-                        };
-                        lane
-                    }
-                };
                 let (outcome, body) = match answer {
                     Ok(response) => {
-                        if broker {
-                            let BrokerEgress::On { tally } = &self.broker_egress else {
-                                return Err(GatewayError::BrokerEgressOff);
-                            };
-                            match OutboundTally::new(tally)
-                                .record_response(
-                                    destination.base_url(),
-                                    response.status,
-                                    response.retry_after,
-                                    self.clock.now_utc(),
-                                )
-                                .map_err(|error| tally_gateway_error(tally, error))?
-                            {
-                                TallyResponseDecision::Recorded => {}
-                                TallyResponseDecision::RateLimited {
-                                    reopens_at,
-                                    retry_after,
-                                } => {
-                                    return Err(GatewayError::BrokerHostPaused {
-                                        destination,
-                                        host: destination.base_url(),
-                                        reopens_at: httpdate::fmt_http_date(reopens_at),
-                                        retry_after,
-                                        attempts,
-                                    });
-                                }
-                            }
-                        }
                         if (200..300).contains(&response.status) {
                             if lane.record_success() {
                                 tracing::info!(
@@ -1443,10 +1567,6 @@ mod tests {
         /// How much later than asked each sleep ends, by the clock: a timer
         /// that fires late, as one does on a loaded or suspended host.
         lag: StdMutex<Duration>,
-        /// One scripted wall-clock read advances both clocks, modelling work
-        /// between a tally decision's timestamp and the transport hand-off.
-        utc_jump: StdMutex<Option<(usize, Duration)>>,
-        utc_calls: AtomicUsize,
     }
 
     impl FakeTime {
@@ -1456,8 +1576,6 @@ mod tests {
                 monotonic_origin: tokio::time::Instant::now().into_std(),
                 slept: StdMutex::new(Vec::new()),
                 lag: StdMutex::new(Duration::ZERO),
-                utc_jump: StdMutex::new(None),
-                utc_calls: AtomicUsize::new(0),
             })
         }
 
@@ -1467,9 +1585,6 @@ mod tests {
 
         fn lagging(&self, by: Duration) {
             *self.lag.lock().expect("lag") = by;
-        }
-        fn jump_on_utc_call(&self, call: usize, by: Duration) {
-            *self.utc_jump.lock().expect("UTC jump") = Some((call, by));
         }
 
         /// The sleeps that ran to their end; one abandoned early (a
@@ -1484,20 +1599,11 @@ mod tests {
             tokio::time::Instant::now().into_std() + *self.offset.lock().expect("clock")
         }
 
-        fn now_utc(&self) -> SystemTime {
-            let call = self.utc_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            let jump = self
-                .utc_jump
-                .lock()
-                .expect("UTC jump")
-                .filter(|(wanted, _)| *wanted == call)
-                .map(|(_, by)| by);
-            if let Some(by) = jump {
-                self.advance(by);
-            }
-            SystemTime::UNIX_EPOCH
-                + Duration::from_secs(1_800_000_000)
-                + self.now().saturating_duration_since(self.monotonic_origin)
+        fn now_boot(&self) -> Result<BootTime, String> {
+            Ok(BootTime::new(
+                "test-boot",
+                self.now().saturating_duration_since(self.monotonic_origin),
+            ))
         }
     }
 
@@ -1609,7 +1715,13 @@ mod tests {
             "iaam-http-gateway-test-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::write(&tally, "").expect("empty tally created");
+        let initialized = format!(
+            "iaam-outbound-tally-v2\nboot\ttest-boot\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\n",
+            Destination::TinkoffProd.base_url(),
+            Destination::TinkoffSandbox.base_url(),
+            Destination::FinamApi.base_url(),
+        );
+        std::fs::write(&tally, initialized).expect("initialized tally created");
         BrokerEgress::On { tally }
     }
 
@@ -1672,52 +1784,6 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("300"), "{message}");
         assert!(message.contains("narrow"), "{message}");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_broker_handoff_past_the_bound_is_not_sent_and_is_decided_again() {
-        let time = FakeTime::new();
-        // `check_host` is the first UTC read; the second is the tally
-        // reservation. Advance after that decision timestamp and before the
-        // gateway can hand the request to the transport.
-        time.jump_on_utc_call(2, Duration::from_millis(101));
-        let gateway = gateway(&time, Scripted::answering(&time, 200));
-        let request = operations().with_request_allowance(RequestAllowance::new(1));
-
-        gateway
-            .send("OperationsService", &request, None)
-            .await
-            .expect("the fresh re-decision sends");
-
-        assert_eq!(
-            gateway.transport.sent_count(),
-            1,
-            "the expired reservation must not reach transport"
-        );
-        assert_eq!(
-            time.slept(),
-            [Duration::from_millis(1_100)],
-            "the spent reservation is kept and paces the re-decision"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_broker_handoff_at_the_bound_is_sent_without_a_redecision() {
-        let time = FakeTime::new();
-        time.jump_on_utc_call(2, HANDOFF_BOUND);
-        let gateway = gateway(&time, Scripted::answering(&time, 200));
-        let request = operations().with_request_allowance(RequestAllowance::new(1));
-
-        gateway
-            .send("OperationsService", &request, None)
-            .await
-            .expect("a hand-off at the inclusive bound sends");
-
-        assert_eq!(gateway.transport.sent_count(), 1);
-        assert!(
-            time.slept().is_empty(),
-            "the valid reservation was needlessly spent and re-decided"
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1811,15 +1877,14 @@ mod tests {
         let sent = gateway.transport.sent_at();
         assert_eq!(sent.len(), 160);
         assert_never_more_than(50, MINUTE, &sent);
-        // Host reservations are 1.1 s apart: the extra 100 ms is the
-        // maximum decision-to-handoff interval. The method budget holds the
-        // 51st reservation until 60.1 s for the same reason.
-        assert_eq!(sent[49], start + Duration::from_millis(53_900));
-        assert_eq!(sent[50], start + MINUTE + HANDOFF_BOUND);
+        // The endpoint permit makes the old 100 ms hand-off margin
+        // unnecessary: departures themselves are one second apart.
+        assert_eq!(sent[49], start + Duration::from_secs(49));
+        assert_eq!(sent[50], start + MINUTE);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_method_window_retains_its_oldest_reservation_for_the_handoff_margin() {
+    async fn the_method_window_retains_its_oldest_reservation() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
         let start = time.now();
@@ -1829,16 +1894,15 @@ mod tests {
                 .await
                 .expect("send inside method budget");
         }
-        time.advance(Duration::from_millis(6_100));
 
         gateway
             .send("OperationsService", &operations(), None)
             .await
-            .expect("send after widened method window");
+            .expect("send after the method window");
 
         let sent = gateway.transport.sent_at();
-        assert_eq!(sent[50], start + MINUTE + HANDOFF_BOUND);
-        assert_eq!(time.slept().last(), Some(&HANDOFF_BOUND));
+        assert_eq!(sent[50], start + MINUTE);
+        assert_eq!(time.slept().last(), Some(&Duration::from_secs(11)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1856,7 +1920,7 @@ mod tests {
 
         let sent = gateway.transport.sent_at();
         assert_never_more_than(25, MINUTE, &sent);
-        assert_eq!(sent[25], sent[0] + MINUTE + HANDOFF_BOUND);
+        assert_eq!(sent[25], sent[0] + MINUTE);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1878,7 +1942,7 @@ mod tests {
 
         assert_eq!(
             gateway.transport.sent_at().last(),
-            Some(&(start + Duration::from_secs(55))),
+            Some(&(start + Duration::from_secs(50))),
             "the users method waited for the operations method's budget"
         );
     }
@@ -2102,11 +2166,7 @@ mod tests {
                 "status {transient}"
             );
             assert_eq!(gateway.transport.sent_count(), 2, "status {transient}");
-            assert_eq!(
-                time.slept(),
-                [Duration::from_secs(1), HANDOFF_BOUND],
-                "status {transient}"
-            );
+            assert_eq!(time.slept(), [Duration::from_secs(1)], "status {transient}");
         }
     }
 
@@ -2273,12 +2333,8 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 3);
         assert_eq!(
             time.slept(),
-            [
-                Duration::from_secs(1),
-                HANDOFF_BOUND,
-                Duration::from_secs(2),
-            ],
-            "exponential backoff plus departure spacing"
+            [Duration::from_secs(1), Duration::from_secs(2)],
+            "exponential backoff"
         );
         assert!(refused.is_transient());
         assert_eq!(refused.status(), Some(503));
@@ -2797,9 +2853,9 @@ mod tests {
             .await
             .expect_err("the third attempt would start past the deadline");
 
-        // Attempts at 0 s and 1.1 s; the third would start at 3.1 s.
+        // Attempts at 0 s and 1 s; the third would start at 3 s.
         assert_eq!(gateway.transport.sent_count(), 2);
-        assert_eq!(time.slept(), [Duration::from_secs(1), HANDOFF_BOUND]);
+        assert_eq!(time.slept(), [Duration::from_secs(1)]);
         assert!(gateway.transport.sent_at().iter().all(|at| *at < deadline));
         assert!(
             matches!(
@@ -2848,7 +2904,7 @@ mod tests {
         let refused = gateway
             .send("OperationsService", &operations(), Some(deadline))
             .await
-            .expect_err("the tally budget frees a request only at the widened minute boundary");
+            .expect_err("the tally budget frees a request only at the rolling minute boundary");
 
         assert!(
             matches!(
@@ -2861,7 +2917,7 @@ mod tests {
             ),
             "{refused:?}"
         );
-        assert_eq!(refused.retry_after(), Some(Duration::from_millis(6_200)));
+        assert_eq!(refused.retry_after(), Some(Duration::from_secs(11)));
         assert_eq!(gateway.transport.sent_count(), 50);
         assert_eq!(time.slept(), slept_before_refusal);
     }
@@ -3279,7 +3335,7 @@ mod tests {
         log.assert_line(
             "INFO",
             "outbound call waits",
-            &["reason=\"outbound tally\"", "wait_ms=6200", "attempt=1"],
+            &["reason=\"outbound tally\"", "wait_ms=11000", "attempt=1"],
         );
     }
 
@@ -3568,6 +3624,14 @@ mod tests {
     #[test]
     fn a_budget_at_its_documented_limit_is_accepted() {
         assert!(table_with(Budget { used: 10, ..ROW }).is_ok());
+    }
+    #[test]
+    fn a_broker_budget_longer_than_the_tally_retention_is_refused() {
+        let refused = table_with(Budget {
+            window: Duration::from_secs(24 * 60 * 60 + 1),
+            ..ROW
+        });
+        assert!(matches!(refused, Err(GatewayError::InvalidBudgets(_))));
     }
 
     #[test]

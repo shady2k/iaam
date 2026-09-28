@@ -597,10 +597,9 @@ struct ObservedOutbound<T: Transport> {
     context: Arc<CallContext>,
 }
 
-impl<T: Transport> Outbound for ObservedOutbound<T> {
+impl<T: Transport + 'static> Outbound for ObservedOutbound<T> {
     fn send<'a>(
         &'a self,
-        method: &'static str,
         request: &'a HttpRequest,
         deadline: Option<Instant>,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>> {
@@ -608,7 +607,7 @@ impl<T: Transport> Outbound for ObservedOutbound<T> {
         Box::pin(async move {
             self.context.active_call.store(call, Ordering::SeqCst);
             let before = self.context.arrivals.load(Ordering::SeqCst);
-            let result = self.gateway.send(method, request, deadline).await;
+            let result = self.gateway.send(request, deadline).await;
 
             if self.context.arrivals.load(Ordering::SeqCst) == before {
                 self.context.locally_refused.fetch_add(1, Ordering::SeqCst);
@@ -685,7 +684,7 @@ impl Scenario {
         sleep_mode: SleepMode,
     ) -> Self {
         let directory = TempDir::new(label);
-        let tally = directory.path("tally");
+        let tally = directory.path("outbound-tally");
         if egress {
             std::fs::write(&tally, "")
                 .unwrap_or_else(|error| panic!("create {}: {error}", tally.display()));
@@ -739,16 +738,17 @@ impl Scenario {
             }),
             SleepMode::Logical => Arc::clone(&clock) as Arc<dyn Sleeper>,
         };
-        let gateway = Gateway::with_parts(
+        let gateway = Gateway::with_parts_in_directory(
             transport,
             BUDGETS,
             Arc::clone(&clock) as Arc<dyn Clock>,
             sleeper,
             if egress {
-                BrokerEgress::On { tally }
+                BrokerEgress::On
             } else {
                 BrokerEgress::Off
             },
+            &directory.0,
         )
         .unwrap_or_else(|error| panic!("build proof gateway: {error}"));
         let outbound = Arc::new(ObservedOutbound {
@@ -809,20 +809,9 @@ fn direct_request(destination: Destination, path: &str) -> HttpRequest {
 fn direct_path(destination: Destination) -> &'static str {
     match destination {
         Destination::TinkoffProd | Destination::TinkoffSandbox => {
-            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations"
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor"
         }
         Destination::FinamApi => "/v1/accounts/account",
-        Destination::MoexIss
-        | Destination::CbrScripts
-        | Destination::CbrDailyInfo
-        | Destination::TinvestContract => panic!("not a broker endpoint"),
-    }
-}
-
-fn direct_method(destination: Destination) -> &'static str {
-    match destination {
-        Destination::TinkoffProd | Destination::TinkoffSandbox => "OperationsService",
-        Destination::FinamApi => "AccountsService.GetAccount",
         Destination::MoexIss
         | Destination::CbrScripts
         | Destination::CbrDailyInfo
@@ -835,10 +824,7 @@ async fn direct_send(
     destination: Destination,
 ) -> Result<HttpResponse, GatewayError> {
     let request = direct_request(destination, direct_path(destination));
-    scenario
-        .outbound
-        .send(direct_method(destination), &request, None)
-        .await
+    scenario.outbound.send(&request, None).await
 }
 
 async fn exercise_wire_spacing(destination: Destination) -> Scenario {
@@ -1003,7 +989,11 @@ async fn exercise_finam_renewal() -> Scenario {
     scenario
 }
 
-async fn exercise_transient(label: &str, reply: LoopbackReply) -> Scenario {
+async fn exercise_transient(
+    label: &str,
+    reply: LoopbackReply,
+    expected_requests: usize,
+) -> Scenario {
     let scenario = Scenario::new(
         label,
         Destination::TinkoffProd,
@@ -1013,7 +1003,7 @@ async fn exercise_transient(label: &str, reply: LoopbackReply) -> Scenario {
     );
     let result = direct_send(&scenario, Destination::TinkoffProd).await;
     assert!(result.is_err(), "transient failure unexpectedly succeeded");
-    assert_eq!(scenario.server.requests_received(), 3);
+    assert_eq!(scenario.server.requests_received(), expected_requests);
     scenario
 }
 
@@ -1216,9 +1206,7 @@ async fn exercise_concurrent_callers() -> Scenario {
             Destination::TinkoffProd,
             direct_path(Destination::TinkoffProd),
         );
-        first_outbound
-            .send("OperationsService", &request, None)
-            .await
+        first_outbound.send(&request, None).await
     });
     wait_for_arrivals(&scenario, 1).await;
 
@@ -1231,9 +1219,7 @@ async fn exercise_concurrent_callers() -> Scenario {
             Destination::TinkoffProd,
             direct_path(Destination::TinkoffProd),
         );
-        second_outbound
-            .send("OperationsService", &request, None)
-            .await
+        second_outbound.send(&request, None).await
     });
     while !second_started.load(Ordering::SeqCst) {
         tokio::task::yield_now().await;
@@ -1329,31 +1315,36 @@ fn assert_path_aliases_refused() {
     let server = LoopbackServer::start(std::iter::empty())
         .unwrap_or_else(|error| panic!("path loopback: {error}"));
     let clock = FakeTime::new();
-    let build = |path: PathBuf| {
-        Gateway::with_parts(
+    let build = |path: &Path| {
+        Gateway::with_parts_in_directory(
             HttpClientHarness::new(&server),
             BUDGETS,
             Arc::clone(&clock) as Arc<dyn Clock>,
             Arc::clone(&clock) as Arc<dyn Sleeper>,
-            BrokerEgress::On { tally: path },
+            BrokerEgress::On,
+            path,
         )
     };
 
-    assert!(build(PathBuf::from("relative-tally")).is_err());
+    assert!(build(Path::new("relative-directory")).is_err());
 
     let symlink_target = directory.path("symlink-target");
     let symlink = directory.path("symlink");
-    std::fs::write(&symlink_target, "").unwrap_or_else(|error| panic!("symlink target: {error}"));
+    std::fs::create_dir(&symlink_target).unwrap_or_else(|error| panic!("symlink target: {error}"));
+    std::fs::write(symlink_target.join("outbound-tally"), "")
+        .unwrap_or_else(|error| panic!("symlink tally: {error}"));
     std::os::unix::fs::symlink(&symlink_target, &symlink)
-        .unwrap_or_else(|error| panic!("create tally symlink: {error}"));
-    assert!(build(symlink).is_err());
+        .unwrap_or_else(|error| panic!("create directory symlink: {error}"));
+    assert!(build(&symlink).is_err());
 
+    let hard_directory = directory.path("hard-tally");
+    std::fs::create_dir(&hard_directory)
+        .unwrap_or_else(|error| panic!("hard-link directory: {error}"));
     let hard_target = directory.path("hard-target");
-    let hard_alias = directory.path("hard-alias");
     std::fs::write(&hard_target, "").unwrap_or_else(|error| panic!("hard-link target: {error}"));
-    std::fs::hard_link(&hard_target, &hard_alias)
+    std::fs::hard_link(&hard_target, hard_directory.join("outbound-tally"))
         .unwrap_or_else(|error| panic!("create tally hard link: {error}"));
-    assert!(build(hard_alias).is_err());
+    assert!(build(&hard_directory).is_err());
     assert_eq!(server.requests_received(), 0);
 }
 
@@ -1376,9 +1367,9 @@ async fn process_child() {
     let Ok(role) = std::env::var("IAAM_CEILING_PROCESS_ROLE") else {
         return;
     };
-    let tally = PathBuf::from(
+    let egress_directory = PathBuf::from(
         std::env::var("IAAM_CEILING_PROCESS_TALLY")
-            .unwrap_or_else(|error| panic!("child tally: {error}")),
+            .unwrap_or_else(|error| panic!("child egress directory: {error}")),
     );
     let ready = PathBuf::from(
         std::env::var("IAAM_CEILING_PROCESS_READY")
@@ -1395,19 +1386,19 @@ async fn process_child() {
     let server = LoopbackServer::start([LoopbackReply::complete(200, "{}")])
         .unwrap_or_else(|error| panic!("child loopback: {error}"));
     let clock = FakeTime::new();
-    let gateway = Gateway::with_parts(
+    let gateway = Gateway::with_parts_in_directory(
         HttpClientHarness::new(&server),
         BUDGETS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         Arc::clone(&clock) as Arc<dyn Sleeper>,
-        BrokerEgress::On { tally },
+        BrokerEgress::On,
+        &egress_directory,
     )
     .unwrap_or_else(|error| panic!("child gateway: {error}"));
 
     if role == "owner" {
         gateway
             .send(
-                "OperationsService",
                 &direct_request(
                     Destination::TinkoffProd,
                     direct_path(Destination::TinkoffProd),
@@ -1442,7 +1433,6 @@ async fn process_child() {
     }
     let owned = gateway
         .send(
-            "OperationsService",
             &direct_request(
                 Destination::TinkoffProd,
                 direct_path(Destination::TinkoffProd),
@@ -1457,7 +1447,6 @@ async fn process_child() {
     assert_eq!(server.requests_received(), 0);
     gateway
         .send(
-            "AccountsService.GetAccount",
             &direct_request(Destination::FinamApi, direct_path(Destination::FinamApi)),
             None,
         )
@@ -1473,7 +1462,7 @@ async fn process_child() {
 
 fn process_measurements() -> (Measurements, Measurements) {
     let directory = TempDir::new("processes");
-    let tally = directory.path("tally");
+    let tally = directory.path("outbound-tally");
     let ready = directory.path("ready");
     let done = directory.path("done");
     let owner_result = directory.path("owner-result");
@@ -1484,7 +1473,7 @@ fn process_measurements() -> (Measurements, Measurements) {
         Command::new(&executable)
             .args(["--exact", "process_child", "--nocapture"])
             .env("IAAM_CEILING_PROCESS_ROLE", role)
-            .env("IAAM_CEILING_PROCESS_TALLY", &tally)
+            .env("IAAM_CEILING_PROCESS_TALLY", &directory.0)
             .env("IAAM_CEILING_PROCESS_READY", &ready)
             .env("IAAM_CEILING_PROCESS_DONE", &done)
             .env("IAAM_CEILING_PROCESS_RESULT", result)
@@ -1599,10 +1588,11 @@ async fn executable_ceiling_proof() {
     .await;
     stalled_body.verify_and_print("429-stalled-body", Destination::FinamApi, None);
 
-    let server_error = exercise_transient("always-500", LoopbackReply::complete(500, "down")).await;
+    let server_error =
+        exercise_transient("always-500", LoopbackReply::complete(500, "down"), 3).await;
     server_error.verify_and_print("always-500", Destination::TinkoffProd, None);
 
-    let timeout = exercise_transient("timeouts", LoopbackReply::held(200, "late")).await;
+    let timeout = exercise_transient("timeouts", LoopbackReply::held(200, "late"), 1).await;
     timeout.verify_and_print("timeouts", Destination::TinkoffProd, None);
 
     let (same_redirect, cross_redirect) = exercise_redirects().await;

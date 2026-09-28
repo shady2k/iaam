@@ -2300,12 +2300,14 @@ async fn concurrent_account_syncs_own_separate_three_hundred_attempt_allowances(
         now: Mutex::new(Instant::now()),
         wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
     });
-    let gateway = Gateway::with_parts(
+    let directory = broker_egress_directory();
+    let gateway = Gateway::with_parts_in_directory(
         CountingTransport(Arc::clone(&sent)),
         BUDGETS,
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
-        broker_egress(),
+        iaam_http::BrokerEgress::On,
+        &directory,
     );
     let Ok(gateway) = gateway else {
         panic!("the documented budget table was invalid");
@@ -2313,17 +2315,17 @@ async fn concurrent_account_syncs_own_separate_three_hundred_attempt_allowances(
     for allowance in allowances {
         let request = HttpRequest::post(
             iaam_http::Destination::TinkoffProd,
-            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
             iaam_http::RequestBody::Json("{}".to_owned()),
         )
         .idempotent()
         .with_request_allowance(allowance);
         for attempt in 1..=300 {
-            if let Err(error) = gateway.send("OperationsService", &request, None).await {
+            if let Err(error) = gateway.send(&request, None).await {
                 panic!("sync allowance ended at attempt {attempt}: {error}");
             }
         }
-        let result = gateway.send("OperationsService", &request, None).await;
+        let result = gateway.send(&request, None).await;
         assert!(matches!(
             result,
             Err(iaam_http::GatewayError::RequestCeiling { ceiling: 300, .. })
@@ -2515,15 +2517,16 @@ impl Sleeper for PausedTime {
     }
 }
 
-fn broker_egress() -> iaam_http::BrokerEgress {
+fn broker_egress_directory() -> std::path::PathBuf {
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let tally = std::env::temp_dir().join(format!(
+    let directory = std::env::temp_dir().join(format!(
         "iaam-app-sync-test-{}-{sequence}",
         std::process::id()
     ));
-    std::fs::write(&tally, "").expect("empty tally created");
-    iaam_http::BrokerEgress::On { tally }
+    std::fs::create_dir(&directory).expect("egress directory created");
+    std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+    directory
 }
 
 /// A T-Invest that answers every operations page, always with one more to
@@ -2561,7 +2564,8 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
     let time = Arc::new(PausedTime {
         start: tokio::time::Instant::now().into_std(),
     });
-    let gateway = Gateway::with_parts(
+    let directory = broker_egress_directory();
+    let gateway = Gateway::with_parts_in_directory(
         SlowTinvest {
             step: Duration::from_secs(4 * 60),
             asked: Arc::clone(&asked),
@@ -2569,7 +2573,8 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
         BUDGETS,
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
-        broker_egress(),
+        iaam_http::BrokerEgress::On,
+        &directory,
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);
@@ -2644,12 +2649,14 @@ fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
         now: Mutex::new(Instant::now()),
         wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
     });
-    let gateway = Gateway::with_parts(
+    let directory = broker_egress_directory();
+    let gateway = Gateway::with_parts_in_directory(
         transport,
         BUDGETS,
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
-        broker_egress(),
+        iaam_http::BrokerEgress::On,
+        &directory,
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);

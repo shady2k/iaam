@@ -92,7 +92,7 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     // bypass any of them.
     let egress = BrokerEgress::from_env().expect("broker egress configured");
     let gateway = Gateway::production(egress).expect("broker gateway configured");
-    let result = gateway.send("UsersService", &request, None).await;
+    let result = gateway.send(&request, None).await;
 
     // Status and body length only, never the body: test output is kept in
     // CI logs and transcripts, and nothing guarantees a broker's refusal

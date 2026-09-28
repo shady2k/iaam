@@ -205,8 +205,7 @@ impl TinkoffClient {
         Ok(body)
     }
 
-    /// `call.service` names the budget the call draws on, as T-Invest states
-    /// its limits: per service, not per method.
+    /// The request path identifies the service budget at the gateway.
     async fn post(
         &self,
         call: ReadCall,
@@ -226,7 +225,7 @@ impl TinkoffClient {
         );
         let response = self
             .gateway
-            .send(call.service, &request, deadline)
+            .send(&request, deadline)
             .await
             .map_err(|error| gateway_error(error, self.token.expose()))?;
         String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)
@@ -254,30 +253,25 @@ impl TinkoffClient {
     }
 }
 
-/// Metadata that keeps one read-only RPC's environment check, service name
-/// and REST path together.
+/// Metadata that keeps one read-only RPC's environment check and path together.
 #[derive(Clone, Copy)]
 struct ReadCall {
     method: Method,
-    service: &'static str,
     path: &'static str,
 }
 
 const ACCOUNTS: ReadCall = ReadCall {
     method: Method::Accounts,
-    service: "UsersService",
     path: "UsersService/GetAccounts",
 };
 
 const PORTFOLIO: ReadCall = ReadCall {
     method: Method::Portfolio,
-    service: "OperationsService",
     path: "OperationsService/GetPortfolio",
 };
 
 const OPERATIONS: ReadCall = ReadCall {
     method: Method::Operations,
-    service: "OperationsService",
     path: "OperationsService/GetOperationsByCursor",
 };
 
@@ -466,15 +460,16 @@ mod tests {
         })
     }
 
-    fn broker_egress() -> iaam_http::BrokerEgress {
+    fn broker_egress_directory() -> std::path::PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tally = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "iaam-broker-tinkoff-test-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::write(&tally, "").expect("empty tally created");
-        iaam_http::BrokerEgress::On { tally }
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+        directory
     }
 
     fn client(
@@ -493,8 +488,9 @@ mod tests {
             wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         });
         let paths = Arc::new(Mutex::new(Vec::new()));
+        let directory = broker_egress_directory();
         let gateway = Arc::new(
-            Gateway::with_parts(
+            Gateway::with_parts_in_directory(
                 FakeTinvest {
                     script: Mutex::new(answers.into()),
                     paths: Arc::clone(&paths),
@@ -502,7 +498,8 @@ mod tests {
                 BUDGETS,
                 Arc::clone(&time) as Arc<dyn Clock>,
                 Arc::clone(&time) as Arc<dyn Sleeper>,
-                broker_egress(),
+                iaam_http::BrokerEgress::On,
+                &directory,
             )
             .expect("the documented table is valid"),
         );
@@ -581,22 +578,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transient_failure_of_an_operations_page_is_retried() {
-        let (client, gateway, _) = client(vec![
-            Err(HttpError::Timeout),
-            answer(200, r#"{"hasNext":false,"items":[]}"#),
-        ]);
+    async fn a_timeout_of_an_operations_page_closes_egress_without_retrying() {
+        let (client, gateway, _) = client(vec![Err(HttpError::Timeout)]);
 
-        client
+        let error = client
             .get_operations_by_cursor(
                 &GetOperationsByCursorRequest::new("account"),
                 None,
                 &iaam_http::RequestAllowance::new(u32::MAX),
             )
             .await
-            .expect("the second attempt passes");
+            .expect_err("an outcome without a status closes egress");
 
-        assert_eq!(sent(&gateway), 2);
+        assert!(
+            matches!(
+                &error,
+                TinkoffError::Gateway(refused)
+                    if refused.is_broker_egress_refusal()
+                        && refused.retry_after() == Some(Duration::from_secs(90))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(sent(&gateway), 1);
     }
 
     #[test]
@@ -660,18 +663,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_network_failure_that_outlasts_the_retries_is_unreachable() {
-        let answers = (0..ATTEMPTS).map(|_| Err(HttpError::Network)).collect();
-        let (client, _, _) = client(answers);
+    async fn a_network_failure_closes_egress_without_retrying() {
+        let (client, paths, time) = client(vec![Err(HttpError::Network)]);
 
         let error = client
             .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
             .await
-            .expect_err("every attempt failed");
+            .expect_err("an outcome without a status closes egress");
 
         assert!(
-            matches!(error, TinkoffError::Unreachable { status: None, .. }),
+            matches!(
+                &error,
+                TinkoffError::Gateway(refused)
+                    if refused.is_broker_egress_refusal()
+                        && refused.retry_after() == Some(Duration::from_secs(90))
+            ),
             "{error:?}"
+        );
+        assert_eq!(sent(&paths), 1);
+        assert_eq!(
+            *time.slept.lock().expect("sleeps"),
+            [Duration::from_secs(60)]
         );
     }
 

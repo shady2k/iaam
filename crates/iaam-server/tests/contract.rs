@@ -532,17 +532,19 @@ struct FinamScript(std::sync::Mutex<std::collections::VecDeque<String>>);
 impl FinamScript {
     /// A gateway over the script, for a harness's broker channels.
     fn gateway(script: Vec<String>) -> Arc<dyn Outbound> {
-        let tally =
-            std::env::temp_dir().join(format!("iaam-contract-finam-tally-{}", Uuid::new_v4()));
-        std::fs::write(&tally, "").expect("empty tally created");
+        let directory =
+            std::env::temp_dir().join(format!("iaam-contract-finam-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
         let time = FinamTime::new();
         Arc::new(
-            Gateway::with_parts(
+            Gateway::with_parts_in_directory(
                 FinamScript(std::sync::Mutex::new(script.into())),
                 iaam_http::gateway::BUDGETS,
                 Arc::clone(&time) as Arc<dyn iaam_http::gateway::Clock>,
                 time as Arc<dyn iaam_http::gateway::Sleeper>,
-                iaam_http::BrokerEgress::On { tally },
+                iaam_http::BrokerEgress::On,
+                &directory,
             )
             .expect("the budget table is valid"),
         )

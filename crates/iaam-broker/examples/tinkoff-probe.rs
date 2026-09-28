@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rejection, and its status is the whole answer. Status and body length
     // only: a body is the broker's answer about the account, and terminal
     // output ends up in logs and pasted transcripts.
-    match gateway.send("UsersService", &request, None).await {
+    match gateway.send(&request, None).await {
         Ok(response) => println!("HTTP {}, {} bytes", response.status, response.body.len()),
         Err(GatewayError::Rejected { status, body, .. }) => {
             println!("HTTP {status}, {} bytes", body.as_bytes().len());

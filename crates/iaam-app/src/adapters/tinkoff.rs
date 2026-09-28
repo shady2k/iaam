@@ -1185,15 +1185,16 @@ pub(crate) mod fake {
         }
     }
 
-    fn broker_egress() -> iaam_http::BrokerEgress {
+    fn broker_egress_directory() -> std::path::PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tally = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "iaam-app-tinkoff-test-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::write(&tally, "").expect("empty tally created");
-        iaam_http::BrokerEgress::On { tally }
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+        directory
     }
 
     /// A gateway over a fake T-Invest answering `script`, then `otherwise`.
@@ -1207,7 +1208,8 @@ pub(crate) mod fake {
             wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         });
         let log = Log::default();
-        let gateway = Gateway::with_parts(
+        let directory = broker_egress_directory();
+        let gateway = Gateway::with_parts_in_directory(
             FakeTinvest {
                 script: Mutex::new(script.into()),
                 otherwise,
@@ -1216,7 +1218,8 @@ pub(crate) mod fake {
             BUDGETS,
             Arc::clone(&time) as Arc<dyn Clock>,
             Arc::clone(&time) as Arc<dyn Sleeper>,
-            broker_egress(),
+            iaam_http::BrokerEgress::On,
+            &directory,
         )
         .expect("the documented table is valid");
         (Arc::new(gateway), log, time)
@@ -3215,7 +3218,12 @@ mod tests {
             .await
             .expect_err("the named wait crosses the deadline");
 
-        assert_eq!(log.lock().expect("log").len(), 3);
+        assert_eq!(
+            log.lock().expect("log").len(),
+            3,
+            "error={error:?}; sleeps={:?}",
+            time.slept()
+        );
         assert_eq!(
             time.slept(),
             [
@@ -3275,7 +3283,7 @@ mod tests {
         let error = super::tinkoff_error(super::TinkoffError::Gateway(
             iaam_http::GatewayError::UnknownBudget {
                 destination: iaam_http::Destination::TinkoffProd,
-                method: "Nowhere",
+                path: "/Nowhere".to_owned(),
             },
         ));
         assert!(matches!(error, BrokerError::Adapter { .. }), "{error:?}");

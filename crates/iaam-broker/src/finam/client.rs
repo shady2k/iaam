@@ -12,13 +12,6 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time};
 
-/// Budget key of `AccountsService/GetAccount`. Finam states its limit per
-/// method, so each method draws on a budget of its own.
-const GET_ACCOUNT: &str = "AccountsService.GetAccount";
-
-/// Budget key of `AccountsService/Transactions`.
-const TRANSACTIONS: &str = "AccountsService.Transactions";
-
 /// The limit one transactions request names (`TransactionsRequest.limit`
 /// in the published contract). The contract publishes no maximum and no
 /// continuation: an answer carrying exactly this many transactions may
@@ -26,14 +19,6 @@ const TRANSACTIONS: &str = "AccountsService.Transactions";
 /// answer stays under the limit, and only a single day that still
 /// reaches it is refused — never silently truncated.
 const TRANSACTIONS_LIMIT: i32 = 1_000;
-
-/// Budget key of the session methods: the exchange of the secret for a
-/// session token (`POST /v1/sessions`) and the details of that token
-/// (`POST /v1/sessions/details`, `TokenDetails` in Finam's REST docs). One
-/// row budgets both: Finam documents 200 requests a minute for each
-/// method, and the row grants the conservative half of that to the two of
-/// them together.
-const SESSIONS: &str = "AuthService.Sessions";
 
 /// What Finam answers with when it names no other lifetime (it names none
 /// today): the portal's FAQ states a session token lives 15 minutes
@@ -163,13 +148,8 @@ impl FinamClient {
         account_id: &str,
         allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
-        self.get(
-            GET_ACCOUNT,
-            format!("/v1/accounts/{account_id}"),
-            &[],
-            allowance,
-        )
-        .await
+        self.get(format!("/v1/accounts/{account_id}"), &[], allowance)
+            .await
     }
 
     /// Return the raw body of the account's transactions for a whole
@@ -268,7 +248,6 @@ impl FinamClient {
         ];
         let body = self
             .get(
-                TRANSACTIONS,
                 format!("/v1/accounts/{account_id}/transactions"),
                 &query,
                 allowance,
@@ -289,7 +268,7 @@ impl FinamClient {
         allowance: &RequestAllowance,
     ) -> Result<Vec<String>, FinamError> {
         let (body, token) = self
-            .authorized(SESSIONS, allowance, |token| {
+            .authorized(allowance, |token| {
                 // The token rides the body only: the published contract gives
                 // this method no Authorization header, unlike the data
                 // methods. Reading twice changes nothing.
@@ -329,13 +308,12 @@ impl FinamClient {
     /// Send a reading call over the session token.
     async fn get(
         &self,
-        method: &'static str,
         path: String,
         query: &[(&str, String)],
         allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
         let query = query.to_vec();
-        self.authorized(method, allowance, move |token| {
+        self.authorized(allowance, move |token| {
             let mut request = HttpRequest::get(Destination::FinamApi, &path)
                 .with_bare_token(token)
                 .with_request_allowance(allowance.clone());
@@ -354,12 +332,11 @@ impl FinamClient {
     /// finally carried it.
     async fn authorized(
         &self,
-        method: &'static str,
         allowance: &RequestAllowance,
         build: impl Fn(&str) -> HttpRequest,
     ) -> Result<(String, Secret), FinamError> {
         let session = self.session(allowance).await?;
-        let step = match self.raw(method, &build(session.token.expose())).await {
+        let step = match self.raw(&build(session.token.expose())).await {
             Ok(body) => return Ok((body, session.token.clone())),
             Err(step) => step,
         };
@@ -367,7 +344,7 @@ impl FinamClient {
             return Err(step.into_error(self.token.expose(), Some(session.token.expose())));
         }
         let fresh = self.renewed(&session, allowance).await?;
-        match self.raw(method, &build(fresh.token.expose())).await {
+        match self.raw(&build(fresh.token.expose())).await {
             Ok(body) => Ok((body, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
         }
@@ -480,7 +457,7 @@ impl FinamClient {
         .with_request_allowance(allowance.clone());
         let response = self
             .gateway
-            .send(SESSIONS, &request, None)
+            .send(&request, None)
             .await
             .map_err(|error| classify_refusal(error, self.token.expose(), None))?;
         let value: Value =
@@ -500,10 +477,10 @@ impl FinamClient {
     }
 
     /// Send the request through the gateway and return its body.
-    async fn raw(&self, method: &'static str, request: &HttpRequest) -> Result<String, Step> {
+    async fn raw(&self, request: &HttpRequest) -> Result<String, Step> {
         let response = self
             .gateway
-            .send(method, request, None)
+            .send(request, None)
             .await
             .map_err(Step::Refused)?;
         String::from_utf8(response.body).map_err(|_| Step::Malformed)
@@ -876,15 +853,16 @@ mod tests {
         }
     }
 
-    fn broker_egress() -> iaam_http::BrokerEgress {
+    fn broker_egress_directory() -> std::path::PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tally = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "iaam-broker-finam-test-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::write(&tally, "").expect("empty tally created");
-        iaam_http::BrokerEgress::On { tally }
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+        directory
     }
 
     fn client_over(
@@ -920,12 +898,14 @@ mod tests {
         time: &Arc<FakeTime>,
         transactions_limit: i32,
     ) -> FinamClient {
-        let gateway = Gateway::with_parts(
+        let directory = broker_egress_directory();
+        let gateway = Gateway::with_parts_in_directory(
             transport,
             budgets,
             Arc::clone(time) as Arc<dyn Clock>,
             Arc::clone(time) as Arc<dyn Sleeper>,
-            broker_egress(),
+            iaam_http::BrokerEgress::On,
+            &directory,
         )
         .expect("the budget table is valid");
         let key = Key::from_bytes([7; 32]);
@@ -1571,30 +1551,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_network_fault_to_the_end_is_unavailable_with_no_status() {
+    async fn a_network_fault_closes_egress_without_retrying() {
         let endpoint = Arc::new(Scripted::answering(200));
-        for _ in 0..iaam_http::gateway::ATTEMPTS {
-            endpoint
-                .script
-                .lock()
-                .expect("script")
-                .push_back(Err(HttpError::Network));
-        }
-        let (client, _) = client_over(BUDGETS, &endpoint);
+        endpoint
+            .script
+            .lock()
+            .expect("script")
+            .push_back(Err(HttpError::Network));
+        let (client, time) = client_over(BUDGETS, &endpoint);
 
         let error = client
             .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
-            .expect_err("every attempt faults");
+            .expect_err("an outcome without a status closes egress");
 
         assert!(
             matches!(
                 error,
-                FinamError::Unavailable { status: None, attempts, .. }
-                    if attempts == iaam_http::gateway::ATTEMPTS
+                FinamError::EgressRefused {
+                    retry_after: Some(retry_after),
+                    ..
+                } if retry_after == Duration::from_secs(90)
             ),
             "{error:?}"
         );
+        assert_eq!(endpoint.received.lock().expect("received").len(), 1);
+        assert_eq!(time.slept(), [Duration::from_secs(60)]);
     }
 
     /// A table with no Finam row: a build fault the gateway catches.

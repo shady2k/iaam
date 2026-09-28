@@ -102,11 +102,12 @@ how much suspended time elapsed before the reboot: every active pause and
 closure restarts for its full stored duration, old request histories restart
 from the new boot, and the first send to each endpoint waits 60 seconds.
 
-`IAAM_OUTBOUND_TALLY` is validated when the gateway is built. It must be the
-absolute canonical spelling of an existing ordinary file, not a symlink or
-hard-linked file. A missing, unreadable, aliased or corrupt tally refuses
-broker operation and names the path; it never falls back to an in-memory
-allowance.
+The gateway opens the compiled directory `/var/lib/iaam/egress` when broker
+egress is enabled and keeps that directory descriptor for its lifetime. Its
+`outbound-tally`, lock, owner and temporary records are opened relative to the
+descriptor without following symlinks, then checked again by device and inode.
+A missing, unreadable, replaced, symlinked, hard-linked or corrupt record
+refuses broker operation; there is no in-memory allowance fallback.
 
 Run the executable ceiling proof before enabling broker egress:
 
@@ -163,7 +164,7 @@ open breakers are still lost on restart.
 | `IAAM_DATABASE` | **required** | none — every subcommand refuses without it | every subcommand, including `serve` |
 | `IAAM_BROKER_KEY_FILE` | path to a secret | none | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
 | `IAAM_BROKER_EGRESS` | `off` or `on` | `off` | `serve`, broker examples, ignored live sandbox test |
-| `IAAM_OUTBOUND_TALLY` | path to mutable state | none — required when broker egress is `on` | `serve`, broker examples, ignored live sandbox test |
+| `/var/lib/iaam/egress` | compiled persistent state directory, required when broker egress is `on` | fixed path | `serve`, broker examples, ignored live sandbox test |
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
 | `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
 | `IAAM_RATE_WINDOW_SECONDS` | optional | `60` | `serve` |
@@ -181,34 +182,36 @@ and answers `200` with or without the key (§6.2).
 
 `IAAM_BROKER_EGRESS` is a fail-closed deployment switch. Unset and `off` both
 refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
-or network is touched. `on` requires `IAAM_OUTBOUND_TALLY`; no other spelling
-is accepted.
+or network is touched. `on` requires the compiled directory
+`/var/lib/iaam/egress`; there is no environment-variable path override.
 
-`IAAM_OUTBOUND_TALLY` names one existing ordinary file outside this repository
-and outside the database. Its configured spelling must be absolute and
-canonical. Symlinks and files with another hard link are refused. Put it in a
-persistent, writable directory, for example:
+Create the directory and its one existing tally before startup:
 
 ```console
-$ install -m 0600 /dev/null /var/lib/iaam/outbound-tally
+$ install -d -m 0700 /var/lib/iaam/egress
+$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally
 $ export IAAM_BROKER_EGRESS=on
-$ export IAAM_OUTBOUND_TALLY=/var/lib/iaam/outbound-tally
 ```
 
-Every iaam process on the machine that may contact a broker must receive that
-exact path and run as an OS user able to read and replace the tally; create and
-lock `<tally>.lock` and the three `<tally>.*.owner` files; create
-`<tally>.tmp`; and sync the directory. The tally must already exist; an empty
-tally is valid only for its first initialization. Persist it across service
-restarts. iaam writes a complete temporary file, syncs it, atomically replaces
-the tally and syncs the directory. A leftover temporary file is ignored; only
-the last complete tally is read.
+Every iaam process on the machine that may contact a broker must see that exact
+persistent mount and run as an OS user able to read, write and sync the tally;
+create and lock its lock and three endpoint-owner records; create its temporary
+record; atomically rename within the directory; and sync the directory. The
+tally must already exist. An empty tally is initialized on first use. A v1
+tally is refused because it cannot prove rolling 24-hour history; remove it
+only during a controlled stop and recreate the empty file. A leftover
+temporary file is ignored; only the last complete tally is read.
 
-Do not copy or alias the tally while a process is using it, and do not delete or
-truncate it to clear a refusal, pause or closure. A missing or unreadable path,
-a directory in place of the tally, a non-canonical spelling, an alias, partial
-or invalid contents make broker operation fail as `source_unavailable`, with
-the path in the reason and no broker send.
+Do not copy, alias, replace, delete or truncate a live egress directory or any
+record in it. The process verifies the path and held inodes before each
+transaction. A handoff is recorded as pending before network I/O and cleared
+only after the response status is durably committed. Cancellation, deadline,
+transport failure, panic or process death leaves that attempt unresolved and
+closes the host for the remaining request-timeout-plus-60-second window.
+
+Operational repair is a controlled stop: stop every process using the mount,
+repair or recreate the records, then start one process and run
+`make ceiling-proof` before restoring traffic.
 
 
 `IAAM_SOURCE_PROFILES` names a directory of **source profiles** — reviewed JSON

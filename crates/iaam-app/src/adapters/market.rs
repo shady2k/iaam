@@ -15,11 +15,6 @@ use sha2::{Digest, Sha256};
 use crate::error::AppError;
 use crate::ports::{OutboundHttp, OutboundResponse};
 
-/// The budget key this port's requests are sent under. The destinations
-/// behind the port (MOEX, the CBR, the published contract) keep one budget
-/// for every method, so the key names the caller rather than a method.
-const METHOD: &str = "OutboundHttp";
-
 /// Outbound transport over the shared gateway.
 pub struct HttpOutbound {
     gateway: Arc<dyn Outbound>,
@@ -38,7 +33,7 @@ impl OutboundHttp for HttpOutbound {
         let origin = origin(request.destination());
         let response = self
             .gateway
-            .send(METHOD, &request, None)
+            .send(&request, None)
             .await
             .map_err(|error| source_error(origin, &error))?;
         Ok(OutboundResponse {

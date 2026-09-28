@@ -72,23 +72,12 @@ impl HttpClient {
     /// `Gateway::send`, which the `Transport` impl serves.
     pub(crate) async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let client = self.client_for(request.destination())?;
-        let mut builder = match request.method() {
-            HttpMethod::Get => client.0.get(request.url()),
-            HttpMethod::Post => client.0.post(request.url()),
-        };
-        builder = builder.timeout(REQUEST_TIMEOUT);
-        if let Some(value) = authorization_header(request)? {
-            builder = builder.header(reqwest::header::AUTHORIZATION, value);
-        }
-        if let Some(action) = request.soap_action() {
-            builder = builder.header("SOAPAction", format!("\"{action}\""));
-        }
-        if let Some(body) = request.body() {
-            builder = builder
-                .header("Content-Type", body.content_type())
-                .body(body.payload().to_owned());
-        }
-        let response = builder.send().await.map_err(classify_transport_error)?;
+        let built = build(&client.0, request)?;
+        let response = client
+            .0
+            .execute(built)
+            .await
+            .map_err(classify_transport_error)?;
         let status = response.status().as_u16();
         // Read before `bytes()` consumes the response.
         let retry_after = named_delay(
@@ -128,6 +117,31 @@ fn named_delay(
             .and_then(|value| parse_retry_after(value, now))
     };
     seconds(reqwest::header::RETRY_AFTER.as_str()).or_else(|| reset_header.and_then(seconds))
+}
+
+/// The request exactly as it goes on the wire: method, URL, timeout and
+/// headers. Separate from sending so what a broker receives can be checked
+/// without a network.
+fn build(client: &reqwest::Client, request: &HttpRequest) -> Result<reqwest::Request, HttpError> {
+    let mut builder = match request.method() {
+        HttpMethod::Get => client.get(request.url()),
+        HttpMethod::Post => client.post(request.url()),
+    };
+    builder = builder.timeout(REQUEST_TIMEOUT);
+    if let Some(value) = authorization_header(request)? {
+        builder = builder.header(reqwest::header::AUTHORIZATION, value);
+    }
+    if let Some(action) = request.soap_action() {
+        builder = builder.header("SOAPAction", format!("\"{action}\""));
+    }
+    if let Some(body) = request.body() {
+        builder = builder
+            .header("Content-Type", body.content_type())
+            .body(body.payload().to_owned());
+    }
+    builder
+        .build()
+        .map_err(|error| HttpError::RequestNotBuilt(error.to_string()))
 }
 
 /// The `Authorization` header as it goes on the wire, marked sensitive so
@@ -254,12 +268,18 @@ mod tests {
         assert_eq!(named, None);
     }
 
+    fn wire(request: &HttpRequest) -> reqwest::Request {
+        build(&reqwest::Client::new(), request).expect("the request builds")
+    }
+
     #[test]
     fn a_bearer_request_goes_out_with_the_bearer_scheme() {
         let request = HttpRequest::get(Destination::TinkoffProd, "/").with_bearer("t.token");
-        let value = authorization_header(&request)
-            .expect("a valid token")
-            .expect("a header");
+        let sent = wire(&request);
+        let value = sent
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("an Authorization header");
 
         assert_eq!(value.to_str().expect("ascii"), "Bearer t.token");
         assert!(value.is_sensitive());
@@ -268,12 +288,33 @@ mod tests {
     #[test]
     fn a_bare_token_goes_out_as_the_whole_header_value() {
         let request = HttpRequest::get(Destination::FinamApi, "/").with_bare_token("jwt.value");
-        let value = authorization_header(&request)
-            .expect("a valid token")
-            .expect("a header");
+        let sent = wire(&request);
+        let value = sent
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("an Authorization header");
 
         assert_eq!(value.to_str().expect("ascii"), "jwt.value");
         assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn a_request_without_a_token_goes_out_without_authorization() {
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            RequestBody::Json("{}".to_owned()),
+        );
+        let sent = wire(&request);
+
+        assert!(sent.headers().get(reqwest::header::AUTHORIZATION).is_none());
+        assert_eq!(sent.url().as_str(), "https://api.finam.ru/v1/sessions");
+        assert_eq!(
+            sent.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .map(|value| value.to_str().expect("ascii")),
+            Some("application/json")
+        );
     }
 
     #[test]
@@ -281,7 +322,7 @@ mod tests {
         let request = HttpRequest::get(Destination::FinamApi, "/").with_bare_token("bad\ntoken");
 
         assert!(matches!(
-            authorization_header(&request),
+            build(&reqwest::Client::new(), &request),
             Err(HttpError::RequestNotBuilt(_))
         ));
     }

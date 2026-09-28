@@ -257,16 +257,14 @@ impl FinamClient {
     pub async fn get_account_ids(&self) -> Result<Vec<String>, FinamError> {
         let (body, token) = self
             .authorized(SESSIONS, |token| {
-                // The token rides the body, as the method's page passes it,
-                // and the Authorization header, bare, as the API's
-                // authentication asks of every method. Reading twice changes
-                // nothing.
+                // The token rides the body only: the published contract gives
+                // this method no Authorization header, unlike the data
+                // methods. Reading twice changes nothing.
                 HttpRequest::post(
                     Destination::FinamApi,
                     "/v1/sessions/details",
                     RequestBody::Json(serde_json::json!({ "token": token }).to_string()),
                 )
-                .with_bare_token(token)
                 .idempotent()
             })
             .await?;
@@ -1489,12 +1487,9 @@ mod tests {
         assert_eq!(received.len(), 2);
         let details = &received[1];
         assert_eq!(details.url(), "https://api.finam.ru/v1/sessions/details");
-        assert_eq!(
-            details
-                .authorization()
-                .map(|value| value.expose().to_owned()),
-            Some(JWT_ONE.to_owned())
-        );
+        // The published contract passes this token in the body and gives
+        // the method no Authorization header.
+        assert!(details.authorization().is_none());
         assert_eq!(
             details.body().map(iaam_http::RequestBody::payload),
             Some(r#"{"token":"invented.jwt.one"}"#),
@@ -1657,10 +1652,7 @@ mod tests {
         assert_eq!(ids, vec!["Three".to_owned()]);
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 4);
-        assert_eq!(
-            received[3].bearer().map(|token| token.expose()),
-            Some(JWT_TWO)
-        );
+        assert!(received[3].authorization().is_none());
         assert_eq!(
             received[3].body().map(iaam_http::RequestBody::payload),
             Some(r#"{"token":"invented.jwt.two"}"#),

@@ -413,6 +413,13 @@ mod tests {
     fn client(
         answers: Vec<Result<HttpResponse, HttpError>>,
     ) -> (TinkoffClient, Arc<Mutex<Vec<String>>>, Arc<FakeTime>) {
+        client_in(Environment::Prod, answers)
+    }
+
+    fn client_in(
+        environment: Environment,
+        answers: Vec<Result<HttpResponse, HttpError>>,
+    ) -> (TinkoffClient, Arc<Mutex<Vec<String>>>, Arc<FakeTime>) {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
@@ -432,7 +439,7 @@ mod tests {
         );
         let key = Key::from_bytes([3; 32]);
         let token = open(&key, &seal(&key, TOKEN)).expect("token opens");
-        let client = TinkoffClient::new(Environment::Prod, token, gateway);
+        let client = TinkoffClient::new(environment, token, gateway);
         (client, paths, time)
     }
 
@@ -730,28 +737,37 @@ mod tests {
     /// `docs/api/tinkoff-invest/*.proto` declare.
     #[tokio::test]
     async fn every_method_is_posted_to_its_published_address() {
-        let (client, paths, _) = client(vec![
-            answer(200, r#"{"accounts":[]}"#),
-            answer(200, "{}"),
-            answer(200, r#"{"hasNext":false,"items":[]}"#),
-        ]);
+        for (environment, host) in [
+            (Environment::Prod, "invest-public-api.tbank.ru"),
+            (Environment::Sandbox, "sandbox-invest-public-api.tbank.ru"),
+        ] {
+            let (client, paths, _) = client_in(
+                environment,
+                vec![
+                    answer(200, r#"{"accounts":[]}"#),
+                    answer(200, "{}"),
+                    answer(200, r#"{"hasNext":false,"items":[]}"#),
+                ],
+            );
 
-        client.get_accounts().await.expect("accounts");
-        client.get_portfolio("Main", None).await.expect("portfolio");
-        client
-            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("Main"), None)
-            .await
-            .expect("operations");
+            client.get_accounts().await.expect("accounts");
+            client.get_portfolio("Main", None).await.expect("portfolio");
+            client
+                .get_operations_by_cursor(&GetOperationsByCursorRequest::new("Main"), None)
+                .await
+                .expect("operations");
 
-        let base = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1";
-        assert_eq!(
-            *paths.lock().expect("paths"),
-            vec![
-                format!("{base}.UsersService/GetAccounts"),
-                format!("{base}.OperationsService/GetPortfolio"),
-                format!("{base}.OperationsService/GetOperationsByCursor"),
-            ]
-        );
+            let base = format!("https://{host}/rest/tinkoff.public.invest.api.contract.v1");
+            assert_eq!(
+                *paths.lock().expect("paths"),
+                vec![
+                    format!("{base}.UsersService/GetAccounts"),
+                    format!("{base}.OperationsService/GetPortfolio"),
+                    format!("{base}.OperationsService/GetOperationsByCursor"),
+                ],
+                "{environment:?}"
+            );
+        }
     }
 
     #[test]

@@ -2489,7 +2489,7 @@ fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
 }
 
 #[tokio::test]
-async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
+async fn a_broker_that_stays_throttled_is_unreachable_for_the_minimum_pause() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
@@ -2517,7 +2517,7 @@ async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
             ..
         } => {
             assert_eq!(origin, "tinkoff");
-            assert_eq!(retry_after, Some(Duration::from_secs(7)));
+            assert_eq!(retry_after, Some(Duration::from_secs(60)));
         }
         other => panic!("expected an unreachable broker, got {other:?}"),
     }

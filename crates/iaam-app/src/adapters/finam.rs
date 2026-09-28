@@ -319,13 +319,11 @@ fn securities_transfer_reason(kind: &ChannelOperationKind) -> Option<&'static st
 fn finam_error(error: FinamError) -> BrokerError {
     let detail = error.to_string();
     match error {
-        FinamError::RateLimited { retry_after } | FinamError::Unavailable { retry_after, .. } => {
-            BrokerError::Unreachable {
-                broker: BROKER.to_owned(),
-                detail,
-                retry_after: Some(retry_after),
-            }
-        }
+        FinamError::Unavailable { retry_after, .. } => BrokerError::Unreachable {
+            broker: BROKER.to_owned(),
+            detail,
+            retry_after: Some(retry_after),
+        },
         FinamError::EgressRefused {
             retry_after,
             reason: _,

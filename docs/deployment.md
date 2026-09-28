@@ -73,18 +73,23 @@ the server process. Those protect MOEX and the CBR exactly as before and prevent
 parallel calls inside one process, but they do not cross a restart.
 
 Broker call accounting is different. With broker egress enabled, every local
-process uses the same **outbound tally** file. The gateway locks that file only
-while it reads, decides and records a send. The tally preserves:
+process uses the same **outbound tally** path. Synchronisation uses a separate
+adjacent file whose name is the tally path plus `.lock`; iaam creates that lock
+file when it is absent. The gateway holds its lock only while it reads, decides,
+or records an outcome. The tally preserves:
 
 - the per-method minute budgets from the gateway table;
 - at least one second between sends to the same broker host;
-- at most 1,000 broker sends in one UTC day.
+- at most 1,000 broker sends in one UTC day;
+- recent permanent broker refusals and their 30-minute host closure;
+- broker `429` pauses and the 30-minute closure after a second `429` in ten
+  minutes.
 
-Those three rules therefore hold across local processes and restarts. A process
-never holds the file lock while sleeping or while an HTTP request is in flight:
-after a required wait it locks and decides again. A missing, unreadable or
-corrupt tally refuses the broker call and names the path; it never falls back
-to an in-memory allowance.
+Those rules therefore hold across local processes and restarts. A process never
+holds the lock while sleeping or while an HTTP request is in flight: after a
+required wait it locks and decides again, and after a response it locks again
+to record that outcome. A missing, unreadable or corrupt tally refuses the
+broker call and names the path; it never falls back to an in-memory allowance.
 
 Administrative commands (`claim`, `token issue`, `broker key …`,
 `broker access …`, `bundle export`, `bundle import`) open the database and do
@@ -144,12 +149,17 @@ $ export IAAM_OUTBOUND_TALLY=/var/lib/iaam/outbound-tally
 ```
 
 Every iaam process on the machine that may contact a broker must receive the
-same path and OS user access to read, lock and rewrite it. The file must already
-exist; an empty file is valid only for its first initialization. Persist it
-across service restarts. Do not copy it while a process is using it and do not
-delete or truncate it to clear a refusal. A missing or unreadable path, a
-directory in place of the file or invalid contents make the call fail as
-`source_unavailable`, with the path in the reason and no broker send.
+same path and run as an OS user able to read and replace the tally, create and
+lock `<tally>.lock`, create `<tally>.tmp`, and sync their directory. The tally
+must already exist; an empty tally is valid only for its first initialization.
+Persist it across service restarts. iaam writes a complete temporary file,
+syncs it, atomically replaces the tally and syncs the directory. A leftover
+temporary file is ignored; only the last complete tally is read.
+
+Do not copy the tally while a process is using it, and do not delete or truncate
+it to clear a refusal, pause or closure. A missing or unreadable path, a
+directory in place of the tally, partial or invalid contents make the call fail
+as `source_unavailable`, with the path in the reason and no broker send.
 
 
 `IAAM_SOURCE_PROFILES` names a directory of **source profiles** — reviewed JSON
@@ -976,8 +986,8 @@ supplies what is missing and with which command.
 | `{"code":"unauthorized", …}` (401) | header missing, or the token is unknown or revoked | §7.1 for an agent token; §7.3 for an owner token |
 | `{"code":"not_configured","message":"broker access encryption is not configured: …"}` (503) | the server was started without `IAAM_BROKER_KEY_FILE` | restart it with the key mounted: §6.2 |
 | `{"code":"not_configured","message":"broker access is not configured"}` (503) | same code, different fact: no active access for that broker and environment | the owner, at a console: `iaam broker access add` (§6.3). A restart changes nothing |
-| `{"code":"source_unavailable", …}` (503, with `Retry-After` when the wait is known) | an outside source — the broker on `POST /v1/brokers/{broker}/sync`, MOEX or the CBR on `POST /v1/market/sync` — could not be reached for now. One of: it kept failing transiently (429, 500, 502, 503, 504, network, timeout) through the gateway's retries; its breaker is open after five calls in a row failed that way, and the call was not sent; it named a wait (`Retry-After` or its reset header) longer than the gateway holds a call (15 minutes), or longer than the call's own deadline allowed; or a broker sync reached its 15-minute deadline. The deadline bounds the sync's contact with the broker: an attempt still in flight at that moment, and a wait for the host's lane, for a budget, for a named reset or for a backoff, all end there. It does not bound the local work after both answers are in: writing them to the journal runs to its end. Nothing was written: a broker sync fetches the operations and the portfolio before its first write, and a market sync records no observation (its run is closed as partial) | wait what `Retry-After` says, then sync again. A repeat inside a wait the source named does not reach it: the gateway holds it until the wait ends, or refuses it at once with this same code when the wait outlasts its deadline or 15 minutes. A repeat inside an open breaker's cool-down (up to 5 minutes) is refused the same way without being sent. Otherwise `Retry-After` is the gateway's own backoff, and a repeat before it **is** sent, paced only by the budget. A restart forgets every wait and breaker (§1.1) |
-| `{"code":"source_refused", …}` (502) | the source answered with a status the gateway does not retry — any failure other than 429, 500, 502, 503 and 504 — so it was sent once: for a broker, e.g. 401 or 403 for a revoked or wrong token; for a market source, e.g. 404 for a security or path it does not know. No fact and no observation was written | broker: check the access, `iaam broker access` (§6.3); market source: check what the request names. Retrying unchanged gets the same answer |
+| `{"code":"source_unavailable", …}` (503, with `Retry-After` when the wait is known) | an outside source — the broker on `POST /v1/brokers/{broker}/sync`, MOEX or the CBR on `POST /v1/market/sync` — could not be reached for now. A broker `429` immediately persists a host pause of at least 60 seconds; a second within ten minutes closes that host for 30 minutes. Three other broker `4xx` responses within ten minutes also close it for 30 minutes. A broker `5xx`, network failure or timeout gets at most three attempts per call; market sources retain five. The in-process breaker opens after five whole calls fail transiently, and a call during its cool-down is not sent. A source may also name a wait longer than the gateway holds a call (15 minutes), a wait may outlast the call's own deadline, or a broker sync may reach its 15-minute deadline. The deadline bounds contact with the source, including an attempt in flight and every lane, budget, reset or backoff wait. It does not bound local work after both broker answers arrive. Nothing was written: a broker sync fetches operations and portfolio before its first write, and a market sync records no observation (its run is closed as partial) | wait what `Retry-After` says, then sync again. During a broker pause or closure, the tally refuses before a send; those states survive restart (§1.1). A repeat inside an in-process named wait or open breaker is likewise refused, but those are forgotten on restart. Otherwise `Retry-After` is the gateway's own backoff, and a repeat before it may be sent subject to its budgets |
+| `{"code":"source_refused", …}` (502) | the source answered with a status the gateway does not retry. For a broker, each `4xx` except `429` — for example 401 or 403 for a revoked or wrong token — is sent once and counted in the tally; after the third within ten minutes, later calls are `source_unavailable` until the 30-minute closure ends. For a market source, any failure other than 429, 500, 502, 503 and 504 is sent once. No fact and no observation was written | broker: check the access, `iaam broker access` (§6.3); market source: check what the request names. Retrying an unchanged refusal repeats it and can close a broker host |
 | `{"code":"invalid_request","message":"an owner token cannot be issued via the API: …"}` (422) | `scope: owner` requested over HTTP | by design; issue it at the console (§7.3) |
 | `Connection refused` from curl | nothing is listening at that address | container: `IAAM_LISTEN` left at the loopback default while publishing a port (§3.6). Host: `systemctl is-active iaam` |
 

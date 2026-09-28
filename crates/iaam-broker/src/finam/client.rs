@@ -52,9 +52,6 @@ pub enum FinamError {
     /// network: retrying meets the same fault.
     #[error("the transport to Finam could not be built: {reason}")]
     TransportNotBuilt { reason: String },
-    /// Finam kept answering 429 through every retry.
-    #[error("Finam gateway rate-limited the request; retry after {retry_after:?}")]
-    RateLimited { retry_after: Duration },
     /// Finam kept failing transiently, or the circuit to it is open; the same
     /// request may succeed after `retry_after`.
     #[error(
@@ -527,13 +524,10 @@ fn classify_refusal(error: GatewayError, secret: &str, token: Option<&str>) -> F
         };
     }
     if let Some(retry_after) = error.retry_after() {
-        return match error.status() {
-            Some(429) => FinamError::RateLimited { retry_after },
-            status => FinamError::Unavailable {
-                status,
-                attempts: error.attempts(),
-                retry_after,
-            },
+        return FinamError::Unavailable {
+            status: error.status(),
+            attempts: error.attempts(),
+            retry_after,
         };
     }
     match error {
@@ -1312,19 +1306,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_429_to_the_end_is_rate_limited_with_its_wait() {
+    async fn a_429_to_the_end_is_the_persisted_minimum_host_pause() {
         let endpoint = Arc::new(Scripted::answering(429).then(200, &session_answer(JWT_ONE)));
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
             .get_portfolio("Main")
             .await
-            .expect_err("every attempt is throttled");
+            .expect_err("the broker host is paused");
 
-        match error {
-            FinamError::RateLimited { retry_after } => assert!(!retry_after.is_zero()),
-            other => panic!("expected RateLimited, got {other:?}"),
+        match &error {
+            FinamError::EgressRefused {
+                reason,
+                retry_after: Some(retry_after),
+            } => {
+                assert!(reason.contains("paused after status 429"), "{reason}");
+                assert!(reason.contains("reopens at"), "{reason}");
+                assert_eq!(*retry_after, Duration::from_secs(60));
+            }
+            other => panic!("expected EgressRefused, got {other:?}"),
         }
+        assert_eq!(endpoint.received.lock().expect("received").len(), 2);
     }
     #[test]
     fn the_daily_egress_ceiling_keeps_its_operational_detail() {

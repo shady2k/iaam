@@ -89,14 +89,20 @@ struct RecordingTransport {
     time: Arc<FakeTime>,
     sent: Arc<Mutex<Vec<(Destination, SystemTime)>>>,
     answers: Arc<Mutex<VecDeque<Result<HttpResponse, HttpError>>>>,
+    default_status: u16,
 }
 
 impl RecordingTransport {
     fn answering(time: &Arc<FakeTime>) -> Self {
+        Self::answering_status(time, 200)
+    }
+
+    fn answering_status(time: &Arc<FakeTime>, status: u16) -> Self {
         Self {
             time: Arc::clone(time),
             sent: Arc::new(Mutex::new(Vec::new())),
             answers: Arc::new(Mutex::new(VecDeque::new())),
+            default_status: status,
         }
     }
 
@@ -117,7 +123,7 @@ impl Transport for RecordingTransport {
             .pop_front()
             .unwrap_or_else(|| {
                 Ok(HttpResponse {
-                    status: 200,
+                    status: self.default_status,
                     body: Vec::new(),
                     retry_after: None,
                 })
@@ -147,6 +153,10 @@ fn operations() -> HttpRequest {
         RequestBody::Json("{}".to_owned()),
     )
     .idempotent()
+}
+
+fn finam_session() -> HttpRequest {
+    HttpRequest::get(Destination::FinamApi, "/v1/sessions")
 }
 
 fn elapsed(later: SystemTime, earlier: SystemTime) -> Duration {
@@ -207,6 +217,384 @@ async fn two_gateways_and_a_rebuilt_gateway_share_spacing_and_the_minute_budget(
         assert!(elapsed(pair[1], pair[0]) >= Duration::from_secs(1));
     }
     assert_never_more_than(50, Duration::from_secs(60), &sent);
+}
+
+#[tokio::test]
+async fn three_broker_refusals_close_the_host_for_thirty_minutes_across_gateways() {
+    let directory = TempDir::create("refusals");
+    let tally = directory.file("tally");
+    std::fs::write(&tally, "").expect("empty tally created");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering_status(&time, 400);
+    let first = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+    let second = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+
+    for attempt in 1..=2 {
+        let refused = first
+            .send("OperationsService", &operations(), None)
+            .await
+            .expect_err("the broker refuses the request");
+        assert!(
+            matches!(
+                refused,
+                GatewayError::Rejected {
+                    status: 400,
+                    attempts: 1,
+                    ..
+                }
+            ),
+            "refusal {attempt}: {refused:?}"
+        );
+        time.advance(Duration::from_secs(4 * 60));
+    }
+    let third = first
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the third refusal is still the response just sent");
+    assert!(
+        matches!(
+            third,
+            GatewayError::Rejected {
+                status: 400,
+                attempts: 1,
+                ..
+            }
+        ),
+        "{third:?}"
+    );
+
+    let expected_reopen = httpdate::fmt_http_date(time.wall() + Duration::from_secs(30 * 60));
+    for blocked in [
+        second
+            .send("OperationsService", &operations(), None)
+            .await
+            .expect_err("the second gateway sees the closure"),
+        gateway(
+            transport.clone(),
+            &time,
+            BrokerEgress::On {
+                tally: tally.clone(),
+            },
+        )
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the rebuilt gateway sees the closure"),
+    ] {
+        let message = blocked.to_string();
+        assert!(
+            message.contains(Destination::TinkoffProd.base_url()),
+            "{message}"
+        );
+        assert!(message.contains("three refusals"), "{message}");
+        assert!(message.contains(&expected_reopen), "{message}");
+    }
+    assert_eq!(transport.sent().len(), 3);
+
+    time.advance(Duration::from_secs(30 * 60));
+    let reopened = second
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the broker still answers 400 after the closure");
+    assert!(matches!(
+        reopened,
+        GatewayError::Rejected {
+            status: 400,
+            attempts: 1,
+            ..
+        }
+    ));
+    assert_eq!(transport.sent().len(), 4);
+}
+
+#[tokio::test]
+async fn three_finam_session_renewal_401s_close_the_finam_host() {
+    let directory = TempDir::create("finam-renewal-refusals");
+    let tally = directory.file("tally");
+    std::fs::write(&tally, "").expect("empty tally created");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering_status(&time, 401);
+    let first = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+
+    for _ in 0..3 {
+        let refused = first
+            .send("AuthService.Sessions", &finam_session(), None)
+            .await
+            .expect_err("the renewal is refused");
+        assert!(matches!(
+            refused,
+            GatewayError::Rejected {
+                status: 401,
+                attempts: 1,
+                ..
+            }
+        ));
+    }
+
+    let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
+    let blocked = rebuilt
+        .send("AuthService.Sessions", &finam_session(), None)
+        .await
+        .expect_err("the rebuilt gateway sees the Finam closure");
+    let message = blocked.to_string();
+    assert!(
+        message.contains(Destination::FinamApi.base_url()),
+        "{message}"
+    );
+    assert!(message.contains("three refusals"), "{message}");
+    assert!(message.contains("reopens at"), "{message}");
+    assert_eq!(transport.sent().len(), 3);
+}
+
+#[tokio::test]
+async fn a_persisted_host_closure_precedes_this_processes_open_breaker() {
+    let directory = TempDir::create("closure-before-breaker");
+    let tally = directory.file("tally");
+    std::fs::write(&tally, "").expect("empty tally created");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let failing_transport = RecordingTransport::answering_status(&time, 500);
+    let locally_broken = gateway(
+        failing_transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+
+    for _ in 0..5 {
+        let refused = locally_broken
+            .send("OperationsService", &operations(), None)
+            .await
+            .expect_err("the three attempts are exhausted");
+        assert!(matches!(refused, GatewayError::Exhausted { .. }));
+    }
+
+    let refusing_transport = RecordingTransport::answering_status(&time, 400);
+    let refusing = gateway(
+        refusing_transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+    for _ in 0..3 {
+        let refused = refusing
+            .send("OperationsService", &operations(), None)
+            .await
+            .expect_err("the broker refuses the request");
+        assert!(matches!(
+            refused,
+            GatewayError::Rejected { status: 400, .. }
+        ));
+    }
+
+    let blocked = locally_broken
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the persisted closure is more specific than the breaker");
+    assert!(
+        matches!(
+            blocked,
+            GatewayError::BrokerHostClosed {
+                reason: "three refusals within ten minutes",
+                attempts: 0,
+                ..
+            }
+        ),
+        "{blocked:?}"
+    );
+    assert_eq!(failing_transport.sent().len(), 15);
+    assert_eq!(refusing_transport.sent().len(), 3);
+}
+
+#[tokio::test]
+async fn a_429_pauses_for_a_minute_and_the_second_closes_across_gateways() {
+    let directory = TempDir::create("rate-limit");
+    let tally = directory.file("tally");
+    std::fs::write(&tally, "").expect("empty tally created");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering_status(&time, 429);
+    let first = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+    let second = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+
+    let paused = first
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the first 429 pauses the host");
+    assert!(
+        matches!(
+            paused,
+            GatewayError::BrokerHostPaused {
+                attempts: 1,
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(60)
+        ),
+        "{paused:?}"
+    );
+    let blocked = second
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("another gateway sees the pause");
+    assert!(
+        matches!(blocked, GatewayError::BrokerHostPaused { attempts: 0, .. }),
+        "{blocked:?}"
+    );
+    assert_eq!(transport.sent().len(), 1);
+
+    time.advance(Duration::from_secs(60));
+    let second_rate_limit = second
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the second 429 records the closure");
+    assert!(
+        matches!(
+            second_rate_limit,
+            GatewayError::BrokerHostPaused {
+                attempts: 1,
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(30 * 60)
+        ),
+        "{second_rate_limit:?}"
+    );
+    let rebuilt = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+    let blocked = rebuilt
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the rebuilt gateway sees the closure");
+    let message = blocked.to_string();
+    assert!(message.contains("two 429 responses"), "{message}");
+    assert!(message.contains("reopens at"), "{message}");
+    assert_eq!(transport.sent().len(), 2);
+}
+
+#[tokio::test]
+async fn a_429_keeps_a_longer_declared_pause_across_a_rebuild() {
+    let directory = TempDir::create("named-rate-limit");
+    let tally = directory.file("tally");
+    std::fs::write(&tally, "").expect("empty tally created");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    transport
+        .answers
+        .lock()
+        .expect("answers")
+        .push_back(Ok(HttpResponse {
+            status: 429,
+            body: Vec::new(),
+            retry_after: Some(Duration::from_secs(120)),
+        }));
+    let first = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+
+    let paused = first
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the declared pause is returned");
+    assert!(
+        matches!(
+            paused,
+            GatewayError::BrokerHostPaused {
+                attempts: 1,
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(120)
+        ),
+        "{paused:?}"
+    );
+
+    let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
+    let paused = rebuilt
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the rebuilt gateway sees the declared pause");
+    assert!(
+        matches!(
+            paused,
+            GatewayError::BrokerHostPaused {
+                attempts: 0,
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(120)
+        ),
+        "{paused:?}"
+    );
+    assert_eq!(transport.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn a_leftover_temporary_file_never_replaces_the_last_complete_tally() {
+    let directory = TempDir::create("interrupted-write");
+    let tally = directory.file("tally");
+    let temporary = directory.file("tally.tmp");
+    let lock = directory.file("tally.lock");
+    std::fs::write(&tally, "").expect("empty tally created");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let first = gateway(
+        transport.clone(),
+        &time,
+        BrokerEgress::On {
+            tally: tally.clone(),
+        },
+    );
+    first
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect("the initial state is persisted");
+    assert!(lock.is_file(), "the separate lock file was not created");
+
+    std::fs::write(&temporary, "partial new state").expect("leftover temporary file written");
+    let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
+    rebuilt
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect("the intact tally, not the temporary file, is read");
+
+    let sent: Vec<_> = transport.sent().into_iter().map(|(_, at)| at).collect();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(elapsed(sent[1], sent[0]), Duration::from_secs(1));
 }
 
 #[tokio::test]
@@ -278,6 +666,12 @@ async fn missing_corrupt_and_unopenable_tallies_refuse_without_sending_and_name_
     let empty_host = directory.file("empty-host-tally");
     std::fs::write(&empty_host, "iaam-outbound-tally-v1\nhost\t\t-\t0\t0\t-\n")
         .expect("empty host tally written");
+    let partial = directory.file("partial-tally");
+    std::fs::write(
+        &partial,
+        "iaam-outbound-tally-v1\nhost\thttps://api.example\t1\t2\n",
+    )
+    .expect("partial tally written");
     let missing = directory.file("missing-tally");
 
     for (path, detail) in [
@@ -285,6 +679,7 @@ async fn missing_corrupt_and_unopenable_tallies_refuse_without_sending_and_name_
         (corrupt, None),
         (descending, Some("out of order")),
         (empty_host, Some("line 2")),
+        (partial, Some("unknown record shape")),
         (directory.path.clone(), None),
     ] {
         let gateway = gateway(
@@ -304,6 +699,46 @@ async fn missing_corrupt_and_unopenable_tallies_refuse_without_sending_and_name_
             assert!(message.contains(detail), "{message}");
         }
     }
+    assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
+async fn the_previous_host_record_shape_keeps_its_active_closure() {
+    let directory = TempDir::create("previous-host-shape");
+    let tally = directory.file("tally");
+    let now_seconds = 1_800_000_000_u64;
+    let now_nanos = u128::from(now_seconds) * 1_000_000_000;
+    let closed_until = now_nanos + u128::from(60_u64) * 1_000_000_000;
+    let day = now_seconds / 86_400;
+    std::fs::write(
+        &tally,
+        format!(
+            "iaam-outbound-tally-v1\nhost\t{}\t-\t{day}\t0\t{closed_until}\n",
+            Destination::TinkoffProd.base_url()
+        ),
+    )
+    .expect("previous tally shape written");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(now_seconds));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, BrokerEgress::On { tally });
+
+    let blocked = gateway
+        .send("OperationsService", &operations(), None)
+        .await
+        .expect_err("the previous tally closure is active");
+
+    assert!(
+        matches!(
+            blocked,
+            GatewayError::BrokerHostClosed {
+                reason: "repeated broker refusals",
+                attempts: 0,
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(60)
+        ),
+        "{blocked:?}"
+    );
     assert!(transport.sent().is_empty());
 }
 

@@ -14,9 +14,9 @@ use thiserror::Error;
 /// error must not turn a remote refusal into an access leak.
 #[derive(Debug, Error)]
 pub enum TinkoffError {
-    /// T-Invest failed transiently — a 5xx, a 429, a network fault, an open
-    /// breaker, a deadline — and went on failing through the gateway's
-    /// retries. The same call is worth making again after `retry_after`.
+    /// T-Invest failed transiently — a 5xx, a network fault, an open breaker
+    /// or a deadline — and went on failing through the gateway's retries. The
+    /// same call is worth making again after `retry_after`.
     #[error(
         "T-Invest is unreachable after {attempts} attempts (last status {status:?}); retry after {retry_after:?}"
     )]

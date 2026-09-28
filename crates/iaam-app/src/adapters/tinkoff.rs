@@ -3015,35 +3015,41 @@ mod tests {
             .await
     }
 
-    /// T-Invest limits a caller with 429 and names when its limit resets,
-    /// then fails once more; the fetch waits what it was told, the backoff and
-    /// the host spacing between pages, and completes every page.
+    /// T-Invest limits a caller with 429 and names a reset shorter than the
+    /// mandatory pause. The fetch stops immediately and exposes the full
+    /// minute before another broker call may start.
     #[tokio::test]
-    async fn a_multi_page_fetch_survives_a_limit_and_a_failure_waiting_what_was_named() {
-        let named = Duration::from_secs(7);
+    async fn a_multi_page_fetch_stops_at_a_limit_and_exposes_the_host_pause() {
         let (gateway, log, time) = fake::gateway(
             vec![
                 Answer {
                     status: 429,
                     body: "{}".to_owned(),
-                    reset: Some(named),
+                    reset: Some(Duration::from_secs(7)),
                 },
-                Answer::status(503, "{}"),
-                Answer::status(200, &page_json(true, Some("cursor-2"), Some("operation-1"))),
-                Answer::status(200, &page_json(false, None, Some("operation-2"))),
+                Answer::status(200, &page_json(false, None, Some("operation-1"))),
             ],
             None,
         );
 
-        let parsed = fetch(&channel(gateway)).await.expect("every page arrives");
+        let error = fetch(&channel(gateway))
+            .await
+            .expect_err("the broker host is paused");
 
-        assert_eq!(parsed.accepted.len() + parsed.quarantined.len(), 2);
-        let backoff = RetryPolicy::new(ATTEMPTS, FIRST_BACKOFF).delay(2, &Outcome::status(503));
-        assert_eq!(time.slept(), [named, backoff, Duration::from_secs(1)]);
-        let log = log.lock().expect("log");
-        assert_eq!(log.len(), 4);
-        assert!(!log[2].contains("cursor"), "{}", log[2]);
-        assert!(log[3].contains(r#""cursor":"cursor-2""#), "{}", log[3]);
+        assert!(
+            matches!(
+                &error,
+                BrokerError::Unreachable {
+                    detail,
+                    retry_after: Some(retry_after),
+                    ..
+                } if detail.contains("paused after status 429")
+                    && *retry_after == Duration::from_secs(60)
+            ),
+            "{error:?}"
+        );
+        assert!(time.slept().is_empty());
+        assert_eq!(log.lock().expect("log").len(), 1);
     }
 
     #[tokio::test]
@@ -3112,11 +3118,10 @@ mod tests {
         assert_eq!(log.lock().expect("log").len(), 2);
     }
 
-    /// A wait T-Invest asks for that would end past the sync's deadline is
-    /// not waited: the fetch stops there, as "unreachable, retry later", and
-    /// says how many pages had arrived.
+    /// A 429 stops a multi-page fetch without waiting in the request and says
+    /// how many pages had arrived before the persisted host pause.
     #[tokio::test]
-    async fn a_fetch_cut_by_its_deadline_is_unreachable_and_names_the_pages_fetched() {
+    async fn a_fetch_limited_after_two_pages_is_unreachable_and_names_the_pages_fetched() {
         let (gateway, log, time) = fake::gateway(
             vec![
                 Answer::status(200, &page_json(true, Some("cursor-2"), Some("operation-1"))),
@@ -3149,9 +3154,16 @@ mod tests {
             "only host spacing before the three sends was waited"
         );
         assert!(
-            matches!(&error, BrokerError::Unreachable { detail, .. }
-                if detail.contains("retry after")
-                    && detail.ends_with("operation pages fetched before it: 2")),
+            matches!(
+                &error,
+                BrokerError::Unreachable {
+                    detail,
+                    retry_after: Some(retry_after),
+                    ..
+                } if detail.contains("reopens at")
+                    && detail.ends_with("operation pages fetched before it: 2")
+                    && *retry_after == Duration::from_secs(60)
+            ),
             "{error:?}"
         );
     }

@@ -83,9 +83,16 @@ are the repository's installation, and each person's plugin and hooks are theirs
   as committed at a revision; `--jsonl <file>` reads any beads-format export.
   A status the project does not use is refused (exit 2); tombstones are dropped.
 - **Rules:** `.backlog/rules/check.mjs` with `time-format.mjs` beside it,
-  `check-commits.mjs`, `check-docs.mjs`, byte-for-byte copies of shady2k-skills
-  0.65.1 (setup 0.33.0), `skills/backlog/setup-shady2k-skills/`. Their
+  `check-commits.mjs`, `check-docs.mjs`, and `check-present.mjs` with
+  `document-format.mjs` beside it, byte-for-byte copies of shady2k-skills
+  0.67.0 (setup 0.35.0), `skills/backlog/setup-shady2k-skills/`. Their
   `--version` is the installation.
+- **Present documents:** `make present` (`node .backlog/rules/check-present.mjs
+  --config .backlog/config.json --base <rev>`; `BASE` defaults to the merge base
+  with `origin/main`), run when a pull request is opened. It
+  refuses a change that leaves a present document naming a path the change
+  removed, and reports older drift without refusing. The documents, areas and
+  ignores are in the config. Personal scope: CI does not run it.
 - **Work records:** a run's claims, receipts and stops are `br` comments whose
   text starts with `[shady2k-time`. The export carries every comment; the
   adapter passes those raw and whole as `comments` (`id` is br's comment id as

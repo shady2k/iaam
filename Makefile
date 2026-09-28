@@ -67,6 +67,10 @@ backlog-connect: ## Connect this clone to the backlog workflow: backlog gate and
 backlog: ## The backlog gate against the tracker as committed (BASE=... defaults to HEAD)
 	node .backlog/gate.mjs $(if $(BASE),--base $(BASE))
 
+.PHONY: present
+present: ## Present documents name no path this change removed (BASE=... defaults to the merge base with origin/main)
+	node .backlog/rules/check-present.mjs --config .backlog/config.json --base $(or $(BASE),$$(git merge-base origin/main HEAD))
+
 .PHONY: privacy
 privacy: ## No personal data in the tree (shapes only; needs no configuration)
 	$(RUN) ./scripts/check-no-personal-data.sh $(BASE)

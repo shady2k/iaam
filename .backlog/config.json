@@ -13,6 +13,10 @@
   "holdDays": 2,
   "bulkCluster": 20,
   "timeRecordsExempt": [],
+  "presentDocuments": ["AGENTS.md", "CLAUDE.md", "README.md", "docs/glossary-ru-en.md", "docs/backlog-integration.md", "docs/api/conventions.md", "docs/import-boundary.md", "docs/irreversible-core.md", "docs/deployment.md", "docs/agent-skill/SKILL.md"],
+  "presentAreas": ["crates"],
+  "presentIgnores": ["skills/"],
+  "presentChurnCommits": 20,
   "execution": {
     "development": "tdd",
     "runMode": "worker-sessions",

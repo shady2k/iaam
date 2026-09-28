@@ -168,7 +168,7 @@ pub async fn sync_broker(
     // The account the broker is asked for is its own number, never our
     // identifier (`iaam-xzz5.3.2`). A stored binding is the word that stands;
     // without one the access is asked what it sees: exactly one number is
-    // taken and recorded as the binding, several are refused with the
+    // taken and held for the binding, several are refused with the
     // candidates named — the owner binds one, the sync never guesses — and
     // none is refused too. Every refusal below happens before anything is
     // fetched for the interval or written to the journal.
@@ -176,8 +176,8 @@ pub async fn sync_broker(
         .store
         .broker_account_binding(principal.owner, account, &broker_code)
         .await?;
-    let (broker_account, binding_recorded) = match binding {
-        Some(number) => (number, false),
+    let (broker_account, pending_binding) = match binding {
+        Some(number) => (number, None),
         None => {
             let candidates = broker
                 .fetch_account_numbers(deadline)
@@ -189,18 +189,7 @@ pub async fn sync_broker(
                         broker: broker_code.as_str().to_owned(),
                     });
                 }
-                [one] => {
-                    services
-                        .store
-                        .record_broker_account_binding(
-                            principal.owner,
-                            account,
-                            &broker_code,
-                            (*one).clone(),
-                        )
-                        .await?;
-                    (one.clone(), true)
-                }
+                [one] => (one.clone(), Some(one.clone())),
                 several => {
                     return Err(AppError::BrokerAccountAmbiguous {
                         broker: broker_code.as_str().to_owned(),
@@ -243,6 +232,23 @@ pub async fn sync_broker(
                 .await
                 .map_err(broker_error)?,
         )
+    };
+    // The sync's fetches have succeeded — both answers, wherever the
+    // portfolio is asked for at all: an out-of-interval trade withholds
+    // every assertion, so its portfolio is never requested. Only now does
+    // the discovery made above stand. A sync that fails before this point
+    // — a fetch refused, unreadable, or past its deadline — leaves no
+    // binding, so a retry asks the access what it sees again instead of
+    // trusting a number nothing confirmed. This is the sync's first write.
+    let binding_recorded = match pending_binding {
+        Some(number) => {
+            services
+                .store
+                .record_broker_account_binding(principal.owner, account, &broker_code, number)
+                .await?;
+            true
+        }
+        None => false,
     };
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();

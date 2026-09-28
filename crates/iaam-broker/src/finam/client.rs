@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::credentials::BrokerToken;
@@ -95,6 +95,13 @@ pub struct FinamClient {
     clock: Arc<dyn Clock>,
     /// The live session, while one is worth reusing.
     session: Mutex<Option<Session>>,
+    /// Serialises the exchange of the secret for a session token: of the
+    /// simultaneous callers that found nothing live, the first through the
+    /// gate exchanges and the rest reuse what it stored — Finam's own
+    /// token manager makes a repeated start a no-op for the same reason.
+    /// The cache lock above guards reads and stores only; the exchange
+    /// itself is a network call and must not hold it.
+    exchanging: tokio::sync::Mutex<()>,
 }
 
 impl FinamClient {
@@ -111,6 +118,7 @@ impl FinamClient {
             gateway,
             clock,
             session: Mutex::new(None),
+            exchanging: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -202,7 +210,7 @@ impl FinamClient {
     }
 
     /// Send an authorized call: the session token is the bearer. A 401 to
-    /// that token is answered with one fresh exchange and one retry; the
+    /// that token is answered with one shared renewal and one retry; the
     /// second 401 is a refusal. Returns the body and the token that
     /// finally carried it.
     async fn authorized(
@@ -218,8 +226,7 @@ impl FinamClient {
         if !step.is_unauthorized() {
             return Err(step.into_error(self.token.expose(), Some(session.token.expose())));
         }
-        let fresh = self.exchange().await?;
-        self.keep(fresh.clone());
+        let fresh = self.renewed(&session).await?;
         match self.raw(method, &build(fresh.token.expose())).await {
             Ok(body) => Ok((body, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
@@ -227,8 +234,15 @@ impl FinamClient {
     }
 
     /// The session to carry: the remembered one while it lives, else a
-    /// fresh exchange.
+    /// fresh exchange. A caller that found nothing live queues on the
+    /// exchange gate and looks once more before exchanging: of several
+    /// simultaneous first calls, the first through the gate pays for the
+    /// session and the rest reuse it.
     async fn session(&self) -> Result<Session, FinamError> {
+        if let Some(live) = self.live_session() {
+            return Ok(live);
+        }
+        let _gate = self.exchanging.lock().await;
         if let Some(live) = self.live_session() {
             return Ok(live);
         }
@@ -237,11 +251,37 @@ impl FinamClient {
         Ok(fresh)
     }
 
+    /// The session to retry a refused call with: one renewal among every
+    /// caller the refusal hit. The first through the gate exchanges; the
+    /// rest find a live session that is not the refused one and carry it —
+    /// a concurrent renewal has already replaced the token Finam rejected.
+    async fn renewed(&self, refused: &Session) -> Result<Session, FinamError> {
+        let _gate = self.exchanging.lock().await;
+        if let Some(live) = self.live_session() {
+            if live.token.expose() != refused.token.expose() {
+                return Ok(live);
+            }
+        }
+        let fresh = self.exchange().await?;
+        self.keep(fresh.clone());
+        Ok(fresh)
+    }
+
+    /// The session cache, taken even through a poison.
+    ///
+    /// A panic while the lock is held poisons it, but the data it guards
+    /// stays consistent — every writer stores one whole session — so the
+    /// lock is recovered from rather than panicked on: one poisoned call
+    /// must not take the channel down until the process restarts.
+    fn cache(&self) -> MutexGuard<'_, Option<Session>> {
+        self.session.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The remembered session while it has more than the renewal margin
     /// left. The lock guards a read only: the exchange never happens under
     /// it.
     fn live_session(&self) -> Option<Session> {
-        let guard = self.session.lock().expect("session lock");
+        let guard = self.cache();
         let session = guard.as_ref()?;
         let left = session
             .expires_at
@@ -252,7 +292,7 @@ impl FinamClient {
     /// Remember the fresh session unless a concurrent call already put a
     /// longer-lived one there.
     fn keep(&self, fresh: Session) {
-        let mut guard = self.session.lock().expect("session lock");
+        let mut guard = self.cache();
         if guard
             .as_ref()
             .is_none_or(|current| current.expires_at <= fresh.expires_at)
@@ -267,7 +307,7 @@ impl FinamClient {
     /// replaced that session since, and a stranger's end is not ours to
     /// write.
     fn correct_session_lifetime(&self, token: &str, lifetime: Duration) {
-        let mut guard = self.session.lock().expect("session lock");
+        let mut guard = self.cache();
         if let Some(session) = guard.as_mut() {
             if session.token.expose() == token {
                 session.expires_at = session.issued_at + lifetime;
@@ -441,6 +481,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -551,6 +592,88 @@ mod tests {
         }
     }
 
+    /// The state behind a [`Driven`] endpoint: it remembers every request
+    /// and answers by kind — the exchange with a fresh token each time, the
+    /// data calls with a 401 for the first `refused` of them and `200 {}`
+    /// after. A test of simultaneous callers must not depend on the order
+    /// they reach the wire, so a positional script will not do.
+    struct Counted {
+        refused: usize,
+        exchanges: AtomicUsize,
+        data: AtomicUsize,
+        received: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl Counted {
+        fn refusing_first(refused: usize) -> Self {
+            Self {
+                refused,
+                exchanges: AtomicUsize::new(0),
+                data: AtomicUsize::new(0),
+                received: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    /// The transport the gateway drives: the same instance the test reads
+    /// back through.
+    struct Driven(Arc<Counted>);
+
+    impl Transport for Driven {
+        async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+            // Yield once before answering: concurrent callers genuinely
+            // overlap instead of one finishing before the other starts.
+            tokio::task::yield_now().await;
+            let endpoint = &self.0;
+            endpoint
+                .received
+                .lock()
+                .expect("received")
+                .push(request.clone());
+            if request.url() == "https://api.finam.ru/v1/sessions" {
+                let n = endpoint.exchanges.fetch_add(1, Ordering::SeqCst);
+                return Ok(response(
+                    200,
+                    &session_answer(&format!("invented.jwt.{}", n + 1)),
+                ));
+            }
+            let n = endpoint.data.fetch_add(1, Ordering::SeqCst);
+            if n < endpoint.refused {
+                Ok(response(401, ""))
+            } else {
+                Ok(response(200, "{}"))
+            }
+        }
+    }
+
+    /// The first exchange mints `invented.jwt.1`, the renewal `.2`.
+    const FIRST_TOKEN: &str = "invented.jwt.1";
+    const RENEWED_TOKEN: &str = "invented.jwt.2";
+
+    fn counted_client(endpoint: &Arc<Counted>) -> (Arc<FinamClient>, Arc<FakeTime>) {
+        let time = FakeTime::new();
+        let client = client_with_transport(BUDGETS, Driven(Arc::clone(endpoint)), &time);
+        (Arc::new(client), time)
+    }
+
+    /// Two callers of one client, run together on the single-thread test
+    /// runtime: each parks at its first wire yield, so they truly overlap.
+    async fn two_concurrent_calls(
+        client: &Arc<FinamClient>,
+    ) -> (Result<String, FinamError>, Result<String, FinamError>) {
+        let first = {
+            let client = Arc::clone(client);
+            tokio::spawn(async move { client.get_portfolio("Main").await })
+        };
+        let second = {
+            let client = Arc::clone(client);
+            tokio::spawn(async move { client.get_portfolio("Main").await })
+        };
+        tokio::join!(async { first.await.expect("first task joins") }, async {
+            second.await.expect("second task joins")
+        },)
+    }
+
     fn response(status: u16, body: &str) -> HttpResponse {
         HttpResponse {
             status,
@@ -564,21 +687,30 @@ mod tests {
         endpoint: &Arc<Scripted>,
     ) -> (FinamClient, Arc<FakeTime>) {
         let time = FakeTime::new();
-        let clock = Arc::clone(&time) as Arc<dyn Clock>;
+        let client = client_with_transport(budgets, Shared(Arc::clone(endpoint)), &time);
+        (client, time)
+    }
+
+    /// A client over a transport of the test's choosing, reading the same
+    /// fake clock the gateway does; `new` keeps the system clock.
+    fn client_with_transport(
+        budgets: &'static [Budget],
+        transport: impl Transport + 'static,
+        time: &Arc<FakeTime>,
+    ) -> FinamClient {
         let gateway = Gateway::with_parts(
-            Shared(Arc::clone(endpoint)),
+            transport,
             budgets,
-            Arc::clone(&time) as Arc<dyn Clock>,
-            Arc::clone(&time) as Arc<dyn Sleeper>,
+            Arc::clone(time) as Arc<dyn Clock>,
+            Arc::clone(time) as Arc<dyn Sleeper>,
         )
         .expect("the budget table is valid");
         let key = Key::from_bytes([7; 32]);
         let secret = open(&key, &seal(&key, SECRET)).expect("an invented secret");
-        // The private constructor, so the client reads the same fake clock
-        // the gateway does; `new` keeps the system clock.
-        (
-            FinamClient::with_clock(secret, Arc::new(gateway), clock),
-            time,
+        FinamClient::with_clock(
+            secret,
+            Arc::new(gateway),
+            Arc::clone(time) as Arc<dyn Clock>,
         )
     }
 
@@ -644,6 +776,108 @@ mod tests {
 
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
         assert!(time.slept().is_empty(), "the clock renews, nothing sleeps");
+    }
+
+    /// **Simultaneous first calls share one exchange.** Both callers find
+    /// no live session; of the two, only the first through the exchange
+    /// gate pays for the session, the second finds it stored and reuses
+    /// it — the auth budget is spent once, not once per caller.
+    #[tokio::test]
+    async fn simultaneous_first_calls_exchange_once() {
+        let endpoint = Arc::new(Counted::refusing_first(0));
+        let (client, _) = counted_client(&endpoint);
+
+        let (first, second) = two_concurrent_calls(&client).await;
+        assert_eq!(first.expect("the first call"), "{}");
+        assert_eq!(second.expect("the second call"), "{}");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 3, "two data calls over one exchange");
+        let exchanges = received
+            .iter()
+            .filter(|request| request.url() == "https://api.finam.ru/v1/sessions")
+            .count();
+        assert_eq!(exchanges, 1, "one exchange, not one per caller");
+        for request in received.iter().skip(1) {
+            assert_eq!(
+                request.bearer().map(|token| token.expose()),
+                Some(FIRST_TOKEN)
+            );
+        }
+    }
+
+    /// **Simultaneous 401s share one renewal.** Both callers carry the same
+    /// refused token; the first through the gate exchanges, the rest find a
+    /// live session that is not the refused one and retry with it — a
+    /// concurrent renewal has already replaced the token Finam rejected.
+    #[tokio::test]
+    async fn simultaneous_401s_renew_once() {
+        let endpoint = Arc::new(Counted::refusing_first(2));
+        let (client, time) = counted_client(&endpoint);
+
+        let (first, second) = two_concurrent_calls(&client).await;
+        assert_eq!(first.expect("the first retry"), "{}");
+        assert_eq!(second.expect("the second retry"), "{}");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(
+            received.len(),
+            6,
+            "two refusals, two retries, two exchanges"
+        );
+        let exchanges = received
+            .iter()
+            .filter(|request| request.url() == "https://api.finam.ru/v1/sessions")
+            .count();
+        assert_eq!(exchanges, 2, "the initial exchange plus one shared renewal");
+        let retried = received
+            .iter()
+            .filter(|request| request.bearer().map(|token| token.expose()) == Some(RENEWED_TOKEN))
+            .count();
+        assert_eq!(retried, 2, "both callers retry on the renewed token");
+        assert!(
+            received
+                .iter()
+                .skip(1)
+                .take(2)
+                .all(|request| request.bearer().map(|token| token.expose()) == Some(FIRST_TOKEN)),
+            "both first attempts carried the refused token"
+        );
+        assert!(time.slept().is_empty(), "a 401 never waits");
+    }
+
+    /// **A poisoned cache lock is recovered from, not panicked on.** A
+    /// panic while the lock is held poisons a std mutex; the guarded data
+    /// is one whole session either way, so the next call takes the lock
+    /// and carries on instead of panicking with it until restart.
+    #[tokio::test]
+    async fn a_poisoned_cache_lock_is_recovered_from_not_panicked_on() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, "{}"),
+        );
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        // Whatever the code that would one day hold the cache lock across
+        // a panic looks like, the shape is this: a panic while it is held.
+        // The test poisons the lock the same way such a panic would.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = client.session.lock().expect("the stand-in holds the lock");
+            panic!("the stand-in poisons the cache lock");
+        }));
+        assert!(poisoned.is_err(), "the stand-in did panic");
+
+        client
+            .get_portfolio("Main")
+            .await
+            .expect("the call after the poison carries on");
+
+        assert_eq!(
+            endpoint.received.lock().expect("received").len(),
+            2,
+            "the exchange went through after the poison"
+        );
     }
 
     #[tokio::test]

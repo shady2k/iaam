@@ -17,7 +17,7 @@ use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, SourceId};
-use iaam_core::money::{CalcMoney, CurrencyCode};
+use iaam_core::money::CurrencyCode;
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::evidence::SourceChannel;
@@ -371,6 +371,27 @@ fn trade_operation(
     let buy = matches!(kind, ChannelOperationKind::Buy);
     let instrument = required_instrument(&operation)?;
     let quantity = required_quantity(&operation)?;
+    // A trade that carries accrued interest cannot be recorded: Finam's
+    // published contract names `change_original` — the money change in
+    // the instrument's currency — and `trade.accrued_interest` side by
+    // side, and says of neither that it holds the other, while the
+    // recorded settlement is built as the gross plus the accrued
+    // interest. Keeping both would guess the equation between them, so
+    // the trade waits in quarantine until the relationship is
+    // established. A zero interest carries nothing to relate, and a trade
+    // without the field never did.
+    if let Some(accrued) = operation
+        .accrued_interest
+        .filter(|accrued| !accrued.is_zero())
+    {
+        return Err(row_unparsable(format!(
+            "trade carries accrued interest {}: whether Finam's change_original already \
+             contains it is an unestablished relationship, and recording both could count \
+             it twice — establish the relationship between change_original and accrued \
+             interest before importing this trade",
+            accrued.inner()
+        )));
+    }
     // The gross is the money Finam itself states for the trade:
     // `change_original`, the change in the instrument's own currency.
     // Computing a gross from the price would have to assume the price's
@@ -385,18 +406,9 @@ fn trade_operation(
     let currency = money.currency;
     let gross_minor = money_amount(money, "change_original")?;
     // The commission arrives as its own COMMISSION/FEE row and becomes a Fee;
-    // a fee inside the trade as well would charge the account twice.
-    let accrued_interest_minor = match operation.accrued_interest {
-        Some(accrued) => Some(
-            CalcMoney::new(Dec::new(accrued.inner().abs()), currency)
-                .rounded_minor()
-                .map_err(|error| {
-                    row_unparsable(format!("accrued interest cannot be rounded: {error}"))
-                })?
-                .raw(),
-        ),
-        None => None,
-    };
+    // a fee inside the trade as well would charge the account twice. The
+    // interest-bearing trades were refused above, so the recorded fact
+    // carries no accrued interest of its own.
     let operation_kind = if buy {
         OperationKind::Buy {
             instrument,
@@ -406,7 +418,7 @@ fn trade_operation(
             gross_minor,
             fee_minor: None,
             basis_fee: None,
-            accrued_interest_minor,
+            accrued_interest_minor: None,
             currency,
         }
     } else {
@@ -417,7 +429,7 @@ fn trade_operation(
             gross_minor,
             fee_minor: None,
             basis_fee: None,
-            accrued_interest_minor,
+            accrued_interest_minor: None,
             currency,
         }
     };
@@ -636,6 +648,7 @@ mod tests {
     const DIVIDEND_ID: &str = "3f2b8c5e-1a4d-4f6b-9c2e-5a7d8e1f4a3b";
     const BUY_ID: &str = "8d1c2f3a-4b5e-4c6d-9a0b-1c2d3e4f5a6b";
     const FEE_ID: &str = "c2d3e4f5-a6b7-4c8d-9e0f-1a2b3c4d5e6f";
+    const ZERO_ACCRUED_ID: &str = "b7e3c9a1-5f8d-4b2e-8a6c-9d0e1f2a3b4c";
     const SYMBOL: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
 
     fn token() -> BrokerToken {
@@ -1024,6 +1037,113 @@ mod tests {
         // 98.5% of the 1_000 face value, ten bonds: 9_850.00 RUB — not the
         // 985.00 a price-times-quantity computation would have assumed.
         assert_eq!(*gross_minor, 985_000);
+    }
+
+    /// A trade that carries accrued interest cannot be recorded: Finam's
+    /// published contract names `change_original` — the money change in
+    /// the instrument's currency — and `trade.accrued_interest` side by
+    /// side, and says of neither that it holds the other, while the
+    /// recorded settlement is built as the gross plus the accrued
+    /// interest. Keeping both would guess the equation between them, so
+    /// the trade waits in quarantine under a reason naming the
+    /// unestablished relationship. A trade whose accrued interest is zero
+    /// carries nothing to relate, and is recorded as now.
+    #[tokio::test]
+    async fn a_trade_with_accrued_interest_waits_until_the_relationship_is_established() {
+        let body = json!({
+            "transactions": [
+                {
+                    "id": BUY_ID,
+                    "timestamp": "2025-06-12T00:00:00Z",
+                    "category": "TRADE_BUY",
+                    "symbol": SYMBOL,
+                    "change": { "units": "-9900", "nanos": 0, "currencyCode": "rub" },
+                    "changeOriginal": { "units": "-9900", "nanos": 0, "currencyCode": "rub" },
+                    "trade": {
+                        "size": { "value": "10" },
+                        "price": { "value": "98.5" },
+                        "accruedInterest": { "value": "50" },
+                    },
+                    "transactionCategory": "TRADE",
+                },
+                {
+                    "id": ZERO_ACCRUED_ID,
+                    "timestamp": "2025-06-13T00:00:00Z",
+                    "category": "TRADE_BUY",
+                    "symbol": SYMBOL,
+                    "change": { "units": "-9850", "nanos": 0, "currencyCode": "rub" },
+                    "changeOriginal": { "units": "-9850", "nanos": 0, "currencyCode": "rub" },
+                    "trade": {
+                        "size": { "value": "10" },
+                        "price": { "value": "98.5" },
+                        "accruedInterest": { "value": "0" },
+                    },
+                    "transactionCategory": "TRADE",
+                },
+            ],
+        })
+        .to_string();
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
+
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                None,
+            )
+            .await
+            .expect("the page is parsed");
+
+        assert_eq!(
+            parsed.quarantined.len(),
+            1,
+            "only the interest-bearing trade waits: {:?}",
+            parsed.quarantined
+        );
+        let refused = &parsed.quarantined[0];
+        assert!(
+            refused.reason.contains("change_original")
+                && refused.reason.contains("accrued interest"),
+            "the refusal names both sides of the relationship: {}",
+            refused.reason
+        );
+        assert!(
+            refused.reason.contains("unestablished"),
+            "the refusal names the relationship as unestablished: {}",
+            refused.reason
+        );
+        assert_eq!(
+            refused.raw["trade"]["accruedInterest"],
+            json!({ "value": "50" }),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.dimensions,
+            [Dimension::Cash, Dimension::Positions]
+                .into_iter()
+                .collect(),
+            "{refused:?}"
+        );
+
+        assert_eq!(parsed.accepted.len(), 1, "{:?}", parsed.accepted);
+        let OperationKind::Buy {
+            gross_minor,
+            accrued_interest_minor,
+            ..
+        } = &parsed.accepted[0].kind
+        else {
+            panic!(
+                "the zero-interest trade is recorded as a buy: {:?}",
+                parsed.accepted[0].kind
+            );
+        };
+        assert_eq!(*gross_minor, 985_000, "9_850.00 RUB in minor units");
+        assert_eq!(
+            *accrued_interest_minor, None,
+            "zero interest is no interest to record"
+        );
     }
 
     /// A foreign-currency security's trade moves the instrument's own

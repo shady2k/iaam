@@ -160,6 +160,15 @@ impl FinamClient {
     /// middle day and each half is asked again until every answer stays
     /// under the limit. A single day whose answer still reaches it has no
     /// smaller interval to ask, and is refused rather than truncated.
+    ///
+    /// iaam's date range is inclusive at both ends, Finam's
+    /// `interval.start_time` inclusive and its `interval.end_time`
+    /// exclusive ([`typeInterval` in Finam's generated
+    /// contract](https://github.com/FinamWeb/finam-trade-api/blob/main/docs/swagger/api.swagger.json)):
+    /// [from, to] is asked as the half-open instant range [from 00:00,
+    /// (to + 1 day) 00:00). When an answer reaches the limit and the
+    /// range splits, the halves meet exactly on the same instant and
+    /// cover every moment of the interval exactly once between them.
     pub async fn get_transactions(
         &self,
         account_id: &str,
@@ -172,7 +181,12 @@ impl FinamClient {
 
     /// The transactions of one date interval, whole. The recursion is
     /// boxed because it splits itself in two; its depth is the interval's
-    /// day count halved down to one.
+    /// day count halved down to one. The split keeps the coverage whole:
+    /// the left half is [from, middle], the right [after middle, to], and
+    /// since each is asked as [start 00:00, (end + 1 day) 00:00), the left
+    /// half's end instant equals the right half's start — the halves
+    /// cover every instant of the whole interval exactly once between
+    /// them, the middle day included.
     fn transactions_interval<'a>(
         &'a self,
         account_id: &'a str,
@@ -204,16 +218,23 @@ impl FinamClient {
     }
 
     /// One request of the interval fetch: the page the contract answers
-    /// with, its transactions as the wire printed them.
+    /// with, its transactions as the wire printed them. iaam's inclusive
+    /// [from, to] goes on the wire as the half-open instant range
+    /// [from 00:00, (to + 1 day) 00:00), because Finam's
+    /// `interval.end_time` is exclusive — an end at midnight of `to`
+    /// itself would leave the whole `to` day outside the request.
     async fn transactions_page(
         &self,
         account_id: &str,
         from: Date,
         to: Date,
     ) -> Result<Vec<Value>, FinamError> {
+        // An unrepresentable day after `to` has no whole instant range to
+        // name; the interval cannot be proven complete, and is refused.
+        let end = to.next_day().ok_or(FinamError::PartialResponse)?;
         let query = [
             ("interval.start_time", rfc3339_midnight(from)),
-            ("interval.end_time", rfc3339_midnight(to)),
+            ("interval.end_time", rfc3339_midnight(end)),
             ("limit", self.transactions_limit.to_string()),
         ];
         let body = self
@@ -551,7 +572,9 @@ mod tests {
 
     use iaam_http::gateway::{BUDGETS, Budget, Clock, MethodScope, Sleeper, Transport};
     use iaam_http::{Destination, Gateway, HttpError, HttpRequest, HttpResponse};
+    use time::format_description::well_known::Rfc3339;
     use time::macros::date;
+    use time::{OffsetDateTime, Time};
 
     use crate::credentials::{Key, open, seal};
 
@@ -839,7 +862,7 @@ mod tests {
             received[2].url(),
             "https://api.finam.ru/v1/accounts/Main/transactions\
              ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D01T00%3A00%3A00Z\
+             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z\
              &limit=1000"
         );
         for request in received.iter().skip(1) {
@@ -1666,7 +1689,12 @@ mod tests {
 
     /// An answer carrying exactly the limit may continue past the page:
     /// the interval splits at its middle day and each half is asked again,
-    /// and the merged answer keeps the wire's order.
+    /// and the merged answer keeps the wire's order. Finam's
+    /// `interval.end_time` is exclusive, so iaam's inclusive date range is
+    /// asked as the half-open instant range [from 00:00, (to + 1 day)
+    /// 00:00), and the split keeps that coverage whole: the halves meet
+    /// exactly, and between them cover every instant — the split day and
+    /// the `to` day included — exactly once.
     #[tokio::test]
     async fn a_response_that_reaches_the_limit_splits_the_interval() {
         let endpoint = Arc::new(
@@ -1690,13 +1718,13 @@ mod tests {
         assert_eq!(received.len(), 4, "one page per split, one exchange");
         let full = "https://api.finam.ru/v1/accounts/Main/transactions\
              ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D01T00%3A00%3A00Z&limit=2";
+             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z&limit=2";
         let left = "https://api.finam.ru/v1/accounts/Main/transactions\
              ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D01%2D16T00%3A00%3A00Z&limit=2";
+             &interval%2Eend%5Ftime=2024%2D01%2D17T00%3A00%3A00Z&limit=2";
         let right = "https://api.finam.ru/v1/accounts/Main/transactions\
              ?interval%2Estart%5Ftime=2024%2D01%2D17T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D01T00%3A00%3A00Z&limit=2";
+             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z&limit=2";
         assert_eq!(received[1].url(), full, "the asked interval goes first");
         assert_eq!(
             received[2].url(),
@@ -1706,7 +1734,34 @@ mod tests {
         assert_eq!(
             received[3].url(),
             right,
-            "the second half takes over the middle day"
+            "the second half takes the days after the middle day"
+        );
+
+        // The exact strings above pin the wire form; the instants prove the
+        // coverage they promise.
+        let (whole_start, whole_end) = asked_interval(&received[1].url());
+        let (left_start, left_end) = asked_interval(&received[2].url());
+        let (right_start, right_end) = asked_interval(&received[3].url());
+        assert_eq!(
+            left_end, right_start,
+            "the halves meet exactly: between them they cover every instant of the interval once — none missed, none shared",
+        );
+        assert_eq!(left_start, whole_start, "the left half opens the interval");
+        assert_eq!(right_end, whole_end, "the right half closes the interval");
+        // The split day — iaam's middle day, January 16 — lies wholly inside
+        // the left half, and the `to` day, February 1, wholly inside the
+        // right half: the days an exclusive end at midnight would leave out.
+        let split_day = OffsetDateTime::new_utc(date!(2024 - 01 - 16), Time::MIDNIGHT);
+        let after_split = OffsetDateTime::new_utc(date!(2024 - 01 - 17), Time::MIDNIGHT);
+        assert!(
+            left_start <= split_day && after_split <= left_end,
+            "the split day is requested by the left half: {left_start}..{left_end}"
+        );
+        let to_day = OffsetDateTime::new_utc(date!(2024 - 02 - 01), Time::MIDNIGHT);
+        let after_to = OffsetDateTime::new_utc(date!(2024 - 02 - 02), Time::MIDNIGHT);
+        assert!(
+            right_start <= to_day && after_to <= right_end,
+            "the to day is requested by the right half: {right_start}..{right_end}"
         );
 
         let merged: serde_json::Value = serde_json::from_str(&body).expect("merged body");
@@ -1720,6 +1775,33 @@ mod tests {
         // back inside them: the merge appends only the halves, and no
         // transaction is carried twice.
         assert_eq!(ids, ["left", "right"]);
+    }
+
+    /// The half-open instant range a transactions request named, read back
+    /// out of the URL the gateway received.
+    fn asked_interval(url: &str) -> (OffsetDateTime, OffsetDateTime) {
+        fn decode(value: &str) -> String {
+            value
+                .replace("%2D", "-")
+                .replace("%2E", ".")
+                .replace("%3A", ":")
+                .replace("%5F", "_")
+        }
+        let query = url.split('?').nth(1).expect("the request names a query");
+        let mut start = None;
+        let mut end = None;
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').expect("a key=value pair");
+            match decode(key).as_str() {
+                "interval.start_time" => start = Some(decode(value)),
+                "interval.end_time" => end = Some(decode(value)),
+                _ => {}
+            }
+        }
+        let parse = |value: Option<String>, field: &str| {
+            OffsetDateTime::parse(&value.expect(field), &Rfc3339).expect(field)
+        };
+        (parse(start, "a start_time"), parse(end, "an end_time"))
     }
 
     /// A single day has no smaller interval to ask: an answer that reaches

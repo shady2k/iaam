@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 # Единственное место в дереве, где объявлен HTTP-клиент. rustls без
 # встроенных корней там, где якорь задан явно; веб-корни там, где узел
@@ -39,6 +42,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 sha2 = "0.11"
 # Captures the gateway's events in a test, to prove what they carry.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+# Self dependency so integration tests compile the same feature-gated loopback
+# harness that downstream acceptance tests reuse.
+iaam-http = { path = ".", version = "0.1.0", features = ["test-support"] }
 
 [lints]
 workspace = true

@@ -52,6 +52,8 @@ pub mod request;
 pub mod resilience;
 pub mod response;
 mod tally;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod trust;
 
 pub use destination::Destination;

@@ -82,7 +82,10 @@ fn client_anchors(destination: Destination) -> Anchors {
 /// Build a client for a destination's trust anchor.
 pub(crate) fn client_for(destination: Destination) -> Result<ConfiguredClient, HttpError> {
     let anchors = client_anchors(destination);
-    let builder = Client::builder().tls_backend_rustls();
+    let builder = Client::builder()
+        .tls_backend_rustls()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never());
     let builder = match anchors {
         Anchors::WebRoots => builder,
         Anchors::Pinned(pem) => {

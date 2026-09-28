@@ -1,5 +1,4 @@
 {
-  "hasMore": false,
   "transactions": [
     {
       "id": "FINAM-CASH-001",
@@ -7,12 +6,12 @@
       "timestamp": "2026-08-20T09:00:00Z",
       "symbol": "RUB",
       "change": {
-        "currency_code": "RUB",
+        "currencyCode": "RUB",
         "units": "100000",
         "nanos": 0
       },
-      "transaction_category": "CASH",
-      "transaction_name": "Пополнение брокерского счёта"
+      "transactionCategory": "CASH",
+      "transactionName": "Пополнение брокерского счёта"
     },
     {
       "id": "FINAM-TRADE-001",
@@ -20,18 +19,22 @@
       "timestamp": "2026-08-20T10:11:12Z",
       "symbol": "01234567-89ab-cdef-0123-456789abcdef",
       "change": {
-        "currency_code": "RUB",
+        "currencyCode": "RUB",
+        "units": "-270",
+        "nanos": -130000000
+      },
+      "changeOriginal": {
+        "currencyCode": "RUB",
         "units": "-270",
         "nanos": -130000000
       },
       "trade": {
         "size": {"value": "1"},
         "price": {"value": "270.13"},
-        "accrued_interest": {"value": "0"}
+        "accruedInterest": {"value": "0"}
       },
-      "transaction_category": "TRADE",
-      "transaction_name": "Покупка ценных бумаг",
-      "change_qty": {"value": "1"}
+      "transactionCategory": "TRADE",
+      "transactionName": "Покупка ценных бумаг"
     },
     {
       "id": "FINAM-FEE-001",
@@ -39,12 +42,12 @@
       "timestamp": "2026-08-20T10:11:13Z",
       "symbol": "RUB",
       "change": {
-        "currency_code": "RUB",
+        "currencyCode": "RUB",
         "units": "0",
         "nanos": -135065000
       },
-      "transaction_category": "FEE",
-      "transaction_name": "Комиссия брокера"
+      "transactionCategory": "FEE",
+      "transactionName": "Комиссия брокера"
     }
   ]
 }

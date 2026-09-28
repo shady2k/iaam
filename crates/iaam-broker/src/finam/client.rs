@@ -1,3 +1,4 @@
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,14 @@ const GET_ACCOUNT: &str = "AccountsService.GetAccount";
 
 /// Budget key of `AccountsService/Transactions`.
 const TRANSACTIONS: &str = "AccountsService.Transactions";
+
+/// The limit one transactions request names (`TransactionsRequest.limit`
+/// in the published contract). The contract publishes no maximum and no
+/// continuation: an answer carrying exactly this many transactions may
+/// continue past the page, so the fetched interval narrows until an
+/// answer stays under the limit, and only a single day that still
+/// reaches it is refused — never silently truncated.
+const TRANSACTIONS_LIMIT: i32 = 1_000;
 
 /// Budget key of the session methods: the exchange of the secret for a
 /// session token (`POST /v1/sessions`) and the details of that token
@@ -64,7 +73,13 @@ pub enum FinamError {
     /// no row for Finam, which is a fault of this build, not of the request.
     #[error("the outbound gateway refused the Finam call: {reason}")]
     Gateway { reason: String },
-    #[error("Finam paginated response is truncated: next-page token is missing")]
+    /// A single day's transactions answer reached the request's limit, and
+    /// a single day cannot be split further: whether more transactions lie
+    /// past the page cannot be proven from the wire, so the interval is
+    /// refused rather than fetched truncated.
+    #[error(
+        "Finam transactions answer for a single day reached the request limit; the interval cannot be proven complete"
+    )]
     PartialResponse,
     #[error("successful response does not match the JSON schema")]
     MalformedResponse,
@@ -95,6 +110,9 @@ pub struct FinamClient {
     clock: Arc<dyn Clock>,
     /// The live session, while one is worth reusing.
     session: Mutex<Option<Session>>,
+    /// The limit a transactions request names; the contract's `limit`,
+    /// fixed for this build and narrowed around in tests.
+    transactions_limit: i32,
 }
 
 impl FinamClient {
@@ -102,15 +120,21 @@ impl FinamClient {
     /// zeroizing wrapper.
     #[must_use]
     pub fn new(token: BrokerToken, gateway: Arc<dyn Outbound>) -> Self {
-        Self::with_clock(token, gateway, Arc::new(SystemClock))
+        Self::with_clock(token, gateway, Arc::new(SystemClock), TRANSACTIONS_LIMIT)
     }
 
-    fn with_clock(token: BrokerToken, gateway: Arc<dyn Outbound>, clock: Arc<dyn Clock>) -> Self {
+    fn with_clock(
+        token: BrokerToken,
+        gateway: Arc<dyn Outbound>,
+        clock: Arc<dyn Clock>,
+        transactions_limit: i32,
+    ) -> Self {
         Self {
             token,
             gateway,
             clock,
             session: Mutex::new(None),
+            transactions_limit,
         }
     }
 
@@ -120,16 +144,69 @@ impl FinamClient {
             .await
     }
 
-    /// Return the raw body of a transaction page for an interval.
+    /// Return the raw body of the account's transactions for a whole
+    /// interval, under the published contract: the request names a limit,
+    /// and the answer is a bare repeated list with no continuation to
+    /// follow. Completeness is proven by narrowing: an answer that reaches
+    /// the limit may continue past the page, so the interval splits at its
+    /// middle day and each half is asked again until every answer stays
+    /// under the limit. A single day whose answer still reaches it has no
+    /// smaller interval to ask, and is refused rather than truncated.
     pub async fn get_transactions(
         &self,
         account_id: &str,
         from: Date,
         to: Date,
     ) -> Result<String, FinamError> {
+        let transactions = self.transactions_interval(account_id, from, to).await?;
+        Ok(serde_json::json!({ "transactions": transactions }).to_string())
+    }
+
+    /// The transactions of one date interval, whole. The recursion is
+    /// boxed because it splits itself in two; its depth is the interval's
+    /// day count halved down to one.
+    fn transactions_interval<'a>(
+        &'a self,
+        account_id: &'a str,
+        from: Date,
+        to: Date,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, FinamError>> + Send + 'a>> {
+        Box::pin(async move {
+            if from > to {
+                return Ok(Vec::new());
+            }
+            let transactions = self.transactions_page(account_id, from, to).await?;
+            let limit = usize::try_from(self.transactions_limit).unwrap_or(usize::MAX);
+            if transactions.len() < limit {
+                return Ok(transactions);
+            }
+            let whole_days = (to - from).whole_days();
+            if whole_days == 0 {
+                return Err(FinamError::PartialResponse);
+            }
+            let middle = from + time::Duration::days(whole_days / 2);
+            let mut merged = self.transactions_interval(account_id, from, middle).await?;
+            let after_middle = middle.next_day().ok_or(FinamError::PartialResponse)?;
+            let rest = self
+                .transactions_interval(account_id, after_middle, to)
+                .await?;
+            merged.extend(rest);
+            Ok(merged)
+        })
+    }
+
+    /// One request of the interval fetch: the page the contract answers
+    /// with, its transactions as the wire printed them.
+    async fn transactions_page(
+        &self,
+        account_id: &str,
+        from: Date,
+        to: Date,
+    ) -> Result<Vec<Value>, FinamError> {
         let query = [
             ("interval.start_time", rfc3339_midnight(from)),
             ("interval.end_time", rfc3339_midnight(to)),
+            ("limit", self.transactions_limit.to_string()),
         ];
         let body = self
             .get(
@@ -138,8 +215,13 @@ impl FinamClient {
                 &query,
             )
             .await?;
-        validate_transactions_page(&body)?;
-        Ok(body)
+        let value: Value =
+            serde_json::from_str(&body).map_err(|_| FinamError::MalformedResponse)?;
+        let transactions = value
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or(FinamError::MalformedResponse)?;
+        Ok(transactions.clone())
     }
 
     /// The account ids the access sees, from `POST /v1/sessions/details`.
@@ -406,24 +488,6 @@ fn classify_rejection(status: u16, body: &[u8], secret: &str, token: Option<&str
         }
     }
 }
-
-fn validate_transactions_page(body: &str) -> Result<(), FinamError> {
-    let value: Value = serde_json::from_str(body).map_err(|_| FinamError::MalformedResponse)?;
-    let has_more = value
-        .get("hasMore")
-        .or_else(|| value.get("has_more"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let next_page_token = value
-        .get("nextPageToken")
-        .or_else(|| value.get("next_page_token"))
-        .and_then(Value::as_str);
-    if has_more && next_page_token.is_none_or(str::is_empty) {
-        return Err(FinamError::PartialResponse);
-    }
-    Ok(())
-}
-
 fn redact_token(body: &str, token: &str) -> String {
     if token.is_empty() {
         body.to_owned()
@@ -435,8 +499,8 @@ fn redact_token(body: &str, token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FinamClient, FinamError, RENEW_BEFORE, SESSION_LIFETIME, classify_rejection,
-        validate_transactions_page,
+        FinamClient, FinamError, RENEW_BEFORE, SESSION_LIFETIME, TRANSACTIONS_LIMIT,
+        classify_rejection,
     };
     use std::collections::VecDeque;
     use std::future::Future;
@@ -563,6 +627,17 @@ mod tests {
         budgets: &'static [Budget],
         endpoint: &Arc<Scripted>,
     ) -> (FinamClient, Arc<FakeTime>) {
+        client_with_limit(budgets, endpoint, TRANSACTIONS_LIMIT)
+    }
+
+    /// The same client, naming a smaller transactions limit: the contract's
+    /// `limit` is a request field, and a scripted "page full" answer needs
+    /// a page small enough to fill.
+    fn client_with_limit(
+        budgets: &'static [Budget],
+        endpoint: &Arc<Scripted>,
+        transactions_limit: i32,
+    ) -> (FinamClient, Arc<FakeTime>) {
         let time = FakeTime::new();
         let clock = Arc::clone(&time) as Arc<dyn Clock>;
         let gateway = Gateway::with_parts(
@@ -577,7 +652,7 @@ mod tests {
         // The private constructor, so the client reads the same fake clock
         // the gateway does; `new` keeps the system clock.
         (
-            FinamClient::with_clock(secret, Arc::new(gateway), clock),
+            FinamClient::with_clock(secret, Arc::new(gateway), clock, transactions_limit),
             time,
         )
     }
@@ -596,7 +671,7 @@ mod tests {
             Scripted::answering(200)
                 .then(200, &session_answer(JWT_ONE))
                 .then(200, "{}")
-                .then(200, "{}"),
+                .then(200, r#"{"transactions":[]}"#),
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
@@ -620,7 +695,8 @@ mod tests {
             received[2].url(),
             "https://api.finam.ru/v1/accounts/Main/transactions\
              ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D01T00%3A00%3A00Z"
+             &interval%2Eend%5Ftime=2024%2D02%2D01T00%3A00%3A00Z\
+             &limit=1000"
         );
         for request in received.iter().skip(1) {
             assert_eq!(request.bearer().map(|token| token.expose()), Some(JWT_ONE));
@@ -1103,7 +1179,7 @@ mod tests {
             Scripted::answering(200)
                 .then(200, &session_answer(JWT_ONE))
                 .then(200, "{}")
-                .then(200, "{}")
+                .then(200, r#"{"transactions":[]}"#)
                 .then(200, "{}"),
         );
         let (client, time) = client_over(ONE_PER_METHOD, &endpoint);
@@ -1342,11 +1418,107 @@ mod tests {
         }
     }
 
-    #[test]
-    fn refuses_a_page_that_claims_more_without_a_token() {
-        assert!(matches!(
-            validate_transactions_page(r#"{"hasMore":true,"transactions":[]}"#),
-            Err(FinamError::PartialResponse)
-        ));
+    /// An answer carrying exactly the limit may continue past the page:
+    /// the interval splits at its middle day and each half is asked again,
+    /// and the merged answer keeps the wire's order.
+    #[tokio::test]
+    async fn a_response_that_reaches_the_limit_splits_the_interval() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(
+                    200,
+                    r#"{"transactions":[{"id":"first-one"},{"id":"first-two"}]}"#,
+                )
+                .then(200, r#"{"transactions":[{"id":"left"}]}"#)
+                .then(200, r#"{"transactions":[{"id":"right"}]}"#),
+        );
+        let (client, _) = client_with_limit(BUDGETS, &endpoint, 2);
+
+        let body = client
+            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .await
+            .expect("the whole interval is fetched");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 4, "one page per split, one exchange");
+        let full = "https://api.finam.ru/v1/accounts/Main/transactions\
+             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
+             &interval%2Eend%5Ftime=2024%2D02%2D01T00%3A00%3A00Z&limit=2";
+        let left = "https://api.finam.ru/v1/accounts/Main/transactions\
+             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
+             &interval%2Eend%5Ftime=2024%2D01%2D16T00%3A00%3A00Z&limit=2";
+        let right = "https://api.finam.ru/v1/accounts/Main/transactions\
+             ?interval%2Estart%5Ftime=2024%2D01%2D17T00%3A00%3A00Z\
+             &interval%2Eend%5Ftime=2024%2D02%2D01T00%3A00%3A00Z&limit=2";
+        assert_eq!(received[1].url(), full, "the asked interval goes first");
+        assert_eq!(
+            received[2].url(),
+            left,
+            "the first half narrows the interval"
+        );
+        assert_eq!(
+            received[3].url(),
+            right,
+            "the second half takes over the middle day"
+        );
+
+        let merged: serde_json::Value = serde_json::from_str(&body).expect("merged body");
+        let ids: Vec<&str> = merged["transactions"]
+            .as_array()
+            .expect("merged transactions")
+            .iter()
+            .map(|transaction| transaction["id"].as_str().expect("id"))
+            .collect();
+        // The halves re-cover the full page's interval, so its rows come
+        // back inside them: the merge appends only the halves, and no
+        // transaction is carried twice.
+        assert_eq!(ids, ["left", "right"]);
+    }
+
+    /// A single day has no smaller interval to ask: an answer that reaches
+    /// the limit there is refused, never fetched truncated.
+    #[tokio::test]
+    async fn an_answer_for_one_day_that_reaches_the_limit_is_refused() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, r#"{"transactions":[{"id":"one"},{"id":"two"}]}"#),
+        );
+        let (client, _) = client_with_limit(BUDGETS, &endpoint, 2);
+
+        let error = client
+            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 01 - 01))
+            .await
+            .expect_err("a full single day cannot be proven complete");
+
+        assert!(
+            matches!(error, FinamError::PartialResponse),
+            "the refusal names the unprovable interval: {error}"
+        );
+        assert_eq!(
+            endpoint.received.lock().expect("received").len(),
+            2,
+            "one exchange, one refused page, no further request"
+        );
+    }
+
+    /// An interval that names no days holds no transactions: nothing is
+    /// asked, and the empty answer is the whole truth.
+    #[tokio::test]
+    async fn an_interval_that_names_no_days_sends_no_request() {
+        let endpoint = Arc::new(Scripted::answering(200));
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        let body = client
+            .get_transactions("Main", date!(2024 - 02 - 01), date!(2024 - 01 - 01))
+            .await
+            .expect("an empty interval is an empty answer");
+
+        assert_eq!(body, r#"{"transactions":[]}"#);
+        assert!(
+            endpoint.received.lock().expect("received").is_empty(),
+            "no request may be spent on an interval with no days"
+        );
     }
 }

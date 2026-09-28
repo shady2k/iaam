@@ -6482,7 +6482,6 @@ const FINAM_SYMBOL: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
 /// account, instrument or amount.
 fn finam_transactions_page() -> String {
     json!({
-        "hasMore": false,
         "transactions": [
             {
                 "id": "3f2b8c5e-1a4d-4f6b-9c2e-5a7d8e1f4a3b",
@@ -6497,8 +6496,11 @@ fn finam_transactions_page() -> String {
                 "category": "TRADE_BUY",
                 "symbol": FINAM_SYMBOL,
                 "change": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
-                "changeQty": { "value": "10" },
-                "trade": { "price": { "value": "100.50" } },
+                "changeOriginal": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
+                "trade": {
+                    "size": { "value": "10" },
+                    "price": { "value": "100.50" },
+                },
             },
         ],
     })

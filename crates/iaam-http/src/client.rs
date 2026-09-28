@@ -94,14 +94,25 @@ impl HttpClient {
         base_url: &str,
         timeout: Duration,
     ) -> Result<HttpResponse, HttpError> {
+        self.send_to_base_observed(request, base_url, timeout, Box::new(|_, _| {}))
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn send_to_base_observed(
+        &self,
+        request: &HttpRequest,
+        base_url: &str,
+        timeout: Duration,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+    ) -> Result<HttpResponse, HttpError> {
         let request_url = request.url();
         let destination_base = request.destination().base_url().trim_end_matches('/');
         let suffix = request_url
             .strip_prefix(destination_base)
             .unwrap_or(request_url.as_str());
         let url = format!("{}{suffix}", base_url.trim_end_matches('/'));
-        self.send_to_url(request, url, timeout, Box::new(|_, _| {}))
-            .await
+        self.send_to_url(request, url, timeout, observe).await
     }
 
     async fn send_to_url(

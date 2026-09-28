@@ -114,12 +114,27 @@ Run the executable ceiling proof before enabling broker egress:
 $ make ceiling-proof
 ```
 
-Each printed cell is `reached/ceiling`, derived from requests recorded by the
-scripted transport rather than from gateway counters. The `minute(method)`
-column names the method key whose sliding 60-second window was largest.
+The proof sends through the production gateway and HTTP client to loopback TCP
+servers, one endpoint at a time. The receiver records completed request headers,
+so the table is derived from wire arrivals rather than gateway counters.
+`sec(wire)` is measured with a dedicated real-time spacing run for every
+endpoint; other rows say `wire-row` and rely on that endpoint's named spacing
+row instead of presenting logical time as wire time. The remaining duration
+columns are `reached/ceiling` from the injected boot clock sampled when each
+request reaches the receiver. `minute(method)` names the endpoint-method pair
+whose rolling 60-second window was largest. Unknown pairs fail the proof.
 `closure` and `pause` must both be `0/0`; `attempts` includes retries and Finam
-session exchanges. The command also runs the real sync allowance, tally
-persistence across owner rebuilds, egress-off and two-process ownership cases.
+session exchanges. The command also exercises the real T-Invest and Finam sync
+loops, retry and response-body failures, redirect policy, the 1,000-request
+rolling day boundary, concurrent callers, boot and wall-clock changes, tally
+persistence across owner rebuilds, egress-off, path aliases and two-process
+ownership.
+
+The proof deliberately does not contact live brokers or test TLS, proxies,
+network filesystems, container mount namespaces, or a hostile process modifying
+the tally. The loopback fixture speaks HTTP/1.1 on Linux. Its real-time spacing
+rows observe the host scheduler; longer accounting windows are advanced by the
+injected boot clock so the check remains bounded and deterministic.
 
 Administrative commands (`claim`, `token issue`, `broker key …`,
 `broker access …`, `bundle export`, `bundle import`) open the database and do

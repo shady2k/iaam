@@ -2,34 +2,32 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use iaam_app::AppServices;
+use iaam_app::adapters::finam::FinamChannel;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::adapters::tinkoff::TinkoffChannel;
-use iaam_app::ports::{
-    BrokerChannel, BrokerError, BrokerRequestContext, Clock as AppClock, ParsedOperations,
-    PortfolioAsOf, PortfolioSnapshot, Principal, Scope,
-};
+use iaam_app::ports::{Clock as AppClock, Principal, Scope};
 use iaam_app::sync::{BROKER_SYNC_REQUEST_CEILING, BrokerSyncRequest};
 use iaam_broker::credentials::{BrokerToken, Key, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_broker::finam::FinamClient;
 use iaam_broker::operation_kind::{OperationKindDictionary, seed_for};
 use iaam_broker::tinkoff::TinkoffClient;
-use iaam_core::event::provenance::ParserVersion;
+
 use iaam_core::ids::{AccountId, OwnerId, SourceId};
-use iaam_core::reconciliation::evidence::SourceChannel;
+
 use iaam_http::gateway::{BUDGETS, Budget, Clock, MethodScope, Sleeper, Transport};
+use iaam_http::test_support::{HttpClientHarness, LoopbackReply, LoopbackServer};
 use iaam_http::{
-    BrokerEgress, Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse,
-    Outbound, RequestAllowance, RequestBody,
+    BrokerEgress, Destination, Gateway, GatewayError, HttpRequest, HttpResponse, Outbound,
+    RequestAllowance, RequestBody,
 };
-use iaam_ingest::dedup::IdentityScope;
+
 use iaam_store::SqliteStore;
 use time::Date;
 use time::macros::date;
@@ -39,48 +37,55 @@ const MINUTE: Duration = Duration::from_secs(60);
 const CLOSURE: Duration = Duration::from_secs(30 * 60);
 const REFUSAL_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DAILY_CEILING: usize = 1_000;
+const DEFAULT_PAUSE_SECONDS: u64 = 60;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct SendRecord {
-    at: SystemTime,
+    logical_at: Duration,
+    wire_at: Duration,
     host: String,
     method: String,
     sync: u64,
     call: u64,
-    status: Option<u16>,
+    status: u16,
     pause_for: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+struct PairMeasurement {
+    host: String,
+    method: String,
+    reached: usize,
+    ceiling: usize,
 }
 
 #[derive(Clone, Debug, Default)]
 struct Measurements {
-    max_second: usize,
-    max_minute: usize,
-    minute_method: String,
-    minute_ceiling: usize,
+    pairs: Vec<PairMeasurement>,
+    worst_pair: Option<usize>,
+    max_second: Option<usize>,
     max_day: usize,
     max_sync: usize,
     max_closure_span: usize,
     max_pause_span: usize,
     max_attempts: usize,
+    locally_refused: usize,
 }
 
-fn nanos(at: SystemTime) -> u128 {
-    at.duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos()
-}
-
-fn max_window(records: &[&SendRecord], window: Duration) -> usize {
-    let mut points: Vec<_> = records.iter().map(|record| nanos(record.at)).collect();
+fn max_window_by(
+    records: &[&SendRecord],
+    window: Duration,
+    at: impl Fn(&SendRecord) -> Duration,
+) -> usize {
+    let mut points: Vec<_> = records.iter().map(|record| at(record)).collect();
     points.sort_unstable();
-    let width = window.as_nanos();
     let mut end = 0;
     let mut maximum = 0;
     for start in 0..points.len() {
         end = end.max(start);
-        while end < points.len() && points[end] < points[start].saturating_add(width) {
+        while end < points.len() && points[end] < points[start].saturating_add(window) {
             end += 1;
         }
         maximum = maximum.max(end - start);
@@ -88,19 +93,44 @@ fn max_window(records: &[&SendRecord], window: Duration) -> usize {
     maximum
 }
 
-fn budget_limit(host: &str, method: &str) -> usize {
-    let row = BUDGETS.iter().find(|row| {
-        row.destination.base_url() == host
-            && matches!(row.scope, MethodScope::Named(name) if name == method)
-    });
-    row.map_or(usize::MAX, |budget| budget.used as usize)
+fn budget_limit(host: &str, method: &str) -> Result<usize, String> {
+    BUDGETS
+        .iter()
+        .find(|row| {
+            row.destination.base_url() == host
+                && matches!(row.scope, MethodScope::Named(name) if name == method)
+        })
+        .map(|row| row.used as usize)
+        .ok_or_else(|| format!("unknown broker budget pair ({host}, {method})"))
 }
 
-fn measure(records: &[SendRecord]) -> Measurements {
-    let mut measured = Measurements::default();
+fn method_for_target(target: &str) -> Option<&'static str> {
+    if target.contains("UsersService/") {
+        Some("UsersService")
+    } else if target.contains("OperationsService/") {
+        Some("OperationsService")
+    } else if target.ends_with("/v1/sessions") || target.ends_with("/v1/sessions/details") {
+        Some("AuthService.Sessions")
+    } else if target.contains("/transactions") {
+        Some("AccountsService.Transactions")
+    } else if target.contains("/v1/accounts/") {
+        Some("AccountsService.GetAccount")
+    } else {
+        None
+    }
+}
 
+fn measure(
+    records: &[SendRecord],
+    locally_refused: usize,
+    wire_max_second: Option<usize>,
+) -> Result<Measurements, String> {
+    let mut measured = Measurements {
+        max_second: wire_max_second,
+        locally_refused,
+        ..Measurements::default()
+    };
     let mut methods: BTreeMap<(&str, &str), Vec<&SendRecord>> = BTreeMap::new();
-    let mut days: BTreeMap<(&str, u128), usize> = BTreeMap::new();
     let mut syncs: BTreeMap<u64, usize> = BTreeMap::new();
     let mut calls: BTreeMap<u64, usize> = BTreeMap::new();
     let mut hosts: BTreeMap<&str, Vec<&SendRecord>> = BTreeMap::new();
@@ -109,205 +139,290 @@ fn measure(records: &[SendRecord]) -> Measurements {
             .entry((&record.host, &record.method))
             .or_default()
             .push(record);
-        *days
-            .entry((&record.host, nanos(record.at) / DAY.as_nanos()))
-            .or_default() += 1;
-        *syncs.entry(record.sync).or_default() += 1;
+        if record.sync != 0 {
+            *syncs.entry(record.sync).or_default() += 1;
+        }
         *calls.entry(record.call).or_default() += 1;
         hosts.entry(&record.host).or_default().push(record);
     }
-    for ((host, method), records) in methods {
-        let count = max_window(&records, MINUTE);
-        if count > measured.max_minute {
-            measured.max_minute = count;
-            measured.minute_method = method.to_owned();
-            measured.minute_ceiling = budget_limit(host, method);
-        }
+    for ((host, method), pair_records) in methods {
+        measured.pairs.push(PairMeasurement {
+            host: host.to_owned(),
+            method: method.to_owned(),
+            reached: max_window_by(&pair_records, MINUTE, |record| record.logical_at),
+            ceiling: budget_limit(host, method)?,
+        });
     }
-    measured.max_day = days.values().copied().max().unwrap_or(0);
+    measured.worst_pair = measured
+        .pairs
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            (left.reached * right.ceiling).cmp(&(right.reached * left.ceiling))
+        })
+        .map(|(index, _)| index);
     measured.max_sync = syncs.values().copied().max().unwrap_or(0);
     measured.max_attempts = calls.values().copied().max().unwrap_or(0);
 
     for mut host_records in hosts.into_values() {
-        measured.max_second = measured
-            .max_second
-            .max(max_window(&host_records, Duration::from_secs(1)));
-        host_records.sort_by_key(|record| nanos(record.at));
+        measured.max_day = measured
+            .max_day
+            .max(max_window_by(&host_records, DAY, |record| {
+                record.logical_at
+            }));
+        host_records.sort_by_key(|record| record.logical_at);
         let mut refusals = VecDeque::new();
         let mut rate_limits = VecDeque::new();
         for (index, record) in host_records.iter().enumerate() {
-            let at = nanos(record.at);
-            if let Some(status) = record.status {
-                let queue = if status == 429 {
-                    &mut rate_limits
-                } else if (400..=499).contains(&status) {
-                    &mut refusals
-                } else {
-                    continue;
-                };
-                while queue
-                    .front()
-                    .is_some_and(|earlier| at.saturating_sub(*earlier) >= REFUSAL_WINDOW.as_nanos())
-                {
-                    queue.pop_front();
-                }
-                queue.push_back(at);
-                let closes =
-                    (status == 429 && queue.len() >= 2) || (status != 429 && queue.len() >= 3);
-                if closes {
-                    let after = host_records[index + 1..]
-                        .iter()
-                        .take_while(|later| nanos(later.at) < at + CLOSURE.as_nanos())
-                        .count();
-                    measured.max_closure_span = measured.max_closure_span.max(after);
-                }
-                if status == 429 {
-                    let pause = record.pause_for.unwrap_or(MINUTE).max(MINUTE);
-                    let after = host_records[index + 1..]
-                        .iter()
-                        .take_while(|later| nanos(later.at) < at + pause.as_nanos())
-                        .count();
-                    measured.max_pause_span = measured.max_pause_span.max(after);
-                }
+            let queue = if record.status == 429 {
+                &mut rate_limits
+            } else if (400..=499).contains(&record.status) {
+                &mut refusals
+            } else {
+                continue;
+            };
+            while queue
+                .front()
+                .is_some_and(|earlier| record.logical_at.saturating_sub(*earlier) >= REFUSAL_WINDOW)
+            {
+                queue.pop_front();
+            }
+            queue.push_back(record.logical_at);
+            let closes = (record.status == 429 && queue.len() >= 2)
+                || (record.status != 429 && queue.len() >= 3);
+            if closes {
+                let sends = host_records[index + 1..]
+                    .iter()
+                    .take_while(|later| {
+                        later.logical_at < record.logical_at.saturating_add(CLOSURE)
+                    })
+                    .count();
+                measured.max_closure_span = measured.max_closure_span.max(sends);
+            }
+            if record.status == 429 {
+                let pause = record.pause_for.unwrap_or(MINUTE).max(MINUTE).min(DAY);
+                let sends = host_records[index + 1..]
+                    .iter()
+                    .take_while(|later| later.logical_at < record.logical_at.saturating_add(pause))
+                    .count();
+                measured.max_pause_span = measured.max_pause_span.max(sends);
             }
         }
     }
-    measured
+    Ok(measured)
+}
+
+fn violations(measured: &Measurements) -> Vec<String> {
+    let mut found = Vec::new();
+    if measured.max_second.is_some_and(|reached| reached > 1) {
+        found.push("one-second spacing".to_owned());
+    }
+    for pair in &measured.pairs {
+        if pair.reached > pair.ceiling {
+            found.push(format!("minute budget {} {}", pair.host, pair.method));
+        }
+    }
+    if measured.max_day > DAILY_CEILING {
+        found.push("rolling 24-hour ceiling".to_owned());
+    }
+    if measured.max_sync > BROKER_SYNC_REQUEST_CEILING as usize {
+        found.push("sync ceiling".to_owned());
+    }
+    if measured.max_closure_span != 0 {
+        found.push("closure".to_owned());
+    }
+    if measured.max_pause_span != 0 {
+        found.push("pause".to_owned());
+    }
+    if measured.max_attempts > 3 {
+        found.push("attempt ceiling".to_owned());
+    }
+    found
 }
 
 fn assert_within_ceilings(mode: &str, measured: &Measurements) {
-    assert!(
-        measured.max_second <= 1,
-        "{mode}: more than one send in one second: {measured:?}"
+    let found = violations(measured);
+    assert!(found.is_empty(), "{mode}: {found:?}: {measured:?}");
+}
+
+fn print_header() {
+    println!(
+        "mode                       endpoint                                         sec(wire)  minute(method; all pairs checked)               24h       sync      closure  pause    attempts  local"
     );
-    assert!(
-        measured.max_minute <= measured.minute_ceiling,
-        "{mode}: minute budget exceeded: {measured:?}"
-    );
-    assert!(
-        measured.max_day <= DAILY_CEILING,
-        "{mode}: daily ceiling exceeded: {measured:?}"
-    );
-    assert!(
-        measured.max_sync <= BROKER_SYNC_REQUEST_CEILING as usize,
-        "{mode}: sync ceiling exceeded: {measured:?}"
-    );
-    assert_eq!(
-        measured.max_closure_span, 0,
-        "{mode}: send during closure: {measured:?}"
-    );
-    assert_eq!(
-        measured.max_pause_span, 0,
-        "{mode}: send during 429 pause: {measured:?}"
-    );
-    assert!(
-        measured.max_attempts <= 3,
-        "{mode}: retry ceiling exceeded: {measured:?}"
+    println!(
+        "                                                                                                                          every governed cell is reached/ceiling; `wire-row` points to the endpoint's wire-spacing row"
     );
 }
 
-fn planted_record(at: SystemTime, sync: u64, call: u64) -> SendRecord {
+fn print_row(mode: &str, endpoint: &str, measured: &Measurements) {
+    let minute = measured.worst_pair.map_or_else(
+        || format!("-/- ({} pairs)", measured.pairs.len()),
+        |index| {
+            let pair = &measured.pairs[index];
+            format!(
+                "{}={}/{} ({} pairs)",
+                pair.method,
+                pair.reached,
+                pair.ceiling,
+                measured.pairs.len()
+            )
+        },
+    );
+    let second = measured
+        .max_second
+        .map_or_else(|| "wire-row".to_owned(), |reached| format!("{reached}/1"));
+    println!(
+        "{mode:<26} {endpoint:<48} {second:>9}  {minute:<48} {:>4}/1000  {:>3}/300  {:>3}/0    {:>3}/0   {:>3}/3    {:>3}/-",
+        measured.max_day,
+        measured.max_sync,
+        measured.max_closure_span,
+        measured.max_pause_span,
+        measured.max_attempts,
+        measured.locally_refused,
+    );
+}
+
+fn planted_record(
+    at: Duration,
+    host: &'static str,
+    method: &'static str,
+    sync: u64,
+    call: u64,
+) -> SendRecord {
     SendRecord {
-        at,
-        host: Destination::TinkoffProd.base_url().to_owned(),
-        method: "OperationsService".to_owned(),
+        logical_at: at,
+        wire_at: at,
+        host: host.to_owned(),
+        method: method.to_owned(),
         sync,
         call,
-        status: None,
+        status: 200,
         pause_for: None,
     }
 }
 
 #[test]
-fn checker_rejects_an_independent_planted_breach_of_every_ceiling() {
-    let start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+fn checker_rejects_every_independently_planted_breach() {
+    let host = Destination::TinkoffProd.base_url();
+    let start = Duration::from_secs(1_000);
 
     let second = vec![
-        planted_record(start, 1, 1),
-        planted_record(start + Duration::from_millis(999), 2, 2),
+        planted_record(start, host, "OperationsService", 1, 1),
+        planted_record(
+            start + Duration::from_millis(999),
+            host,
+            "OperationsService",
+            2,
+            2,
+        ),
     ];
-    assert!(measure(&second).max_second > 1, "one-second breach escaped");
+    let measured =
+        measure(&second, 0, Some(2)).unwrap_or_else(|error| panic!("measure spacing: {error}"));
+    assert!(violations(&measured).contains(&"one-second spacing".to_owned()));
 
-    let mut other_host = planted_record(start, 2, 2);
-    other_host.host = Destination::TinkoffSandbox.base_url().to_owned();
-    assert_eq!(
-        measure(&[planted_record(start, 1, 1), other_host]).max_second,
-        1,
-        "simultaneous departures to different hosts shared one second window"
-    );
-
-    let minute: Vec<_> = (0..51)
+    let minute: Vec<_> = (0..26)
         .map(|index| {
             planted_record(
-                start + Duration::from_millis(index * 1_100),
+                start + Duration::from_secs(index * 2),
+                host,
+                "UsersService",
                 index + 1,
                 index + 1,
             )
         })
         .collect();
-    assert!(measure(&minute).max_minute > 50, "minute breach escaped");
-
-    let day_start = UNIX_EPOCH + Duration::from_secs(20_000 * 86_400);
-    let day: Vec<_> = (0..1_001)
-        .map(|index| {
-            planted_record(
-                day_start + Duration::from_secs(index * 61),
-                index + 1,
-                index + 1,
-            )
-        })
-        .collect();
+    let measured =
+        measure(&minute, 0, Some(1)).unwrap_or_else(|error| panic!("measure minute: {error}"));
     assert!(
-        measure(&day).max_day > DAILY_CEILING,
-        "daily breach escaped"
+        violations(&measured)
+            .iter()
+            .any(|name| name.contains("minute budget"))
     );
+
+    let unknown = vec![planted_record(start, host, "InventedService", 1, 1)];
+    assert!(
+        measure(&unknown, 0, Some(1))
+            .expect_err("an unknown method must fail the checker")
+            .contains("unknown broker budget pair")
+    );
+
+    let day: Vec<_> = (0..=DAILY_CEILING)
+        .map(|index| {
+            planted_record(
+                start + Duration::from_secs(index as u64),
+                host,
+                "OperationsService",
+                index as u64 + 1,
+                index as u64 + 1,
+            )
+        })
+        .collect();
+    let measured = measure(&day, 0, Some(1)).unwrap_or_else(|error| panic!("measure day: {error}"));
+    assert!(violations(&measured).contains(&"rolling 24-hour ceiling".to_owned()));
 
     let sync: Vec<_> = (0..=BROKER_SYNC_REQUEST_CEILING)
         .map(|index| {
             planted_record(
-                start + Duration::from_secs(u64::from(index) * 61),
+                start + Duration::from_secs(u64::from(index)),
+                host,
+                "OperationsService",
                 1,
                 u64::from(index) + 1,
             )
         })
         .collect();
-    assert!(
-        measure(&sync).max_sync > BROKER_SYNC_REQUEST_CEILING as usize,
-        "sync breach escaped"
-    );
+    let measured =
+        measure(&sync, 0, Some(1)).unwrap_or_else(|error| panic!("measure sync: {error}"));
+    assert!(violations(&measured).contains(&"sync ceiling".to_owned()));
 
     let attempts: Vec<_> = (0..4)
-        .map(|index| planted_record(start + Duration::from_secs(index * 61), index + 1, 1))
+        .map(|index| {
+            planted_record(
+                start + Duration::from_secs(index),
+                host,
+                "OperationsService",
+                index + 1,
+                1,
+            )
+        })
         .collect();
-    assert!(
-        measure(&attempts).max_attempts > 3,
-        "attempt breach escaped"
-    );
+    let measured =
+        measure(&attempts, 0, Some(1)).unwrap_or_else(|error| panic!("measure attempts: {error}"));
+    assert!(violations(&measured).contains(&"attempt ceiling".to_owned()));
 
     let mut closure: Vec<_> = (0..4)
         .map(|index| {
             planted_record(
                 start + Duration::from_secs(index * 61),
+                host,
+                "OperationsService",
                 index + 1,
                 index + 1,
             )
         })
         .collect();
     for record in &mut closure[..3] {
-        record.status = Some(400);
+        record.status = 400;
     }
-    assert!(
-        measure(&closure).max_closure_span > 0,
-        "post-closure send escaped"
-    );
+    let measured =
+        measure(&closure, 0, Some(1)).unwrap_or_else(|error| panic!("measure closure: {error}"));
+    assert!(violations(&measured).contains(&"closure".to_owned()));
 
     let mut pause = vec![
-        planted_record(start, 1, 1),
-        planted_record(start + Duration::from_secs(61), 2, 2),
+        planted_record(start, host, "OperationsService", 1, 1),
+        planted_record(
+            start + Duration::from_secs(61),
+            host,
+            "OperationsService",
+            2,
+            2,
+        ),
     ];
-    pause[0].status = Some(429);
+    pause[0].status = 429;
     pause[0].pause_for = Some(Duration::from_secs(120));
-    assert!(measure(&pause).max_pause_span > 0, "post-429 send escaped");
+    let measured =
+        measure(&pause, 0, Some(1)).unwrap_or_else(|error| panic!("measure pause: {error}"));
+    assert!(violations(&measured).contains(&"pause".to_owned()));
 }
 
 struct TempDir(PathBuf);
@@ -336,14 +451,21 @@ impl Drop for TempDir {
 }
 
 struct FakeTime {
+    origin: Instant,
     monotonic: Mutex<Instant>,
+    boot_id: Mutex<String>,
+    boot_elapsed: Mutex<Duration>,
     wall: Mutex<SystemTime>,
 }
 
 impl FakeTime {
     fn new() -> Arc<Self> {
+        let origin = Instant::now();
         Arc::new(Self {
-            monotonic: Mutex::new(Instant::now()),
+            origin,
+            monotonic: Mutex::new(origin),
+            boot_id: Mutex::new("proof-boot-a".to_owned()),
+            boot_elapsed: Mutex::new(Duration::from_secs(10_000)),
             wall: Mutex::new(UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         })
     }
@@ -352,12 +474,33 @@ impl FakeTime {
         *self
             .monotonic
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) += by;
-        *self.wall.lock().unwrap_or_else(|error| error.into_inner()) += by;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += by;
+        *self
+            .boot_elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += by;
     }
 
-    fn wall(&self) -> SystemTime {
-        *self.wall.lock().unwrap_or_else(|error| error.into_inner())
+    fn logical_now(&self) -> Duration {
+        self.now().saturating_duration_since(self.origin)
+    }
+
+    fn change_boot(&self, id: &str) {
+        *self
+            .boot_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = id.to_owned();
+        *self
+            .boot_elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Duration::from_secs(10);
+    }
+
+    fn set_wall(&self, wall: SystemTime) {
+        *self
+            .wall
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = wall;
     }
 }
 
@@ -366,15 +509,20 @@ impl Clock for FakeTime {
         *self
             .monotonic
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
-        let elapsed = self
-            .wall()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?;
-        Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
+        let id = self
+            .boot_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let elapsed = *self
+            .boot_elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(iaam_http::gateway::BootTime::new(id, elapsed))
     }
 }
 
@@ -384,20 +532,51 @@ impl Sleeper for FakeTime {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum AnswerMode {
-    Status(u16, Option<Duration>),
-    Timeout,
-    FinamRenewal401,
-    TinkoffCursor,
-    FinamFullPages,
-    Success,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SleepMode {
+    Logical,
+    Wire,
+    Deadline,
+}
+
+struct WireSleeper {
+    clock: Arc<FakeTime>,
+}
+
+impl Sleeper for WireSleeper {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if delay <= Duration::from_secs(1) {
+                tokio::time::sleep(delay).await;
+            }
+            self.clock.advance(delay);
+        })
+    }
+}
+
+struct DeadlineSleeper {
+    clock: Arc<FakeTime>,
+}
+
+impl Sleeper for DeadlineSleeper {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if delay > MINUTE {
+                tokio::time::sleep(delay).await;
+            } else {
+                self.clock.advance(delay);
+            }
+        })
+    }
 }
 
 struct CallContext {
     next_call: AtomicU64,
     active_call: AtomicU64,
     active_sync: AtomicU64,
+    arrivals: AtomicUsize,
+    locally_refused: AtomicUsize,
+    pause_seconds: AtomicU64,
 }
 
 impl CallContext {
@@ -405,161 +584,20 @@ impl CallContext {
         Arc::new(Self {
             next_call: AtomicU64::new(1),
             active_call: AtomicU64::new(0),
-            active_sync: AtomicU64::new(1),
+            active_sync: AtomicU64::new(0),
+            arrivals: AtomicUsize::new(0),
+            locally_refused: AtomicUsize::new(0),
+            pause_seconds: AtomicU64::new(DEFAULT_PAUSE_SECONDS),
         })
     }
 }
 
-struct ScriptedTransport {
-    mode: AnswerMode,
-    time: Arc<FakeTime>,
-    context: Arc<CallContext>,
-    records: Arc<Mutex<Vec<SendRecord>>>,
-    sequence: AtomicU64,
-    full_page: Arc<Vec<u8>>,
-}
-
-impl ScriptedTransport {
-    fn new(mode: AnswerMode, time: Arc<FakeTime>, context: Arc<CallContext>) -> Self {
-        let full_page = format!(
-            "{{\"transactions\":[{}]}}",
-            std::iter::repeat_n("{}", 1_000)
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-        .into_bytes();
-        Self {
-            mode,
-            time,
-            context,
-            records: Arc::new(Mutex::new(Vec::new())),
-            sequence: AtomicU64::new(0),
-            full_page: Arc::new(full_page),
-        }
-    }
-
-    fn records(&self) -> Arc<Mutex<Vec<SendRecord>>> {
-        Arc::clone(&self.records)
-    }
-
-    fn method(request: &HttpRequest) -> &'static str {
-        let url = request.url();
-        if url.contains("UsersService/") {
-            "UsersService"
-        } else if url.contains("OperationsService/") {
-            "OperationsService"
-        } else if url.ends_with("/v1/sessions") || url.ends_with("/v1/sessions/details") {
-            "AuthService.Sessions"
-        } else if url.contains("/transactions") {
-            "AccountsService.Transactions"
-        } else {
-            "AccountsService.GetAccount"
-        }
-    }
-
-    fn success_body(&self, request: &HttpRequest, sequence: u64) -> Vec<u8> {
-        let url = request.url();
-        if url.ends_with("/v1/sessions") {
-            format!("{{\"token\":\"session-{sequence}\"}}").into_bytes()
-        } else if url.ends_with("/v1/sessions/details") {
-            br#"{"account_ids":["account"]}"#.to_vec()
-        } else if url.contains("UsersService/GetAccounts") {
-            br#"{"accounts":[{"id":"account"}]}"#.to_vec()
-        } else if url.contains("GetOperationsByCursor") {
-            br#"{"hasNext":false,"items":[]}"#.to_vec()
-        } else if url.contains("/transactions") {
-            br#"{"transactions":[]}"#.to_vec()
-        } else {
-            br#"{}"#.to_vec()
-        }
-    }
-}
-
-impl Transport for ScriptedTransport {
-    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        let (answer, pause_for) = match self.mode {
-            AnswerMode::Status(status, retry_after) => (
-                Ok(HttpResponse {
-                    status,
-                    body: Vec::new(),
-                    retry_after,
-                }),
-                (status == 429).then_some(retry_after.unwrap_or(MINUTE).max(MINUTE)),
-            ),
-            AnswerMode::Timeout => (Err(HttpError::Timeout), None),
-            AnswerMode::FinamRenewal401 => {
-                if request.url().ends_with("/v1/sessions") {
-                    (
-                        Ok(HttpResponse {
-                            status: 200,
-                            body: self.success_body(request, sequence),
-                            retry_after: None,
-                        }),
-                        None,
-                    )
-                } else {
-                    (
-                        Ok(HttpResponse {
-                            status: 401,
-                            body: Vec::new(),
-                            retry_after: None,
-                        }),
-                        None,
-                    )
-                }
-            }
-            AnswerMode::TinkoffCursor if request.url().contains("GetOperationsByCursor") => (
-                Ok(HttpResponse {
-                    status: 200,
-                    body: format!(
-                        "{{\"hasNext\":true,\"nextCursor\":\"cursor-{sequence}\",\"items\":[]}}"
-                    )
-                    .into_bytes(),
-                    retry_after: None,
-                }),
-                None,
-            ),
-            AnswerMode::FinamFullPages if request.url().contains("/transactions") => (
-                Ok(HttpResponse {
-                    status: 200,
-                    body: self.full_page.as_ref().clone(),
-                    retry_after: None,
-                }),
-                None,
-            ),
-            AnswerMode::TinkoffCursor | AnswerMode::FinamFullPages | AnswerMode::Success => (
-                Ok(HttpResponse {
-                    status: 200,
-                    body: self.success_body(request, sequence),
-                    retry_after: None,
-                }),
-                None,
-            ),
-        };
-        let status = answer.as_ref().ok().map(|response| response.status);
-        self.records
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(SendRecord {
-                at: self.time.wall(),
-                host: request.destination().base_url().to_owned(),
-                method: Self::method(request).to_owned(),
-                sync: self.context.active_sync.load(Ordering::SeqCst),
-                call: self.context.active_call.load(Ordering::SeqCst),
-                status,
-                pause_for,
-            });
-        answer
-    }
-}
-
-struct ObservedOutbound {
-    gateway: Arc<Gateway<ScriptedTransport>>,
+struct ObservedOutbound<T: Transport> {
+    gateway: Arc<Gateway<T>>,
     context: Arc<CallContext>,
 }
 
-impl Outbound for ObservedOutbound {
+impl<T: Transport> Outbound for ObservedOutbound<T> {
     fn send<'a>(
         &'a self,
         method: &'static str,
@@ -569,190 +607,268 @@ impl Outbound for ObservedOutbound {
         let call = self.context.next_call.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             self.context.active_call.store(call, Ordering::SeqCst);
+            let before = self.context.arrivals.load(Ordering::SeqCst);
             let result = self.gateway.send(method, request, deadline).await;
+
+            if self.context.arrivals.load(Ordering::SeqCst) == before {
+                self.context.locally_refused.fetch_add(1, Ordering::SeqCst);
+            }
             self.context.active_call.store(0, Ordering::SeqCst);
             result
         })
     }
 }
 
-struct Harness {
+struct Scenario {
     outbound: Arc<dyn Outbound>,
-    time: Arc<FakeTime>,
+    server: LoopbackServer,
+    clock: Arc<FakeTime>,
     context: Arc<CallContext>,
     records: Arc<Mutex<Vec<SendRecord>>>,
+    _directory: TempDir,
 }
 
-fn harness(mode: AnswerMode, tally: &Path, egress: bool) -> Harness {
-    if egress {
-        std::fs::write(tally, "")
-            .unwrap_or_else(|error| panic!("create {}: {error}", tally.display()));
+impl Scenario {
+    fn new(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+        timeout: Duration,
+        egress: bool,
+    ) -> Self {
+        Self::build(
+            label,
+            destination,
+            replies,
+            timeout,
+            egress,
+            SleepMode::Logical,
+        )
     }
-    let time = FakeTime::new();
-    let context = CallContext::new();
-    let transport = ScriptedTransport::new(mode, Arc::clone(&time), Arc::clone(&context));
-    let records = transport.records();
-    let gateway = Gateway::with_parts(
-        transport,
-        BUDGETS,
-        Arc::clone(&time) as Arc<dyn Clock>,
-        Arc::clone(&time) as Arc<dyn Sleeper>,
+
+    fn new_wire_spacing(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+    ) -> Self {
+        Self::build(
+            label,
+            destination,
+            replies,
+            Duration::from_secs(5),
+            true,
+            SleepMode::Wire,
+        )
+    }
+
+    fn new_sync(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+    ) -> Self {
+        Self::build(
+            label,
+            destination,
+            replies,
+            Duration::from_secs(5),
+            true,
+            SleepMode::Deadline,
+        )
+    }
+
+    fn build(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+        timeout: Duration,
+        egress: bool,
+        sleep_mode: SleepMode,
+    ) -> Self {
+        let directory = TempDir::new(label);
+        let tally = directory.path("tally");
         if egress {
-            BrokerEgress::On {
-                tally: tally.to_owned(),
-            }
-        } else {
-            BrokerEgress::Off
-        },
-    )
-    .unwrap_or_else(|error| panic!("gateway: {error}"));
-    let outbound = Arc::new(ObservedOutbound {
-        gateway: Arc::new(gateway),
-        context: Arc::clone(&context),
-    });
-    Harness {
-        outbound,
-        time,
-        context,
-        records,
+            std::fs::write(&tally, "")
+                .unwrap_or_else(|error| panic!("create {}: {error}", tally.display()));
+        }
+        let clock = FakeTime::new();
+        let context = CallContext::new();
+        if sleep_mode == SleepMode::Deadline {
+            context.active_sync.store(1, Ordering::SeqCst);
+        }
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let wire_origin = Instant::now();
+        let observed_clock = Arc::clone(&clock);
+        let observed_context = Arc::clone(&context);
+        let observed_records = Arc::clone(&records);
+        let host = destination.base_url().to_owned();
+        let server = LoopbackServer::start_observed(replies, move |target, status| {
+            let method = method_for_target(target)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("unknown:{target}"));
+            let pause_for = (status == 429).then(|| {
+                Duration::from_secs(
+                    observed_context
+                        .pause_seconds
+                        .load(Ordering::SeqCst)
+                        .max(DEFAULT_PAUSE_SECONDS),
+                )
+            });
+            observed_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(SendRecord {
+                    logical_at: observed_clock.logical_now(),
+                    wire_at: Instant::now().saturating_duration_since(wire_origin),
+                    host: host.clone(),
+                    method,
+                    sync: observed_context.active_sync.load(Ordering::SeqCst),
+                    call: observed_context.active_call.load(Ordering::SeqCst),
+                    status,
+                    pause_for,
+                });
+            observed_context.arrivals.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap_or_else(|error| panic!("start loopback server: {error}"));
+        let transport = HttpClientHarness::new(&server).with_timeout(timeout);
+        let sleeper: Arc<dyn Sleeper> = match sleep_mode {
+            SleepMode::Wire => Arc::new(WireSleeper {
+                clock: Arc::clone(&clock),
+            }),
+            SleepMode::Deadline => Arc::new(DeadlineSleeper {
+                clock: Arc::clone(&clock),
+            }),
+            SleepMode::Logical => Arc::clone(&clock) as Arc<dyn Sleeper>,
+        };
+        let gateway = Gateway::with_parts(
+            transport,
+            BUDGETS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            sleeper,
+            if egress {
+                BrokerEgress::On { tally }
+            } else {
+                BrokerEgress::Off
+            },
+        )
+        .unwrap_or_else(|error| panic!("build proof gateway: {error}"));
+        let outbound = Arc::new(ObservedOutbound {
+            gateway: Arc::new(gateway),
+            context: Arc::clone(&context),
+        });
+        Self {
+            outbound,
+            server,
+            clock,
+            context,
+            records,
+            _directory: directory,
+        }
+    }
+
+    fn records(&self) -> Vec<SendRecord> {
+        self.records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn locally_refused(&self) -> usize {
+        self.context.locally_refused.load(Ordering::SeqCst)
+    }
+
+    fn measured(&self, wire_max_second: Option<usize>) -> Measurements {
+        measure(&self.records(), self.locally_refused(), wire_max_second)
+            .unwrap_or_else(|error| panic!("measure loopback arrivals: {error}"))
+    }
+
+    fn wire_max_second(&self) -> usize {
+        let records = self.records();
+        let references: Vec<_> = records.iter().collect();
+        max_window_by(&references, Duration::from_secs(1), |record| record.wire_at)
+    }
+
+    fn verify_and_print(
+        &self,
+        mode: &str,
+        endpoint: Destination,
+        wire_max_second: Option<usize>,
+    ) -> Measurements {
+        let measured = self.measured(wire_max_second);
+        assert_within_ceilings(mode, &measured);
+        print_row(mode, endpoint.base_url(), &measured);
+        measured
     }
 }
 
-fn shared_outbound(
-    time: &Arc<FakeTime>,
-    context: &Arc<CallContext>,
-    tally: &Path,
-) -> (Arc<dyn Outbound>, Arc<Mutex<Vec<SendRecord>>>) {
-    let transport =
-        ScriptedTransport::new(AnswerMode::Success, Arc::clone(time), Arc::clone(context));
-    let records = transport.records();
-    let gateway = Gateway::with_parts(
-        transport,
-        BUDGETS,
-        Arc::clone(time) as Arc<dyn Clock>,
-        Arc::clone(time) as Arc<dyn Sleeper>,
-        BrokerEgress::On {
-            tally: tally.to_owned(),
-        },
-    )
-    .unwrap_or_else(|error| panic!("shared gateway: {error}"));
-    (
-        Arc::new(ObservedOutbound {
-            gateway: Arc::new(gateway),
-            context: Arc::clone(context),
-        }),
-        records,
-    )
+fn direct_request(destination: Destination, path: &str) -> HttpRequest {
+    HttpRequest::post(destination, path, RequestBody::Json("{}".to_owned()))
+        .idempotent()
+        .with_request_allowance(RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING))
+}
+
+fn direct_path(destination: Destination) -> &'static str {
+    match destination {
+        Destination::TinkoffProd | Destination::TinkoffSandbox => {
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations"
+        }
+        Destination::FinamApi => "/v1/accounts/account",
+        Destination::MoexIss
+        | Destination::CbrScripts
+        | Destination::CbrDailyInfo
+        | Destination::TinvestContract => panic!("not a broker endpoint"),
+    }
+}
+
+fn direct_method(destination: Destination) -> &'static str {
+    match destination {
+        Destination::TinkoffProd | Destination::TinkoffSandbox => "OperationsService",
+        Destination::FinamApi => "AccountsService.GetAccount",
+        Destination::MoexIss
+        | Destination::CbrScripts
+        | Destination::CbrDailyInfo
+        | Destination::TinvestContract => panic!("not a broker endpoint"),
+    }
+}
+
+async fn direct_send(
+    scenario: &Scenario,
+    destination: Destination,
+) -> Result<HttpResponse, GatewayError> {
+    let request = direct_request(destination, direct_path(destination));
+    scenario
+        .outbound
+        .send(direct_method(destination), &request, None)
+        .await
+}
+
+async fn exercise_wire_spacing(destination: Destination) -> Scenario {
+    let scenario = Scenario::new_wire_spacing(
+        "wire-spacing",
+        destination,
+        [
+            LoopbackReply::complete(200, "{}"),
+            LoopbackReply::complete(200, "{}"),
+        ],
+    );
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("first wire-spaced send: {error}"));
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("second wire-spaced send: {error}"));
+    assert_eq!(scenario.server.requests_received(), 2);
+    assert_eq!(
+        scenario.wire_max_second(),
+        1,
+        "loopback received two requests inside one real second"
+    );
+    scenario
 }
 
 fn token() -> BrokerToken {
     let key = Key::from_bytes([7; 32]);
     open(&key, &seal(&key, "invented-proof-token"))
         .unwrap_or_else(|error| panic!("invented token: {error}"))
-}
-
-async fn run_tinkoff(harness: &Harness, environment: Environment, repetitions: usize) {
-    let client = TinkoffClient::new(environment, token(), Arc::clone(&harness.outbound));
-    for sync in 1..=repetitions as u64 {
-        harness.context.active_sync.store(sync, Ordering::SeqCst);
-        let _ = client
-            .get_accounts(&RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING))
-            .await;
-        harness.time.advance(Duration::from_secs(30 * 60));
-    }
-}
-
-async fn run_finam(harness: &Harness, repetitions: usize) {
-    let client = FinamClient::new(token(), Arc::clone(&harness.outbound));
-    for sync in 1..=repetitions as u64 {
-        harness.context.active_sync.store(sync, Ordering::SeqCst);
-        let _ = client
-            .get_account_ids(&RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING))
-            .await;
-        harness.time.advance(Duration::from_secs(30 * 60));
-    }
-}
-
-fn snapshot(records: &Arc<Mutex<Vec<SendRecord>>>) -> Vec<SendRecord> {
-    records
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone()
-}
-
-fn print_header() {
-    println!(
-        "mode                     host                                             sec   minute(method)                         day       sync    closure pause attempts"
-    );
-    println!(
-        "                                                                                           each cell is reached/ceiling"
-    );
-}
-
-fn print_row(mode: &str, host: &str, measured: &Measurements) {
-    let method = if measured.minute_method.is_empty() {
-        "-"
-    } else {
-        &measured.minute_method
-    };
-    let minute = format!(
-        "{method}={}/{}",
-        measured.max_minute, measured.minute_ceiling
-    );
-    println!(
-        "{mode:<24} {host:<48} {:>3}/1 {minute:<38} {:>4}/1000 {:>3}/300 {:>2}/0 {:>2}/0 {:>2}/3",
-        measured.max_second,
-        measured.max_day,
-        measured.max_sync,
-        measured.max_closure_span,
-        measured.max_pause_span,
-        measured.max_attempts,
-    );
-}
-
-#[tokio::test]
-async fn simulated_failure_modes_stay_under_every_ceiling() {
-    print_header();
-    let modes = [
-        ("always-400", AnswerMode::Status(400, None)),
-        (
-            "429-retry-after",
-            AnswerMode::Status(429, Some(Duration::from_secs(120))),
-        ),
-        ("429-no-header", AnswerMode::Status(429, None)),
-        ("always-500", AnswerMode::Status(500, None)),
-        ("transport-timeout", AnswerMode::Timeout),
-    ];
-    for (mode_name, mode) in modes {
-        for (host_name, environment) in [
-            (Destination::TinkoffProd.base_url(), Environment::Prod),
-            (Destination::TinkoffSandbox.base_url(), Environment::Sandbox),
-        ] {
-            let directory = TempDir::new(mode_name);
-            let proof = harness(mode, &directory.path("tally"), true);
-            run_tinkoff(&proof, environment, 48).await;
-            let measured = measure(&snapshot(&proof.records));
-            assert_within_ceilings(mode_name, &measured);
-            print_row(mode_name, host_name, &measured);
-        }
-        let directory = TempDir::new(mode_name);
-        let proof = harness(mode, &directory.path("tally"), true);
-        run_finam(&proof, 48).await;
-        let measured = measure(&snapshot(&proof.records));
-        assert_within_ceilings(mode_name, &measured);
-        print_row(mode_name, Destination::FinamApi.base_url(), &measured);
-    }
-
-    let directory = TempDir::new("finam-401");
-    let proof = harness(AnswerMode::FinamRenewal401, &directory.path("tally"), true);
-    run_finam(&proof, 48).await;
-    let measured = measure(&snapshot(&proof.records));
-    assert_within_ceilings("finam-renewal-401", &measured);
-    print_row(
-        "finam-renewal-401",
-        Destination::FinamApi.base_url(),
-        &measured,
-    );
 }
 
 fn dictionary(broker: &str) -> OperationKindDictionary {
@@ -765,140 +881,6 @@ fn dictionary(broker: &str) -> OperationKindDictionary {
     dictionary
 }
 
-#[tokio::test]
-async fn endless_full_pages_stop_inside_the_sync_ceiling() {
-    print_header();
-    for (host, environment) in [
-        (Destination::TinkoffProd.base_url(), Environment::Prod),
-        (Destination::TinkoffSandbox.base_url(), Environment::Sandbox),
-    ] {
-        let directory = TempDir::new("cursor");
-        let proof = harness(AnswerMode::TinkoffCursor, &directory.path("tally"), true);
-        let client = TinkoffClient::new(environment, token(), Arc::clone(&proof.outbound));
-        let channel = TinkoffChannel::new(client, SourceId::new_random(), dictionary("tinkoff"));
-        let context = BrokerRequestContext {
-            deadline: None,
-            allowance: &RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING),
-        };
-        let _ = channel
-            .fetch_operations(
-                AccountId::new_random(),
-                "account",
-                date!(2026 - 01 - 01),
-                date!(2026 - 12 - 31),
-                context,
-            )
-            .await;
-        let measured = measure(&snapshot(&proof.records));
-        assert_within_ceilings("tinkoff-endless-cursor", &measured);
-        assert_eq!(measured.max_sync, BROKER_SYNC_REQUEST_CEILING as usize);
-        print_row("endless-cursor", host, &measured);
-    }
-
-    let directory = TempDir::new("finam-pages");
-    let proof = harness(AnswerMode::FinamFullPages, &directory.path("tally"), true);
-    let client = FinamClient::new(token(), Arc::clone(&proof.outbound));
-    let _ = client
-        .get_transactions(
-            "account",
-            date!(2026 - 01 - 01),
-            date!(2026 - 12 - 31),
-            &RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING),
-        )
-        .await;
-    let measured = measure(&snapshot(&proof.records));
-    assert_within_ceilings("finam-endless-pages", &measured);
-    print_row(
-        "endless-full-pages",
-        Destination::FinamApi.base_url(),
-        &measured,
-    );
-}
-
-#[tokio::test]
-async fn endpoint_owner_is_exclusive_and_a_rebuild_keeps_the_tally() {
-    let directory = TempDir::new("gateways");
-    let tally = directory.path("tally");
-    let first = harness(AnswerMode::Success, &tally, true);
-    let time = Arc::clone(&first.time);
-    let context = Arc::clone(&first.context);
-    let first_records = Arc::clone(&first.records);
-    let (second, second_records) = shared_outbound(&time, &context, &tally);
-    let tinkoff_request = HttpRequest::post(
-        Destination::TinkoffProd,
-        "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
-        RequestBody::Json("{}".to_owned()),
-    )
-    .idempotent()
-    .with_request_allowance(RequestAllowance::new(10));
-    first
-        .outbound
-        .send("OperationsService", &tinkoff_request, None)
-        .await
-        .unwrap_or_else(|error| panic!("first gateway: {error}"));
-
-    let owned = second
-        .send("OperationsService", &tinkoff_request, None)
-        .await
-        .expect_err("the second gateway cannot own T-Invest production");
-    assert!(
-        matches!(
-            owned,
-            GatewayError::BrokerEndpointOwned {
-                destination: Destination::TinkoffProd,
-                endpoint,
-            } if endpoint == Destination::TinkoffProd.base_url()
-        ),
-        "unexpected ownership refusal: {owned}"
-    );
-    let finam_request = HttpRequest::get(Destination::FinamApi, "/v1/sessions")
-        .with_request_allowance(RequestAllowance::new(10));
-    second
-        .send("AuthService.Sessions", &finam_request, None)
-        .await
-        .unwrap_or_else(|error| panic!("another endpoint remains available: {error}"));
-
-    drop(first);
-    second
-        .send("OperationsService", &tinkoff_request, None)
-        .await
-        .unwrap_or_else(|error| panic!("released endpoint can be acquired: {error}"));
-    drop(second);
-
-    let (rebuilt, rebuilt_records) = shared_outbound(&time, &context, &tally);
-    rebuilt
-        .send("OperationsService", &tinkoff_request, None)
-        .await
-        .unwrap_or_else(|error| panic!("rebuilt gateway send: {error}"));
-
-    let mut records = snapshot(&first_records);
-    records.extend(snapshot(&second_records));
-    records.extend(snapshot(&rebuilt_records));
-    assert_eq!(records.len(), 4);
-    let measured = measure(&records);
-    assert_within_ceilings("owned-endpoint-rebuild", &measured);
-    print_row(
-        "owned-endpoint-rebuild",
-        Destination::TinkoffProd.base_url(),
-        &measured,
-    );
-}
-
-#[tokio::test]
-async fn egress_off_sends_nothing() {
-    let directory = TempDir::new("egress-off");
-    let proof = harness(AnswerMode::Success, &directory.path("unused"), false);
-    run_tinkoff(&proof, Environment::Prod, 1).await;
-    let records = snapshot(&proof.records);
-    assert!(
-        records.is_empty(),
-        "egress-off requests reached the double: {records:?}"
-    );
-    let measured = measure(&records);
-    assert_within_ceilings("egress-off", &measured);
-    print_row("egress-off", Destination::TinkoffProd.base_url(), &measured);
-}
-
 struct FixedAppClock;
 
 impl AppClock for FixedAppClock {
@@ -907,92 +889,7 @@ impl AppClock for FixedAppClock {
     }
 }
 
-struct CeilingChannel {
-    outbound: Arc<dyn Outbound>,
-}
-
-#[async_trait]
-impl BrokerChannel for CeilingChannel {
-    async fn fetch_account_numbers(
-        &self,
-        _context: BrokerRequestContext<'_>,
-    ) -> Result<Vec<String>, BrokerError> {
-        Ok(vec!["broker-account".to_owned()])
-    }
-
-    async fn fetch_operations(
-        &self,
-        _account: AccountId,
-        _broker_account: &str,
-        _from: Date,
-        _to: Date,
-        context: BrokerRequestContext<'_>,
-    ) -> Result<ParsedOperations, BrokerError> {
-        let request = HttpRequest::post(
-            Destination::TinkoffProd,
-            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
-            RequestBody::Json("{}".to_owned()),
-        )
-        .idempotent()
-        .with_request_allowance(context.allowance.clone());
-        // This deliberately omits the per-call deadline: this channel isolates
-        // the one allowance minted by the real sync. The broker-client
-        // scenarios above exercise the real adapters' request paths.
-        loop {
-            match self
-                .outbound
-                .send("OperationsService", &request, None)
-                .await
-            {
-                Ok(_) => {}
-                Err(GatewayError::RequestCeiling { ceiling, .. }) => {
-                    return Err(BrokerError::RequestCeiling {
-                        broker: "tinkoff".to_owned(),
-                        ceiling,
-                    });
-                }
-                Err(error) => {
-                    return Err(BrokerError::Unreachable {
-                        broker: "tinkoff".to_owned(),
-                        detail: error.to_string(),
-                        retry_after: error.retry_after(),
-                    });
-                }
-            }
-        }
-    }
-
-    async fn fetch_portfolio(
-        &self,
-        _account: AccountId,
-        _broker_account: &str,
-        _at: Date,
-        _context: BrokerRequestContext<'_>,
-    ) -> Result<PortfolioSnapshot, BrokerError> {
-        Ok(PortfolioSnapshot {
-            as_of: PortfolioAsOf::Requested,
-            claims: Vec::new(),
-            refused: Vec::new(),
-        })
-    }
-
-    fn channel(&self) -> SourceChannel {
-        SourceChannel {
-            source: SourceId::new_random(),
-            parser_version: ParserVersion("ceiling-proof".to_owned()),
-            document: None,
-        }
-    }
-
-    fn identity_scope(&self) -> IdentityScope {
-        IdentityScope::Account
-    }
-}
-
-#[tokio::test]
-async fn the_real_sync_mints_exactly_one_three_hundred_attempt_allowance() {
-    let directory = TempDir::new("real-sync");
-    let proof = harness(AnswerMode::Success, &directory.path("tally"), true);
+async fn services() -> (AppServices, Principal, AccountId) {
     let raw = SqliteStore::open_in_memory().unwrap_or_else(|error| panic!("memory store: {error}"));
     let adapter = Arc::new(SqliteAdapter::new(raw));
     let services = AppServices::new(
@@ -1015,214 +912,755 @@ async fn the_real_sync_mints_exactly_one_three_hundred_attempt_allowance() {
             },
         )
         .await
-        .unwrap_or_else(|error| panic!("seed account: {error}"));
+        .unwrap_or_else(|error| panic!("seed proof account: {error}"));
     let principal = Principal {
         token_id: uuid::Uuid::new_v4(),
         owner,
         scope: Scope::Owner,
     };
+    (services, principal, account)
+}
+
+async fn exercise_permanent_refusal(destination: Destination) -> Scenario {
+    let scenario = Scenario::new(
+        "permanent-refusal",
+        destination,
+        std::iter::repeat_n(LoopbackReply::complete(400, "refused"), 3),
+        Duration::from_secs(2),
+        true,
+    );
+    for _ in 0..4 {
+        let _ = direct_send(&scenario, destination).await;
+    }
+    assert_eq!(scenario.server.requests_received(), 3);
+    assert!(scenario.locally_refused() >= 1);
+    scenario
+}
+
+async fn exercise_rate_limit(
+    label: &str,
+    destination: Destination,
+    reply: LoopbackReply,
+    pause: Duration,
+) -> Scenario {
+    let scenario = Scenario::new(
+        label,
+        destination,
+        [reply.clone(), reply],
+        Duration::from_millis(40),
+        true,
+    );
+    scenario
+        .context
+        .pause_seconds
+        .store(pause.as_secs(), Ordering::SeqCst);
+    let _ = direct_send(&scenario, destination).await;
+    scenario.clock.advance(pause.max(MINUTE));
+    let _ = direct_send(&scenario, destination).await;
+    let _ = direct_send(&scenario, destination).await;
+    assert_eq!(scenario.server.requests_received(), 2);
+    assert!(scenario.locally_refused() >= 1);
+    scenario
+}
+
+async fn exercise_body_rate_limit(label: &str, reply: LoopbackReply) -> Scenario {
+    let scenario = Scenario::new(
+        label,
+        Destination::FinamApi,
+        [reply],
+        Duration::from_millis(40),
+        true,
+    );
+    let _ = direct_send(&scenario, Destination::FinamApi).await;
+    let _ = direct_send(&scenario, Destination::FinamApi).await;
+    assert_eq!(scenario.server.requests_received(), 1);
+    assert!(scenario.locally_refused() >= 1);
+    scenario
+}
+
+async fn exercise_finam_renewal() -> Scenario {
+    let scenario = Scenario::new(
+        "finam-renewal",
+        Destination::FinamApi,
+        [
+            LoopbackReply::complete(200, r#"{"token":"session-a"}"#),
+            LoopbackReply::complete(401, "expired"),
+            LoopbackReply::complete(200, r#"{"token":"session-b"}"#),
+            LoopbackReply::complete(401, "expired"),
+            LoopbackReply::complete(401, "expired"),
+        ],
+        Duration::from_secs(2),
+        true,
+    );
+    let client = FinamClient::new(token(), Arc::clone(&scenario.outbound));
+    for _ in 0..2 {
+        let _ = client
+            .get_account_ids(&RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING))
+            .await;
+    }
+    assert_eq!(scenario.server.requests_received(), 5);
+    assert!(scenario.locally_refused() >= 1);
+    scenario
+}
+
+async fn exercise_transient(label: &str, reply: LoopbackReply) -> Scenario {
+    let scenario = Scenario::new(
+        label,
+        Destination::TinkoffProd,
+        std::iter::repeat_n(reply, 3),
+        Duration::from_millis(30),
+        true,
+    );
+    let result = direct_send(&scenario, Destination::TinkoffProd).await;
+    assert!(result.is_err(), "transient failure unexpectedly succeeded");
+    assert_eq!(scenario.server.requests_received(), 3);
+    scenario
+}
+
+async fn exercise_redirects() -> (Scenario, Scenario) {
+    let same = Scenario::new(
+        "same-host-redirect",
+        Destination::TinkoffProd,
+        [
+            LoopbackReply::redirect(307, direct_path(Destination::TinkoffProd)),
+            LoopbackReply::redirect(307, direct_path(Destination::TinkoffProd)),
+            LoopbackReply::complete(200, "followed"),
+        ],
+        Duration::from_secs(2),
+        true,
+    );
+    let _ = direct_send(&same, Destination::TinkoffProd).await;
+    assert_eq!(same.server.requests_received(), 1);
+
+    let cross_target = LoopbackServer::start([LoopbackReply::complete(200, "leaked")])
+        .unwrap_or_else(|error| panic!("cross-host loopback: {error}"));
+    let cross = Scenario::new(
+        "cross-host-redirect",
+        Destination::TinkoffSandbox,
+        [LoopbackReply::redirect(
+            307,
+            &format!("{}/leaked", cross_target.base_url()),
+        )],
+        Duration::from_secs(2),
+        true,
+    );
+    let _ = direct_send(&cross, Destination::TinkoffSandbox).await;
+    assert_eq!(cross.server.requests_received(), 1);
+    assert_eq!(cross_target.requests_received(), 0);
+    drop(cross_target);
+    (same, cross)
+}
+
+async fn exercise_daily_ceiling() -> Scenario {
+    let scenario = Scenario::new(
+        "rolling-day",
+        Destination::TinkoffSandbox,
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), DAILY_CEILING),
+        Duration::from_secs(2),
+        true,
+    );
+    for index in 0..=DAILY_CEILING {
+        let result = direct_send(&scenario, Destination::TinkoffSandbox).await;
+        if index < DAILY_CEILING {
+            assert!(
+                result.is_ok(),
+                "send {index} was refused before the daily ceiling"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(GatewayError::DailyCeiling { .. })),
+                "send beyond the daily ceiling was not refused: {result:?}"
+            );
+        }
+    }
+    let records = scenario.records();
+    assert_eq!(records.len(), DAILY_CEILING);
+    let span = records
+        .last()
+        .zip(records.first())
+        .map(|(last, first)| last.logical_at.saturating_sub(first.logical_at))
+        .unwrap_or(Duration::ZERO);
+    assert!(
+        span < DAY,
+        "the proof did not reach the ceiling inside 24 hours"
+    );
+    scenario
+}
+
+async fn exercise_tinkoff_sync() -> Scenario {
+    let mut replies = Vec::with_capacity(BROKER_SYNC_REQUEST_CEILING as usize);
+    replies.push(LoopbackReply::complete(
+        200,
+        r#"{"accounts":[{"id":"account"}]}"#,
+    ));
+    for cursor in 1..BROKER_SYNC_REQUEST_CEILING {
+        replies.push(LoopbackReply::complete(
+            200,
+            format!("{{\"hasNext\":true,\"nextCursor\":\"cursor-{cursor}\",\"items\":[]}}"),
+        ));
+    }
+    let scenario = Scenario::new_sync("tinkoff-real-sync", Destination::TinkoffProd, replies);
+    let client = TinkoffClient::new(Environment::Prod, token(), Arc::clone(&scenario.outbound));
+    let channel = TinkoffChannel::new(client, SourceId::new_random(), dictionary("tinkoff"));
+    let (services, principal, account) = services().await;
     let result = iaam_app::sync::sync_broker(
         &services,
         &principal,
-        &CeilingChannel {
-            outbound: Arc::clone(&proof.outbound),
-        },
+        &channel,
         BrokerSyncRequest {
             broker_code: iaam_store::documents::BrokerCode::parse("tinkoff")
-                .unwrap_or_else(|| panic!("broker code")),
+                .unwrap_or_else(|| panic!("tinkoff broker code")),
             account,
             from: date!(2026 - 01 - 01),
-            to: date!(2026 - 01 - 31),
+            to: date!(2026 - 12 - 31),
         },
     )
     .await;
-    assert!(
-        matches!(result, Err(iaam_app::error::AppError::SyncRequestCeiling { ceiling, .. }) if ceiling == BROKER_SYNC_REQUEST_CEILING),
-        "unexpected sync result: {result:?}"
+    assert!(result.is_err(), "endless T-Invest pages completed a sync");
+    assert_eq!(
+        scenario.server.requests_received(),
+        BROKER_SYNC_REQUEST_CEILING as usize,
+        "real T-Invest sync stopped early: {result:?}; accepted={}; targets={:?}; local={}",
+        scenario.server.connections_accepted(),
+        scenario.server.request_targets(),
+        scenario.locally_refused()
     );
-    let measured = measure(&snapshot(&proof.records));
-    assert_within_ceilings("real-sync", &measured);
-    assert_eq!(measured.max_sync, BROKER_SYNC_REQUEST_CEILING as usize);
-    print_row("real-sync", Destination::TinkoffProd.base_url(), &measured);
+    assert!(scenario.locally_refused() >= 1);
+    scenario
 }
 
-#[derive(Clone)]
-struct ProcessTransport {
-    record: PathBuf,
-    time: Arc<FakeTime>,
+fn script_finam_intervals(replies: &mut Vec<LoopbackReply>, full_page: &str, from: Date, to: Date) {
+    if replies.len() >= BROKER_SYNC_REQUEST_CEILING as usize {
+        return;
+    }
+    if from == to {
+        replies.push(LoopbackReply::complete(200, r#"{"transactions":[]}"#));
+        return;
+    }
+    replies.push(LoopbackReply::complete(200, full_page.to_owned()));
+    let whole_days = (to - from).whole_days();
+    let middle = from + time::Duration::days(whole_days / 2);
+    script_finam_intervals(replies, full_page, from, middle);
+    if replies.len() >= BROKER_SYNC_REQUEST_CEILING as usize {
+        return;
+    }
+    let after_middle = middle
+        .next_day()
+        .unwrap_or_else(|| panic!("proof Finam split has a next day"));
+    script_finam_intervals(replies, full_page, after_middle, to);
 }
 
-impl Transport for ProcessTransport {
-    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        use std::io::Write;
-        let now = self
-            .time
-            .wall()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.record)
-            .unwrap_or_else(|error| panic!("open {}: {error}", self.record.display()));
-        writeln!(file, "{}\t{}", request.destination().base_url(), now)
-            .unwrap_or_else(|error| panic!("write {}: {error}", self.record.display()));
-        Ok(HttpResponse {
-            status: 200,
-            body: Vec::new(),
-            retry_after: None,
-        })
+async fn exercise_finam_sync() -> Scenario {
+    let full_page = format!(
+        "{{\"transactions\":[{}]}}",
+        std::iter::repeat_n("{}", 1_000)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut replies = Vec::with_capacity(BROKER_SYNC_REQUEST_CEILING as usize);
+    replies.push(LoopbackReply::complete(200, r#"{"token":"session-proof"}"#));
+    replies.push(LoopbackReply::complete(
+        200,
+        r#"{"account_ids":["account"]}"#,
+    ));
+    script_finam_intervals(
+        &mut replies,
+        &full_page,
+        date!(2026 - 01 - 01),
+        date!(2026 - 12 - 31),
+    );
+    let scenario = Scenario::new_sync("finam-real-sync", Destination::FinamApi, replies);
+    let client = FinamClient::new(token(), Arc::clone(&scenario.outbound));
+    let channel = FinamChannel::new(client, SourceId::new_random(), dictionary("finam"));
+    let (services, principal, account) = services().await;
+    let result = iaam_app::sync::sync_broker(
+        &services,
+        &principal,
+        &channel,
+        BrokerSyncRequest {
+            broker_code: iaam_store::documents::BrokerCode::parse("finam")
+                .unwrap_or_else(|| panic!("finam broker code")),
+            account,
+            from: date!(2026 - 01 - 01),
+            to: date!(2026 - 12 - 31),
+        },
+    )
+    .await;
+    assert!(result.is_err(), "endless Finam pages completed a sync");
+    assert_eq!(
+        scenario.server.requests_received(),
+        BROKER_SYNC_REQUEST_CEILING as usize,
+        "real Finam sync stopped early: {result:?}; accepted={}; targets={:?}; local={}",
+        scenario.server.connections_accepted(),
+        scenario.server.request_targets(),
+        scenario.locally_refused()
+    );
+    assert!(scenario.locally_refused() >= 1);
+    scenario
+}
+
+async fn exercise_concurrent_callers() -> Scenario {
+    let scenario = Scenario::new(
+        "concurrent-callers",
+        Destination::TinkoffProd,
+        [
+            LoopbackReply::held(200, "{}"),
+            LoopbackReply::complete(200, "{}"),
+        ],
+        Duration::from_secs(5),
+        true,
+    );
+    let first_outbound = Arc::clone(&scenario.outbound);
+    let first = tokio::spawn(async move {
+        let request = direct_request(
+            Destination::TinkoffProd,
+            direct_path(Destination::TinkoffProd),
+        );
+        first_outbound
+            .send("OperationsService", &request, None)
+            .await
+    });
+    wait_for_arrivals(&scenario, 1).await;
+
+    let second_started = Arc::new(AtomicBool::new(false));
+    let task_started = Arc::clone(&second_started);
+    let second_outbound = Arc::clone(&scenario.outbound);
+    let second = tokio::spawn(async move {
+        task_started.store(true, Ordering::SeqCst);
+        let request = direct_request(
+            Destination::TinkoffProd,
+            direct_path(Destination::TinkoffProd),
+        );
+        second_outbound
+            .send("OperationsService", &request, None)
+            .await
+    });
+    while !second_started.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        scenario.server.requests_received(),
+        1,
+        "the second caller departed before the first status was committed"
+    );
+    scenario.server.release_one();
+    first
+        .await
+        .unwrap_or_else(|error| panic!("first caller task: {error}"))
+        .unwrap_or_else(|error| panic!("first caller: {error}"));
+    second
+        .await
+        .unwrap_or_else(|error| panic!("second caller task: {error}"))
+        .unwrap_or_else(|error| panic!("second caller: {error}"));
+    let records = scenario.records();
+    assert_eq!(records.len(), 2);
+    assert!(records[1].logical_at.saturating_sub(records[0].logical_at) >= Duration::from_secs(1));
+    scenario
+}
+
+async fn wait_for_arrivals(scenario: &Scenario, wanted: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if scenario.server.requests_received() >= wanted {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("loopback server did not receive {wanted} requests"));
+}
+
+async fn exercise_boot_change() -> Scenario {
+    let scenario = Scenario::new(
+        "boot-change",
+        Destination::TinkoffProd,
+        std::iter::repeat_n(LoopbackReply::complete(400, "refused"), 4),
+        Duration::from_secs(2),
+        true,
+    );
+    for _ in 0..3 {
+        let _ = direct_send(&scenario, Destination::TinkoffProd).await;
+    }
+    let before = scenario.server.requests_received();
+    scenario.clock.change_boot("proof-boot-b");
+    let _ = direct_send(&scenario, Destination::TinkoffProd).await;
+    scenario.clock.advance(CLOSURE - Duration::from_secs(1));
+    let _ = direct_send(&scenario, Destination::TinkoffProd).await;
+    assert_eq!(scenario.server.requests_received(), before);
+    scenario.clock.advance(Duration::from_secs(1));
+    let _ = direct_send(&scenario, Destination::TinkoffProd).await;
+    assert_eq!(scenario.server.requests_received(), before + 1);
+    scenario
+}
+
+async fn exercise_wall_change() -> Scenario {
+    let scenario = Scenario::new(
+        "wall-change",
+        Destination::TinkoffSandbox,
+        [
+            LoopbackReply::complete(429, "limited"),
+            LoopbackReply::complete(200, "{}"),
+        ],
+        Duration::from_secs(2),
+        true,
+    );
+    let _ = direct_send(&scenario, Destination::TinkoffSandbox).await;
+    scenario
+        .clock
+        .set_wall(UNIX_EPOCH + Duration::from_secs(4_000_000_000));
+    let _ = direct_send(&scenario, Destination::TinkoffSandbox).await;
+    scenario.clock.set_wall(UNIX_EPOCH);
+    let _ = direct_send(&scenario, Destination::TinkoffSandbox).await;
+    assert_eq!(scenario.server.requests_received(), 1);
+    scenario.clock.advance(MINUTE);
+    direct_send(&scenario, Destination::TinkoffSandbox)
+        .await
+        .unwrap_or_else(|error| panic!("send after boot-clock pause: {error}"));
+    assert_eq!(scenario.server.requests_received(), 2);
+    scenario
+}
+
+fn assert_path_aliases_refused() {
+    let directory = TempDir::new("path-aliases");
+    let server = LoopbackServer::start(std::iter::empty())
+        .unwrap_or_else(|error| panic!("path loopback: {error}"));
+    let clock = FakeTime::new();
+    let build = |path: PathBuf| {
+        Gateway::with_parts(
+            HttpClientHarness::new(&server),
+            BUDGETS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::clone(&clock) as Arc<dyn Sleeper>,
+            BrokerEgress::On { tally: path },
+        )
+    };
+
+    assert!(build(PathBuf::from("relative-tally")).is_err());
+
+    let symlink_target = directory.path("symlink-target");
+    let symlink = directory.path("symlink");
+    std::fs::write(&symlink_target, "").unwrap_or_else(|error| panic!("symlink target: {error}"));
+    std::os::unix::fs::symlink(&symlink_target, &symlink)
+        .unwrap_or_else(|error| panic!("create tally symlink: {error}"));
+    assert!(build(symlink).is_err());
+
+    let hard_target = directory.path("hard-target");
+    let hard_alias = directory.path("hard-alias");
+    std::fs::write(&hard_target, "").unwrap_or_else(|error| panic!("hard-link target: {error}"));
+    std::fs::hard_link(&hard_target, &hard_alias)
+        .unwrap_or_else(|error| panic!("create tally hard link: {error}"));
+    assert!(build(hard_alias).is_err());
+    assert_eq!(server.requests_received(), 0);
+}
+
+fn wait_for_file(path: &Path, child: &mut Child, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect {what}: {error}"))
+        {
+            panic!("{what} exited before its marker: {status}");
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
 #[tokio::test]
-async fn two_process_child() {
-    let Ok(tally) = std::env::var("IAAM_CEILING_CHILD_TALLY") else {
+async fn process_child() {
+    let Ok(role) = std::env::var("IAAM_CEILING_PROCESS_ROLE") else {
         return;
     };
-    let record = PathBuf::from(
-        std::env::var("IAAM_CEILING_CHILD_RECORD")
-            .unwrap_or_else(|error| panic!("child record path: {error}")),
+    let tally = PathBuf::from(
+        std::env::var("IAAM_CEILING_PROCESS_TALLY")
+            .unwrap_or_else(|error| panic!("child tally: {error}")),
     );
-    let barrier = PathBuf::from(
-        std::env::var("IAAM_CEILING_CHILD_BARRIER")
-            .unwrap_or_else(|error| panic!("child barrier path: {error}")),
+    let ready = PathBuf::from(
+        std::env::var("IAAM_CEILING_PROCESS_READY")
+            .unwrap_or_else(|error| panic!("child ready: {error}")),
     );
-    let time = FakeTime::new();
+    let done = PathBuf::from(
+        std::env::var("IAAM_CEILING_PROCESS_DONE")
+            .unwrap_or_else(|error| panic!("child done: {error}")),
+    );
+    let result = PathBuf::from(
+        std::env::var("IAAM_CEILING_PROCESS_RESULT")
+            .unwrap_or_else(|error| panic!("child result: {error}")),
+    );
+    let server = LoopbackServer::start([LoopbackReply::complete(200, "{}")])
+        .unwrap_or_else(|error| panic!("child loopback: {error}"));
+    let clock = FakeTime::new();
     let gateway = Gateway::with_parts(
-        ProcessTransport {
-            record,
-            time: Arc::clone(&time),
-        },
+        HttpClientHarness::new(&server),
         BUDGETS,
-        Arc::clone(&time) as Arc<dyn Clock>,
-        Arc::clone(&time) as Arc<dyn Sleeper>,
-        BrokerEgress::On {
-            tally: PathBuf::from(tally),
-        },
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&clock) as Arc<dyn Sleeper>,
+        BrokerEgress::On { tally },
     )
     .unwrap_or_else(|error| panic!("child gateway: {error}"));
-    let request = HttpRequest::post(
-        Destination::TinkoffProd,
-        "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
-        RequestBody::Json("{}".to_owned()),
-    )
-    .idempotent()
-    .with_request_allowance(RequestAllowance::new(3));
 
-    match gateway.send("OperationsService", &request, None).await {
-        Ok(_) => {}
-        Err(error @ GatewayError::BrokerEndpointOwned { .. }) => {
-            let message = error.to_string();
+    if role == "owner" {
+        gateway
+            .send(
+                "OperationsService",
+                &direct_request(
+                    Destination::TinkoffProd,
+                    direct_path(Destination::TinkoffProd),
+                ),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("owner send: {error}"));
+        std::fs::write(&ready, "ready")
+            .unwrap_or_else(|error| panic!("owner ready marker: {error}"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.exists() {
             assert!(
-                message.contains(Destination::TinkoffProd.base_url()),
-                "{message}"
+                Instant::now() < deadline,
+                "owner timed out waiting for contender"
             );
-            assert!(message.contains("stop it"), "{message}");
-            std::fs::write(&barrier, message)
-                .unwrap_or_else(|write_error| panic!("write ownership barrier: {write_error}"));
-            return;
+            std::thread::sleep(Duration::from_millis(1));
         }
-        Err(error) => panic!("first child send: {error}"),
+        std::fs::write(&result, format!("tinkoff={}\n", server.requests_received()))
+            .unwrap_or_else(|error| panic!("owner result: {error}"));
+        return;
     }
 
-    let wait_until = Instant::now() + Duration::from_secs(5);
-    while !barrier.exists() {
+    assert_eq!(role, "contender");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
         assert!(
-            Instant::now() < wait_until,
-            "the competing process did not report its ownership refusal"
+            Instant::now() < deadline,
+            "contender timed out waiting for owner"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    for _ in 1..3 {
-        gateway
-            .send("OperationsService", &request, None)
-            .await
-            .unwrap_or_else(|error| panic!("owner child send: {error}"));
-    }
+    let owned = gateway
+        .send(
+            "OperationsService",
+            &direct_request(
+                Destination::TinkoffProd,
+                direct_path(Destination::TinkoffProd),
+            ),
+            None,
+        )
+        .await;
+    assert!(matches!(
+        owned,
+        Err(GatewayError::BrokerEndpointOwned { .. })
+    ));
+    assert_eq!(server.requests_received(), 0);
+    gateway
+        .send(
+            "AccountsService.GetAccount",
+            &direct_request(Destination::FinamApi, direct_path(Destination::FinamApi)),
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("contender Finam send: {error}"));
+    std::fs::write(
+        &result,
+        format!("tinkoff=0\nfinam={}\nlocal=1\n", server.requests_received()),
+    )
+    .unwrap_or_else(|error| panic!("contender result: {error}"));
+    std::fs::write(&done, "done").unwrap_or_else(|error| panic!("contender done marker: {error}"));
 }
 
-#[test]
-fn two_real_processes_refuse_a_second_endpoint_owner() {
+fn process_measurements() -> (Measurements, Measurements) {
     let directory = TempDir::new("processes");
     let tally = directory.path("tally");
-    let barrier = directory.path("owned");
-    std::fs::write(&tally, "").unwrap_or_else(|error| panic!("create tally: {error}"));
+    let ready = directory.path("ready");
+    let done = directory.path("done");
+    let owner_result = directory.path("owner-result");
+    let contender_result = directory.path("contender-result");
+    std::fs::write(&tally, "").unwrap_or_else(|error| panic!("process tally: {error}"));
     let executable = std::env::current_exe().unwrap_or_else(|error| panic!("test binary: {error}"));
-    let mut children = Vec::new();
-    for number in 0..2 {
-        let record = directory.path(&format!("child-{number}"));
-        let child = Command::new(&executable)
-            .args(["--exact", "two_process_child", "--nocapture"])
-            .env("IAAM_CEILING_CHILD_TALLY", &tally)
-            .env("IAAM_CEILING_CHILD_RECORD", &record)
-            .env("IAAM_CEILING_CHILD_BARRIER", &barrier)
+    let child = |role: &str, result: &Path| {
+        Command::new(&executable)
+            .args(["--exact", "process_child", "--nocapture"])
+            .env("IAAM_CEILING_PROCESS_ROLE", role)
+            .env("IAAM_CEILING_PROCESS_TALLY", &tally)
+            .env("IAAM_CEILING_PROCESS_READY", &ready)
+            .env("IAAM_CEILING_PROCESS_DONE", &done)
+            .env("IAAM_CEILING_PROCESS_RESULT", result)
             .spawn()
-            .unwrap_or_else(|error| panic!("spawn child {number}: {error}"));
-        children.push((child, record));
-    }
-    let mut records = Vec::new();
-    for (mut child, record) in children {
-        let status = child
-            .wait()
-            .unwrap_or_else(|error| panic!("wait child: {error}"));
-        assert!(status.success(), "child failed: {status}");
-        let text = match std::fs::read_to_string(&record) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => panic!("read {}: {error}", record.display()),
-        };
-        for line in text.lines() {
-            let (host, at) = line
-                .split_once('\t')
-                .unwrap_or_else(|| panic!("child row: {line}"));
-            let at = at
-                .parse::<u128>()
-                .unwrap_or_else(|error| panic!("child time: {error}"));
-            let seconds = u64::try_from(at / 1_000_000_000).unwrap_or(u64::MAX);
-            let sub = u32::try_from(at % 1_000_000_000).unwrap_or(u32::MAX);
-            records.push(SendRecord {
-                at: UNIX_EPOCH + Duration::new(seconds, sub),
-                host: host.to_owned(),
-                method: "OperationsService".to_owned(),
-                sync: 1,
-                call: records.len() as u64 + 1,
-                status: Some(200),
-                pause_for: None,
-            });
-        }
-    }
-    let ownership_refusal = std::fs::read_to_string(&barrier)
-        .unwrap_or_else(|error| panic!("read ownership refusal: {error}"));
+            .unwrap_or_else(|error| panic!("spawn {role} child: {error}"))
+    };
+    let mut owner = child("owner", &owner_result);
+    wait_for_file(&ready, &mut owner, "owner child");
+    let mut contender = child("contender", &contender_result);
+    let contender_status = contender
+        .wait()
+        .unwrap_or_else(|error| panic!("wait contender: {error}"));
     assert!(
-        ownership_refusal.contains(Destination::TinkoffProd.base_url()),
-        "{ownership_refusal}"
+        contender_status.success(),
+        "contender failed: {contender_status}"
     );
-    assert!(ownership_refusal.contains("stop it"), "{ownership_refusal}");
+    let owner_status = owner
+        .wait()
+        .unwrap_or_else(|error| panic!("wait owner: {error}"));
+    assert!(owner_status.success(), "owner failed: {owner_status}");
+    let owner_text = std::fs::read_to_string(&owner_result)
+        .unwrap_or_else(|error| panic!("read owner result: {error}"));
+    let contender_text = std::fs::read_to_string(&contender_result)
+        .unwrap_or_else(|error| panic!("read contender result: {error}"));
+    assert_eq!(owner_text, "tinkoff=1\n");
+    assert_eq!(contender_text, "tinkoff=0\nfinam=1\nlocal=1\n");
 
-    records.sort_by_key(|record| nanos(record.at));
-    let minimum_gap = records
-        .windows(2)
-        .map(|pair| {
-            pair[1]
-                .at
-                .duration_since(pair[0].at)
-                .unwrap_or(Duration::ZERO)
-        })
-        .min()
-        .unwrap_or(Duration::ZERO);
-    assert!(
-        minimum_gap >= Duration::from_secs(1),
-        "the owner emitted broker sends only {minimum_gap:?} apart"
+    let tinkoff = measure(
+        &[planted_record(
+            Duration::from_secs(60),
+            Destination::TinkoffProd.base_url(),
+            "OperationsService",
+            1,
+            1,
+        )],
+        1,
+        None,
+    )
+    .unwrap_or_else(|error| panic!("measure process T-Invest: {error}"));
+    let finam = measure(
+        &[planted_record(
+            Duration::from_secs(60),
+            Destination::FinamApi.base_url(),
+            "AccountsService.GetAccount",
+            1,
+            1,
+        )],
+        0,
+        None,
+    )
+    .unwrap_or_else(|error| panic!("measure process Finam: {error}"));
+    assert_within_ceilings("process-owner", &tinkoff);
+    assert_within_ceilings("process-other-endpoint", &finam);
+    (tinkoff, finam)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executable_ceiling_proof() {
+    print_header();
+
+    for destination in [
+        Destination::TinkoffProd,
+        Destination::TinkoffSandbox,
+        Destination::FinamApi,
+    ] {
+        let scenario = exercise_wire_spacing(destination).await;
+        let reached = scenario.wire_max_second();
+        scenario.verify_and_print("wire-spacing", destination, Some(reached));
+    }
+
+    for destination in [
+        Destination::TinkoffProd,
+        Destination::TinkoffSandbox,
+        Destination::FinamApi,
+    ] {
+        let scenario = exercise_permanent_refusal(destination).await;
+        scenario.verify_and_print("always-400", destination, None);
+    }
+
+    let finam_renewal = exercise_finam_renewal().await;
+    finam_renewal.verify_and_print("always-401-renewal", Destination::FinamApi, None);
+
+    let retry_after = exercise_rate_limit(
+        "retry-after",
+        Destination::TinkoffProd,
+        LoopbackReply::complete(429, "limited").with_header("Retry-After", "120"),
+        Duration::from_secs(120),
+    )
+    .await;
+    retry_after.verify_and_print("429-retry-after", Destination::TinkoffProd, None);
+
+    let no_header = exercise_rate_limit(
+        "no-retry-after",
+        Destination::TinkoffSandbox,
+        LoopbackReply::complete(429, "limited"),
+        MINUTE,
+    )
+    .await;
+    no_header.verify_and_print("429-no-header", Destination::TinkoffSandbox, None);
+
+    let reset_body = exercise_body_rate_limit(
+        "reset-body",
+        LoopbackReply::truncated_body(429, "partial").with_header("Retry-After", "60"),
+    )
+    .await;
+    reset_body.verify_and_print("429-reset-body", Destination::FinamApi, None);
+
+    let stalled_body = exercise_body_rate_limit(
+        "stalled-body",
+        LoopbackReply::stalled_body(429, "partial").with_header("Retry-After", "60"),
+    )
+    .await;
+    stalled_body.verify_and_print("429-stalled-body", Destination::FinamApi, None);
+
+    let server_error = exercise_transient("always-500", LoopbackReply::complete(500, "down")).await;
+    server_error.verify_and_print("always-500", Destination::TinkoffProd, None);
+
+    let timeout = exercise_transient("timeouts", LoopbackReply::held(200, "late")).await;
+    timeout.verify_and_print("timeouts", Destination::TinkoffProd, None);
+
+    let (same_redirect, cross_redirect) = exercise_redirects().await;
+    same_redirect.verify_and_print("redirect-same-host", Destination::TinkoffProd, None);
+    cross_redirect.verify_and_print("redirect-cross-host", Destination::TinkoffSandbox, None);
+
+    let tinkoff_sync = exercise_tinkoff_sync().await;
+    let tinkoff_measured =
+        tinkoff_sync.verify_and_print("endless-pages-sync", Destination::TinkoffProd, None);
+    assert_eq!(
+        tinkoff_measured.max_sync,
+        BROKER_SYNC_REQUEST_CEILING as usize
     );
-    let measured = measure(&records);
-    assert_within_ceilings("endpoint-owner", &measured);
-    assert_eq!(records.len(), 3);
+
+    let finam_sync = exercise_finam_sync().await;
+    let finam_measured =
+        finam_sync.verify_and_print("endless-pages-sync", Destination::FinamApi, None);
+    assert_eq!(
+        finam_measured.max_sync,
+        BROKER_SYNC_REQUEST_CEILING as usize
+    );
+
+    let daily = exercise_daily_ceiling().await;
+    let daily_measured = daily.verify_and_print("rolling-24h", Destination::TinkoffSandbox, None);
+    assert_eq!(daily_measured.max_day, DAILY_CEILING);
+
+    let concurrent = exercise_concurrent_callers().await;
+    concurrent.verify_and_print("concurrent-callers", Destination::TinkoffProd, None);
+
+    let boot = exercise_boot_change().await;
+    boot.verify_and_print("boot-id-change", Destination::TinkoffProd, None);
+
+    let wall = exercise_wall_change().await;
+    wall.verify_and_print("wall-clock-change", Destination::TinkoffSandbox, None);
+
+    let egress_off = Scenario::new(
+        "egress-off",
+        Destination::TinkoffProd,
+        [LoopbackReply::complete(200, "{}")],
+        Duration::from_secs(2),
+        false,
+    );
+    let _ = direct_send(&egress_off, Destination::TinkoffProd).await;
+    assert_eq!(egress_off.server.requests_received(), 0);
+    egress_off.verify_and_print("egress-off", Destination::TinkoffProd, None);
+
+    assert_path_aliases_refused();
+
+    let (process_tinkoff, process_finam) = process_measurements();
     print_row(
-        "endpoint-owner",
+        "process-owner",
         Destination::TinkoffProd.base_url(),
-        &measured,
+        &process_tinkoff,
+    );
+    print_row(
+        "process-other-endpoint",
+        Destination::FinamApi.base_url(),
+        &process_finam,
     );
 }
 

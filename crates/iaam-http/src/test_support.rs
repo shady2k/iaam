@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ pub struct LoopbackReply {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     ending: BodyEnding,
+    hold_before_status: bool,
 }
 
 impl LoopbackReply {
@@ -41,6 +42,7 @@ impl LoopbackReply {
             headers: Vec::new(),
             body: body.into(),
             ending: BodyEnding::Complete,
+            hold_before_status: false,
         }
     }
 
@@ -58,6 +60,7 @@ impl LoopbackReply {
             headers: Vec::new(),
             body: body_prefix.into(),
             ending: BodyEnding::Truncated,
+            hold_before_status: false,
         }
     }
 
@@ -69,6 +72,19 @@ impl LoopbackReply {
             headers: Vec::new(),
             body: body_prefix.into(),
             ending: BodyEnding::Stall,
+            hold_before_status: false,
+        }
+    }
+
+    /// A complete response held before its status line until the server is released.
+    #[must_use]
+    pub fn held(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.into(),
+            ending: BodyEnding::Complete,
+            hold_before_status: true,
         }
     }
 
@@ -80,6 +96,42 @@ impl LoopbackReply {
     }
 }
 
+#[derive(Default)]
+struct ReplyGate {
+    permits: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl ReplyGate {
+    fn wait(&self, stopping: &AtomicBool) {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *permits == 0 && !stopping.load(Ordering::SeqCst) {
+            permits = self
+                .ready
+                .wait(permits)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if *permits != 0 {
+            *permits -= 1;
+        }
+    }
+
+    fn release(&self) {
+        *self
+            .permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        self.ready.notify_one();
+    }
+
+    fn stop(&self) {
+        self.ready.notify_all();
+    }
+}
+
 /// A real HTTP/1.1 server bound to an ephemeral loopback port.
 pub struct LoopbackServer {
     address: SocketAddr,
@@ -87,27 +139,41 @@ pub struct LoopbackServer {
     accepted: Arc<AtomicUsize>,
     request_targets: Arc<Mutex<Vec<String>>>,
     stopping: Arc<AtomicBool>,
-    stall_release: mpsc::Sender<()>,
+    reply_gate: Arc<ReplyGate>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl LoopbackServer {
     /// Start a server that answers requests in script order.
     pub fn start(replies: impl IntoIterator<Item = LoopbackReply>) -> std::io::Result<Self> {
+        Self::start_observed(replies, |_, _| {})
+    }
+
+    /// Start a server and observe each complete request at the TCP receiver.
+    ///
+    /// The observer runs after the request headers arrive and before the
+    /// scripted status is written. It therefore counts wire arrivals rather
+    /// than gateway or transport calls.
+    pub fn start_observed(
+        replies: impl IntoIterator<Item = LoopbackReply>,
+        mut observe: impl FnMut(&str, u16) + Send + 'static,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         let address = listener.local_addr()?;
         let received = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::new(AtomicUsize::new(0));
         let request_targets = Arc::new(Mutex::new(Vec::new()));
         let stopping = Arc::new(AtomicBool::new(false));
-        let (stall_release, stall_wait) = mpsc::channel();
+        let reply_gate = Arc::new(ReplyGate::default());
         let mut replies: VecDeque<_> = replies.into_iter().collect();
 
         let thread_received = Arc::clone(&received);
         let thread_accepted = Arc::clone(&accepted);
         let thread_targets = Arc::clone(&request_targets);
         let thread_stopping = Arc::clone(&stopping);
+        let thread_gate = Arc::clone(&reply_gate);
         let handle = thread::spawn(move || {
+            let mut handlers = Vec::new();
             for accepted in listener.incoming() {
                 let mut stream = accepted.unwrap_or_else(|error| {
                     panic!("loopback HTTP server could not accept a request: {error}")
@@ -116,20 +182,40 @@ impl LoopbackServer {
                     break;
                 }
                 thread_accepted.fetch_add(1, Ordering::SeqCst);
-                let target = read_request_target(&mut stream).unwrap_or_else(|error| {
-                    panic!("loopback HTTP server could not read a request: {error}")
-                });
+                let target = match read_request_target(&mut stream) {
+                    Ok(target) => target,
+                    Err(error)
+                        if thread_stopping.load(Ordering::SeqCst)
+                            && error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        break;
+                    }
+                    Err(error) => {
+                        panic!("loopback HTTP server could not read a request: {error}");
+                    }
+                };
                 thread_received.fetch_add(1, Ordering::SeqCst);
                 thread_targets
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(target);
+                    .push(target.clone());
                 let reply = replies
                     .pop_front()
                     .unwrap_or_else(|| LoopbackReply::complete(500, "unscripted request"));
-                write_reply(&mut stream, &reply, &stall_wait).unwrap_or_else(|error| {
-                    panic!("loopback HTTP server could not write a response: {error}")
-                });
+                observe(&target, reply.status);
+                let handler_gate = Arc::clone(&thread_gate);
+                let handler_stopping = Arc::clone(&thread_stopping);
+                handlers.push(thread::spawn(move || {
+                    write_reply(&mut stream, &reply, &handler_gate, &handler_stopping)
+                        .unwrap_or_else(|error| {
+                            panic!("loopback HTTP server could not write a response: {error}")
+                        });
+                }));
+            }
+            for handler in handlers {
+                if let Err(panic) = handler.join() {
+                    std::panic::resume_unwind(panic);
+                }
             }
         });
 
@@ -139,7 +225,7 @@ impl LoopbackServer {
             accepted,
             request_targets,
             stopping,
-            stall_release,
+            reply_gate,
             thread: Some(handle),
         })
     }
@@ -170,12 +256,17 @@ impl LoopbackServer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Release one response held before its status or while its body stalls.
+    pub fn release_one(&self) {
+        self.reply_gate.release();
+    }
 }
 
 impl Drop for LoopbackServer {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::SeqCst);
-        let _ = self.stall_release.send(());
+        self.reply_gate.stop();
         drop(TcpStream::connect(self.address));
         let Some(handle) = self.thread.take() else {
             return;
@@ -227,6 +318,15 @@ impl Transport for HttpClientHarness {
         request: &'a HttpRequest,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         Self::send(self, request)
+    }
+
+    fn send_observed<'a>(
+        &'a self,
+        request: &'a HttpRequest,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+    ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
+        self.client
+            .send_to_base_observed(request, &self.base_url, self.timeout, observe)
     }
 }
 
@@ -291,8 +391,15 @@ fn read_request_target_observed(
 fn write_reply(
     stream: &mut TcpStream,
     reply: &LoopbackReply,
-    stall_wait: &mpsc::Receiver<()>,
+    reply_gate: &ReplyGate,
+    stopping: &AtomicBool,
 ) -> std::io::Result<()> {
+    if reply.hold_before_status {
+        reply_gate.wait(stopping);
+        if stopping.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+    }
     write!(stream, "HTTP/1.1 {} Test\r\n", reply.status)?;
     for (name, value) in &reply.headers {
         write!(stream, "{name}: {value}\r\n")?;
@@ -312,7 +419,7 @@ fn write_reply(
         BodyEnding::Complete => Ok(()),
         BodyEnding::Truncated => stream.shutdown(Shutdown::Both),
         BodyEnding::Stall => {
-            let _ = stall_wait.recv();
+            reply_gate.wait(stopping);
             Ok(())
         }
     }

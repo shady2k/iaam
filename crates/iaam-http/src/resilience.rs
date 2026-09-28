@@ -159,9 +159,11 @@ pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
 pub fn is_transient(outcome: &Outcome) -> bool {
     match outcome {
         Outcome::Transport(HttpError::Network | HttpError::Timeout) => true,
-        Outcome::Transport(HttpError::ClientNotBuilt(_) | HttpError::TrustAnchorNotParsed(_)) => {
-            false
-        }
+        Outcome::Transport(
+            HttpError::ClientNotBuilt(_)
+            | HttpError::TrustAnchorNotParsed(_)
+            | HttpError::RequestNotBuilt(_),
+        ) => false,
         Outcome::Status { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 504),
     }
 }

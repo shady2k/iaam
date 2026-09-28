@@ -219,7 +219,8 @@ impl TinkoffClient {
     ) -> Result<String, TinkoffError> {
         ensure_method_available(self.environment, method)?;
         let body = serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?;
-        let request = Self::request(self.environment, path, body, self.token.expose());
+        let path = format!("{PACKAGE}.{path}");
+        let request = Self::request(self.environment, &path, body, self.token.expose());
         let response = self
             .gateway
             .send(service, &request, deadline)
@@ -242,6 +243,11 @@ impl TinkoffClient {
             .with_reset_header(RESET_HEADER)
     }
 }
+
+/// The protobuf package every service lives in. The REST gateway serves a
+/// method at `/rest/<package>.<Service>/<Method>`; without the package it
+/// answers 404 to every call.
+const PACKAGE: &str = "tinkoff.public.invest.api.contract.v1";
 
 /// The environment selects the destination, not a URL suffix.
 ///
@@ -719,23 +725,32 @@ mod tests {
         assert!(ensure_method_available(Environment::Sandbox, Method::Portfolio).is_ok());
     }
 
-    fn method_url(environment: Environment, path: &str) -> String {
-        HttpRequest::post(
-            destination_for(environment),
-            path,
-            RequestBody::Json("{}".to_owned()),
-        )
-        .url()
-    }
-    #[test]
-    fn builds_method_url_from_environment_base_url() {
+    /// Each method reaches the address T-Invest publishes for it:
+    /// `/rest/<package>.<Service>/<Method>`, the package being the one
+    /// `docs/api/tinkoff-invest/*.proto` declare.
+    #[tokio::test]
+    async fn every_method_is_posted_to_its_published_address() {
+        let (client, paths, _) = client(vec![
+            answer(200, r#"{"accounts":[]}"#),
+            answer(200, "{}"),
+            answer(200, r#"{"hasNext":false,"items":[]}"#),
+        ]);
+
+        client.get_accounts().await.expect("accounts");
+        client.get_portfolio("Main", None).await.expect("portfolio");
+        client
+            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("Main"), None)
+            .await
+            .expect("operations");
+
+        let base = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1";
         assert_eq!(
-            method_url(Environment::Prod, "OperationsService/GetPortfolio"),
-            "https://invest-public-api.tbank.ru/rest/OperationsService/GetPortfolio"
-        );
-        assert_eq!(
-            method_url(Environment::Sandbox, "UsersService/GetAccounts"),
-            "https://sandbox-invest-public-api.tbank.ru/rest/UsersService/GetAccounts"
+            *paths.lock().expect("paths"),
+            vec![
+                format!("{base}.UsersService/GetAccounts"),
+                format!("{base}.OperationsService/GetPortfolio"),
+                format!("{base}.OperationsService/GetOperationsByCursor"),
+            ]
         );
     }
 

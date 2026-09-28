@@ -44,6 +44,10 @@ pub enum HttpError {
     ClientNotBuilt(String),
     #[error("embedded trust root was not parsed: {0}")]
     TrustAnchorNotParsed(String),
+    /// The request could not be written as HTTP (a token that is not a
+    /// valid header value): this build's fault, and nothing was sent.
+    #[error("request was not built: {0}")]
+    RequestNotBuilt(String),
 }
 
 #[cfg(test)]

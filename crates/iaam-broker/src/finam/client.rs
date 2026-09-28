@@ -258,14 +258,15 @@ impl FinamClient {
         let (body, token) = self
             .authorized(SESSIONS, |token| {
                 // The token rides the body, as the method's page passes it,
-                // and the bearer, as the API's authentication asks of every
-                // method. Reading twice changes nothing.
+                // and the Authorization header, bare, as the API's
+                // authentication asks of every method. Reading twice changes
+                // nothing.
                 HttpRequest::post(
                     Destination::FinamApi,
                     "/v1/sessions/details",
                     RequestBody::Json(serde_json::json!({ "token": token }).to_string()),
                 )
-                .with_bearer(token)
+                .with_bare_token(token)
                 .idempotent()
             })
             .await?;
@@ -302,7 +303,7 @@ impl FinamClient {
     ) -> Result<String, FinamError> {
         let query = query.to_vec();
         self.authorized(method, move |token| {
-            let mut request = HttpRequest::get(Destination::FinamApi, &path).with_bearer(token);
+            let mut request = HttpRequest::get(Destination::FinamApi, &path).with_bare_token(token);
             for (key, value) in &query {
                 request = request.with_query(key, value);
             }
@@ -866,7 +867,13 @@ mod tests {
              &limit=1000"
         );
         for request in received.iter().skip(1) {
-            assert_eq!(request.bearer().map(|token| token.expose()), Some(JWT_ONE));
+            // Finam documents `Authorization: <token>`, no scheme word.
+            assert_eq!(
+                request
+                    .authorization()
+                    .map(|value| value.expose().to_owned()),
+                Some(JWT_ONE.to_owned())
+            );
         }
     }
 
@@ -1482,7 +1489,12 @@ mod tests {
         assert_eq!(received.len(), 2);
         let details = &received[1];
         assert_eq!(details.url(), "https://api.finam.ru/v1/sessions/details");
-        assert_eq!(details.bearer().map(|token| token.expose()), Some(JWT_ONE));
+        assert_eq!(
+            details
+                .authorization()
+                .map(|value| value.expose().to_owned()),
+            Some(JWT_ONE.to_owned())
+        );
         assert_eq!(
             details.body().map(iaam_http::RequestBody::payload),
             Some(r#"{"token":"invented.jwt.one"}"#),

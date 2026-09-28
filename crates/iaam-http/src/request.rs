@@ -72,6 +72,18 @@ impl core::fmt::Debug for Secret {
     }
 }
 
+/// How a request's token is written into its `Authorization` header. Each
+/// source publishes its own form, and a server that expects the other one
+/// refuses every call: T-Invest documents `Bearer <token>`, Finam the bare
+/// token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthScheme {
+    /// `Authorization: Bearer <token>`.
+    Bearer,
+    /// `Authorization: <token>`, with no scheme word.
+    Bare,
+}
+
 /// Complete description of an outgoing request.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -81,6 +93,7 @@ pub struct HttpRequest {
     query: Vec<(String, String)>,
     body: Option<RequestBody>,
     bearer: Option<Secret>,
+    auth_scheme: AuthScheme,
     soap_action: Option<String>,
     reset_header: Option<&'static str>,
     idempotent: bool,
@@ -110,6 +123,7 @@ impl HttpRequest {
             query: Vec::new(),
             body,
             bearer: None,
+            auth_scheme: AuthScheme::Bearer,
             soap_action: None,
             reset_header: None,
             // A GET reads; any other method may act, and acting twice is
@@ -127,6 +141,16 @@ impl HttpRequest {
     #[must_use]
     pub fn with_bearer(mut self, token: &str) -> Self {
         self.bearer = Some(Secret::new(token));
+        self.auth_scheme = AuthScheme::Bearer;
+        self
+    }
+
+    /// The token as the whole `Authorization` value, with no scheme word:
+    /// the form Finam publishes (`Authorization: <token>`).
+    #[must_use]
+    pub fn with_bare_token(mut self, token: &str) -> Self {
+        self.bearer = Some(Secret::new(token));
+        self.auth_scheme = AuthScheme::Bare;
         self
     }
 
@@ -177,9 +201,25 @@ impl HttpRequest {
         self.body.as_ref()
     }
 
+    /// The token the request carries, whatever its scheme.
     #[must_use]
     pub const fn bearer(&self) -> Option<&Secret> {
         self.bearer.as_ref()
+    }
+
+    #[must_use]
+    pub const fn auth_scheme(&self) -> AuthScheme {
+        self.auth_scheme
+    }
+
+    /// The `Authorization` header value exactly as it is sent, or `None`
+    /// when the request carries no token.
+    #[must_use]
+    pub fn authorization(&self) -> Option<Secret> {
+        self.bearer.as_ref().map(|token| match self.auth_scheme {
+            AuthScheme::Bearer => Secret::new(&format!("Bearer {}", token.expose())),
+            AuthScheme::Bare => Secret::new(token.expose()),
+        })
     }
 
     #[must_use]
@@ -316,6 +356,36 @@ mod tests {
         let request = HttpRequest::get(Destination::MoexIss, "/").with_bearer("bearer-token");
 
         assert_eq!(request.bearer().map(Secret::expose), Some("bearer-token"));
+    }
+
+    #[test]
+    fn a_bearer_request_is_authorized_with_the_bearer_scheme() {
+        let request = HttpRequest::get(Destination::MoexIss, "/").with_bearer("bearer-token");
+
+        assert_eq!(
+            request.authorization().as_ref().map(Secret::expose),
+            Some("Bearer bearer-token")
+        );
+    }
+
+    #[test]
+    fn a_bare_token_request_is_authorized_with_the_token_alone() {
+        let request = HttpRequest::get(Destination::FinamApi, "/").with_bare_token("jwt-value");
+
+        assert_eq!(
+            request.authorization().as_ref().map(Secret::expose),
+            Some("jwt-value")
+        );
+        assert_eq!(request.bearer().map(Secret::expose), Some("jwt-value"));
+    }
+
+    #[test]
+    fn a_request_without_a_token_carries_no_authorization() {
+        assert!(
+            HttpRequest::get(Destination::MoexIss, "/")
+                .authorization()
+                .is_none()
+        );
     }
 
     #[test]

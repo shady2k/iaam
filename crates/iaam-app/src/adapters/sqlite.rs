@@ -2695,10 +2695,16 @@ mod tests {
             fetch(&first).await;
             fetch(&second).await;
         }
-        assert!(time.slept().is_empty(), "fifty calls fit the minute");
+        assert_eq!(
+            time.slept(),
+            vec![Duration::from_secs(1); 49],
+            "the first fifty calls use only host spacing"
+        );
         fetch(&second).await;
 
-        assert_eq!(time.slept(), [Duration::from_secs(60)]);
+        let slept = time.slept();
+        assert_eq!(slept.len(), 50);
+        assert_eq!(slept.last(), Some(&Duration::from_secs(11)));
         assert_eq!(log.lock().expect("log").len(), 51);
     }
 

@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use iaam_app::adapters::market::HttpOutbound;
 use iaam_app::error::AppError;
@@ -40,6 +40,10 @@ impl FakeTime {
 impl Clock for FakeTime {
     fn now(&self) -> Instant {
         *self.now.lock().expect("clock")
+    }
+
+    fn now_utc(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH
     }
 }
 
@@ -101,6 +105,7 @@ fn adapter(time: &Arc<FakeTime>, endpoint: Scripted) -> (HttpOutbound, Arc<Mutex
         BUDGETS,
         Arc::clone(time) as Arc<dyn Clock>,
         Arc::clone(time) as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::Off,
     )
     .expect("the documented table is valid");
     (HttpOutbound::new(Arc::new(gateway)), sent)

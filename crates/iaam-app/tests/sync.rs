@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use iaam_app::AppServices;
@@ -2290,17 +2290,23 @@ async fn a_panicked_sync_releases_its_account() {
 /// T-Invest below takes its time to answer.
 struct FakeTime {
     now: Mutex<Instant>,
+    wall: Mutex<SystemTime>,
 }
 
 impl FakeTime {
     fn advance(&self, by: Duration) {
         *self.now.lock().expect("clock") += by;
+        *self.wall.lock().expect("wall clock") += by;
     }
 }
 
 impl GatewayClock for FakeTime {
     fn now(&self) -> Instant {
         *self.now.lock().expect("clock")
+    }
+
+    fn now_utc(&self) -> SystemTime {
+        *self.wall.lock().expect("wall clock")
     }
 }
 
@@ -2314,11 +2320,19 @@ impl Sleeper for FakeTime {
 /// Time on tokio's paused timer: the gateway's clock and sleeps and the slow
 /// T-Invest below all run on it, so a request still in flight at the deadline
 /// loses a real race against it rather than a clock moved by hand.
-struct PausedTime;
+struct PausedTime {
+    start: Instant,
+}
 
 impl GatewayClock for PausedTime {
     fn now(&self) -> Instant {
         tokio::time::Instant::now().into_std()
+    }
+
+    fn now_utc(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_800_000_000)
+            + self.now().duration_since(self.start)
     }
 }
 
@@ -2326,6 +2340,17 @@ impl Sleeper for PausedTime {
     fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(tokio::time::sleep(delay))
     }
+}
+
+fn broker_egress() -> iaam_http::BrokerEgress {
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let tally = std::env::temp_dir().join(format!(
+        "iaam-app-sync-test-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::write(&tally, "").expect("empty tally created");
+    iaam_http::BrokerEgress::On { tally }
 }
 
 /// A T-Invest that answers every operations page, always with one more to
@@ -2360,14 +2385,18 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
     let asked = Arc::new(AtomicUsize::new(0));
     // Four minutes a page: pages are asked for at 0, 4, 8 and 12 minutes;
     // the fourth would answer at 16, past the sync's fifteen.
+    let time = Arc::new(PausedTime {
+        start: tokio::time::Instant::now().into_std(),
+    });
     let gateway = Gateway::with_parts(
         SlowTinvest {
             step: Duration::from_secs(4 * 60),
             asked: Arc::clone(&asked),
         },
         BUDGETS,
-        Arc::new(PausedTime) as Arc<dyn GatewayClock>,
-        Arc::new(PausedTime) as Arc<dyn Sleeper>,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        broker_egress(),
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);
@@ -2440,12 +2469,14 @@ impl Transport for ThrottlingTinvest {
 fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
     let time = Arc::new(FakeTime {
         now: Mutex::new(Instant::now()),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
     });
     let gateway = Gateway::with_parts(
         transport,
         BUDGETS,
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
+        broker_egress(),
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);

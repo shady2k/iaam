@@ -163,7 +163,7 @@ enum OperationType {
         use std::future::Future;
         use std::pin::Pin;
         use std::sync::{Arc, Mutex};
-        use std::time::{Duration, Instant};
+        use std::time::{Duration, Instant, SystemTime};
 
         use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
         use iaam_http::{Gateway, HttpError, HttpResponse};
@@ -172,6 +172,10 @@ enum OperationType {
         impl Clock for FakeTime {
             fn now(&self) -> Instant {
                 *self.0.lock().expect("clock")
+            }
+
+            fn now_utc(&self) -> SystemTime {
+                SystemTime::UNIX_EPOCH
             }
         }
         impl Sleeper for FakeTime {
@@ -198,6 +202,7 @@ enum OperationType {
             BUDGETS,
             Arc::clone(&time) as Arc<dyn Clock>,
             Arc::clone(&time) as Arc<dyn Sleeper>,
+            iaam_http::BrokerEgress::Off,
         )
         .expect("the documented table is valid");
 

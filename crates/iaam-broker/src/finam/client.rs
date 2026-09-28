@@ -73,6 +73,13 @@ pub enum FinamError {
     /// no row for Finam, which is a fault of this build, not of the request.
     #[error("the outbound gateway refused the Finam call: {reason}")]
     Gateway { reason: String },
+    /// The process-level egress switch or per-machine tally refused before
+    /// the transport. This is operational configuration, not an adapter bug.
+    #[error("the Finam request cannot leave this machine: {reason}")]
+    EgressRefused {
+        reason: String,
+        retry_after: Option<Duration>,
+    },
     /// A single day's transactions answer reached the request's limit, and
     /// a single day cannot be split further: whether more transactions lie
     /// past the page cannot be proven from the wire, so the interval is
@@ -513,6 +520,12 @@ fn lifetime_of(value: &Value) -> Option<Duration> {
 /// usually cut it already), then the owner's secret, which no layer before
 /// this one knows to look for.
 fn classify_refusal(error: GatewayError, secret: &str, token: Option<&str>) -> FinamError {
+    if error.is_broker_egress_refusal() {
+        return FinamError::EgressRefused {
+            reason: error.to_string(),
+            retry_after: error.retry_after(),
+        };
+    }
     if let Some(retry_after) = error.retry_after() {
         return match error.status() {
             Some(429) => FinamError::RateLimited { retry_after },
@@ -567,14 +580,15 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use iaam_http::gateway::{BUDGETS, Budget, Clock, MethodScope, Sleeper, Transport};
-    use iaam_http::{Destination, Gateway, HttpError, HttpRequest, HttpResponse};
+    use iaam_http::{Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse};
     use time::format_description::well_known::Rfc3339;
     use time::macros::date;
     use time::{OffsetDateTime, Time};
 
+    use super::classify_refusal;
     use crate::credentials::{Key, open, seal};
 
     /// The owner's secret, invented; the session tokens are invented too.
@@ -593,6 +607,7 @@ mod tests {
     struct FakeTime {
         now: Mutex<Instant>,
         slept: Mutex<Vec<Duration>>,
+        wall: Mutex<SystemTime>,
     }
 
     impl FakeTime {
@@ -600,6 +615,7 @@ mod tests {
             Arc::new(Self {
                 now: Mutex::new(Instant::now()),
                 slept: Mutex::new(Vec::new()),
+                wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
             })
         }
 
@@ -616,12 +632,17 @@ mod tests {
         fn now(&self) -> Instant {
             *self.now.lock().expect("clock")
         }
+
+        fn now_utc(&self) -> SystemTime {
+            *self.wall.lock().expect("wall clock")
+        }
     }
 
     impl Sleeper for FakeTime {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.slept.lock().expect("sleeps").push(delay);
             *self.now.lock().expect("clock") += delay;
+            *self.wall.lock().expect("wall clock") += delay;
             Box::pin(async {})
         }
     }
@@ -773,6 +794,17 @@ mod tests {
         }
     }
 
+    fn broker_egress() -> iaam_http::BrokerEgress {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tally = std::env::temp_dir().join(format!(
+            "iaam-broker-finam-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::write(&tally, "").expect("empty tally created");
+        iaam_http::BrokerEgress::On { tally }
+    }
+
     fn client_over(
         budgets: &'static [Budget],
         endpoint: &Arc<Scripted>,
@@ -811,6 +843,7 @@ mod tests {
             budgets,
             Arc::clone(time) as Arc<dyn Clock>,
             Arc::clone(time) as Arc<dyn Sleeper>,
+            broker_egress(),
         )
         .expect("the budget table is valid");
         let key = Key::from_bytes([7; 32]);
@@ -891,7 +924,15 @@ mod tests {
         }
 
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
-        assert!(time.slept().is_empty(), "the clock renews, nothing sleeps");
+        assert_eq!(
+            time.slept(),
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            ],
+            "the exchange and three account calls share host spacing"
+        );
     }
 
     /// **Simultaneous first calls share one exchange.** Both callers find
@@ -959,7 +1000,17 @@ mod tests {
                 .all(|request| request.bearer().map(|token| token.expose()) == Some(FIRST_TOKEN)),
             "both first attempts carried the refused token"
         );
-        assert!(time.slept().is_empty(), "a 401 never waits");
+        assert_eq!(
+            time.slept(),
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            ],
+            "six sends share host spacing; 401 adds no gateway backoff"
+        );
     }
 
     /// **A poisoned cache lock is recovered from, not panicked on.** A
@@ -1174,9 +1225,17 @@ mod tests {
 
         assert_eq!(error, FinamError::InvalidToken);
         // Two exchanges, two data calls: one renewal, one retry, then the
-        // refusal. No wait: a 401 is never retried by the gateway itself.
+        // refusal. Each send observes host spacing; a 401 adds no gateway
+        // retry backoff.
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
-        assert!(time.slept().is_empty());
+        assert_eq!(
+            time.slept(),
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            ]
+        );
         assert_no_secret(&error);
     }
 
@@ -1196,7 +1255,7 @@ mod tests {
 
         assert_eq!(error, FinamError::InvalidToken);
         assert_eq!(endpoint.received.lock().expect("received").len(), 2);
-        assert!(time.slept().is_empty());
+        assert_eq!(time.slept(), vec![Duration::from_secs(1)]);
         assert_no_secret(&error);
     }
 
@@ -1217,7 +1276,10 @@ mod tests {
 
         assert_eq!(body, r#"{"id":"Main"}"#);
         assert_eq!(endpoint.received.lock().expect("received").len(), 3);
-        assert_eq!(time.slept(), vec![iaam_http::gateway::FIRST_BACKOFF]);
+        assert_eq!(
+            time.slept(),
+            vec![Duration::from_secs(1), iaam_http::gateway::FIRST_BACKOFF]
+        );
     }
 
     #[tokio::test]
@@ -1263,6 +1325,31 @@ mod tests {
             FinamError::RateLimited { retry_after } => assert!(!retry_after.is_zero()),
             other => panic!("expected RateLimited, got {other:?}"),
         }
+    }
+    #[test]
+    fn the_daily_egress_ceiling_keeps_its_operational_detail() {
+        let error = classify_refusal(
+            GatewayError::DailyCeiling {
+                destination: Destination::FinamApi,
+                ceiling: 1_000,
+                resets_at: "Tue, 01 Jan 2030 00:00:00 GMT".to_owned(),
+                retry_after: Duration::from_secs(60),
+            },
+            SECRET,
+            Some(JWT_ONE),
+        );
+
+        let FinamError::EgressRefused {
+            reason,
+            retry_after,
+        } = &error
+        else {
+            panic!("daily ceiling was collapsed into {error:?}");
+        };
+        assert!(reason.contains("1000"), "{reason}");
+        assert!(reason.contains("Tue, 01 Jan 2030 00:00:00 GMT"), "{reason}");
+        assert_eq!(*retry_after, Some(Duration::from_secs(60)));
+        assert_no_secret(&error);
     }
 
     /// The gateway has already cut the session token out of a rejected
@@ -1463,10 +1550,21 @@ mod tests {
             .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
             .await
             .expect("transactions");
-        assert!(time.slept().is_empty(), "three methods, three budgets");
+        assert_eq!(
+            time.slept(),
+            vec![Duration::from_secs(1), Duration::from_secs(1)],
+            "the session exchange, account call, and transactions call share host spacing"
+        );
 
         client.get_portfolio("Main").await.expect("portfolio again");
-        assert_eq!(time.slept(), vec![Duration::from_secs(60)]);
+        assert_eq!(
+            time.slept(),
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(59)
+            ]
+        );
         // One exchange for four calls: the session rides its own budget.
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
     }

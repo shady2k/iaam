@@ -25,7 +25,7 @@ use time::{Duration, OffsetDateTime};
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open};
 use iaam_broker::environment::Environment;
 use iaam_http::client::HttpClient;
-use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, RequestBody};
+use iaam_http::{BrokerEgress, Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::SoleOwner;
 use iaam_store::documents::BrokerCode;
@@ -74,8 +74,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
-    // A separate process, so a gateway of its own.
-    let gateway = Gateway::production()?;
+    // The recorder shares the same per-machine tally as the server and probes.
+    let gateway = Gateway::production(BrokerEgress::from_env()?)?;
 
     // Request only open accounts: a closed account is unsuitable for the
     // following calls and would make the sample set non-deterministic.

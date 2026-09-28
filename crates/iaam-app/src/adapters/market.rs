@@ -64,6 +64,13 @@ fn source_error(origin: &str, error: &GatewayError) -> AppError {
             retry_after: Some(retry_after),
         };
     }
+    if error.is_broker_egress_refusal() {
+        return AppError::SourceUnreachable {
+            origin: origin.to_owned(),
+            detail: error.to_string(),
+            retry_after: None,
+        };
+    }
     match error {
         GatewayError::Rejected { .. } => AppError::SourceRefused {
             origin: origin.to_owned(),

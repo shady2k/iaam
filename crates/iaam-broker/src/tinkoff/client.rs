@@ -278,6 +278,9 @@ fn ensure_method_available(environment: Environment, method: Method) -> Result<(
 /// A transient failure the gateway gave up on is "unreachable, retry later";
 /// only a permanent refusal is read as T-Invest's own answer.
 fn gateway_error(error: GatewayError, token: &str) -> TinkoffError {
+    if error.is_broker_egress_refusal() {
+        return TinkoffError::Gateway(error);
+    }
     if let Some(retry_after) = error.retry_after() {
         return TinkoffError::Unreachable {
             status: error.status(),
@@ -355,6 +358,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::time::SystemTime;
 
     use iaam_http::gateway::{ATTEMPTS, BUDGETS, Clock, FIRST_BACKOFF, Sleeper, Transport};
     use iaam_http::resilience::{Outcome, RetryPolicy};
@@ -369,11 +373,16 @@ mod tests {
     struct FakeTime {
         now: Mutex<Instant>,
         slept: Mutex<Vec<Duration>>,
+        wall: Mutex<SystemTime>,
     }
 
     impl Clock for FakeTime {
         fn now(&self) -> Instant {
             *self.now.lock().expect("clock")
+        }
+
+        fn now_utc(&self) -> SystemTime {
+            *self.wall.lock().expect("wall clock")
         }
     }
 
@@ -381,6 +390,7 @@ mod tests {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.slept.lock().expect("sleeps").push(delay);
             *self.now.lock().expect("clock") += delay;
+            *self.wall.lock().expect("wall clock") += delay;
             Box::pin(async {})
         }
     }
@@ -410,6 +420,17 @@ mod tests {
         })
     }
 
+    fn broker_egress() -> iaam_http::BrokerEgress {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tally = std::env::temp_dir().join(format!(
+            "iaam-broker-tinkoff-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::write(&tally, "").expect("empty tally created");
+        iaam_http::BrokerEgress::On { tally }
+    }
+
     fn client(
         answers: Vec<Result<HttpResponse, HttpError>>,
     ) -> (TinkoffClient, Arc<Mutex<Vec<String>>>, Arc<FakeTime>) {
@@ -423,6 +444,7 @@ mod tests {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
+            wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         });
         let paths = Arc::new(Mutex::new(Vec::new()));
         let gateway = Arc::new(
@@ -434,6 +456,7 @@ mod tests {
                 BUDGETS,
                 Arc::clone(&time) as Arc<dyn Clock>,
                 Arc::clone(&time) as Arc<dyn Sleeper>,
+                broker_egress(),
             )
             .expect("the documented table is valid"),
         );
@@ -555,6 +578,26 @@ mod tests {
         );
         assert_eq!(sent(&gateway), ATTEMPTS as usize);
     }
+    #[test]
+    fn the_daily_egress_ceiling_keeps_its_operational_detail() {
+        let mapped = gateway_error(
+            GatewayError::DailyCeiling {
+                destination: Destination::TinkoffProd,
+                ceiling: 1_000,
+                resets_at: "Tue, 01 Jan 2030 00:00:00 GMT".to_owned(),
+                retry_after: Duration::from_secs(60),
+            },
+            TOKEN,
+        );
+
+        let TinkoffError::Gateway(refused) = mapped else {
+            panic!("daily ceiling was collapsed into {mapped:?}");
+        };
+        let detail = refused.to_string();
+        assert!(detail.contains("1000"), "{detail}");
+        assert!(detail.contains("Tue, 01 Jan 2030 00:00:00 GMT"), "{detail}");
+        assert!(!detail.contains(TOKEN), "{detail}");
+    }
 
     #[tokio::test]
     async fn a_network_failure_that_outlasts_the_retries_is_unreachable() {
@@ -617,15 +660,17 @@ mod tests {
                 .await
                 .expect("portfolio");
         }
-        assert!(time.slept.lock().expect("sleeps").is_empty());
+        assert_eq!(
+            *time.slept.lock().expect("sleeps"),
+            vec![Duration::from_secs(1); 49]
+        );
         client
             .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"), None)
             .await
             .expect("operations");
-        assert!(
-            time.slept.lock().expect("sleeps").is_empty(),
-            "operations waited on the users budget"
-        );
+        let sleeps = time.slept.lock().expect("sleeps");
+        assert_eq!(sleeps.len(), 50, "operations waited on the users budget");
+        assert_eq!(sleeps.last(), Some(&Duration::from_secs(1)));
     }
 
     #[tokio::test]
@@ -659,10 +704,9 @@ mod tests {
             client.get_accounts().await.expect("accounts");
         }
 
-        assert_eq!(
-            *time.slept.lock().expect("sleeps"),
-            [Duration::from_secs(60)]
-        );
+        let mut expected = vec![Duration::from_secs(1); 24];
+        expected.push(Duration::from_secs(36));
+        assert_eq!(*time.slept.lock().expect("sleeps"), expected);
     }
 
     #[test]

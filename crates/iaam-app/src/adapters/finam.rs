@@ -326,6 +326,14 @@ fn finam_error(error: FinamError) -> BrokerError {
                 retry_after: Some(retry_after),
             }
         }
+        FinamError::EgressRefused {
+            retry_after,
+            reason: _,
+        } => BrokerError::Unreachable {
+            broker: BROKER.to_owned(),
+            detail,
+            retry_after,
+        },
         FinamError::InvalidToken | FinamError::UnexpectedStatus { .. } => BrokerError::Refused {
             broker: BROKER.to_owned(),
             detail,
@@ -638,9 +646,10 @@ mod tests {
     use crate::adapters::tinkoff::fake::{self, Answer};
     use iaam_broker::credentials::BrokerToken;
     use iaam_core::reconciliation::claim::ControlClaim;
-    use iaam_http::{Gateway, Outbound};
+    use iaam_http::{BrokerEgress, Gateway, Outbound};
     use serde_json::json;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use time::macros::date;
 
@@ -655,6 +664,17 @@ mod tests {
         let key = iaam_broker::credentials::Key::from_bytes([9; 32]);
         iaam_broker::credentials::open(&key, &iaam_broker::credentials::seal(&key, TOKEN))
             .expect("token round trip")
+    }
+
+    fn broker_egress() -> BrokerEgress {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tally = std::env::temp_dir().join(format!(
+            "iaam-app-finam-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::write(&tally, "").expect("empty tally created");
+        BrokerEgress::On { tally }
     }
 
     fn dictionary() -> OperationKindDictionary {
@@ -1417,7 +1437,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_still_running_at_the_deadline_is_dropped() {
         let gateway: Arc<dyn Outbound> =
-            Arc::new(Gateway::new(Parked).expect("the budget table is valid"));
+            Arc::new(Gateway::new(Parked, broker_egress()).expect("the budget table is valid"));
         let channel = channel(gateway);
         let deadline = Instant::now() + Duration::from_secs(15 * 60);
 

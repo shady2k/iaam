@@ -59,45 +59,38 @@ Three rules follow, and they hold for every step below.
   first owner token exactly once. There is no one-time claim code and no
   `POST /v1/claim`; both were retired with ADR-0003.
 
-### 1.1 One server process per instance
+### 1.1 One server process and one broker tally per instance
 
 An instance runs **exactly one `iaam serve`** against its database. Not two
 behind a load balancer, not a second one started beside the first "to test",
 not a blue-green overlap where the old one keeps serving while the new one
-starts.
+starts. The claim that permits only one broker sync per account at a time is
+in-process state (`crates/iaam-app/src/scenarios/sync.rs`, `RunningSyncs`), so a
+second server could sync the same account concurrently.
 
-Everything that keeps this instance polite to the brokers, MOEX and the CBR
-lives in the memory of that one process, in its outbound gateway
-(`crates/iaam-http/src/gateway.rs`):
+The outbound gateway also keeps its lane, named waits and circuit breaker in
+the server process. Those protect MOEX and the CBR exactly as before and prevent
+parallel calls inside one process, but they do not cross a restart.
 
-- the **budget** per destination and method, half of the limit the source
-  documents where it documents one;
-- the **lane** that allows one request in flight per host;
-- a **named wait** — a reset time the source itself asked for in
-  `Retry-After` or its reset header — which holds back every later call to
-  that host until it ends;
-- the **circuit breaker** per host, which stops calling a source that keeps
-  failing.
+Broker call accounting is different. With broker egress enabled, every local
+process uses the same **outbound tally** file. The gateway locks that file only
+while it reads, decides and records a send. The tally preserves:
 
-The claim that lets only one broker sync run per account at a time lives there
-too (`crates/iaam-app/src/scenarios/sync.rs`, `RunningSyncs`).
+- the per-method minute budgets from the gateway table;
+- at least one second between sends to the same broker host;
+- at most 1,000 broker sends in one UTC day.
 
-None of this is shared between processes, and none of it survives a restart. A
-second process starts with a full budget of its own, a lane of its own, no
-knowledge of a wait the broker named to the first, and no knowledge of the sync
-the first is running. Two processes are two allowances against the same broker
-token: together they spend the whole documented limit, which leaves no margin,
-and a third exceeds it. They can also sync one account twice at the same time.
+Those three rules therefore hold across local processes and restarts. A process
+never holds the file lock while sleeping or while an HTTP request is in flight:
+after a required wait it locks and decides again. A missing, unreadable or
+corrupt tally refuses the broker call and names the path; it never falls back
+to an in-memory allowance.
 
-Only `serve` talks to an outside source. The administrative commands in the
-table above (`claim`, `token issue`, `broker key …`, `broker access …`,
-`bundle export`, `bundle import`) open the database and nothing else: `serve`
-is the one place in `crates/iaam-bootstrap/src/main.rs` that builds the
-gateway, and `scripts/check-architecture.sh` (guard 11b) refuses a second one.
-At run time `Gateway::production()` refuses every call after the first in one
-process, with an error naming this section.
-So running an administrative command beside the running service is safe, and
-is how §6 and §7 are meant to be done.
+Administrative commands (`claim`, `token issue`, `broker key …`,
+`broker access …`, `bundle export`, `bundle import`) open the database and do
+not contact a source. The two broker examples and the ignored live sandbox
+test do contact brokers and consequently use the same egress switch and tally
+as `serve`.
 
 ```console
 $ pgrep -c -x iaam
@@ -105,11 +98,9 @@ $ pgrep -c -x iaam
 ```
 
 More than `1` while no administrative command is running means a second server.
-Stop it before the next sync. A restart does not break the rule, but it drops
-every budget, named wait and open breaker the old process had learned, so do
-not restart the service to "clear" a `source_unavailable`: it removes the one
-thing that kept the next call from reaching a source that asked to be left
-alone.
+Stop it before the next sync. Restarting does not clear the broker tally, and
+must not be used to evade a `source_unavailable`; in-process named waits and
+open breakers are still lost on restart.
 
 ---
 
@@ -121,6 +112,8 @@ alone.
 |---|---|---|---|
 | `IAAM_DATABASE` | **required** | none — every subcommand refuses without it | every subcommand, including `serve` |
 | `IAAM_BROKER_KEY_FILE` | path to a secret | none | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
+| `IAAM_BROKER_EGRESS` | `off` or `on` | `off` | `serve`, broker examples, ignored live sandbox test |
+| `IAAM_OUTBOUND_TALLY` | path to mutable state | none — required when broker egress is `on` | `serve`, broker examples, ignored live sandbox test |
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
 | `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
 | `IAAM_RATE_WINDOW_SECONDS` | optional | `60` | `serve` |
@@ -135,6 +128,29 @@ decrypts — answer `{"code":"not_configured", …}` on a server started without
 and the fix is a restart with the key, not a different call.
 `GET /v1/broker-access` is not one of them: it lists metadata, decrypts nothing,
 and answers `200` with or without the key (§6.2).
+
+`IAAM_BROKER_EGRESS` is a fail-closed deployment switch. Unset and `off` both
+refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
+or network is touched. `on` requires `IAAM_OUTBOUND_TALLY`; no other spelling
+is accepted.
+
+`IAAM_OUTBOUND_TALLY` names one ordinary file outside this repository and
+outside the database. Put it in a persistent, writable directory, for example:
+
+```console
+$ install -m 0600 /dev/null /var/lib/iaam/outbound-tally
+$ export IAAM_BROKER_EGRESS=on
+$ export IAAM_OUTBOUND_TALLY=/var/lib/iaam/outbound-tally
+```
+
+Every iaam process on the machine that may contact a broker must receive the
+same path and OS user access to read, lock and rewrite it. The file must already
+exist; an empty file is valid only for its first initialization. Persist it
+across service restarts. Do not copy it while a process is using it and do not
+delete or truncate it to clear a refusal. A missing or unreadable path, a
+directory in place of the file or invalid contents make the call fail as
+`source_unavailable`, with the path in the reason and no broker send.
+
 
 `IAAM_SOURCE_PROFILES` names a directory of **source profiles** — reviewed JSON
 files describing one institution's export, which the server reads a document

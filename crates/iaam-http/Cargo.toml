@@ -28,6 +28,9 @@ tokio = { version = "1", features = ["sync", "time"] }
 # operator watching a slow synchronisation must tell a budget wait from an
 # open breaker. The same facade the rest of the tree logs through.
 tracing = "0.1"
+# Cross-process request accounting must lock one machine-local file. `fs2`
+# provides the portable exclusive lock on the workspace's Rust 1.85 MSRV.
+fs2 = "0.4"
 
 [dev-dependencies]
 # `test-util` pauses the tokio timer, so the production sleeper is checked

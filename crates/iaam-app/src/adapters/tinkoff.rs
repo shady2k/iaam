@@ -1023,6 +1023,13 @@ fn tinkoff_error(error: TinkoffError) -> BrokerError {
             detail,
             retry_after: Some(retry_after),
         },
+        TinkoffError::Gateway(error) if error.is_broker_egress_refusal() => {
+            BrokerError::Unreachable {
+                broker: BROKER.to_owned(),
+                detail,
+                retry_after: error.retry_after(),
+            }
+        }
         TinkoffError::InvalidToken
         | TinkoffError::MethodUnavailable { .. }
         | TinkoffError::UnexpectedStatus { .. } => BrokerError::Refused {
@@ -1034,7 +1041,8 @@ fn tinkoff_error(error: TinkoffError) -> BrokerError {
         | TinkoffError::RequestSerialization => unparsable(detail),
         // A method key without a budget, or a client or trust root that could
         // not be built, is this build's fault, not the broker's: retrying
-        // later meets the same fault.
+        // later meets the same fault. Operational egress/tally refusals were
+        // separated above so they remain actionable at the server boundary.
         TinkoffError::Gateway(_) | TinkoffError::Transport(_) => BrokerError::Adapter {
             broker: BROKER.to_owned(),
             detail,
@@ -1068,7 +1076,7 @@ pub(crate) mod fake {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
     use iaam_http::{Gateway, HttpError, HttpRequest, HttpResponse};
@@ -1077,6 +1085,7 @@ pub(crate) mod fake {
     pub(crate) struct FakeTime {
         now: Mutex<Instant>,
         slept: Mutex<Vec<Duration>>,
+        wall: Mutex<SystemTime>,
     }
 
     impl FakeTime {
@@ -1089,12 +1098,17 @@ pub(crate) mod fake {
         fn now(&self) -> Instant {
             *self.now.lock().expect("clock")
         }
+
+        fn now_utc(&self) -> SystemTime {
+            *self.wall.lock().expect("wall clock")
+        }
     }
 
     impl Sleeper for FakeTime {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.slept.lock().expect("sleeps").push(delay);
             *self.now.lock().expect("clock") += delay;
+            *self.wall.lock().expect("wall clock") += delay;
             Box::pin(async {})
         }
     }
@@ -1150,6 +1164,17 @@ pub(crate) mod fake {
         }
     }
 
+    fn broker_egress() -> iaam_http::BrokerEgress {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tally = std::env::temp_dir().join(format!(
+            "iaam-app-tinkoff-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::write(&tally, "").expect("empty tally created");
+        iaam_http::BrokerEgress::On { tally }
+    }
+
     /// A gateway over a fake T-Invest answering `script`, then `otherwise`.
     pub(crate) fn gateway(
         script: Vec<Answer>,
@@ -1158,6 +1183,7 @@ pub(crate) mod fake {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
+            wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         });
         let log = Log::default();
         let gateway = Gateway::with_parts(
@@ -1169,6 +1195,7 @@ pub(crate) mod fake {
             BUDGETS,
             Arc::clone(&time) as Arc<dyn Clock>,
             Arc::clone(&time) as Arc<dyn Sleeper>,
+            broker_egress(),
         )
         .expect("the documented table is valid");
         (Arc::new(gateway), log, time)
@@ -2989,8 +3016,8 @@ mod tests {
     }
 
     /// T-Invest limits a caller with 429 and names when its limit resets,
-    /// then fails once more; the fetch waits what it was told, then the
-    /// backoff, and completes every page.
+    /// then fails once more; the fetch waits what it was told, the backoff and
+    /// the host spacing between pages, and completes every page.
     #[tokio::test]
     async fn a_multi_page_fetch_survives_a_limit_and_a_failure_waiting_what_was_named() {
         let named = Duration::from_secs(7);
@@ -3012,7 +3039,7 @@ mod tests {
 
         assert_eq!(parsed.accepted.len() + parsed.quarantined.len(), 2);
         let backoff = RetryPolicy::new(ATTEMPTS, FIRST_BACKOFF).delay(2, &Outcome::status(503));
-        assert_eq!(time.slept(), [named, backoff]);
+        assert_eq!(time.slept(), [named, backoff, Duration::from_secs(1)]);
         let log = log.lock().expect("log");
         assert_eq!(log.len(), 4);
         assert!(!log[2].contains("cursor"), "{}", log[2]);
@@ -3116,7 +3143,11 @@ mod tests {
             .expect_err("the named wait crosses the deadline");
 
         assert_eq!(log.lock().expect("log").len(), 3);
-        assert!(time.slept().is_empty(), "a wait past the deadline was run");
+        assert_eq!(
+            time.slept(),
+            [Duration::from_secs(1), Duration::from_secs(1)],
+            "only host spacing before the three sends was waited"
+        );
         assert!(
             matches!(&error, BrokerError::Unreachable { detail, .. }
                 if detail.contains("retry after")
@@ -3164,6 +3195,32 @@ mod tests {
             },
         ));
         assert!(matches!(error, BrokerError::Adapter { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn egress_and_tally_refusals_remain_actionable_for_the_sync_surface() {
+        for refusal in [
+            iaam_http::GatewayError::BrokerEgressOff,
+            iaam_http::GatewayError::TallyCorrupt {
+                path: std::path::PathBuf::from("/run/iaam/outbound-tally"),
+                reason: "missing header".to_owned(),
+            },
+        ] {
+            let error = super::tinkoff_error(super::TinkoffError::Gateway(refusal));
+            let BrokerError::Unreachable {
+                detail,
+                retry_after,
+                ..
+            } = error
+            else {
+                panic!("operational refusal became an adapter fault: {error:?}");
+            };
+            assert!(retry_after.is_none());
+            assert!(
+                detail.contains("IAAM_BROKER_EGRESS") || detail.contains("outbound-tally"),
+                "{detail}"
+            );
+        }
     }
 
     /// A client or trust root this build could not construct is our fault

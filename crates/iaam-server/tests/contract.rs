@@ -8,6 +8,8 @@
 //! means the agent will fix itself based on incorrect guidance.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::Router;
@@ -482,6 +484,39 @@ impl iaam_http::gateway::Transport for NoNetwork {
     }
 }
 
+/// One deterministic clock for the scripted Finam gateway: tally spacing
+/// advances this clock instead of sleeping on the wall clock.
+struct FinamTime(std::sync::Mutex<(std::time::Instant, std::time::SystemTime)>);
+
+impl FinamTime {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(std::sync::Mutex::new((
+            std::time::Instant::now(),
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        ))))
+    }
+}
+
+impl iaam_http::gateway::Clock for FinamTime {
+    fn now(&self) -> std::time::Instant {
+        self.0.lock().expect("Finam time").0
+    }
+
+    fn now_utc(&self) -> std::time::SystemTime {
+        self.0.lock().expect("Finam time").1
+    }
+}
+
+impl iaam_http::gateway::Sleeper for FinamTime {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let mut time = self.0.lock().expect("Finam time");
+            time.0 += delay;
+            time.1 += delay;
+        })
+    }
+}
+
 /// A Finam Trade API on a script: every request is answered with the next
 /// body in order, and one more request than scripted fails the test.
 struct FinamScript(std::sync::Mutex<std::collections::VecDeque<String>>);
@@ -489,9 +524,19 @@ struct FinamScript(std::sync::Mutex<std::collections::VecDeque<String>>);
 impl FinamScript {
     /// A gateway over the script, for a harness's broker channels.
     fn gateway(script: Vec<String>) -> Arc<dyn Outbound> {
+        let tally =
+            std::env::temp_dir().join(format!("iaam-contract-finam-tally-{}", Uuid::new_v4()));
+        std::fs::write(&tally, "").expect("empty tally created");
+        let time = FinamTime::new();
         Arc::new(
-            Gateway::new(FinamScript(std::sync::Mutex::new(script.into())))
-                .expect("the budget table is valid"),
+            Gateway::with_parts(
+                FinamScript(std::sync::Mutex::new(script.into())),
+                iaam_http::gateway::BUDGETS,
+                Arc::clone(&time) as Arc<dyn iaam_http::gateway::Clock>,
+                time as Arc<dyn iaam_http::gateway::Sleeper>,
+                iaam_http::BrokerEgress::On { tally },
+            )
+            .expect("the budget table is valid"),
         )
     }
 }
@@ -687,7 +732,10 @@ async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) ->
         store,
         Some(Key::from_bytes([7; 32])),
         broker_gateway.unwrap_or_else(|| {
-            Arc::new(Gateway::new(NoNetwork).expect("the budget table is valid"))
+            Arc::new(
+                Gateway::new(NoNetwork, iaam_http::BrokerEgress::Off)
+                    .expect("the budget table is valid"),
+            )
         }),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
@@ -35450,6 +35498,24 @@ async fn an_unreachable_broker_without_a_known_wait_sends_no_retry_after() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
     assert_eq!(response["code"], "source_unavailable");
     assert!(headers.get("retry-after").is_none(), "{headers:?}");
+}
+
+#[tokio::test]
+async fn broker_egress_refusal_answers_503_naming_the_switch() {
+    let detail = iaam_http::GatewayError::BrokerEgressOff.to_string();
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::Unreachable {
+        broker: "tinkoff".to_owned(),
+        detail,
+        retry_after: None,
+    })
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+    assert_eq!(response["code"], "source_unavailable");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.contains("IAAM_BROKER_EGRESS"), "{message}");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
 }
 
 #[tokio::test]

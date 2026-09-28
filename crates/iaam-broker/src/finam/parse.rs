@@ -39,8 +39,6 @@ pub enum ParseError {
     },
     #[error("exact number overflow in field {field}")]
     NumericOverflow { field: &'static str },
-    #[error("Finam paginated response is truncated: next-page token is missing")]
-    PartialResponse,
 }
 
 /// An operation's monetary value in currency minor units.
@@ -59,11 +57,22 @@ pub struct ChannelOperation {
     /// decides what it becomes, and that dictionary lives in data.
     pub source_kind: String,
     pub symbol: Option<String>,
+    /// The trade's executed quantity, from the contract's `trade.size`.
     pub quantity: Option<Quantity>,
+    /// The money change in rubles (`change` in the contract): the
+    /// non-trade rows' money.
     pub payment: Option<ChannelMoney>,
+    /// The money change in the instrument's own currency (`change_original`
+    /// in the contract): the trade's gross, as Finam states it.
+    pub change_original: Option<ChannelMoney>,
     pub price: Option<Dec>,
     pub accrued_interest: Option<Dec>,
-    pub transaction_category: String,
+    /// The transaction's own grouping, verbatim, when the wire printed one.
+    ///
+    /// Deliberately NOT defaulted to `category`: the category is the
+    /// operation's word, and a consumer that files the two into one slot
+    /// makes a rule written on the grouping fire on rows it never described.
+    pub transaction_category: Option<String>,
     pub transaction_name: Option<String>,
     pub deduplication_key: String,
     pub parser_version: ParserVersion,
@@ -78,18 +87,11 @@ impl ChannelOperation {
     }
 }
 
-/// Parse a transaction page without network access.
+/// Parse a transactions answer without network access. The published
+/// response is a bare repeated list: completeness is the fetching client's
+/// proof, not a field this body could name.
 pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError> {
     let response: RawTransactionsResponse = parse_json(body)?;
-    let has_more = response.has_more.unwrap_or(false);
-    if has_more
-        && response
-            .next_page_token
-            .as_deref()
-            .is_none_or(str::is_empty)
-    {
-        return Err(ParseError::PartialResponse);
-    }
     let transactions = response.transactions.ok_or(ParseError::MissingField {
         field: "transactions",
     })?;
@@ -153,9 +155,10 @@ fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {
         &mut rejection,
     );
     let quantity = keep_or_reject(
-        item.change_qty
+        item.trade
             .as_ref()
-            .map(|value| parse_quantity(value, "changeQty"))
+            .and_then(|trade| trade.size.as_ref())
+            .map(|value| parse_quantity(value, "trade.size"))
             .transpose(),
         &mut rejection,
     );
@@ -164,6 +167,13 @@ fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {
             .as_ref()
             .and_then(|trade| trade.price.as_ref())
             .map(|value| parse_decimal(value, "trade.price"))
+            .transpose(),
+        &mut rejection,
+    );
+    let change_original = keep_or_reject(
+        item.change_original
+            .as_ref()
+            .map(|value| parse_money(value, "change_original"))
             .transpose(),
         &mut rejection,
     );
@@ -185,9 +195,10 @@ fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {
         symbol: nonempty(item.symbol),
         quantity,
         payment,
+        change_original,
         price,
         accrued_interest,
-        transaction_category: item.transaction_category.unwrap_or(category),
+        transaction_category: nonempty(item.transaction_category),
         transaction_name: nonempty(item.transaction_name),
         deduplication_key: operation_id.clone(),
         parser_version: ParserVersion(FINAM_PARSER_VERSION.to_owned()),
@@ -204,9 +215,10 @@ fn rejected_operation(raw: Value, reason: ParseError) -> ChannelOperation {
         symbol: None,
         quantity: None,
         payment: None,
+        change_original: None,
         price: None,
         accrued_interest: None,
-        transaction_category: String::new(),
+        transaction_category: None,
         transaction_name: None,
         deduplication_key: String::new(),
         parser_version: ParserVersion(FINAM_PARSER_VERSION.to_owned()),
@@ -352,12 +364,10 @@ fn parse_json<T: DeserializeOwned>(body: &str) -> Result<T, ParseError> {
     serde_json::from_str(body).map_err(|error| ParseError::Json(error.to_string()))
 }
 
+/// The published response is a bare repeated list: the request carries a
+/// limit, and no continuation field exists to read.
 #[derive(Debug, Deserialize)]
 struct RawTransactionsResponse {
-    #[serde(rename = "hasMore", alias = "has_more")]
-    has_more: Option<bool>,
-    #[serde(rename = "nextPageToken", alias = "next_page_token")]
-    next_page_token: Option<String>,
     transactions: Option<Vec<Value>>,
 }
 
@@ -370,17 +380,21 @@ struct RawTransaction {
     timestamp: Option<String>,
     symbol: Option<String>,
     change: Option<RawMoneyValue>,
+    /// The money change in the instrument's own currency; `change` folds
+    /// every instrument into rubles.
+    #[serde(rename = "changeOriginal", alias = "change_original")]
+    change_original: Option<RawMoneyValue>,
     trade: Option<RawTrade>,
     #[serde(alias = "transactionCategory")]
     transaction_category: Option<String>,
     #[serde(alias = "transactionName")]
     transaction_name: Option<String>,
-    #[serde(alias = "changeQty")]
-    change_qty: Option<RawQuotation>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawTrade {
+    /// The executed quantity, in pieces (the contract's `Trade.size`).
+    size: Option<RawQuotation>,
     price: Option<RawQuotation>,
     #[serde(alias = "accruedInterest")]
     accrued_interest: Option<RawQuotation>,

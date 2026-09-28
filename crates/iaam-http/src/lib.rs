@@ -54,5 +54,5 @@ pub mod trust;
 
 pub use destination::Destination;
 pub use gateway::{Gateway, GatewayError, Outbound};
-pub use request::{HttpMethod, HttpRequest, RequestBody, Secret};
+pub use request::{AuthScheme, HttpMethod, HttpRequest, RequestBody, Secret};
 pub use response::{HttpError, HttpResponse};

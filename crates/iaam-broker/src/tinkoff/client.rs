@@ -219,7 +219,8 @@ impl TinkoffClient {
     ) -> Result<String, TinkoffError> {
         ensure_method_available(self.environment, method)?;
         let body = serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?;
-        let request = Self::request(self.environment, path, body, self.token.expose());
+        let path = format!("{PACKAGE}.{path}");
+        let request = Self::request(self.environment, &path, body, self.token.expose());
         let response = self
             .gateway
             .send(service, &request, deadline)
@@ -242,6 +243,11 @@ impl TinkoffClient {
             .with_reset_header(RESET_HEADER)
     }
 }
+
+/// The protobuf package every service lives in. The REST gateway serves a
+/// method at `/rest/<package>.<Service>/<Method>`; without the package it
+/// answers 404 to every call.
+const PACKAGE: &str = "tinkoff.public.invest.api.contract.v1";
 
 /// The environment selects the destination, not a URL suffix.
 ///
@@ -407,6 +413,13 @@ mod tests {
     fn client(
         answers: Vec<Result<HttpResponse, HttpError>>,
     ) -> (TinkoffClient, Arc<Mutex<Vec<String>>>, Arc<FakeTime>) {
+        client_in(Environment::Prod, answers)
+    }
+
+    fn client_in(
+        environment: Environment,
+        answers: Vec<Result<HttpResponse, HttpError>>,
+    ) -> (TinkoffClient, Arc<Mutex<Vec<String>>>, Arc<FakeTime>) {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
@@ -426,7 +439,7 @@ mod tests {
         );
         let key = Key::from_bytes([3; 32]);
         let token = open(&key, &seal(&key, TOKEN)).expect("token opens");
-        let client = TinkoffClient::new(Environment::Prod, token, gateway);
+        let client = TinkoffClient::new(environment, token, gateway);
         (client, paths, time)
     }
 
@@ -719,24 +732,42 @@ mod tests {
         assert!(ensure_method_available(Environment::Sandbox, Method::Portfolio).is_ok());
     }
 
-    fn method_url(environment: Environment, path: &str) -> String {
-        HttpRequest::post(
-            destination_for(environment),
-            path,
-            RequestBody::Json("{}".to_owned()),
-        )
-        .url()
-    }
-    #[test]
-    fn builds_method_url_from_environment_base_url() {
-        assert_eq!(
-            method_url(Environment::Prod, "OperationsService/GetPortfolio"),
-            "https://invest-public-api.tbank.ru/rest/OperationsService/GetPortfolio"
-        );
-        assert_eq!(
-            method_url(Environment::Sandbox, "UsersService/GetAccounts"),
-            "https://sandbox-invest-public-api.tbank.ru/rest/UsersService/GetAccounts"
-        );
+    /// Each method reaches the address T-Invest publishes for it:
+    /// `/rest/<package>.<Service>/<Method>`, the package being the one
+    /// `docs/api/tinkoff-invest/*.proto` declare.
+    #[tokio::test]
+    async fn every_method_is_posted_to_its_published_address() {
+        for (environment, host) in [
+            (Environment::Prod, "invest-public-api.tbank.ru"),
+            (Environment::Sandbox, "sandbox-invest-public-api.tbank.ru"),
+        ] {
+            let (client, paths, _) = client_in(
+                environment,
+                vec![
+                    answer(200, r#"{"accounts":[]}"#),
+                    answer(200, "{}"),
+                    answer(200, r#"{"hasNext":false,"items":[]}"#),
+                ],
+            );
+
+            client.get_accounts().await.expect("accounts");
+            client.get_portfolio("Main", None).await.expect("portfolio");
+            client
+                .get_operations_by_cursor(&GetOperationsByCursorRequest::new("Main"), None)
+                .await
+                .expect("operations");
+
+            let base = format!("https://{host}/rest/tinkoff.public.invest.api.contract.v1");
+            assert_eq!(
+                *paths.lock().expect("paths"),
+                vec![
+                    format!("{base}.UsersService/GetAccounts"),
+                    format!("{base}.OperationsService/GetPortfolio"),
+                    format!("{base}.OperationsService/GetOperationsByCursor"),
+                ],
+                "{environment:?}"
+            );
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ use iaam_market::moex::{HistoryQuery, history_request};
 use iaam_market::{
     AccruedInterestObservation, FxObservation, KeyRateObservation, PriceKind, PriceObservation,
 };
+use iaam_store::documents::BrokerCode;
 use iaam_store::market::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
@@ -58,6 +59,10 @@ pub struct SyncOutcome {
     pub possible_duplicates: usize,
     pub assertions: usize,
     pub assertions_withheld: Option<AssertionsWithheld>,
+    /// True when this sync recorded the binding itself: no binding stood,
+    /// the access saw exactly one account, and it was taken. The binding
+    /// itself is read through the account's own route, not repeated here.
+    pub binding_recorded: bool,
 }
 
 /// How long a whole broker sync may take, from its start.
@@ -120,14 +125,35 @@ impl Drop for SyncClaim<'_> {
 /// Reconciliation of two independent channels must still recognise the same operation even
 /// from different sources. A probable duplicate is not removed: it is only a hint
 /// at the §10.6 level, so it enters the journal as a new fact.
+/// One broker synchronisation, whole: which broker the binding is kept
+/// under, whose account the facts belong to, and the interval to read.
+///
+/// A struct rather than five loose arguments so that adding one does not
+/// silently reorder the ones already there (§15.1), the way
+/// [`MarketSyncRequest`] does for the market sync beside it. The channel is
+/// deliberately not a field: it is a live connection the caller opened, not
+/// a description of what is being asked.
+#[derive(Debug, Clone)]
+pub struct BrokerSyncRequest {
+    pub broker_code: BrokerCode,
+    pub account: AccountId,
+    pub from: Date,
+    pub to: Date,
+}
+
+/// Retrieves the broker's operations and portfolio and records new facts.
 pub async fn sync_broker(
     services: &AppServices,
     principal: &Principal,
     broker: &dyn BrokerChannel,
-    account: AccountId,
-    from: Date,
-    to: Date,
+    request: BrokerSyncRequest,
 ) -> Result<SyncOutcome, AppError> {
+    let BrokerSyncRequest {
+        broker_code,
+        account,
+        from,
+        to,
+    } = request;
     if !principal.scope.may_submit() {
         return Err(AppError::Invalid {
             field: "scope".to_owned(),
@@ -139,8 +165,43 @@ pub async fn sync_broker(
     let _claim = services.running_syncs.claim(principal.owner, account)?;
     let deadline = Some(Instant::now() + SYNC_DEADLINE);
 
+    // The account the broker is asked for is its own number, never our
+    // identifier (`iaam-xzz5.3.2`). A stored binding is the word that stands;
+    // without one the access is asked what it sees: exactly one number is
+    // taken and held for the binding, several are refused with the
+    // candidates named — the owner binds one, the sync never guesses — and
+    // none is refused too. Every refusal below happens before anything is
+    // fetched for the interval or written to the journal.
+    let binding = services
+        .store
+        .broker_account_binding(principal.owner, account, &broker_code)
+        .await?;
+    let (broker_account, pending_binding) = match binding {
+        Some(number) => (number, None),
+        None => {
+            let candidates = broker
+                .fetch_account_numbers(deadline)
+                .await
+                .map_err(broker_error)?;
+            match candidates.as_slice() {
+                [] => {
+                    return Err(AppError::BrokerAccountUnseen {
+                        broker: broker_code.as_str().to_owned(),
+                    });
+                }
+                [one] => (one.clone(), Some(one.clone())),
+                several => {
+                    return Err(AppError::BrokerAccountAmbiguous {
+                        broker: broker_code.as_str().to_owned(),
+                        candidates: several.to_vec(),
+                    });
+                }
+            }
+        }
+    };
+
     let parsed = broker
-        .fetch_operations(account, from, to, deadline)
+        .fetch_operations(account, &broker_account, from, to, deadline)
         .await
         .map_err(broker_error)?;
     let channel = broker.channel();
@@ -167,10 +228,27 @@ pub async fn sync_broker(
     } else {
         Some(
             broker
-                .fetch_portfolio(account, to, deadline)
+                .fetch_portfolio(account, &broker_account, to, deadline)
                 .await
                 .map_err(broker_error)?,
         )
+    };
+    // The sync's fetches have succeeded — both answers, wherever the
+    // portfolio is asked for at all: an out-of-interval trade withholds
+    // every assertion, so its portfolio is never requested. Only now does
+    // the discovery made above stand. A sync that fails before this point
+    // — a fetch refused, unreadable, or past its deadline — leaves no
+    // binding, so a retry asks the access what it sees again instead of
+    // trusting a number nothing confirmed. This is the sync's first write.
+    let binding_recorded = match pending_binding {
+        Some(number) => {
+            services
+                .store
+                .record_broker_account_binding(principal.owner, account, &broker_code, number)
+                .await?;
+            true
+        }
+        None => false,
     };
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
@@ -317,6 +395,7 @@ pub async fn sync_broker(
             possible_duplicates,
             assertions: 0,
             assertions_withheld: None,
+            binding_recorded,
         });
     };
     let assertions_withheld = match snapshot.as_of {
@@ -333,6 +412,7 @@ pub async fn sync_broker(
             possible_duplicates,
             assertions: 0,
             assertions_withheld,
+            binding_recorded,
         });
     }
 
@@ -382,6 +462,7 @@ pub async fn sync_broker(
         possible_duplicates,
         assertions,
         assertions_withheld: None,
+        binding_recorded,
     })
 }
 

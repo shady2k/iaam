@@ -24,8 +24,9 @@ use crate::ports::{
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
-use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
+use iaam_broker::credentials::{BrokerScope, BrokerToken, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
+use iaam_broker::finam::FinamClient;
 use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::batch::ControlSection;
@@ -302,7 +303,18 @@ fn import_session_error(error: iaam_store::StoreError) -> AppError {
 }
 
 fn store_error(error: iaam_store::StoreError) -> AppError {
-    AppError::Store(error.to_string())
+    match error {
+        // A broker number another of the owner's accounts already holds is
+        // his answer, not a fault: a `500` would send him looking for a
+        // failure instead of at the account that holds the number
+        // (`iaam-xzz5.3.2`). This is the one place every port method's
+        // refusal passes through, so the arm here covers both the route that
+        // sets a binding and the sync that records one.
+        iaam_store::StoreError::BrokerAccountBindingHeld { account } => AppError::Conflict {
+            what: format!("broker account is already bound to account {account}"),
+        },
+        other => AppError::Store(other.to_string()),
+    }
 }
 
 /// The three resolution cases must remain distinguishable on this side
@@ -768,6 +780,47 @@ impl Store for SqliteAdapter {
             store
                 .withdraw_report_default_contour(owner)
                 .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+    ) -> Result<Option<String>, AppError> {
+        let broker = broker.clone();
+        self.blocking(move |store| {
+            store
+                .broker_account_binding(owner, account, &broker)
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn record_broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: String,
+    ) -> Result<(), AppError> {
+        let broker = broker.clone();
+        self.blocking(move |store| {
+            store
+                .record_broker_account_binding(owner, account, &broker, &broker_account)
+                .map_err(|error| match error {
+                    // The binding named an account this owner does not hold.
+                    // Unreachable behind a route that checks ownership first,
+                    // but the sync resolves the account straight from the
+                    // request, so the not-found refusal reaches the caller
+                    // typed rather than as a fault.
+                    iaam_store::StoreError::NotFound { what, id } => {
+                        AppError::NotFound { what, id }
+                    }
+                    other => store_error(other),
+                })
         })
         .await
     }
@@ -1783,6 +1836,54 @@ impl crate::ports::BrokerDictionary for SqliteAdapter {
             .await
     }
 }
+/// The pieces the shared path gathered for one channel: the client's
+/// transport inputs plus the port data every channel carries.
+struct ChannelParts {
+    environment: Environment,
+    token: BrokerToken,
+    gateway: Arc<dyn Outbound>,
+    source: SourceId,
+    dictionary: OperationKindDictionary,
+}
+
+fn build_tinkoff_channel(parts: ChannelParts) -> Arc<dyn BrokerChannel> {
+    Arc::new(crate::adapters::tinkoff::TinkoffChannel::new(
+        TinkoffClient::new(parts.environment, parts.token, parts.gateway),
+        parts.source,
+        parts.dictionary,
+    ))
+}
+
+fn build_finam_channel(parts: ChannelParts) -> Arc<dyn BrokerChannel> {
+    Arc::new(crate::adapters::finam::FinamChannel::new(
+        FinamClient::new(parts.token, parts.gateway),
+        parts.source,
+        parts.dictionary,
+    ))
+}
+
+/// How a registry row builds its channel from the shared parts.
+type ChannelBuilder = fn(ChannelParts) -> Arc<dyn BrokerChannel>;
+
+/// The broker registry: one row per broker this build opens a channel for —
+/// the broker code, then how its channel is built from the access the shared
+/// path gathered. The factory's `open` is shared by every row: access
+/// lookup, scope and environment checks, token opening and dictionary
+/// loading happen once for all. Adding a broker is one builder and one row
+/// here, not a branch in the factory.
+const CHANNEL_REGISTRY: &[(&str, ChannelBuilder)] = &[
+    ("finam", build_finam_channel),
+    ("tinkoff", build_tinkoff_channel),
+];
+
+/// The broker codes this build opens a channel for, read straight off
+/// [`CHANNEL_REGISTRY`] so the two cannot disagree. The sync's factory and
+/// the binding route check the same vocabulary with it: a binding kept for a
+/// broker no channel can open would stand silently while every sync of it
+/// failed.
+pub fn supported_brokers() -> impl Iterator<Item = &'static str> {
+    CHANNEL_REGISTRY.iter().map(|(name, _)| *name)
+}
 
 #[async_trait]
 impl BrokerChannelFactory for SqliteAdapter {
@@ -1792,13 +1893,20 @@ impl BrokerChannelFactory for SqliteAdapter {
             expected: "a supported broker code".to_owned(),
             actual: broker.to_owned(),
         })?;
-        if code.as_str() != "tinkoff" {
+        let Some(build) = CHANNEL_REGISTRY
+            .iter()
+            .find(|entry| entry.0 == code.as_str())
+            .map(|(_, build)| build)
+        else {
             return Err(AppError::Invalid {
                 field: "broker".to_owned(),
-                expected: "tinkoff".to_owned(),
+                expected: format!(
+                    "a broker this build opens a channel for: {}",
+                    supported_brokers().collect::<Vec<_>>().join(", ")
+                ),
                 actual: broker.to_owned(),
             });
-        }
+        };
 
         let key = self.key()?.clone();
         let broker = broker.to_owned();
@@ -1855,7 +1963,6 @@ impl BrokerChannelFactory for SqliteAdapter {
         let gateway = self.gateway.clone().ok_or(AppError::NotConfigured {
             what: "outbound gateway",
         })?;
-        let client = TinkoffClient::new(environment, token, gateway);
         // The dictionary is read here, not during parsing: `iaam-broker` intentionally
         // knows nothing about storage (see its `lib.rs`), and the adapter links
         // them — using the same approach already used for SQLite.
@@ -1875,11 +1982,13 @@ impl BrokerChannelFactory for SqliteAdapter {
                 actual: format!("{} -> {}", first.source_kind, first.kind),
             });
         }
-        Ok(Arc::new(crate::adapters::tinkoff::TinkoffChannel::new(
-            client,
-            SourceId(access.id),
+        Ok(build(ChannelParts {
+            environment,
+            token,
+            gateway,
+            source: SourceId(access.id),
             dictionary,
-        )))
+        }))
     }
 }
 
@@ -2572,6 +2681,7 @@ mod tests {
                 channel
                     .fetch_operations(
                         iaam_core::ids::AccountId::new_random(),
+                        "invented-one",
                         time::macros::date!(2026 - 08 - 01),
                         time::macros::date!(2026 - 08 - 31),
                         None,
@@ -2590,5 +2700,106 @@ mod tests {
 
         assert_eq!(time.slept(), [Duration::from_secs(60)]);
         assert_eq!(log.lock().expect("log").len(), 51);
+    }
+
+    /// The factory finds a broker by its code in the registry: an access for
+    /// Finam opens Finam's channel, whose answer flows through the same port.
+    #[tokio::test]
+    async fn the_registry_opens_the_finam_channel_for_its_code() {
+        use crate::adapters::tinkoff::fake::{self, Answer};
+        use crate::ports::BrokerEnvironment;
+        use serde_json::json;
+
+        let page = json!({
+            "hasMore": false,
+            "transactions": [
+                {
+                    "id": "3f2b8c5e-1a4d-4f6b-9c2e-5a7d8e1f4a3b",
+                    "timestamp": "2025-06-10T10:00:00Z",
+                    "category": "DEPOSIT",
+                    "change": { "units": "5000", "nanos": 0, "currencyCode": "rub" },
+                },
+            ],
+        })
+        .to_string();
+        // The channel's first request is the session exchange: the secret
+        // becomes a session token before the transactions page is asked
+        // for, so the double answers that exchange too.
+        let exchange = Answer::status(200, r#"{"token":"invented-finam-session-token"}"#);
+        let (gateway, log, _time) = fake::gateway(vec![exchange, Answer::status(200, &page)], None);
+        let adapter = SqliteAdapter::with_broker_key(
+            SqliteStore::open_in_memory().expect("memory store"),
+            Some(Key::from_bytes([7; 32])),
+            gateway,
+        );
+        let owner = OwnerId::new_random();
+        adapter
+            .add_access(
+                owner,
+                "finam".to_owned(),
+                BrokerEnvironment::Prod,
+                zeroize::Zeroizing::new("invented-finam-token".to_owned()),
+            )
+            .await
+            .expect("access is set up");
+
+        let channel = adapter
+            .open(owner, "finam")
+            .await
+            .expect("the registry opens finam");
+
+        let parsed = channel
+            .fetch_operations(
+                iaam_core::ids::AccountId::new_random(),
+                "invented-one",
+                time::macros::date!(2025 - 06 - 01),
+                time::macros::date!(2025 - 06 - 30),
+                None,
+            )
+            .await
+            .expect("the scripted page is parsed");
+        assert_eq!(parsed.accepted.len(), 1, "{:?}", parsed.accepted);
+        assert_eq!(
+            channel.channel().parser_version.0,
+            iaam_broker::finam::FINAM_PARSER_VERSION
+        );
+        assert_eq!(
+            log.lock().expect("log").len(),
+            2,
+            "the exchange and the page: two requests answered"
+        );
+    }
+
+    /// A broker the registry has no row for is refused by name, with the
+    /// registry's own codes named as the expectation.
+    #[tokio::test]
+    async fn an_unregistered_broker_is_refused_with_the_registry_names() {
+        use crate::adapters::tinkoff::fake;
+
+        let (gateway, _log, _time) = fake::gateway(Vec::new(), None);
+        let adapter = SqliteAdapter::with_broker_key(
+            SqliteStore::open_in_memory().expect("memory store"),
+            Some(Key::from_bytes([7; 32])),
+            gateway,
+        );
+
+        let Err(error) = adapter.open(OwnerId::new_random(), "bcs").await else {
+            panic!("bcs has no registry row");
+        };
+
+        assert!(
+            matches!(
+                &error,
+                AppError::Invalid {
+                    field,
+                    expected,
+                    actual
+                } if field == "broker"
+                    && expected.contains("finam")
+                    && expected.contains("tinkoff")
+                    && actual == "bcs"
+            ),
+            "{error}"
+        );
     }
 }

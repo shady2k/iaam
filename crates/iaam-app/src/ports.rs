@@ -185,6 +185,10 @@ pub const fn required_scope(operation: OperationKey) -> Scope {
         // A name disposition is undone by stating `undecided`, the settled
         // item's own target.
         OperationKey::RecordAccountNameDisposition => Scope::Agent,
+        // A broker account binding is restated by the same call: binding the
+        // account to another number replaces the one standing, which is the
+        // owner correcting his own word.
+        OperationKey::RecordBrokerAccountBinding => Scope::Agent,
         // A correction is itself two facts in the append-only journal, so the
         // correction can be undone by another correction.
         OperationKey::SubmitCorrections => Scope::Agent,
@@ -1031,6 +1035,28 @@ pub trait Store: Send + Sync {
         &self,
         owner: OwnerId,
     ) -> Result<Option<ContourId>, AppError>;
+
+    /// The broker's own account number one of the owner's accounts is bound
+    /// to, or `None` while he has bound none (`iaam-xzz5.3.2`).
+    async fn broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+    ) -> Result<Option<String>, AppError>;
+
+    /// Bind one of the owner's accounts to the broker's own account number
+    /// for it, replacing whatever number stood before. Refused when another
+    /// of the owner's accounts already holds the number: one broker account
+    /// is bound to at most one iaam account, and the refusal names the
+    /// account that holds it.
+    async fn record_broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: String,
+    ) -> Result<(), AppError>;
 
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
     async fn list_account_activity(
@@ -2166,13 +2192,32 @@ pub struct PortfolioSnapshot {
 /// that sends anything to the broker, nor will there ever be one (§14).
 #[async_trait]
 pub trait BrokerChannel: Send + Sync {
+    /// The account numbers this access sees at the broker, from the
+    /// broker's own account listing (`iaam-xzz5.3.2`).
+    ///
+    /// What a sync without a stored binding asks before it can name an
+    /// account to the broker at all: exactly one number means the binding can
+    /// be recorded, several mean the owner must bind one, none mean the
+    /// access sees nothing. The channel reads them, and never chooses
+    /// between them.
+    async fn fetch_account_numbers(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<String>, BrokerError>;
+
     /// Account operations for an interval: accepted and sent to quarantine.
     ///
-    /// `deadline` is the whole sync's: no request starts, and no wait for
-    /// one runs, past it. A channel that reaches it answers `Unreachable`.
+    /// `account` names the owner's account in *this* system — it is what the
+    /// returned submissions carry. `broker_account` is the broker's own
+    /// number for it, resolved from a stored binding or the access's single
+    /// account, and it is what the broker is asked for: no live broker
+    /// recognises our identifier (`iaam-xzz5.3.2`). `deadline` is the whole
+    /// sync's: no request starts, and no wait for one runs, past it. A
+    /// channel that reaches it answers `Unreachable`.
     async fn fetch_operations(
         &self,
         account: AccountId,
+        broker_account: &str,
         from: Date,
         to: Date,
         deadline: Option<std::time::Instant>,
@@ -2181,11 +2226,13 @@ pub trait BrokerChannel: Send + Sync {
     /// Portfolio claims for the requested account and their date semantics.
     ///
     /// Returns the source's assertions, not a calculation: the values calculated
-    /// from the journal are subsequently reconciled against them. `deadline`
-    /// is the whole sync's, as for `fetch_operations`.
+    /// from the journal are subsequently reconciled against them. The two
+    /// account halves are [`Self::fetch_operations`]'s, and so is the
+    /// reasoning. `deadline` is the whole sync's, as for `fetch_operations`.
     async fn fetch_portfolio(
         &self,
         account: AccountId,
+        broker_account: &str,
         at: Date,
         deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError>;

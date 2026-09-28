@@ -51,7 +51,7 @@ use iaam_core::returns::{
 };
 use iaam_core::rules::{LotRuleVersion, PostingKind, RuleRegistry};
 use iaam_core::valuation::{FxSource, FxTable};
-use iaam_http::Gateway;
+use iaam_http::{Gateway, Outbound};
 use iaam_server::action_catalog::{ActionCatalog, ActionCatalogError};
 use iaam_server::auth::hash_token;
 use iaam_server::dto::{ReturnsReportDto, VerdictDto};
@@ -87,9 +87,17 @@ struct EmptyChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for EmptyChannel {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Ok(Vec::new())
+    }
+
     async fn fetch_operations(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _from: Date,
         _to: Date,
         _deadline: Option<std::time::Instant>,
@@ -103,6 +111,7 @@ impl BrokerChannel for EmptyChannel {
     async fn fetch_portfolio(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _at: Date,
         _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
@@ -128,9 +137,17 @@ struct PopulatedChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for PopulatedChannel {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Ok(vec!["invented-one".to_owned()])
+    }
+
     async fn fetch_operations(
         &self,
         account: AccountId,
+        _broker_account: &str,
         _from: Date,
         _to: Date,
         _deadline: Option<std::time::Instant>,
@@ -164,6 +181,7 @@ impl BrokerChannel for PopulatedChannel {
     async fn fetch_portfolio(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _at: Date,
         _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
@@ -421,8 +439,10 @@ async fn harness_with_factory_and_provisioning(
             provisioned,
             with_account,
             with_broker_access,
+            broker_access_broker: None,
             rate_limit,
             http: Arc::new(UnavailableOutboundHttp),
+            broker_gateway: None,
         },
     )
     .await
@@ -437,8 +457,10 @@ async fn harness_with_http(http: Arc<dyn OutboundHttp>) -> Harness {
             provisioned: true,
             with_account: true,
             with_broker_access: false,
+            broker_access_broker: None,
             rate_limit: GENEROUS_RATE_LIMIT,
             http,
+            broker_gateway: None,
         },
     )
     .await
@@ -460,6 +482,72 @@ impl iaam_http::gateway::Transport for NoNetwork {
     }
 }
 
+/// A Finam Trade API on a script: every request is answered with the next
+/// body in order, and one more request than scripted fails the test.
+struct FinamScript(std::sync::Mutex<std::collections::VecDeque<String>>);
+
+impl FinamScript {
+    /// A gateway over the script, for a harness's broker channels.
+    fn gateway(script: Vec<String>) -> Arc<dyn Outbound> {
+        Arc::new(
+            Gateway::new(FinamScript(std::sync::Mutex::new(script.into())))
+                .expect("the budget table is valid"),
+        )
+    }
+}
+
+impl iaam_http::gateway::Transport for FinamScript {
+    async fn send(
+        &self,
+        _request: &iaam_http::HttpRequest,
+    ) -> Result<iaam_http::HttpResponse, iaam_http::HttpError> {
+        let body = self
+            .0
+            .lock()
+            .expect("script")
+            .pop_front()
+            .expect("the script ran out: more requests than expected");
+        Ok(iaam_http::HttpResponse {
+            status: 200,
+            body: body.into_bytes(),
+            retry_after: None,
+        })
+    }
+}
+
+/// A harness whose real registry factory opens the Finam channel through the
+/// scripted Finam API: access for `finam` is seeded with the channel's own
+/// operation-kind dictionary, so `open` takes the registry's Finam row.
+async fn finam_sync_harness(script: Vec<String>) -> Harness {
+    let store = SqliteStore::open_in_memory().expect("in-memory database");
+    // The instrument the Finam rows name must exist before the journal will
+    // accept an event that moves it.
+    store
+        .upsert_instrument(&InstrumentRecord {
+            id: InstrumentId(Uuid::parse_str(FINAM_SYMBOL).expect("invented UUID")),
+            kind: Some(InstrumentKind::Share),
+            symbol: "IZPA".into(),
+            title: "Invented issuer".into(),
+            currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
+            lineage: None,
+        })
+        .expect("invented instrument");
+    harness_with_everything(
+        store,
+        HarnessSetup {
+            channel_factory: None,
+            provisioned: true,
+            with_account: true,
+            with_broker_access: false,
+            broker_access_broker: Some("finam"),
+            rate_limit: GENEROUS_RATE_LIMIT,
+            http: Arc::new(UnavailableOutboundHttp),
+            broker_gateway: Some(FinamScript::gateway(script)),
+        },
+    )
+    .await
+}
+
 /// Every knob of the harness in one place; the narrower builders above name
 /// the ones a test turns.
 struct HarnessSetup {
@@ -467,8 +555,14 @@ struct HarnessSetup {
     provisioned: bool,
     with_account: bool,
     with_broker_access: bool,
+    /// Access seeded for another registered broker, with its channel
+    /// dictionary: the real registry factory can then open that channel.
+    broker_access_broker: Option<&'static str>,
     rate_limit: u32,
     http: Arc<dyn OutboundHttp>,
+    /// The gateway the storage adapter's own broker channels use; `None`
+    /// keeps the harness's no-network transport.
+    broker_gateway: Option<Arc<dyn Outbound>>,
 }
 
 async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) -> Harness {
@@ -477,8 +571,10 @@ async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) ->
         provisioned,
         with_account,
         with_broker_access,
+        broker_access_broker,
         rate_limit,
         http,
+        broker_gateway,
     } = setup;
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -553,6 +649,36 @@ async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) ->
             .expect("broker access");
     }
 
+    if let Some(broker) = broker_access_broker {
+        let sealed = iaam_broker::credentials::seal(&Key::from_bytes([7; 32]), BROKER_TOKEN);
+        let (dictionary, entries) = iaam_broker::operation_kind::seed_for(broker)
+            .expect("the seeded broker has an operation-kind dictionary");
+        let entries = entries
+            .iter()
+            .map(
+                |(source_kind, kind)| iaam_store::broker_operation_kinds::BrokerOperationKind {
+                    source_kind: (*source_kind).to_owned(),
+                    kind: (*kind).to_owned(),
+                },
+            )
+            .collect::<Vec<_>>();
+        store
+            .insert_broker_access_with_operation_kinds(
+                &NewBrokerAccess {
+                    id: Uuid::new_v4(),
+                    owner,
+                    broker: BrokerCode::parse(broker).expect("broker code"),
+                    environment: "prod".to_owned(),
+                    scope: "read_only".to_owned(),
+                    nonce: sealed.nonce().to_vec(),
+                    ciphertext: sealed.ciphertext().to_vec(),
+                },
+                dictionary,
+                &entries,
+            )
+            .expect("broker access with dictionary");
+    }
+
     // The key is created directly from bytes, not from a file: a file in a temporary directory
     // would have to be deleted, and a test that failed before deletion would leave
     // the key behind. Fixed bytes are safe here — the database lives
@@ -560,7 +686,9 @@ async fn harness_with_everything(mut store: SqliteStore, setup: HarnessSetup) ->
     let adapter = Arc::new(SqliteAdapter::with_broker_key(
         store,
         Some(Key::from_bytes([7; 32])),
-        Arc::new(Gateway::new(NoNetwork).expect("the budget table is valid")),
+        broker_gateway.unwrap_or_else(|| {
+            Arc::new(Gateway::new(NoNetwork).expect("the budget table is valid"))
+        }),
     ));
     let broker: Arc<dyn BrokerVault> = adapter.clone();
     let channels: Arc<dyn BrokerChannelFactory> =
@@ -6285,6 +6413,22 @@ async fn broker_sync_returns_the_scenario_outcome() {
         Some(factory),
     )
     .await;
+    // The access sees no account at all, so the binding stands before the
+    // sync runs: without it the sync refuses with `broker_account_unseen`
+    // instead of reaching the empty answer this test reads.
+    let (status, bound) = call(
+        &harness.router,
+        put(
+            &format!(
+                "/v1/accounts/{}/broker-binding/tinkoff",
+                harness.account.inner()
+            ),
+            &harness.owner_token,
+            &json!({ "broker_account": "invented-one" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bound}");
     let body = json!({
         "account": harness.account.inner(),
         "from": "2025-01-01",
@@ -6296,6 +6440,7 @@ async fn broker_sync_returns_the_scenario_outcome() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["binding_recorded"], false);
     assert_eq!(response["recorded"], json!([]));
     assert_eq!(response["duplicates"], 0);
     assert_eq!(response["assertions"], 0);
@@ -6326,6 +6471,101 @@ async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() 
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
     assert_eq!(response["code"], "forbidden");
+}
+
+/// The instrument every invented Finam row names; registered by the harness
+/// before the sync runs.
+const FINAM_SYMBOL: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+
+/// An invented June 2025 Finam answer: a dividend and a purchase on one
+/// transactions page, then a portfolio of cash and one position. No real
+/// account, instrument or amount.
+fn finam_transactions_page() -> String {
+    json!({
+        "transactions": [
+            {
+                "id": "3f2b8c5e-1a4d-4f6b-9c2e-5a7d8e1f4a3b",
+                "timestamp": "2025-06-10T10:00:00Z",
+                "category": "DIVIDEND",
+                "symbol": FINAM_SYMBOL,
+                "change": { "units": "12", "nanos": 500_000_000, "currencyCode": "rub" },
+            },
+            {
+                "id": "8d1c2f3a-4b5e-4c6d-9a0b-1c2d3e4f5a6b",
+                "timestamp": "2025-06-12T00:00:00Z",
+                "category": "TRADE_BUY",
+                "symbol": FINAM_SYMBOL,
+                "change": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
+                "changeOriginal": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
+                "trade": {
+                    "size": { "value": "10" },
+                    "price": { "value": "100.50" },
+                },
+            },
+        ],
+    })
+    .to_string()
+}
+
+fn finam_portfolio() -> String {
+    json!({
+        "accountId": "d0c7aa0f-6f2e-4a5b-8c3d-9e0f1a2b3c4d",
+        "cash": [ { "units": "15432", "nanos": 560_000_000, "currencyCode": "rub" } ],
+        "positions": [ {
+            "symbol": FINAM_SYMBOL,
+            "quantity": { "value": "10" },
+        } ],
+    })
+    .to_string()
+}
+
+/// The session exchange's answer: the sync's first request trades the
+/// access's secret for a session token (`POST /v1/sessions`), which both
+/// data calls of the sync then carry as their bearer.
+fn finam_session_token() -> String {
+    json!({ "token": "invented-finam-session-token" }).to_string()
+}
+
+/// `POST /v1/sessions/details`: the accounts listing the sync asks when no
+/// binding stands, before it can name an account to the data calls.
+fn finam_sessions_details() -> String {
+    json!({ "account_ids": ["invented-finam-account"] }).to_string()
+}
+
+/// `POST /v1/brokers/finam/sync` reaches the registry's Finam channel: the
+/// invented page comes back as recorded operations, and the broker token
+/// stays off the response. The script answers four requests: the session
+/// exchange, the accounts listing (no binding stands, the access sees
+/// exactly one account, and the sync takes it), the transactions page, then
+/// the portfolio.
+#[tokio::test]
+async fn the_finam_sync_route_records_operations_from_the_finam_channel() {
+    let harness = finam_sync_harness(vec![
+        finam_session_token(),
+        finam_sessions_details(),
+        finam_transactions_page(),
+        finam_portfolio(),
+    ])
+    .await;
+    let body = json!({
+        "account": harness.account.inner(),
+        "from": "2025-06-01",
+        "to": "2025-06-30",
+    });
+
+    let (status, response) = call(
+        &harness.router,
+        post("/v1/brokers/finam/sync", &harness.owner_token, &body),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let recorded = response["recorded"].as_array().expect("verdicts");
+    assert_eq!(recorded.len(), 2, "{response}");
+    assert_eq!(recorded[0]["verdict"], "provisional", "{response}");
+    assert_eq!(recorded[1]["verdict"], "provisional", "{response}");
+    assert_eq!(response["duplicates"], 0, "{response}");
+    assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
 }
 
 #[tokio::test]
@@ -12062,9 +12302,17 @@ struct TwinRowsChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for TwinRowsChannel {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Ok(vec!["invented-one".to_owned()])
+    }
+
     async fn fetch_operations(
         &self,
         account: AccountId,
+        _broker_account: &str,
         _from: Date,
         _to: Date,
         _deadline: Option<std::time::Instant>,
@@ -12099,6 +12347,7 @@ impl BrokerChannel for TwinRowsChannel {
     async fn fetch_portfolio(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _at: Date,
         _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
@@ -33061,6 +33310,7 @@ async fn beginning_an_import_publishes_every_call_that_begins_one() {
             "open_import_session",
             "read_import_document",
             "add_import_rows",
+            "record_broker_account_binding",
             "sync_broker",
         ],
         "{item}"
@@ -33104,8 +33354,19 @@ async fn beginning_an_import_publishes_every_call_that_begins_one() {
         "{item}"
     );
 
-    // Every one of the four admits an agent, so the item does too — and the
-    // item's floor is the narrowest of them, not a fourth statement beside them.
+    // The binding channel: which broker is the owner's; the number is read
+    // off the broker's own interface, the way the document above is.
+    assert_eq!(
+        asked(&options[3]),
+        vec![
+            ("/broker".to_owned(), "owner".to_owned()),
+            ("/broker_account".to_owned(), "external_document".to_owned()),
+        ],
+        "{item}"
+    );
+
+    // Every one of the five admits an agent, so the item does too — and the
+    // item's floor is the narrowest of them, not a fifth statement beside them.
     for option in options {
         assert_eq!(option["requiredScope"], "agent", "{option}");
     }
@@ -35092,9 +35353,17 @@ struct FailingChannel {
 
 #[async_trait::async_trait]
 impl BrokerChannel for FailingChannel {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Err(self.error.clone())
+    }
+
     async fn fetch_operations(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _from: Date,
         _to: Date,
         _deadline: Option<std::time::Instant>,
@@ -35105,6 +35374,7 @@ impl BrokerChannel for FailingChannel {
     async fn fetch_portfolio(
         &self,
         _account: AccountId,
+        _broker_account: &str,
         _at: Date,
         _deadline: Option<std::time::Instant>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
@@ -35308,4 +35578,394 @@ async fn the_broker_sync_openapi_declares_an_unreachable_and_a_refusing_broker()
         .as_str()
         .unwrap_or_else(|| panic!("the sync route declares no 502: {responses}"));
     assert!(refused.contains("refused"), "{refused}");
+}
+
+// --- iaam-xzz5.3.2: the binding, and the sync that reads it --------------
+
+/// A broker channel that answers the accounts listing with a fixed set and
+/// records, in order, every number a fetch asked for. The operations answer
+/// carries one invented deposit, so a sync that gets past the binding has a
+/// row to record.
+struct RecordingChannel {
+    source: iaam_core::reconciliation::evidence::SourceChannel,
+    accounts: Vec<String>,
+    requested: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl BrokerChannel for RecordingChannel {
+    async fn fetch_account_numbers(
+        &self,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Ok(self.accounts.clone())
+    }
+
+    async fn fetch_operations(
+        &self,
+        account: AccountId,
+        broker_account: &str,
+        _from: Date,
+        _to: Date,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<ParsedOperations, BrokerError> {
+        self.requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(broker_account.to_owned());
+        Ok(ParsedOperations {
+            accepted: vec![SubmittedOperation {
+                account,
+                kind: OperationKind::Deposit {
+                    amount_minor: 1_000,
+                    currency: CurrencyCode::Rub,
+                },
+                dates: OperationDates {
+                    cash_posted: Some(date!(2025 - 01 - 01)),
+                    ..Default::default()
+                },
+                source_time: None,
+                idempotency_key: Some("binding-row-1".to_owned()),
+                source_operation_id: Some("binding-broker-row-1".to_owned()),
+                source_position_id: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+                source_kind: None,
+                description: None,
+                counterparty: None,
+            }],
+            quarantined: Vec::new(),
+        })
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        broker_account: &str,
+        _at: Date,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        self.requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(broker_account.to_owned());
+        Ok(PortfolioSnapshot {
+            as_of: PortfolioAsOf::Current,
+            claims: Vec::new(),
+            refused: Vec::new(),
+        })
+    }
+
+    fn channel(&self) -> iaam_core::reconciliation::evidence::SourceChannel {
+        self.source.clone()
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Source
+    }
+}
+
+fn recording_channel(accounts: &[&str]) -> Arc<RecordingChannel> {
+    Arc::new(RecordingChannel {
+        source: iaam_core::reconciliation::evidence::SourceChannel {
+            source: SourceId::new_random(),
+            parser_version: ParserVersion("contract-test".to_owned()),
+            document: None,
+        },
+        accounts: accounts.iter().map(|value| (*value).to_owned()).collect(),
+        requested: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+async fn binding_harness(accounts: &[&str]) -> (Harness, Arc<RecordingChannel>) {
+    let channel = recording_channel(accounts);
+    let factory: Arc<dyn BrokerChannelFactory> = Arc::new(FixedChannelFactory {
+        channel: channel.clone(),
+    });
+    let harness = harness_with_factory(
+        SqliteStore::open_in_memory().expect("in-memory database"),
+        Some(factory),
+    )
+    .await;
+    (harness, channel)
+}
+
+fn binding_path(account: &AccountId, broker: &str) -> String {
+    format!("/v1/accounts/{}/broker-binding/{broker}", account.inner())
+}
+
+fn sync_body(account: &AccountId) -> serde_json::Value {
+    json!({
+        "account": account.inner(),
+        "from": "2025-01-01",
+        "to": "2025-01-31",
+    })
+}
+
+#[tokio::test]
+async fn a_bound_account_syncs_with_the_brokers_own_number() {
+    let (harness, channel) = binding_harness(&["seen-1", "seen-2"]).await;
+
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&harness.account, "tinkoff"),
+            &harness.owner_token,
+            &json!({ "broker_account": "bound-7" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["account"], json!(harness.account.inner()));
+    assert_eq!(body["broker"], "tinkoff");
+    assert_eq!(body["broker_account"], "bound-7");
+
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/brokers/tinkoff/sync",
+            &harness.owner_token,
+            &sync_body(&harness.account),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["binding_recorded"], false,
+        "the binding already stood; the sync only read it"
+    );
+
+    {
+        let requested = channel
+            .requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            requested.as_slice(),
+            ["bound-7", "bound-7"],
+            "both broker requests carried the bound number and nothing else"
+        );
+    }
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &binding_path(&harness.account, "tinkoff"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["broker_account"], "bound-7");
+}
+
+#[tokio::test]
+async fn an_unbound_account_syncs_and_binds_itself_when_the_access_sees_one() {
+    let (harness, channel) = binding_harness(&["solo"]).await;
+
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/brokers/tinkoff/sync",
+            &harness.owner_token,
+            &sync_body(&harness.account),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["binding_recorded"], true,
+        "the answer says the sync bound the account itself"
+    );
+
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &binding_path(&harness.account, "tinkoff"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["broker_account"], "solo");
+
+    {
+        let requested = channel
+            .requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(requested.as_slice(), ["solo", "solo"]);
+    }
+}
+
+#[tokio::test]
+async fn an_ambiguous_access_refuses_the_sync_and_names_the_candidates() {
+    let (harness, channel) =
+        binding_harness(&["candidate-one", "candidate-two", "candidate-three"]).await;
+
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/brokers/tinkoff/sync",
+            &harness.owner_token,
+            &sync_body(&harness.account),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(response["code"], "broker_account_ambiguous");
+    let message = response["message"].as_str().expect("message");
+    for candidate in ["candidate-one", "candidate-two", "candidate-three"] {
+        assert!(
+            message.contains(candidate),
+            "the refusal names every candidate: {message}"
+        );
+    }
+    assert!(
+        channel
+            .requested
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty(),
+        "nothing was fetched for the interval"
+    );
+
+    // And the silence of the binding route is the state that explains it.
+    let (status, body) = call(
+        &harness.router,
+        get(
+            &binding_path(&harness.account, "tinkoff"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["code"], "not_found");
+}
+
+#[tokio::test]
+async fn an_access_that_sees_no_account_refuses_the_sync() {
+    let (harness, _channel) = binding_harness(&[]).await;
+
+    let (status, response) = call(
+        &harness.router,
+        post(
+            "/v1/brokers/tinkoff/sync",
+            &harness.owner_token,
+            &sync_body(&harness.account),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(response["code"], "broker_account_unseen");
+}
+
+#[tokio::test]
+async fn one_broker_number_is_bound_to_at_most_one_iaam_account() {
+    let (harness, _channel) = binding_harness(&["taken"]).await;
+
+    let (status, body) = call(
+        &harness.router,
+        post(
+            "/v1/accounts",
+            &harness.owner_token,
+            &json!({ "title": "Second" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let second = AccountId(
+        body["id"]
+            .as_str()
+            .expect("created account id")
+            .parse()
+            .expect("uuid"),
+    );
+
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&harness.account, "tinkoff"),
+            &harness.owner_token,
+            &json!({ "broker_account": "taken" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&second, "tinkoff"),
+            &harness.owner_token,
+            &json!({ "broker_account": "taken" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "already_exists");
+    let message = body["message"].as_str().expect("message");
+    assert!(
+        message.contains(&harness.account.inner().to_string()),
+        "the refusal names the account that holds the number: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_binding_refuses_an_empty_number_and_an_unknown_broker() {
+    let (harness, _channel) = binding_harness(&[]).await;
+
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&harness.account, "tinkoff"),
+            &harness.owner_token,
+            &json!({ "broker_account": "   " }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(body["field"], "broker_account");
+
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&harness.account, "no-such-broker"),
+            &harness.owner_token,
+            &json!({ "broker_account": "bound-7" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["field"], "broker");
+}
+
+#[tokio::test]
+async fn a_binding_is_an_agent_reachable_statement_a_read_only_token_cannot_write() {
+    let (harness, _channel) = binding_harness(&[]).await;
+
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&harness.account, "tinkoff"),
+            &harness.agent_token,
+            &json!({ "broker_account": "agent-bound" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = call(
+        &harness.router,
+        put(
+            &binding_path(&harness.account, "tinkoff"),
+            &harness.readonly_token,
+            &json!({ "broker_account": "read-only-bound" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "forbidden");
 }

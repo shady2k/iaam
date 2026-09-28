@@ -19,12 +19,18 @@ fn parses_synthetic_transactions_and_keeps_rejected_rows() -> Result<(), Box<dyn
         .iter()
         .find(|operation| operation.operation_id == "FINAM-TRADE-001")
         .ok_or("synthetic fixture does not contain the buy")?;
-    // Parsing preserves the source word in upper case: that is a channel
-    // property, not dictionary knowledge. The dictionary classifies it.
-    assert_eq!(buy.source_kind, "BUY");
+    // The trade's quantity is read from `trade.size`, where the published
+    // contract carries it; top-level `changeQty` is a securities-transfer
+    // field the fixture does not invent.
     assert_eq!(buy.quantity_as_decimal(), Some("1".to_owned()));
     assert_eq!(
         buy.payment.as_ref().map(|money| money.amount),
+        Some(PostedMinor::new(-27_013))
+    );
+    // The trade's own money arrives beside the ruble fold, named by the
+    // contract's `change_original`.
+    assert_eq!(
+        buy.change_original.as_ref().map(|money| money.amount),
         Some(PostedMinor::new(-27_013))
     );
     assert_eq!(
@@ -83,8 +89,10 @@ fn parses_synthetic_portfolio_cash_and_positions() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+/// The published response is a bare repeated list: no continuation fields
+/// exist to be missing, and their absence is not an error.
 #[test]
-fn refuses_a_transaction_page_with_missing_continuation_token() {
-    let result = parse_operations(r#"{"hasMore":true,"transactions":[]}"#);
-    assert!(matches!(result, Err(ParseError::PartialResponse)));
+fn parses_the_bare_repeated_response_the_contract_publishes() {
+    let operations = parse_operations(r#"{"transactions":[]}"#).expect("the bare answer parses");
+    assert!(operations.is_empty());
 }

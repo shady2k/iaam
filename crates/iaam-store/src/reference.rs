@@ -13,7 +13,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use time::Date;
 use time::format_description::well_known::Iso8601;
 
-use crate::{ResolveError, SqliteStore, StoreError, now};
+use crate::{ResolveError, SqliteStore, StoreError, documents::BrokerCode, now};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
@@ -1285,6 +1285,119 @@ impl SqliteStore {
         withdrawn
             .map(|value| parse_uuid(&value, "contour").map(ContourId))
             .transpose()
+    }
+
+    /// The broker's own account number one of the owner's accounts is bound
+    /// to, or `None` while he has bound none (`iaam-xzz5.3.2`).
+    ///
+    /// The binding is the owner's word about which of the broker's accounts is
+    /// this account of his; `None` is «he has not said» and is the state a
+    /// sync resolves by asking the channel what its access sees — never by
+    /// guessing. The broker is part of the key: one account may be bound at
+    /// more than one broker, and one broker's number never answers for
+    /// another's.
+    pub fn broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+    ) -> Result<Option<String>, StoreError> {
+        let number: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT broker_account FROM broker_account_bindings
+                 WHERE owner = ?1 AND account = ?2 AND broker = ?3",
+                params![
+                    owner.inner().to_string(),
+                    account.inner().to_string(),
+                    broker.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(number)
+    }
+
+    /// Bind one of the owner's accounts to the broker's own account number
+    /// for it, replacing whatever number stood before.
+    ///
+    /// An upsert on `(owner, account, broker)`: restating the binding is how
+    /// the owner corrects his own word, so a second call replaces rather than
+    /// refuses, and a repeat writes nothing new. What **is** refused is
+    /// binding a number another of his accounts already holds — one broker
+    /// account belongs to at most one iaam account, which is what keeps a
+    /// sync from filing one broker's rows onto two accounts. The unique index
+    /// arbitrates rather than a read-then-write, so two callers racing to
+    /// bind the same number cannot both win; on the refusal the account that
+    /// holds the number is read and named.
+    ///
+    /// That the account exists and is this owner's is the table's own
+    /// triggers' work, not checked here — the reason a foreign key cannot say
+    /// it is written on the migration.
+    pub fn record_broker_account_binding(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        broker: &BrokerCode,
+        broker_account: &str,
+    ) -> Result<(), StoreError> {
+        // The typed half of the triggers' work: a binding naming an account
+        // this owner does not hold is refused as a not-found answer rather
+        // than surfacing as the trigger's abort. The triggers stay — the
+        // check and the insert are two statements, and the trigger is what
+        // the lost race runs into.
+        let held: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM accounts WHERE owner = ?1 AND id = ?2",
+                params![owner.inner().to_string(), account.inner().to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if held.is_none() {
+            return Err(StoreError::NotFound {
+                what: "account",
+                id: account.inner().to_string(),
+            });
+        }
+        let inserted = self.conn.execute(
+            "INSERT INTO broker_account_bindings (owner, account, broker, broker_account, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (owner, account, broker) DO UPDATE SET
+                 broker_account = excluded.broker_account,
+                 recorded_at = excluded.recorded_at
+             WHERE broker_account_bindings.broker_account IS NOT excluded.broker_account",
+            params![
+                owner.inner().to_string(),
+                account.inner().to_string(),
+                broker.as_str(),
+                broker_account,
+                now()
+            ],
+        );
+        if let Err(rusqlite::Error::SqliteFailure(error, _)) = &inserted
+            && error.code == rusqlite::ErrorCode::ConstraintViolation
+        {
+            // A unique-index refusal names the account that holds the
+            // number. A refusal that names no holder is the trigger's or the
+            // CHECK's abort — a lost race or an empty number — and stays a
+            // raw SQLite error, because the typed answer has nothing honest
+            // to name.
+            let holder: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT account FROM broker_account_bindings
+                     WHERE owner = ?1 AND broker = ?2 AND broker_account = ?3",
+                    params![owner.inner().to_string(), broker.as_str(), broker_account],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(account) = holder {
+                return Err(StoreError::BrokerAccountBindingHeld { account });
+            }
+        }
+        inserted?;
+        Ok(())
     }
 
     /// Circuit composition at a version **for the specified owner**.

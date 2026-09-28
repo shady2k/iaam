@@ -816,6 +816,12 @@ pub enum OwnerPrompt {
     TransferPartners,
     /// Which broker holds an account.
     BrokerChannel,
+    /// At which broker a broker account binding is kept.
+    ///
+    /// The same pointer as [`Self::BrokerChannel`] and a different call: the
+    /// binding route keeps the binding for one broker, and the question is
+    /// about the binding, not about where the account is held.
+    BindingBroker,
     /// The first date a broker is asked about.
     SyncFrom,
     /// The last date a broker is asked about.
@@ -889,6 +895,9 @@ impl OwnerPrompt {
             Self::ExclusionReason => "/reason",
             Self::TransferPartners => "/partners",
             Self::BrokerChannel => "/broker",
+            // The same pointer as `BrokerChannel` and a different question,
+            // which is what `asked_by` below is for.
+            Self::BindingBroker => "/broker",
             Self::SyncFrom => "/from",
             Self::SyncTo => "/to",
             Self::Corrections => "/corrections",
@@ -925,6 +934,7 @@ impl OwnerPrompt {
             Self::ExclusionReason => OperationKey::RecordAccountScope,
             Self::TransferPartners => OperationKey::RecordAccountTransferPartners,
             Self::BrokerChannel | Self::SyncFrom | Self::SyncTo => OperationKey::SyncBroker,
+            Self::BindingBroker => OperationKey::RecordBrokerAccountBinding,
             Self::Corrections | Self::AcknowledgeRetraction => OperationKey::SubmitCorrections,
             Self::OwnerBalanceCash => OperationKey::RecordOwnerBalance,
             Self::OpeningAmount | Self::OpeningCurrency | Self::OpeningDate => {
@@ -1042,6 +1052,14 @@ impl OwnerPrompt {
                  own accounts. Until then each line is counted separately, as money leaving you \
                  and as money arriving from outside — so both your spending and your income \
                  read larger than they were."
+                    .to_owned(),
+            ),
+            Self::BindingBroker => (
+                "At which broker is this binding kept?".to_owned(),
+                "The binding names which of that broker's own accounts is this account of \
+                 yours, and it is kept per broker: the same account may be bound at more than \
+                 one broker, and each binding stands on its own. Nothing here chooses the \
+                 broker for you."
                     .to_owned(),
             ),
             Self::BrokerChannel => (
@@ -4941,6 +4959,28 @@ fn start_account_import_action(account: &AccountView) -> Action {
         },
     };
 
+    // The call that makes the sync work when the broker's access sees more
+    // than one account (`iaam-xzz5.3.2`): a sync sends the broker its own
+    // account number, and without a stored binding it can only take an access
+    // that names exactly one. The number itself is read off the broker's own
+    // interface — `ExternalDocument`, by the axis's word: the statement holds
+    // it, however the owner copied it here — and which broker it is kept for
+    // is a path segment, the owner's to name exactly as the sync's is.
+    let binding = ResolutionOption {
+        operation: OperationKey::RecordBrokerAccountBinding,
+        request: RequestPlan {
+            preset: {
+                let mut preset = BTreeMap::new();
+                preset.insert("account".to_owned(), account.id.inner().to_string().into());
+                preset
+            },
+            missing: vec![
+                MissingInput::asked(OwnerPrompt::BindingBroker),
+                MissingInput::plain("/broker_account", NobodyIsAsked::ExternalDocument),
+            ],
+        },
+    };
+
     Action::new(
         ActionFacts {
             // Scoped to the account: this action is emitted once per account with
@@ -4975,7 +5015,9 @@ fn start_account_import_action(account: &AccountView) -> Action {
              accounts and rules or asks him about it. Then read the assessment the \
              session publishes to see what committing would record and what it would \
              not, and commit under the revision that assessment carries; or synchronise \
-             a broker channel over an interval. An import already under way is its own \
+             a broker channel over an interval — binding the account to the broker's own \
+             account number first when that access sees more than one account, because a \
+             sync names the broker's number and never guesses between several. An import already under way is its own \
              item in this queue — a session holding rows that has not been committed or \
              abandoned is published as `import_session_unfinished` — and opening one \
              again finds it too: the call refuses, names the session, and publishes the \
@@ -4983,7 +5025,7 @@ fn start_account_import_action(account: &AccountView) -> Action {
             account.id.inner(),
             account.title
         ),
-        ActionTarget::from_options(vec![session, document, rows, sync]),
+        ActionTarget::from_options(vec![session, document, rows, binding, sync]),
     )
     .expect("account import action publishes every one of its resolutions")
 }
@@ -6520,6 +6562,7 @@ mod tests {
             OwnerPrompt::ExclusionReason,
             OwnerPrompt::TransferPartners,
             OwnerPrompt::BrokerChannel,
+            OwnerPrompt::BindingBroker,
             OwnerPrompt::SyncFrom,
             OwnerPrompt::SyncTo,
             OwnerPrompt::Corrections,
@@ -6555,6 +6598,7 @@ mod tests {
             OwnerPrompt::CategoryGroupTitle => "CategoryGroupTitle",
             OwnerPrompt::CategoryTitle => "CategoryTitle",
             OwnerPrompt::BrokerChannel => "BrokerChannel",
+            OwnerPrompt::BindingBroker => "BindingBroker",
             OwnerPrompt::SyncFrom => "SyncFrom",
             OwnerPrompt::SyncTo => "SyncTo",
             OwnerPrompt::Corrections => "Corrections",
@@ -6578,12 +6622,12 @@ mod tests {
         let names: BTreeSet<&str> = specimens().iter().map(question_name).collect();
         assert_eq!(
             names.len(),
-            22,
+            23,
             "a question was added to the vocabulary and not to the list the guards run over"
         );
         assert_eq!(
             specimens().len(),
-            23,
+            24,
             "the account title is asked in two shapes and both are swept"
         );
     }
@@ -8904,7 +8948,7 @@ mod tests {
             .find(|action| action.kind() == ActionKind::StartAccountImport)
             .expect("account import action");
         assert_ne!(import.state(), ActionState::Blocked);
-        assert_eq!(import.target().resolutions().len(), 4);
+        assert_eq!(import.target().resolutions().len(), 5);
         assert_eq!(
             import.subject().and_then(ActionSubject::account),
             Some(account.id)
@@ -9329,10 +9373,12 @@ mod tests {
                 OperationKey::OpenImportSession,
                 OperationKey::ReadImportDocument,
                 OperationKey::AddImportRows,
+                OperationKey::RecordBrokerAccountBinding,
                 OperationKey::SyncBroker,
             ],
             "the order is the promise: the call that can be made now, then the \
-             two that put a statement into what it returns, then the channel"
+             two that put a statement into what it returns, then the channel — \
+             the binding before the sync it enables"
         );
 
         // The session is opened for this account and nothing else is known: the
@@ -9387,9 +9433,29 @@ mod tests {
             ]
         );
 
+        // The binding knows the account; which broker, and which of the
+        // broker's accounts this one is, are named where the value lives —
+        // the broker by the owner, the number off the broker's own record.
+        let binding = resolutions[3].1;
+        assert_eq!(
+            binding.preset.get("account"),
+            Some(&serde_json::Value::from(account.id.inner().to_string()))
+        );
+        assert_eq!(
+            binding
+                .missing
+                .iter()
+                .map(|input| (input.pointer.as_str(), input.provided_by))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/broker", ProvidedBy::Owner),
+                ("/broker_account", ProvidedBy::ExternalDocument),
+            ]
+        );
+
         // The sync knows the account; which broker, and over what interval, are
         // the owner's to name.
-        let sync = resolutions[3].1;
+        let sync = resolutions[4].1;
         assert_eq!(
             sync.preset.get("account"),
             Some(&serde_json::Value::from(account.id.inner().to_string()))

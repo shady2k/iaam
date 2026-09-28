@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
+# Debug-only loopback fixtures. The crate root rejects this feature whenever
+# debug assertions are disabled.
 test-support = []
 
 [dependencies]

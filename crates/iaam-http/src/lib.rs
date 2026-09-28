@@ -44,6 +44,11 @@
 //! broker tally does and is shared by every process given its path. The
 //! deployment contract is in `docs/deployment.md` §1.1.
 
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!(
+    "iaam-http feature `test-support` requires debug assertions and cannot be enabled in release builds"
+);
+
 pub mod client;
 pub mod destination;
 mod egress;

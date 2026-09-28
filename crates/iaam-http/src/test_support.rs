@@ -3,6 +3,8 @@
 //! This module exists only with `cfg(test)` or the `test-support` feature. It
 //! keeps the real `HttpClient` below the gateway while replacing only the
 //! destination base URL with a loopback listener.
+//! Release builds reject the feature: the harness must never become a
+//! production transport.
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};

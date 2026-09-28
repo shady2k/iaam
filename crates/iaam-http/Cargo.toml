@@ -31,6 +31,8 @@ tracing = "0.1"
 # Cross-process request accounting must lock one machine-local file. `fs2`
 # provides the portable exclusive lock on the workspace's Rust 1.85 MSRV.
 fs2 = "0.4"
+# Safe access to Linux CLOCK_BOOTTIME, which advances while suspended.
+rustix = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 # `test-util` pauses the tokio timer, so the production sleeper is checked

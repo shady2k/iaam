@@ -59,7 +59,7 @@ Three rules follow, and they hold for every step below.
   first owner token exactly once. There is no one-time claim code and no
   `POST /v1/claim`; both were retired with ADR-0003.
 
-### 1.1 One server process and one broker tally per instance
+### 1.1 One server process and one owner per broker endpoint
 
 An instance runs **exactly one `iaam serve`** against its database. Not two
 behind a load balancer, not a second one started beside the first "to test",
@@ -68,58 +68,45 @@ starts. The claim that permits only one broker sync per account at a time is
 in-process state (`crates/iaam-app/src/scenarios/sync.rs`, `RunningSyncs`), so a
 second server could sync the same account concurrently.
 
-The outbound gateway also keeps its lane, named waits and circuit breaker in
-the server process. Those protect MOEX and the CBR exactly as before and prevent
-parallel calls inside one process, but they do not cross a restart.
+The outbound gateway also keeps its MOEX and CBR lanes, named waits and circuit
+breakers in the server process. They do not cross a restart.
 
-Broker call accounting is different. With broker egress enabled, every local
-process uses the same **outbound tally** path. Synchronisation uses a separate
-adjacent file whose name is the tally path plus `.lock`; iaam creates that lock
-file when it is absent. The gateway holds its lock only while it reads, decides,
-or records an outcome. The tally preserves:
+Broker traffic has a stronger rule: **one process owns each broker endpoint**.
+The first request to T-Invest production, T-Invest sandbox or Finam acquires an
+exclusive adjacent owner file (`<tally>.tinkoff-prod.owner`,
+`<tally>.tinkoff-sandbox.owner` or `<tally>.finam.owner`) and holds that lock
+for the gateway's lifetime. A second process asking for that endpoint is
+refused before transport; the reason names the endpoint and tells the operator
+to use or stop the owning process. It may still own and use another endpoint.
+This makes accidental concurrent servers observable instead of trying to share
+one broker allowance between them.
+
+Within an owned endpoint, the gateway allows one request in flight. The HTTP
+client follows no redirect and performs no retry below the gateway. It records
+the status line and a Retry-After clamped to one day before consuming the body,
+and the next request cannot decide before that record exists. The shared
+`<tally>.lock` is held only for a tally transaction; waits and HTTP requests do
+not hold it. The tally preserves:
 
 - the per-method minute budgets from the gateway table;
-- at least one second between transport hand-offs to the same broker host;
-- at most 1,000 broker hand-offs in one UTC day, subject to the UTC-clock
-  residual below;
+- at least one second between sends to the same broker host;
+- at most 1,000 sends per endpoint in any rolling 24-hour interval;
 - recent permanent broker refusals and their 30-minute host closure;
 - broker `429` pauses and the 30-minute closure after a second `429` in ten
   minutes.
 
-Those records and decisions persist across local processes and restarts. A
-process never holds the lock while sleeping or while an HTTP request is in
-flight: after a required wait it locks and decides again, and after a response
-it locks again to record that outcome. A missing, unreadable or corrupt tally
-refuses the broker call and names the path; it never falls back to an in-memory
+The persisted time source is Linux boot identity plus `CLOCK_BOOTTIME`, not
+wall time. Wall-clock steps therefore cannot shorten a pause, closure, spacing
+window or rolling daily window. After a boot identity change, iaam cannot know
+how much suspended time elapsed before the reboot: every active pause and
+closure restarts for its full stored duration, old request histories restart
+from the new boot, and the first send to each endpoint waits 60 seconds.
+
+`IAAM_OUTBOUND_TALLY` is validated when the gateway is built. It must be the
+absolute canonical spelling of an existing ordinary file, not a symlink or
+hard-linked file. A missing, unreadable, aliased or corrupt tally refuses
+broker operation and names the path; it never falls back to an in-memory
 allowance.
-
-The ceiling is measured where the gateway hands a request to the transport,
-not where it first consults the tally. A tally reservation is at least 1.1
-seconds after the preceding reservation, and method budgets use 60.1-second
-windows. The extra 100 milliseconds is the maximum decision-to-handoff
-interval, measured with the process monotonic clock. If that interval expires,
-the gateway sends nothing, gives the unsent attempt back to the sync allowance,
-keeps the tally slot spent, and decides again. Thus the earlier hand-off may
-consume all 100 milliseconds while the later hand-off consumes none and the
-departures are still one second apart; the same arithmetic protects every
-60-second method window.
-
-The cross-process tally necessarily persists UTC wall-clock timestamps.
-Consequently, a forward wall-clock correction can make old reservations appear
-older and admit work early; the monotonic hand-off check does not remove that
-cross-process residual. One forward jump across a complete method window can
-place one old configured batch beside one new configured batch. Configured
-budgets are half the published broker limits, so those two batches reach, but
-do not exceed, the published limit.
-
-The daily counter is wall-clock-based too. A forward jump across a UTC-day
-boundary changes the tally's day and resets its count, so up to 1,000
-reservations can be admitted again without 24 hours of real elapsed time;
-repeated manual day jumps can repeat that reset. Independently, a reservation
-made within 100 milliseconds before UTC midnight can depart after midnight
-while remaining charged to the prior day, giving the strict per-departure
-calendar-day count a one-request boundary residual. Keep system time
-synchronised; do not use clock changes to advance a tally.
 
 Run the executable ceiling proof before enabling broker egress:
 
@@ -131,14 +118,14 @@ Each printed cell is `reached/ceiling`, derived from requests recorded by the
 scripted transport rather than from gateway counters. The `minute(method)`
 column names the method key whose sliding 60-second window was largest.
 `closure` and `pause` must both be `0/0`; `attempts` includes retries and Finam
-session exchanges. The command also runs the real sync allowance, shared-tally
-restart, egress-off and two-process scenarios.
+session exchanges. The command also runs the real sync allowance, tally
+persistence across owner rebuilds, egress-off and two-process ownership cases.
 
 Administrative commands (`claim`, `token issue`, `broker key …`,
 `broker access …`, `bundle export`, `bundle import`) open the database and do
 not contact a source. The two broker examples and the ignored live sandbox
-test do contact brokers and consequently use the same egress switch and tally
-as `serve`.
+test do contact brokers and consequently use the same egress switch, endpoint
+ownership and tally as `serve`.
 
 ```console
 $ pgrep -c -x iaam
@@ -146,7 +133,7 @@ $ pgrep -c -x iaam
 ```
 
 More than `1` while no administrative command is running means a second server.
-Stop it before the next sync. Restarting does not clear the broker tally, and
+Stop it before the next sync. Restarting does not clear the broker tally and
 must not be used to evade a `source_unavailable`; in-process named waits and
 open breakers are still lost on restart.
 
@@ -182,8 +169,10 @@ refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
 or network is touched. `on` requires `IAAM_OUTBOUND_TALLY`; no other spelling
 is accepted.
 
-`IAAM_OUTBOUND_TALLY` names one ordinary file outside this repository and
-outside the database. Put it in a persistent, writable directory, for example:
+`IAAM_OUTBOUND_TALLY` names one existing ordinary file outside this repository
+and outside the database. Its configured spelling must be absolute and
+canonical. Symlinks and files with another hard link are refused. Put it in a
+persistent, writable directory, for example:
 
 ```console
 $ install -m 0600 /dev/null /var/lib/iaam/outbound-tally
@@ -191,18 +180,20 @@ $ export IAAM_BROKER_EGRESS=on
 $ export IAAM_OUTBOUND_TALLY=/var/lib/iaam/outbound-tally
 ```
 
-Every iaam process on the machine that may contact a broker must receive the
-same path and run as an OS user able to read and replace the tally, create and
-lock `<tally>.lock`, create `<tally>.tmp`, and sync their directory. The tally
-must already exist; an empty tally is valid only for its first initialization.
-Persist it across service restarts. iaam writes a complete temporary file,
-syncs it, atomically replaces the tally and syncs the directory. A leftover
-temporary file is ignored; only the last complete tally is read.
+Every iaam process on the machine that may contact a broker must receive that
+exact path and run as an OS user able to read and replace the tally; create and
+lock `<tally>.lock` and the three `<tally>.*.owner` files; create
+`<tally>.tmp`; and sync the directory. The tally must already exist; an empty
+tally is valid only for its first initialization. Persist it across service
+restarts. iaam writes a complete temporary file, syncs it, atomically replaces
+the tally and syncs the directory. A leftover temporary file is ignored; only
+the last complete tally is read.
 
-Do not copy the tally while a process is using it, and do not delete or truncate
-it to clear a refusal, pause or closure. A missing or unreadable path, a
-directory in place of the tally, partial or invalid contents make the call fail
-as `source_unavailable`, with the path in the reason and no broker send.
+Do not copy or alias the tally while a process is using it, and do not delete or
+truncate it to clear a refusal, pause or closure. A missing or unreadable path,
+a directory in place of the tally, a non-canonical spelling, an alias, partial
+or invalid contents make broker operation fail as `source_unavailable`, with
+the path in the reason and no broker send.
 
 
 `IAAM_SOURCE_PROFILES` names a directory of **source profiles** — reviewed JSON

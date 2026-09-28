@@ -1114,8 +1114,14 @@ pub(crate) mod fake {
             *self.now.lock().expect("clock")
         }
 
-        fn now_utc(&self) -> SystemTime {
-            *self.wall.lock().expect("wall clock")
+        fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+            let elapsed = self
+                .wall
+                .lock()
+                .expect("wall clock")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?;
+            Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
         }
     }
 
@@ -3078,8 +3084,8 @@ mod tests {
     }
 
     /// T-Invest limits a caller with 429 and names a reset shorter than the
-    /// mandatory pause. The fetch stops immediately and exposes the full
-    /// minute before another broker call may start.
+    /// mandatory pause. Once the first-send safety wait has elapsed, the fetch
+    /// stops on the response and exposes the full minute before another call.
     #[tokio::test]
     async fn a_multi_page_fetch_stops_at_a_limit_and_exposes_the_host_pause() {
         let (gateway, log, time) = fake::gateway(
@@ -3110,7 +3116,7 @@ mod tests {
             ),
             "{error:?}"
         );
-        assert!(time.slept().is_empty());
+        assert_eq!(time.slept(), [Duration::from_secs(60)]);
         assert_eq!(log.lock().expect("log").len(), 1);
     }
 
@@ -3125,7 +3131,7 @@ mod tests {
 
         assert!(matches!(error, BrokerError::Refused { .. }), "{error:?}");
         assert_eq!(log.lock().expect("log").len(), 1);
-        assert!(time.slept().is_empty());
+        assert_eq!(time.slept(), [Duration::from_secs(60)]);
         assert!(!error.to_string().contains(TOKEN));
         assert!(!format!("{error:?}").contains(TOKEN));
     }
@@ -3196,7 +3202,7 @@ mod tests {
             ],
             None,
         );
-        let deadline = time.now() + Duration::from_secs(30);
+        let deadline = time.now() + Duration::from_secs(90);
 
         let error = channel(gateway)
             .fetch_operations(
@@ -3212,8 +3218,12 @@ mod tests {
         assert_eq!(log.lock().expect("log").len(), 3);
         assert_eq!(
             time.slept(),
-            [Duration::from_millis(1_100), Duration::from_millis(1_100)],
-            "only host spacing before the three sends was waited"
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ],
+            "first-send safety and host spacing were waited before the three sends"
         );
         assert!(
             matches!(

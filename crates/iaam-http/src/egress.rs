@@ -11,7 +11,8 @@ pub const OUTBOUND_TALLY_ENV: &str = "IAAM_OUTBOUND_TALLY";
 pub enum BrokerEgress {
     /// Broker destinations are refused before the tally or transport.
     Off,
-    /// Broker destinations share the named per-machine outbound tally.
+    /// Broker destinations use the named tally and acquire one lifetime owner
+    /// lock per endpoint.
     On { tally: PathBuf },
 }
 
@@ -23,7 +24,7 @@ pub enum BrokerEgressConfigError {
     #[error("{BROKER_EGRESS_ENV} is not valid Unicode; use `on` or `off`")]
     NonUnicodeSwitch,
     #[error(
-        "{BROKER_EGRESS_ENV}=on requires {OUTBOUND_TALLY_ENV} to name the per-machine tally file"
+        "{BROKER_EGRESS_ENV}=on requires {OUTBOUND_TALLY_ENV} to name the canonical per-machine tally file"
     )]
     MissingTally,
 }

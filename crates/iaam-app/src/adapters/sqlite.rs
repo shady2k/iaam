@@ -2707,14 +2707,16 @@ mod tests {
         }
         assert_eq!(
             time.slept(),
-            vec![Duration::from_millis(1_100); 49],
-            "the first fifty calls use only departure-safe host spacing"
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 49))
+                .collect::<Vec<_>>(),
+            "the first fifty calls wait once after boot, then use host spacing"
         );
         fetch(&second).await;
 
         let slept = time.slept();
-        assert_eq!(slept.len(), 50);
-        assert_eq!(slept.last(), Some(&Duration::from_millis(6_200)));
+        assert_eq!(slept.len(), 51);
+        assert_eq!(slept.last(), Some(&Duration::from_secs(11)));
         assert_eq!(log.lock().expect("log").len(), 51);
     }
 

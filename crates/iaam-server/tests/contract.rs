@@ -503,8 +503,15 @@ impl iaam_http::gateway::Clock for FinamTime {
         self.0.lock().expect("Finam time").0
     }
 
-    fn now_utc(&self) -> std::time::SystemTime {
-        self.0.lock().expect("Finam time").1
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        let elapsed = self
+            .0
+            .lock()
+            .expect("Finam time")
+            .1
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?;
+        Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
     }
 }
 

@@ -87,10 +87,11 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     // GetAccounts only reads, so a second copy of it is harmless.
     .idempotent()
     .with_bearer(token.expose());
-    // Live mode uses the same explicit egress switch and per-machine tally as
-    // the server and examples; requesting this test must not bypass either.
+    // Live mode uses the server's explicit egress switch, canonical tally and
+    // lifetime sandbox-endpoint ownership; requesting this test must not
+    // bypass any of them.
     let egress = BrokerEgress::from_env().expect("broker egress configured");
-    let gateway = Gateway::production(egress).expect("the budget table is valid");
+    let gateway = Gateway::production(egress).expect("broker gateway configured");
     let result = gateway.send("UsersService", &request, None).await;
 
     // Status and body length only, never the body: test output is kept in

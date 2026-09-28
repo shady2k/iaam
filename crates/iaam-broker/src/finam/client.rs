@@ -669,8 +669,14 @@ mod tests {
             *self.now.lock().expect("clock")
         }
 
-        fn now_utc(&self) -> SystemTime {
-            *self.wall.lock().expect("wall clock")
+        fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+            let elapsed = self
+                .wall
+                .lock()
+                .expect("wall clock")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?;
+            Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
         }
     }
 
@@ -1013,8 +1019,10 @@ mod tests {
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
         assert_eq!(
             time.slept(),
-            vec![Duration::from_millis(1_100); 3],
-            "the exchange and three account calls share host spacing"
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 3))
+                .collect::<Vec<_>>(),
+            "the first send waits after boot, then four sends share host spacing"
         );
     }
 
@@ -1046,13 +1054,12 @@ mod tests {
         }
     }
 
-    /// **Simultaneous 401s share one renewal.** Both callers carry the same
-    /// refused token; the first through the gate exchanges, the rest find a
-    /// live session that is not the refused one and retry with it — a
-    /// concurrent renewal has already replaced the token Finam rejected.
+    /// The endpoint serialises simultaneous callers. One 401 is committed
+    /// before the queued call sends; the refused call renews once and retries,
+    /// while the queued call cannot overlap its status.
     #[tokio::test]
-    async fn simultaneous_401s_renew_once() {
-        let endpoint = Arc::new(Counted::refusing_first(2));
+    async fn a_401_is_renewed_once_while_a_second_call_waits_on_the_endpoint() {
+        let endpoint = Arc::new(Counted::refusing_first(1));
         let (client, time) = counted_client(&endpoint);
 
         let (first, second) = two_concurrent_calls(&client).await;
@@ -1062,8 +1069,8 @@ mod tests {
         let received = endpoint.received.lock().expect("received");
         assert_eq!(
             received.len(),
-            6,
-            "two refusals, two retries, two exchanges"
+            5,
+            "one refusal, two successful data calls, two exchanges"
         );
         let exchanges = received
             .iter()
@@ -1074,19 +1081,24 @@ mod tests {
             .iter()
             .filter(|request| request.bearer().map(|token| token.expose()) == Some(RENEWED_TOKEN))
             .count();
-        assert_eq!(retried, 2, "both callers retry on the renewed token");
-        assert!(
-            received
-                .iter()
-                .skip(1)
-                .take(2)
-                .all(|request| request.bearer().map(|token| token.expose()) == Some(FIRST_TOKEN)),
-            "both first attempts carried the refused token"
+        assert_eq!(
+            retried, 1,
+            "the refused caller retries on the renewed token"
+        );
+        let first_token_calls = received
+            .iter()
+            .filter(|request| request.bearer().map(|token| token.expose()) == Some(FIRST_TOKEN))
+            .count();
+        assert_eq!(
+            first_token_calls, 2,
+            "both first data calls carried the refused token"
         );
         assert_eq!(
             time.slept(),
-            vec![Duration::from_millis(1_100); 5],
-            "six sends share host spacing; 401 adds no gateway backoff"
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 4))
+                .collect::<Vec<_>>(),
+            "the first send waits after boot, then five sends share host spacing"
         );
     }
 
@@ -1308,7 +1320,15 @@ mod tests {
         // refusal. Each send observes host spacing; a 401 adds no gateway
         // retry backoff.
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
-        assert_eq!(time.slept(), vec![Duration::from_millis(1_100); 3],);
+        assert_eq!(
+            time.slept(),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ]
+        );
         assert_no_secret(&error);
     }
 
@@ -1333,7 +1353,10 @@ mod tests {
 
         assert_eq!(error, FinamError::InvalidToken);
         assert_eq!(endpoint.received.lock().expect("received").len(), 2);
-        assert_eq!(time.slept(), vec![Duration::from_millis(1_100)]);
+        assert_eq!(
+            time.slept(),
+            [Duration::from_secs(60), Duration::from_secs(1)]
+        );
         assert_no_secret(&error);
     }
 
@@ -1356,10 +1379,10 @@ mod tests {
         assert_eq!(endpoint.received.lock().expect("received").len(), 3);
         assert_eq!(
             time.slept(),
-            vec![
-                Duration::from_millis(1_100),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
                 iaam_http::gateway::FIRST_BACKOFF,
-                Duration::from_millis(100),
             ]
         );
     }
@@ -1542,7 +1565,7 @@ mod tests {
 
             assert_eq!(error, expected);
             assert_eq!(endpoint.received.lock().expect("received").len(), 1);
-            assert!(time.slept().is_empty());
+            assert_eq!(time.slept(), [Duration::from_secs(60)]);
             assert_no_secret(&error);
         }
     }
@@ -1650,8 +1673,12 @@ mod tests {
             .expect("transactions");
         assert_eq!(
             time.slept(),
-            vec![Duration::from_millis(1_100); 2],
-            "the session exchange, account call, and transactions call share host spacing"
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ],
+            "the first send waits after boot, then the three sends share host spacing"
         );
 
         client
@@ -1660,10 +1687,11 @@ mod tests {
             .expect("portfolio again");
         assert_eq!(
             time.slept(),
-            vec![
-                Duration::from_millis(1_100),
-                Duration::from_millis(1_100),
-                Duration::from_secs(59)
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(59),
             ]
         );
         // One exchange for four calls: the session rides its own budget.

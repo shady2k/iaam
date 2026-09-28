@@ -26,7 +26,8 @@ const METHOD: &str = "tinkoff.public.invest.api.contract.v1.UsersService/GetAcco
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The same process configuration as the server: broker egress is off
-    // unless the operator explicitly names the shared per-machine tally.
+    // unless the operator explicitly names the canonical tally, and this
+    // process must acquire the sandbox endpoint for its lifetime.
     let gateway = Gateway::production(BrokerEgress::from_env()?)?;
     // GetAccounts only reads, so a second copy of it is harmless.
     let mut request = HttpRequest::post(

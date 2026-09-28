@@ -79,17 +79,60 @@ file when it is absent. The gateway holds its lock only while it reads, decides,
 or records an outcome. The tally preserves:
 
 - the per-method minute budgets from the gateway table;
-- at least one second between sends to the same broker host;
-- at most 1,000 broker sends in one UTC day;
+- at least one second between transport hand-offs to the same broker host;
+- at most 1,000 broker hand-offs in one UTC day, subject to the UTC-clock
+  residual below;
 - recent permanent broker refusals and their 30-minute host closure;
 - broker `429` pauses and the 30-minute closure after a second `429` in ten
   minutes.
 
-Those rules therefore hold across local processes and restarts. A process never
-holds the lock while sleeping or while an HTTP request is in flight: after a
-required wait it locks and decides again, and after a response it locks again
-to record that outcome. A missing, unreadable or corrupt tally refuses the
-broker call and names the path; it never falls back to an in-memory allowance.
+Those records and decisions persist across local processes and restarts. A
+process never holds the lock while sleeping or while an HTTP request is in
+flight: after a required wait it locks and decides again, and after a response
+it locks again to record that outcome. A missing, unreadable or corrupt tally
+refuses the broker call and names the path; it never falls back to an in-memory
+allowance.
+
+The ceiling is measured where the gateway hands a request to the transport,
+not where it first consults the tally. A tally reservation is at least 1.1
+seconds after the preceding reservation, and method budgets use 60.1-second
+windows. The extra 100 milliseconds is the maximum decision-to-handoff
+interval, measured with the process monotonic clock. If that interval expires,
+the gateway sends nothing, gives the unsent attempt back to the sync allowance,
+keeps the tally slot spent, and decides again. Thus the earlier hand-off may
+consume all 100 milliseconds while the later hand-off consumes none and the
+departures are still one second apart; the same arithmetic protects every
+60-second method window.
+
+The cross-process tally necessarily persists UTC wall-clock timestamps.
+Consequently, a forward wall-clock correction can make old reservations appear
+older and admit work early; the monotonic hand-off check does not remove that
+cross-process residual. One forward jump across a complete method window can
+place one old configured batch beside one new configured batch. Configured
+budgets are half the published broker limits, so those two batches reach, but
+do not exceed, the published limit.
+
+The daily counter is wall-clock-based too. A forward jump across a UTC-day
+boundary changes the tally's day and resets its count, so up to 1,000
+reservations can be admitted again without 24 hours of real elapsed time;
+repeated manual day jumps can repeat that reset. Independently, a reservation
+made within 100 milliseconds before UTC midnight can depart after midnight
+while remaining charged to the prior day, giving the strict per-departure
+calendar-day count a one-request boundary residual. Keep system time
+synchronised; do not use clock changes to advance a tally.
+
+Run the executable ceiling proof before enabling broker egress:
+
+```console
+$ make ceiling-proof
+```
+
+Each printed cell is `reached/ceiling`, derived from requests recorded by the
+scripted transport rather than from gateway counters. The `minute(method)`
+column names the method key whose sliding 60-second window was largest.
+`closure` and `pause` must both be `0/0`; `attempts` includes retries and Finam
+session exchanges. The command also runs the real sync allowance, shared-tally
+restart, egress-off and two-process scenarios.
 
 Administrative commands (`claim`, `token issue`, `broker key …`,
 `broker access …`, `bundle export`, `bundle import`) open the database and do

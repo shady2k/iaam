@@ -11,6 +11,16 @@ use thiserror::Error;
 const HEADER: &str = "iaam-outbound-tally-v1";
 const MINUTE_NANOS: u128 = 60_000_000_000;
 const SECOND_NANOS: u128 = 1_000_000_000;
+/// Maximum time from the timestamp reserved in this tally to the transport
+/// hand-off. Decisions are spaced by `1s + 100ms`: the earlier departure may
+/// use its whole 100ms bound while the later one departs immediately, leaving
+/// at least 1s between departures. Method windows are widened by the same
+/// 100ms, so even those two extremes cannot place request `limit + 1` inside
+/// any 60s departure window.
+pub(crate) const HANDOFF_BOUND: Duration = Duration::from_millis(100);
+const HANDOFF_BOUND_NANOS: u128 = 100_000_000;
+const DEPARTURE_SPACING_NANOS: u128 = SECOND_NANOS + HANDOFF_BOUND_NANOS;
+const BUDGET_RETENTION_NANOS: u128 = MINUTE_NANOS + HANDOFF_BOUND_NANOS;
 const REFUSAL_WINDOW_NANOS: u128 = 10 * MINUTE_NANOS;
 const RATE_LIMIT_PAUSE_NANOS: u128 = MINUTE_NANOS;
 const CLOSURE_NANOS: u128 = 30 * MINUTE_NANOS;
@@ -259,7 +269,8 @@ impl OutboundTally {
         }
 
         let spacing_wait = host_state.last_send.map_or(0, |last| {
-            last.saturating_add(SECOND_NANOS).saturating_sub(now_nanos)
+            last.saturating_add(DEPARTURE_SPACING_NANOS)
+                .saturating_sub(now_nanos)
         });
         let key = (host.to_owned(), budget_key.to_owned());
         let sent = state.sends.entry(key).or_default();
@@ -513,7 +524,7 @@ impl State {
 
     fn prune(&mut self, now_nanos: u128) -> bool {
         let mut changed = false;
-        let send_cutoff = now_nanos.saturating_sub(MINUTE_NANOS);
+        let send_cutoff = now_nanos.saturating_sub(BUDGET_RETENTION_NANOS);
         self.sends.retain(|_, sent| {
             let previous = sent.len();
             sent.retain(|at| *at > send_cutoff);

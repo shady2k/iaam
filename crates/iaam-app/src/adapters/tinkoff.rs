@@ -3212,7 +3212,7 @@ mod tests {
         assert_eq!(log.lock().expect("log").len(), 3);
         assert_eq!(
             time.slept(),
-            [Duration::from_secs(1), Duration::from_secs(1)],
+            [Duration::from_millis(1_100), Duration::from_millis(1_100)],
             "only host spacing before the three sends was waited"
         );
         assert!(

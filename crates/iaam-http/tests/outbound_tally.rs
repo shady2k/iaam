@@ -603,7 +603,7 @@ async fn a_leftover_temporary_file_never_replaces_the_last_complete_tally() {
 
     let sent: Vec<_> = transport.sent().into_iter().map(|(_, at)| at).collect();
     assert_eq!(sent.len(), 2);
-    assert_eq!(elapsed(sent[1], sent[0]), Duration::from_secs(1));
+    assert_eq!(elapsed(sent[1], sent[0]), Duration::from_millis(1_100));
 }
 
 #[tokio::test]
@@ -635,13 +635,15 @@ async fn the_thousand_and_first_broker_send_of_a_utc_day_is_refused_without_tran
     else {
         panic!("expected daily ceiling, got {refused}");
     };
-    let seconds_today = time
+    let elapsed = time
         .wall()
         .duration_since(UNIX_EPOCH)
-        .expect("wall clock after epoch")
-        .as_secs()
-        % 86_400;
-    let expected_wait = Duration::from_secs(86_400 - seconds_today);
+        .expect("wall clock after epoch");
+    let day = Duration::from_secs(86_400);
+    let nanos_today = elapsed.as_nanos() % day.as_nanos();
+    let expected_wait = Duration::from_nanos(
+        u64::try_from(day.as_nanos() - nanos_today).expect("one day fits in u64 nanoseconds"),
+    );
     assert_eq!(*retry_after, expected_wait);
     assert_eq!(
         resets_at,
@@ -750,6 +752,67 @@ async fn the_previous_host_record_shape_keeps_its_active_closure() {
         ),
         "{blocked:?}"
     );
+    assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
+async fn the_previous_host_record_shape_keeps_its_last_send_spacing() {
+    let directory = TempDir::create("previous-host-spacing");
+    let tally = directory.file("tally");
+    let now_seconds = 1_800_000_000_u64;
+    let now_nanos = u128::from(now_seconds) * 1_000_000_000;
+    let day = now_seconds / 86_400;
+    std::fs::write(
+        &tally,
+        format!(
+            "iaam-outbound-tally-v1\nhost\t{}\t{now_nanos}\t{day}\t0\t-\n",
+            Destination::TinkoffProd.base_url()
+        ),
+    )
+    .expect("previous tally shape written");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(now_seconds));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, BrokerEgress::On { tally });
+
+    gateway
+        .send("OperationsService", &operations(&unbounded()), None)
+        .await
+        .expect("send after the preserved spacing");
+
+    assert_eq!(
+        *time.slept.lock().expect("sleeps"),
+        [Duration::from_millis(1_100)]
+    );
+    assert_eq!(transport.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn the_previous_host_record_shape_keeps_its_utc_day_count() {
+    let directory = TempDir::create("previous-host-day");
+    let tally = directory.file("tally");
+    let now_seconds = 1_800_000_000_u64;
+    let day = now_seconds / 86_400;
+    std::fs::write(
+        &tally,
+        format!(
+            "iaam-outbound-tally-v1\nhost\t{}\t-\t{day}\t1000\t-\n",
+            Destination::TinkoffProd.base_url()
+        ),
+    )
+    .expect("previous tally shape written");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(now_seconds));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, BrokerEgress::On { tally });
+
+    let blocked = gateway
+        .send("OperationsService", &operations(&unbounded()), None)
+        .await
+        .expect_err("the preserved UTC-day count is full");
+
+    assert!(matches!(
+        blocked,
+        GatewayError::DailyCeiling { ceiling: 1_000, .. }
+    ));
     assert!(transport.sent().is_empty());
 }
 

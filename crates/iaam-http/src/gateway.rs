@@ -41,7 +41,8 @@ use crate::request::{HttpRequest, Secret};
 use crate::resilience::{MAX_NAMED_WAIT, Outcome, Retry, RetryPolicy, is_transient};
 use crate::response::{HttpError, HttpResponse};
 use crate::tally::{
-    ClosureReason, DAILY_CEILING, OutboundTally, TallyDecision, TallyError, TallyResponseDecision,
+    ClosureReason, DAILY_CEILING, HANDOFF_BOUND, OutboundTally, TallyDecision, TallyError,
+    TallyResponseDecision,
 };
 
 /// The window every per-minute limit below is stated over.
@@ -1082,6 +1083,7 @@ impl<T: Transport> Gateway<T> {
                         return Err(cut(attempts, status, wait));
                     }
                 }
+                let mut tally_decided_at = None;
                 if broker {
                     let BrokerEgress::On { tally } = &self.broker_egress else {
                         return Err(GatewayError::BrokerEgressOff);
@@ -1095,11 +1097,12 @@ impl<T: Transport> Gateway<T> {
                             ceiling: allowance.ceiling(),
                         });
                     }
+                    let decided_at = self.clock.now();
                     let tally_decision = match OutboundTally::new(tally).decide_and_record(
                         destination.base_url(),
                         key.unwrap_or("*"),
                         budget.used,
-                        budget.window,
+                        budget.window.saturating_add(HANDOFF_BOUND),
                         self.clock.now_utc(),
                     ) {
                         Ok(decision) => decision,
@@ -1109,7 +1112,7 @@ impl<T: Transport> Gateway<T> {
                         }
                     };
                     match tally_decision {
-                        TallyDecision::Send => {}
+                        TallyDecision::Send => tally_decided_at = Some(decided_at),
                         TallyDecision::Paused {
                             reopens_at,
                             retry_after,
@@ -1177,6 +1180,18 @@ impl<T: Transport> Gateway<T> {
                 } else {
                     Some(lane)
                 };
+                if let Some(decided_at) = tally_decided_at
+                    && self.clock.now().saturating_duration_since(decided_at) > HANDOFF_BOUND
+                {
+                    // The tally reservation remains spent: forgetting it
+                    // would let another process use the same slot. No request
+                    // left this process, so the sync's transport allowance is
+                    // returned before this call decides again.
+                    if let Some(allowance) = allowance {
+                        allowance.give_back();
+                    }
+                    continue;
+                }
                 attempts += 1;
                 let Some(answer) = self
                     .by_deadline(self.transport.send(request), deadline)
@@ -1428,6 +1443,10 @@ mod tests {
         /// How much later than asked each sleep ends, by the clock: a timer
         /// that fires late, as one does on a loaded or suspended host.
         lag: StdMutex<Duration>,
+        /// One scripted wall-clock read advances both clocks, modelling work
+        /// between a tally decision's timestamp and the transport hand-off.
+        utc_jump: StdMutex<Option<(usize, Duration)>>,
+        utc_calls: AtomicUsize,
     }
 
     impl FakeTime {
@@ -1437,6 +1456,8 @@ mod tests {
                 monotonic_origin: tokio::time::Instant::now().into_std(),
                 slept: StdMutex::new(Vec::new()),
                 lag: StdMutex::new(Duration::ZERO),
+                utc_jump: StdMutex::new(None),
+                utc_calls: AtomicUsize::new(0),
             })
         }
 
@@ -1446,6 +1467,9 @@ mod tests {
 
         fn lagging(&self, by: Duration) {
             *self.lag.lock().expect("lag") = by;
+        }
+        fn jump_on_utc_call(&self, call: usize, by: Duration) {
+            *self.utc_jump.lock().expect("UTC jump") = Some((call, by));
         }
 
         /// The sleeps that ran to their end; one abandoned early (a
@@ -1461,6 +1485,16 @@ mod tests {
         }
 
         fn now_utc(&self) -> SystemTime {
+            let call = self.utc_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let jump = self
+                .utc_jump
+                .lock()
+                .expect("UTC jump")
+                .filter(|(wanted, _)| *wanted == call)
+                .map(|(_, by)| by);
+            if let Some(by) = jump {
+                self.advance(by);
+            }
             SystemTime::UNIX_EPOCH
                 + Duration::from_secs(1_800_000_000)
                 + self.now().saturating_duration_since(self.monotonic_origin)
@@ -1641,6 +1675,52 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_broker_handoff_past_the_bound_is_not_sent_and_is_decided_again() {
+        let time = FakeTime::new();
+        // `check_host` is the first UTC read; the second is the tally
+        // reservation. Advance after that decision timestamp and before the
+        // gateway can hand the request to the transport.
+        time.jump_on_utc_call(2, Duration::from_millis(101));
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let request = operations().with_request_allowance(RequestAllowance::new(1));
+
+        gateway
+            .send("OperationsService", &request, None)
+            .await
+            .expect("the fresh re-decision sends");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            1,
+            "the expired reservation must not reach transport"
+        );
+        assert_eq!(
+            time.slept(),
+            [Duration::from_millis(1_100)],
+            "the spent reservation is kept and paces the re-decision"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broker_handoff_at_the_bound_is_sent_without_a_redecision() {
+        let time = FakeTime::new();
+        time.jump_on_utc_call(2, HANDOFF_BOUND);
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let request = operations().with_request_allowance(RequestAllowance::new(1));
+
+        gateway
+            .send("OperationsService", &request, None)
+            .await
+            .expect("a hand-off at the inclusive bound sends");
+
+        assert_eq!(gateway.transport.sent_count(), 1);
+        assert!(
+            time.slept().is_empty(),
+            "the valid reservation was needlessly spent and re-decided"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_broker_request_without_an_allowance_never_reaches_transport() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
@@ -1731,10 +1811,34 @@ mod tests {
         let sent = gateway.transport.sent_at();
         assert_eq!(sent.len(), 160);
         assert_never_more_than(50, MINUTE, &sent);
-        // Host pacing separates the first fifty by one second; the method
-        // budget still holds the 51st until the minute boundary.
-        assert_eq!(sent[49], start + Duration::from_secs(49));
-        assert_eq!(sent[50], start + MINUTE);
+        // Host reservations are 1.1 s apart: the extra 100 ms is the
+        // maximum decision-to-handoff interval. The method budget holds the
+        // 51st reservation until 60.1 s for the same reason.
+        assert_eq!(sent[49], start + Duration::from_millis(53_900));
+        assert_eq!(sent[50], start + MINUTE + HANDOFF_BOUND);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_method_window_retains_its_oldest_reservation_for_the_handoff_margin() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let start = time.now();
+        for _ in 0..50 {
+            gateway
+                .send("OperationsService", &operations(), None)
+                .await
+                .expect("send inside method budget");
+        }
+        time.advance(Duration::from_millis(6_100));
+
+        gateway
+            .send("OperationsService", &operations(), None)
+            .await
+            .expect("send after widened method window");
+
+        let sent = gateway.transport.sent_at();
+        assert_eq!(sent[50], start + MINUTE + HANDOFF_BOUND);
+        assert_eq!(time.slept().last(), Some(&HANDOFF_BOUND));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1752,7 +1856,7 @@ mod tests {
 
         let sent = gateway.transport.sent_at();
         assert_never_more_than(25, MINUTE, &sent);
-        assert_eq!(sent[25], sent[0] + MINUTE);
+        assert_eq!(sent[25], sent[0] + MINUTE + HANDOFF_BOUND);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1774,7 +1878,7 @@ mod tests {
 
         assert_eq!(
             gateway.transport.sent_at().last(),
-            Some(&(start + Duration::from_secs(50))),
+            Some(&(start + Duration::from_secs(55))),
             "the users method waited for the operations method's budget"
         );
     }
@@ -1998,7 +2102,11 @@ mod tests {
                 "status {transient}"
             );
             assert_eq!(gateway.transport.sent_count(), 2, "status {transient}");
-            assert_eq!(time.slept(), [Duration::from_secs(1)], "status {transient}");
+            assert_eq!(
+                time.slept(),
+                [Duration::from_secs(1), HANDOFF_BOUND],
+                "status {transient}"
+            );
         }
     }
 
@@ -2165,8 +2273,12 @@ mod tests {
         assert_eq!(gateway.transport.sent_count(), 3);
         assert_eq!(
             time.slept(),
-            [1, 2].map(Duration::from_secs),
-            "exponential from one second"
+            [
+                Duration::from_secs(1),
+                HANDOFF_BOUND,
+                Duration::from_secs(2),
+            ],
+            "exponential backoff plus departure spacing"
         );
         assert!(refused.is_transient());
         assert_eq!(refused.status(), Some(503));
@@ -2685,9 +2797,9 @@ mod tests {
             .await
             .expect_err("the third attempt would start past the deadline");
 
-        // Attempts at 0 s and 1 s; the third would start at 3 s.
+        // Attempts at 0 s and 1.1 s; the third would start at 3.1 s.
         assert_eq!(gateway.transport.sent_count(), 2);
-        assert_eq!(time.slept(), [Duration::from_secs(1)]);
+        assert_eq!(time.slept(), [Duration::from_secs(1), HANDOFF_BOUND]);
         assert!(gateway.transport.sent_at().iter().all(|at| *at < deadline));
         assert!(
             matches!(
@@ -2731,12 +2843,12 @@ mod tests {
             call(&gateway).await.expect("within the budget");
         }
         let slept_before_refusal = time.slept();
-        let deadline = time.now() + Duration::from_secs(10);
+        let deadline = time.now() + Duration::from_secs(6);
 
         let refused = gateway
             .send("OperationsService", &operations(), Some(deadline))
             .await
-            .expect_err("the tally budget frees a request only at the minute boundary");
+            .expect_err("the tally budget frees a request only at the widened minute boundary");
 
         assert!(
             matches!(
@@ -2749,10 +2861,7 @@ mod tests {
             ),
             "{refused:?}"
         );
-        assert_eq!(
-            refused.retry_after(),
-            Some(MINUTE - Duration::from_secs(49))
-        );
+        assert_eq!(refused.retry_after(), Some(Duration::from_millis(6_200)));
         assert_eq!(gateway.transport.sent_count(), 50);
         assert_eq!(time.slept(), slept_before_refusal);
     }
@@ -2993,7 +3102,7 @@ mod tests {
     async fn a_deadline_with_room_leaves_the_retries_alone() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(status(503))));
-        let deadline = time.now() + Duration::from_millis(1001);
+        let deadline = time.now() + Duration::from_millis(1_101);
 
         gateway
             .send("OperationsService", &operations(), Some(deadline))
@@ -3170,7 +3279,7 @@ mod tests {
         log.assert_line(
             "INFO",
             "outbound call waits",
-            &["reason=\"outbound tally\"", "wait_ms=11000", "attempt=1"],
+            &["reason=\"outbound tally\"", "wait_ms=6200", "attempt=1"],
         );
     }
 

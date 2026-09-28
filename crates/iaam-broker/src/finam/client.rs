@@ -1013,11 +1013,7 @@ mod tests {
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
         assert_eq!(
             time.slept(),
-            vec![
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                Duration::from_secs(1)
-            ],
+            vec![Duration::from_millis(1_100); 3],
             "the exchange and three account calls share host spacing"
         );
     }
@@ -1089,13 +1085,7 @@ mod tests {
         );
         assert_eq!(
             time.slept(),
-            vec![
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                Duration::from_secs(1)
-            ],
+            vec![Duration::from_millis(1_100); 5],
             "six sends share host spacing; 401 adds no gateway backoff"
         );
     }
@@ -1318,14 +1308,7 @@ mod tests {
         // refusal. Each send observes host spacing; a 401 adds no gateway
         // retry backoff.
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
-        assert_eq!(
-            time.slept(),
-            vec![
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                Duration::from_secs(1)
-            ]
-        );
+        assert_eq!(time.slept(), vec![Duration::from_millis(1_100); 3],);
         assert_no_secret(&error);
     }
 
@@ -1350,7 +1333,7 @@ mod tests {
 
         assert_eq!(error, FinamError::InvalidToken);
         assert_eq!(endpoint.received.lock().expect("received").len(), 2);
-        assert_eq!(time.slept(), vec![Duration::from_secs(1)]);
+        assert_eq!(time.slept(), vec![Duration::from_millis(1_100)]);
         assert_no_secret(&error);
     }
 
@@ -1373,7 +1356,11 @@ mod tests {
         assert_eq!(endpoint.received.lock().expect("received").len(), 3);
         assert_eq!(
             time.slept(),
-            vec![Duration::from_secs(1), iaam_http::gateway::FIRST_BACKOFF]
+            vec![
+                Duration::from_millis(1_100),
+                iaam_http::gateway::FIRST_BACKOFF,
+                Duration::from_millis(100),
+            ]
         );
     }
 
@@ -1663,7 +1650,7 @@ mod tests {
             .expect("transactions");
         assert_eq!(
             time.slept(),
-            vec![Duration::from_secs(1), Duration::from_secs(1)],
+            vec![Duration::from_millis(1_100); 2],
             "the session exchange, account call, and transactions call share host spacing"
         );
 
@@ -1674,8 +1661,8 @@ mod tests {
         assert_eq!(
             time.slept(),
             vec![
-                Duration::from_secs(1),
-                Duration::from_secs(1),
+                Duration::from_millis(1_100),
+                Duration::from_millis(1_100),
                 Duration::from_secs(59)
             ]
         );

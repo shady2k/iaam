@@ -719,7 +719,7 @@ mod tests {
         }
         assert_eq!(
             *time.slept.lock().expect("sleeps"),
-            vec![Duration::from_secs(1); 49]
+            vec![Duration::from_millis(1_100); 49]
         );
         client
             .get_operations_by_cursor(
@@ -731,7 +731,7 @@ mod tests {
             .expect("operations");
         let sleeps = time.slept.lock().expect("sleeps");
         assert_eq!(sleeps.len(), 50, "operations waited on the users budget");
-        assert_eq!(sleeps.last(), Some(&Duration::from_secs(1)));
+        assert_eq!(sleeps.last(), Some(&Duration::from_millis(1_100)));
     }
 
     #[tokio::test]
@@ -778,8 +778,8 @@ mod tests {
                 .expect("accounts");
         }
 
-        let mut expected = vec![Duration::from_secs(1); 24];
-        expected.push(Duration::from_secs(36));
+        let mut expected = vec![Duration::from_millis(1_100); 24];
+        expected.push(Duration::from_millis(33_700));
         assert_eq!(*time.slept.lock().expect("sleeps"), expected);
     }
 

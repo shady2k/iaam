@@ -17,7 +17,7 @@ use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::ParserVersion;
 use iaam_core::ids::{AccountId, InstrumentId, SourceId};
-use iaam_core::money::{CalcMoney, CurrencyCode, Quantity};
+use iaam_core::money::{CalcMoney, CurrencyCode};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::evidence::SourceChannel;
@@ -370,24 +370,20 @@ fn trade_operation(
 ) -> Result<SubmittedOperation, RowRefusal> {
     let buy = matches!(kind, ChannelOperationKind::Buy);
     let instrument = required_instrument(&operation)?;
-    let payment = operation
-        .payment
-        .ok_or_else(|| row_unparsable("trade does not contain change"))?;
-    let currency = payment.currency;
     let quantity = required_quantity(&operation)?;
-    let price = required_price(&operation)?;
-    // The gross is computed from the source's own price and quantity. The
-    // `change` field is read for the currency only: what Finam folds into it
-    // (fees, accrued) is its business, while its own `accruedInterest` field
-    // is what the accrued is made of here — a gross taken from `change`
-    // would double-count whatever the separate fields already name.
-    let gross = iaam_core::money::gross_for_fill(
-        CalcMoney::new(Dec::new(price.inner()), currency),
-        Quantity(quantity),
-    )
-    .map_err(|error| row_unparsable(format!("trade gross overflow: {error}")))?
-    .rounded_minor()
-    .map_err(|error| row_unparsable(format!("trade gross cannot be rounded: {error}")))?;
+    // The gross is the money Finam itself states for the trade:
+    // `change_original`, the change in the instrument's own currency.
+    // Computing a gross from the price would have to assume the price's
+    // basis (a bond's price is a percentage of its face value), its
+    // currency and the face value — none of which the transactions answer
+    // carries — so a trade whose money Finam does not state is refused,
+    // never computed by assumption. `change` folds every instrument into
+    // rubles and is not the trade's money in its own terms.
+    let money = operation
+        .change_original
+        .ok_or_else(|| row_unparsable("trade does not contain change_original"))?;
+    let currency = money.currency;
+    let gross_minor = money_amount(money, "change_original")?;
     // The commission arrives as its own COMMISSION/FEE row and becomes a Fee;
     // a fee inside the trade as well would charge the account twice.
     let accrued_interest_minor = match operation.accrued_interest {
@@ -407,7 +403,7 @@ fn trade_operation(
             // No custody here: the channel names no place of storage.
             custody: None,
             quantity,
-            gross_minor: gross.raw(),
+            gross_minor,
             fee_minor: None,
             basis_fee: None,
             accrued_interest_minor,
@@ -418,7 +414,7 @@ fn trade_operation(
             instrument,
             custody: None,
             quantity,
-            gross_minor: gross.raw(),
+            gross_minor,
             fee_minor: None,
             basis_fee: None,
             accrued_interest_minor,
@@ -589,29 +585,17 @@ fn money_amount(money: ChannelMoney, field: &'static str) -> Result<i64, RowRefu
 }
 
 /// The quantity as the fact carries it: positive, the side being the
-/// variant. Finam encodes the side of `changeQty` in its sign — a sale
-/// decreases the position — and a sign is not an opinion this channel can
-/// read; zero is refused, nothing else about the direction is guessed.
+/// variant. The quantity comes from the contract's `trade.size`; a sign is
+/// not an opinion this channel can read, so the magnitude is kept and zero
+/// is refused — nothing else about the direction is guessed.
 fn required_quantity(operation: &ChannelOperation) -> Result<Dec, RowRefusal> {
     let quantity = operation
         .quantity
-        .ok_or_else(|| row_unparsable("trade does not contain changeQty"))?;
+        .ok_or_else(|| row_unparsable("trade does not contain trade.size"))?;
     if quantity.0.inner().is_zero() {
         return Err(row_unparsable("trade quantity is zero"));
     }
     Ok(Dec::new(quantity.0.inner().abs()))
-}
-
-/// The price magnitude: the gross is a product of magnitudes, and a price
-/// no exchange prints must not invert it.
-fn required_price(operation: &ChannelOperation) -> Result<Dec, RowRefusal> {
-    let price = operation
-        .price
-        .ok_or_else(|| row_unparsable("trade does not contain trade.price"))?;
-    if price.inner().is_zero() {
-        return Err(row_unparsable("trade price is zero"));
-    }
-    Ok(Dec::new(price.inner().abs()))
 }
 
 fn required_instrument(operation: &ChannelOperation) -> Result<InstrumentId, RowRefusal> {
@@ -696,11 +680,10 @@ mod tests {
     }
 
     /// An invented June 2025 page: a dividend with an instrument, a purchase
-    /// with price and quantity, a bare fee. No real account, instrument or
-    /// amount.
+    /// with the contract's own trade and money fields, a bare fee. No real
+    /// account, instrument or amount.
     fn transactions_page() -> String {
         json!({
-            "hasMore": false,
             "transactions": [
                 {
                     "id": DIVIDEND_ID,
@@ -717,8 +700,11 @@ mod tests {
                     "category": "TRADE_BUY",
                     "symbol": SYMBOL,
                     "change": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
-                    "changeQty": { "value": "10" },
-                    "trade": { "price": { "value": "100.50" } },
+                    "changeOriginal": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
+                    "trade": {
+                        "size": { "value": "10" },
+                        "price": { "value": "100.50" },
+                    },
                     "transactionCategory": "TRADE",
                 },
                 {
@@ -820,7 +806,10 @@ mod tests {
             panic!("second row is the purchase: {:?}", parsed.accepted[1].kind);
         };
         assert_eq!(quantity.inner().to_string(), "10");
-        assert_eq!(*gross_minor, 100_500, "10 x 100.50 RUB in minor units");
+        assert_eq!(
+            *gross_minor, 100_500,
+            "the money of change_original: 1_005.00 RUB"
+        );
         assert_eq!(*currency, iaam_core::money::CurrencyCode::Rub);
         assert_eq!(parsed.accepted[1].dates.trade, Some(date!(2025 - 06 - 12)));
         assert_eq!(parsed.accepted[1].source_kind.as_deref(), Some("TRADE_BUY"));
@@ -848,7 +837,6 @@ mod tests {
     #[tokio::test]
     async fn a_row_the_parser_cannot_read_is_quarantined_with_its_reason() {
         let body = json!({
-            "hasMore": false,
             "transactions": [
                 {
                     "timestamp": "2025-06-10T10:00:00Z",
@@ -885,7 +873,6 @@ mod tests {
     #[tokio::test]
     async fn a_kind_absent_from_the_dictionary_is_quarantined_with_its_code() {
         let body = json!({
-            "hasMore": false,
             "transactions": [
                 {
                     "id": DIVIDEND_ID,
@@ -929,10 +916,13 @@ mod tests {
         );
     }
 
+    /// A trade whose money Finam does not state has no gross this channel
+    /// may record: `change` folds every instrument into rubles, and a gross
+    /// computed from the price would have to assume the price basis and the
+    /// currency. The row is refused with its reason, never computed.
     #[tokio::test]
-    async fn a_trade_missing_its_price_is_refused_not_guessed() {
+    async fn a_trade_without_change_original_is_refused_not_computed() {
         let body = json!({
-            "hasMore": false,
             "transactions": [
                 {
                     "id": BUY_ID,
@@ -940,7 +930,10 @@ mod tests {
                     "category": "TRADE_BUY",
                     "symbol": SYMBOL,
                     "change": { "units": "-1005", "nanos": 0, "currencyCode": "rub" },
-                    "changeQty": { "value": "10" },
+                    "trade": {
+                        "size": { "value": "10" },
+                        "price": { "value": "100.50" },
+                    },
                 },
                 {
                     "id": FEE_ID,
@@ -975,8 +968,8 @@ mod tests {
         assert_eq!(parsed.quarantined.len(), 1, "{:?}", parsed.quarantined);
         let refused = &parsed.quarantined[0];
         assert!(
-            refused.reason.contains("price"),
-            "the refusal names the missing field: {}",
+            refused.reason.contains("change_original"),
+            "the refusal names the money Finam never stated: {}",
             refused.reason
         );
         assert_eq!(
@@ -988,13 +981,106 @@ mod tests {
         );
     }
 
-    /// Finam's own accounting for a sale decreases the position: `changeQty`
+    /// A bond's price is a percentage of its face value: multiplying it by
+    /// the quantity would record a hundredth of the money that moved. The
+    /// gross is the money Finam itself states in the instrument's currency.
+    #[tokio::test]
+    async fn a_bond_quoted_in_percent_of_face_records_the_money_finam_states() {
+        let body = json!({
+            "transactions": [
+                {
+                    "id": BUY_ID,
+                    "timestamp": "2025-06-12T00:00:00Z",
+                    "category": "TRADE_BUY",
+                    "symbol": SYMBOL,
+                    "change": { "units": "-9850", "nanos": 0, "currencyCode": "rub" },
+                    "changeOriginal": { "units": "-9850", "nanos": 0, "currencyCode": "rub" },
+                    "trade": {
+                        "size": { "value": "10" },
+                        "price": { "value": "98.5" },
+                    },
+                    "transactionCategory": "TRADE",
+                },
+            ],
+        })
+        .to_string();
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
+
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                None,
+            )
+            .await
+            .expect("the page is parsed");
+
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        let OperationKind::Buy { gross_minor, .. } = &parsed.accepted[0].kind else {
+            panic!("the bond purchase is a buy: {:?}", parsed.accepted[0].kind);
+        };
+        // 98.5% of the 1_000 face value, ten bonds: 9_850.00 RUB — not the
+        // 985.00 a price-times-quantity computation would have assumed.
+        assert_eq!(*gross_minor, 985_000);
+    }
+
+    /// A foreign-currency security's trade moves the instrument's own
+    /// money: the ruble fold in `change` names neither the currency nor the
+    /// amount the fact records.
+    #[tokio::test]
+    async fn a_foreign_currency_trade_records_the_instruments_own_money() {
+        let body = json!({
+            "transactions": [
+                {
+                    "id": BUY_ID,
+                    "timestamp": "2025-06-12T00:00:00Z",
+                    "category": "TRADE_BUY",
+                    "symbol": SYMBOL,
+                    "change": { "units": "-95000", "nanos": 0, "currencyCode": "rub" },
+                    "changeOriginal": { "units": "-1005", "nanos": 0, "currencyCode": "usd" },
+                    "trade": {
+                        "size": { "value": "10" },
+                        "price": { "value": "100.50" },
+                    },
+                    "transactionCategory": "TRADE",
+                },
+            ],
+        })
+        .to_string();
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
+
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                None,
+            )
+            .await
+            .expect("the page is parsed");
+
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        let OperationKind::Buy {
+            gross_minor,
+            currency,
+            ..
+        } = &parsed.accepted[0].kind
+        else {
+            panic!("the purchase is a buy: {:?}", parsed.accepted[0].kind);
+        };
+        assert_eq!(*gross_minor, 100_500, "1_005.00 USD in minor units");
+        assert_eq!(*currency, iaam_core::money::CurrencyCode::Usd);
+    }
+
+    /// Finam's own accounting for a sale decreases the position: `trade.size`
     /// arrives negative and `change` positive. The fact keeps positive
     /// quantities and amounts; the variant carries the side.
     #[tokio::test]
     async fn a_sale_is_recorded_positive_whatever_sign_finam_prints() {
         let body = json!({
-            "hasMore": false,
             "transactions": [
                 {
                     "id": BUY_ID,
@@ -1002,8 +1088,11 @@ mod tests {
                     "category": "TRADE_SELL",
                     "symbol": SYMBOL,
                     "change": { "units": "1005", "nanos": 0, "currencyCode": "rub" },
-                    "changeQty": { "value": "-10" },
-                    "trade": { "price": { "value": "100.50" } },
+                    "changeOriginal": { "units": "1005", "nanos": 0, "currencyCode": "rub" },
+                    "trade": {
+                        "size": { "value": "-10" },
+                        "price": { "value": "100.50" },
+                    },
                 },
             ],
         })
@@ -1049,7 +1138,7 @@ mod tests {
     /// none.
     #[tokio::test]
     async fn an_empty_page_over_an_empty_dictionary_is_an_empty_sync() {
-        let body = json!({ "hasMore": false, "transactions": [] }).to_string();
+        let body = json!({ "transactions": [] }).to_string();
         let channel = FinamChannel::new(
             FinamClient::new(
                 token(),
@@ -1080,7 +1169,6 @@ mod tests {
     #[tokio::test]
     async fn a_securities_transfer_is_refused_under_its_own_name() {
         let body = json!({
-            "hasMore": false,
             "transactions": [
                 {
                     "id": DIVIDEND_ID,

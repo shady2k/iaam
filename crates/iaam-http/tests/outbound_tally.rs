@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
 use iaam_http::{
     BrokerEgress, Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse,
-    RequestBody,
+    RequestAllowance, RequestBody,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -140,13 +140,14 @@ fn gateway(
     .expect("documented budgets are valid")
 }
 
-fn operations() -> HttpRequest {
+fn operations(allowance: &RequestAllowance) -> HttpRequest {
     HttpRequest::post(
         Destination::TinkoffProd,
         "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
         RequestBody::Json("{}".to_owned()),
     )
     .idempotent()
+    .with_request_allowance(allowance.clone())
 }
 
 fn elapsed(later: SystemTime, earlier: SystemTime) -> Duration {
@@ -188,16 +189,17 @@ async fn two_gateways_and_a_rebuilt_gateway_share_spacing_and_the_minute_budget(
         },
     );
 
+    let allowance = RequestAllowance::new(u32::MAX);
     for index in 0..51 {
         let current = if index % 2 == 0 { &first } else { &second };
         current
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&allowance), None)
             .await
             .expect("request sent");
     }
     let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
     rebuilt
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect("request sent after rebuild");
 
@@ -218,14 +220,15 @@ async fn the_thousand_and_first_broker_send_of_a_utc_day_is_refused_without_tran
     let transport = RecordingTransport::answering(&time);
     let gateway = gateway(transport.clone(), &time, BrokerEgress::On { tally });
 
+    let allowance = RequestAllowance::new(u32::MAX);
     for _ in 0..1_000 {
         gateway
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&allowance), None)
             .await
             .expect("request within daily ceiling sent");
     }
     let refused = gateway
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect_err("daily ceiling refuses the next request");
 
@@ -256,7 +259,7 @@ async fn the_thousand_and_first_broker_send_of_a_utc_day_is_refused_without_tran
 
     time.advance(expected_wait);
     gateway
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect("the next UTC day has a fresh ceiling");
     assert_eq!(transport.sent().len(), 1_001);
@@ -279,6 +282,7 @@ async fn missing_corrupt_and_unopenable_tallies_refuse_without_sending_and_name_
     std::fs::write(&empty_host, "iaam-outbound-tally-v1\nhost\t\t-\t0\t0\t-\n")
         .expect("empty host tally written");
     let missing = directory.file("missing-tally");
+    let allowance = RequestAllowance::new(u32::MAX);
 
     for (path, detail) in [
         (missing, None),
@@ -295,7 +299,7 @@ async fn missing_corrupt_and_unopenable_tallies_refuse_without_sending_and_name_
             },
         );
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&allowance), None)
             .await
             .expect_err("bad tally refuses the request");
         let message = refused.to_string();
@@ -313,9 +317,10 @@ async fn egress_switch_applies_only_to_broker_destinations() {
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
     let transport = RecordingTransport::answering(&time);
     let off = gateway(transport.clone(), &time, BrokerEgress::Off);
+    let allowance = RequestAllowance::new(u32::MAX);
 
     let refused = off
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect_err("broker egress is off");
     assert!(matches!(refused, GatewayError::BrokerEgressOff));
@@ -333,7 +338,7 @@ async fn egress_switch_applies_only_to_broker_destinations() {
     let tally = directory.file("tally");
     std::fs::write(&tally, "").expect("empty tally created");
     let on = gateway(transport.clone(), &time, BrokerEgress::On { tally });
-    on.send("OperationsService", &operations(), None)
+    on.send("OperationsService", &operations(&allowance), None)
         .await
         .expect("broker request passes through the tally");
 

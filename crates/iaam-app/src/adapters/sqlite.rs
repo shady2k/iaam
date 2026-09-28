@@ -2586,6 +2586,16 @@ fn account_detail_view(record: AccountDetailRecord) -> AccountDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn broker_context(
+        deadline: Option<std::time::Instant>,
+    ) -> crate::ports::BrokerRequestContext<'static> {
+        static ALLOWANCE: std::sync::LazyLock<iaam_http::RequestAllowance> =
+            std::sync::LazyLock::new(|| iaam_http::RequestAllowance::new(u32::MAX));
+        crate::ports::BrokerRequestContext {
+            deadline,
+            allowance: &ALLOWANCE,
+        }
+    }
 
     #[test]
     fn resolve_error_preserves_unknown_date_and_ambiguous_distinctions() {
@@ -2684,7 +2694,7 @@ mod tests {
                         "invented-one",
                         time::macros::date!(2026 - 08 - 01),
                         time::macros::date!(2026 - 08 - 31),
-                        None,
+                        broker_context(None),
                     )
                     .await
                     .expect("one page")
@@ -2760,7 +2770,7 @@ mod tests {
                 "invented-one",
                 time::macros::date!(2025 - 06 - 01),
                 time::macros::date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the scripted page is parsed");

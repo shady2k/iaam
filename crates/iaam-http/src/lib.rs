@@ -57,5 +57,5 @@ pub mod trust;
 pub use destination::Destination;
 pub use egress::{BrokerEgress, BrokerEgressConfigError};
 pub use gateway::{Gateway, GatewayError, Outbound};
-pub use request::{AuthScheme, HttpMethod, HttpRequest, RequestBody, Secret};
+pub use request::{AuthScheme, HttpMethod, HttpRequest, RequestAllowance, RequestBody, Secret};
 pub use response::{HttpError, HttpResponse};

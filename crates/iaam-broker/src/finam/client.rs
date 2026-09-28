@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use crate::credentials::BrokerToken;
 use iaam_http::gateway::{Clock, SystemClock};
-use iaam_http::{Destination, GatewayError, HttpRequest, Outbound, RequestBody, Secret};
+use iaam_http::{
+    Destination, GatewayError, HttpRequest, Outbound, RequestAllowance, RequestBody, Secret,
+};
 use serde_json::Value;
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
@@ -80,6 +82,11 @@ pub enum FinamError {
         reason: String,
         retry_after: Option<Duration>,
     },
+    /// This sync has spent every request attempt it is allowed.
+    #[error(
+        "Finam request ceiling of {ceiling} attempts reached; the range is too long for one sync; narrow it and sync again"
+    )]
+    RequestCeiling { ceiling: u32 },
     /// A single day's transactions answer reached the request's limit, and
     /// a single day cannot be split further: whether more transactions lie
     /// past the page cannot be proven from the wire, so the interval is
@@ -154,9 +161,18 @@ impl FinamClient {
     }
 
     /// Return the raw body of the account's current portfolio.
-    pub async fn get_portfolio(&self, account_id: &str) -> Result<String, FinamError> {
-        self.get(GET_ACCOUNT, format!("/v1/accounts/{account_id}"), &[])
-            .await
+    pub async fn get_portfolio(
+        &self,
+        account_id: &str,
+        allowance: &RequestAllowance,
+    ) -> Result<String, FinamError> {
+        self.get(
+            GET_ACCOUNT,
+            format!("/v1/accounts/{account_id}"),
+            &[],
+            allowance,
+        )
+        .await
     }
 
     /// Return the raw body of the account's transactions for a whole
@@ -181,8 +197,11 @@ impl FinamClient {
         account_id: &str,
         from: Date,
         to: Date,
+        allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
-        let transactions = self.transactions_interval(account_id, from, to).await?;
+        let transactions = self
+            .transactions_interval(account_id, from, to, allowance)
+            .await?;
         Ok(serde_json::json!({ "transactions": transactions }).to_string())
     }
 
@@ -199,12 +218,15 @@ impl FinamClient {
         account_id: &'a str,
         from: Date,
         to: Date,
+        allowance: &'a RequestAllowance,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, FinamError>> + Send + 'a>> {
         Box::pin(async move {
             if from > to {
                 return Ok(Vec::new());
             }
-            let transactions = self.transactions_page(account_id, from, to).await?;
+            let transactions = self
+                .transactions_page(account_id, from, to, allowance)
+                .await?;
             let limit = usize::try_from(self.transactions_limit).unwrap_or(usize::MAX);
             if transactions.len() < limit {
                 return Ok(transactions);
@@ -214,10 +236,12 @@ impl FinamClient {
                 return Err(FinamError::PartialResponse);
             }
             let middle = from + time::Duration::days(whole_days / 2);
-            let mut merged = self.transactions_interval(account_id, from, middle).await?;
+            let mut merged = self
+                .transactions_interval(account_id, from, middle, allowance)
+                .await?;
             let after_middle = middle.next_day().ok_or(FinamError::PartialResponse)?;
             let rest = self
-                .transactions_interval(account_id, after_middle, to)
+                .transactions_interval(account_id, after_middle, to, allowance)
                 .await?;
             merged.extend(rest);
             Ok(merged)
@@ -235,6 +259,7 @@ impl FinamClient {
         account_id: &str,
         from: Date,
         to: Date,
+        allowance: &RequestAllowance,
     ) -> Result<Vec<Value>, FinamError> {
         // An unrepresentable day after `to` has no whole instant range to
         // name; the interval cannot be proven complete, and is refused.
@@ -249,6 +274,7 @@ impl FinamClient {
                 TRANSACTIONS,
                 format!("/v1/accounts/{account_id}/transactions"),
                 &query,
+                allowance,
             )
             .await?;
         let value: Value =
@@ -261,9 +287,12 @@ impl FinamClient {
     }
 
     /// The account ids the access sees, from `POST /v1/sessions/details`.
-    pub async fn get_account_ids(&self) -> Result<Vec<String>, FinamError> {
+    pub async fn get_account_ids(
+        &self,
+        allowance: &RequestAllowance,
+    ) -> Result<Vec<String>, FinamError> {
         let (body, token) = self
-            .authorized(SESSIONS, |token| {
+            .authorized(SESSIONS, allowance, |token| {
                 // The token rides the body only: the published contract gives
                 // this method no Authorization header, unlike the data
                 // methods. Reading twice changes nothing.
@@ -272,6 +301,7 @@ impl FinamClient {
                     "/v1/sessions/details",
                     RequestBody::Json(serde_json::json!({ "token": token }).to_string()),
                 )
+                .with_request_allowance(allowance.clone())
                 .idempotent()
             })
             .await?;
@@ -305,10 +335,13 @@ impl FinamClient {
         method: &'static str,
         path: String,
         query: &[(&str, String)],
+        allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
         let query = query.to_vec();
-        self.authorized(method, move |token| {
-            let mut request = HttpRequest::get(Destination::FinamApi, &path).with_bare_token(token);
+        self.authorized(method, allowance, move |token| {
+            let mut request = HttpRequest::get(Destination::FinamApi, &path)
+                .with_bare_token(token)
+                .with_request_allowance(allowance.clone());
             for (key, value) in &query {
                 request = request.with_query(key, value);
             }
@@ -325,9 +358,10 @@ impl FinamClient {
     async fn authorized(
         &self,
         method: &'static str,
+        allowance: &RequestAllowance,
         build: impl Fn(&str) -> HttpRequest,
     ) -> Result<(String, Secret), FinamError> {
-        let session = self.session().await?;
+        let session = self.session(allowance).await?;
         let step = match self.raw(method, &build(session.token.expose())).await {
             Ok(body) => return Ok((body, session.token.clone())),
             Err(step) => step,
@@ -335,7 +369,7 @@ impl FinamClient {
         if !step.is_unauthorized() {
             return Err(step.into_error(self.token.expose(), Some(session.token.expose())));
         }
-        let fresh = self.renewed(&session).await?;
+        let fresh = self.renewed(&session, allowance).await?;
         match self.raw(method, &build(fresh.token.expose())).await {
             Ok(body) => Ok((body, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
@@ -347,7 +381,7 @@ impl FinamClient {
     /// exchange gate and looks once more before exchanging: of several
     /// simultaneous first calls, the first through the gate pays for the
     /// session and the rest reuse it.
-    async fn session(&self) -> Result<Session, FinamError> {
+    async fn session(&self, allowance: &RequestAllowance) -> Result<Session, FinamError> {
         if let Some(live) = self.live_session() {
             return Ok(live);
         }
@@ -355,7 +389,7 @@ impl FinamClient {
         if let Some(live) = self.live_session() {
             return Ok(live);
         }
-        let fresh = self.exchange().await?;
+        let fresh = self.exchange(allowance).await?;
         self.keep(fresh.clone());
         Ok(fresh)
     }
@@ -364,14 +398,18 @@ impl FinamClient {
     /// caller the refusal hit. The first through the gate exchanges; the
     /// rest find a live session that is not the refused one and carry it —
     /// a concurrent renewal has already replaced the token Finam rejected.
-    async fn renewed(&self, refused: &Session) -> Result<Session, FinamError> {
+    async fn renewed(
+        &self,
+        refused: &Session,
+        allowance: &RequestAllowance,
+    ) -> Result<Session, FinamError> {
         let _gate = self.exchanging.lock().await;
         if let Some(live) = self.live_session() {
             if live.token.expose() != refused.token.expose() {
                 return Ok(live);
             }
         }
-        let fresh = self.exchange().await?;
+        let fresh = self.exchange(allowance).await?;
         self.keep(fresh.clone());
         Ok(fresh)
     }
@@ -431,7 +469,7 @@ impl FinamClient {
     /// documented one until a details answer corrects it. Minting a
     /// session has no effect on the account, so the gateway may repeat it
     /// like any read.
-    async fn exchange(&self) -> Result<Session, FinamError> {
+    async fn exchange(&self, allowance: &RequestAllowance) -> Result<Session, FinamError> {
         // The anchor precedes the send: Finam creates the token between
         // the request and the answer, so measuring its life from the
         // request can only renew early, never late.
@@ -441,7 +479,8 @@ impl FinamClient {
             "/v1/sessions",
             RequestBody::Json(serde_json::json!({ "secret": self.token.expose() }).to_string()),
         )
-        .idempotent();
+        .idempotent()
+        .with_request_allowance(allowance.clone());
         let response = self
             .gateway
             .send(SESSIONS, &request, None)
@@ -525,6 +564,9 @@ fn classify_refusal(error: GatewayError, secret: &str, token: Option<&str>) -> F
             reason: error.to_string(),
             retry_after: error.retry_after(),
         };
+    }
+    if let GatewayError::RequestCeiling { ceiling, .. } = error {
+        return FinamError::RequestCeiling { ceiling };
     }
     if let Some(retry_after) = error.retry_after() {
         return match error.status() {
@@ -699,6 +741,38 @@ mod tests {
         }
     }
 
+    /// A Finam endpoint that makes every multi-day transactions answer full
+    /// and every single-day answer complete. A long interval therefore keeps
+    /// splitting without introducing a second pagination mechanism.
+    #[derive(Default)]
+    struct FullIntervals {
+        received: Mutex<Vec<HttpRequest>>,
+    }
+
+    struct FullIntervalsTransport(Arc<FullIntervals>);
+
+    impl Transport for FullIntervalsTransport {
+        async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.0
+                .received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            if request.url() == "https://api.finam.ru/v1/sessions" {
+                return Ok(response(200, &session_answer(JWT_ONE)));
+            }
+            let (start, end) = asked_interval(&request.url());
+            if end - start > time::Duration::days(1) {
+                Ok(response(
+                    200,
+                    r#"{"transactions":[{"id":"full-interval"}]}"#,
+                ))
+            } else {
+                Ok(response(200, r#"{"transactions":[]}"#))
+            }
+        }
+    }
+
     /// The state behind a [`Driven`] endpoint: it remembers every request
     /// and answers by kind — the exchange with a fresh token each time, the
     /// data calls with a 401 for the first `refused` of them and `200 {}`
@@ -775,11 +849,19 @@ mod tests {
     ) -> (Result<String, FinamError>, Result<String, FinamError>) {
         let first = {
             let client = Arc::clone(client);
-            tokio::spawn(async move { client.get_portfolio("Main").await })
+            tokio::spawn(async move {
+                client
+                    .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+                    .await
+            })
         };
         let second = {
             let client = Arc::clone(client);
-            tokio::spawn(async move { client.get_portfolio("Main").await })
+            tokio::spawn(async move {
+                client
+                    .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+                    .await
+            })
         };
         tokio::join!(async { first.await.expect("first task joins") }, async {
             second.await.expect("second task joins")
@@ -874,9 +956,17 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        client.get_portfolio("Main").await.expect("portfolio");
         client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+        client
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("transactions");
 
@@ -920,7 +1010,10 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         for _ in 0..3 {
-            client.get_portfolio("Main").await.expect("portfolio");
+            client
+                .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect("portfolio");
         }
 
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
@@ -1036,7 +1129,7 @@ mod tests {
         assert!(poisoned.is_err(), "the stand-in did panic");
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the call after the poison carries on");
 
@@ -1058,14 +1151,14 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
         time.advance(SESSION_LIFETIME);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1089,7 +1182,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
@@ -1098,7 +1191,7 @@ mod tests {
         time.advance(SESSION_LIFETIME - RENEW_BEFORE + Duration::from_secs(1));
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1121,7 +1214,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
@@ -1130,7 +1223,7 @@ mod tests {
         time.advance(SESSION_LIFETIME - RENEW_BEFORE);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1151,7 +1244,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
@@ -1161,7 +1254,10 @@ mod tests {
             expires_at: time.now() + Duration::from_secs(60),
         });
 
-        client.get_portfolio("Main").await.expect("portfolio");
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
 
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 3);
@@ -1190,7 +1286,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let body = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");
 
@@ -1219,7 +1315,7 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("refused after the renewed call is refused too");
 
@@ -1249,7 +1345,12 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect_err("403 is refused");
 
@@ -1270,7 +1371,7 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         let body = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");
 
@@ -1288,7 +1389,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("every attempt fails");
 
@@ -1317,7 +1418,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("every attempt is throttled");
 
@@ -1365,7 +1466,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("400 is refused");
 
@@ -1385,7 +1486,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("every attempt of the exchange fails");
 
@@ -1406,7 +1507,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("the secret itself is refused");
 
@@ -1422,7 +1523,7 @@ mod tests {
             let (client, _) = client_over(BUDGETS, &endpoint);
 
             let error = client
-                .get_portfolio("Main")
+                .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                 .await
                 .expect_err("no token, no session");
 
@@ -1446,7 +1547,7 @@ mod tests {
             let (client, time) = client_over(BUDGETS, &endpoint);
 
             let error = client
-                .get_portfolio("Main")
+                .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                 .await
                 .expect_err("no client, no request");
 
@@ -1470,7 +1571,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("every attempt faults");
 
@@ -1499,7 +1600,7 @@ mod tests {
         let (client, _) = client_over(NO_FINAM, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("no budget, no request");
 
@@ -1545,9 +1646,17 @@ mod tests {
         );
         let (client, time) = client_over(ONE_PER_METHOD, &endpoint);
 
-        client.get_portfolio("Main").await.expect("portfolio");
         client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+        client
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("transactions");
         assert_eq!(
@@ -1556,7 +1665,10 @@ mod tests {
             "the session exchange, account call, and transactions call share host spacing"
         );
 
-        client.get_portfolio("Main").await.expect("portfolio again");
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio again");
         assert_eq!(
             time.slept(),
             vec![
@@ -1578,7 +1690,10 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        let ids = client.get_account_ids().await.expect("the accounts");
+        let ids = client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the accounts");
 
         assert_eq!(ids, vec!["One".to_owned(), "Two".to_owned()]);
         let received = endpoint.received.lock().expect("received");
@@ -1604,7 +1719,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_account_ids()
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("no ids, no answer");
 
@@ -1631,10 +1746,13 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
-        client.get_account_ids().await.expect("the accounts");
+        client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the accounts");
 
         // One second inside the corrected margin: the ten-minute token is
         // exchanged anew, though the uncorrected fifteen-minute assumption
@@ -1643,7 +1761,7 @@ mod tests {
         time.advance(corrected - RENEW_BEFORE + Duration::from_secs(1));
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1674,13 +1792,19 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
-        client.get_account_ids().await.expect("the accounts");
+        client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the accounts");
 
         time.advance(Duration::from_secs(60));
-        client.get_portfolio("Main").await.expect("portfolio");
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
 
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 4);
@@ -1707,14 +1831,14 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
         // Past the margin: the renewal puts the second token in the cache.
         time.advance(SESSION_LIFETIME - RENEW_BEFORE + Duration::from_secs(1));
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1724,7 +1848,10 @@ mod tests {
         client.correct_session_lifetime(JWT_ONE, Duration::from_secs(60));
 
         time.advance(Duration::from_secs(60));
-        client.get_portfolio("Main").await.expect("portfolio");
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
 
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 5);
@@ -1745,7 +1872,10 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        let ids = client.get_account_ids().await.expect("the retry succeeds");
+        let ids = client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the retry succeeds");
 
         assert_eq!(ids, vec!["Three".to_owned()]);
         let received = endpoint.received.lock().expect("received");
@@ -1812,7 +1942,12 @@ mod tests {
         let (client, _) = client_with_limit(BUDGETS, &endpoint, 2);
 
         let body = client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("the whole interval is fetched");
 
@@ -1879,6 +2014,46 @@ mod tests {
         assert_eq!(ids, ["left", "right"]);
     }
 
+    #[tokio::test]
+    async fn full_intervals_stop_at_three_hundred_transport_attempts() {
+        let endpoint = Arc::new(FullIntervals::default());
+        let time = FakeTime::new();
+        let client = client_with_transport(
+            BUDGETS,
+            FullIntervalsTransport(Arc::clone(&endpoint)),
+            &time,
+            1,
+        );
+        let allowance = iaam_http::RequestAllowance::new(300);
+        let result = client
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 12 - 31),
+                &allowance,
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("the 301st request was not refused");
+        };
+
+        assert!(matches!(error, FinamError::RequestCeiling { ceiling: 300 }));
+        let received = endpoint
+            .received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(received.len(), 300);
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| request.url() == "https://api.finam.ru/v1/sessions")
+                .count(),
+            1,
+            "the session exchange spends one of the same 300 attempts"
+        );
+        assert!(error.to_string().contains("narrow"));
+    }
+
     /// The half-open instant range a transactions request named, read back
     /// out of the URL the gateway received.
     fn asked_interval(url: &str) -> (OffsetDateTime, OffsetDateTime) {
@@ -1918,7 +2093,12 @@ mod tests {
         let (client, _) = client_with_limit(BUDGETS, &endpoint, 2);
 
         let error = client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 01 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 01 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect_err("a full single day cannot be proven complete");
 
@@ -1941,7 +2121,12 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let body = client
-            .get_transactions("Main", date!(2024 - 02 - 01), date!(2024 - 01 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 02 - 01),
+                date!(2024 - 01 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("an empty interval is an empty answer");
 

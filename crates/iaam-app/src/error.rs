@@ -135,6 +135,12 @@ pub enum AppError {
         detail: String,
         retry_after: Option<std::time::Duration>,
     },
+    /// A broker sync used every transport attempt it is allowed. The caller's
+    /// interval is valid but too wide to fetch safely in one run.
+    #[error(
+        "{origin} request ceiling of {ceiling} attempts reached; the range is too long for one sync; narrow it and sync again"
+    )]
+    SyncRequestCeiling { origin: String, ceiling: u32 },
     /// The broker access sees no account at all to bind the requested
     /// account against, so the sync refuses before it fetches or writes
     /// anything. Separate from `SourceRefused`, because the broker answered
@@ -354,6 +360,7 @@ impl AppError {
             Self::Random(_) => "random_unavailable",
             Self::Conflict { .. } => "already_exists",
             Self::SourceUnreachable { .. } => "source_unavailable",
+            Self::SyncRequestCeiling { .. } => "sync_request_ceiling",
             Self::SourceRefused { .. } => "source_refused",
             Self::BrokerAccountUnseen { .. } => "broker_account_unseen",
             Self::BrokerAccountAmbiguous { .. } => "broker_account_ambiguous",

@@ -24,9 +24,10 @@ use iaam_app::error::AppError;
 use iaam_app::ingest::dedup::IdentityScope;
 use iaam_app::ingest::{OperationDates, OperationKind, Rejection, SubmittedOperation, Verdict};
 use iaam_app::ports::{
-    BrokerChannel, BrokerChannelFactory, BrokerError, BrokerVault, ClassificationRuleStore, Clock,
-    CustodyUpsert, InstrumentDirectory, OutboundHttp, OutboundResponse, ParsedOperations,
-    PortfolioAsOf, PortfolioSnapshot, Store, TokenAdmin, UnavailableOutboundHttp,
+    BrokerChannel, BrokerChannelFactory, BrokerError, BrokerRequestContext, BrokerVault,
+    ClassificationRuleStore, Clock, CustodyUpsert, InstrumentDirectory, OutboundHttp,
+    OutboundResponse, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Store, TokenAdmin,
+    UnavailableOutboundHttp,
 };
 use iaam_app::storage::SqliteStore;
 use iaam_app::storage::{
@@ -91,7 +92,7 @@ struct EmptyChannel {
 impl BrokerChannel for EmptyChannel {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         Ok(Vec::new())
     }
@@ -102,7 +103,7 @@ impl BrokerChannel for EmptyChannel {
         _broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
             accepted: Vec::new(),
@@ -115,7 +116,7 @@ impl BrokerChannel for EmptyChannel {
         _account: AccountId,
         _broker_account: &str,
         _at: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -141,7 +142,7 @@ struct PopulatedChannel {
 impl BrokerChannel for PopulatedChannel {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         Ok(vec!["invented-one".to_owned()])
     }
@@ -152,7 +153,7 @@ impl BrokerChannel for PopulatedChannel {
         _broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
             accepted: vec![SubmittedOperation {
@@ -185,7 +186,7 @@ impl BrokerChannel for PopulatedChannel {
         _account: AccountId,
         _broker_account: &str,
         _at: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -12352,7 +12353,7 @@ struct TwinRowsChannel {
 impl BrokerChannel for TwinRowsChannel {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         Ok(vec!["invented-one".to_owned()])
     }
@@ -12363,7 +12364,7 @@ impl BrokerChannel for TwinRowsChannel {
         _broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         let row = |operation_id: &str| SubmittedOperation {
             account,
@@ -12397,7 +12398,7 @@ impl BrokerChannel for TwinRowsChannel {
         _account: AccountId,
         _broker_account: &str,
         _at: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
@@ -35403,7 +35404,7 @@ struct FailingChannel {
 impl BrokerChannel for FailingChannel {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         Err(self.error.clone())
     }
@@ -35414,7 +35415,7 @@ impl BrokerChannel for FailingChannel {
         _broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Err(self.error.clone())
     }
@@ -35424,7 +35425,7 @@ impl BrokerChannel for FailingChannel {
         _account: AccountId,
         _broker_account: &str,
         _at: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Err(self.error.clone())
     }
@@ -35516,6 +35517,22 @@ async fn broker_egress_refusal_answers_503_naming_the_switch() {
     let message = response["message"].as_str().expect("a message");
     assert!(message.contains("IAAM_BROKER_EGRESS"), "{message}");
     assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
+}
+
+#[tokio::test]
+async fn broker_request_ceiling_answers_422_with_the_narrower_range_action() {
+    let (status, headers, response) = sync_through_failing_broker(BrokerError::RequestCeiling {
+        broker: "tinkoff".to_owned(),
+        ceiling: 300,
+    })
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert_eq!(response["code"], "sync_request_ceiling");
+    assert!(headers.get("retry-after").is_none(), "{headers:?}");
+    let message = response["message"].as_str().unwrap_or("");
+    assert!(message.contains("300"), "{message}");
+    assert!(message.contains("narrow"), "{message}");
 }
 
 #[tokio::test]
@@ -35627,7 +35644,7 @@ async fn an_unparsable_broker_answer_is_still_500() {
 }
 
 #[tokio::test]
-async fn the_broker_sync_openapi_declares_an_unreachable_and_a_refusing_broker() {
+async fn the_broker_sync_openapi_declares_its_ceiling_unreachable_and_refusing_answers() {
     let harness = harness().await;
     let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -35644,6 +35661,11 @@ async fn the_broker_sync_openapi_declares_an_unreachable_and_a_refusing_broker()
         .as_str()
         .unwrap_or_else(|| panic!("the sync route declares no 502: {responses}"));
     assert!(refused.contains("refused"), "{refused}");
+    let ceiling = responses["422"]["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the sync route declares no 422: {responses}"));
+    assert!(ceiling.contains("300"), "{ceiling}");
+    assert!(ceiling.contains("narrow"), "{ceiling}");
 }
 
 // --- iaam-xzz5.3.2: the binding, and the sync that reads it --------------
@@ -35662,7 +35684,7 @@ struct RecordingChannel {
 impl BrokerChannel for RecordingChannel {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         Ok(self.accounts.clone())
     }
@@ -35673,7 +35695,7 @@ impl BrokerChannel for RecordingChannel {
         broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         self.requested
             .lock()
@@ -35710,7 +35732,7 @@ impl BrokerChannel for RecordingChannel {
         _account: AccountId,
         broker_account: &str,
         _at: Date,
-        _deadline: Option<std::time::Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         self.requested
             .lock()

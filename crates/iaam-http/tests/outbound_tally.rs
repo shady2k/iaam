@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
 use iaam_http::{
     BrokerEgress, Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse,
-    RequestBody,
+    RequestAllowance, RequestBody,
 };
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -146,17 +146,25 @@ fn gateway(
     .expect("documented budgets are valid")
 }
 
-fn operations() -> HttpRequest {
+fn operations(allowance: &RequestAllowance) -> HttpRequest {
     HttpRequest::post(
         Destination::TinkoffProd,
         "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
         RequestBody::Json("{}".to_owned()),
     )
     .idempotent()
+    .with_request_allowance(allowance.clone())
 }
 
-fn finam_session() -> HttpRequest {
+fn finam_session(allowance: &RequestAllowance) -> HttpRequest {
     HttpRequest::get(Destination::FinamApi, "/v1/sessions")
+        .with_request_allowance(allowance.clone())
+}
+
+/// An allowance no closure or pause test can reach: those tests are about the
+/// host, not about one sync's ceiling.
+fn unbounded() -> RequestAllowance {
+    RequestAllowance::new(u32::MAX)
 }
 
 fn elapsed(later: SystemTime, earlier: SystemTime) -> Duration {
@@ -198,16 +206,17 @@ async fn two_gateways_and_a_rebuilt_gateway_share_spacing_and_the_minute_budget(
         },
     );
 
+    let allowance = RequestAllowance::new(u32::MAX);
     for index in 0..51 {
         let current = if index % 2 == 0 { &first } else { &second };
         current
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&allowance), None)
             .await
             .expect("request sent");
     }
     let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
     rebuilt
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect("request sent after rebuild");
 
@@ -243,7 +252,7 @@ async fn three_broker_refusals_close_the_host_for_thirty_minutes_across_gateways
 
     for attempt in 1..=2 {
         let refused = first
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&unbounded()), None)
             .await
             .expect_err("the broker refuses the request");
         assert!(
@@ -260,7 +269,7 @@ async fn three_broker_refusals_close_the_host_for_thirty_minutes_across_gateways
         time.advance(Duration::from_secs(4 * 60));
     }
     let third = first
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the third refusal is still the response just sent");
     assert!(
@@ -278,7 +287,7 @@ async fn three_broker_refusals_close_the_host_for_thirty_minutes_across_gateways
     let expected_reopen = httpdate::fmt_http_date(time.wall() + Duration::from_secs(30 * 60));
     for blocked in [
         second
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&unbounded()), None)
             .await
             .expect_err("the second gateway sees the closure"),
         gateway(
@@ -288,7 +297,7 @@ async fn three_broker_refusals_close_the_host_for_thirty_minutes_across_gateways
                 tally: tally.clone(),
             },
         )
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the rebuilt gateway sees the closure"),
     ] {
@@ -304,7 +313,7 @@ async fn three_broker_refusals_close_the_host_for_thirty_minutes_across_gateways
 
     time.advance(Duration::from_secs(30 * 60));
     let reopened = second
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the broker still answers 400 after the closure");
     assert!(matches!(
@@ -335,7 +344,7 @@ async fn three_finam_session_renewal_401s_close_the_finam_host() {
 
     for _ in 0..3 {
         let refused = first
-            .send("AuthService.Sessions", &finam_session(), None)
+            .send("AuthService.Sessions", &finam_session(&unbounded()), None)
             .await
             .expect_err("the renewal is refused");
         assert!(matches!(
@@ -350,7 +359,7 @@ async fn three_finam_session_renewal_401s_close_the_finam_host() {
 
     let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
     let blocked = rebuilt
-        .send("AuthService.Sessions", &finam_session(), None)
+        .send("AuthService.Sessions", &finam_session(&unbounded()), None)
         .await
         .expect_err("the rebuilt gateway sees the Finam closure");
     let message = blocked.to_string();
@@ -380,7 +389,7 @@ async fn a_persisted_host_closure_precedes_this_processes_open_breaker() {
 
     for _ in 0..5 {
         let refused = locally_broken
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&unbounded()), None)
             .await
             .expect_err("the three attempts are exhausted");
         assert!(matches!(refused, GatewayError::Exhausted { .. }));
@@ -396,7 +405,7 @@ async fn a_persisted_host_closure_precedes_this_processes_open_breaker() {
     );
     for _ in 0..3 {
         let refused = refusing
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&unbounded()), None)
             .await
             .expect_err("the broker refuses the request");
         assert!(matches!(
@@ -406,7 +415,7 @@ async fn a_persisted_host_closure_precedes_this_processes_open_breaker() {
     }
 
     let blocked = locally_broken
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the persisted closure is more specific than the breaker");
     assert!(
@@ -447,7 +456,7 @@ async fn a_429_pauses_for_a_minute_and_the_second_closes_across_gateways() {
     );
 
     let paused = first
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the first 429 pauses the host");
     assert!(
@@ -462,7 +471,7 @@ async fn a_429_pauses_for_a_minute_and_the_second_closes_across_gateways() {
         "{paused:?}"
     );
     let blocked = second
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("another gateway sees the pause");
     assert!(
@@ -473,7 +482,7 @@ async fn a_429_pauses_for_a_minute_and_the_second_closes_across_gateways() {
 
     time.advance(Duration::from_secs(60));
     let second_rate_limit = second
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the second 429 records the closure");
     assert!(
@@ -495,7 +504,7 @@ async fn a_429_pauses_for_a_minute_and_the_second_closes_across_gateways() {
         },
     );
     let blocked = rebuilt
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the rebuilt gateway sees the closure");
     let message = blocked.to_string();
@@ -529,7 +538,7 @@ async fn a_429_keeps_a_longer_declared_pause_across_a_rebuild() {
     );
 
     let paused = first
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the declared pause is returned");
     assert!(
@@ -546,7 +555,7 @@ async fn a_429_keeps_a_longer_declared_pause_across_a_rebuild() {
 
     let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
     let paused = rebuilt
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the rebuilt gateway sees the declared pause");
     assert!(
@@ -580,7 +589,7 @@ async fn a_leftover_temporary_file_never_replaces_the_last_complete_tally() {
         },
     );
     first
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect("the initial state is persisted");
     assert!(lock.is_file(), "the separate lock file was not created");
@@ -588,7 +597,7 @@ async fn a_leftover_temporary_file_never_replaces_the_last_complete_tally() {
     std::fs::write(&temporary, "partial new state").expect("leftover temporary file written");
     let rebuilt = gateway(transport.clone(), &time, BrokerEgress::On { tally });
     rebuilt
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect("the intact tally, not the temporary file, is read");
 
@@ -606,14 +615,15 @@ async fn the_thousand_and_first_broker_send_of_a_utc_day_is_refused_without_tran
     let transport = RecordingTransport::answering(&time);
     let gateway = gateway(transport.clone(), &time, BrokerEgress::On { tally });
 
+    let allowance = RequestAllowance::new(u32::MAX);
     for _ in 0..1_000 {
         gateway
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&allowance), None)
             .await
             .expect("request within daily ceiling sent");
     }
     let refused = gateway
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect_err("daily ceiling refuses the next request");
 
@@ -644,7 +654,7 @@ async fn the_thousand_and_first_broker_send_of_a_utc_day_is_refused_without_tran
 
     time.advance(expected_wait);
     gateway
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect("the next UTC day has a fresh ceiling");
     assert_eq!(transport.sent().len(), 1_001);
@@ -673,6 +683,7 @@ async fn missing_corrupt_and_unopenable_tallies_refuse_without_sending_and_name_
     )
     .expect("partial tally written");
     let missing = directory.file("missing-tally");
+    let allowance = RequestAllowance::new(u32::MAX);
 
     for (path, detail) in [
         (missing, None),
@@ -690,7 +701,7 @@ async fn missing_corrupt_and_unopenable_tallies_refuse_without_sending_and_name_
             },
         );
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send("OperationsService", &operations(&allowance), None)
             .await
             .expect_err("bad tally refuses the request");
         let message = refused.to_string();
@@ -723,7 +734,7 @@ async fn the_previous_host_record_shape_keeps_its_active_closure() {
     let gateway = gateway(transport.clone(), &time, BrokerEgress::On { tally });
 
     let blocked = gateway
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&unbounded()), None)
         .await
         .expect_err("the previous tally closure is active");
 
@@ -748,9 +759,10 @@ async fn egress_switch_applies_only_to_broker_destinations() {
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
     let transport = RecordingTransport::answering(&time);
     let off = gateway(transport.clone(), &time, BrokerEgress::Off);
+    let allowance = RequestAllowance::new(u32::MAX);
 
     let refused = off
-        .send("OperationsService", &operations(), None)
+        .send("OperationsService", &operations(&allowance), None)
         .await
         .expect_err("broker egress is off");
     assert!(matches!(refused, GatewayError::BrokerEgressOff));
@@ -768,7 +780,7 @@ async fn egress_switch_applies_only_to_broker_destinations() {
     let tally = directory.file("tally");
     std::fs::write(&tally, "").expect("empty tally created");
     let on = gateway(transport.clone(), &time, BrokerEgress::On { tally });
-    on.send("OperationsService", &operations(), None)
+    on.send("OperationsService", &operations(&allowance), None)
         .await
         .expect("broker request passes through the tally");
 

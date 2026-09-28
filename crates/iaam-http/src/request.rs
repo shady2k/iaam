@@ -5,6 +5,8 @@
 //! at all. `HttpClient` handles sending.
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use zeroize::Zeroizing;
 
 use crate::destination::Destination;
@@ -83,6 +85,51 @@ pub enum AuthScheme {
     /// `Authorization: <token>`, with no scheme word.
     Bare,
 }
+/// One caller's finite allowance of transport attempts.
+///
+/// Clones share the same count. The request carries the handle into the
+/// gateway, where retries and first attempts consume it alike immediately
+/// before the transport is called.
+#[derive(Debug, Clone)]
+pub struct RequestAllowance {
+    state: Arc<RequestAllowanceState>,
+}
+
+#[derive(Debug)]
+struct RequestAllowanceState {
+    ceiling: u32,
+    remaining: AtomicU32,
+}
+
+impl RequestAllowance {
+    #[must_use]
+    pub fn new(ceiling: u32) -> Self {
+        Self {
+            state: Arc::new(RequestAllowanceState {
+                ceiling,
+                remaining: AtomicU32::new(ceiling),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn ceiling(&self) -> u32 {
+        self.state.ceiling
+    }
+
+    pub(crate) fn take(&self) -> bool {
+        self.state
+            .remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn give_back(&self) {
+        self.state.remaining.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 /// Complete description of an outgoing request.
 #[derive(Debug, Clone)]
@@ -97,6 +144,7 @@ pub struct HttpRequest {
     soap_action: Option<String>,
     reset_header: Option<&'static str>,
     idempotent: bool,
+    allowance: Option<RequestAllowance>,
 }
 
 impl HttpRequest {
@@ -126,6 +174,7 @@ impl HttpRequest {
             auth_scheme: AuthScheme::Bearer,
             soap_action: None,
             reset_header: None,
+            allowance: None,
             // A GET reads; any other method may act, and acting twice is
             // not undone by a later success.
             idempotent: matches!(method, HttpMethod::Get),
@@ -180,6 +229,12 @@ impl HttpRequest {
         self.idempotent = true;
         self
     }
+    /// Count every transport attempt for this request against `allowance`.
+    #[must_use]
+    pub fn with_request_allowance(mut self, allowance: RequestAllowance) -> Self {
+        self.allowance = Some(allowance);
+        self
+    }
 
     #[must_use]
     pub const fn is_idempotent(&self) -> bool {
@@ -230,6 +285,9 @@ impl HttpRequest {
     #[must_use]
     pub const fn reset_header(&self) -> Option<&'static str> {
         self.reset_header
+    }
+    pub(crate) const fn allowance(&self) -> Option<&RequestAllowance> {
+        self.allowance.as_ref()
     }
 
     /// Complete request URL.
@@ -282,6 +340,20 @@ mod tests {
     #[test]
     fn a_post_marked_idempotent_is_idempotent() {
         assert!(post().idempotent().is_idempotent());
+    }
+
+    #[test]
+    fn an_allowance_spends_exactly_its_ceiling_and_can_refund_an_unsent_attempt() {
+        let allowance = RequestAllowance::new(2);
+
+        assert_eq!(allowance.ceiling(), 2);
+        assert!(allowance.take());
+        assert!(allowance.take());
+        assert!(!allowance.take());
+
+        allowance.give_back();
+        assert!(allowance.take());
+        assert!(!allowance.take());
     }
 
     #[test]

@@ -28,7 +28,8 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::ports::{
-    BrokerChannel, BrokerError, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Quarantined,
+    BrokerChannel, BrokerError, BrokerRequestContext, ParsedOperations, PortfolioAsOf,
+    PortfolioSnapshot, Quarantined,
 };
 
 const BROKER: &str = "finam";
@@ -61,12 +62,16 @@ impl FinamChannel {
 impl BrokerChannel for FinamChannel {
     async fn fetch_account_numbers(
         &self,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         bounded(
             deadline,
             "the Finam sessions request",
-            self.client.get_account_ids(),
+            self.client.get_account_ids(allowance),
         )
         .await
     }
@@ -77,14 +82,19 @@ impl BrokerChannel for FinamChannel {
         broker_account: &str,
         from: Date,
         to: Date,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         // The broker is asked for its own account number; the returned rows
         // are stamped with the owner's account in this system.
         let body = bounded(
             deadline,
             "the Finam transactions request",
-            self.client.get_transactions(broker_account, from, to),
+            self.client
+                .get_transactions(broker_account, from, to, allowance),
         )
         .await?;
         let operations = parse_operations(&body).map_err(parse_error)?;
@@ -96,13 +106,17 @@ impl BrokerChannel for FinamChannel {
         account: AccountId,
         broker_account: &str,
         _at: Date,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         let _ = account;
         let body = bounded(
             deadline,
             "the Finam portfolio request",
-            self.client.get_portfolio(broker_account),
+            self.client.get_portfolio(broker_account, allowance),
         )
         .await?;
         adapt_portfolio(&body)
@@ -331,6 +345,10 @@ fn finam_error(error: FinamError) -> BrokerError {
             broker: BROKER.to_owned(),
             detail,
             retry_after,
+        },
+        FinamError::RequestCeiling { ceiling } => BrokerError::RequestCeiling {
+            broker: BROKER.to_owned(),
+            ceiling,
         },
         FinamError::InvalidToken | FinamError::UnexpectedStatus { .. } => BrokerError::Refused {
             broker: BROKER.to_owned(),
@@ -651,6 +669,15 @@ mod tests {
     use std::time::Duration;
     use time::macros::date;
 
+    fn broker_context(deadline: Option<Instant>) -> BrokerRequestContext<'static> {
+        static ALLOWANCE: std::sync::LazyLock<iaam_http::RequestAllowance> =
+            std::sync::LazyLock::new(|| iaam_http::RequestAllowance::new(u32::MAX));
+        BrokerRequestContext {
+            deadline,
+            allowance: &ALLOWANCE,
+        }
+    }
+
     const TOKEN: &str = "invented-finam-token";
     const DIVIDEND_ID: &str = "3f2b8c5e-1a4d-4f6b-9c2e-5a7d8e1f4a3b";
     const BUY_ID: &str = "8d1c2f3a-4b5e-4c6d-9a0b-1c2d3e4f5a6b";
@@ -765,7 +792,7 @@ mod tests {
         );
 
         let ids = channel
-            .fetch_account_numbers(None)
+            .fetch_account_numbers(broker_context(None))
             .await
             .expect("the listing parses");
 
@@ -783,7 +810,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -885,7 +912,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -922,7 +949,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -983,7 +1010,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1043,7 +1070,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1109,7 +1136,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1195,7 +1222,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1243,7 +1270,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1292,7 +1319,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("an empty page is not refused");
@@ -1348,7 +1375,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1404,7 +1431,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                Some(past),
+                broker_context(Some(past)),
             )
             .await
             .expect_err("the deadline has passed");
@@ -1444,7 +1471,7 @@ mod tests {
                 account(),
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 30),
-                Some(deadline),
+                broker_context(Some(deadline)),
             )
             .await
             .expect_err("the deadline fires although Finam never answers");
@@ -1470,7 +1497,7 @@ mod tests {
                 account(),
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the portfolio is parsed");
@@ -1505,7 +1532,7 @@ mod tests {
                 account(),
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect_err("a rejected token");

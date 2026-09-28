@@ -341,6 +341,21 @@ pub enum GatewayError {
         status: Option<u16>,
         attempts: u32,
     },
+    /// A broker request did not carry the sync-scoped allowance. Broker
+    /// clients have no uncounted path: every transport attempt must belong to
+    /// one sync.
+    #[error(
+        "{destination:?} broker request has no sync request allowance; open the request through a broker sync"
+    )]
+    MissingRequestAllowance { destination: Destination },
+    /// This sync has sent every transport attempt it is allowed to send.
+    #[error(
+        "{destination:?} request allowance reached its ceiling of {ceiling} attempts; the range is too long for one sync; narrow it and sync again"
+    )]
+    RequestCeiling {
+        destination: Destination,
+        ceiling: u32,
+    },
     /// Every attempt failed transiently. Worth trying again after
     /// `retry_after`.
     #[error(
@@ -423,6 +438,8 @@ impl GatewayError {
             Self::DailyCeiling { .. } => "daily ceiling",
             Self::BrokerHostPaused { .. } => "broker host paused",
             Self::BrokerHostClosed { .. } => "broker host closed",
+            Self::MissingRequestAllowance { .. } => "missing request allowance",
+            Self::RequestCeiling { .. } => "request ceiling",
             Self::BrokerEgressOff => "broker egress off",
             Self::TallyUnavailable { .. } => "tally unavailable",
             Self::TallyCorrupt { .. } => "tally corrupt",
@@ -452,6 +469,8 @@ impl GatewayError {
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
             | Self::SecondGateway
+            | Self::MissingRequestAllowance { .. }
+            | Self::RequestCeiling { .. }
             | Self::Rejected { .. }
             | Self::Transport { .. } => None,
         }
@@ -474,6 +493,8 @@ impl GatewayError {
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
             | Self::SecondGateway
+            | Self::MissingRequestAllowance { .. }
+            | Self::RequestCeiling { .. }
             | Self::CircuitOpen { .. }
             | Self::Transport { .. } => None,
         }
@@ -497,7 +518,9 @@ impl GatewayError {
             | Self::DailyCeiling { .. }
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
-            | Self::SecondGateway => 0,
+            | Self::SecondGateway
+            | Self::MissingRequestAllowance { .. }
+            | Self::RequestCeiling { .. } => 0,
         }
     }
 
@@ -900,6 +923,15 @@ impl<T: Transport> Gateway<T> {
         if broker && matches!(self.broker_egress, BrokerEgress::Off) {
             return Err(GatewayError::BrokerEgressOff);
         }
+        let allowance = if broker {
+            Some(
+                request
+                    .allowance()
+                    .ok_or(GatewayError::MissingRequestAllowance { destination })?,
+            )
+        } else {
+            None
+        };
         let lane_lock = &self.lanes[destination.base_url()];
         let mut attempts = 0_u32;
         let mut status = None;
@@ -1054,21 +1086,35 @@ impl<T: Transport> Gateway<T> {
                     let BrokerEgress::On { tally } = &self.broker_egress else {
                         return Err(GatewayError::BrokerEgressOff);
                     };
-                    match OutboundTally::new(tally)
-                        .decide_and_record(
-                            destination.base_url(),
-                            key.unwrap_or("*"),
-                            budget.used,
-                            budget.window,
-                            self.clock.now_utc(),
-                        )
-                        .map_err(|error| tally_gateway_error(tally, error))?
-                    {
+                    let Some(allowance) = allowance else {
+                        return Err(GatewayError::MissingRequestAllowance { destination });
+                    };
+                    if !allowance.take() {
+                        return Err(GatewayError::RequestCeiling {
+                            destination,
+                            ceiling: allowance.ceiling(),
+                        });
+                    }
+                    let tally_decision = match OutboundTally::new(tally).decide_and_record(
+                        destination.base_url(),
+                        key.unwrap_or("*"),
+                        budget.used,
+                        budget.window,
+                        self.clock.now_utc(),
+                    ) {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            allowance.give_back();
+                            return Err(tally_gateway_error(tally, error));
+                        }
+                    };
+                    match tally_decision {
                         TallyDecision::Send => {}
                         TallyDecision::Paused {
                             reopens_at,
                             retry_after,
                         } => {
+                            allowance.give_back();
                             return Err(GatewayError::BrokerHostPaused {
                                 destination,
                                 host: destination.base_url(),
@@ -1082,6 +1128,7 @@ impl<T: Transport> Gateway<T> {
                             reopens_at,
                             retry_after,
                         } => {
+                            allowance.give_back();
                             return Err(GatewayError::BrokerHostClosed {
                                 destination,
                                 host: destination.base_url(),
@@ -1096,6 +1143,7 @@ impl<T: Transport> Gateway<T> {
                             reset_at,
                             retry_after,
                         } => {
+                            allowance.give_back();
                             return Err(GatewayError::DailyCeiling {
                                 destination,
                                 ceiling: DAILY_CEILING,
@@ -1104,6 +1152,7 @@ impl<T: Transport> Gateway<T> {
                             });
                         }
                         TallyDecision::Wait(wait) => {
+                            allowance.give_back();
                             if crosses(self.clock.now() + wait) {
                                 return Err(cut(attempts, status, wait));
                             }
@@ -1352,6 +1401,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use crate::RequestAllowance;
     use crate::resilience::MAX_NAMED_WAIT;
 
     #[test]
@@ -1546,6 +1596,7 @@ mod tests {
             "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
             crate::RequestBody::Json("{}".to_owned()),
         )
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
         // A read-only RPC: T-Invest reads over POST.
         .idempotent()
     }
@@ -1565,6 +1616,104 @@ mod tests {
     }
 
     // --- budget -----------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn request_allowance_refuses_the_attempt_after_its_ceiling() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let allowance = RequestAllowance::new(300);
+        let request = operations().with_request_allowance(allowance.clone());
+
+        for attempt in 1..=300 {
+            if let Err(error) = gateway.send("OperationsService", &request, None).await {
+                panic!("attempt {attempt} inside the allowance failed: {error}");
+            }
+        }
+        let result = gateway.send("OperationsService", &request, None).await;
+        let Err(error) = result else {
+            panic!("the next attempt was sent");
+        };
+
+        assert_eq!(gateway.transport.sent_count(), 300);
+        let message = error.to_string();
+        assert!(message.contains("300"), "{message}");
+        assert!(message.contains("narrow"), "{message}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broker_request_without_an_allowance_never_reaches_transport() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .idempotent();
+
+        let result = gateway.send("OperationsService", &request, None).await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::MissingRequestAllowance {
+                destination: Destination::TinkoffProd
+            })
+        ));
+        assert_eq!(gateway.transport.sent_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_spend_the_same_allowance_as_first_attempts() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200)
+            .then(Ok(status(500)))
+            .then(Ok(status(500)))
+            .then(Ok(status(200)));
+        let gateway = gateway(&time, transport);
+        let allowance = RequestAllowance::new(3);
+        let request = operations().with_request_allowance(allowance.clone());
+
+        if let Err(error) = gateway.send("OperationsService", &request, None).await {
+            panic!("the third attempt should succeed: {error}");
+        }
+        let result = gateway.send("OperationsService", &request, None).await;
+        let Err(error) = result else {
+            panic!("three retries did not spend the allowance");
+        };
+
+        assert_eq!(gateway.transport.sent_count(), 3);
+        assert!(error.to_string().contains("3"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn separate_allowances_do_not_share_attempts() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let first = RequestAllowance::new(1);
+        let second = RequestAllowance::new(1);
+
+        if let Err(error) = gateway
+            .send(
+                "OperationsService",
+                &operations().with_request_allowance(first),
+                None,
+            )
+            .await
+        {
+            panic!("first sync did not send: {error}");
+        }
+        if let Err(error) = gateway
+            .send(
+                "OperationsService",
+                &operations().with_request_allowance(second),
+                None,
+            )
+            .await
+        {
+            panic!("second sync did not send: {error}");
+        }
+
+        assert_eq!(gateway.transport.sent_count(), 2);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn operations_service_never_exceeds_fifty_in_any_minute() {
@@ -1652,7 +1801,8 @@ mod tests {
     async fn a_finam_method_missing_from_the_table_is_refused_without_sending() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
-        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts");
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts")
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
 
         let refused = gateway
             .send("AccountsService.Invented", &request, None)
@@ -1764,6 +1914,7 @@ mod tests {
             "/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
             crate::RequestBody::Json("{}".to_owned()),
         )
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
         .idempotent()
     }
 
@@ -1774,7 +1925,8 @@ mod tests {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
         let operations = operations();
-        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts");
+        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts")
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
 
         let (first, second) = tokio::join!(
             gateway.send("OperationsService", &operations, None),
@@ -2052,7 +2204,8 @@ mod tests {
                 Destination::FinamApi,
                 "/v1/accounts/transfer",
                 crate::RequestBody::Json("{}".to_owned()),
-            );
+            )
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
 
             let refused = gateway
                 .send("AccountsService.Transactions", &transfer, None)
@@ -2206,7 +2359,8 @@ mod tests {
             Destination::TinkoffProd,
             "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
             crate::RequestBody::Json("{}".to_owned()),
-        );
+        )
+        .with_request_allowance(RequestAllowance::new(u32::MAX));
 
         let refused = gateway
             .send("OperationsService", &once, None)
@@ -2420,7 +2574,8 @@ mod tests {
         for _ in 0..5 {
             let _ = call(&gateway).await;
         }
-        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts");
+        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts")
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
 
         gateway
             .send("AccountsService.GetAccount", &finam, None)

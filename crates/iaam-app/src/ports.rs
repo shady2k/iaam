@@ -19,7 +19,7 @@ use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint};
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_core::retirement::{AccountRetirement, RetirementRevision};
 use iaam_core::rules::LotRuleVersion;
-use iaam_http::HttpRequest;
+use iaam_http::{HttpRequest, RequestAllowance};
 use iaam_ingest::SubmittedOperation;
 use iaam_ingest::classification::{Classification, RuleMatcher};
 use iaam_ingest::dedup::IdentityScope;
@@ -2121,6 +2121,11 @@ pub enum BrokerError {
         detail: String,
         retry_after: Option<std::time::Duration>,
     },
+    /// This sync spent every broker transport attempt it is allowed.
+    #[error(
+        "broker {broker} request ceiling of {ceiling} attempts reached; the range is too long for one sync; narrow it and sync again"
+    )]
+    RequestCeiling { broker: String, ceiling: u32 },
     #[error("response from broker {broker} could not be parsed: {detail}")]
     Unparsable { broker: String, detail: String },
     #[error("the {broker} adapter reached a state it excludes: {detail}")]
@@ -2179,6 +2184,16 @@ pub struct PortfolioSnapshot {
     pub refused: Vec<Quarantined>,
 }
 
+/// Limits shared by every broker request made for one synchronization.
+///
+/// A sync constructs this once: discovery, retries, operation pages and the
+/// portfolio all see the same deadline and transport-attempt allowance.
+#[derive(Debug, Clone, Copy)]
+pub struct BrokerRequestContext<'a> {
+    pub deadline: Option<std::time::Instant>,
+    pub allowance: &'a RequestAllowance,
+}
+
 /// Broker channel: a second way to obtain the same data.
 ///
 /// It exists to ensure independence (§10.3): a match between the parsed
@@ -2202,7 +2217,7 @@ pub trait BrokerChannel: Send + Sync {
     /// between them.
     async fn fetch_account_numbers(
         &self,
-        deadline: Option<std::time::Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError>;
 
     /// Account operations for an interval: accepted and sent to quarantine.
@@ -2211,16 +2226,18 @@ pub trait BrokerChannel: Send + Sync {
     /// returned submissions carry. `broker_account` is the broker's own
     /// number for it, resolved from a stored binding or the access's single
     /// account, and it is what the broker is asked for: no live broker
-    /// recognises our identifier (`iaam-xzz5.3.2`). `deadline` is the whole
-    /// sync's: no request starts, and no wait for one runs, past it. A
-    /// channel that reaches it answers `Unreachable`.
+    /// recognises our identifier (`iaam-xzz5.3.2`). `context` carries the
+    /// whole sync's deadline and allowance: no request starts, and no wait for
+    /// one runs, past the deadline, while every transport attempt spends the
+    /// same allowance. A channel that reaches either limit answers with its
+    /// typed refusal.
     async fn fetch_operations(
         &self,
         account: AccountId,
         broker_account: &str,
         from: Date,
         to: Date,
-        deadline: Option<std::time::Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError>;
 
     /// Portfolio claims for the requested account and their date semantics.
@@ -2228,13 +2245,13 @@ pub trait BrokerChannel: Send + Sync {
     /// Returns the source's assertions, not a calculation: the values calculated
     /// from the journal are subsequently reconciled against them. The two
     /// account halves are [`Self::fetch_operations`]'s, and so is the
-    /// reasoning. `deadline` is the whole sync's, as for `fetch_operations`.
+    /// reasoning. `context` is the whole sync's, as for `fetch_operations`.
     async fn fetch_portfolio(
         &self,
         account: AccountId,
         broker_account: &str,
         at: Date,
-        deadline: Option<std::time::Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError>;
 
     /// Exactly how the data was obtained. The parser version and absence

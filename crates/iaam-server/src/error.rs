@@ -484,6 +484,10 @@ impl ApiFailure {
                     ApiError::simple("not_configured", message),
                 )
             }
+            AppError::SyncRequestCeiling { .. } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiError::simple(error.code(), error.to_string()),
+            ),
             // The source is down, not our store: 503 says the same call is worth
             // making again, and `Retry-After` says when, where the gateway knew.
             // A wait it did not know is left out rather than guessed.

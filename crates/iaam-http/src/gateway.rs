@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,13 +36,13 @@ use tokio::sync::Mutex;
 
 use crate::client::HttpClient;
 use crate::destination::Destination;
-use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress};
+use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, EGRESS_DIRECTORY};
 use crate::request::{HttpRequest, Secret};
 use crate::resilience::{MAX_NAMED_WAIT, Outcome, Retry, RetryPolicy, is_transient};
 use crate::response::{HttpError, HttpResponse};
 use crate::tally::{
-    ClosureReason, DAILY_CEILING, EndpointOwner, OutboundTally, TALLY_RETENTION, TallyDecision,
-    TallyError, TallyResponseDecision,
+    ClosureReason, DAILY_CEILING, EgressDirectory, EndpointOwner, OutboundTally, TALLY_RETENTION,
+    TallyDecision, TallyError, TallyResponseDecision,
 };
 
 /// The window every per-minute limit below is stated over.
@@ -232,6 +232,35 @@ pub trait Sleeper: Send + Sync {
 /// The system clock.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
+fn require_host_boottime(offsets: &str) -> Result<(), String> {
+    let mut found = false;
+    for line in offsets.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(clock) = fields.next() else {
+            continue;
+        };
+        let Some(seconds) = fields.next() else {
+            return Err(format!("malformed time namespace offset: {line:?}"));
+        };
+        let Some(nanos) = fields.next() else {
+            return Err(format!("malformed time namespace offset: {line:?}"));
+        };
+        if fields.next().is_some() {
+            return Err(format!("malformed time namespace offset: {line:?}"));
+        }
+        if clock == "boottime" {
+            found = true;
+            if seconds != "0" || nanos != "0" {
+                return Err(format!(
+                    "broker egress refuses a time namespace with boottime offset {seconds} {nanos}"
+                ));
+            }
+        }
+    }
+    found
+        .then_some(())
+        .ok_or_else(|| "/proc/self/timens_offsets has no boottime record".to_owned())
+}
 
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
@@ -239,6 +268,9 @@ impl Clock for SystemClock {
     }
 
     fn now_boot(&self) -> Result<BootTime, String> {
+        let offsets = std::fs::read_to_string("/proc/self/timens_offsets")
+            .map_err(|error| format!("read /proc/self/timens_offsets: {error}"))?;
+        require_host_boottime(&offsets)?;
         let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
             .map_err(|error| format!("read /proc/sys/kernel/random/boot_id: {error}"))?;
         let id = id.trim();
@@ -326,20 +358,18 @@ pub trait Outbound: Send + Sync {
     /// `Gateway::send`, boxed.
     fn send<'a>(
         &'a self,
-        method: &'static str,
         request: &'a HttpRequest,
         deadline: Option<Instant>,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>>;
 }
 
-impl<T: Transport> Outbound for Gateway<T> {
+impl<T: Transport + 'static> Outbound for Gateway<T> {
     fn send<'a>(
         &'a self,
-        method: &'static str,
         request: &'a HttpRequest,
         deadline: Option<Instant>,
     ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, GatewayError>> + Send + 'a>> {
-        Box::pin(Self::send(self, method, request, deadline))
+        Box::pin(Self::send(self, request, deadline))
     }
 }
 
@@ -349,10 +379,10 @@ impl<T: Transport> Outbound for Gateway<T> {
 /// the presented secret, so it can be logged as it is.
 #[derive(Debug, Error)]
 pub enum GatewayError {
-    #[error("no budget is recorded for method {method} at {destination:?}")]
+    #[error("no budget is recorded for path {path:?} at {destination:?}")]
     UnknownBudget {
         destination: Destination,
-        method: &'static str,
+        path: String,
     },
     #[error("the budget table is invalid: {0}")]
     InvalidBudgets(String),
@@ -363,7 +393,7 @@ pub enum GatewayError {
     SecondGateway,
     /// The process explicitly disabled every broker destination.
     #[error(
-        "broker egress is disabled by {BROKER_EGRESS_ENV}; set it to `on` and set IAAM_OUTBOUND_TALLY before sending broker requests"
+        "broker egress is disabled by {BROKER_EGRESS_ENV}; set it to `on` and mount {EGRESS_DIRECTORY} before sending broker requests"
     )]
     BrokerEgressOff,
     /// The tally could not be opened, locked, read, written or persisted.
@@ -718,29 +748,59 @@ impl BudgetTable {
         Ok(Self { rows })
     }
 
-    /// The row covering a method key, and the key its budget is kept under.
+    /// The row covering the request path, and the key its budget is kept under.
     ///
-    /// A named row wins over a shared one.
+    /// A broker caller supplies no independent key: destination and path are
+    /// the wire identity. Non-broker destinations retain their shared row.
     fn lookup(
         &self,
-        destination: Destination,
-        method: &'static str,
+        request: &HttpRequest,
     ) -> Result<(Budget, Option<&'static str>), GatewayError> {
-        let find = |wanted: MethodScope| {
-            self.rows
-                .iter()
-                .find(|row| row.destination == destination && row.scope == wanted)
-        };
-        if let Some(row) = find(MethodScope::Named(method)) {
-            return Ok((*row, Some(method)));
+        let destination = request.destination();
+        let key = broker_budget_key(destination, request.path());
+        let wanted = key.map_or(MethodScope::Shared, MethodScope::Named);
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.destination == destination && row.scope == wanted);
+        row.map(|row| (*row, key))
+            .ok_or_else(|| GatewayError::UnknownBudget {
+                destination,
+                path: request.path().to_owned(),
+            })
+    }
+}
+
+fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static str> {
+    match destination {
+        Destination::TinkoffProd | Destination::TinkoffSandbox => {
+            match path.trim_start_matches('/') {
+                "tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+                | "UsersService/GetAccounts" => Some("UsersService"),
+                "tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio"
+                | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor"
+                | "OperationsService/GetPortfolio"
+                | "OperationsService/GetOperationsByCursor" => Some("OperationsService"),
+                _ => None,
+            }
         }
-        if let Some(row) = find(MethodScope::Shared) {
-            return Ok((*row, None));
+        Destination::FinamApi => {
+            let path = path.trim_start_matches('/');
+            if matches!(path, "v1/sessions" | "v1/sessions/details") {
+                return Some("AuthService.Sessions");
+            }
+            let account_path = path.strip_prefix("v1/accounts/")?;
+            if let Some(account) = account_path.strip_suffix("/transactions") {
+                return (!account.is_empty() && !account.contains('/'))
+                    .then_some("AccountsService.Transactions");
+            }
+            (!account_path.is_empty() && !account_path.contains('/'))
+                .then_some("AccountsService.GetAccount")
         }
-        Err(GatewayError::UnknownBudget {
-            destination,
-            method,
-        })
+        Destination::MoexIss
+        | Destination::CbrScripts
+        | Destination::CbrDailyInfo
+        | Destination::TinvestContract => None,
     }
 }
 
@@ -768,6 +828,9 @@ struct Lane {
     /// recording all run while this lane is held, so the next decision cannot
     /// overtake the previous response.
     owner: Option<EndpointOwner>,
+    /// A tally write failed after handoff. Until a conservative pause has
+    /// been durably written, this process may not hand off another request.
+    tally_latched: bool,
 }
 
 impl Lane {
@@ -866,11 +929,7 @@ const fn endpoint_lock_name(destination: Destination) -> Option<&'static str> {
     }
 }
 
-fn tally_gateway_error(
-    path: &std::path::Path,
-    destination: Destination,
-    error: TallyError,
-) -> GatewayError {
+fn tally_gateway_error(destination: Destination, path: &Path, error: TallyError) -> GatewayError {
     match error {
         TallyError::Corrupt(reason) => GatewayError::TallyCorrupt {
             path: path.to_owned(),
@@ -894,17 +953,18 @@ static PRODUCTION_BUILT: AtomicBool = AtomicBool::new(false);
 ///
 /// Built once per server process and shared: non-broker pacing, named waits
 /// and breakers are state of this value. Broker accounting and each endpoint's
-/// lifetime owner instead belong to the tally named by `broker_egress`.
+/// lifetime owner instead belong to the tally in [`EGRESS_DIRECTORY`].
 pub struct Gateway<T> {
-    transport: T,
+    transport: Arc<T>,
     budgets: BudgetTable,
     retry: RetryPolicy,
     non_broker_retry: RetryPolicy,
     clock: Arc<dyn Clock>,
     sleeper: Arc<dyn Sleeper>,
     broker_egress: BrokerEgress,
+    egress_directory: Option<EgressDirectory>,
     /// Keyed by `Destination::base_url`, the host a request reaches.
-    lanes: HashMap<&'static str, Mutex<Lane>>,
+    lanes: HashMap<&'static str, Arc<Mutex<Lane>>>,
 }
 
 impl Gateway<HttpClient> {
@@ -931,26 +991,44 @@ impl Gateway<HttpClient> {
     }
 }
 
-impl<T: Transport> Gateway<T> {
+impl<T: Transport + 'static> Gateway<T> {
     /// A gateway with the documented budgets, system clock and tokio timer
     /// over `transport`.
     ///
     /// # Errors
     /// `GatewayError::InvalidBudgets` when the table in this module is wrong.
     pub fn new(transport: T, broker_egress: BrokerEgress) -> Result<Self, GatewayError> {
-        Self::with_parts(
+        Self::with_parts_in_directory(
             transport,
             BUDGETS,
             Arc::new(SystemClock),
             Arc::new(TokioSleeper),
             broker_egress,
+            Path::new(EGRESS_DIRECTORY),
+        )
+    }
+    /// Test seam for the documented budgets in an isolated egress directory.
+    #[doc(hidden)]
+    pub fn new_in_directory(
+        transport: T,
+        broker_egress: BrokerEgress,
+        directory: &Path,
+    ) -> Result<Self, GatewayError> {
+        Self::with_parts_in_directory(
+            transport,
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            broker_egress,
+            directory,
         )
     }
 
-    /// A gateway over explicit parts.
+    /// A gateway over explicit parts and the compiled egress directory.
     ///
     /// # Errors
-    /// `GatewayError::InvalidBudgets` when `budgets` fails its checks.
+    /// `GatewayError::InvalidBudgets` when `budgets` fails its checks, or a
+    /// tally error when broker egress is enabled and its directory is unsafe.
     pub fn with_parts(
         transport: T,
         budgets: &'static [Budget],
@@ -958,42 +1036,76 @@ impl<T: Transport> Gateway<T> {
         sleeper: Arc<dyn Sleeper>,
         broker_egress: BrokerEgress,
     ) -> Result<Self, GatewayError> {
-        if let BrokerEgress::On { tally } = &broker_egress {
-            OutboundTally::validate(tally).map_err(|error| GatewayError::TallyUnavailable {
-                path: tally.clone(),
-                reason: error.to_string(),
-            })?;
-        }
-        Ok(Self {
+        Self::with_parts_in_directory(
             transport,
+            budgets,
+            clock,
+            sleeper,
+            broker_egress,
+            Path::new(EGRESS_DIRECTORY),
+        )
+    }
+
+    /// Test seam for an isolated egress-directory mount.
+    #[doc(hidden)]
+    pub fn with_parts_in_directory(
+        transport: T,
+        budgets: &'static [Budget],
+        clock: Arc<dyn Clock>,
+        sleeper: Arc<dyn Sleeper>,
+        broker_egress: BrokerEgress,
+        directory_path: &Path,
+    ) -> Result<Self, GatewayError> {
+        let egress_directory = if broker_egress == BrokerEgress::On {
+            let directory = EgressDirectory::open(directory_path).map_err(|error| {
+                GatewayError::TallyUnavailable {
+                    path: directory_path.join(crate::tally::TALLY_FILE),
+                    reason: error.to_string(),
+                }
+            })?;
+            OutboundTally::validate(&directory).map_err(|error| {
+                tally_gateway_error(Destination::FinamApi, &directory.tally_path(), error)
+            })?;
+            Some(directory)
+        } else {
+            None
+        };
+        Ok(Self {
+            transport: Arc::new(transport),
             budgets: BudgetTable::new(budgets)?,
             retry: RetryPolicy::new(ATTEMPTS, FIRST_BACKOFF),
             non_broker_retry: RetryPolicy::new(NON_BROKER_ATTEMPTS, FIRST_BACKOFF),
             clock,
             sleeper,
             broker_egress,
+            egress_directory,
             lanes: Destination::ALL
                 .into_iter()
-                .map(|destination| (destination.base_url(), Mutex::new(Lane::default())))
+                .map(|destination| {
+                    (
+                        destination.base_url(),
+                        Arc::new(Mutex::new(Lane::default())),
+                    )
+                })
                 .collect(),
         })
     }
 
     /// Send a request under every rule of the gateway.
     ///
-    /// `method` names the budget the request draws on, as the budget table
-    /// spells it (`"OperationsService"`). A 2xx response is returned as it
-    /// came; interpreting its body stays with the source.
+    /// A 2xx response is returned as it came; interpreting its body stays
+    /// with the source. Broker budgets are selected only from the destination
+    /// and request path.
     ///
     /// # Errors
     /// See `GatewayError`.
     pub async fn send(
         &self,
-        method: &'static str,
         request: &HttpRequest,
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
-        let result = self.send_unlogged(method, request, deadline).await;
+        let method = request.path();
+        let result = self.send_unlogged(request, deadline).await;
         if let Err(refusal) = &result {
             if let Some(wait) = refusal.retry_after() {
                 tracing::warn!(
@@ -1030,19 +1142,19 @@ impl<T: Transport> Gateway<T> {
 
     async fn send_unlogged(
         &self,
-        method: &'static str,
         request: &HttpRequest,
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
         let destination = request.destination();
+        let method = request.path();
         let broker = is_broker_destination(destination);
         let retry = if broker {
             &self.retry
         } else {
             &self.non_broker_retry
         };
-        let (budget, key) = self.budgets.lookup(destination, method)?;
-        if broker && matches!(self.broker_egress, BrokerEgress::Off) {
+        let (budget, key) = self.budgets.lookup(request)?;
+        if broker && self.broker_egress == BrokerEgress::Off {
             return Err(GatewayError::BrokerEgressOff);
         }
         let allowance = if broker {
@@ -1102,7 +1214,10 @@ impl<T: Transport> Gateway<T> {
                 // A caller queued behind a long call or a named wait gives up
                 // at its deadline rather than when the lane frees; dropping
                 // the lock future leaves the queue as it was.
-                let Some(mut lane) = self.by_deadline(lane_lock.lock(), deadline).await else {
+                let Some(mut lane) = self
+                    .by_deadline(Arc::clone(lane_lock).lock_owned(), deadline)
+                    .await
+                else {
                     let retry_after =
                         retry.delay(attempts, &Outcome::Transport(HttpError::Timeout));
                     return Err(cut(attempts, status, retry_after));
@@ -1112,16 +1227,63 @@ impl<T: Transport> Gateway<T> {
                     self.clock.now().saturating_duration_since(asked),
                     "lane",
                 );
+                if broker
+                    && lane
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| !owner.belongs_to_current_process())
+                {
+                    lane.owner = None;
+                }
                 if broker && lane.owner.is_none() {
-                    let BrokerEgress::On { tally } = &self.broker_egress else {
-                        return Err(GatewayError::BrokerEgressOff);
-                    };
+                    let directory = self
+                        .egress_directory
+                        .as_ref()
+                        .ok_or(GatewayError::BrokerEgressOff)?;
                     let lock_name =
                         endpoint_lock_name(destination).ok_or(GatewayError::BrokerEgressOff)?;
                     lane.owner = Some(
-                        EndpointOwner::acquire(tally, destination.base_url(), lock_name)
-                            .map_err(|error| tally_gateway_error(tally, destination, error))?,
+                        EndpointOwner::acquire(
+                            directory.clone(),
+                            destination.base_url(),
+                            lock_name,
+                        )
+                        .map_err(|error| {
+                            tally_gateway_error(destination, &directory.tally_path(), error)
+                        })?,
                     );
+                }
+                if broker && lane.tally_latched {
+                    let directory = self
+                        .egress_directory
+                        .as_ref()
+                        .ok_or(GatewayError::BrokerEgressOff)?;
+                    let boot = self.clock.now_boot().map_err(|reason| {
+                        tally_gateway_error(
+                            destination,
+                            &directory.tally_path(),
+                            TallyError::Clock(reason),
+                        )
+                    })?;
+                    let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
+                    let retry_after = owner
+                        .tally()
+                        .and_then(|tally| {
+                            tally.record_unknown_outcome(destination.base_url(), &boot)
+                        })
+                        .map_err(|error| {
+                            tally_gateway_error(destination, &directory.tally_path(), error)
+                        })?;
+                    lane.tally_latched = false;
+                    return Err(GatewayError::BrokerHostClosed {
+                        destination,
+                        host: destination.base_url(),
+                        reason: ClosureReason::UnresolvedAttempt.description(),
+                        reopens_at: format!("{retry_after:?} on the boot clock"),
+                        retry_after,
+                        status: None,
+                        attempts,
+                    });
                 }
                 if let Some(retry_after) = lane.refusing(self.clock.now()) {
                     return Err(GatewayError::CircuitOpen {
@@ -1176,9 +1338,10 @@ impl<T: Transport> Gateway<T> {
                     }
                 }
                 if broker {
-                    let BrokerEgress::On { tally } = &self.broker_egress else {
-                        return Err(GatewayError::BrokerEgressOff);
-                    };
+                    let directory = self
+                        .egress_directory
+                        .as_ref()
+                        .ok_or(GatewayError::BrokerEgressOff)?;
                     let Some(allowance) = allowance else {
                         return Err(GatewayError::MissingRequestAllowance { destination });
                     };
@@ -1193,14 +1356,17 @@ impl<T: Transport> Gateway<T> {
                         Err(reason) => {
                             allowance.give_back();
                             return Err(tally_gateway_error(
-                                tally,
                                 destination,
+                                &directory.tally_path(),
                                 TallyError::Clock(reason),
                             ));
                         }
                     };
                     let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
-                    let tally_decision = match owner.tally().decide_and_record(
+                    let owner_tally = owner.tally().map_err(|error| {
+                        tally_gateway_error(destination, &directory.tally_path(), error)
+                    })?;
+                    let tally_decision = match owner_tally.decide_and_record(
                         destination.base_url(),
                         key.unwrap_or("*"),
                         budget.used,
@@ -1210,7 +1376,11 @@ impl<T: Transport> Gateway<T> {
                         Ok(decision) => decision,
                         Err(error) => {
                             allowance.give_back();
-                            return Err(tally_gateway_error(tally, destination, error));
+                            return Err(tally_gateway_error(
+                                destination,
+                                &directory.tally_path(),
+                                error,
+                            ));
                         }
                     };
                     match tally_decision {
@@ -1270,52 +1440,168 @@ impl<T: Transport> Gateway<T> {
                     lane.record_start(key, &budget, self.clock.now());
                 }
                 attempts += 1;
-                let observed = std::sync::Mutex::new(
-                    None::<(
-                        u16,
-                        Option<Duration>,
-                        Result<TallyResponseDecision, GatewayError>,
-                    )>,
-                );
-                let answer = if broker {
-                    let BrokerEgress::On { tally } = &self.broker_egress else {
-                        return Err(GatewayError::BrokerEgressOff);
-                    };
+                let (mut lane, mut answer, observed, unknown, cleanup_error) = if broker {
+                    let directory = self
+                        .egress_directory
+                        .as_ref()
+                        .ok_or(GatewayError::BrokerEgressOff)?;
                     let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
-                    let observe = Box::new(|status, retry_after: Option<Duration>| {
-                        let retry_after = retry_after.map(|delay| delay.min(TALLY_RETENTION));
-                        let recorded = self
-                            .clock
-                            .now_boot()
-                            .map_err(|reason| {
-                                tally_gateway_error(tally, destination, TallyError::Clock(reason))
-                            })
-                            .and_then(|boot| {
-                                owner
-                                    .tally()
-                                    .record_response(
-                                        destination.base_url(),
-                                        status,
-                                        retry_after,
-                                        &boot,
+                    let owner_tally = owner.tally().map_err(|error| {
+                        tally_gateway_error(destination, &directory.tally_path(), error)
+                    })?;
+                    let transport = Arc::clone(&self.transport);
+                    let request = request.clone();
+                    let clock = Arc::clone(&self.clock);
+                    let tally_path = directory.tally_path();
+                    let budget_key = key.unwrap_or("*");
+                    let task = tokio::spawn(async move {
+                        let observed = Arc::new(std::sync::Mutex::new(
+                            None::<(
+                                u16,
+                                Option<Duration>,
+                                Result<TallyResponseDecision, GatewayError>,
+                            )>,
+                        ));
+                        let callback_observed = Arc::clone(&observed);
+                        let callback_clock = Arc::clone(&clock);
+                        let callback_tally = owner_tally.clone();
+                        let callback_path = tally_path.clone();
+                        let observe = Box::new(move |status, retry_after: Option<Duration>| {
+                            let retry_after = retry_after.map(|delay| delay.min(TALLY_RETENTION));
+                            let recorded = callback_clock
+                                .now_boot()
+                                .map_err(|reason| {
+                                    tally_gateway_error(
+                                        destination,
+                                        &callback_path,
+                                        TallyError::Clock(reason),
                                     )
-                                    .map_err(|error| tally_gateway_error(tally, destination, error))
-                            });
-                        *observed
+                                })
+                                .and_then(|boot| {
+                                    callback_tally
+                                        .record_response(
+                                            destination.base_url(),
+                                            status,
+                                            retry_after,
+                                            &boot,
+                                        )
+                                        .map_err(|error| {
+                                            tally_gateway_error(destination, &callback_path, error)
+                                        })
+                                });
+                            *callback_observed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some((status, retry_after, recorded));
+                        });
+                        let answer = transport.send_observed(&request, observe).await;
+                        let observed = observed
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some((status, retry_after, recorded));
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        let unknown =
+                            if matches!(answer, Err(HttpError::Network | HttpError::Timeout))
+                                && observed.is_none()
+                            {
+                                Some(
+                                    clock
+                                        .now_boot()
+                                        .map_err(|reason| {
+                                            tally_gateway_error(
+                                                destination,
+                                                &tally_path,
+                                                TallyError::Clock(reason),
+                                            )
+                                        })
+                                        .and_then(|boot| {
+                                            owner_tally
+                                                .record_unknown_outcome(
+                                                    destination.base_url(),
+                                                    &boot,
+                                                )
+                                                .map_err(|error| {
+                                                    tally_gateway_error(
+                                                        destination,
+                                                        &tally_path,
+                                                        error,
+                                                    )
+                                                })
+                                        }),
+                                )
+                            } else {
+                                None
+                            };
+                        let cleanup_error = if matches!(
+                            answer,
+                            Err(HttpError::ClientNotBuilt(_)
+                                | HttpError::TrustAnchorNotParsed(_)
+                                | HttpError::RequestNotBuilt(_))
+                        ) && observed.is_none()
+                        {
+                            clock
+                                .now_boot()
+                                .map_err(|reason| {
+                                    tally_gateway_error(
+                                        destination,
+                                        &tally_path,
+                                        TallyError::Clock(reason),
+                                    )
+                                })
+                                .and_then(|boot| {
+                                    owner_tally
+                                        .record_not_handed_off(
+                                            destination.base_url(),
+                                            budget_key,
+                                            &boot,
+                                        )
+                                        .map_err(|error| {
+                                            tally_gateway_error(destination, &tally_path, error)
+                                        })
+                                })
+                                .err()
+                        } else {
+                            None
+                        };
+                        if matches!(observed, Some((_, _, Err(_))))
+                            || matches!(unknown, Some(Err(_)))
+                            || cleanup_error.is_some()
+                        {
+                            lane.tally_latched = true;
+                            lane.hold_until(clock.now() + Duration::from_secs(60));
+                        }
+                        (lane, Some(answer), observed, unknown, cleanup_error)
                     });
-                    self.by_deadline(self.transport.send_observed(request, observe), deadline)
-                        .await
+                    // Arm the detached attempt before starting the caller's
+                    // deadline race. This gives an immediately-ready
+                    // transport/status commit the same first-poll semantics
+                    // as `by_deadline` gives an inline future, while a
+                    // transport that suspends remains owned by the task.
+                    tokio::task::yield_now().await;
+                    let Some(joined) = self.by_deadline(task, deadline).await else {
+                        let retry_after =
+                            retry.delay(attempts, &Outcome::Transport(HttpError::Timeout));
+                        return Err(cut(attempts, status, retry_after));
+                    };
+                    joined.map_err(|error| GatewayError::TallyUnavailable {
+                        path: directory.tally_path(),
+                        reason: format!(
+                            "the detached broker attempt failed before resolving its durable pending record: {error}"
+                        ),
+                    })?
                 } else {
-                    self.by_deadline(self.transport.send(request), deadline)
-                        .await
+                    (
+                        lane,
+                        self.by_deadline(self.transport.send(request), deadline)
+                            .await,
+                        None,
+                        None,
+                        None,
+                    )
                 };
-                let observed = observed
-                    .into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let mut answer = answer.map(|result| {
+                if let Some(error) = cleanup_error {
+                    return Err(error);
+                }
+                answer = answer.map(|result| {
                     result.map(|mut response| {
                         response.retry_after =
                             response.retry_after.map(|delay| delay.min(TALLY_RETENTION));
@@ -1323,9 +1609,9 @@ impl<T: Transport> Gateway<T> {
                     })
                 });
                 if let Some((observed_status, observed_retry_after, recorded)) = observed {
-                    match recorded? {
-                        TallyResponseDecision::Recorded => {}
-                        TallyResponseDecision::RateLimited { retry_after } => {
+                    match recorded {
+                        Ok(TallyResponseDecision::Recorded) => {}
+                        Ok(TallyResponseDecision::Paused { retry_after }) => {
                             return Err(GatewayError::BrokerHostPaused {
                                 destination,
                                 host: destination.base_url(),
@@ -1334,6 +1620,7 @@ impl<T: Transport> Gateway<T> {
                                 attempts,
                             });
                         }
+                        Err(error) => return Err(error),
                     }
                     // A status line is an endpoint answer even when its body
                     // later stalls or fails. Keep a 4xx/5xx from becoming a
@@ -1346,13 +1633,29 @@ impl<T: Transport> Gateway<T> {
                             retry_after: observed_retry_after,
                         }));
                     }
+                } else if let Some(recorded) = unknown {
+                    match recorded {
+                        Ok(retry_after) => {
+                            return Err(GatewayError::BrokerHostClosed {
+                                destination,
+                                host: destination.base_url(),
+                                reason: ClosureReason::UnresolvedAttempt.description(),
+                                reopens_at: format!("{retry_after:?} on the boot clock"),
+                                retry_after,
+                                status: None,
+                                attempts,
+                            });
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else if broker && matches!(answer, Some(Ok(_))) {
+                    let directory = self
+                        .egress_directory
+                        .as_ref()
+                        .ok_or(GatewayError::BrokerEgressOff)?;
                     return Err(tally_gateway_error(
-                        match &self.broker_egress {
-                            BrokerEgress::On { tally } => tally,
-                            BrokerEgress::Off => return Err(GatewayError::BrokerEgressOff),
-                        },
                         destination,
+                        &directory.tally_path(),
                         TallyError::Corrupt(
                             "the transport returned a response without exposing its status"
                                 .to_owned(),
@@ -1360,8 +1663,6 @@ impl<T: Transport> Gateway<T> {
                     ));
                 }
                 let Some(answer) = answer else {
-                    // Abandoned in flight: dropping the request cancels it.
-                    // The wait offered is the one a timed-out attempt earns.
                     let retry_after =
                         retry.delay(attempts, &Outcome::Transport(HttpError::Timeout));
                     return Err(cut(attempts, status, retry_after));
@@ -1539,6 +1840,14 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicUsize;
 
+    #[test]
+    fn host_boottime_accepts_only_a_zero_namespace_offset() {
+        require_host_boottime("monotonic 0 0\nboottime 0 0\n").expect("host boot clock accepted");
+        let refused = require_host_boottime("monotonic 0 0\nboottime 1 0\n")
+            .expect_err("namespaced boot clock refused");
+        assert!(refused.contains("boottime offset 1 0"), "{refused}");
+    }
+
     use super::*;
     use crate::RequestAllowance;
     use crate::resilience::MAX_NAMED_WAIT;
@@ -1549,7 +1858,7 @@ mod tests {
         assert!(
             !GatewayError::UnknownBudget {
                 destination: Destination::MoexIss,
-                method: "history",
+                path: "/iss/history.json".to_owned(),
             }
             .is_broker_egress_refusal()
         );
@@ -1708,30 +2017,34 @@ mod tests {
         }
     }
 
-    fn broker_egress() -> BrokerEgress {
+    fn broker_egress_directory() -> PathBuf {
         static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let tally = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "iaam-http-gateway-test-{}-{sequence}",
             std::process::id()
         ));
+        std::fs::create_dir(&directory).expect("egress directory created");
         let initialized = format!(
             "iaam-outbound-tally-v2\nboot\ttest-boot\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\n",
             Destination::TinkoffProd.base_url(),
             Destination::TinkoffSandbox.base_url(),
             Destination::FinamApi.base_url(),
         );
-        std::fs::write(&tally, initialized).expect("initialized tally created");
-        BrokerEgress::On { tally }
+        std::fs::write(directory.join(crate::tally::TALLY_FILE), initialized)
+            .expect("initialized tally created");
+        directory
     }
 
     fn gateway(time: &Arc<FakeTime>, transport: Scripted) -> Gateway<Scripted> {
-        Gateway::with_parts(
+        let directory = broker_egress_directory();
+        Gateway::with_parts_in_directory(
             transport,
             BUDGETS,
             Arc::clone(time) as Arc<dyn Clock>,
             Arc::clone(time) as Arc<dyn Sleeper>,
-            broker_egress(),
+            BrokerEgress::On,
+            &directory,
         )
         .expect("the documented table is valid")
     }
@@ -1739,7 +2052,7 @@ mod tests {
     fn operations() -> HttpRequest {
         HttpRequest::post(
             Destination::TinkoffProd,
-            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
             crate::RequestBody::Json("{}".to_owned()),
         )
         .with_request_allowance(RequestAllowance::new(u32::MAX))
@@ -1771,11 +2084,11 @@ mod tests {
         let request = operations().with_request_allowance(allowance.clone());
 
         for attempt in 1..=300 {
-            if let Err(error) = gateway.send("OperationsService", &request, None).await {
+            if let Err(error) = gateway.send(&request, None).await {
                 panic!("attempt {attempt} inside the allowance failed: {error}");
             }
         }
-        let result = gateway.send("OperationsService", &request, None).await;
+        let result = gateway.send(&request, None).await;
         let Err(error) = result else {
             panic!("the next attempt was sent");
         };
@@ -1792,12 +2105,12 @@ mod tests {
         let gateway = gateway(&time, Scripted::answering(&time, 200));
         let request = HttpRequest::post(
             Destination::TinkoffProd,
-            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
             crate::RequestBody::Json("{}".to_owned()),
         )
         .idempotent();
 
-        let result = gateway.send("OperationsService", &request, None).await;
+        let result = gateway.send(&request, None).await;
         assert!(matches!(
             result,
             Err(GatewayError::MissingRequestAllowance {
@@ -1818,10 +2131,10 @@ mod tests {
         let allowance = RequestAllowance::new(3);
         let request = operations().with_request_allowance(allowance.clone());
 
-        if let Err(error) = gateway.send("OperationsService", &request, None).await {
+        if let Err(error) = gateway.send(&request, None).await {
             panic!("the third attempt should succeed: {error}");
         }
-        let result = gateway.send("OperationsService", &request, None).await;
+        let result = gateway.send(&request, None).await;
         let Err(error) = result else {
             panic!("three retries did not spend the allowance");
         };
@@ -1838,21 +2151,13 @@ mod tests {
         let second = RequestAllowance::new(1);
 
         if let Err(error) = gateway
-            .send(
-                "OperationsService",
-                &operations().with_request_allowance(first),
-                None,
-            )
+            .send(&operations().with_request_allowance(first), None)
             .await
         {
             panic!("first sync did not send: {error}");
         }
         if let Err(error) = gateway
-            .send(
-                "OperationsService",
-                &operations().with_request_allowance(second),
-                None,
-            )
+            .send(&operations().with_request_allowance(second), None)
             .await
         {
             panic!("second sync did not send: {error}");
@@ -1862,16 +2167,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn broker_spacing_starts_when_the_previous_status_is_committed() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).jumping(Duration::from_secs(7)),
+        );
+        let start = time.now();
+
+        gateway.send(&operations(), None).await.expect("first sent");
+        gateway
+            .send(&operations(), None)
+            .await
+            .expect("second sent");
+
+        assert_eq!(
+            gateway.transport.sent_at(),
+            vec![start, start + Duration::from_secs(8)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn operations_service_never_exceeds_fifty_in_any_minute() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
         let start = time.now();
 
         for _ in 0..160 {
-            gateway
-                .send("OperationsService", &operations(), None)
-                .await
-                .expect("sent");
+            gateway.send(&operations(), None).await.expect("sent");
         }
 
         let sent = gateway.transport.sent_at();
@@ -1890,13 +2213,13 @@ mod tests {
         let start = time.now();
         for _ in 0..50 {
             gateway
-                .send("OperationsService", &operations(), None)
+                .send(&operations(), None)
                 .await
                 .expect("send inside method budget");
         }
 
         gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect("send after the method window");
 
@@ -1912,10 +2235,7 @@ mod tests {
         let request = users();
 
         for _ in 0..60 {
-            gateway
-                .send("UsersService", &request, None)
-                .await
-                .expect("sent");
+            gateway.send(&request, None).await.expect("sent");
         }
 
         let sent = gateway.transport.sent_at();
@@ -1930,15 +2250,9 @@ mod tests {
         let start = time.now();
 
         for _ in 0..50 {
-            gateway
-                .send("OperationsService", &operations(), None)
-                .await
-                .expect("sent");
+            gateway.send(&operations(), None).await.expect("sent");
         }
-        gateway
-            .send("UsersService", &operations(), None)
-            .await
-            .expect("sent");
+        gateway.send(&users(), None).await.expect("sent");
 
         assert_eq!(
             gateway.transport.sent_at().last(),
@@ -1969,20 +2283,18 @@ mod tests {
     async fn a_finam_method_missing_from_the_table_is_refused_without_sending() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
-        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts")
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/invented")
             .with_request_allowance(RequestAllowance::new(u32::MAX));
 
-        let refused = gateway
-            .send("AccountsService.Invented", &request, None)
-            .await;
+        let refused = gateway.send(&request, None).await;
 
         assert!(
             matches!(
                 refused,
                 Err(GatewayError::UnknownBudget {
                     destination: Destination::FinamApi,
-                    method: "AccountsService.Invented"
-                })
+                    ref path
+                }) if path == "/v1/invented"
             ),
             "{refused:?}"
         );
@@ -1995,8 +2307,8 @@ mod tests {
         let gateway = gateway(&time, Scripted::answering(&time, 200));
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
-        for method in ["history", "securities", "history"] {
-            gateway.send(method, &request, None).await.expect("sent");
+        for _ in 0..3 {
+            gateway.send(&request, None).await.expect("sent");
         }
 
         let sent = gateway.transport.sent_at();
@@ -2008,9 +2320,10 @@ mod tests {
     async fn a_method_missing_from_the_table_is_refused_without_sending() {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
-
+        let request = HttpRequest::get(Destination::TinkoffProd, "/InstrumentsService/Invented")
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
         let refused = gateway
-            .send("InstrumentsService", &operations(), None)
+            .send(&request, None)
             .await
             .expect_err("no budget is recorded for it");
 
@@ -2018,8 +2331,8 @@ mod tests {
             refused,
             GatewayError::UnknownBudget {
                 destination: Destination::TinkoffProd,
-                method: "InstrumentsService"
-            }
+                path
+            } if path == "/InstrumentsService/Invented"
         ));
         assert_eq!(gateway.transport.sent_count(), 0);
     }
@@ -2046,7 +2359,7 @@ mod tests {
         .expect("a one-row table is valid");
         let request = HttpRequest::get(Destination::TinvestContract, "/contract.proto");
 
-        let refused = gateway.send("contract", &request, None).await;
+        let refused = gateway.send(&request, None).await;
 
         assert!(matches!(refused, Err(GatewayError::UnknownBudget { .. })));
         assert_eq!(gateway.transport.sent_count(), 0);
@@ -2093,13 +2406,11 @@ mod tests {
         let time = FakeTime::new();
         let gateway = gateway(&time, Scripted::answering(&time, 200));
         let operations = operations();
-        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts")
+        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts/account-id")
             .with_request_allowance(RequestAllowance::new(u32::MAX));
 
-        let (first, second) = tokio::join!(
-            gateway.send("OperationsService", &operations, None),
-            gateway.send("AccountsService.GetAccount", &finam, None),
-        );
+        let (first, second) =
+            tokio::join!(gateway.send(&operations, None), gateway.send(&finam, None),);
 
         first.expect("sent");
         second.expect("sent");
@@ -2114,8 +2425,8 @@ mod tests {
         let daily_info = HttpRequest::get(Destination::CbrDailyInfo, "/DailyInfoWebServ/");
 
         let (first, second) = tokio::join!(
-            gateway.send("rates", &scripts, None),
-            gateway.send("key_rate", &daily_info, None),
+            gateway.send(&scripts, None),
+            gateway.send(&daily_info, None),
         );
 
         first.expect("sent");
@@ -2130,11 +2441,8 @@ mod tests {
         let scripts = HttpRequest::get(Destination::CbrScripts, "/scripts/XML_daily.asp");
         let daily_info = HttpRequest::get(Destination::CbrDailyInfo, "/DailyInfoWebServ/");
 
-        gateway.send("rates", &scripts, None).await.expect("sent");
-        gateway
-            .send("key_rate", &daily_info, None)
-            .await
-            .expect("sent");
+        gateway.send(&scripts, None).await.expect("sent");
+        gateway.send(&daily_info, None).await.expect("sent");
 
         let sent = gateway.transport.sent_at();
         assert_eq!(sent[1] - sent[0], Duration::from_millis(100));
@@ -2158,7 +2466,7 @@ mod tests {
                 Scripted::answering(&time, 200).then(Ok(status(transient))),
             );
 
-            let response = gateway.send("OperationsService", &operations(), None).await;
+            let response = gateway.send(&operations(), None).await;
 
             assert_eq!(
                 response.expect("the retry succeeded").status,
@@ -2176,7 +2484,7 @@ mod tests {
         let gateway = gateway(&time, Scripted::answering(&time, 429));
 
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect_err("the host is paused");
 
@@ -2193,15 +2501,58 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_network_failure_and_a_timeout_are_retried() {
+    async fn retry_after_on_a_server_error_is_persisted_before_returning() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(with_retry_after(503, Duration::from_secs(30)))),
+        );
+
+        let first = gateway
+            .send(&operations(), None)
+            .await
+            .expect_err("retry-after pauses even on a server error");
+        let second = gateway
+            .send(&operations(), None)
+            .await
+            .expect_err("the durable pause prevents another send");
+
+        assert!(matches!(
+            first,
+            GatewayError::BrokerHostPaused { attempts: 1, retry_after, .. }
+                if retry_after == Duration::from_secs(30)
+        ));
+        assert!(matches!(
+            second,
+            GatewayError::BrokerHostPaused { attempts: 0, retry_after, .. }
+                if retry_after == Duration::from_secs(30)
+        ));
+        assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_network_failure_or_timeout_closes_without_a_one_second_retry() {
         for failure in [HttpError::Network, HttpError::Timeout] {
             let time = FakeTime::new();
             let gateway = gateway(&time, Scripted::answering(&time, 200).then(Err(failure)));
 
-            let response = gateway.send("OperationsService", &operations(), None).await;
+            let refused = gateway
+                .send(&operations(), None)
+                .await
+                .expect_err("an outcome without a status is unresolved");
 
-            assert_eq!(response.expect("the retry succeeded").status, 200);
-            assert_eq!(gateway.transport.sent_count(), 2);
+            assert!(matches!(
+                refused,
+                GatewayError::BrokerHostClosed {
+                    reason: "an earlier request has no committed status",
+                    attempts: 1,
+                    retry_after,
+                    ..
+                } if retry_after == Duration::from_secs(90)
+            ));
+            assert_eq!(gateway.transport.sent_count(), 1);
+            assert!(time.slept().is_empty());
         }
     }
 
@@ -2212,7 +2563,7 @@ mod tests {
             let gateway = gateway(&time, Scripted::answering(&time, permanent));
 
             let refused = gateway
-                .send("OperationsService", &operations(), None)
+                .send(&operations(), None)
                 .await
                 .expect_err("a permanent status is a refusal");
 
@@ -2243,7 +2594,7 @@ mod tests {
         );
 
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect_err("401 is a refusal");
 
@@ -2266,7 +2617,7 @@ mod tests {
         let request = operations().with_bearer("t.invented");
 
         let refused = gateway
-            .send("OperationsService", &request, None)
+            .send(&request, None)
             .await
             .expect_err("400 is a refusal");
 
@@ -2308,7 +2659,7 @@ mod tests {
         );
 
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect_err("a client that cannot be built stays unbuilt");
 
@@ -2326,7 +2677,7 @@ mod tests {
         let gateway = gateway(&time, Scripted::answering(&time, 503));
 
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect_err("every attempt failed");
 
@@ -2349,7 +2700,7 @@ mod tests {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
         let refused = gateway
-            .send("market", &request, None)
+            .send(&request, None)
             .await
             .expect_err("every attempt failed");
 
@@ -2365,50 +2716,52 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_request_not_marked_idempotent_is_sent_once() {
-        for failure in [Ok(status(503)), Err(HttpError::Timeout)] {
+        for (failure, unknown) in [(Ok(status(503)), false), (Err(HttpError::Timeout), true)] {
             let time = FakeTime::new();
             let gateway = gateway(&time, Scripted::answering(&time, 200).then(failure));
             let transfer = HttpRequest::post(
                 Destination::FinamApi,
-                "/v1/accounts/transfer",
+                "/v1/accounts/account-id/transactions",
                 crate::RequestBody::Json("{}".to_owned()),
             )
             .with_request_allowance(RequestAllowance::new(u32::MAX));
 
             let refused = gateway
-                .send("AccountsService.Transactions", &transfer, None)
+                .send(&transfer, None)
                 .await
                 .expect_err("a second send could do the thing twice");
 
             assert_eq!(gateway.transport.sent_count(), 1);
-            assert!(
-                time.slept().is_empty(),
-                "it waited for a retry it may not make"
-            );
-            assert!(
-                matches!(refused, GatewayError::Exhausted { attempts: 1, .. }),
-                "{refused:?}"
-            );
-            assert_eq!(refused.retry_after(), Some(FIRST_BACKOFF));
+            assert!(time.slept().is_empty());
+            if unknown {
+                assert!(matches!(refused, GatewayError::BrokerHostClosed { .. }));
+            } else {
+                assert!(matches!(
+                    refused,
+                    GatewayError::Exhausted { attempts: 1, .. }
+                ));
+                assert_eq!(refused.retry_after(), Some(FIRST_BACKOFF));
+            }
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn exhausted_network_failures_carry_no_status() {
+    async fn a_network_failure_carries_no_status_and_is_not_retried() {
         let time = FakeTime::new();
-        let transport = (0..ATTEMPTS).fold(Scripted::answering(&time, 200), |script, _| {
-            script.then(Err(HttpError::Network))
-        });
-        let gateway = gateway(&time, transport);
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Err(HttpError::Network)),
+        );
 
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
-            .expect_err("every attempt failed");
+            .expect_err("the outcome has no committed status");
 
         assert!(refused.is_transient());
         assert_eq!(refused.status(), None);
-        assert_eq!(refused.attempts(), ATTEMPTS);
+        assert_eq!(refused.attempts(), 1);
+        assert_eq!(gateway.transport.sent_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2423,7 +2776,7 @@ mod tests {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
         gateway
-            .send("market", &request, None)
+            .send(&request, None)
             .await
             .expect("the third attempt succeeded");
 
@@ -2444,7 +2797,7 @@ mod tests {
             let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
             gateway
-                .send("market", &request, None)
+                .send(&request, None)
                 .await
                 .expect("the retry succeeded");
 
@@ -2463,7 +2816,7 @@ mod tests {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
         let refused = gateway
-            .send("market", &request, None)
+            .send(&request, None)
             .await
             .expect_err("the gateway holds nobody that long");
 
@@ -2495,10 +2848,7 @@ mod tests {
         let soap = HttpRequest::get(Destination::CbrDailyInfo, "/DailyInfoWebServ/");
         let start = time.now();
 
-        let (first, second) = tokio::join!(
-            gateway.send("rates", &rates, None),
-            gateway.send("soap", &soap, None),
-        );
+        let (first, second) = tokio::join!(gateway.send(&rates, None), gateway.send(&soap, None),);
 
         first.expect("sent");
         second.expect("sent");
@@ -2515,35 +2865,45 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_named_delay_holds_back_a_call_made_after_the_one_that_learned_it() {
+    async fn a_named_delay_refuses_later_calls_until_the_persisted_pause_ends() {
         let time = FakeTime::new();
         let gateway = gateway(
             &time,
             Scripted::answering(&time, 200)
                 .then(Ok(with_retry_after(503, Duration::from_secs(20)))),
         );
-        let start = time.now();
         let once = HttpRequest::post(
             Destination::TinkoffProd,
-            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
             crate::RequestBody::Json("{}".to_owned()),
         )
         .with_request_allowance(RequestAllowance::new(u32::MAX));
 
-        let refused = gateway
-            .send("OperationsService", &once, None)
+        let first = gateway
+            .send(&once, None)
             .await
-            .expect_err("sent once and refused");
-        assert_eq!(refused.retry_after(), Some(Duration::from_secs(20)));
+            .expect_err("sent once and paused");
+        let blocked = gateway
+            .send(&operations(), None)
+            .await
+            .expect_err("the pause is not waited inside the process");
+        assert_eq!(first.retry_after(), Some(Duration::from_secs(20)));
+        assert!(matches!(
+            blocked,
+            GatewayError::BrokerHostPaused {
+                attempts: 0,
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(20)
+        ));
+        assert_eq!(gateway.transport.sent_count(), 1);
+
+        time.advance(Duration::from_secs(20));
         gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect("sent after the reset");
-
-        assert_eq!(
-            gateway.transport.sent_at()[1],
-            start + Duration::from_secs(20)
-        );
+        assert_eq!(gateway.transport.sent_count(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2558,7 +2918,7 @@ mod tests {
         time.advance(Duration::from_secs(600));
 
         let refused = gateway
-            .send("UsersService", &users(), None)
+            .send(&users(), None)
             .await
             .expect_err("the reset is fifty minutes away");
 
@@ -2581,7 +2941,7 @@ mod tests {
         let deadline = time.now() + Duration::from_secs(60);
 
         let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
+            .send(&operations(), Some(deadline))
             .await
             .expect_err("the reset falls after the deadline");
 
@@ -2606,7 +2966,7 @@ mod tests {
         );
 
         let response = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect("2xx is a success");
 
@@ -2627,7 +2987,7 @@ mod tests {
         let request = operations().with_bearer("t.invented-token");
 
         let refused = gateway
-            .send("OperationsService", &request, None)
+            .send(&request, None)
             .await
             .expect_err("403 is a refusal");
 
@@ -2644,7 +3004,7 @@ mod tests {
     }
 
     async fn call(gateway: &Gateway<Scripted>) -> Result<HttpResponse, GatewayError> {
-        gateway.send("OperationsService", &operations(), None).await
+        gateway.send(&operations(), None).await
     }
 
     const COOL_DOWN: Duration = Duration::from_secs(5 * 60);
@@ -2726,7 +3086,7 @@ mod tests {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
         for _ in 0..6 {
-            let refused = gateway.send("market", &request, None).await;
+            let refused = gateway.send(&request, None).await;
             assert!(
                 matches!(refused, Err(GatewayError::Rejected { .. })),
                 "{refused:?}"
@@ -2742,11 +3102,11 @@ mod tests {
         for _ in 0..5 {
             let _ = call(&gateway).await;
         }
-        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts")
+        let finam = HttpRequest::get(Destination::FinamApi, "/v1/accounts/account-id")
             .with_request_allowance(RequestAllowance::new(u32::MAX));
 
         gateway
-            .send("AccountsService.GetAccount", &finam, None)
+            .send(&finam, None)
             .await
             .expect("Finam is not the destination that failed");
     }
@@ -2810,10 +3170,8 @@ mod tests {
 
         // Two calls at once: the first to finish failing opens the breaker,
         // and the other's next attempt is refused rather than sent.
-        let (first, second) = tokio::join!(
-            gateway.send("OperationsService", &operations, None),
-            gateway.send("UsersService", &users, None),
-        );
+        let (first, second) =
+            tokio::join!(gateway.send(&operations, None), gateway.send(&users, None),);
 
         let refused = [first, second]
             .into_iter()
@@ -2831,7 +3189,7 @@ mod tests {
         let gateway = gateway(&time, Scripted::answering(&time, 200));
 
         let refused = gateway
-            .send("OperationsService", &operations(), Some(time.now()))
+            .send(&operations(), Some(time.now()))
             .await
             .expect_err("the deadline is now");
 
@@ -2849,7 +3207,7 @@ mod tests {
         let deadline = time.now() + Duration::from_millis(2500);
 
         let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
+            .send(&operations(), Some(deadline))
             .await
             .expect_err("the third attempt would start past the deadline");
 
@@ -2880,9 +3238,7 @@ mod tests {
         let gateway = gateway(&time, Scripted::answering(&time, 503));
         let deadline = time.now() + Duration::from_secs(3);
 
-        let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
-            .await;
+        let refused = gateway.send(&operations(), Some(deadline)).await;
 
         assert!(matches!(
             refused,
@@ -2902,7 +3258,7 @@ mod tests {
         let deadline = time.now() + Duration::from_secs(6);
 
         let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
+            .send(&operations(), Some(deadline))
             .await
             .expect_err("the tally budget frees a request only at the rolling minute boundary");
 
@@ -2932,7 +3288,7 @@ mod tests {
         let deadline = time.now() + Duration::from_secs(10);
 
         let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
+            .send(&operations(), Some(deadline))
             .await
             .expect_err("the answer would come twenty seconds past the deadline");
 
@@ -2965,11 +3321,7 @@ mod tests {
         let start = time.now();
 
         gateway
-            .send(
-                "OperationsService",
-                &operations(),
-                Some(start + Duration::from_secs(10)),
-            )
+            .send(&operations(), Some(start + Duration::from_secs(10)))
             .await
             .expect("the answer came a second before the deadline");
 
@@ -2985,9 +3337,7 @@ mod tests {
         );
         let deadline = time.now() + Duration::from_secs(60);
 
-        let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
-            .await;
+        let refused = gateway.send(&operations(), Some(deadline)).await;
 
         assert!(
             matches!(
@@ -3007,9 +3357,7 @@ mod tests {
         );
         let deadline = time.now() + Duration::from_secs(10);
 
-        let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
-            .await;
+        let refused = gateway.send(&operations(), Some(deadline)).await;
 
         assert!(
             matches!(
@@ -3030,9 +3378,7 @@ mod tests {
         );
         let deadline = time.now() + Duration::from_secs(60);
 
-        let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
-            .await;
+        let refused = gateway.send(&operations(), Some(deadline)).await;
 
         assert!(
             matches!(
@@ -3054,11 +3400,10 @@ mod tests {
         let queued = HttpRequest::get(Destination::CbrDailyInfo, "/DailyInfoWebServ/");
         let deadline = time.now() + Duration::from_secs(10);
 
-        let (first, (second, returned)) =
-            tokio::join!(gateway.send("rates", &holding, None), async {
-                let refused = gateway.send("soap", &queued, Some(deadline)).await;
-                (refused, time.now())
-            },);
+        let (first, (second, returned)) = tokio::join!(gateway.send(&holding, None), async {
+            let refused = gateway.send(&queued, Some(deadline)).await;
+            (refused, time.now())
+        },);
 
         first.expect("the call holding the lane had no deadline");
         assert_eq!(returned, deadline, "the queued call outlived its deadline");
@@ -3086,9 +3431,7 @@ mod tests {
         let deadline = time.now() + Duration::from_secs(20);
         time.lagging(Duration::from_secs(30));
 
-        let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
-            .await;
+        let refused = gateway.send(&operations(), Some(deadline)).await;
 
         assert!(
             matches!(
@@ -3114,9 +3457,7 @@ mod tests {
         let deadline = time.now() + Duration::from_secs(100);
         time.lagging(MINUTE);
 
-        let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
-            .await;
+        let refused = gateway.send(&operations(), Some(deadline)).await;
 
         assert!(
             matches!(
@@ -3136,9 +3477,7 @@ mod tests {
         let deadline = time.now() + Duration::from_secs(2);
         time.lagging(Duration::from_secs(5));
 
-        let refused = gateway
-            .send("OperationsService", &operations(), Some(deadline))
-            .await;
+        let refused = gateway.send(&operations(), Some(deadline)).await;
 
         assert!(
             matches!(
@@ -3161,7 +3500,7 @@ mod tests {
         let deadline = time.now() + Duration::from_millis(1_101);
 
         gateway
-            .send("OperationsService", &operations(), Some(deadline))
+            .send(&operations(), Some(deadline))
             .await
             .expect("the retry starts before the deadline");
 
@@ -3174,9 +3513,7 @@ mod tests {
         let gateway = gateway(&time, Scripted::answering(&time, 503));
         for _ in 0..5 {
             let deadline = time.now() + Duration::from_millis(500);
-            let cut = gateway
-                .send("OperationsService", &operations(), Some(deadline))
-                .await;
+            let cut = gateway.send(&operations(), Some(deadline)).await;
             assert!(
                 matches!(cut, Err(GatewayError::DeadlineReached { .. })),
                 "{cut:?}"
@@ -3278,7 +3615,7 @@ mod tests {
             "outbound call retries",
             &[
                 "destination=TinkoffProd",
-                "method=\"OperationsService\"",
+                "method=\"/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor\"",
                 "attempt=1",
                 "wait_ms=1000",
                 "status=503",
@@ -3300,7 +3637,7 @@ mod tests {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
 
         gateway
-            .send("market", &request, None)
+            .send(&request, None)
             .await
             .expect("the fourth attempt succeeded");
 
@@ -3350,10 +3687,8 @@ mod tests {
         let queued = HttpRequest::get(Destination::CbrDailyInfo, "/DailyInfoWebServ/");
         let log = Log::capture();
 
-        let (first, second) = tokio::join!(
-            gateway.send("rates", &holding, None),
-            gateway.send("soap", &queued, None),
-        );
+        let (first, second) =
+            tokio::join!(gateway.send(&holding, None), gateway.send(&queued, None),);
 
         first.expect("sent");
         second.expect("sent");
@@ -3363,7 +3698,7 @@ mod tests {
             &[
                 "reason=\"lane\"",
                 "wait_ms=5000",
-                "method=\"soap\"",
+                "method=\"/DailyInfoWebServ/\"",
                 "attempt=1",
             ],
         );
@@ -3429,9 +3764,7 @@ mod tests {
 
         let late = FakeTime::new();
         let gateway = self::gateway(&late, Scripted::answering(&late, 200));
-        let _ = gateway
-            .send("OperationsService", &operations(), Some(late.now()))
-            .await;
+        let _ = gateway.send(&operations(), Some(late.now())).await;
         log.assert_line("WARN", "refusal=\"deadline\"", &["outbound call refused"]);
 
         let long = MAX_NAMED_WAIT + Duration::from_secs(1);
@@ -3466,7 +3799,7 @@ mod tests {
             &[
                 "outbound call refused",
                 "destination=TinkoffProd",
-                "method=\"OperationsService\"",
+                "method=\"/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor\"",
                 "status=404",
                 "attempt=1",
             ],
@@ -3477,40 +3810,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_secret_and_no_body_reach_the_log() {
         let time = FakeTime::new();
-        let leaking = || {
-            Ok(HttpResponse {
-                body: b"t.invented-token account Main balance".to_vec(),
-                ..with_retry_after(503, Duration::from_secs(2))
-            })
-        };
-        let script = (0..5 * ATTEMPTS).fold(Scripted::answering(&time, 200), |script, _| {
-            script.then(leaking())
-        });
         let gateway = gateway(
             &time,
-            script.then(Ok(HttpResponse {
-                body: b"t.invented-token".to_vec(),
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                body: b"t.invented-token balance".to_vec(),
                 ..status(401)
             })),
         );
         let request = operations().with_bearer("t.invented-token");
         let log = Log::capture();
 
-        for _ in 0..6 {
-            let _ = gateway.send("OperationsService", &request, None).await;
-        }
-        time.advance(COOL_DOWN);
-        let _ = gateway.send("OperationsService", &request, None).await;
+        let _ = gateway.send(&request, None).await;
 
         let text = log.text();
-        assert!(
-            text.contains("breaker opened"),
-            "the scenario logged nothing: {text}"
-        );
-        assert!(
-            text.contains("refusal=\"rejected\""),
-            "the rejection that echoed the token was not logged: {text}"
-        );
+        assert!(text.contains("refusal=\"rejected\""), "{text}");
         assert!(!text.contains("invented-token"), "{text}");
         assert!(!text.contains("balance"), "{text}");
     }
@@ -3551,7 +3864,7 @@ mod tests {
 
         shared(&gateway);
         // Built, never polled: nothing is sent.
-        spawnable(gateway.send("history", &request, None));
+        spawnable(gateway.send(&request, None));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3560,10 +3873,7 @@ mod tests {
         let gateway = Arc::new(gateway(&time, Scripted::answering(&time, 200)));
         let held: Arc<dyn Outbound> = Arc::clone(&gateway) as Arc<dyn Outbound>;
 
-        let response = held
-            .send("OperationsService", &operations(), None)
-            .await
-            .expect("sent");
+        let response = held.send(&operations(), None).await.expect("sent");
 
         assert_eq!(response.status, 200);
         assert_eq!(gateway.transport.sent_count(), 1);
@@ -3574,7 +3884,13 @@ mod tests {
         let time = FakeTime::new();
         let held: Arc<dyn Outbound> = Arc::new(gateway(&time, Scripted::answering(&time, 200)));
 
-        let refused = held.send("InstrumentsService", &operations(), None).await;
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/unmapped",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(u32::MAX));
+        let refused = held.send(&request, None).await;
 
         assert!(matches!(refused, Err(GatewayError::UnknownBudget { .. })));
     }

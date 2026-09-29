@@ -252,6 +252,11 @@ impl HttpRequest {
     }
 
     #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[must_use]
     pub const fn body(&self) -> Option<&RequestBody> {
         self.body.as_ref()
     }

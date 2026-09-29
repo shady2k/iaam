@@ -211,7 +211,7 @@ enum OperationType {
 
         for _ in 0..2 {
             gateway
-                .send("operations.proto", &operation_types_request(), None)
+                .send(&operation_types_request(), None)
                 .await
                 .expect("the contract host has a budget");
         }

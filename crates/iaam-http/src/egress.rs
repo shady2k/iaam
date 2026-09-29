@@ -1,19 +1,17 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use thiserror::Error;
 
 pub const BROKER_EGRESS_ENV: &str = "IAAM_BROKER_EGRESS";
-pub const OUTBOUND_TALLY_ENV: &str = "IAAM_OUTBOUND_TALLY";
+pub const EGRESS_DIRECTORY: &str = "/var/lib/iaam/egress";
 
 /// Whether this process may send requests to a broker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerEgress {
     /// Broker destinations are refused before the tally or transport.
     Off,
-    /// Broker destinations use the named tally and acquire one lifetime owner
-    /// lock per endpoint.
-    On { tally: PathBuf },
+    /// Broker destinations use the fixed per-machine egress directory.
+    On,
 }
 
 /// Invalid broker-egress process configuration.
@@ -23,20 +21,17 @@ pub enum BrokerEgressConfigError {
     InvalidSwitch { value: String },
     #[error("{BROKER_EGRESS_ENV} is not valid Unicode; use `on` or `off`")]
     NonUnicodeSwitch,
-    #[error(
-        "{BROKER_EGRESS_ENV}=on requires {OUTBOUND_TALLY_ENV} to name the canonical per-machine tally file"
-    )]
-    MissingTally,
 }
 
 impl BrokerEgress {
-    /// Read the process's broker-egress switch and tally path.
+    /// Read the process's broker-egress switch.
     ///
-    /// The switch defaults to `off`. `IAAM_OUTBOUND_TALLY` is required only
-    /// when the switch is `on`; no path is guessed.
+    /// The switch defaults to `off`. When it is `on`, the gateway opens the
+    /// compiled-in per-machine egress directory; no environment variable can
+    /// choose another tally or endpoint-owner identity.
     ///
     /// # Errors
-    /// An invalid switch value, a non-Unicode switch, or a missing tally path.
+    /// An invalid switch value or a non-Unicode switch.
     pub fn from_env() -> Result<Self, BrokerEgressConfigError> {
         Self::from_lookup(|name| std::env::var_os(name))
     }
@@ -53,12 +48,7 @@ impl BrokerEgress {
             .map_err(|_| BrokerEgressConfigError::NonUnicodeSwitch)?;
         match value.as_str() {
             "off" => Ok(Self::Off),
-            "on" => {
-                let tally = get(OUTBOUND_TALLY_ENV)
-                    .map(PathBuf::from)
-                    .ok_or(BrokerEgressConfigError::MissingTally)?;
-                Ok(Self::On { tally })
-            }
+            "on" => Ok(Self::On),
             _ => Err(BrokerEgressConfigError::InvalidSwitch { value }),
         }
     }
@@ -94,19 +84,10 @@ mod tests {
     }
 
     #[test]
-    fn broker_egress_on_requires_and_keeps_the_tally_path() {
-        let configured = BrokerEgress::from_lookup(values(&[
-            (BROKER_EGRESS_ENV, "on"),
-            (OUTBOUND_TALLY_ENV, "/run/iaam/outbound-tally"),
-        ]))
-        .unwrap();
+    fn broker_egress_accepts_explicit_on_without_another_setting() {
+        let configured = BrokerEgress::from_lookup(values(&[(BROKER_EGRESS_ENV, "on")])).unwrap();
 
-        assert_eq!(
-            configured,
-            BrokerEgress::On {
-                tally: PathBuf::from("/run/iaam/outbound-tally")
-            }
-        );
+        assert_eq!(configured, BrokerEgress::On);
     }
 
     #[test]
@@ -118,14 +99,5 @@ mod tests {
         assert!(message.contains("yes"), "{message}");
         assert!(message.contains("on"), "{message}");
         assert!(message.contains("off"), "{message}");
-    }
-
-    #[test]
-    fn enabled_switch_without_a_tally_names_the_missing_input() {
-        let error = BrokerEgress::from_lookup(values(&[(BROKER_EGRESS_ENV, "on")])).unwrap_err();
-        let message = error.to_string();
-
-        assert!(message.contains(BROKER_EGRESS_ENV), "{message}");
-        assert!(message.contains(OUTBOUND_TALLY_ENV), "{message}");
     }
 }

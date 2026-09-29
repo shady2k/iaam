@@ -62,7 +62,7 @@ pub mod test_support;
 pub mod trust;
 
 pub use destination::Destination;
-pub use egress::{BrokerEgress, BrokerEgressConfigError};
+pub use egress::{BrokerEgress, BrokerEgressConfigError, EGRESS_DIRECTORY};
 pub use gateway::{Gateway, GatewayError, Outbound};
 pub use request::{AuthScheme, HttpMethod, HttpRequest, RequestAllowance, RequestBody, Secret};
 pub use response::{HttpError, HttpResponse};

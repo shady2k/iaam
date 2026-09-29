@@ -16,7 +16,7 @@ async fn a_redirect_returns_to_the_gateway_as_one_refusal() {
     let request = HttpRequest::get(Destination::MoexIss, "/first");
 
     let refusal = gateway
-        .send("market", &request, None)
+        .send(&request, None)
         .await
         .expect_err("a redirect is a refusal, not a transparent second request");
 

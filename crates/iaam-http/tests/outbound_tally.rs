@@ -188,6 +188,43 @@ impl Transport for HoldingTransport {
         Ok(status(200))
     }
 }
+#[derive(Clone)]
+struct PanickingTransport {
+    sent: Arc<AtomicUsize>,
+}
+
+impl Transport for PanickingTransport {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.sent.fetch_add(1, Ordering::SeqCst);
+        panic!("invented transport panic");
+    }
+}
+
+#[derive(Clone)]
+struct BreakTallyTransport {
+    sent: Arc<AtomicUsize>,
+    directory: PathBuf,
+}
+
+impl Transport for BreakTallyTransport {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.sent.fetch_add(1, Ordering::SeqCst);
+        std::fs::create_dir(self.directory.join("outbound-tally.tmp"))
+            .expect("temporary tally path blocked");
+        Ok(status(200))
+    }
+}
+
+struct ProcessHoldingTransport {
+    ready: PathBuf,
+}
+
+impl Transport for ProcessHoldingTransport {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        std::fs::write(&self.ready, b"pending").expect("pending marker written");
+        std::future::pending().await
+    }
+}
 
 fn status(status: u16) -> HttpResponse {
     HttpResponse {
@@ -197,28 +234,27 @@ fn status(status: u16) -> HttpResponse {
     }
 }
 
-fn try_gateway<T: Transport>(
+fn try_gateway<T: Transport + 'static>(
     transport: T,
     time: &Arc<FakeTime>,
     tally: &Path,
 ) -> Result<Gateway<T>, GatewayError> {
-    Gateway::with_parts(
+    Gateway::with_parts_in_directory(
         transport,
         BUDGETS,
         Arc::clone(time) as Arc<dyn Clock>,
         Arc::clone(time) as Arc<dyn Sleeper>,
-        BrokerEgress::On {
-            tally: tally.to_owned(),
-        },
+        BrokerEgress::On,
+        tally.parent().expect("tally has a directory"),
     )
 }
 
-fn gateway<T: Transport>(transport: T, time: &Arc<FakeTime>, tally: &Path) -> Gateway<T> {
+fn gateway<T: Transport + 'static>(transport: T, time: &Arc<FakeTime>, tally: &Path) -> Gateway<T> {
     try_gateway(transport, time, tally).expect("documented budgets and tally are valid")
 }
 
 fn empty_tally(directory: &TempDir) -> PathBuf {
-    let tally = directory.file("tally");
+    let tally = directory.file("outbound-tally");
     std::fs::write(&tally, "").expect("empty tally created");
     tally
 }
@@ -226,7 +262,7 @@ fn empty_tally(directory: &TempDir) -> PathBuf {
 fn operations() -> HttpRequest {
     HttpRequest::post(
         Destination::TinkoffProd,
-        "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperations",
+        "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
         RequestBody::Json("{}".to_owned()),
     )
     .idempotent()
@@ -266,7 +302,7 @@ async fn first_send_waits_sixty_seconds_then_spacing_and_minute_budget_hold() {
 
     for _ in 0..52 {
         gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect("request within the budget sent");
     }
@@ -292,18 +328,10 @@ async fn the_next_decision_sees_the_previous_status_before_it_can_send() {
     let gateway = Arc::new(gateway(transport.clone(), &time, &tally));
 
     let first_gateway = Arc::clone(&gateway);
-    let first = tokio::spawn(async move {
-        first_gateway
-            .send("OperationsService", &operations(), None)
-            .await
-    });
+    let first = tokio::spawn(async move { first_gateway.send(&operations(), None).await });
     transport.first_arrived.notified().await;
     let second_gateway = Arc::clone(&gateway);
-    let second = tokio::spawn(async move {
-        second_gateway
-            .send("OperationsService", &operations(), None)
-            .await
-    });
+    let second = tokio::spawn(async move { second_gateway.send(&operations(), None).await });
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
@@ -338,7 +366,7 @@ async fn a_boot_id_change_restarts_an_active_closure_in_full() {
 
     for _ in 0..3 {
         let refused = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect_err("broker refusal returned");
         assert!(matches!(
@@ -350,7 +378,7 @@ async fn a_boot_id_change_restarts_an_active_closure_in_full() {
     time.reboot("boot-b");
 
     let blocked = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("closure restarts after reboot");
     assert!(matches!(
@@ -373,7 +401,7 @@ async fn a_wall_clock_step_does_not_expire_a_boot_clock_pause() {
     let gateway = gateway(transport.clone(), &time, &tally);
 
     let first = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("429 pauses");
     assert!(matches!(
@@ -383,7 +411,7 @@ async fn a_wall_clock_step_does_not_expire_a_boot_clock_pause() {
     time.step_wall(Duration::from_secs(7 * 24 * 60 * 60));
 
     let blocked = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("wall time does not release the pause");
     assert!(matches!(
@@ -415,7 +443,7 @@ async fn retry_after_is_clamped_to_one_day_in_the_tally() {
     let gateway = gateway(transport, &time, &tally);
 
     let refused = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("429 pauses");
     assert!(matches!(
@@ -436,7 +464,7 @@ async fn a_429_status_is_persisted_when_consuming_its_body_fails() {
     let gateway = gateway(transport.clone(), &time, &tally);
 
     let refused = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("the observed 429 pauses even though its body failed");
 
@@ -460,7 +488,7 @@ async fn a_429_pause_and_second_429_closure_are_persisted() {
     let gateway = gateway(transport.clone(), &time, &tally);
 
     let first = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("first 429 pauses");
     assert!(matches!(
@@ -470,7 +498,7 @@ async fn a_429_pause_and_second_429_closure_are_persisted() {
     ));
     time.advance(Duration::from_secs(60));
     let second = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("second 429 closes");
     assert!(matches!(
@@ -479,7 +507,7 @@ async fn a_429_pause_and_second_429_closure_are_persisted() {
             if retry_after == Duration::from_secs(30 * 60)
     ));
     let closed = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("closure blocks");
     assert!(matches!(
@@ -499,7 +527,7 @@ async fn three_finam_refusals_close_only_the_finam_endpoint() {
 
     for _ in 0..3 {
         let refused = gateway
-            .send("AuthService.Sessions", &finam_session(), None)
+            .send(&finam_session(), None)
             .await
             .expect_err("Finam refusal returned");
         assert!(matches!(
@@ -508,7 +536,7 @@ async fn three_finam_refusals_close_only_the_finam_endpoint() {
         ));
     }
     let closed = gateway
-        .send("AuthService.Sessions", &finam_session(), None)
+        .send(&finam_session(), None)
         .await
         .expect_err("Finam closure blocks");
     assert!(matches!(
@@ -517,7 +545,7 @@ async fn three_finam_refusals_close_only_the_finam_endpoint() {
     ));
 
     let tinkoff = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("transport still answers 401 for T-Invest");
     assert!(matches!(
@@ -536,12 +564,12 @@ async fn a_leftover_temporary_file_never_replaces_the_complete_tally() {
     let gateway = gateway(transport.clone(), &time, &tally);
 
     gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect("initial state persisted");
     std::fs::write(&temporary, "partial new state").expect("leftover temporary written");
     gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect("complete tally remains authoritative");
 
@@ -558,14 +586,14 @@ async fn the_thousand_and_first_send_in_any_rolling_day_is_refused() {
 
     for _ in 0..1_000 {
         gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect("request within rolling ceiling sent");
     }
     let oldest = Duration::from_secs(1_800_000_000 + 60);
     let expected_wait = oldest + Duration::from_secs(24 * 60 * 60) - time.boot();
     let refused = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("rolling ceiling refuses request 1001");
     assert!(matches!(
@@ -580,7 +608,7 @@ async fn the_thousand_and_first_send_in_any_rolling_day_is_refused() {
 
     time.advance(expected_wait);
     gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect("oldest request aged out of the rolling day");
     assert_eq!(transport.sent().len(), 1_001);
@@ -589,30 +617,49 @@ async fn the_thousand_and_first_send_in_any_rolling_day_is_refused() {
 #[tokio::test]
 async fn invalid_path_spellings_and_aliases_are_refused_naming_the_path() {
     let directory = TempDir::create("paths");
-    let tally = empty_tally(&directory);
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let build = |path: &Path| {
+        Gateway::with_parts_in_directory(
+            RecordingTransport::answering(&time),
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            path,
+        )
+    };
 
-    let relative = PathBuf::from("relative-tally");
-    let noncanonical = directory.path.join(".").join("tally");
+    let relative = PathBuf::from("relative-directory");
+    let noncanonical = directory.path.join(".");
     let missing = directory.file("missing");
     let mut invalid = vec![relative, noncanonical, missing];
 
     #[cfg(unix)]
     {
-        let symlink = directory.file("tally-symlink");
-        std::os::unix::fs::symlink(&tally, &symlink).expect("symlink created");
+        let symlink_target = directory.file("symlink-target");
+        std::fs::create_dir(&symlink_target).expect("symlink target directory created");
+        std::fs::write(symlink_target.join("outbound-tally"), "")
+            .expect("symlink target tally created");
+        let symlink = directory.file("directory-symlink");
+        std::os::unix::fs::symlink(&symlink_target, &symlink).expect("symlink created");
         invalid.push(symlink);
-        let hardlink = directory.file("tally-hardlink");
-        std::fs::hard_link(&tally, &hardlink).expect("hard link created");
-        invalid.push(hardlink);
+
+        let hard_directory = directory.file("hard-directory");
+        std::fs::create_dir(&hard_directory).expect("hard-link directory created");
+        let target = directory.file("hard-target");
+        std::fs::write(&target, "").expect("hard-link target created");
+        std::fs::hard_link(&target, hard_directory.join("outbound-tally"))
+            .expect("hard link created");
+        invalid.push(hard_directory);
     }
 
     for path in invalid {
-        let Err(error) = try_gateway(RecordingTransport::answering(&time), &time, &path) else {
+        let Err(error) = build(&path) else {
             panic!("path alias was accepted: {}", path.display());
         };
         assert!(
-            error.to_string().contains(&path.display().to_string()),
+            error.to_string().contains("outbound-tally")
+                || error.to_string().contains(&path.display().to_string()),
             "{error}"
         );
     }
@@ -621,18 +668,227 @@ async fn invalid_path_spellings_and_aliases_are_refused_naming_the_path() {
 #[tokio::test]
 async fn a_corrupt_tally_is_refused_without_transport_and_names_the_path() {
     let directory = TempDir::create("corrupt");
-    let tally = directory.file("tally");
+    let tally = directory.file("outbound-tally");
     std::fs::write(&tally, "not a tally\n").expect("corrupt tally written");
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
     let transport = RecordingTransport::answering(&time);
     let gateway = gateway(transport.clone(), &time, &tally);
 
     let refused = gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("corrupt tally refuses");
     assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
     assert!(refused.to_string().contains(&tally.display().to_string()));
+    assert!(transport.sent().is_empty());
+}
+#[tokio::test]
+async fn a_v1_tally_is_refused_with_a_recreation_remedy() {
+    let directory = TempDir::create("v1-refused");
+    let tally = directory.file("outbound-tally");
+    std::fs::write(
+        &tally,
+        "iaam-outbound-tally-v1\nhost\thttps://invest-public-api.tbank.ru/rest\t1\t1\t1\t-\n",
+    )
+    .expect("v1 tally written");
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    let refused = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("v1 tally cannot prove a rolling day");
+    let message = refused.to_string();
+
+    assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
+    assert!(message.contains("v1"), "{message}");
+    assert!(message.contains("recreate"), "{message}");
+    assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
+async fn a_broker_budget_cannot_be_selected_independently_of_the_request_path() {
+    let directory = TempDir::create("request-budget");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    let request = HttpRequest::post(
+        Destination::TinkoffProd,
+        "/tinkoff.public.invest.api.contract.v1.UsersService/Invented",
+        RequestBody::Json("{}".to_owned()),
+    )
+    .with_request_allowance(RequestAllowance::new(u32::MAX));
+    let refused = gateway
+        .send(&request, None)
+        .await
+        .expect_err("an unmapped broker path has no caller-selected budget");
+
+    assert!(matches!(refused, GatewayError::UnknownBudget { .. }));
+    assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
+async fn caller_cancellation_does_not_cancel_status_commit() {
+    let directory = TempDir::create("caller-cancel");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let first_arrived = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let transport = HoldingTransport {
+        sent: Arc::clone(&sent),
+        first_arrived: Arc::clone(&first_arrived),
+        release_first: Arc::clone(&release_first),
+    };
+    let gateway = Arc::new(gateway(transport, &time, &tally));
+    let arrived = first_arrived.notified();
+    let task_gateway = Arc::clone(&gateway);
+    let caller = tokio::spawn(async move { task_gateway.send(&operations(), None).await });
+
+    arrived.await;
+    caller.abort();
+    release_first.notify_one();
+
+    let refused = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the detached 429 status pauses the next caller");
+    assert!(matches!(refused, GatewayError::BrokerHostPaused { .. }));
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_transport_panic_leaves_a_durable_unresolved_attempt() {
+    let directory = TempDir::create("panic-pending");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let gateway = gateway(
+        PanickingTransport {
+            sent: Arc::clone(&sent),
+        },
+        &time,
+        &tally,
+    );
+
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("transport task panic is reported");
+    assert!(matches!(first, GatewayError::TallyUnavailable { .. }));
+
+    let second = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the unresolved attempt closes the host");
+    assert!(
+        matches!(
+            second,
+            GatewayError::BrokerHostClosed {
+                reason: "an earlier request has no committed status",
+                ..
+            }
+        ),
+        "{second:?}"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_tally_commit_failure_latches_until_a_pause_is_persisted() {
+    let directory = TempDir::create("commit-latch");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let gateway = gateway(
+        BreakTallyTransport {
+            sent: Arc::clone(&sent),
+            directory: directory.path.clone(),
+        },
+        &time,
+        &tally,
+    );
+
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("status commit fails");
+    assert!(matches!(first, GatewayError::TallyUnavailable { .. }));
+    std::fs::remove_dir(directory.file("outbound-tally.tmp"))
+        .expect("temporary obstruction removed");
+
+    let second = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the in-memory latch first persists a pause");
+    assert!(
+        matches!(second, GatewayError::BrokerHostClosed { .. }),
+        "{second:?}"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn pending_attempt_child() {
+    let Some(directory) = std::env::var_os("IAAM_PENDING_CHILD_DIRECTORY") else {
+        return;
+    };
+    let ready = PathBuf::from(
+        std::env::var_os("IAAM_PENDING_CHILD_READY").expect("child ready path configured"),
+    );
+    let tally = PathBuf::from(directory).join("outbound-tally");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime");
+    runtime.block_on(async {
+        let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        let gateway = gateway(ProcessHoldingTransport { ready }, &time, &tally);
+        let _ = gateway.send(&operations(), None).await;
+    });
+}
+
+#[tokio::test]
+async fn process_death_leaves_the_pending_attempt_closed_for_ninety_seconds() {
+    let directory = TempDir::create("process-death");
+    let tally = empty_tally(&directory);
+    let ready = directory.file("pending-ready");
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "pending_attempt_child", "--nocapture"])
+        .env("IAAM_PENDING_CHILD_DIRECTORY", &directory.path)
+        .env("IAAM_PENDING_CHILD_READY", &ready)
+        .spawn()
+        .expect("pending child started");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "pending child did not hand off");
+        assert_eq!(child.try_wait().expect("child status"), None);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    child.kill().expect("pending child killed");
+    child.wait().expect("pending child reaped");
+
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+    let refused = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the killed attempt remains unresolved");
+    assert!(
+        matches!(
+            refused,
+            GatewayError::BrokerHostClosed {
+                reason: "an earlier request has no committed status",
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(90)
+        ),
+        "{refused:?}"
+    );
     assert!(transport.sent().is_empty());
 }
 
@@ -652,7 +908,7 @@ fn endpoint_owner_child() {
         let gateway = gateway(transport.clone(), &time, &tally);
 
         let owned = gateway
-            .send("OperationsService", &operations(), None)
+            .send(&operations(), None)
             .await
             .expect_err("parent owns T-Invest production");
         let message = owned.to_string();
@@ -669,7 +925,7 @@ fn endpoint_owner_child() {
         );
 
         gateway
-            .send("AuthService.Sessions", &finam_session(), None)
+            .send(&finam_session(), None)
             .await
             .expect("Finam remains available to the child process");
         assert_eq!(
@@ -691,7 +947,7 @@ async fn another_process_is_refused_for_owned_endpoint_but_can_use_another() {
     let transport = RecordingTransport::answering(&time);
     let gateway = gateway(transport, &time, &tally);
     gateway
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect("parent acquires T-Invest production");
 
@@ -724,12 +980,11 @@ async fn egress_switch_applies_only_to_broker_destinations() {
     .expect("budgets valid");
 
     let refused = off
-        .send("OperationsService", &operations(), None)
+        .send(&operations(), None)
         .await
         .expect_err("broker egress is off");
     assert!(matches!(refused, GatewayError::BrokerEgressOff));
     off.send(
-        "market",
         &HttpRequest::get(Destination::MoexIss, "/iss/history.json"),
         None,
     )

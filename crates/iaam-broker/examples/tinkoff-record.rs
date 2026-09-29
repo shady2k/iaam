@@ -83,7 +83,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let accounts = fetch_raw(
         &gateway,
         Destination::TinkoffSandbox,
-        "UsersService",
         ACCOUNTS_METHOD,
         token.expose(),
         json!({"status": "ACCOUNT_STATUS_OPEN"}),
@@ -95,7 +94,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let portfolio = fetch_raw(
         &gateway,
         Destination::TinkoffSandbox,
-        "OperationsService",
         PORTFOLIO_METHOD,
         token.expose(),
         json!({"accountId": account_id.as_str()}),
@@ -106,7 +104,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let operations = fetch_raw(
         &gateway,
         Destination::TinkoffSandbox,
-        "OperationsService",
         OPERATIONS_METHOD,
         token.expose(),
         json!({
@@ -171,7 +168,6 @@ fn interval(days: u64) -> Result<(String, String), io::Error> {
 async fn fetch_raw(
     gateway: &Gateway<HttpClient>,
     destination: Destination,
-    service: &'static str,
     method: &str,
     token: &str,
     body: Value,
@@ -185,7 +181,7 @@ async fn fetch_raw(
     .idempotent()
     .with_bearer(token)
     .with_reset_header("x-ratelimit-reset");
-    match gateway.send(service, &request, None).await {
+    match gateway.send(&request, None).await {
         Ok(response) => Ok(response.body),
         // The refusal body is written neither to a file nor to the error: the
         // gateway is not required to separate diagnostics from owner data.

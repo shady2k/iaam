@@ -691,15 +691,16 @@ mod tests {
             .expect("token round trip")
     }
 
-    fn broker_egress() -> BrokerEgress {
+    fn broker_egress_directory() -> std::path::PathBuf {
         static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let tally = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "iaam-app-finam-test-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::write(&tally, "").expect("empty tally created");
-        BrokerEgress::On { tally }
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+        directory
     }
 
     fn dictionary() -> OperationKindDictionary {
@@ -1461,8 +1462,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_request_still_running_at_the_deadline_is_dropped() {
-        let gateway: Arc<dyn Outbound> =
-            Arc::new(Gateway::new(Parked, broker_egress()).expect("the budget table is valid"));
+        let directory = broker_egress_directory();
+        let gateway: Arc<dyn Outbound> = Arc::new(
+            Gateway::new_in_directory(Parked, BrokerEgress::On, &directory)
+                .expect("the budget table is valid"),
+        );
         let channel = channel(gateway);
         let deadline = Instant::now() + Duration::from_secs(15 * 60);
 

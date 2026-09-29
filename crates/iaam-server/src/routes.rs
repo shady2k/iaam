@@ -1705,7 +1705,7 @@ pub async fn preview_category_rules_batch_route(
         (status = 400, description = "Request body could not be read", body = ApiError),
         (status = 413, description = "Request body exceeds the limit", body = ApiError),
         (status = 415, description = "Body sent without Content-Type: application/json", body = ApiError),
-        (status = 422, description = "Request could not be read", body = ApiError)
+        (status = 422, description = "The request could not be read, or the sync reached its 300 transport-attempt ceiling (code `sync_request_ceiling`): the range is too long for one sync; narrow it and sync again; nothing was written", body = ApiError)
     ),
     security(("bearer" = []))
 )]

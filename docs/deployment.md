@@ -59,45 +59,116 @@ Three rules follow, and they hold for every step below.
   first owner token exactly once. There is no one-time claim code and no
   `POST /v1/claim`; both were retired with ADR-0003.
 
-### 1.1 One server process per instance
+### 1.1 One server process and one owner per broker endpoint
 
 An instance runs **exactly one `iaam serve`** against its database. Not two
 behind a load balancer, not a second one started beside the first "to test",
 not a blue-green overlap where the old one keeps serving while the new one
-starts.
+starts. The claim that permits only one broker sync per account at a time is
+in-process state (`crates/iaam-app/src/scenarios/sync.rs`, `RunningSyncs`), so a
+second server could sync the same account concurrently.
 
-Everything that keeps this instance polite to the brokers, MOEX and the CBR
-lives in the memory of that one process, in its outbound gateway
-(`crates/iaam-http/src/gateway.rs`):
+The outbound gateway also keeps its MOEX and CBR lanes, named waits and circuit
+breakers in the server process. They do not cross a restart.
 
-- the **budget** per destination and method, half of the limit the source
-  documents where it documents one;
-- the **lane** that allows one request in flight per host;
-- a **named wait** — a reset time the source itself asked for in
-  `Retry-After` or its reset header — which holds back every later call to
-  that host until it ends;
-- the **circuit breaker** per host, which stops calling a source that keeps
-  failing.
+Broker traffic has a stronger rule: **one process owns each broker endpoint**.
+The first request to T-Invest production, T-Invest sandbox or Finam acquires
+`tinkoff-prod.owner`, `tinkoff-sandbox.owner` or `finam.owner` in the compiled
+egress directory, and holds that lock for the gateway's lifetime. A second
+process asking for that endpoint is refused before transport; the reason names
+the endpoint and tells the operator to use or stop the owning process. It may
+still own and use another endpoint.
+This makes accidental concurrent servers observable instead of trying to share
+one broker allowance between them.
 
-The claim that lets only one broker sync run per account at a time lives there
-too (`crates/iaam-app/src/scenarios/sync.rs`, `RunningSyncs`).
+Within an owned endpoint, the gateway allows one request in flight. The HTTP
+client follows no redirect and performs no retry below the gateway. It commits
+the reservation at transport handoff, then records the status line and a
+Retry-After clamped to one day before consuming the body. The method, rolling
+day and one-second spacing timestamps all move to the later of the original
+decision and the handoff or status commit; delayed handoff cannot age an
+allowance before a byte is sent. The next request cannot decide before that
+record exists. If the detached transport/status task panics, its lane records
+that failure before unlocking; the next lane holder durably closes the endpoint
+for one hour before deciding, even when the status line was already recorded.
+The shared `outbound-tally.lock` is held only for a tally transaction; the boot clock is
+sampled while this lock is held, and waits and HTTP requests do not hold it. The
+tally preserves:
 
-None of this is shared between processes, and none of it survives a restart. A
-second process starts with a full budget of its own, a lane of its own, no
-knowledge of a wait the broker named to the first, and no knowledge of the sync
-the first is running. Two processes are two allowances against the same broker
-token: together they spend the whole documented limit, which leaves no margin,
-and a third exceeds it. They can also sync one account twice at the same time.
+- the per-method minute budgets from the gateway table;
+- at least one second between sends to the same broker host;
+- at most 1,000 sends per endpoint in any rolling 24-hour interval;
+- recent permanent broker refusals and their 30-minute host closure;
+- broker `429` pauses of at least 60 seconds and the 30-minute closure after a
+  second `429` in ten minutes.
 
-Only `serve` talks to an outside source. The administrative commands in the
-table above (`claim`, `token issue`, `broker key …`, `broker access …`,
-`bundle export`, `bundle import`) open the database and nothing else: `serve`
-is the one place in `crates/iaam-bootstrap/src/main.rs` that builds the
-gateway, and `scripts/check-architecture.sh` (guard 11b) refuses a second one.
-At run time `Gateway::production()` refuses every call after the first in one
-process, with an error naming this section.
-So running an administrative command beside the running service is safe, and
-is how §6 and §7 are meant to be done.
+The persisted time source is Linux boot identity plus `CLOCK_BOOTTIME`, not
+wall time. Wall-clock steps therefore cannot shorten a pause, closure, spacing
+window or rolling daily window. After a boot identity change, iaam cannot know
+how much suspended time elapsed before the reboot: every active pause restarts
+for its stored duration; every closure restarts from its persisted reason
+(30 minutes for repeated broker refusals or rate limits, one hour for an
+unresolved attempt); old request histories restart from the new boot; and the
+first send to each endpoint waits 60 seconds.
+
+The gateway opens the compiled directory `/var/lib/iaam/egress` when broker
+egress is enabled and keeps that directory descriptor for its lifetime. Its
+`outbound-tally`, `outbound-tally-generation`, lock, owner and temporary records
+are opened relative to the descriptor without following symlinks, then checked
+again by device and inode. The tally and its separate generation record advance
+together; an emptied tally or a generation mismatch refuses operation instead
+of accepting truncation or rollback. A missing, unreadable, replaced,
+symlinked, hard-linked or corrupt record refuses broker operation; there is no
+in-memory allowance fallback.
+
+Run the executable ceiling proof before enabling broker egress:
+
+```console
+$ make ceiling-proof
+```
+
+The proof sends through the production gateway and HTTP client to loopback TCP
+servers, one endpoint at a time. The receiver records completed request headers,
+so the table is derived from wire arrivals rather than gateway counters.
+`sec(logical)` is checked for every row from the injected boot clock.
+`sec(wire)` is measured with a dedicated real-time spacing run for every
+endpoint; other rows say `wire-row` and rely on that endpoint's named spacing
+row instead of presenting logical time as wire time. The remaining duration
+columns are `reached/ceiling` from the injected boot clock sampled when each
+request reaches the receiver. `minute(method)` names the endpoint-method pair
+whose rolling 60-second window was largest. Unknown or near-miss paths are
+refused before transport. `closure` and `pause` must both be `0/0`; `attempts`
+includes retries and Finam session exchanges.
+
+The command also exercises the real T-Invest and Finam sync loops; retry and
+response-body failures; redirect policy; exact Retry-After, 30-minute closure,
+90-second unresolved-send and rolling 24-hour boundaries; concurrent callers;
+caller cancellation, deadline expiry, a panic after the status line, a killed
+child, and a durable status-commit failure; a clock advance between reservation
+and transport handoff; boot identity changes; tally persistence across owner
+rebuilds; egress-off; path aliases; and two-process ownership. The process rows
+are reconstructed from the loopback receiver's actual wire-arrival records.
+The two child processes deliberately disagree in an irrelevant environment
+variable while receiving the same egress directory, proving that filesystem
+identity, not process-local environment, coordinates ownership.
+
+There is deliberately no fake wall-clock-step row. The production
+`Clock`/`SystemClock` used for persisted ceilings exposes only in-process
+monotonic time and Linux boot time; it has no wall-clock read to step. The proof
+does change the boot identity and checks the conservative reset behavior.
+
+The proof deliberately does not contact live brokers or test TLS, proxies,
+network filesystems, separate machines, container mount namespaces, or a
+hostile process modifying the tally. The loopback fixture speaks HTTP/1.1 on
+Linux. Its real-time spacing rows observe the host scheduler; longer accounting
+windows are advanced by the injected boot clock so the check remains bounded
+and deterministic.
+
+Administrative commands (`claim`, `token issue`, `broker key …`,
+`broker access …`, `bundle export`, `bundle import`) open the database and do
+not contact a source. The two broker examples and the ignored live sandbox
+test do contact brokers and consequently use the same egress switch, endpoint
+ownership and tally as `serve`.
 
 ```console
 $ pgrep -c -x iaam
@@ -105,11 +176,9 @@ $ pgrep -c -x iaam
 ```
 
 More than `1` while no administrative command is running means a second server.
-Stop it before the next sync. A restart does not break the rule, but it drops
-every budget, named wait and open breaker the old process had learned, so do
-not restart the service to "clear" a `source_unavailable`: it removes the one
-thing that kept the next call from reaching a source that asked to be left
-alone.
+Stop it before the next sync. Restarting does not clear the broker tally and
+must not be used to evade a `source_unavailable`; in-process named waits and
+open breakers are still lost on restart.
 
 ---
 
@@ -121,6 +190,8 @@ alone.
 |---|---|---|---|
 | `IAAM_DATABASE` | **required** | none — every subcommand refuses without it | every subcommand, including `serve` |
 | `IAAM_BROKER_KEY_FILE` | path to a secret | none | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
+| `IAAM_BROKER_EGRESS` | `off` or `on` | `off` | `serve`, broker examples, ignored live sandbox test |
+| `/var/lib/iaam/egress` | compiled persistent state directory, required when broker egress is `on` | fixed path | `serve`, broker examples, ignored live sandbox test |
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
 | `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
 | `IAAM_RATE_WINDOW_SECONDS` | optional | `60` | `serve` |
@@ -135,6 +206,64 @@ decrypts — answer `{"code":"not_configured", …}` on a server started without
 and the fix is a restart with the key, not a different call.
 `GET /v1/broker-access` is not one of them: it lists metadata, decrypts nothing,
 and answers `200` with or without the key (§6.2).
+
+`IAAM_BROKER_EGRESS` is a fail-closed deployment switch. Unset and `off` both
+refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
+or network is touched. `on` requires the compiled directory
+`/var/lib/iaam/egress`; there is no environment-variable path override.
+
+Create the directory and its two existing tally records before startup:
+
+```console
+$ install -d -m 0700 /var/lib/iaam/egress
+$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally
+$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally-generation
+$ export IAAM_BROKER_EGRESS=on
+```
+
+Every iaam process on the machine that may contact a broker must see that exact
+persistent mount and run as an OS user able to read, write and sync both tally
+records; create and lock its lock and three endpoint-owner records; create its
+temporary records; atomically rename within the directory; and sync the
+directory. A container must bind the same host directory at
+`/var/lib/iaam/egress`; a container-private directory or a different host path
+creates a separate owner and tally domain and is not safe. Processes on
+different machines do not share this coordination. Network filesystems and
+cross-machine tally sharing are outside the proof.
+
+Both tally records must already exist. A pair of empty records is accepted only
+as a conservative recovery state: on first use iaam records 1,000 attempts at
+the current time for **each** broker endpoint, so every broker endpoint remains
+at its rolling-day ceiling for 24 hours. This is deliberate; an empty pair
+cannot prove that an earlier tally was unused. Only the current
+`iaam-outbound-tally-v4` format is accepted; no older format was deployed, so
+any older header is corruption, not a migration source. The two records carry
+the same generation. A process also remembers the highest matching generation
+it has read and refuses a later matching pair below that high-water mark, even
+if both files were rolled back together. Leftover temporary files are ignored;
+only the last complete tally and matching generation are read.
+
+Do not copy, alias, replace, delete or truncate a live egress directory or any
+record in it. The process verifies the path and held inodes before each
+transaction. A reservation becomes pending before network I/O and is cleared
+only after the response status is durably committed. Cancellation, deadline,
+transport failure or panic moves the reservation to the observation time before
+clearing it and closes the endpoint for the request timeout plus the mandatory
+60-second rate-limit pause: 90 seconds. Pruning retains the timestamps that
+belong to a pending attempt. Process death leaves the pending marker in place;
+a new owner that adopts it reinserts any timestamps lost by an older pruner at
+its own acquisition time and closes that endpoint for a full hour from
+adoption. Other endpoint activity and the original handoff's age do not shorten
+that closure.
+
+Operational repair is a controlled stop: stop every process using the mount and
+repair both records as one matched pair. If no trustworthy matched pair exists,
+empty both records together, start one process, and expect the documented
+24-hour daily-ceiling refusal on every broker endpoint. After that interval,
+run `make ceiling-proof` before restoring traffic. Never restore just one
+record or bypass the conservative interval by editing timestamps or generation
+numbers.
+
 
 `IAAM_SOURCE_PROFILES` names a directory of **source profiles** — reviewed JSON
 files describing one institution's export, which the server reads a document
@@ -960,8 +1089,8 @@ supplies what is missing and with which command.
 | `{"code":"unauthorized", …}` (401) | header missing, or the token is unknown or revoked | §7.1 for an agent token; §7.3 for an owner token |
 | `{"code":"not_configured","message":"broker access encryption is not configured: …"}` (503) | the server was started without `IAAM_BROKER_KEY_FILE` | restart it with the key mounted: §6.2 |
 | `{"code":"not_configured","message":"broker access is not configured"}` (503) | same code, different fact: no active access for that broker and environment | the owner, at a console: `iaam broker access add` (§6.3). A restart changes nothing |
-| `{"code":"source_unavailable", …}` (503, with `Retry-After` when the wait is known) | an outside source — the broker on `POST /v1/brokers/{broker}/sync`, MOEX or the CBR on `POST /v1/market/sync` — could not be reached for now. One of: it kept failing transiently (429, 500, 502, 503, 504, network, timeout) through the gateway's retries; its breaker is open after five calls in a row failed that way, and the call was not sent; it named a wait (`Retry-After` or its reset header) longer than the gateway holds a call (15 minutes), or longer than the call's own deadline allowed; or a broker sync reached its 15-minute deadline. The deadline bounds the sync's contact with the broker: an attempt still in flight at that moment, and a wait for the host's lane, for a budget, for a named reset or for a backoff, all end there. It does not bound the local work after both answers are in: writing them to the journal runs to its end. Nothing was written: a broker sync fetches the operations and the portfolio before its first write, and a market sync records no observation (its run is closed as partial) | wait what `Retry-After` says, then sync again. A repeat inside a wait the source named does not reach it: the gateway holds it until the wait ends, or refuses it at once with this same code when the wait outlasts its deadline or 15 minutes. A repeat inside an open breaker's cool-down (up to 5 minutes) is refused the same way without being sent. Otherwise `Retry-After` is the gateway's own backoff, and a repeat before it **is** sent, paced only by the budget. A restart forgets every wait and breaker (§1.1) |
-| `{"code":"source_refused", …}` (502) | the source answered with a status the gateway does not retry — any failure other than 429, 500, 502, 503 and 504 — so it was sent once: for a broker, e.g. 401 or 403 for a revoked or wrong token; for a market source, e.g. 404 for a security or path it does not know. No fact and no observation was written | broker: check the access, `iaam broker access` (§6.3); market source: check what the request names. Retrying unchanged gets the same answer |
+| `{"code":"source_unavailable", …}` (503, with `Retry-After` when the wait is known) | an outside source — the broker on `POST /v1/brokers/{broker}/sync`, MOEX or the CBR on `POST /v1/market/sync` — could not be reached for now. A broker `429` immediately persists a host pause of at least 60 seconds; a second within ten minutes closes that host for 30 minutes. Three other broker `4xx` responses within ten minutes also close it for 30 minutes. A broker `5xx`, network failure or timeout gets at most three attempts per call; market sources retain five. The in-process breaker opens after five whole calls fail transiently, and a call during its cool-down is not sent. A source may also name a wait longer than the gateway holds a call (15 minutes), a wait may outlast the call's own deadline, or a broker sync may reach its 15-minute deadline. The deadline bounds contact with the source, including an attempt in flight and every lane, budget, reset or backoff wait. It does not bound local work after both broker answers arrive. Nothing was written: a broker sync fetches operations and portfolio before its first write, and a market sync records no observation (its run is closed as partial) | wait what `Retry-After` says, then sync again. During a broker pause or closure, the tally refuses before a send; those states survive restart (§1.1). A repeat inside an in-process named wait or open breaker is likewise refused, but those are forgotten on restart. Otherwise `Retry-After` is the gateway's own backoff, and a repeat before it may be sent subject to its budgets |
+| `{"code":"source_refused", …}` (502) | the source answered with a status the gateway does not retry. For a broker, each `4xx` except `429` — for example 401 or 403 for a revoked or wrong token — is sent once and counted in the tally; after the third within ten minutes, later calls are `source_unavailable` until the 30-minute closure ends. For a market source, any failure other than 429, 500, 502, 503 and 504 is sent once. No fact and no observation was written | broker: check the access, `iaam broker access` (§6.3); market source: check what the request names. Retrying an unchanged refusal repeats it and can close a broker host |
 | `{"code":"invalid_request","message":"an owner token cannot be issued via the API: …"}` (422) | `scope: owner` requested over HTTP | by design; issue it at the console (§7.3) |
 | `Connection refused` from curl | nothing is listening at that address | container: `IAAM_LISTEN` left at the loopback default while publishing a port (§3.6). Host: `systemctl is-active iaam` |
 

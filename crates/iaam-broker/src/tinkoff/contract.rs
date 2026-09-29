@@ -173,6 +173,13 @@ enum OperationType {
             fn now(&self) -> Instant {
                 *self.0.lock().expect("clock")
             }
+
+            fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+                Ok(iaam_http::gateway::BootTime::new(
+                    "test-boot",
+                    Duration::ZERO,
+                ))
+            }
         }
         impl Sleeper for FakeTime {
             fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -198,12 +205,13 @@ enum OperationType {
             BUDGETS,
             Arc::clone(&time) as Arc<dyn Clock>,
             Arc::clone(&time) as Arc<dyn Sleeper>,
+            iaam_http::BrokerEgress::Off,
         )
         .expect("the documented table is valid");
 
         for _ in 0..2 {
             gateway
-                .send("operations.proto", &operation_types_request(), None)
+                .send(&operation_types_request(), None)
                 .await
                 .expect("the contract host has a budget");
         }

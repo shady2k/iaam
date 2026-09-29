@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Debug-only loopback fixtures. The crate root rejects this feature whenever
+# debug assertions are disabled.
+test-support = []
+
 [dependencies]
 # Единственное место в дереве, где объявлен HTTP-клиент. rustls без
 # встроенных корней там, где якорь задан явно; веб-корни там, где узел
@@ -28,6 +33,11 @@ tokio = { version = "1", features = ["sync", "time"] }
 # operator watching a slow synchronisation must tell a budget wait from an
 # open breaker. The same facade the rest of the tree logs through.
 tracing = "0.1"
+# Cross-process request accounting must lock one machine-local file. `fs2`
+# provides the portable exclusive lock on the workspace's Rust 1.85 MSRV.
+fs2 = "0.4"
+# Safe access to Linux CLOCK_BOOTTIME, which advances while suspended.
+rustix = { version = "1", features = ["fs", "time"] }
 
 [dev-dependencies]
 # `test-util` pauses the tokio timer, so the production sleeper is checked
@@ -36,6 +46,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 sha2 = "0.11"
 # Captures the gateway's events in a test, to prove what they carry.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+# Self dependency so integration tests compile the same feature-gated loopback
+# harness that downstream acceptance tests reuse.
+iaam-http = { path = ".", version = "0.1.0", features = ["test-support"] }
 
 [lints]
 workspace = true

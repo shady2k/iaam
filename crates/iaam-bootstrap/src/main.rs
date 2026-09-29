@@ -20,7 +20,7 @@ use iaam_app::ports::{
 };
 use iaam_broker::credentials::Key;
 use iaam_broker::environment::Environment;
-use iaam_http::Gateway;
+use iaam_http::{BrokerEgress, Gateway};
 use iaam_server::rate_limit::RateLimiter;
 use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
@@ -415,10 +415,11 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         .map(read_broker_key)
         .transpose()?;
     let market_store = SqliteStore::open(&config.database)?;
-    // The one gateway of the process: its budgets, lanes and breakers are
-    // state, and a second one would be a second allowance against the same
-    // destinations. Every adapter that goes outside is handed this one.
-    let gateway = Arc::new(Gateway::production()?);
+    // The one gateway of the process. Each broker endpoint is owned by one
+    // process for this gateway's lifetime; boot-clock budgets, spacing and the
+    // rolling 24-hour ceiling persist in the configured outbound tally.
+    let broker_egress = BrokerEgress::from_env()?;
+    let gateway = Arc::new(Gateway::production(broker_egress)?);
     let http = Arc::new(HttpOutbound::new(gateway.clone()));
 
     // Assembled once, here, because the catalogue belongs to the deployment.

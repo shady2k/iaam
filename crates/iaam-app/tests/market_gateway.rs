@@ -41,6 +41,13 @@ impl Clock for FakeTime {
     fn now(&self) -> Instant {
         *self.now.lock().expect("clock")
     }
+
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        Ok(iaam_http::gateway::BootTime::new(
+            "test-boot",
+            Duration::ZERO,
+        ))
+    }
 }
 
 impl Sleeper for FakeTime {
@@ -101,6 +108,7 @@ fn adapter(time: &Arc<FakeTime>, endpoint: Scripted) -> (HttpOutbound, Arc<Mutex
         BUDGETS,
         Arc::clone(time) as Arc<dyn Clock>,
         Arc::clone(time) as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::Off,
     )
     .expect("the documented table is valid");
     (HttpOutbound::new(Arc::new(gateway)), sent)

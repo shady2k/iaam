@@ -25,7 +25,7 @@ use time::{Duration, OffsetDateTime};
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open};
 use iaam_broker::environment::Environment;
 use iaam_http::client::HttpClient;
-use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, RequestBody};
+use iaam_http::{BrokerEgress, Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 use iaam_store::SqliteStore;
 use iaam_store::broker_access::SoleOwner;
 use iaam_store::documents::BrokerCode;
@@ -74,15 +74,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
-    // A separate process, so a gateway of its own.
-    let gateway = Gateway::production()?;
+    // The recorder must acquire the sandbox endpoint for its lifetime and
+    // records every send in the same canonical tally as the server and probes.
+    let gateway = Gateway::production(BrokerEgress::from_env()?)?;
 
     // Request only open accounts: a closed account is unsuitable for the
     // following calls and would make the sample set non-deterministic.
     let accounts = fetch_raw(
         &gateway,
         Destination::TinkoffSandbox,
-        "UsersService",
         ACCOUNTS_METHOD,
         token.expose(),
         json!({"status": "ACCOUNT_STATUS_OPEN"}),
@@ -94,7 +94,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let portfolio = fetch_raw(
         &gateway,
         Destination::TinkoffSandbox,
-        "OperationsService",
         PORTFOLIO_METHOD,
         token.expose(),
         json!({"accountId": account_id.as_str()}),
@@ -105,7 +104,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let operations = fetch_raw(
         &gateway,
         Destination::TinkoffSandbox,
-        "OperationsService",
         OPERATIONS_METHOD,
         token.expose(),
         json!({
@@ -170,7 +168,6 @@ fn interval(days: u64) -> Result<(String, String), io::Error> {
 async fn fetch_raw(
     gateway: &Gateway<HttpClient>,
     destination: Destination,
-    service: &'static str,
     method: &str,
     token: &str,
     body: Value,
@@ -184,7 +181,7 @@ async fn fetch_raw(
     .idempotent()
     .with_bearer(token)
     .with_reset_header("x-ratelimit-reset");
-    match gateway.send(service, &request, None).await {
+    match gateway.send(&request, None).await {
         Ok(response) => Ok(response.body),
         // The refusal body is written neither to a file nor to the error: the
         // gateway is not required to separate diagnostics from owner data.

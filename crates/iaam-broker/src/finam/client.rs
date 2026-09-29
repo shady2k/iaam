@@ -4,18 +4,13 @@ use std::time::{Duration, Instant};
 
 use crate::credentials::BrokerToken;
 use iaam_http::gateway::{Clock, SystemClock};
-use iaam_http::{Destination, GatewayError, HttpRequest, Outbound, RequestBody, Secret};
+use iaam_http::{
+    Destination, GatewayError, HttpRequest, Outbound, RequestAllowance, RequestBody, Secret,
+};
 use serde_json::Value;
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time};
-
-/// Budget key of `AccountsService/GetAccount`. Finam states its limit per
-/// method, so each method draws on a budget of its own.
-const GET_ACCOUNT: &str = "AccountsService.GetAccount";
-
-/// Budget key of `AccountsService/Transactions`.
-const TRANSACTIONS: &str = "AccountsService.Transactions";
 
 /// The limit one transactions request names (`TransactionsRequest.limit`
 /// in the published contract). The contract publishes no maximum and no
@@ -24,14 +19,6 @@ const TRANSACTIONS: &str = "AccountsService.Transactions";
 /// answer stays under the limit, and only a single day that still
 /// reaches it is refused — never silently truncated.
 const TRANSACTIONS_LIMIT: i32 = 1_000;
-
-/// Budget key of the session methods: the exchange of the secret for a
-/// session token (`POST /v1/sessions`) and the details of that token
-/// (`POST /v1/sessions/details`, `TokenDetails` in Finam's REST docs). One
-/// row budgets both: Finam documents 200 requests a minute for each
-/// method, and the row grants the conservative half of that to the two of
-/// them together.
-const SESSIONS: &str = "AuthService.Sessions";
 
 /// What Finam answers with when it names no other lifetime (it names none
 /// today): the portal's FAQ states a session token lives 15 minutes
@@ -52,9 +39,6 @@ pub enum FinamError {
     /// network: retrying meets the same fault.
     #[error("the transport to Finam could not be built: {reason}")]
     TransportNotBuilt { reason: String },
-    /// Finam kept answering 429 through every retry.
-    #[error("Finam gateway rate-limited the request; retry after {retry_after:?}")]
-    RateLimited { retry_after: Duration },
     /// Finam kept failing transiently, or the circuit to it is open; the same
     /// request may succeed after `retry_after`.
     #[error(
@@ -73,6 +57,23 @@ pub enum FinamError {
     /// no row for Finam, which is a fault of this build, not of the request.
     #[error("the outbound gateway refused the Finam call: {reason}")]
     Gateway { reason: String },
+    /// The process-level egress switch or per-machine tally refused before
+    /// the transport. This is operational configuration, not an adapter bug.
+    #[error("the Finam request cannot leave this machine: {reason}")]
+    EgressRefused {
+        reason: String,
+        retry_after: Option<Duration>,
+    },
+    /// This sync has spent every request attempt it is allowed.
+    #[error(
+        "Finam request ceiling of {ceiling} attempts reached; the range is too long for one sync; narrow it and sync again"
+    )]
+    RequestCeiling { ceiling: u32 },
+    /// The account id cannot be represented as one canonical API path segment.
+    #[error(
+        "Finam account id cannot be used in the account endpoint path; use a non-empty id other than . or .. without /, \\, %, ?, or #"
+    )]
+    InvalidAccountId,
     /// A single day's transactions answer reached the request's limit, and
     /// a single day cannot be split further: whether more transactions lie
     /// past the page cannot be proven from the wire, so the interval is
@@ -147,9 +148,13 @@ impl FinamClient {
     }
 
     /// Return the raw body of the account's current portfolio.
-    pub async fn get_portfolio(&self, account_id: &str) -> Result<String, FinamError> {
-        self.get(GET_ACCOUNT, format!("/v1/accounts/{account_id}"), &[])
-            .await
+    pub async fn get_portfolio(
+        &self,
+        account_id: &str,
+        allowance: &RequestAllowance,
+    ) -> Result<String, FinamError> {
+        validate_account_id(account_id)?;
+        self.get_account(account_id, "", &[], allowance).await
     }
 
     /// Return the raw body of the account's transactions for a whole
@@ -174,8 +179,12 @@ impl FinamClient {
         account_id: &str,
         from: Date,
         to: Date,
+        allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
-        let transactions = self.transactions_interval(account_id, from, to).await?;
+        validate_account_id(account_id)?;
+        let transactions = self
+            .transactions_interval(account_id, from, to, allowance)
+            .await?;
         Ok(serde_json::json!({ "transactions": transactions }).to_string())
     }
 
@@ -192,12 +201,15 @@ impl FinamClient {
         account_id: &'a str,
         from: Date,
         to: Date,
+        allowance: &'a RequestAllowance,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, FinamError>> + Send + 'a>> {
         Box::pin(async move {
             if from > to {
                 return Ok(Vec::new());
             }
-            let transactions = self.transactions_page(account_id, from, to).await?;
+            let transactions = self
+                .transactions_page(account_id, from, to, allowance)
+                .await?;
             let limit = usize::try_from(self.transactions_limit).unwrap_or(usize::MAX);
             if transactions.len() < limit {
                 return Ok(transactions);
@@ -207,10 +219,12 @@ impl FinamClient {
                 return Err(FinamError::PartialResponse);
             }
             let middle = from + time::Duration::days(whole_days / 2);
-            let mut merged = self.transactions_interval(account_id, from, middle).await?;
+            let mut merged = self
+                .transactions_interval(account_id, from, middle, allowance)
+                .await?;
             let after_middle = middle.next_day().ok_or(FinamError::PartialResponse)?;
             let rest = self
-                .transactions_interval(account_id, after_middle, to)
+                .transactions_interval(account_id, after_middle, to, allowance)
                 .await?;
             merged.extend(rest);
             Ok(merged)
@@ -228,6 +242,7 @@ impl FinamClient {
         account_id: &str,
         from: Date,
         to: Date,
+        allowance: &RequestAllowance,
     ) -> Result<Vec<Value>, FinamError> {
         // An unrepresentable day after `to` has no whole instant range to
         // name; the interval cannot be proven complete, and is refused.
@@ -238,11 +253,7 @@ impl FinamClient {
             ("limit", self.transactions_limit.to_string()),
         ];
         let body = self
-            .get(
-                TRANSACTIONS,
-                format!("/v1/accounts/{account_id}/transactions"),
-                &query,
-            )
+            .get_account(account_id, "/transactions", &query, allowance)
             .await?;
         let value: Value =
             serde_json::from_str(&body).map_err(|_| FinamError::MalformedResponse)?;
@@ -254,9 +265,12 @@ impl FinamClient {
     }
 
     /// The account ids the access sees, from `POST /v1/sessions/details`.
-    pub async fn get_account_ids(&self) -> Result<Vec<String>, FinamError> {
+    pub async fn get_account_ids(
+        &self,
+        allowance: &RequestAllowance,
+    ) -> Result<Vec<String>, FinamError> {
         let (body, token) = self
-            .authorized(SESSIONS, |token| {
+            .authorized(allowance, |token| {
                 // The token rides the body only: the published contract gives
                 // this method no Authorization header, unlike the data
                 // methods. Reading twice changes nothing.
@@ -265,6 +279,7 @@ impl FinamClient {
                     "/v1/sessions/details",
                     RequestBody::Json(serde_json::json!({ "token": token }).to_string()),
                 )
+                .with_request_allowance(allowance.clone())
                 .idempotent()
             })
             .await?;
@@ -293,15 +308,23 @@ impl FinamClient {
     }
 
     /// Send a reading call over the session token.
-    async fn get(
+    async fn get_account(
         &self,
-        method: &'static str,
-        path: String,
+        account_id: &str,
+        suffix: &str,
         query: &[(&str, String)],
+        allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
         let query = query.to_vec();
-        self.authorized(method, move |token| {
-            let mut request = HttpRequest::get(Destination::FinamApi, &path).with_bare_token(token);
+        self.authorized(allowance, move |token| {
+            let mut request = HttpRequest::get_with_encoded_path_segment(
+                Destination::FinamApi,
+                "/v1/accounts/",
+                account_id,
+                suffix,
+            )
+            .with_bare_token(token)
+            .with_request_allowance(allowance.clone());
             for (key, value) in &query {
                 request = request.with_query(key, value);
             }
@@ -317,19 +340,19 @@ impl FinamClient {
     /// finally carried it.
     async fn authorized(
         &self,
-        method: &'static str,
+        allowance: &RequestAllowance,
         build: impl Fn(&str) -> HttpRequest,
     ) -> Result<(String, Secret), FinamError> {
-        let session = self.session().await?;
-        let step = match self.raw(method, &build(session.token.expose())).await {
+        let session = self.session(allowance).await?;
+        let step = match self.raw(&build(session.token.expose())).await {
             Ok(body) => return Ok((body, session.token.clone())),
             Err(step) => step,
         };
         if !step.is_unauthorized() {
             return Err(step.into_error(self.token.expose(), Some(session.token.expose())));
         }
-        let fresh = self.renewed(&session).await?;
-        match self.raw(method, &build(fresh.token.expose())).await {
+        let fresh = self.renewed(&session, allowance).await?;
+        match self.raw(&build(fresh.token.expose())).await {
             Ok(body) => Ok((body, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
         }
@@ -340,7 +363,7 @@ impl FinamClient {
     /// exchange gate and looks once more before exchanging: of several
     /// simultaneous first calls, the first through the gate pays for the
     /// session and the rest reuse it.
-    async fn session(&self) -> Result<Session, FinamError> {
+    async fn session(&self, allowance: &RequestAllowance) -> Result<Session, FinamError> {
         if let Some(live) = self.live_session() {
             return Ok(live);
         }
@@ -348,7 +371,7 @@ impl FinamClient {
         if let Some(live) = self.live_session() {
             return Ok(live);
         }
-        let fresh = self.exchange().await?;
+        let fresh = self.exchange(allowance).await?;
         self.keep(fresh.clone());
         Ok(fresh)
     }
@@ -357,14 +380,18 @@ impl FinamClient {
     /// caller the refusal hit. The first through the gate exchanges; the
     /// rest find a live session that is not the refused one and carry it —
     /// a concurrent renewal has already replaced the token Finam rejected.
-    async fn renewed(&self, refused: &Session) -> Result<Session, FinamError> {
+    async fn renewed(
+        &self,
+        refused: &Session,
+        allowance: &RequestAllowance,
+    ) -> Result<Session, FinamError> {
         let _gate = self.exchanging.lock().await;
         if let Some(live) = self.live_session() {
             if live.token.expose() != refused.token.expose() {
                 return Ok(live);
             }
         }
-        let fresh = self.exchange().await?;
+        let fresh = self.exchange(allowance).await?;
         self.keep(fresh.clone());
         Ok(fresh)
     }
@@ -424,7 +451,7 @@ impl FinamClient {
     /// documented one until a details answer corrects it. Minting a
     /// session has no effect on the account, so the gateway may repeat it
     /// like any read.
-    async fn exchange(&self) -> Result<Session, FinamError> {
+    async fn exchange(&self, allowance: &RequestAllowance) -> Result<Session, FinamError> {
         // The anchor precedes the send: Finam creates the token between
         // the request and the answer, so measuring its life from the
         // request can only renew early, never late.
@@ -434,10 +461,11 @@ impl FinamClient {
             "/v1/sessions",
             RequestBody::Json(serde_json::json!({ "secret": self.token.expose() }).to_string()),
         )
-        .idempotent();
+        .idempotent()
+        .with_request_allowance(allowance.clone());
         let response = self
             .gateway
-            .send(SESSIONS, &request, None)
+            .send(&request, None)
             .await
             .map_err(|error| classify_refusal(error, self.token.expose(), None))?;
         let value: Value =
@@ -457,14 +485,24 @@ impl FinamClient {
     }
 
     /// Send the request through the gateway and return its body.
-    async fn raw(&self, method: &'static str, request: &HttpRequest) -> Result<String, Step> {
+    async fn raw(&self, request: &HttpRequest) -> Result<String, Step> {
         let response = self
             .gateway
-            .send(method, request, None)
+            .send(request, None)
             .await
             .map_err(Step::Refused)?;
         String::from_utf8(response.body).map_err(|_| Step::Malformed)
     }
+}
+
+fn validate_account_id(account_id: &str) -> Result<(), FinamError> {
+    if account_id.is_empty()
+        || matches!(account_id, "." | "..")
+        || account_id.contains(['/', '\\', '%', '?', '#'])
+    {
+        return Err(FinamError::InvalidAccountId);
+    }
+    Ok(())
 }
 
 /// What a sent call came back with, before Finam's meaning is laid over it.
@@ -513,14 +551,20 @@ fn lifetime_of(value: &Value) -> Option<Duration> {
 /// usually cut it already), then the owner's secret, which no layer before
 /// this one knows to look for.
 fn classify_refusal(error: GatewayError, secret: &str, token: Option<&str>) -> FinamError {
+    if error.is_broker_egress_refusal() {
+        return FinamError::EgressRefused {
+            reason: error.to_string(),
+            retry_after: error.retry_after(),
+        };
+    }
+    if let GatewayError::RequestCeiling { ceiling, .. } = error {
+        return FinamError::RequestCeiling { ceiling };
+    }
     if let Some(retry_after) = error.retry_after() {
-        return match error.status() {
-            Some(429) => FinamError::RateLimited { retry_after },
-            status => FinamError::Unavailable {
-                status,
-                attempts: error.attempts(),
-                retry_after,
-            },
+        return FinamError::Unavailable {
+            status: error.status(),
+            attempts: error.attempts(),
+            retry_after,
         };
     }
     match error {
@@ -567,14 +611,15 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use iaam_http::gateway::{BUDGETS, Budget, Clock, MethodScope, Sleeper, Transport};
-    use iaam_http::{Destination, Gateway, HttpError, HttpRequest, HttpResponse};
+    use iaam_http::{Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse};
     use time::format_description::well_known::Rfc3339;
     use time::macros::date;
     use time::{OffsetDateTime, Time};
 
+    use super::classify_refusal;
     use crate::credentials::{Key, open, seal};
 
     /// The owner's secret, invented; the session tokens are invented too.
@@ -593,6 +638,7 @@ mod tests {
     struct FakeTime {
         now: Mutex<Instant>,
         slept: Mutex<Vec<Duration>>,
+        wall: Mutex<SystemTime>,
     }
 
     impl FakeTime {
@@ -600,6 +646,7 @@ mod tests {
             Arc::new(Self {
                 now: Mutex::new(Instant::now()),
                 slept: Mutex::new(Vec::new()),
+                wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
             })
         }
 
@@ -616,12 +663,23 @@ mod tests {
         fn now(&self) -> Instant {
             *self.now.lock().expect("clock")
         }
+
+        fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+            let elapsed = self
+                .wall
+                .lock()
+                .expect("wall clock")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?;
+            Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
+        }
     }
 
     impl Sleeper for FakeTime {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.slept.lock().expect("sleeps").push(delay);
             *self.now.lock().expect("clock") += delay;
+            *self.wall.lock().expect("wall clock") += delay;
             Box::pin(async {})
         }
     }
@@ -675,6 +733,38 @@ mod tests {
                 .expect("script")
                 .pop_front()
                 .unwrap_or_else(|| Ok(response(endpoint.default_status, "")))
+        }
+    }
+
+    /// A Finam endpoint that makes every multi-day transactions answer full
+    /// and every single-day answer complete. A long interval therefore keeps
+    /// splitting without introducing a second pagination mechanism.
+    #[derive(Default)]
+    struct FullIntervals {
+        received: Mutex<Vec<HttpRequest>>,
+    }
+
+    struct FullIntervalsTransport(Arc<FullIntervals>);
+
+    impl Transport for FullIntervalsTransport {
+        async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.0
+                .received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
+            if request.url() == "https://api.finam.ru/v1/sessions" {
+                return Ok(response(200, &session_answer(JWT_ONE)));
+            }
+            let (start, end) = asked_interval(&request.url());
+            if end - start > time::Duration::days(1) {
+                Ok(response(
+                    200,
+                    r#"{"transactions":[{"id":"full-interval"}]}"#,
+                ))
+            } else {
+                Ok(response(200, r#"{"transactions":[]}"#))
+            }
         }
     }
 
@@ -754,11 +844,19 @@ mod tests {
     ) -> (Result<String, FinamError>, Result<String, FinamError>) {
         let first = {
             let client = Arc::clone(client);
-            tokio::spawn(async move { client.get_portfolio("Main").await })
+            tokio::spawn(async move {
+                client
+                    .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+                    .await
+            })
         };
         let second = {
             let client = Arc::clone(client);
-            tokio::spawn(async move { client.get_portfolio("Main").await })
+            tokio::spawn(async move {
+                client
+                    .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+                    .await
+            })
         };
         tokio::join!(async { first.await.expect("first task joins") }, async {
             second.await.expect("second task joins")
@@ -771,6 +869,24 @@ mod tests {
             body: body.as_bytes().to_vec(),
             retry_after: None,
         }
+    }
+
+    fn broker_egress_directory() -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "iaam-broker-finam-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(
+            directory.join("outbound-tally"),
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+        )
+        .expect("initialized tally created");
+        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+            .expect("initialized generation created");
+        directory
     }
 
     fn client_over(
@@ -806,11 +922,14 @@ mod tests {
         time: &Arc<FakeTime>,
         transactions_limit: i32,
     ) -> FinamClient {
-        let gateway = Gateway::with_parts(
+        let directory = broker_egress_directory();
+        let gateway = Gateway::with_parts_in_directory(
             transport,
             budgets,
             Arc::clone(time) as Arc<dyn Clock>,
             Arc::clone(time) as Arc<dyn Sleeper>,
+            iaam_http::BrokerEgress::On,
+            &directory,
         )
         .expect("the budget table is valid");
         let key = Key::from_bytes([7; 32]);
@@ -841,9 +960,17 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        client.get_portfolio("Main").await.expect("portfolio");
         client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_portfolio("Main Account", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+        client
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("transactions");
 
@@ -856,7 +983,10 @@ mod tests {
             exchange.body().map(iaam_http::RequestBody::payload),
             Some(r#"{"secret":"finam-invented-secret"}"#),
         );
-        assert_eq!(received[1].url(), "https://api.finam.ru/v1/accounts/Main");
+        assert_eq!(
+            received[1].url(),
+            "https://api.finam.ru/v1/accounts/Main%20Account"
+        );
         assert_eq!(
             received[2].url(),
             "https://api.finam.ru/v1/accounts/Main/transactions\
@@ -876,6 +1006,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsafe_account_ids_are_refused_before_the_session_or_data_request() {
+        for account_id in ["", ".", "..", "/", "\\", "%2e%2e", "?", "#"] {
+            let endpoint = Arc::new(Scripted::answering(200));
+            let (client, _) = client_over(BUDGETS, &endpoint);
+
+            let error = client
+                .get_portfolio(account_id, &iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect_err("unsafe account id must be refused");
+
+            assert!(
+                error.to_string().contains("Finam account id"),
+                "{account_id:?}: {error}"
+            );
+            assert!(
+                endpoint.received.lock().expect("received").is_empty(),
+                "{account_id:?} reached transport"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_session_is_exchanged_once_and_reused() {
         let endpoint = Arc::new(
             Scripted::answering(200)
@@ -887,11 +1039,20 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         for _ in 0..3 {
-            client.get_portfolio("Main").await.expect("portfolio");
+            client
+                .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect("portfolio");
         }
 
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
-        assert!(time.slept().is_empty(), "the clock renews, nothing sleeps");
+        assert_eq!(
+            time.slept(),
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 3))
+                .collect::<Vec<_>>(),
+            "the first send waits after boot, then four sends share host spacing"
+        );
     }
 
     /// **Simultaneous first calls share one exchange.** Both callers find
@@ -922,13 +1083,12 @@ mod tests {
         }
     }
 
-    /// **Simultaneous 401s share one renewal.** Both callers carry the same
-    /// refused token; the first through the gate exchanges, the rest find a
-    /// live session that is not the refused one and retry with it — a
-    /// concurrent renewal has already replaced the token Finam rejected.
+    /// The endpoint serialises simultaneous callers. One 401 is committed
+    /// before the queued call sends; the refused call renews once and retries,
+    /// while the queued call cannot overlap its status.
     #[tokio::test]
-    async fn simultaneous_401s_renew_once() {
-        let endpoint = Arc::new(Counted::refusing_first(2));
+    async fn a_401_is_renewed_once_while_a_second_call_waits_on_the_endpoint() {
+        let endpoint = Arc::new(Counted::refusing_first(1));
         let (client, time) = counted_client(&endpoint);
 
         let (first, second) = two_concurrent_calls(&client).await;
@@ -938,8 +1098,8 @@ mod tests {
         let received = endpoint.received.lock().expect("received");
         assert_eq!(
             received.len(),
-            6,
-            "two refusals, two retries, two exchanges"
+            5,
+            "one refusal, two successful data calls, two exchanges"
         );
         let exchanges = received
             .iter()
@@ -950,16 +1110,25 @@ mod tests {
             .iter()
             .filter(|request| request.bearer().map(|token| token.expose()) == Some(RENEWED_TOKEN))
             .count();
-        assert_eq!(retried, 2, "both callers retry on the renewed token");
-        assert!(
-            received
-                .iter()
-                .skip(1)
-                .take(2)
-                .all(|request| request.bearer().map(|token| token.expose()) == Some(FIRST_TOKEN)),
-            "both first attempts carried the refused token"
+        assert_eq!(
+            retried, 1,
+            "the refused caller retries on the renewed token"
         );
-        assert!(time.slept().is_empty(), "a 401 never waits");
+        let first_token_calls = received
+            .iter()
+            .filter(|request| request.bearer().map(|token| token.expose()) == Some(FIRST_TOKEN))
+            .count();
+        assert_eq!(
+            first_token_calls, 2,
+            "both first data calls carried the refused token"
+        );
+        assert_eq!(
+            time.slept(),
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 4))
+                .collect::<Vec<_>>(),
+            "the first send waits after boot, then five sends share host spacing"
+        );
     }
 
     /// **A poisoned cache lock is recovered from, not panicked on.** A
@@ -985,7 +1154,7 @@ mod tests {
         assert!(poisoned.is_err(), "the stand-in did panic");
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the call after the poison carries on");
 
@@ -1007,14 +1176,14 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
         time.advance(SESSION_LIFETIME);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1038,7 +1207,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
@@ -1047,7 +1216,7 @@ mod tests {
         time.advance(SESSION_LIFETIME - RENEW_BEFORE + Duration::from_secs(1));
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1070,7 +1239,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
@@ -1079,7 +1248,7 @@ mod tests {
         time.advance(SESSION_LIFETIME - RENEW_BEFORE);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1100,7 +1269,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
@@ -1110,7 +1279,10 @@ mod tests {
             expires_at: time.now() + Duration::from_secs(60),
         });
 
-        client.get_portfolio("Main").await.expect("portfolio");
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
 
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 3);
@@ -1139,7 +1311,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let body = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");
 
@@ -1168,15 +1340,24 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("refused after the renewed call is refused too");
 
         assert_eq!(error, FinamError::InvalidToken);
         // Two exchanges, two data calls: one renewal, one retry, then the
-        // refusal. No wait: a 401 is never retried by the gateway itself.
+        // refusal. Each send observes host spacing; a 401 adds no gateway
+        // retry backoff.
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
-        assert!(time.slept().is_empty());
+        assert_eq!(
+            time.slept(),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ]
+        );
         assert_no_secret(&error);
     }
 
@@ -1190,13 +1371,21 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect_err("403 is refused");
 
         assert_eq!(error, FinamError::InvalidToken);
         assert_eq!(endpoint.received.lock().expect("received").len(), 2);
-        assert!(time.slept().is_empty());
+        assert_eq!(
+            time.slept(),
+            [Duration::from_secs(60), Duration::from_secs(1)]
+        );
         assert_no_secret(&error);
     }
 
@@ -1211,13 +1400,20 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         let body = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");
 
         assert_eq!(body, r#"{"id":"Main"}"#);
         assert_eq!(endpoint.received.lock().expect("received").len(), 3);
-        assert_eq!(time.slept(), vec![iaam_http::gateway::FIRST_BACKOFF]);
+        assert_eq!(
+            time.slept(),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                iaam_http::gateway::FIRST_BACKOFF,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1226,7 +1422,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("every attempt fails");
 
@@ -1250,19 +1446,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_429_to_the_end_is_rate_limited_with_its_wait() {
+    async fn a_429_to_the_end_is_the_persisted_minimum_host_pause() {
         let endpoint = Arc::new(Scripted::answering(429).then(200, &session_answer(JWT_ONE)));
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
-            .expect_err("every attempt is throttled");
+            .expect_err("the broker host is paused");
 
-        match error {
-            FinamError::RateLimited { retry_after } => assert!(!retry_after.is_zero()),
-            other => panic!("expected RateLimited, got {other:?}"),
+        match &error {
+            FinamError::EgressRefused {
+                reason,
+                retry_after: Some(retry_after),
+            } => {
+                assert!(reason.contains("paused after status 429"), "{reason}");
+                assert!(reason.contains("reopens at"), "{reason}");
+                assert_eq!(*retry_after, Duration::from_secs(60));
+            }
+            other => panic!("expected EgressRefused, got {other:?}"),
         }
+        assert_eq!(endpoint.received.lock().expect("received").len(), 2);
+    }
+    #[test]
+    fn the_daily_egress_ceiling_keeps_its_operational_detail() {
+        let error = classify_refusal(
+            GatewayError::DailyCeiling {
+                destination: Destination::FinamApi,
+                ceiling: 1_000,
+                resets_at: "Tue, 01 Jan 2030 00:00:00 GMT".to_owned(),
+                retry_after: Duration::from_secs(60),
+            },
+            SECRET,
+            Some(JWT_ONE),
+        );
+
+        let FinamError::EgressRefused {
+            reason,
+            retry_after,
+        } = &error
+        else {
+            panic!("daily ceiling was collapsed into {error:?}");
+        };
+        assert!(reason.contains("1000"), "{reason}");
+        assert!(reason.contains("Tue, 01 Jan 2030 00:00:00 GMT"), "{reason}");
+        assert_eq!(*retry_after, Some(Duration::from_secs(60)));
+        assert_no_secret(&error);
     }
 
     /// The gateway has already cut the session token out of a rejected
@@ -1278,7 +1507,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("400 is refused");
 
@@ -1298,7 +1527,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("every attempt of the exchange fails");
 
@@ -1319,7 +1548,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("the secret itself is refused");
 
@@ -1335,7 +1564,7 @@ mod tests {
             let (client, _) = client_over(BUDGETS, &endpoint);
 
             let error = client
-                .get_portfolio("Main")
+                .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                 .await
                 .expect_err("no token, no session");
 
@@ -1359,42 +1588,44 @@ mod tests {
             let (client, time) = client_over(BUDGETS, &endpoint);
 
             let error = client
-                .get_portfolio("Main")
+                .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                 .await
                 .expect_err("no client, no request");
 
             assert_eq!(error, expected);
             assert_eq!(endpoint.received.lock().expect("received").len(), 1);
-            assert!(time.slept().is_empty());
+            assert_eq!(time.slept(), [Duration::from_secs(60)]);
             assert_no_secret(&error);
         }
     }
 
     #[tokio::test]
-    async fn a_network_fault_to_the_end_is_unavailable_with_no_status() {
+    async fn a_network_fault_closes_egress_without_retrying() {
         let endpoint = Arc::new(Scripted::answering(200));
-        for _ in 0..iaam_http::gateway::ATTEMPTS {
-            endpoint
-                .script
-                .lock()
-                .expect("script")
-                .push_back(Err(HttpError::Network));
-        }
-        let (client, _) = client_over(BUDGETS, &endpoint);
+        endpoint
+            .script
+            .lock()
+            .expect("script")
+            .push_back(Err(HttpError::Network));
+        let (client, time) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
-            .expect_err("every attempt faults");
+            .expect_err("an outcome without a status closes egress");
 
         assert!(
             matches!(
                 error,
-                FinamError::Unavailable { status: None, attempts, .. }
-                    if attempts == iaam_http::gateway::ATTEMPTS
+                FinamError::EgressRefused {
+                    retry_after: Some(retry_after),
+                    ..
+                } if retry_after == Duration::from_secs(90)
             ),
             "{error:?}"
         );
+        assert_eq!(endpoint.received.lock().expect("received").len(), 1);
+        assert_eq!(time.slept(), [Duration::from_secs(60)]);
     }
 
     /// A table with no Finam row: a build fault the gateway catches.
@@ -1412,7 +1643,7 @@ mod tests {
         let (client, _) = client_over(NO_FINAM, &endpoint);
 
         let error = client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("no budget, no request");
 
@@ -1458,15 +1689,42 @@ mod tests {
         );
         let (client, time) = client_over(ONE_PER_METHOD, &endpoint);
 
-        client.get_portfolio("Main").await.expect("portfolio");
         client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+        client
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("transactions");
-        assert!(time.slept().is_empty(), "three methods, three budgets");
+        assert_eq!(
+            time.slept(),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ],
+            "the first send waits after boot, then the three sends share host spacing"
+        );
 
-        client.get_portfolio("Main").await.expect("portfolio again");
-        assert_eq!(time.slept(), vec![Duration::from_secs(60)]);
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio again");
+        assert_eq!(
+            time.slept(),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(59),
+            ]
+        );
         // One exchange for four calls: the session rides its own budget.
         assert_eq!(endpoint.received.lock().expect("received").len(), 4);
     }
@@ -1480,7 +1738,10 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        let ids = client.get_account_ids().await.expect("the accounts");
+        let ids = client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the accounts");
 
         assert_eq!(ids, vec!["One".to_owned(), "Two".to_owned()]);
         let received = endpoint.received.lock().expect("received");
@@ -1506,7 +1767,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let error = client
-            .get_account_ids()
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("no ids, no answer");
 
@@ -1533,10 +1794,13 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
-        client.get_account_ids().await.expect("the accounts");
+        client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the accounts");
 
         // One second inside the corrected margin: the ten-minute token is
         // exchanged anew, though the uncorrected fifteen-minute assumption
@@ -1545,7 +1809,7 @@ mod tests {
         time.advance(corrected - RENEW_BEFORE + Duration::from_secs(1));
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1576,13 +1840,19 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
-        client.get_account_ids().await.expect("the accounts");
+        client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the accounts");
 
         time.advance(Duration::from_secs(60));
-        client.get_portfolio("Main").await.expect("portfolio");
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
 
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 4);
@@ -1609,14 +1879,14 @@ mod tests {
         let (client, time) = client_over(BUDGETS, &endpoint);
 
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the first session");
 
         // Past the margin: the renewal puts the second token in the cache.
         time.advance(SESSION_LIFETIME - RENEW_BEFORE + Duration::from_secs(1));
         client
-            .get_portfolio("Main")
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the renewed session");
 
@@ -1626,7 +1896,10 @@ mod tests {
         client.correct_session_lifetime(JWT_ONE, Duration::from_secs(60));
 
         time.advance(Duration::from_secs(60));
-        client.get_portfolio("Main").await.expect("portfolio");
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
 
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 5);
@@ -1647,7 +1920,10 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        let ids = client.get_account_ids().await.expect("the retry succeeds");
+        let ids = client
+            .get_account_ids(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("the retry succeeds");
 
         assert_eq!(ids, vec!["Three".to_owned()]);
         let received = endpoint.received.lock().expect("received");
@@ -1714,7 +1990,12 @@ mod tests {
         let (client, _) = client_with_limit(BUDGETS, &endpoint, 2);
 
         let body = client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 02 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 02 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("the whole interval is fetched");
 
@@ -1781,6 +2062,46 @@ mod tests {
         assert_eq!(ids, ["left", "right"]);
     }
 
+    #[tokio::test]
+    async fn full_intervals_stop_at_three_hundred_transport_attempts() {
+        let endpoint = Arc::new(FullIntervals::default());
+        let time = FakeTime::new();
+        let client = client_with_transport(
+            BUDGETS,
+            FullIntervalsTransport(Arc::clone(&endpoint)),
+            &time,
+            1,
+        );
+        let allowance = iaam_http::RequestAllowance::new(300);
+        let result = client
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 12 - 31),
+                &allowance,
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("the 301st request was not refused");
+        };
+
+        assert!(matches!(error, FinamError::RequestCeiling { ceiling: 300 }));
+        let received = endpoint
+            .received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(received.len(), 300);
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| request.url() == "https://api.finam.ru/v1/sessions")
+                .count(),
+            1,
+            "the session exchange spends one of the same 300 attempts"
+        );
+        assert!(error.to_string().contains("narrow"));
+    }
+
     /// The half-open instant range a transactions request named, read back
     /// out of the URL the gateway received.
     fn asked_interval(url: &str) -> (OffsetDateTime, OffsetDateTime) {
@@ -1820,7 +2141,12 @@ mod tests {
         let (client, _) = client_with_limit(BUDGETS, &endpoint, 2);
 
         let error = client
-            .get_transactions("Main", date!(2024 - 01 - 01), date!(2024 - 01 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 01 - 01),
+                date!(2024 - 01 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect_err("a full single day cannot be proven complete");
 
@@ -1843,7 +2169,12 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let body = client
-            .get_transactions("Main", date!(2024 - 02 - 01), date!(2024 - 01 - 01))
+            .get_transactions(
+                "Main",
+                date!(2024 - 02 - 01),
+                date!(2024 - 01 - 01),
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("an empty interval is an empty answer");
 

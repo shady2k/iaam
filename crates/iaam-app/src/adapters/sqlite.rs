@@ -2586,6 +2586,16 @@ fn account_detail_view(record: AccountDetailRecord) -> AccountDetailView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn broker_context(
+        deadline: Option<std::time::Instant>,
+    ) -> crate::ports::BrokerRequestContext<'static> {
+        static ALLOWANCE: std::sync::LazyLock<iaam_http::RequestAllowance> =
+            std::sync::LazyLock::new(|| iaam_http::RequestAllowance::new(u32::MAX));
+        crate::ports::BrokerRequestContext {
+            deadline,
+            allowance: &ALLOWANCE,
+        }
+    }
 
     #[test]
     fn resolve_error_preserves_unknown_date_and_ambiguous_distinctions() {
@@ -2684,7 +2694,7 @@ mod tests {
                         "invented-one",
                         time::macros::date!(2026 - 08 - 01),
                         time::macros::date!(2026 - 08 - 31),
-                        None,
+                        broker_context(None),
                     )
                     .await
                     .expect("one page")
@@ -2695,10 +2705,18 @@ mod tests {
             fetch(&first).await;
             fetch(&second).await;
         }
-        assert!(time.slept().is_empty(), "fifty calls fit the minute");
+        assert_eq!(
+            time.slept(),
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 49))
+                .collect::<Vec<_>>(),
+            "the first fifty calls wait once after boot, then use host spacing"
+        );
         fetch(&second).await;
 
-        assert_eq!(time.slept(), [Duration::from_secs(60)]);
+        let slept = time.slept();
+        assert_eq!(slept.len(), 51);
+        assert_eq!(slept.last(), Some(&Duration::from_secs(11)));
         assert_eq!(log.lock().expect("log").len(), 51);
     }
 
@@ -2754,7 +2772,7 @@ mod tests {
                 "invented-one",
                 time::macros::date!(2025 - 06 - 01),
                 time::macros::date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the scripted page is parsed");

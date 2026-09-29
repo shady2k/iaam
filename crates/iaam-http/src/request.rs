@@ -5,6 +5,8 @@
 //! at all. `HttpClient` handles sending.
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use zeroize::Zeroizing;
 
 use crate::destination::Destination;
@@ -83,6 +85,51 @@ pub enum AuthScheme {
     /// `Authorization: <token>`, with no scheme word.
     Bare,
 }
+/// One caller's finite allowance of transport attempts.
+///
+/// Clones share the same count. The request carries the handle into the
+/// gateway, where retries and first attempts consume it alike immediately
+/// before the transport is called.
+#[derive(Debug, Clone)]
+pub struct RequestAllowance {
+    state: Arc<RequestAllowanceState>,
+}
+
+#[derive(Debug)]
+struct RequestAllowanceState {
+    ceiling: u32,
+    remaining: AtomicU32,
+}
+
+impl RequestAllowance {
+    #[must_use]
+    pub fn new(ceiling: u32) -> Self {
+        Self {
+            state: Arc::new(RequestAllowanceState {
+                ceiling,
+                remaining: AtomicU32::new(ceiling),
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn ceiling(&self) -> u32 {
+        self.state.ceiling
+    }
+
+    pub(crate) fn take(&self) -> bool {
+        self.state
+            .remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn give_back(&self) {
+        self.state.remaining.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 /// Complete description of an outgoing request.
 #[derive(Debug, Clone)]
@@ -90,6 +137,7 @@ pub struct HttpRequest {
     destination: Destination,
     method: HttpMethod,
     path: String,
+    wire_path: Option<String>,
     query: Vec<(String, String)>,
     body: Option<RequestBody>,
     bearer: Option<Secret>,
@@ -97,6 +145,7 @@ pub struct HttpRequest {
     soap_action: Option<String>,
     reset_header: Option<&'static str>,
     idempotent: bool,
+    allowance: Option<RequestAllowance>,
 }
 
 impl HttpRequest {
@@ -110,6 +159,23 @@ impl HttpRequest {
         Self::new(destination, HttpMethod::Post, path, Some(body))
     }
 
+    /// Build a GET whose one caller-supplied path segment is encoded on the
+    /// wire while [`Self::path`] retains the raw spelling for policy checks.
+    #[must_use]
+    pub fn get_with_encoded_path_segment(
+        destination: Destination,
+        prefix: &str,
+        segment: &str,
+        suffix: &str,
+    ) -> Self {
+        let path = format!("{prefix}{segment}{suffix}");
+        let encoded = utf8_percent_encode(segment, NON_ALPHANUMERIC);
+        let wire_path = format!("{prefix}{encoded}{suffix}");
+        let mut request = Self::get(destination, &path);
+        request.wire_path = Some(wire_path);
+        request
+    }
+
     fn new(
         destination: Destination,
         method: HttpMethod,
@@ -120,12 +186,14 @@ impl HttpRequest {
             destination,
             method,
             path: path.to_owned(),
+            wire_path: None,
             query: Vec::new(),
             body,
             bearer: None,
             auth_scheme: AuthScheme::Bearer,
             soap_action: None,
             reset_header: None,
+            allowance: None,
             // A GET reads; any other method may act, and acting twice is
             // not undone by a later success.
             idempotent: matches!(method, HttpMethod::Get),
@@ -180,6 +248,12 @@ impl HttpRequest {
         self.idempotent = true;
         self
     }
+    /// Count every transport attempt for this request against `allowance`.
+    #[must_use]
+    pub fn with_request_allowance(mut self, allowance: RequestAllowance) -> Self {
+        self.allowance = Some(allowance);
+        self
+    }
 
     #[must_use]
     pub const fn is_idempotent(&self) -> bool {
@@ -194,6 +268,11 @@ impl HttpRequest {
     #[must_use]
     pub const fn method(&self) -> HttpMethod {
         self.method
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     #[must_use]
@@ -231,12 +310,16 @@ impl HttpRequest {
     pub const fn reset_header(&self) -> Option<&'static str> {
         self.reset_header
     }
+    pub(crate) const fn allowance(&self) -> Option<&RequestAllowance> {
+        self.allowance.as_ref()
+    }
 
     /// Complete request URL.
     #[must_use]
     pub fn url(&self) -> String {
         let base = self.destination.base_url().trim_end_matches('/');
-        let path = self.path.trim_start_matches('/');
+        let path = self.wire_path.as_deref().unwrap_or(&self.path);
+        let path = path.trim_start_matches('/');
         let mut url = format!("{base}/{path}");
         if !self.query.is_empty() {
             url.push('?');
@@ -285,6 +368,20 @@ mod tests {
     }
 
     #[test]
+    fn an_allowance_spends_exactly_its_ceiling_and_can_refund_an_unsent_attempt() {
+        let allowance = RequestAllowance::new(2);
+
+        assert_eq!(allowance.ceiling(), 2);
+        assert!(allowance.take());
+        assert!(allowance.take());
+        assert!(!allowance.take());
+
+        allowance.give_back();
+        assert!(allowance.take());
+        assert!(!allowance.take());
+    }
+
+    #[test]
     fn a_request_names_no_reset_header_unless_told() {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
         assert_eq!(request.reset_header(), None);
@@ -301,6 +398,22 @@ mod tests {
     fn a_url_joins_base_and_path_without_doubling_the_slash() {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
         assert_eq!(request.url(), "https://iss.moex.com/iss/history.json");
+    }
+
+    #[test]
+    fn an_encoded_path_segment_keeps_its_raw_policy_path() {
+        let request = HttpRequest::get_with_encoded_path_segment(
+            Destination::FinamApi,
+            "/v1/accounts/",
+            "Main Account",
+            "/transactions",
+        );
+
+        assert_eq!(request.path(), "/v1/accounts/Main Account/transactions");
+        assert_eq!(
+            request.url(),
+            "https://api.finam.ru/v1/accounts/Main%20Account/transactions"
+        );
     }
 
     #[test]

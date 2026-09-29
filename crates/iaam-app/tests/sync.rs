@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use iaam_app::AppServices;
@@ -11,8 +11,8 @@ use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::adapters::tinkoff::TinkoffChannel;
 use iaam_app::error::AppError;
 use iaam_app::ports::{
-    BrokerChannel, BrokerError, Clock, CustodyUpsert, ParsedOperations, PortfolioAsOf,
-    PortfolioSnapshot, Principal, Scope,
+    BrokerChannel, BrokerError, BrokerRequestContext, Clock, CustodyUpsert, ParsedOperations,
+    PortfolioAsOf, PortfolioSnapshot, Principal, Scope,
 };
 use iaam_app::scenarios::ingest::append_checked;
 use iaam_app::sync::{AssertionsWithheld, SYNC_DEADLINE};
@@ -32,7 +32,7 @@ use iaam_core::reconciliation::Dimension;
 use iaam_core::reconciliation::claim::{AssertionPeriod, BalancePoint, ControlClaim};
 use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_http::gateway::{BUDGETS, Clock as GatewayClock, Sleeper, Transport};
-use iaam_http::{Gateway, HttpError, HttpRequest, HttpResponse};
+use iaam_http::{Gateway, HttpError, HttpRequest, HttpResponse, RequestAllowance};
 use iaam_ingest::dedup::DedupLevel;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
@@ -68,7 +68,7 @@ struct FakeBroker {
 impl BrokerChannel for FakeBroker {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         self.accounts_requests.fetch_add(1, Ordering::SeqCst);
         Ok(self.accounts.clone())
@@ -80,7 +80,7 @@ impl BrokerChannel for FakeBroker {
         broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         self.requested_numbers
             .lock()
@@ -94,7 +94,7 @@ impl BrokerChannel for FakeBroker {
         _account: AccountId,
         broker_account: &str,
         _at: Date,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         self.requested_numbers
             .lock()
@@ -2048,7 +2048,7 @@ impl HeldBroker {
 impl BrokerChannel for HeldBroker {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         Ok(Vec::new())
     }
@@ -2059,7 +2059,7 @@ impl BrokerChannel for HeldBroker {
         _broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
@@ -2072,7 +2072,7 @@ impl BrokerChannel for HeldBroker {
         _account: AccountId,
         _broker_account: &str,
         _at: Date,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(empty_portfolio())
     }
@@ -2083,6 +2083,81 @@ impl BrokerChannel for HeldBroker {
 
     fn identity_scope(&self) -> IdentityScope {
         IdentityScope::Account
+    }
+}
+
+/// Captures the sync-owned allowance while holding both account syncs at the
+/// same operation boundary, proving they are live together.
+struct AllowanceBroker {
+    source: SourceChannel,
+    allowances: Mutex<Vec<RequestAllowance>>,
+    entered: AtomicUsize,
+    both_entered: Notify,
+}
+
+#[async_trait]
+impl BrokerChannel for AllowanceBroker {
+    async fn fetch_account_numbers(
+        &self,
+        _context: BrokerRequestContext<'_>,
+    ) -> Result<Vec<String>, BrokerError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_operations(
+        &self,
+        _account: AccountId,
+        _broker_account: &str,
+        _from: Date,
+        _to: Date,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<ParsedOperations, BrokerError> {
+        let allowance = context.allowance;
+        self.allowances
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(allowance.clone());
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        self.both_entered.notify_waiters();
+        loop {
+            let notified = self.both_entered.notified();
+            if self.entered.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            notified.await;
+        }
+        Ok(empty_operations())
+    }
+
+    async fn fetch_portfolio(
+        &self,
+        _account: AccountId,
+        _broker_account: &str,
+        _at: Date,
+        _context: BrokerRequestContext<'_>,
+    ) -> Result<PortfolioSnapshot, BrokerError> {
+        Ok(empty_portfolio())
+    }
+
+    fn channel(&self) -> SourceChannel {
+        self.source.clone()
+    }
+
+    fn identity_scope(&self) -> IdentityScope {
+        IdentityScope::Account
+    }
+}
+
+struct CountingTransport(Arc<AtomicUsize>);
+
+impl Transport for CountingTransport {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(HttpResponse {
+            status: 200,
+            body: Vec::new(),
+            retry_after: None,
+        })
     }
 }
 
@@ -2168,6 +2243,99 @@ async fn syncs_of_two_accounts_do_not_block_each_other() {
 }
 
 #[tokio::test]
+async fn concurrent_account_syncs_own_separate_three_hundred_attempt_allowances() {
+    let services = services();
+    let owner = OwnerId::new_random();
+    let first_account = AccountId::new_random();
+    let second_account = AccountId::new_random();
+    seed_bound_account(&services, owner, first_account, "first").await;
+    seed_bound_account(&services, owner, second_account, "second").await;
+    let before = load_all(&services, owner).await;
+    let broker = AllowanceBroker {
+        source: held_channel(),
+        allowances: Mutex::new(Vec::new()),
+        entered: AtomicUsize::new(0),
+        both_entered: Notify::new(),
+    };
+    let principal = principal(owner);
+
+    let (first, second) = tokio::join!(
+        sync_broker(
+            &services,
+            &principal,
+            &broker,
+            first_account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        ),
+        sync_broker(
+            &services,
+            &principal,
+            &broker,
+            second_account,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+    );
+    if let Err(error) = first {
+        panic!("the first account did not sync: {error}");
+    }
+    if let Err(error) = second {
+        panic!("the second account did not sync: {error}");
+    }
+    let allowances = broker
+        .allowances
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    assert_eq!(allowances.len(), 2);
+    assert!(
+        allowances
+            .iter()
+            .all(|allowance| allowance.ceiling() == 300)
+    );
+
+    let sent = Arc::new(AtomicUsize::new(0));
+    let time = Arc::new(FakeTime {
+        now: Mutex::new(Instant::now()),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
+    });
+    let directory = broker_egress_directory();
+    let gateway = Gateway::with_parts_in_directory(
+        CountingTransport(Arc::clone(&sent)),
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &directory,
+    );
+    let Ok(gateway) = gateway else {
+        panic!("the documented budget table was invalid");
+    };
+    for allowance in allowances {
+        let request = HttpRequest::post(
+            iaam_http::Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+            iaam_http::RequestBody::Json("{}".to_owned()),
+        )
+        .idempotent()
+        .with_request_allowance(allowance);
+        for attempt in 1..=300 {
+            if let Err(error) = gateway.send(&request, None).await {
+                panic!("sync allowance ended at attempt {attempt}: {error}");
+            }
+        }
+        let result = gateway.send(&request, None).await;
+        assert!(matches!(
+            result,
+            Err(iaam_http::GatewayError::RequestCeiling { ceiling: 300, .. })
+        ));
+    }
+    assert_eq!(sent.load(Ordering::SeqCst), 600);
+    assert_eq!(load_all(&services, owner).await, before);
+}
+
+#[tokio::test]
 async fn a_failed_sync_releases_its_account() {
     let services = services();
     let owner = OwnerId::new_random();
@@ -2217,7 +2385,7 @@ struct PanickingBroker(SourceChannel);
 impl BrokerChannel for PanickingBroker {
     async fn fetch_account_numbers(
         &self,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
         Ok(Vec::new())
     }
@@ -2228,7 +2396,7 @@ impl BrokerChannel for PanickingBroker {
         _broker_account: &str,
         _from: Date,
         _to: Date,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         panic!("the broker adapter panicked");
     }
@@ -2238,7 +2406,7 @@ impl BrokerChannel for PanickingBroker {
         _account: AccountId,
         _broker_account: &str,
         _at: Date,
-        _deadline: Option<Instant>,
+        _context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(empty_portfolio())
     }
@@ -2290,17 +2458,29 @@ async fn a_panicked_sync_releases_its_account() {
 /// T-Invest below takes its time to answer.
 struct FakeTime {
     now: Mutex<Instant>,
+    wall: Mutex<SystemTime>,
 }
 
 impl FakeTime {
     fn advance(&self, by: Duration) {
         *self.now.lock().expect("clock") += by;
+        *self.wall.lock().expect("wall clock") += by;
     }
 }
 
 impl GatewayClock for FakeTime {
     fn now(&self) -> Instant {
         *self.now.lock().expect("clock")
+    }
+
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        let elapsed = self
+            .wall
+            .lock()
+            .expect("wall clock")
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?;
+        Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
     }
 }
 
@@ -2314,11 +2494,20 @@ impl Sleeper for FakeTime {
 /// Time on tokio's paused timer: the gateway's clock and sleeps and the slow
 /// T-Invest below all run on it, so a request still in flight at the deadline
 /// loses a real race against it rather than a clock moved by hand.
-struct PausedTime;
+struct PausedTime {
+    start: Instant,
+}
 
 impl GatewayClock for PausedTime {
     fn now(&self) -> Instant {
         tokio::time::Instant::now().into_std()
+    }
+
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        Ok(iaam_http::gateway::BootTime::new(
+            "test-boot",
+            Duration::from_secs(1_800_000_000) + self.now().duration_since(self.start),
+        ))
     }
 }
 
@@ -2326,6 +2515,24 @@ impl Sleeper for PausedTime {
     fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(tokio::time::sleep(delay))
     }
+}
+
+fn broker_egress_directory() -> std::path::PathBuf {
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "iaam-app-sync-test-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).expect("egress directory created");
+    std::fs::write(
+        directory.join("outbound-tally"),
+        "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+    )
+    .expect("initialized tally created");
+    std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+        .expect("initialized generation created");
+    directory
 }
 
 /// A T-Invest that answers every operations page, always with one more to
@@ -2360,14 +2567,20 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
     let asked = Arc::new(AtomicUsize::new(0));
     // Four minutes a page: pages are asked for at 0, 4, 8 and 12 minutes;
     // the fourth would answer at 16, past the sync's fifteen.
-    let gateway = Gateway::with_parts(
+    let time = Arc::new(PausedTime {
+        start: tokio::time::Instant::now().into_std(),
+    });
+    let directory = broker_egress_directory();
+    let gateway = Gateway::with_parts_in_directory(
         SlowTinvest {
             step: Duration::from_secs(4 * 60),
             asked: Arc::clone(&asked),
         },
         BUDGETS,
-        Arc::new(PausedTime) as Arc<dyn GatewayClock>,
-        Arc::new(PausedTime) as Arc<dyn Sleeper>,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &directory,
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);
@@ -2440,12 +2653,16 @@ impl Transport for ThrottlingTinvest {
 fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
     let time = Arc::new(FakeTime {
         now: Mutex::new(Instant::now()),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
     });
-    let gateway = Gateway::with_parts(
+    let directory = broker_egress_directory();
+    let gateway = Gateway::with_parts_in_directory(
         transport,
         BUDGETS,
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &directory,
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);
@@ -2458,7 +2675,7 @@ fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
 }
 
 #[tokio::test]
-async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
+async fn a_broker_that_stays_throttled_is_unreachable_for_the_minimum_pause() {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
@@ -2486,7 +2703,7 @@ async fn a_broker_that_stays_throttled_is_unreachable_with_its_own_wait() {
             ..
         } => {
             assert_eq!(origin, "tinkoff");
-            assert_eq!(retry_after, Some(Duration::from_secs(7)));
+            assert_eq!(retry_after, Some(Duration::from_secs(60)));
         }
         other => panic!("expected an unreachable broker, got {other:?}"),
     }

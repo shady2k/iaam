@@ -28,7 +28,8 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::ports::{
-    BrokerChannel, BrokerError, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Quarantined,
+    BrokerChannel, BrokerError, BrokerRequestContext, ParsedOperations, PortfolioAsOf,
+    PortfolioSnapshot, Quarantined,
 };
 
 const BROKER: &str = "finam";
@@ -61,12 +62,16 @@ impl FinamChannel {
 impl BrokerChannel for FinamChannel {
     async fn fetch_account_numbers(
         &self,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         bounded(
             deadline,
             "the Finam sessions request",
-            self.client.get_account_ids(),
+            self.client.get_account_ids(allowance),
         )
         .await
     }
@@ -77,14 +82,19 @@ impl BrokerChannel for FinamChannel {
         broker_account: &str,
         from: Date,
         to: Date,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         // The broker is asked for its own account number; the returned rows
         // are stamped with the owner's account in this system.
         let body = bounded(
             deadline,
             "the Finam transactions request",
-            self.client.get_transactions(broker_account, from, to),
+            self.client
+                .get_transactions(broker_account, from, to, allowance),
         )
         .await?;
         let operations = parse_operations(&body).map_err(parse_error)?;
@@ -96,13 +106,17 @@ impl BrokerChannel for FinamChannel {
         account: AccountId,
         broker_account: &str,
         _at: Date,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         let _ = account;
         let body = bounded(
             deadline,
             "the Finam portfolio request",
-            self.client.get_portfolio(broker_account),
+            self.client.get_portfolio(broker_account, allowance),
         )
         .await?;
         adapt_portfolio(&body)
@@ -319,18 +333,30 @@ fn securities_transfer_reason(kind: &ChannelOperationKind) -> Option<&'static st
 fn finam_error(error: FinamError) -> BrokerError {
     let detail = error.to_string();
     match error {
-        FinamError::RateLimited { retry_after } | FinamError::Unavailable { retry_after, .. } => {
-            BrokerError::Unreachable {
-                broker: BROKER.to_owned(),
-                detail,
-                retry_after: Some(retry_after),
-            }
-        }
+        FinamError::Unavailable { retry_after, .. } => BrokerError::Unreachable {
+            broker: BROKER.to_owned(),
+            detail,
+            retry_after: Some(retry_after),
+        },
+        FinamError::EgressRefused {
+            retry_after,
+            reason: _,
+        } => BrokerError::Unreachable {
+            broker: BROKER.to_owned(),
+            detail,
+            retry_after,
+        },
+        FinamError::RequestCeiling { ceiling } => BrokerError::RequestCeiling {
+            broker: BROKER.to_owned(),
+            ceiling,
+        },
         FinamError::InvalidToken | FinamError::UnexpectedStatus { .. } => BrokerError::Refused {
             broker: BROKER.to_owned(),
             detail,
         },
-        FinamError::PartialResponse | FinamError::MalformedResponse => unparsable(detail),
+        FinamError::InvalidAccountId
+        | FinamError::PartialResponse
+        | FinamError::MalformedResponse => unparsable(detail),
         // A method key without a budget, or a transport this build could not
         // set up, is this build's fault, not Finam's: retrying later meets
         // the same fault.
@@ -638,11 +664,21 @@ mod tests {
     use crate::adapters::tinkoff::fake::{self, Answer};
     use iaam_broker::credentials::BrokerToken;
     use iaam_core::reconciliation::claim::ControlClaim;
-    use iaam_http::{Gateway, Outbound};
+    use iaam_http::{BrokerEgress, Gateway, Outbound};
     use serde_json::json;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use time::macros::date;
+
+    fn broker_context(deadline: Option<Instant>) -> BrokerRequestContext<'static> {
+        static ALLOWANCE: std::sync::LazyLock<iaam_http::RequestAllowance> =
+            std::sync::LazyLock::new(|| iaam_http::RequestAllowance::new(u32::MAX));
+        BrokerRequestContext {
+            deadline,
+            allowance: &ALLOWANCE,
+        }
+    }
 
     const TOKEN: &str = "invented-finam-token";
     const DIVIDEND_ID: &str = "3f2b8c5e-1a4d-4f6b-9c2e-5a7d8e1f4a3b";
@@ -655,6 +691,24 @@ mod tests {
         let key = iaam_broker::credentials::Key::from_bytes([9; 32]);
         iaam_broker::credentials::open(&key, &iaam_broker::credentials::seal(&key, TOKEN))
             .expect("token round trip")
+    }
+
+    fn broker_egress_directory() -> std::path::PathBuf {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "iaam-app-finam-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(
+            directory.join("outbound-tally"),
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+        )
+        .expect("initialized tally created");
+        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+            .expect("initialized generation created");
+        directory
     }
 
     fn dictionary() -> OperationKindDictionary {
@@ -747,7 +801,7 @@ mod tests {
         );
 
         let ids = channel
-            .fetch_account_numbers(None)
+            .fetch_account_numbers(broker_context(None))
             .await
             .expect("the listing parses");
 
@@ -765,7 +819,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -867,7 +921,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -904,7 +958,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -965,7 +1019,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1025,7 +1079,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1091,7 +1145,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1177,7 +1231,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1225,7 +1279,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1274,7 +1328,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("an empty page is not refused");
@@ -1330,7 +1384,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the page is parsed");
@@ -1386,7 +1440,7 @@ mod tests {
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 01),
                 date!(2025 - 06 - 30),
-                Some(past),
+                broker_context(Some(past)),
             )
             .await
             .expect_err("the deadline has passed");
@@ -1416,8 +1470,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_request_still_running_at_the_deadline_is_dropped() {
-        let gateway: Arc<dyn Outbound> =
-            Arc::new(Gateway::new(Parked).expect("the budget table is valid"));
+        let directory = broker_egress_directory();
+        let gateway: Arc<dyn Outbound> = Arc::new(
+            Gateway::new_in_directory(Parked, BrokerEgress::On, &directory)
+                .expect("the budget table is valid"),
+        );
         let channel = channel(gateway);
         let deadline = Instant::now() + Duration::from_secs(15 * 60);
 
@@ -1426,7 +1483,7 @@ mod tests {
                 account(),
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 30),
-                Some(deadline),
+                broker_context(Some(deadline)),
             )
             .await
             .expect_err("the deadline fires although Finam never answers");
@@ -1452,7 +1509,7 @@ mod tests {
                 account(),
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect("the portfolio is parsed");
@@ -1487,7 +1544,7 @@ mod tests {
                 account(),
                 account().inner().to_string().as_str(),
                 date!(2025 - 06 - 30),
-                None,
+                broker_context(None),
             )
             .await
             .expect_err("a rejected token");

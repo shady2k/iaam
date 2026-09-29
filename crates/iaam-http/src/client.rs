@@ -18,7 +18,10 @@ use crate::trust::{ConfiguredClient, client_for};
 ///
 /// Explicit because `reqwest` has no default timeout; without one, a stalled
 /// endpoint would become a background job that hangs forever.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// No server-named wait can extend gateway arithmetic beyond one day.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Outgoing request client.
 ///
@@ -71,25 +74,93 @@ impl HttpClient {
     /// Private to this crate: outside it the only way to send is
     /// `Gateway::send`, which the `Transport` impl serves.
     pub(crate) async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.send_observed(request, Box::new(|| Ok(())), Box::new(|_, _| {}))
+            .await
+    }
+
+    /// Send while acknowledging hand-off and publishing status and Retry-After
+    /// before consuming the body.
+    pub(crate) async fn send_observed(
+        &self,
+        request: &HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + '_>,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+    ) -> Result<HttpResponse, HttpError> {
+        self.send_to_url(request, request.url(), REQUEST_TIMEOUT, handoff, observe)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn send_to_base(
+        &self,
+        request: &HttpRequest,
+        base_url: &str,
+        timeout: Duration,
+    ) -> Result<HttpResponse, HttpError> {
+        self.send_to_base_observed(
+            request,
+            base_url,
+            timeout,
+            Box::new(|| Ok(())),
+            Box::new(|_, _| {}),
+        )
+        .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn send_to_base_observed(
+        &self,
+        request: &HttpRequest,
+        base_url: &str,
+        timeout: Duration,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + '_>,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+    ) -> Result<HttpResponse, HttpError> {
+        let request_url = request.url();
+        let destination_base = request.destination().base_url().trim_end_matches('/');
+        let suffix = request_url
+            .strip_prefix(destination_base)
+            .unwrap_or(request_url.as_str());
+        let url = format!("{}{suffix}", base_url.trim_end_matches('/'));
+        self.send_to_url(request, url, timeout, handoff, observe)
+            .await
+    }
+
+    async fn send_to_url(
+        &self,
+        request: &HttpRequest,
+        url: String,
+        timeout: Duration,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + '_>,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+    ) -> Result<HttpResponse, HttpError> {
         let client = self.client_for(request.destination())?;
-        let built = build(&client.0, request)?;
-        let response = client
+        let built = build_at(&client.0, request, &url, timeout)?;
+        handoff()?;
+        let mut response = client
             .0
             .execute(built)
             .await
             .map_err(classify_transport_error)?;
         let status = response.status().as_u16();
-        // Read before `bytes()` consumes the response.
+        let successful = response.status().is_success();
         let retry_after = named_delay(
             response.headers(),
             request.reset_header(),
             SystemTime::now(),
         );
-        let body = response
-            .bytes()
-            .await
-            .map_err(classify_transport_error)?
-            .to_vec();
+        observe(status, retry_after);
+        // A status line that arrived is never lost: after a non-2xx status a
+        // body that fails or stalls ends the read with what arrived.
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(error) if successful => return Err(classify_transport_error(error)),
+                Err(_) => break,
+            }
+        }
         Ok(HttpResponse {
             status,
             body,
@@ -115,6 +186,7 @@ fn named_delay(
             .get(name)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_retry_after(value, now))
+            .map(|delay| delay.min(MAX_RETRY_AFTER))
     };
     seconds(reqwest::header::RETRY_AFTER.as_str()).or_else(|| reset_header.and_then(seconds))
 }
@@ -122,12 +194,22 @@ fn named_delay(
 /// The request exactly as it goes on the wire: method, URL, timeout and
 /// headers. Separate from sending so what a broker receives can be checked
 /// without a network.
+#[cfg(test)]
 fn build(client: &reqwest::Client, request: &HttpRequest) -> Result<reqwest::Request, HttpError> {
+    build_at(client, request, &request.url(), REQUEST_TIMEOUT)
+}
+
+fn build_at(
+    client: &reqwest::Client,
+    request: &HttpRequest,
+    url: &str,
+    timeout: Duration,
+) -> Result<reqwest::Request, HttpError> {
     let mut builder = match request.method() {
-        HttpMethod::Get => client.get(request.url()),
-        HttpMethod::Post => client.post(request.url()),
+        HttpMethod::Get => client.get(url),
+        HttpMethod::Post => client.post(url),
     };
-    builder = builder.timeout(REQUEST_TIMEOUT);
+    builder = builder.timeout(timeout);
     if let Some(value) = authorization_header(request)? {
         builder = builder.header(reqwest::header::AUTHORIZATION, value);
     }
@@ -227,6 +309,16 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_is_clamped_before_gateway_time_arithmetic() {
+        let named = named_delay(
+            &headers(&[("retry-after", "18446744073709551615")]),
+            None,
+            SystemTime::now(),
+        );
+        assert_eq!(named, Some(MAX_RETRY_AFTER));
+    }
+
+    #[test]
     fn a_declared_reset_header_is_read_when_retry_after_is_absent() {
         let named = named_delay(
             &headers(&[("x-ratelimit-reset", "17")]),
@@ -249,7 +341,9 @@ mod tests {
     #[test]
     fn retry_after_as_an_http_date_is_the_named_delay() {
         // 2026-10-21 07:28:00 UTC.
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_567_680);
+        let now = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_792_567_680))
+            .expect("fixture time is representable");
         let named = named_delay(
             &headers(&[("retry-after", "Wed, 21 Oct 2026 07:33:00 GMT")]),
             None,
@@ -268,8 +362,14 @@ mod tests {
         assert_eq!(named, None);
     }
 
+    fn configured_client(request: &HttpRequest) -> reqwest::Client {
+        client_for(request.destination())
+            .expect("the configured client builds")
+            .0
+    }
+
     fn wire(request: &HttpRequest) -> reqwest::Request {
-        build(&reqwest::Client::new(), request).expect("the request builds")
+        build(&configured_client(request), request).expect("the request builds")
     }
 
     #[test]
@@ -322,7 +422,7 @@ mod tests {
         let request = HttpRequest::get(Destination::FinamApi, "/").with_bare_token("bad\ntoken");
 
         assert!(matches!(
-            build(&reqwest::Client::new(), &request),
+            build(&configured_client(&request), &request),
             Err(HttpError::RequestNotBuilt(_))
         ));
     }

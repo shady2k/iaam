@@ -100,6 +100,10 @@ test: ## Tests that do not access the network
 doc-test: ## Doc-tests (nextest does not run them)
 	$(RUN) cargo test --workspace --doc
 
+.PHONY: ceiling-proof
+ceiling-proof: ## Broker departures measured against every outbound ceiling
+	$(RUN) cargo test -p iaam-app --test ceiling_proof -- --nocapture --test-threads=1
+
 .PHONY: diff-lint
 diff-lint: ## New allow/ignore/todo! directives and changes to policy files (BASE=...)
 	$(RUN) ./scripts/check-diff-lint.sh $(BASE)

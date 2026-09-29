@@ -33,12 +33,12 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use crate::ports::{
-    BrokerChannel, BrokerError, ParsedOperations, PortfolioAsOf, PortfolioSnapshot, Quarantined,
+    BrokerChannel, BrokerError, BrokerRequestContext, ParsedOperations, PortfolioAsOf,
+    PortfolioSnapshot, Quarantined,
 };
 
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
-const MAX_OPERATION_PAGES: usize = 100;
 
 /// Broker channel implementation for T-Invest.
 pub struct TinkoffChannel {
@@ -72,12 +72,16 @@ impl TinkoffChannel {
 impl BrokerChannel for TinkoffChannel {
     async fn fetch_account_numbers(
         &self,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<Vec<String>, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         // The accounts listing has no deadline parameter on the client — its
         // frozen signature predates the sync's deadline — so the bound is
         // taken here, the way the Finam channel bounds every call.
-        let body = bounded(deadline, self.client.get_accounts()).await?;
+        let body = bounded(deadline, self.client.get_accounts(allowance)).await?;
         parse_account_ids(&body).map_err(parse_error)
     }
 
@@ -87,8 +91,12 @@ impl BrokerChannel for TinkoffChannel {
         broker_account: &str,
         from: time::Date,
         to: time::Date,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         // The broker is asked for its own account number; the returned rows
         // are stamped with the owner's account in this system.
         let mut request = GetOperationsByCursorRequest::new(broker_account.to_owned());
@@ -97,7 +105,7 @@ impl BrokerChannel for TinkoffChannel {
         request.limit = Some(OPERATIONS_PAGE_LIMIT);
         let operations = fetch_operation_pages(request, |request| async move {
             self.client
-                .get_operations_by_cursor(&request, deadline)
+                .get_operations_by_cursor(&request, deadline, allowance)
                 .await
         })
         .await?;
@@ -109,12 +117,16 @@ impl BrokerChannel for TinkoffChannel {
         account: AccountId,
         broker_account: &str,
         _at: time::Date,
-        deadline: Option<Instant>,
+        context: BrokerRequestContext<'_>,
     ) -> Result<PortfolioSnapshot, BrokerError> {
+        let BrokerRequestContext {
+            deadline,
+            allowance,
+        } = context;
         let _ = account;
         let body = self
             .client
-            .get_portfolio(broker_account, deadline)
+            .get_portfolio(broker_account, deadline, allowance)
             .await
             .map_err(tinkoff_error)?;
         adapt_portfolio(&body)
@@ -275,13 +287,15 @@ where
     let mut operations = Vec::new();
     let mut seen_cursors = HashSet::new();
 
-    for fetched in 0..MAX_OPERATION_PAGES {
+    let mut fetched = 0;
+    loop {
         // Every page is refetched on the next try, so the refusal says how
         // far this one got rather than leaving a slow sync looking like a
         // dead one.
         let body = fetch(request.clone())
             .await
             .map_err(|error| after_pages(tinkoff_error(error), fetched))?;
+        fetched += 1;
         let page = parse_operations(&body).map_err(parse_error)?;
         operations.extend(page.operations);
         if !page.has_next {
@@ -299,9 +313,6 @@ where
         }
         request.cursor = Some(cursor);
     }
-    Err(unparsable(format!(
-        "operations response exceeded page cap: fetched {MAX_OPERATION_PAGES} pages while hasNext remained true"
-    )))
 }
 
 /// Names on an "unreachable, retry later" how many operation pages had
@@ -1023,6 +1034,17 @@ fn tinkoff_error(error: TinkoffError) -> BrokerError {
             detail,
             retry_after: Some(retry_after),
         },
+        TinkoffError::Gateway(error) if error.is_broker_egress_refusal() => {
+            BrokerError::Unreachable {
+                broker: BROKER.to_owned(),
+                detail,
+                retry_after: error.retry_after(),
+            }
+        }
+        TinkoffError::RequestCeiling { ceiling } => BrokerError::RequestCeiling {
+            broker: BROKER.to_owned(),
+            ceiling,
+        },
         TinkoffError::InvalidToken
         | TinkoffError::MethodUnavailable { .. }
         | TinkoffError::UnexpectedStatus { .. } => BrokerError::Refused {
@@ -1034,7 +1056,8 @@ fn tinkoff_error(error: TinkoffError) -> BrokerError {
         | TinkoffError::RequestSerialization => unparsable(detail),
         // A method key without a budget, or a client or trust root that could
         // not be built, is this build's fault, not the broker's: retrying
-        // later meets the same fault.
+        // later meets the same fault. Operational egress/tally refusals were
+        // separated above so they remain actionable at the server boundary.
         TinkoffError::Gateway(_) | TinkoffError::Transport(_) => BrokerError::Adapter {
             broker: BROKER.to_owned(),
             detail,
@@ -1068,7 +1091,7 @@ pub(crate) mod fake {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use iaam_http::gateway::{BUDGETS, Clock, Sleeper, Transport};
     use iaam_http::{Gateway, HttpError, HttpRequest, HttpResponse};
@@ -1077,6 +1100,7 @@ pub(crate) mod fake {
     pub(crate) struct FakeTime {
         now: Mutex<Instant>,
         slept: Mutex<Vec<Duration>>,
+        wall: Mutex<SystemTime>,
     }
 
     impl FakeTime {
@@ -1089,12 +1113,23 @@ pub(crate) mod fake {
         fn now(&self) -> Instant {
             *self.now.lock().expect("clock")
         }
+
+        fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+            let elapsed = self
+                .wall
+                .lock()
+                .expect("wall clock")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?;
+            Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
+        }
     }
 
     impl Sleeper for FakeTime {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.slept.lock().expect("sleeps").push(delay);
             *self.now.lock().expect("clock") += delay;
+            *self.wall.lock().expect("wall clock") += delay;
             Box::pin(async {})
         }
     }
@@ -1150,6 +1185,24 @@ pub(crate) mod fake {
         }
     }
 
+    fn broker_egress_directory() -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "iaam-app-tinkoff-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(
+            directory.join("outbound-tally"),
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+        )
+        .expect("initialized tally created");
+        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+            .expect("initialized generation created");
+        directory
+    }
+
     /// A gateway over a fake T-Invest answering `script`, then `otherwise`.
     pub(crate) fn gateway(
         script: Vec<Answer>,
@@ -1158,9 +1211,11 @@ pub(crate) mod fake {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
+            wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         });
         let log = Log::default();
-        let gateway = Gateway::with_parts(
+        let directory = broker_egress_directory();
+        let gateway = Gateway::with_parts_in_directory(
             FakeTinvest {
                 script: Mutex::new(script.into()),
                 otherwise,
@@ -1169,6 +1224,8 @@ pub(crate) mod fake {
             BUDGETS,
             Arc::clone(&time) as Arc<dyn Clock>,
             Arc::clone(&time) as Arc<dyn Sleeper>,
+            iaam_http::BrokerEgress::On,
+            &directory,
         )
         .expect("the documented table is valid");
         (Arc::new(gateway), log, time)
@@ -1202,6 +1259,16 @@ mod tests {
         order_state_reason, rfc3339_operation_end, trade_operations,
     };
     use iaam_broker::operation_kind::OperationKindDictionary;
+    fn broker_context(
+        deadline: Option<std::time::Instant>,
+    ) -> crate::ports::BrokerRequestContext<'static> {
+        static ALLOWANCE: std::sync::LazyLock<iaam_http::RequestAllowance> =
+            std::sync::LazyLock::new(|| iaam_http::RequestAllowance::new(u32::MAX));
+        crate::ports::BrokerRequestContext {
+            deadline,
+            allowance: &ALLOWANCE,
+        }
+    }
 
     /// A future that marks itself the first time it is polled and then never
     /// finishes: the probe for the deadline branch that must never even start
@@ -1230,7 +1297,7 @@ mod tests {
         );
 
         let ids = channel(gateway)
-            .fetch_account_numbers(None)
+            .fetch_account_numbers(broker_context(None))
             .await
             .expect("the listing parses");
 
@@ -2878,29 +2945,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_after_one_hundred_pages_only_when_the_next_page_is_needed() {
+    async fn continues_pagination_after_one_hundred_pages() {
         let request = GetOperationsByCursorRequest::new("account");
-        let mut responses = (1..=100)
-            .map(|number| page_json(true, Some(&format!("cursor-{number}")), None))
-            .collect::<Vec<_>>();
-        let mut requests = Vec::new();
-        let error = fetch_operation_pages(request, |request| {
-            requests.push(request);
-            let body = responses.remove(0);
-            async move { Ok(body) }
-        })
-        .await
-        .expect_err("the hundredth page still requests a continuation");
-
-        assert!(error.to_string().contains("100"));
-        assert_eq!(requests.len(), 100);
-
-        let request = GetOperationsByCursorRequest::new("account");
-        let mut responses = (1..=100)
+        let mut responses = (1..=101)
             .map(|number| {
                 page_json(
-                    number != 100,
-                    (number != 100)
+                    number != 101,
+                    (number != 101)
                         .then(|| format!("cursor-{number}"))
                         .as_deref(),
                     Some(&format!("operation-{number}")),
@@ -2908,16 +2959,18 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut requests = Vec::new();
-        let operations = fetch_operation_pages(request, |request| {
+        let result = fetch_operation_pages(request, |request| {
             requests.push(request);
             let body = responses.remove(0);
             async move { Ok(body) }
         })
-        .await
-        .expect("the hundredth page is accepted when complete");
+        .await;
+        let Ok(operations) = result else {
+            panic!("pagination stopped at the removed page cap");
+        };
 
-        assert_eq!(operations.len(), 100);
-        assert_eq!(requests.len(), 100);
+        assert_eq!(operations.len(), 101);
+        assert_eq!(requests.len(), 101);
     }
 
     #[tokio::test]
@@ -2955,12 +3008,12 @@ mod tests {
     use iaam_broker::credentials::{Key, open, seal};
     use iaam_broker::environment::Environment;
     use iaam_broker::tinkoff::{TinkoffClient, TinkoffError};
-    use iaam_http::Outbound;
     use iaam_http::gateway::{ATTEMPTS, Clock, FIRST_BACKOFF};
     use iaam_http::resilience::{Outcome, RetryPolicy};
+    use iaam_http::{Outbound, RequestAllowance};
 
     use super::fake::{self, Answer};
-    use crate::ports::BrokerChannel;
+    use crate::ports::{BrokerChannel, BrokerRequestContext};
 
     const TOKEN: &str = "secret-token-42";
 
@@ -2983,40 +3036,97 @@ mod tests {
                 "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 01),
                 time::macros::date!(2026 - 08 - 31),
-                None,
+                broker_context(None),
             )
             .await
     }
 
-    /// T-Invest limits a caller with 429 and names when its limit resets,
-    /// then fails once more; the fetch waits what it was told, then the
-    /// backoff, and completes every page.
     #[tokio::test]
-    async fn a_multi_page_fetch_survives_a_limit_and_a_failure_waiting_what_was_named() {
-        let named = Duration::from_secs(7);
+    async fn endless_operation_pages_stop_before_request_three_hundred_and_one() {
+        let pages = (1..=300)
+            .map(|number| {
+                Answer::status(
+                    200,
+                    &page_json(
+                        true,
+                        Some(&format!("cursor-{number}")),
+                        Some(&format!("operation-{number}")),
+                    ),
+                )
+            })
+            .collect();
+        let (gateway, log, _) = fake::gateway(
+            pages,
+            Some(Answer::status(
+                200,
+                &page_json(false, None, Some("operation-301")),
+            )),
+        );
+        let allowance = RequestAllowance::new(300);
+        let adapter = channel(gateway);
+
+        let error = adapter
+            .fetch_operations(
+                AccountId(Uuid::from_u128(1)),
+                "00000000-0000-0000-0000-000000000001",
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                BrokerRequestContext {
+                    deadline: None,
+                    allowance: &allowance,
+                },
+            )
+            .await
+            .expect_err("the next page exceeds this sync's request allowance");
+
+        assert!(matches!(
+            error,
+            BrokerError::RequestCeiling {
+                ref broker,
+                ceiling: 300
+            } if broker == "tinkoff"
+        ));
+        assert_eq!(log.lock().expect("log").len(), 300);
+        let message = error.to_string();
+        assert!(message.contains("300"), "{message}");
+        assert!(message.contains("narrow"), "{message}");
+    }
+
+    /// T-Invest limits a caller with 429 and names a reset shorter than the
+    /// mandatory pause. Once the first-send safety wait has elapsed, the fetch
+    /// stops on the response and exposes the full minute before another call.
+    #[tokio::test]
+    async fn a_multi_page_fetch_stops_at_a_limit_and_exposes_the_host_pause() {
         let (gateway, log, time) = fake::gateway(
             vec![
                 Answer {
                     status: 429,
                     body: "{}".to_owned(),
-                    reset: Some(named),
+                    reset: Some(Duration::from_secs(7)),
                 },
-                Answer::status(503, "{}"),
-                Answer::status(200, &page_json(true, Some("cursor-2"), Some("operation-1"))),
-                Answer::status(200, &page_json(false, None, Some("operation-2"))),
+                Answer::status(200, &page_json(false, None, Some("operation-1"))),
             ],
             None,
         );
 
-        let parsed = fetch(&channel(gateway)).await.expect("every page arrives");
+        let error = fetch(&channel(gateway))
+            .await
+            .expect_err("the broker host is paused");
 
-        assert_eq!(parsed.accepted.len() + parsed.quarantined.len(), 2);
-        let backoff = RetryPolicy::new(ATTEMPTS, FIRST_BACKOFF).delay(2, &Outcome::status(503));
-        assert_eq!(time.slept(), [named, backoff]);
-        let log = log.lock().expect("log");
-        assert_eq!(log.len(), 4);
-        assert!(!log[2].contains("cursor"), "{}", log[2]);
-        assert!(log[3].contains(r#""cursor":"cursor-2""#), "{}", log[3]);
+        assert!(
+            matches!(
+                &error,
+                BrokerError::Unreachable {
+                    detail,
+                    retry_after: Some(retry_after),
+                    ..
+                } if detail.contains("paused after status 429")
+                    && *retry_after == Duration::from_secs(60)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(time.slept(), [Duration::from_secs(60)]);
+        assert_eq!(log.lock().expect("log").len(), 1);
     }
 
     #[tokio::test]
@@ -3030,7 +3140,7 @@ mod tests {
 
         assert!(matches!(error, BrokerError::Refused { .. }), "{error:?}");
         assert_eq!(log.lock().expect("log").len(), 1);
-        assert!(time.slept().is_empty());
+        assert_eq!(time.slept(), [Duration::from_secs(60)]);
         assert!(!error.to_string().contains(TOKEN));
         assert!(!format!("{error:?}").contains(TOKEN));
     }
@@ -3056,7 +3166,7 @@ mod tests {
                 AccountId(Uuid::from_u128(1)),
                 "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 31),
-                None,
+                broker_context(None),
             )
             .await
             .expect_err("every attempt failed");
@@ -3085,11 +3195,10 @@ mod tests {
         assert_eq!(log.lock().expect("log").len(), 2);
     }
 
-    /// A wait T-Invest asks for that would end past the sync's deadline is
-    /// not waited: the fetch stops there, as "unreachable, retry later", and
-    /// says how many pages had arrived.
+    /// A 429 stops a multi-page fetch without waiting in the request and says
+    /// how many pages had arrived before the persisted host pause.
     #[tokio::test]
-    async fn a_fetch_cut_by_its_deadline_is_unreachable_and_names_the_pages_fetched() {
+    async fn a_fetch_limited_after_two_pages_is_unreachable_and_names_the_pages_fetched() {
         let (gateway, log, time) = fake::gateway(
             vec![
                 Answer::status(200, &page_json(true, Some("cursor-2"), Some("operation-1"))),
@@ -3102,7 +3211,7 @@ mod tests {
             ],
             None,
         );
-        let deadline = time.now() + Duration::from_secs(30);
+        let deadline = time.now() + Duration::from_secs(90);
 
         let error = channel(gateway)
             .fetch_operations(
@@ -3110,17 +3219,37 @@ mod tests {
                 "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 01),
                 time::macros::date!(2026 - 08 - 31),
-                Some(deadline),
+                broker_context(Some(deadline)),
             )
             .await
             .expect_err("the named wait crosses the deadline");
 
-        assert_eq!(log.lock().expect("log").len(), 3);
-        assert!(time.slept().is_empty(), "a wait past the deadline was run");
+        assert_eq!(
+            log.lock().expect("log").len(),
+            3,
+            "error={error:?}; sleeps={:?}",
+            time.slept()
+        );
+        assert_eq!(
+            time.slept(),
+            [
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ],
+            "first-send safety and host spacing were waited before the three sends"
+        );
         assert!(
-            matches!(&error, BrokerError::Unreachable { detail, .. }
-                if detail.contains("retry after")
-                    && detail.ends_with("operation pages fetched before it: 2")),
+            matches!(
+                &error,
+                BrokerError::Unreachable {
+                    detail,
+                    retry_after: Some(retry_after),
+                    ..
+                } if detail.contains("reopens at")
+                    && detail.ends_with("operation pages fetched before it: 2")
+                    && *retry_after == Duration::from_secs(60)
+            ),
             "{error:?}"
         );
     }
@@ -3134,7 +3263,7 @@ mod tests {
                 AccountId(Uuid::from_u128(1)),
                 "00000000-0000-0000-0000-000000000001",
                 time::macros::date!(2026 - 08 - 31),
-                Some(time.now()),
+                broker_context(Some(time.now())),
             )
             .await
             .expect_err("the deadline is now");
@@ -3160,10 +3289,36 @@ mod tests {
         let error = super::tinkoff_error(super::TinkoffError::Gateway(
             iaam_http::GatewayError::UnknownBudget {
                 destination: iaam_http::Destination::TinkoffProd,
-                method: "Nowhere",
+                path: "/Nowhere".to_owned(),
             },
         ));
         assert!(matches!(error, BrokerError::Adapter { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn egress_and_tally_refusals_remain_actionable_for_the_sync_surface() {
+        for refusal in [
+            iaam_http::GatewayError::BrokerEgressOff,
+            iaam_http::GatewayError::TallyCorrupt {
+                path: std::path::PathBuf::from("/run/iaam/outbound-tally"),
+                reason: "missing header".to_owned(),
+            },
+        ] {
+            let error = super::tinkoff_error(super::TinkoffError::Gateway(refusal));
+            let BrokerError::Unreachable {
+                detail,
+                retry_after,
+                ..
+            } = error
+            else {
+                panic!("operational refusal became an adapter fault: {error:?}");
+            };
+            assert!(retry_after.is_none());
+            assert!(
+                detail.contains("IAAM_BROKER_EGRESS") || detail.contains("outbound-tally"),
+                "{detail}"
+            );
+        }
     }
 
     /// A client or trust root this build could not construct is our fault

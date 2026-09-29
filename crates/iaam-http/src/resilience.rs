@@ -23,6 +23,13 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// come back rather than held. Up to it, the source's word is obeyed in full.
 pub const MAX_NAMED_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// Longest delay accepted from an endpoint response header.
+///
+/// The value is persisted and later added to monotonic and system-clock
+/// instants. A one-day bound preserves a broker's full daily refusal without
+/// allowing an untrusted integer to overflow those calculations.
+pub const MAX_SOURCE_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Attempt outcome.
 #[derive(Debug)]
 pub enum Outcome {
@@ -101,11 +108,12 @@ impl RetryPolicy {
     /// The wait before the next attempt, also when no attempt is left: a
     /// caller that gave up is told when trying again is worth it.
     ///
-    /// A `Retry-After` the source named wins over the guess, in full: the
-    /// source knows its own refusal window, we do not, and coming back sooner
-    /// is exactly the hammering it asked us to stop. `MAX_BACKOFF` bounds our
-    /// guess, not the source's word; a named wait too long to hold a caller
-    /// for is the gateway's to refuse (`MAX_NAMED_WAIT`).
+    /// A `Retry-After` the source named wins over the guess. The source knows
+    /// its own refusal window, and coming back sooner is exactly the hammering
+    /// it asked us to stop. `MAX_BACKOFF` bounds our guess;
+    /// `MAX_SOURCE_DELAY` bounds untrusted header arithmetic; a named wait too
+    /// long to hold a caller for is the gateway's to refuse
+    /// (`MAX_NAMED_WAIT`).
     #[must_use]
     pub fn delay(&self, attempt: u32, outcome: &Outcome) -> Duration {
         match outcome {
@@ -135,18 +143,23 @@ impl RetryPolicy {
 ///
 /// Both forms the spec allows: delay-seconds (`Retry-After: 120`) and an
 /// HTTP-date (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`), the latter as the
-/// time left until it; a date already past asks for no wait. A value that
-/// parses as neither returns `None` rather than zero or an error, so the
-/// caller can fall back to the computed backoff instead of retrying
-/// immediately or aborting the attempt outright.
+/// time left until it; a date already past asks for no wait. Valid values are
+/// clamped to [`MAX_SOURCE_DELAY`]. A value that parses as neither returns
+/// `None` rather than zero or an error, so the caller can fall back to the
+/// computed backoff instead of retrying immediately or aborting the attempt
+/// outright.
 #[must_use]
 pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if let Ok(seconds) = value.parse() {
-        return Some(Duration::from_secs(seconds));
+        return Some(Duration::from_secs(seconds).min(MAX_SOURCE_DELAY));
     }
     let at = httpdate::parse_http_date(value).ok()?;
-    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
+    Some(
+        at.duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .min(MAX_SOURCE_DELAY),
+    )
 }
 
 /// A transient refusal, where a retry may produce a different response.
@@ -331,7 +344,9 @@ mod tests {
 
     /// 2026-10-21 07:28:00 UTC, the instant the dates below are read at.
     fn at() -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_567_680)
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(1_792_567_680))
+            .expect("fixture time is representable")
     }
 
     #[test]
@@ -339,6 +354,14 @@ mod tests {
         assert_eq!(
             parse_retry_after("120", at()),
             Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn delay_seconds_are_clamped_to_one_day() {
+        assert_eq!(
+            parse_retry_after(&u64::MAX.to_string(), at()),
+            Some(MAX_SOURCE_DELAY)
         );
     }
 
@@ -355,6 +378,14 @@ mod tests {
         assert_eq!(
             parse_retry_after("Wed, 21 Oct 2026 07:30:30 GMT", at()),
             Some(Duration::from_secs(150))
+        );
+    }
+
+    #[test]
+    fn an_http_date_is_clamped_to_one_day() {
+        assert_eq!(
+            parse_retry_after("Fri, 23 Oct 2026 07:28:00 GMT", at()),
+            Some(MAX_SOURCE_DELAY)
         );
     }
 

@@ -8,13 +8,14 @@
 //! # Every outbound call goes through the gateway
 //!
 //! [`Gateway::send`] is the only public way to send a request, and
-//! [`Outbound`] the one type a caller holds it by. Budgets, the
-//! one-request-per-host lane, retries and the circuit breaker live there, and
-//! a caller that reached the transport directly would skip all of them
-//! without a single error: that is how the calls this crate once served
-//! outgrew their limits. So the production transport cannot be built outside
-//! this crate — [`Gateway::production`] is how a process gets it, already
-//! inside its gateway — and outside it neither of these compiles:
+//! [`Outbound`] the one type a caller holds it by. Routing, retries and the
+//! circuit breaker live there. MOEX and CBR pacing uses an in-process host
+//! lane; broker budgets, host spacing and the UTC daily ceiling use a locked
+//! per-machine outbound tally. A caller that reached the transport directly
+//! would skip those rules without a single error. So the production transport
+//! cannot be built outside this crate — [`Gateway::production`] is how a
+//! process gets it, already inside its gateway — and outside it neither of
+//! these compiles:
 //!
 //! ```compile_fail,E0624
 //! use iaam_http::client::HttpClient;
@@ -34,25 +35,34 @@
 //! - no crate but this one depends on `reqwest` or any other HTTP client
 //!   crate, under its own name, under another (`package = "reqwest"`) or
 //!   through the workspace, and none builds a `reqwest` client by path;
-//! - production code builds a gateway once, with [`Gateway::production`] in
-//!   `serve` of `iaam-bootstrap`, and names the type without an alias: the
-//!   gateway is one per process and shared, because two gateways are two
-//!   budgets against the same destination. [`Gateway::new`] and
-//!   `Gateway::with_parts` stay public for tests, which build their own
-//!   over a fake transport and clock.
+//! - `serve` builds one gateway with [`Gateway::production`] and shares it
+//!   throughout the server process. [`Gateway::new`] and
+//!   `Gateway::with_parts` stay public for tests, which build their own over a
+//!   fake transport and clock.
 //!
-//! The gateway's state lives in the memory of that one process, so an
-//! instance runs one server process: `docs/deployment.md` §1.1.
+//! In-process lanes, named waits and breakers do not survive a restart. The
+//! broker tally does and is shared by every process given its path. The
+//! deployment contract is in `docs/deployment.md` §1.1.
+
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!(
+    "iaam-http feature `test-support` requires debug assertions and cannot be enabled in release builds"
+);
 
 pub mod client;
 pub mod destination;
+mod egress;
 pub mod gateway;
 pub mod request;
 pub mod resilience;
 pub mod response;
+mod tally;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod trust;
 
 pub use destination::Destination;
+pub use egress::{BrokerEgress, BrokerEgressConfigError, EGRESS_DIRECTORY};
 pub use gateway::{Gateway, GatewayError, Outbound};
-pub use request::{AuthScheme, HttpMethod, HttpRequest, RequestBody, Secret};
+pub use request::{AuthScheme, HttpMethod, HttpRequest, RequestAllowance, RequestBody, Secret};
 pub use response::{HttpError, HttpResponse};

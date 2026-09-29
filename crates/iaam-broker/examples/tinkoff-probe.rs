@@ -16,7 +16,7 @@
 use std::env;
 use std::fs;
 
-use iaam_http::{Destination, Gateway, GatewayError, HttpRequest, RequestBody};
+use iaam_http::{BrokerEgress, Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 
 // The ordinary method at the sandbox address is the method recommended by
 // T-Invest. The sandbox method at this same address returns `40003`, namely a
@@ -25,9 +25,10 @@ const METHOD: &str = "tinkoff.public.invest.api.contract.v1.UsersService/GetAcco
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // A separate process, so a gateway of its own: it shares no budget with
-    // a running server, and a probe is one request.
-    let gateway = Gateway::production()?;
+    // The same process configuration as the server: broker egress is off
+    // unless the operator explicitly names the canonical tally, and this
+    // process must acquire the sandbox endpoint for its lifetime.
+    let gateway = Gateway::production(BrokerEgress::from_env()?)?;
     // GetAccounts only reads, so a second copy of it is harmless.
     let mut request = HttpRequest::post(
         Destination::TinkoffSandbox,
@@ -52,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rejection, and its status is the whole answer. Status and body length
     // only: a body is the broker's answer about the account, and terminal
     // output ends up in logs and pasted transcripts.
-    match gateway.send("UsersService", &request, None).await {
+    match gateway.send(&request, None).await {
         Ok(response) => println!("HTTP {}, {} bytes", response.status, response.body.len()),
         Err(GatewayError::Rejected { status, body, .. }) => {
             println!("HTTP {status}, {} bytes", body.as_bytes().len());

@@ -5,7 +5,7 @@
 
 use crate::AppServices;
 use crate::error::AppError;
-use crate::ports::{BrokerChannel, PortfolioAsOf, Principal, Recorded};
+use crate::ports::{BrokerChannel, BrokerRequestContext, PortfolioAsOf, Principal, Recorded};
 use crate::scenarios::coverage_gap;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
@@ -14,7 +14,7 @@ use iaam_core::event::{Confidence, Event, Relation};
 use iaam_core::ids::InstrumentId;
 use iaam_core::ids::{AccountId, EventId, OwnerId, PrincipalId};
 use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::SourceChannel};
-use iaam_http::HttpRequest;
+use iaam_http::{HttpRequest, RequestAllowance};
 use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
 use iaam_ingest::operation::NormalizationContext;
 use iaam_ingest::{Verdict, normalize};
@@ -71,6 +71,11 @@ pub struct SyncOutcome {
 /// is made under this one deadline, so a broker that slows to a crawl ends
 /// the sync with a refusal instead of holding its account indefinitely.
 pub const SYNC_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// Maximum transport attempts one broker sync may send, retries included.
+///
+/// The sync mints one allowance and carries it through account discovery,
+/// session exchange, operations pages and portfolio.
+pub const BROKER_SYNC_REQUEST_CEILING: u32 = 300;
 
 /// The accounts a broker sync is running for, in this process.
 ///
@@ -164,6 +169,11 @@ pub async fn sync_broker(
 
     let _claim = services.running_syncs.claim(principal.owner, account)?;
     let deadline = Some(Instant::now() + SYNC_DEADLINE);
+    let allowance = RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING);
+    let broker_context = BrokerRequestContext {
+        deadline,
+        allowance: &allowance,
+    };
 
     // The account the broker is asked for is its own number, never our
     // identifier (`iaam-xzz5.3.2`). A stored binding is the word that stands;
@@ -180,7 +190,7 @@ pub async fn sync_broker(
         Some(number) => (number, None),
         None => {
             let candidates = broker
-                .fetch_account_numbers(deadline)
+                .fetch_account_numbers(broker_context)
                 .await
                 .map_err(broker_error)?;
             match candidates.as_slice() {
@@ -201,7 +211,7 @@ pub async fn sync_broker(
     };
 
     let parsed = broker
-        .fetch_operations(account, &broker_account, from, to, deadline)
+        .fetch_operations(account, &broker_account, from, to, broker_context)
         .await
         .map_err(broker_error)?;
     let channel = broker.channel();
@@ -228,7 +238,7 @@ pub async fn sync_broker(
     } else {
         Some(
             broker
-                .fetch_portfolio(account, &broker_account, to, deadline)
+                .fetch_portfolio(account, &broker_account, to, broker_context)
                 .await
                 .map_err(broker_error)?,
         )
@@ -481,6 +491,10 @@ fn broker_error(error: crate::ports::BrokerError) -> AppError {
             origin: broker,
             detail,
             retry_after,
+        },
+        BrokerError::RequestCeiling { broker, ceiling } => AppError::SyncRequestCeiling {
+            origin: broker,
+            ceiling,
         },
         // What to fix is the broker's own advice: the source-general refusal
         // cannot know that the access configured for the owner is the culprit.

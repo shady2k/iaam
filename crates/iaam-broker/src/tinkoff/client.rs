@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::credentials::BrokerToken;
 use crate::environment::{Environment, Method};
-use iaam_http::{Destination, GatewayError, HttpRequest, Outbound, RequestBody};
+use iaam_http::{Destination, GatewayError, HttpRequest, Outbound, RequestAllowance, RequestBody};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -14,9 +14,9 @@ use thiserror::Error;
 /// error must not turn a remote refusal into an access leak.
 #[derive(Debug, Error)]
 pub enum TinkoffError {
-    /// T-Invest failed transiently — a 5xx, a 429, a network fault, an open
-    /// breaker, a deadline — and went on failing through the gateway's
-    /// retries. The same call is worth making again after `retry_after`.
+    /// T-Invest failed transiently — a 5xx, a network fault, an open breaker
+    /// or a deadline — and went on failing through the gateway's retries. The
+    /// same call is worth making again after `retry_after`.
     #[error(
         "T-Invest is unreachable after {attempts} attempts (last status {status:?}); retry after {retry_after:?}"
     )]
@@ -28,6 +28,11 @@ pub enum TinkoffError {
         /// When trying again is worth it.
         retry_after: Duration,
     },
+    /// This sync has spent every request attempt it is allowed.
+    #[error(
+        "T-Invest request ceiling of {ceiling} attempts reached; the range is too long for one sync; narrow it and sync again"
+    )]
+    RequestCeiling { ceiling: u32 },
     /// The gateway rejected the presented token.
     #[error("T-Invest token is invalid")]
     InvalidToken,
@@ -157,15 +162,8 @@ impl TinkoffClient {
     }
 
     /// Return the raw response body from `UsersService/GetAccounts`.
-    pub async fn get_accounts(&self) -> Result<String, TinkoffError> {
-        self.post(
-            Method::Accounts,
-            "UsersService",
-            "UsersService/GetAccounts",
-            json!({}),
-            None,
-        )
-        .await
+    pub async fn get_accounts(&self, allowance: &RequestAllowance) -> Result<String, TinkoffError> {
+        self.post(ACCOUNTS, json!({}), None, allowance).await
     }
 
     /// Return the raw response body from `OperationsService/GetPortfolio`.
@@ -175,13 +173,13 @@ impl TinkoffClient {
         &self,
         account_id: &str,
         deadline: Option<Instant>,
+        allowance: &RequestAllowance,
     ) -> Result<String, TinkoffError> {
         self.post(
-            Method::Portfolio,
-            "OperationsService",
-            "OperationsService/GetPortfolio",
+            PORTFOLIO,
             json!({ "accountId": account_id }),
             deadline,
+            allowance,
         )
         .await
     }
@@ -193,37 +191,41 @@ impl TinkoffClient {
         &self,
         request: &GetOperationsByCursorRequest,
         deadline: Option<Instant>,
+        allowance: &RequestAllowance,
     ) -> Result<String, TinkoffError> {
         let body = self
             .post(
-                Method::Operations,
-                "OperationsService",
-                "OperationsService/GetOperationsByCursor",
+                OPERATIONS,
                 serde_json::to_value(request).map_err(|_| TinkoffError::RequestSerialization)?,
                 deadline,
+                allowance,
             )
             .await?;
         validate_cursor_page(&body)?;
         Ok(body)
     }
 
-    /// `service` names the budget the call draws on, as T-Invest states its
-    /// limits: per service, not per method.
+    /// The request path identifies the service budget at the gateway.
     async fn post(
         &self,
-        method: Method,
-        service: &'static str,
-        path: &str,
+        call: ReadCall,
         body: Value,
         deadline: Option<Instant>,
+        allowance: &RequestAllowance,
     ) -> Result<String, TinkoffError> {
-        ensure_method_available(self.environment, method)?;
+        ensure_method_available(self.environment, call.method)?;
         let body = serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?;
-        let path = format!("{PACKAGE}.{path}");
-        let request = Self::request(self.environment, &path, body, self.token.expose());
+        let path = format!("{PACKAGE}.{}", call.path);
+        let request = Self::request(
+            self.environment,
+            &path,
+            body,
+            self.token.expose(),
+            allowance.clone(),
+        );
         let response = self
             .gateway
-            .send(service, &request, deadline)
+            .send(&request, deadline)
             .await
             .map_err(|error| gateway_error(error, self.token.expose()))?;
         String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)
@@ -236,13 +238,42 @@ impl TinkoffClient {
     // Marked idempotent because every RPC this client calls only reads: a
     // POST is sent once unless its caller says a second copy is harmless. A
     // write added to this client needs a request of its own, left unmarked.
-    fn request(environment: Environment, path: &str, body: String, token: &str) -> HttpRequest {
+    fn request(
+        environment: Environment,
+        path: &str,
+        body: String,
+        token: &str,
+        allowance: RequestAllowance,
+    ) -> HttpRequest {
         HttpRequest::post(destination_for(environment), path, RequestBody::Json(body))
             .idempotent()
             .with_bearer(token)
             .with_reset_header(RESET_HEADER)
+            .with_request_allowance(allowance)
     }
 }
+
+/// Metadata that keeps one read-only RPC's environment check and path together.
+#[derive(Clone, Copy)]
+struct ReadCall {
+    method: Method,
+    path: &'static str,
+}
+
+const ACCOUNTS: ReadCall = ReadCall {
+    method: Method::Accounts,
+    path: "UsersService/GetAccounts",
+};
+
+const PORTFOLIO: ReadCall = ReadCall {
+    method: Method::Portfolio,
+    path: "OperationsService/GetPortfolio",
+};
+
+const OPERATIONS: ReadCall = ReadCall {
+    method: Method::Operations,
+    path: "OperationsService/GetOperationsByCursor",
+};
 
 /// The protobuf package every service lives in. The REST gateway serves a
 /// method at `/rest/<package>.<Service>/<Method>`; without the package it
@@ -278,6 +309,12 @@ fn ensure_method_available(environment: Environment, method: Method) -> Result<(
 /// A transient failure the gateway gave up on is "unreachable, retry later";
 /// only a permanent refusal is read as T-Invest's own answer.
 fn gateway_error(error: GatewayError, token: &str) -> TinkoffError {
+    if let GatewayError::RequestCeiling { ceiling, .. } = error {
+        return TinkoffError::RequestCeiling { ceiling };
+    }
+    if error.is_broker_egress_refusal() {
+        return TinkoffError::Gateway(error);
+    }
     if let Some(retry_after) = error.retry_after() {
         return TinkoffError::Unreachable {
             status: error.status(),
@@ -355,6 +392,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
+    use std::time::SystemTime;
 
     use iaam_http::gateway::{ATTEMPTS, BUDGETS, Clock, FIRST_BACKOFF, Sleeper, Transport};
     use iaam_http::resilience::{Outcome, RetryPolicy};
@@ -369,11 +407,22 @@ mod tests {
     struct FakeTime {
         now: Mutex<Instant>,
         slept: Mutex<Vec<Duration>>,
+        wall: Mutex<SystemTime>,
     }
 
     impl Clock for FakeTime {
         fn now(&self) -> Instant {
             *self.now.lock().expect("clock")
+        }
+
+        fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+            let elapsed = self
+                .wall
+                .lock()
+                .expect("wall clock")
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?;
+            Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
         }
     }
 
@@ -381,6 +430,7 @@ mod tests {
         fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
             self.slept.lock().expect("sleeps").push(delay);
             *self.now.lock().expect("clock") += delay;
+            *self.wall.lock().expect("wall clock") += delay;
             Box::pin(async {})
         }
     }
@@ -410,6 +460,24 @@ mod tests {
         })
     }
 
+    fn broker_egress_directory() -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "iaam-broker-tinkoff-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::write(
+            directory.join("outbound-tally"),
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+        )
+        .expect("initialized tally created");
+        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+            .expect("initialized generation created");
+        directory
+    }
+
     fn client(
         answers: Vec<Result<HttpResponse, HttpError>>,
     ) -> (TinkoffClient, Arc<Mutex<Vec<String>>>, Arc<FakeTime>) {
@@ -423,10 +491,12 @@ mod tests {
         let time = Arc::new(FakeTime {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
+            wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         });
         let paths = Arc::new(Mutex::new(Vec::new()));
+        let directory = broker_egress_directory();
         let gateway = Arc::new(
-            Gateway::with_parts(
+            Gateway::with_parts_in_directory(
                 FakeTinvest {
                     script: Mutex::new(answers.into()),
                     paths: Arc::clone(&paths),
@@ -434,6 +504,8 @@ mod tests {
                 BUDGETS,
                 Arc::clone(&time) as Arc<dyn Clock>,
                 Arc::clone(&time) as Arc<dyn Sleeper>,
+                iaam_http::BrokerEgress::On,
+                &directory,
             )
             .expect("the documented table is valid"),
         );
@@ -452,11 +524,17 @@ mod tests {
         let (client, gateway, time) =
             client(vec![answer(401, &format!(r#"{{"message":"{TOKEN}"}}"#))]);
 
-        let error = client.get_accounts().await.expect_err("401 is a refusal");
+        let error = client
+            .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect_err("401 is a refusal");
 
         assert!(matches!(error, TinkoffError::InvalidToken), "{error:?}");
         assert_eq!(sent(&gateway), 1, "a rejected token was sent again");
-        assert!(time.slept.lock().expect("sleeps").is_empty());
+        assert_eq!(
+            *time.slept.lock().expect("sleeps"),
+            [Duration::from_secs(60)]
+        );
         assert!(!error.to_string().contains(TOKEN));
         assert!(!format!("{error:?}").contains(TOKEN));
     }
@@ -465,7 +543,10 @@ mod tests {
     async fn a_forbidden_answer_is_an_invalid_token_too() {
         let (client, gateway, _) = client(vec![answer(403, "{}")]);
 
-        let error = client.get_accounts().await.expect_err("403 is a refusal");
+        let error = client
+            .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect_err("403 is a refusal");
 
         assert!(matches!(error, TinkoffError::InvalidToken), "{error:?}");
         assert_eq!(sent(&gateway), 1);
@@ -480,7 +561,7 @@ mod tests {
         ]);
 
         let body = client
-            .get_accounts()
+            .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the third attempt passes");
 
@@ -495,7 +576,7 @@ mod tests {
         let (client, gateway, _) = client(vec![answer(503, "{}"), answer(200, "{}")]);
 
         client
-            .get_portfolio("account", None)
+            .get_portfolio("account", None, &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the second attempt passes");
 
@@ -503,18 +584,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transient_failure_of_an_operations_page_is_retried() {
-        let (client, gateway, _) = client(vec![
-            Err(HttpError::Timeout),
-            answer(200, r#"{"hasNext":false,"items":[]}"#),
-        ]);
+    async fn a_timeout_of_an_operations_page_closes_egress_without_retrying() {
+        let (client, gateway, _) = client(vec![Err(HttpError::Timeout)]);
 
-        client
-            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"), None)
+        let error = client
+            .get_operations_by_cursor(
+                &GetOperationsByCursorRequest::new("account"),
+                None,
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
-            .expect("the second attempt passes");
+            .expect_err("an outcome without a status closes egress");
 
-        assert_eq!(sent(&gateway), 2);
+        assert!(
+            matches!(
+                &error,
+                TinkoffError::Gateway(refused)
+                    if refused.is_broker_egress_refusal()
+                        && refused.retry_after() == Some(Duration::from_secs(90))
+            ),
+            "{error:?}"
+        );
+        assert_eq!(sent(&gateway), 1);
     }
 
     #[test]
@@ -524,6 +615,7 @@ mod tests {
             "UsersService/GetAccounts",
             "{}".to_owned(),
             TOKEN,
+            iaam_http::RequestAllowance::new(u32::MAX),
         );
         assert!(request.is_idempotent());
     }
@@ -536,7 +628,7 @@ mod tests {
         let (client, gateway, _) = client(answers);
 
         let error = client
-            .get_accounts()
+            .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("every attempt failed");
 
@@ -555,20 +647,49 @@ mod tests {
         );
         assert_eq!(sent(&gateway), ATTEMPTS as usize);
     }
+    #[test]
+    fn the_daily_egress_ceiling_keeps_its_operational_detail() {
+        let mapped = gateway_error(
+            GatewayError::DailyCeiling {
+                destination: Destination::TinkoffProd,
+                ceiling: 1_000,
+                resets_at: "Tue, 01 Jan 2030 00:00:00 GMT".to_owned(),
+                retry_after: Duration::from_secs(60),
+            },
+            TOKEN,
+        );
+
+        let TinkoffError::Gateway(refused) = mapped else {
+            panic!("daily ceiling was collapsed into {mapped:?}");
+        };
+        let detail = refused.to_string();
+        assert!(detail.contains("1000"), "{detail}");
+        assert!(detail.contains("Tue, 01 Jan 2030 00:00:00 GMT"), "{detail}");
+        assert!(!detail.contains(TOKEN), "{detail}");
+    }
 
     #[tokio::test]
-    async fn a_network_failure_that_outlasts_the_retries_is_unreachable() {
-        let answers = (0..ATTEMPTS).map(|_| Err(HttpError::Network)).collect();
-        let (client, _, _) = client(answers);
+    async fn a_network_failure_closes_egress_without_retrying() {
+        let (client, paths, time) = client(vec![Err(HttpError::Network)]);
 
         let error = client
-            .get_accounts()
+            .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
             .await
-            .expect_err("every attempt failed");
+            .expect_err("an outcome without a status closes egress");
 
         assert!(
-            matches!(error, TinkoffError::Unreachable { status: None, .. }),
+            matches!(
+                &error,
+                TinkoffError::Gateway(refused)
+                    if refused.is_broker_egress_refusal()
+                        && refused.retry_after() == Some(Duration::from_secs(90))
+            ),
             "{error:?}"
+        );
+        assert_eq!(sent(&paths), 1);
+        assert_eq!(
+            *time.slept.lock().expect("sleeps"),
+            [Duration::from_secs(60)]
         );
     }
 
@@ -576,7 +697,10 @@ mod tests {
     async fn a_transport_that_cannot_be_built_stays_a_transport_error() {
         let (client, _, _) = client(vec![Err(HttpError::ClientNotBuilt("no".to_owned()))]);
 
-        let error = client.get_accounts().await.expect_err("nothing was sent");
+        let error = client
+            .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect_err("nothing was sent");
 
         assert!(matches!(error, TinkoffError::Transport(_)), "{error:?}");
     }
@@ -589,7 +713,7 @@ mod tests {
         )]);
 
         let error = client
-            .get_portfolio("account", None)
+            .get_portfolio("account", None, &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect_err("400");
 
@@ -609,23 +733,34 @@ mod tests {
         let (client, _, time) = client(answers);
 
         for _ in 0..25 {
-            client.get_accounts().await.expect("accounts");
+            client
+                .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect("accounts");
         }
         for _ in 0..25 {
             client
-                .get_portfolio("account", None)
+                .get_portfolio("account", None, &iaam_http::RequestAllowance::new(u32::MAX))
                 .await
                 .expect("portfolio");
         }
-        assert!(time.slept.lock().expect("sleeps").is_empty());
+        assert_eq!(
+            *time.slept.lock().expect("sleeps"),
+            std::iter::once(Duration::from_secs(60))
+                .chain(std::iter::repeat_n(Duration::from_secs(1), 49))
+                .collect::<Vec<_>>()
+        );
         client
-            .get_operations_by_cursor(&GetOperationsByCursorRequest::new("account"), None)
+            .get_operations_by_cursor(
+                &GetOperationsByCursorRequest::new("account"),
+                None,
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("operations");
-        assert!(
-            time.slept.lock().expect("sleeps").is_empty(),
-            "operations waited on the users budget"
-        );
+        let sleeps = time.slept.lock().expect("sleeps");
+        assert_eq!(sleeps.len(), 51, "operations waited for host spacing");
+        assert_eq!(sleeps.last(), Some(&Duration::from_secs(1)));
     }
 
     #[tokio::test]
@@ -639,13 +774,23 @@ mod tests {
 
         assert_eq!(
             client
-                .get_operations_by_cursor(&request, None)
+                .get_operations_by_cursor(
+                    &request,
+                    None,
+                    &iaam_http::RequestAllowance::new(u32::MAX),
+                )
                 .await
                 .expect("page"),
             page
         );
         assert!(matches!(
-            client.get_operations_by_cursor(&request, None).await,
+            client
+                .get_operations_by_cursor(
+                    &request,
+                    None,
+                    &iaam_http::RequestAllowance::new(u32::MAX),
+                )
+                .await,
             Err(TinkoffError::PartialResponse)
         ));
     }
@@ -656,13 +801,16 @@ mod tests {
         let (client, _, time) = client(answers);
 
         for _ in 0..26 {
-            client.get_accounts().await.expect("accounts");
+            client
+                .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect("accounts");
         }
 
-        assert_eq!(
-            *time.slept.lock().expect("sleeps"),
-            [Duration::from_secs(60)]
-        );
+        let mut expected = vec![Duration::from_secs(60)];
+        expected.extend(std::iter::repeat_n(Duration::from_secs(1), 24));
+        expected.push(Duration::from_secs(36));
+        assert_eq!(*time.slept.lock().expect("sleeps"), expected);
     }
 
     #[test]
@@ -672,6 +820,7 @@ mod tests {
             "UsersService/GetAccounts",
             "{}".to_owned(),
             TOKEN,
+            iaam_http::RequestAllowance::new(u32::MAX),
         );
         assert_eq!(request.reset_header(), Some("x-ratelimit-reset"));
     }
@@ -750,10 +899,20 @@ mod tests {
                 ],
             );
 
-            client.get_accounts().await.expect("accounts");
-            client.get_portfolio("Main", None).await.expect("portfolio");
             client
-                .get_operations_by_cursor(&GetOperationsByCursorRequest::new("Main"), None)
+                .get_accounts(&iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect("accounts");
+            client
+                .get_portfolio("Main", None, &iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect("portfolio");
+            client
+                .get_operations_by_cursor(
+                    &GetOperationsByCursorRequest::new("Main"),
+                    None,
+                    &iaam_http::RequestAllowance::new(u32::MAX),
+                )
                 .await
                 .expect("operations");
 

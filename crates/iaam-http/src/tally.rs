@@ -1131,3 +1131,179 @@ fn validate_atom(value: &str, line: usize) -> Result<(), TallyError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "iaam-tally-unit-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path)
+                .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
+            std::fs::write(path.join(TALLY_FILE), "")
+                .unwrap_or_else(|error| panic!("create tally: {error}"));
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tally(label: &str) -> (TempDir, EgressDirectory, OutboundTally) {
+        let temporary = TempDir::new(label);
+        let directory = EgressDirectory::open(&temporary.0)
+            .unwrap_or_else(|error| panic!("open egress directory: {error}"));
+        let tally = OutboundTally::new(directory.clone())
+            .unwrap_or_else(|error| panic!("open tally: {error}"));
+        (temporary, directory, tally)
+    }
+
+    fn ready_send(tally: &OutboundTally, host: &str, at: Duration) -> BootTime {
+        let first = BootTime::new("test-boot", at);
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &first),
+            Ok(TallyDecision::Wait(wait)) if wait == Duration::from_secs(60)
+        ));
+        let ready = BootTime::new("test-boot", at + Duration::from_secs(60));
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &ready),
+            Ok(TallyDecision::Send)
+        ));
+        ready
+    }
+
+    #[test]
+    fn a_shorter_overlapping_retry_after_never_shortens_the_longer_pause() {
+        let (_temporary, _directory, tally) = tally("overlapping-pause");
+        let host = "https://broker.invalid";
+        let sent = ready_send(&tally, host, Duration::from_secs(10_000));
+        assert!(matches!(
+            tally.record_response(
+                host,
+                503,
+                Some(Duration::from_secs(120)),
+                &sent
+            ),
+            Ok(TallyResponseDecision::Paused { retry_after })
+                if retry_after == Duration::from_secs(120)
+        ));
+
+        let later = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(10));
+        assert!(matches!(
+            tally.record_response(
+                host,
+                503,
+                Some(Duration::from_secs(30)),
+                &later
+            ),
+            Ok(TallyResponseDecision::Paused { retry_after })
+                if retry_after == Duration::from_secs(110)
+        ));
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &later),
+            Ok(TallyDecision::Paused { retry_after })
+                if retry_after == Duration::from_secs(110)
+        ));
+    }
+
+    #[test]
+    fn an_inherited_owner_pid_must_reacquire() {
+        let (_temporary, directory, _tally) = tally("owner-pid");
+        let mut owner =
+            EndpointOwner::acquire(directory, "https://broker.invalid", "outbound-tally.test")
+                .unwrap_or_else(|error| panic!("acquire endpoint owner: {error}"));
+        let current = std::process::id();
+        owner.pid = if current == u32::MAX { 0 } else { current + 1 };
+
+        assert!(!owner.belongs_to_current_process());
+    }
+
+    #[test]
+    fn pause_and_closure_end_at_their_exact_equality_instants() {
+        let (_pause_temporary, _pause_directory, pause_tally) = tally("pause-boundary");
+        let host = "https://pause.invalid";
+        let sent = ready_send(&pause_tally, host, Duration::from_secs(20_000));
+        pause_tally
+            .record_response(host, 429, None, &sent)
+            .unwrap_or_else(|error| panic!("record 429: {error}"));
+        let before_pause_end = BootTime::new(
+            "test-boot",
+            sent.elapsed() + Duration::from_secs(60) - Duration::from_nanos(1),
+        );
+        assert!(matches!(
+            pause_tally.decide_and_record(
+                host,
+                "method",
+                100,
+                Duration::from_secs(60),
+                &before_pause_end
+            ),
+            Ok(TallyDecision::Paused { retry_after })
+                if retry_after == Duration::from_nanos(1)
+        ));
+        let pause_end = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(60));
+        assert!(matches!(
+            pause_tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &pause_end),
+            Ok(TallyDecision::Send)
+        ));
+
+        let (_closure_temporary, _closure_directory, closure_tally) = tally("closure-boundary");
+        let host = "https://closure.invalid";
+        let first = ready_send(&closure_tally, host, Duration::from_secs(30_000));
+        closure_tally
+            .record_response(host, 400, None, &first)
+            .unwrap_or_else(|error| panic!("record first refusal: {error}"));
+        for offset in [1_u64, 2] {
+            let at = BootTime::new("test-boot", first.elapsed() + Duration::from_secs(offset));
+            assert!(matches!(
+                closure_tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &at),
+                Ok(TallyDecision::Send)
+            ));
+            closure_tally
+                .record_response(host, 400, None, &at)
+                .unwrap_or_else(|error| panic!("record refusal {offset}: {error}"));
+        }
+        let closure_started = first.elapsed() + Duration::from_secs(2);
+        let before_closure_end = BootTime::new(
+            "test-boot",
+            closure_started + Duration::from_secs(30 * 60) - Duration::from_nanos(1),
+        );
+        assert!(matches!(
+            closure_tally.decide_and_record(
+                host,
+                "method",
+                100,
+                Duration::from_secs(60),
+                &before_closure_end
+            ),
+            Ok(TallyDecision::Closed { retry_after, .. })
+                if retry_after == Duration::from_nanos(1)
+        ));
+        let closure_end =
+            BootTime::new("test-boot", closure_started + Duration::from_secs(30 * 60));
+        assert!(matches!(
+            closure_tally.decide_and_record(
+                host,
+                "method",
+                100,
+                Duration::from_secs(60),
+                &closure_end
+            ),
+            Ok(TallyDecision::Send)
+        ));
+    }
+}

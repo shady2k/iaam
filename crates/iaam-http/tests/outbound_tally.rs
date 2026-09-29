@@ -615,6 +615,44 @@ async fn the_thousand_and_first_send_in_any_rolling_day_is_refused() {
 }
 
 #[tokio::test]
+async fn a_not_handed_off_reservation_is_rolled_back_before_daily_exhaustion() {
+    let directory = TempDir::create("rollback-before-ceiling");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    transport
+        .answers
+        .lock()
+        .expect("answers")
+        .push_back(Err(HttpError::RequestNotBuilt(
+            "invented pre-handoff failure".to_owned(),
+        )));
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the planted pre-handoff failure is returned");
+    assert!(matches!(first, GatewayError::Transport { attempts: 1, .. }));
+    for index in 0..1_000 {
+        gateway
+            .send(&operations(), None)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("successful send {index} was charged for the rolled-back attempt: {error}")
+            });
+    }
+    let exhausted = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the request after 1,000 real handoffs is refused");
+    assert!(matches!(
+        exhausted,
+        GatewayError::DailyCeiling { ceiling: 1_000, .. }
+    ));
+}
+
+#[tokio::test]
 async fn invalid_path_spellings_and_aliases_are_refused_naming_the_path() {
     let directory = TempDir::create("paths");
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
@@ -731,6 +769,40 @@ async fn a_broker_budget_cannot_be_selected_independently_of_the_request_path() 
 }
 
 #[tokio::test]
+async fn finam_account_path_near_misses_are_refused_without_sending() {
+    let directory = TempDir::create("finam-path-near-misses");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    for path in [
+        "/v1/accounts/",
+        "/v1/accounts//transactions",
+        "/v1/accounts/account/child",
+        "/v1/accounts/account/child/transactions",
+    ] {
+        let request = HttpRequest::get(Destination::FinamApi, path)
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
+        let refused = gateway
+            .send(&request, None)
+            .await
+            .expect_err("a near-miss Finam path has no budget");
+        assert!(
+            matches!(
+                refused,
+                GatewayError::UnknownBudget {
+                    destination: Destination::FinamApi,
+                    path: ref refused_path
+                } if refused_path == path
+            ),
+            "{path}: {refused:?}"
+        );
+    }
+    assert!(transport.sent().is_empty());
+}
+
+#[tokio::test]
 async fn caller_cancellation_does_not_cancel_status_commit() {
     let directory = TempDir::create("caller-cancel");
     let tally = empty_tally(&directory);
@@ -819,6 +891,8 @@ async fn a_tally_commit_failure_latches_until_a_pause_is_persisted() {
     assert!(matches!(first, GatewayError::TallyUnavailable { .. }));
     std::fs::remove_dir(directory.file("outbound-tally.tmp"))
         .expect("temporary obstruction removed");
+    std::fs::write(&tally, "")
+        .expect("remove the durable pending fallback so the in-memory latch is isolated");
 
     let second = gateway
         .send(&operations(), None)

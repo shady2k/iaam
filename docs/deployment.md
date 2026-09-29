@@ -72,12 +72,12 @@ The outbound gateway also keeps its MOEX and CBR lanes, named waits and circuit
 breakers in the server process. They do not cross a restart.
 
 Broker traffic has a stronger rule: **one process owns each broker endpoint**.
-The first request to T-Invest production, T-Invest sandbox or Finam acquires an
-exclusive adjacent owner file (`<tally>.tinkoff-prod.owner`,
-`<tally>.tinkoff-sandbox.owner` or `<tally>.finam.owner`) and holds that lock
-for the gateway's lifetime. A second process asking for that endpoint is
-refused before transport; the reason names the endpoint and tells the operator
-to use or stop the owning process. It may still own and use another endpoint.
+The first request to T-Invest production, T-Invest sandbox or Finam acquires
+`tinkoff-prod.owner`, `tinkoff-sandbox.owner` or `finam.owner` in the compiled
+egress directory, and holds that lock for the gateway's lifetime. A second
+process asking for that endpoint is refused before transport; the reason names
+the endpoint and tells the operator to use or stop the owning process. It may
+still own and use another endpoint.
 This makes accidental concurrent servers observable instead of trying to share
 one broker allowance between them.
 
@@ -85,7 +85,7 @@ Within an owned endpoint, the gateway allows one request in flight. The HTTP
 client follows no redirect and performs no retry below the gateway. It records
 the status line and a Retry-After clamped to one day before consuming the body,
 and the next request cannot decide before that record exists. The shared
-`<tally>.lock` is held only for a tally transaction; waits and HTTP requests do
+`outbound-tally.lock` is held only for a tally transaction; waits and HTTP requests do
 not hold it. The tally preserves:
 
 - the per-method minute budgets from the gateway table;
@@ -118,24 +118,39 @@ $ make ceiling-proof
 The proof sends through the production gateway and HTTP client to loopback TCP
 servers, one endpoint at a time. The receiver records completed request headers,
 so the table is derived from wire arrivals rather than gateway counters.
+`sec(logical)` is checked for every row from the injected boot clock.
 `sec(wire)` is measured with a dedicated real-time spacing run for every
 endpoint; other rows say `wire-row` and rely on that endpoint's named spacing
 row instead of presenting logical time as wire time. The remaining duration
 columns are `reached/ceiling` from the injected boot clock sampled when each
 request reaches the receiver. `minute(method)` names the endpoint-method pair
-whose rolling 60-second window was largest. Unknown pairs fail the proof.
-`closure` and `pause` must both be `0/0`; `attempts` includes retries and Finam
-session exchanges. The command also exercises the real T-Invest and Finam sync
-loops, retry and response-body failures, redirect policy, the 1,000-request
-rolling day boundary, concurrent callers, boot and wall-clock changes, tally
-persistence across owner rebuilds, egress-off, path aliases and two-process
-ownership.
+whose rolling 60-second window was largest. Unknown or near-miss paths are
+refused before transport. `closure` and `pause` must both be `0/0`; `attempts`
+includes retries and Finam session exchanges.
+
+The command also exercises the real T-Invest and Finam sync loops; retry and
+response-body failures; redirect policy; exact Retry-After, 30-minute closure,
+90-second unresolved-send and rolling 24-hour boundaries; concurrent callers;
+caller cancellation, deadline expiry, a panic after the status line, a killed
+child, and a durable status-commit failure; a clock advance between reservation
+and transport handoff; boot identity changes; tally persistence across owner
+rebuilds; egress-off; path aliases; and two-process ownership. The process rows
+are reconstructed from the loopback receiver's actual wire-arrival records.
+The two child processes deliberately disagree in an irrelevant environment
+variable while receiving the same egress directory, proving that filesystem
+identity, not process-local environment, coordinates ownership.
+
+There is deliberately no fake wall-clock-step row. The production
+`Clock`/`SystemClock` used for persisted ceilings exposes only in-process
+monotonic time and Linux boot time; it has no wall-clock read to step. The proof
+does change the boot identity and checks the conservative reset behavior.
 
 The proof deliberately does not contact live brokers or test TLS, proxies,
-network filesystems, container mount namespaces, or a hostile process modifying
-the tally. The loopback fixture speaks HTTP/1.1 on Linux. Its real-time spacing
-rows observe the host scheduler; longer accounting windows are advanced by the
-injected boot clock so the check remains bounded and deterministic.
+network filesystems, separate machines, container mount namespaces, or a
+hostile process modifying the tally. The loopback fixture speaks HTTP/1.1 on
+Linux. Its real-time spacing rows observe the host scheduler; longer accounting
+windows are advanced by the injected boot clock so the check remains bounded
+and deterministic.
 
 Administrative commands (`claim`, `token issue`, `broker key …`,
 `broker access …`, `bundle export`, `bundle import`) open the database and do
@@ -196,11 +211,17 @@ $ export IAAM_BROKER_EGRESS=on
 Every iaam process on the machine that may contact a broker must see that exact
 persistent mount and run as an OS user able to read, write and sync the tally;
 create and lock its lock and three endpoint-owner records; create its temporary
-record; atomically rename within the directory; and sync the directory. The
-tally must already exist. An empty tally is initialized on first use. A v1
-tally is refused because it cannot prove rolling 24-hour history; remove it
-only during a controlled stop and recreate the empty file. A leftover
-temporary file is ignored; only the last complete tally is read.
+record; atomically rename within the directory; and sync the directory. A
+container must bind the same host directory at `/var/lib/iaam/egress`; a
+container-private directory or a different host path creates a separate owner
+and tally domain and is not safe. Processes on different machines do not share
+this coordination. Network filesystems and cross-machine tally sharing are
+outside the proof.
+
+The tally must already exist. An empty tally is initialized on first use. A v1
+tally is refused because it cannot prove rolling 24-hour history; remove it only
+during a controlled stop and recreate the empty file. A leftover temporary file
+is ignored; only the last complete tally is read.
 
 Do not copy, alias, replace, delete or truncate a live egress directory or any
 record in it. The process verifies the path and held inodes before each

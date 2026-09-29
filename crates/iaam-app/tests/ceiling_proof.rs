@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use iaam_app::AppServices;
 use iaam_app::adapters::finam::FinamChannel;
@@ -24,20 +24,20 @@ use iaam_core::ids::{AccountId, OwnerId, SourceId};
 use iaam_http::gateway::{BUDGETS, Budget, Clock, MethodScope, Sleeper, Transport};
 use iaam_http::test_support::{HttpClientHarness, LoopbackReply, LoopbackServer};
 use iaam_http::{
-    BrokerEgress, Destination, Gateway, GatewayError, HttpRequest, HttpResponse, Outbound,
-    RequestAllowance, RequestBody,
+    BrokerEgress, Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse,
+    Outbound, RequestAllowance, RequestBody,
 };
 
 use iaam_store::SqliteStore;
 use time::Date;
 use time::macros::date;
+use tokio::sync::Notify;
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const MINUTE: Duration = Duration::from_secs(60);
 const CLOSURE: Duration = Duration::from_secs(30 * 60);
 const REFUSAL_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DAILY_CEILING: usize = 1_000;
-const DEFAULT_PAUSE_SECONDS: u64 = 60;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -65,7 +65,8 @@ struct PairMeasurement {
 struct Measurements {
     pairs: Vec<PairMeasurement>,
     worst_pair: Option<usize>,
-    max_second: Option<usize>,
+    max_logical_second: usize,
+    max_wire_second: Option<usize>,
     max_day: usize,
     max_sync: usize,
     max_closure_span: usize,
@@ -126,7 +127,7 @@ fn measure(
     wire_max_second: Option<usize>,
 ) -> Result<Measurements, String> {
     let mut measured = Measurements {
-        max_second: wire_max_second,
+        max_wire_second: wire_max_second,
         locally_refused,
         ..Measurements::default()
     };
@@ -165,6 +166,11 @@ fn measure(
     measured.max_attempts = calls.values().copied().max().unwrap_or(0);
 
     for mut host_records in hosts.into_values() {
+        measured.max_logical_second = measured.max_logical_second.max(max_window_by(
+            &host_records,
+            Duration::from_secs(1),
+            |record| record.logical_at,
+        ));
         measured.max_day = measured
             .max_day
             .max(max_window_by(&host_records, DAY, |record| {
@@ -214,8 +220,11 @@ fn measure(
 
 fn violations(measured: &Measurements) -> Vec<String> {
     let mut found = Vec::new();
-    if measured.max_second.is_some_and(|reached| reached > 1) {
-        found.push("one-second spacing".to_owned());
+    if measured.max_logical_second > 1 {
+        found.push("one-second logical spacing".to_owned());
+    }
+    if measured.max_wire_second.is_some_and(|reached| reached > 1) {
+        found.push("one-second wire spacing".to_owned());
     }
     for pair in &measured.pairs {
         if pair.reached > pair.ceiling {
@@ -247,10 +256,10 @@ fn assert_within_ceilings(mode: &str, measured: &Measurements) {
 
 fn print_header() {
     println!(
-        "mode                       endpoint                                         sec(wire)  minute(method; all pairs checked)               24h       sync      closure  pause    attempts  local"
+        "mode                       endpoint                                      sec(logical)  sec(wire)  minute(method; all pairs checked)               24h       sync      closure  pause    attempts  local"
     );
     println!(
-        "                                                                                                                          every governed cell is reached/ceiling; `wire-row` points to the endpoint's wire-spacing row"
+        "                                                                                                                                            every governed cell is reached/ceiling; `wire-row` points to the endpoint's real-time spacing row"
     );
 }
 
@@ -268,11 +277,12 @@ fn print_row(mode: &str, endpoint: &str, measured: &Measurements) {
             )
         },
     );
-    let second = measured
-        .max_second
+    let wire_second = measured
+        .max_wire_second
         .map_or_else(|| "wire-row".to_owned(), |reached| format!("{reached}/1"));
     println!(
-        "{mode:<26} {endpoint:<48} {second:>9}  {minute:<48} {:>4}/1000  {:>3}/300  {:>3}/0    {:>3}/0   {:>3}/3    {:>3}/-",
+        "{mode:<26} {endpoint:<45} {:>7}/1  {wire_second:>9}  {minute:<48} {:>4}/1000  {:>3}/300  {:>3}/0    {:>3}/0   {:>3}/3    {:>3}/-",
+        measured.max_logical_second,
         measured.max_day,
         measured.max_sync,
         measured.max_closure_span,
@@ -318,7 +328,9 @@ fn checker_rejects_every_independently_planted_breach() {
     ];
     let measured =
         measure(&second, 0, Some(2)).unwrap_or_else(|error| panic!("measure spacing: {error}"));
-    assert!(violations(&measured).contains(&"one-second spacing".to_owned()));
+    let spacing_violations = violations(&measured);
+    assert!(spacing_violations.contains(&"one-second logical spacing".to_owned()));
+    assert!(spacing_violations.contains(&"one-second wire spacing".to_owned()));
 
     let minute: Vec<_> = (0..26)
         .map(|index| {
@@ -455,7 +467,7 @@ struct FakeTime {
     monotonic: Mutex<Instant>,
     boot_id: Mutex<String>,
     boot_elapsed: Mutex<Duration>,
-    wall: Mutex<SystemTime>,
+    panic_next_boot: AtomicBool,
 }
 
 impl FakeTime {
@@ -466,7 +478,7 @@ impl FakeTime {
             monotonic: Mutex::new(origin),
             boot_id: Mutex::new("proof-boot-a".to_owned()),
             boot_elapsed: Mutex::new(Duration::from_secs(10_000)),
-            wall: Mutex::new(UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
+            panic_next_boot: AtomicBool::new(false),
         })
     }
 
@@ -496,11 +508,8 @@ impl FakeTime {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Duration::from_secs(10);
     }
 
-    fn set_wall(&self, wall: SystemTime) {
-        *self
-            .wall
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = wall;
+    fn panic_next_boot_read(&self) {
+        self.panic_next_boot.store(true, Ordering::SeqCst);
     }
 }
 
@@ -513,6 +522,10 @@ impl Clock for FakeTime {
     }
 
     fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        assert!(
+            !self.panic_next_boot.swap(false, Ordering::SeqCst),
+            "planted boot-clock panic"
+        );
         let id = self
             .boot_id
             .lock()
@@ -537,6 +550,7 @@ enum SleepMode {
     Logical,
     Wire,
     Deadline,
+    ControlledDeadline,
 }
 
 struct WireSleeper {
@@ -570,13 +584,34 @@ impl Sleeper for DeadlineSleeper {
     }
 }
 
+#[derive(Default)]
+struct DeadlineControl {
+    armed: AtomicBool,
+    release: Notify,
+}
+
+struct ControlledDeadlineSleeper {
+    clock: Arc<FakeTime>,
+    control: Arc<DeadlineControl>,
+}
+
+impl Sleeper for ControlledDeadlineSleeper {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if self.control.armed.swap(false, Ordering::SeqCst) {
+                self.control.release.notified().await;
+            }
+            self.clock.advance(delay);
+        })
+    }
+}
+
 struct CallContext {
     next_call: AtomicU64,
     active_call: AtomicU64,
     active_sync: AtomicU64,
     arrivals: AtomicUsize,
     locally_refused: AtomicUsize,
-    pause_seconds: AtomicU64,
 }
 
 impl CallContext {
@@ -587,7 +622,6 @@ impl CallContext {
             active_sync: AtomicU64::new(0),
             arrivals: AtomicUsize::new(0),
             locally_refused: AtomicUsize::new(0),
-            pause_seconds: AtomicU64::new(DEFAULT_PAUSE_SECONDS),
         })
     }
 }
@@ -618,12 +652,67 @@ impl<T: Transport + 'static> Outbound for ObservedOutbound<T> {
     }
 }
 
+struct ProofTransport {
+    inner: HttpClientHarness,
+    clock: Arc<FakeTime>,
+    advance_before_handoff: Mutex<Option<Duration>>,
+}
+
+impl ProofTransport {
+    fn new(
+        inner: HttpClientHarness,
+        clock: Arc<FakeTime>,
+        advance_before_handoff: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            clock,
+            advance_before_handoff: Mutex::new(
+                (!advance_before_handoff.is_zero()).then_some(advance_before_handoff),
+            ),
+        }
+    }
+
+    fn advance_before_handoff(&self) {
+        if let Some(by) = self
+            .advance_before_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            self.clock.advance(by);
+        }
+    }
+}
+
+impl Transport for ProofTransport {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.advance_before_handoff();
+        self.inner.send(request).await
+    }
+
+    fn send_observed<'a>(
+        &'a self,
+        request: &'a HttpRequest,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+    ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
+        self.advance_before_handoff();
+        Transport::send_observed(&self.inner, request, observe)
+    }
+}
+
+struct ScenarioTiming {
+    sleep_mode: SleepMode,
+    advance_before_handoff: Duration,
+}
+
 struct Scenario {
     outbound: Arc<dyn Outbound>,
     server: LoopbackServer,
     clock: Arc<FakeTime>,
     context: Arc<CallContext>,
     records: Arc<Mutex<Vec<SendRecord>>>,
+    deadline_control: Arc<DeadlineControl>,
     _directory: TempDir,
 }
 
@@ -641,7 +730,10 @@ impl Scenario {
             replies,
             timeout,
             egress,
-            SleepMode::Logical,
+            ScenarioTiming {
+                sleep_mode: SleepMode::Logical,
+                advance_before_handoff: Duration::ZERO,
+            },
         )
     }
 
@@ -656,11 +748,34 @@ impl Scenario {
             replies,
             Duration::from_secs(5),
             true,
-            SleepMode::Wire,
+            ScenarioTiming {
+                sleep_mode: SleepMode::Wire,
+                advance_before_handoff: Duration::ZERO,
+            },
         )
     }
 
     fn new_sync(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+    ) -> Self {
+        let scenario = Self::build(
+            label,
+            destination,
+            replies,
+            Duration::from_secs(5),
+            true,
+            ScenarioTiming {
+                sleep_mode: SleepMode::Deadline,
+                advance_before_handoff: Duration::ZERO,
+            },
+        );
+        scenario.context.active_sync.store(1, Ordering::SeqCst);
+        scenario
+    }
+
+    fn new_deadline(
         label: &str,
         destination: Destination,
         replies: impl IntoIterator<Item = LoopbackReply>,
@@ -671,7 +786,29 @@ impl Scenario {
             replies,
             Duration::from_secs(5),
             true,
-            SleepMode::Deadline,
+            ScenarioTiming {
+                sleep_mode: SleepMode::ControlledDeadline,
+                advance_before_handoff: Duration::ZERO,
+            },
+        )
+    }
+
+    fn new_stale_reservation(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+        advance_before_handoff: Duration,
+    ) -> Self {
+        Self::build(
+            label,
+            destination,
+            replies,
+            Duration::from_secs(5),
+            true,
+            ScenarioTiming {
+                sleep_mode: SleepMode::Logical,
+                advance_before_handoff,
+            },
         )
     }
 
@@ -681,8 +818,12 @@ impl Scenario {
         replies: impl IntoIterator<Item = LoopbackReply>,
         timeout: Duration,
         egress: bool,
-        sleep_mode: SleepMode,
+        timing: ScenarioTiming,
     ) -> Self {
+        let ScenarioTiming {
+            sleep_mode,
+            advance_before_handoff,
+        } = timing;
         let directory = TempDir::new(label);
         let tally = directory.path("outbound-tally");
         if egress {
@@ -691,10 +832,8 @@ impl Scenario {
         }
         let clock = FakeTime::new();
         let context = CallContext::new();
-        if sleep_mode == SleepMode::Deadline {
-            context.active_sync.store(1, Ordering::SeqCst);
-        }
         let records = Arc::new(Mutex::new(Vec::new()));
+        let deadline_control = Arc::new(DeadlineControl::default());
         let wire_origin = Instant::now();
         let observed_clock = Arc::clone(&clock);
         let observed_context = Arc::clone(&context);
@@ -704,14 +843,7 @@ impl Scenario {
             let method = method_for_target(target)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("unknown:{target}"));
-            let pause_for = (status == 429).then(|| {
-                Duration::from_secs(
-                    observed_context
-                        .pause_seconds
-                        .load(Ordering::SeqCst)
-                        .max(DEFAULT_PAUSE_SECONDS),
-                )
-            });
+            let pause_for = None;
             observed_records
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -728,13 +860,21 @@ impl Scenario {
             observed_context.arrivals.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap_or_else(|error| panic!("start loopback server: {error}"));
-        let transport = HttpClientHarness::new(&server).with_timeout(timeout);
+        let transport = ProofTransport::new(
+            HttpClientHarness::new(&server).with_timeout(timeout),
+            Arc::clone(&clock),
+            advance_before_handoff,
+        );
         let sleeper: Arc<dyn Sleeper> = match sleep_mode {
             SleepMode::Wire => Arc::new(WireSleeper {
                 clock: Arc::clone(&clock),
             }),
             SleepMode::Deadline => Arc::new(DeadlineSleeper {
                 clock: Arc::clone(&clock),
+            }),
+            SleepMode::ControlledDeadline => Arc::new(ControlledDeadlineSleeper {
+                clock: Arc::clone(&clock),
+                control: Arc::clone(&deadline_control),
             }),
             SleepMode::Logical => Arc::clone(&clock) as Arc<dyn Sleeper>,
         };
@@ -761,6 +901,7 @@ impl Scenario {
             clock,
             context,
             records,
+            deadline_control,
             _directory: directory,
         }
     }
@@ -770,6 +911,30 @@ impl Scenario {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn remember_last_pause(&self, error: &GatewayError) -> Duration {
+        let pause = error
+            .retry_after()
+            .unwrap_or_else(|| panic!("broker refusal carried no duration: {error:?}"));
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last = records
+            .last_mut()
+            .unwrap_or_else(|| panic!("broker refusal had no wire arrival: {error:?}"));
+        assert_eq!(last.status, 429, "pause attached to a non-429 record");
+        last.pause_for = Some(pause);
+        pause
+    }
+
+    fn arm_deadline(&self) {
+        self.deadline_control.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn release_deadline(&self) {
+        self.deadline_control.release.notify_one();
     }
 
     fn locally_refused(&self) -> usize {
@@ -825,6 +990,41 @@ async fn direct_send(
 ) -> Result<HttpResponse, GatewayError> {
     let request = direct_request(destination, direct_path(destination));
     scenario.outbound.send(&request, None).await
+}
+
+async fn assert_refused_until_boundary(
+    scenario: &Scenario,
+    destination: Destination,
+    duration: Duration,
+    label: &str,
+) {
+    let instant = Duration::from_nanos(1);
+    assert!(duration > instant, "{label}: duration is not positive");
+    scenario.clock.advance(duration - instant);
+    let before = scenario.server.requests_received();
+    let refused = direct_send(scenario, destination)
+        .await
+        .expect_err("one instant before the boundary must stay refused");
+    assert_eq!(
+        refused.retry_after(),
+        Some(instant),
+        "{label}: the refusal did not preserve the exact boundary"
+    );
+    assert_eq!(
+        scenario.server.requests_received(),
+        before,
+        "{label}: a request departed before the boundary"
+    );
+
+    scenario.clock.advance(instant);
+    direct_send(scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: exact boundary stayed closed: {error}"));
+    assert_eq!(
+        scenario.server.requests_received(),
+        before + 1,
+        "{label}: exact boundary did not reach the wire"
+    );
 }
 
 async fn exercise_wire_spacing(destination: Destination) -> Scenario {
@@ -911,15 +1111,34 @@ async fn exercise_permanent_refusal(destination: Destination) -> Scenario {
     let scenario = Scenario::new(
         "permanent-refusal",
         destination,
-        std::iter::repeat_n(LoopbackReply::complete(400, "refused"), 3),
+        [
+            LoopbackReply::complete(400, "refused"),
+            LoopbackReply::complete(400, "refused"),
+            LoopbackReply::complete(400, "refused"),
+            LoopbackReply::complete(200, "{}"),
+        ],
         Duration::from_secs(2),
         true,
     );
-    for _ in 0..4 {
-        let _ = direct_send(&scenario, destination).await;
+    for _ in 0..3 {
+        let refusal = direct_send(&scenario, destination)
+            .await
+            .expect_err("permanent refusal returned");
+        assert!(matches!(
+            refusal,
+            GatewayError::Rejected { status: 400, .. }
+        ));
     }
-    assert_eq!(scenario.server.requests_received(), 3);
-    assert!(scenario.locally_refused() >= 1);
+    let closed = direct_send(&scenario, destination)
+        .await
+        .expect_err("three refusals close the endpoint");
+    let closure = closed
+        .retry_after()
+        .unwrap_or_else(|| panic!("closure carried no duration: {closed:?}"));
+    assert_eq!(closure, CLOSURE);
+    assert_refused_until_boundary(&scenario, destination, closure, "permanent closure").await;
+    assert_eq!(scenario.server.requests_received(), 4);
+    assert!(scenario.locally_refused() >= 2);
     scenario
 }
 
@@ -927,23 +1146,21 @@ async fn exercise_rate_limit(
     label: &str,
     destination: Destination,
     reply: LoopbackReply,
-    pause: Duration,
+    expected_pause: Duration,
 ) -> Scenario {
     let scenario = Scenario::new(
         label,
         destination,
-        [reply.clone(), reply],
+        [reply, LoopbackReply::complete(200, "{}")],
         Duration::from_millis(40),
         true,
     );
-    scenario
-        .context
-        .pause_seconds
-        .store(pause.as_secs(), Ordering::SeqCst);
-    let _ = direct_send(&scenario, destination).await;
-    scenario.clock.advance(pause.max(MINUTE));
-    let _ = direct_send(&scenario, destination).await;
-    let _ = direct_send(&scenario, destination).await;
+    let refused = direct_send(&scenario, destination)
+        .await
+        .expect_err("429 pauses the endpoint");
+    let pause = scenario.remember_last_pause(&refused);
+    assert_eq!(pause, expected_pause, "{label}: parsed pause");
+    assert_refused_until_boundary(&scenario, destination, pause, label).await;
     assert_eq!(scenario.server.requests_received(), 2);
     assert!(scenario.locally_refused() >= 1);
     scenario
@@ -953,14 +1170,48 @@ async fn exercise_body_rate_limit(label: &str, reply: LoopbackReply) -> Scenario
     let scenario = Scenario::new(
         label,
         Destination::FinamApi,
-        [reply],
+        [reply, LoopbackReply::complete(200, "{}")],
         Duration::from_millis(40),
         true,
     );
-    let _ = direct_send(&scenario, Destination::FinamApi).await;
-    let _ = direct_send(&scenario, Destination::FinamApi).await;
-    assert_eq!(scenario.server.requests_received(), 1);
+    let refused = direct_send(&scenario, Destination::FinamApi)
+        .await
+        .expect_err("429 status survives the body failure");
+    let pause = scenario.remember_last_pause(&refused);
+    assert_eq!(pause, MINUTE, "{label}: parsed pause");
+    assert_refused_until_boundary(&scenario, Destination::FinamApi, pause, label).await;
+    assert_eq!(scenario.server.requests_received(), 2);
     assert!(scenario.locally_refused() >= 1);
+    scenario
+}
+
+async fn exercise_rate_limit_closure() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new(
+        "rate-limit-closure",
+        destination,
+        [
+            LoopbackReply::complete(429, "limited"),
+            LoopbackReply::complete(429, "limited"),
+            LoopbackReply::complete(200, "{}"),
+        ],
+        Duration::from_secs(2),
+        true,
+    );
+    let first = direct_send(&scenario, destination)
+        .await
+        .expect_err("first 429 pauses");
+    let first_pause = scenario.remember_last_pause(&first);
+    assert_eq!(first_pause, MINUTE);
+    scenario.clock.advance(first_pause);
+
+    let second = direct_send(&scenario, destination)
+        .await
+        .expect_err("second 429 closes");
+    let closure = scenario.remember_last_pause(&second);
+    assert_eq!(closure, CLOSURE);
+    assert_refused_until_boundary(&scenario, destination, closure, "rate-limit closure").await;
+    assert_eq!(scenario.server.requests_received(), 3);
     scenario
 }
 
@@ -1045,24 +1296,26 @@ async fn exercise_daily_ceiling() -> Scenario {
     let scenario = Scenario::new(
         "rolling-day",
         Destination::TinkoffSandbox,
-        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), DAILY_CEILING),
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), DAILY_CEILING + 1),
         Duration::from_secs(2),
         true,
     );
-    for index in 0..=DAILY_CEILING {
-        let result = direct_send(&scenario, Destination::TinkoffSandbox).await;
-        if index < DAILY_CEILING {
-            assert!(
-                result.is_ok(),
-                "send {index} was refused before the daily ceiling"
-            );
-        } else {
-            assert!(
-                matches!(result, Err(GatewayError::DailyCeiling { .. })),
-                "send beyond the daily ceiling was not refused: {result:?}"
-            );
-        }
+    for index in 0..DAILY_CEILING {
+        direct_send(&scenario, Destination::TinkoffSandbox)
+            .await
+            .unwrap_or_else(|error| panic!("send {index} was refused before the ceiling: {error}"));
     }
+    let refused = direct_send(&scenario, Destination::TinkoffSandbox)
+        .await
+        .expect_err("send 1001 must be refused");
+    let reset = match refused {
+        GatewayError::DailyCeiling {
+            ceiling: 1_000,
+            retry_after,
+            ..
+        } => retry_after,
+        other => panic!("send 1001 had the wrong refusal: {other:?}"),
+    };
     let records = scenario.records();
     assert_eq!(records.len(), DAILY_CEILING);
     let span = records
@@ -1074,6 +1327,14 @@ async fn exercise_daily_ceiling() -> Scenario {
         span < DAY,
         "the proof did not reach the ceiling inside 24 hours"
     );
+    assert_refused_until_boundary(
+        &scenario,
+        Destination::TinkoffSandbox,
+        reset,
+        "rolling 24-hour ceiling",
+    )
+    .await;
+    assert_eq!(scenario.records().len(), DAILY_CEILING + 1);
     scenario
 }
 
@@ -1260,6 +1521,279 @@ async fn wait_for_arrivals(scenario: &Scenario, wanted: usize) {
     .unwrap_or_else(|_| panic!("loopback server did not receive {wanted} requests"));
 }
 
+async fn exercise_cancelled_caller() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new(
+        "caller-cancelled",
+        destination,
+        [LoopbackReply::held(429, "late")],
+        Duration::from_secs(5),
+        true,
+    );
+    let first_outbound = Arc::clone(&scenario.outbound);
+    let first = tokio::spawn(async move {
+        first_outbound
+            .send(&direct_request(destination, direct_path(destination)), None)
+            .await
+    });
+    wait_for_arrivals(&scenario, 1).await;
+    first.abort();
+    let _ = first.await;
+
+    let next_outbound = Arc::clone(&scenario.outbound);
+    let next = tokio::spawn(async move {
+        next_outbound
+            .send(&direct_request(destination, direct_path(destination)), None)
+            .await
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        scenario.server.requests_received(),
+        1,
+        "a new request departed while the cancelled attempt was unresolved"
+    );
+    scenario.server.release_one();
+    let refused = next
+        .await
+        .unwrap_or_else(|error| panic!("next caller task: {error}"))
+        .expect_err("the late 429 pauses the next caller");
+    assert_eq!(scenario.remember_last_pause(&refused), MINUTE);
+    assert_eq!(scenario.server.requests_received(), 1);
+    scenario
+}
+
+async fn exercise_deadline_midflight() -> Scenario {
+    let destination = Destination::TinkoffSandbox;
+    let scenario = Scenario::new_deadline(
+        "deadline-midflight",
+        destination,
+        [
+            LoopbackReply::complete(200, "{}"),
+            LoopbackReply::held(429, "late"),
+        ],
+    );
+    scenario
+        .outbound
+        .send(&direct_request(destination, direct_path(destination)), None)
+        .await
+        .unwrap_or_else(|error| panic!("warm deadline lane: {error:?}"));
+    scenario.clock.advance(Duration::from_secs(1));
+    scenario.arm_deadline();
+
+    let deadline = scenario.clock.now() + Duration::from_secs(1);
+    let first_outbound = Arc::clone(&scenario.outbound);
+    let first = tokio::spawn(async move {
+        first_outbound
+            .send(
+                &direct_request(destination, direct_path(destination)),
+                Some(deadline),
+            )
+            .await
+    });
+    wait_for_arrivals(&scenario, 2).await;
+    scenario.release_deadline();
+    let deadline_error = first
+        .await
+        .unwrap_or_else(|error| panic!("deadline caller task: {error}"))
+        .expect_err("the caller deadline expires");
+    assert!(matches!(
+        deadline_error,
+        GatewayError::DeadlineReached { .. }
+    ));
+
+    let next_outbound = Arc::clone(&scenario.outbound);
+    let next = tokio::spawn(async move {
+        next_outbound
+            .send(&direct_request(destination, direct_path(destination)), None)
+            .await
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        scenario.server.requests_received(),
+        2,
+        "a new request departed while the deadline-cut attempt was unresolved"
+    );
+    scenario.server.release_one();
+    let refused = next
+        .await
+        .unwrap_or_else(|error| panic!("post-deadline caller task: {error}"))
+        .expect_err("the late 429 pauses the next caller");
+    assert_eq!(scenario.remember_last_pause(&refused), MINUTE);
+    assert_eq!(scenario.server.requests_received(), 2);
+    scenario
+}
+
+async fn exercise_status_commit_panic() -> Scenario {
+    let destination = Destination::FinamApi;
+    let scenario = Scenario::new(
+        "status-commit-panic",
+        destination,
+        [LoopbackReply::held(200, "{}")],
+        Duration::from_secs(5),
+        true,
+    );
+    let outbound = Arc::clone(&scenario.outbound);
+    let first = tokio::spawn(async move {
+        outbound
+            .send(&direct_request(destination, direct_path(destination)), None)
+            .await
+    });
+    wait_for_arrivals(&scenario, 1).await;
+    scenario.clock.panic_next_boot_read();
+    scenario.server.release_one();
+    let failed = first
+        .await
+        .unwrap_or_else(|error| panic!("panic caller task: {error}"))
+        .expect_err("the detached status commit panic is reported");
+    assert!(matches!(failed, GatewayError::TallyUnavailable { .. }));
+
+    let closed = direct_send(&scenario, destination)
+        .await
+        .expect_err("the panic leaves a durable unresolved attempt");
+    assert!(matches!(
+        closed,
+        GatewayError::BrokerHostClosed {
+            reason: "an earlier request has no committed status",
+            ..
+        }
+    ));
+    assert_eq!(scenario.server.requests_received(), 1);
+    scenario
+}
+
+async fn exercise_record_failure_latch() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new(
+        "record-failure",
+        destination,
+        [LoopbackReply::held(429, "limited")],
+        Duration::from_secs(5),
+        true,
+    );
+    let outbound = Arc::clone(&scenario.outbound);
+    let first = tokio::spawn(async move {
+        outbound
+            .send(&direct_request(destination, direct_path(destination)), None)
+            .await
+    });
+    wait_for_arrivals(&scenario, 1).await;
+    let obstruction = scenario._directory.path("outbound-tally.tmp");
+    std::fs::create_dir(&obstruction)
+        .unwrap_or_else(|error| panic!("create tally obstruction: {error}"));
+    scenario.server.release_one();
+    let failed = first
+        .await
+        .unwrap_or_else(|error| panic!("record-failure caller task: {error}"))
+        .expect_err("the 429 tally commit fails");
+    assert!(matches!(failed, GatewayError::TallyUnavailable { .. }));
+    std::fs::remove_dir(&obstruction)
+        .unwrap_or_else(|error| panic!("remove tally obstruction: {error}"));
+
+    let closed = direct_send(&scenario, destination)
+        .await
+        .expect_err("the latch persists a closure before another handoff");
+    assert!(matches!(closed, GatewayError::BrokerHostClosed { .. }));
+    assert_eq!(
+        scenario.server.requests_received(),
+        1,
+        "record failure allowed another wire departure"
+    );
+    scenario
+}
+
+async fn exercise_unresolved_boundary() -> Scenario {
+    let destination = Destination::TinkoffSandbox;
+    let scenario = Scenario::new(
+        "unresolved-boundary",
+        destination,
+        [
+            LoopbackReply::held(200, "never arrives"),
+            LoopbackReply::complete(200, "{}"),
+        ],
+        Duration::from_millis(500),
+        true,
+    );
+    let closed = direct_send(&scenario, destination)
+        .await
+        .expect_err("a request with no status is unresolved");
+    let duration = match closed {
+        GatewayError::BrokerHostClosed {
+            reason: "an earlier request has no committed status",
+            retry_after,
+            ..
+        } => retry_after,
+        other => panic!("unknown outcome had the wrong refusal: {other:?}"),
+    };
+    assert_eq!(duration, Duration::from_secs(90));
+    assert_refused_until_boundary(&scenario, destination, duration, "unresolved attempt").await;
+    assert_eq!(scenario.server.requests_received(), 2);
+    scenario
+}
+
+async fn exercise_stale_reservation() -> Scenario {
+    let destination = Destination::FinamApi;
+    let scenario = Scenario::new_stale_reservation(
+        "stale-reservation",
+        destination,
+        [
+            LoopbackReply::complete(200, "{}"),
+            LoopbackReply::complete(200, "{}"),
+        ],
+        Duration::from_secs(7),
+    );
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("stale-reservation first send: {error}"));
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("stale-reservation second send: {error}"));
+    let records = scenario.records();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records[1].logical_at.saturating_sub(records[0].logical_at) >= Duration::from_secs(1),
+        "the response-time status commit did not refresh spacing"
+    );
+    scenario
+}
+
+async fn exercise_path_derived_budget() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new(
+        "path-derived-budget",
+        destination,
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), 26),
+        Duration::from_secs(5),
+        true,
+    );
+    let users = direct_request(
+        destination,
+        "/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
+    );
+    for index in 0..26 {
+        scenario
+            .outbound
+            .send(&users, None)
+            .await
+            .unwrap_or_else(|error| panic!("UsersService call {index} failed: {error}"));
+    }
+    let unknown = direct_request(
+        destination,
+        "/tinkoff.public.invest.api.contract.v1.InventedService/GetThings",
+    );
+    let refused = scenario
+        .outbound
+        .send(&unknown, None)
+        .await
+        .expect_err("an unmapped broker path is refused");
+    assert!(matches!(refused, GatewayError::UnknownBudget { .. }));
+    assert_eq!(scenario.server.requests_received(), 26);
+    scenario
+}
+
 async fn exercise_boot_change() -> Scenario {
     let scenario = Scenario::new(
         "boot-change",
@@ -1280,33 +1814,6 @@ async fn exercise_boot_change() -> Scenario {
     scenario.clock.advance(Duration::from_secs(1));
     let _ = direct_send(&scenario, Destination::TinkoffProd).await;
     assert_eq!(scenario.server.requests_received(), before + 1);
-    scenario
-}
-
-async fn exercise_wall_change() -> Scenario {
-    let scenario = Scenario::new(
-        "wall-change",
-        Destination::TinkoffSandbox,
-        [
-            LoopbackReply::complete(429, "limited"),
-            LoopbackReply::complete(200, "{}"),
-        ],
-        Duration::from_secs(2),
-        true,
-    );
-    let _ = direct_send(&scenario, Destination::TinkoffSandbox).await;
-    scenario
-        .clock
-        .set_wall(UNIX_EPOCH + Duration::from_secs(4_000_000_000));
-    let _ = direct_send(&scenario, Destination::TinkoffSandbox).await;
-    scenario.clock.set_wall(UNIX_EPOCH);
-    let _ = direct_send(&scenario, Destination::TinkoffSandbox).await;
-    assert_eq!(scenario.server.requests_received(), 1);
-    scenario.clock.advance(MINUTE);
-    direct_send(&scenario, Destination::TinkoffSandbox)
-        .await
-        .unwrap_or_else(|error| panic!("send after boot-clock pause: {error}"));
-    assert_eq!(scenario.server.requests_received(), 2);
     scenario
 }
 
@@ -1362,6 +1869,61 @@ fn wait_for_file(path: &Path, child: &mut Child, what: &str) {
     }
 }
 
+fn process_record_text(records: &[SendRecord], locally_refused: usize) -> String {
+    let mut text = String::new();
+    for record in records {
+        text.push_str(&format!(
+            "wire\t{}\t{}\t{}\t{}\n",
+            record.logical_at.as_nanos(),
+            record.host,
+            record.method,
+            record.status
+        ));
+    }
+    text.push_str(&format!("local\t{locally_refused}\n"));
+    text
+}
+
+fn parse_process_records(text: &str) -> (Vec<SendRecord>, usize) {
+    let mut records = Vec::new();
+    let mut locally_refused = None;
+    for (index, line) in text.lines().enumerate() {
+        let fields: Vec<_> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["wire", logical_nanos, host, method, status] => {
+                let logical_nanos = logical_nanos
+                    .parse::<u64>()
+                    .unwrap_or_else(|error| panic!("process logical time: {error}"));
+                let status = status
+                    .parse::<u16>()
+                    .unwrap_or_else(|error| panic!("process status: {error}"));
+                records.push(SendRecord {
+                    logical_at: Duration::from_nanos(logical_nanos),
+                    wire_at: Duration::from_nanos(logical_nanos),
+                    host: (*host).to_owned(),
+                    method: (*method).to_owned(),
+                    sync: 1,
+                    call: index as u64 + 1,
+                    status,
+                    pause_for: None,
+                });
+            }
+            ["local", count] => {
+                locally_refused = Some(
+                    count
+                        .parse::<usize>()
+                        .unwrap_or_else(|error| panic!("process local count: {error}")),
+                );
+            }
+            _ => panic!("unknown process result line: {line:?}"),
+        }
+    }
+    (
+        records,
+        locally_refused.unwrap_or_else(|| panic!("process result has no local count")),
+    )
+}
+
 #[tokio::test]
 async fn process_child() {
     let Ok(role) = std::env::var("IAAM_CEILING_PROCESS_ROLE") else {
@@ -1383,9 +1945,37 @@ async fn process_child() {
         std::env::var("IAAM_CEILING_PROCESS_RESULT")
             .unwrap_or_else(|error| panic!("child result: {error}")),
     );
-    let server = LoopbackServer::start([LoopbackReply::complete(200, "{}")])
-        .unwrap_or_else(|error| panic!("child loopback: {error}"));
     let clock = FakeTime::new();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let observed_records = Arc::clone(&records);
+    let observed_clock = Arc::clone(&clock);
+    let wire_origin = Instant::now();
+    let server = LoopbackServer::start_observed(
+        [LoopbackReply::complete(200, "{}")],
+        move |target, status| {
+            let method = method_for_target(target)
+                .unwrap_or_else(|| panic!("unknown process target: {target}"));
+            let host = if target.starts_with("/v1/") {
+                Destination::FinamApi.base_url()
+            } else {
+                Destination::TinkoffProd.base_url()
+            };
+            observed_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(SendRecord {
+                    logical_at: observed_clock.logical_now(),
+                    wire_at: Instant::now().saturating_duration_since(wire_origin),
+                    host: host.to_owned(),
+                    method: method.to_owned(),
+                    sync: 1,
+                    call: 1,
+                    status,
+                    pause_for: None,
+                });
+        },
+    )
+    .unwrap_or_else(|error| panic!("child loopback: {error}"));
     let gateway = Gateway::with_parts_in_directory(
         HttpClientHarness::new(&server),
         BUDGETS,
@@ -1417,7 +2007,10 @@ async fn process_child() {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        std::fs::write(&result, format!("tinkoff={}\n", server.requests_received()))
+        let records = records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::fs::write(&result, process_record_text(&records, 0))
             .unwrap_or_else(|error| panic!("owner result: {error}"));
         return;
     }
@@ -1452,11 +2045,11 @@ async fn process_child() {
         )
         .await
         .unwrap_or_else(|error| panic!("contender Finam send: {error}"));
-    std::fs::write(
-        &result,
-        format!("tinkoff=0\nfinam={}\nlocal=1\n", server.requests_received()),
-    )
-    .unwrap_or_else(|error| panic!("contender result: {error}"));
+    let records = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::fs::write(&result, process_record_text(&records, 1))
+        .unwrap_or_else(|error| panic!("contender result: {error}"));
     std::fs::write(&done, "done").unwrap_or_else(|error| panic!("contender done marker: {error}"));
 }
 
@@ -1477,6 +2070,10 @@ fn process_measurements() -> (Measurements, Measurements) {
             .env("IAAM_CEILING_PROCESS_READY", &ready)
             .env("IAAM_CEILING_PROCESS_DONE", &done)
             .env("IAAM_CEILING_PROCESS_RESULT", result)
+            .env(
+                "IAAM_OUTBOUND_TALLY",
+                format!("/ignored-by-compiled-egress-directory/{role}"),
+            )
             .spawn()
             .unwrap_or_else(|error| panic!("spawn {role} child: {error}"))
     };
@@ -1498,36 +2095,133 @@ fn process_measurements() -> (Measurements, Measurements) {
         .unwrap_or_else(|error| panic!("read owner result: {error}"));
     let contender_text = std::fs::read_to_string(&contender_result)
         .unwrap_or_else(|error| panic!("read contender result: {error}"));
-    assert_eq!(owner_text, "tinkoff=1\n");
-    assert_eq!(contender_text, "tinkoff=0\nfinam=1\nlocal=1\n");
+    let (owner_records, owner_local) = parse_process_records(&owner_text);
+    let (contender_records, contender_local) = parse_process_records(&contender_text);
+    assert_eq!(owner_local, 0);
+    assert_eq!(owner_records.len(), 1);
+    assert_eq!(owner_records[0].host, Destination::TinkoffProd.base_url());
+    assert_eq!(contender_local, 1);
+    assert_eq!(contender_records.len(), 1);
+    assert_eq!(contender_records[0].host, Destination::FinamApi.base_url());
 
-    let tinkoff = measure(
-        &[planted_record(
-            Duration::from_secs(60),
-            Destination::TinkoffProd.base_url(),
-            "OperationsService",
-            1,
-            1,
-        )],
-        1,
-        None,
-    )
-    .unwrap_or_else(|error| panic!("measure process T-Invest: {error}"));
-    let finam = measure(
-        &[planted_record(
-            Duration::from_secs(60),
-            Destination::FinamApi.base_url(),
-            "AccountsService.GetAccount",
-            1,
-            1,
-        )],
-        0,
-        None,
-    )
-    .unwrap_or_else(|error| panic!("measure process Finam: {error}"));
+    let tinkoff = measure(&owner_records, contender_local, None)
+        .unwrap_or_else(|error| panic!("measure process T-Invest: {error}"));
+    let finam = measure(&contender_records, 0, None)
+        .unwrap_or_else(|error| panic!("measure process Finam: {error}"));
     assert_within_ceilings("process-owner", &tinkoff);
     assert_within_ceilings("process-other-endpoint", &finam);
     (tinkoff, finam)
+}
+
+#[tokio::test]
+async fn killed_process_child() {
+    let Some(directory) = std::env::var_os("IAAM_CEILING_KILLED_DIRECTORY") else {
+        return;
+    };
+    let record = PathBuf::from(
+        std::env::var_os("IAAM_CEILING_KILLED_RECORD")
+            .unwrap_or_else(|| panic!("killed child record path")),
+    );
+    let clock = FakeTime::new();
+    let observed_clock = Arc::clone(&clock);
+    let server = LoopbackServer::start_observed(
+        [LoopbackReply::held(200, "never")],
+        move |target, status| {
+            let line = format!(
+                "wire\t{}\t{}\t{}\t{}\nlocal\t0\n",
+                observed_clock.logical_now().as_nanos(),
+                Destination::TinkoffSandbox.base_url(),
+                method_for_target(target)
+                    .unwrap_or_else(|| panic!("unknown killed-process target: {target}")),
+                status
+            );
+            std::fs::write(&record, line)
+                .unwrap_or_else(|error| panic!("write killed-process record: {error}"));
+        },
+    )
+    .unwrap_or_else(|error| panic!("killed-process loopback: {error}"));
+    let gateway = Gateway::with_parts_in_directory(
+        HttpClientHarness::new(&server),
+        BUDGETS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&clock) as Arc<dyn Sleeper>,
+        BrokerEgress::On,
+        Path::new(&directory),
+    )
+    .unwrap_or_else(|error| panic!("killed-process gateway: {error}"));
+    let _ = gateway
+        .send(
+            &direct_request(
+                Destination::TinkoffSandbox,
+                direct_path(Destination::TinkoffSandbox),
+            ),
+            None,
+        )
+        .await;
+}
+
+async fn process_death_measurement() -> Measurements {
+    let directory = TempDir::new("process-death");
+    std::fs::write(directory.path("outbound-tally"), "")
+        .unwrap_or_else(|error| panic!("process-death tally: {error}"));
+    let record = directory.path("wire-record");
+    let executable = std::env::current_exe().unwrap_or_else(|error| panic!("test binary: {error}"));
+    let mut child = Command::new(executable)
+        .args(["--exact", "killed_process_child", "--nocapture"])
+        .env("IAAM_CEILING_KILLED_DIRECTORY", &directory.0)
+        .env("IAAM_CEILING_KILLED_RECORD", &record)
+        .env(
+            "IAAM_OUTBOUND_TALLY",
+            "/ignored-by-compiled-egress-directory/killed",
+        )
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn killed-process child: {error}"));
+    wait_for_file(&record, &mut child, "killed-process child");
+    child
+        .kill()
+        .unwrap_or_else(|error| panic!("kill pending child: {error}"));
+    child
+        .wait()
+        .unwrap_or_else(|error| panic!("reap pending child: {error}"));
+
+    let server = LoopbackServer::start(std::iter::empty())
+        .unwrap_or_else(|error| panic!("replacement loopback: {error}"));
+    let clock = FakeTime::new();
+    let gateway = Gateway::with_parts_in_directory(
+        HttpClientHarness::new(&server),
+        BUDGETS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&clock) as Arc<dyn Sleeper>,
+        BrokerEgress::On,
+        &directory.0,
+    )
+    .unwrap_or_else(|error| panic!("replacement gateway: {error}"));
+    let refused = gateway
+        .send(
+            &direct_request(
+                Destination::TinkoffSandbox,
+                direct_path(Destination::TinkoffSandbox),
+            ),
+            None,
+        )
+        .await
+        .expect_err("the killed process leaves an unresolved attempt");
+    assert!(matches!(
+        refused,
+        GatewayError::BrokerHostClosed {
+            reason: "an earlier request has no committed status",
+            retry_after,
+            ..
+        } if retry_after == Duration::from_secs(90)
+    ));
+    assert_eq!(server.requests_received(), 0);
+    let text = std::fs::read_to_string(&record)
+        .unwrap_or_else(|error| panic!("read killed-process record: {error}"));
+    let (records, local) = parse_process_records(&text);
+    let measured = measure(&records, local + 1, None)
+        .unwrap_or_else(|error| panic!("measure killed-process record: {error}"));
+    assert_within_ceilings("process-killed", &measured);
+    measured
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1573,6 +2267,9 @@ async fn executable_ceiling_proof() {
     )
     .await;
     no_header.verify_and_print("429-no-header", Destination::TinkoffSandbox, None);
+
+    let rate_limit_closure = exercise_rate_limit_closure().await;
+    rate_limit_closure.verify_and_print("two-429-closure", Destination::TinkoffProd, None);
 
     let reset_body = exercise_body_rate_limit(
         "reset-body",
@@ -1622,11 +2319,36 @@ async fn executable_ceiling_proof() {
     let concurrent = exercise_concurrent_callers().await;
     concurrent.verify_and_print("concurrent-callers", Destination::TinkoffProd, None);
 
+    let cancelled = exercise_cancelled_caller().await;
+    cancelled.verify_and_print("caller-cancelled", Destination::TinkoffProd, None);
+
+    let deadline = exercise_deadline_midflight().await;
+    deadline.verify_and_print("deadline-midflight", Destination::TinkoffSandbox, None);
+
+    let panic = exercise_status_commit_panic().await;
+    panic.verify_and_print("status-commit-panic", Destination::FinamApi, None);
+
+    let record_failure = exercise_record_failure_latch().await;
+    record_failure.verify_and_print("record-failure-latch", Destination::TinkoffProd, None);
+
+    let unresolved = exercise_unresolved_boundary().await;
+    unresolved.verify_and_print("unresolved-90s", Destination::TinkoffSandbox, None);
+
+    let stale_reservation = exercise_stale_reservation().await;
+    stale_reservation.verify_and_print("stale-reservation", Destination::FinamApi, None);
+
+    let path_budget = exercise_path_derived_budget().await;
+    let path_budget_measurement =
+        path_budget.verify_and_print("path-derived-budget", Destination::TinkoffProd, None);
+    let users = path_budget_measurement
+        .pairs
+        .iter()
+        .find(|pair| pair.method == "UsersService")
+        .unwrap_or_else(|| panic!("path-derived proof has no UsersService row"));
+    assert_eq!((users.reached, users.ceiling), (25, 25));
+
     let boot = exercise_boot_change().await;
     boot.verify_and_print("boot-id-change", Destination::TinkoffProd, None);
-
-    let wall = exercise_wall_change().await;
-    wall.verify_and_print("wall-clock-change", Destination::TinkoffSandbox, None);
 
     let egress_off = Scenario::new(
         "egress-off",
@@ -1651,6 +2373,12 @@ async fn executable_ceiling_proof() {
         "process-other-endpoint",
         Destination::FinamApi.base_url(),
         &process_finam,
+    );
+    let process_killed = process_death_measurement().await;
+    print_row(
+        "process-killed",
+        Destination::TinkoffSandbox.base_url(),
+        &process_killed,
     );
 }
 

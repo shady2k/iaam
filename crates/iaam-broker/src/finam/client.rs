@@ -69,6 +69,11 @@ pub enum FinamError {
         "Finam request ceiling of {ceiling} attempts reached; the range is too long for one sync; narrow it and sync again"
     )]
     RequestCeiling { ceiling: u32 },
+    /// The account id cannot be represented as one canonical API path segment.
+    #[error(
+        "Finam account id cannot be used in the account endpoint path; use a non-empty id other than . or .. without /, \\, %, ?, or #"
+    )]
+    InvalidAccountId,
     /// A single day's transactions answer reached the request's limit, and
     /// a single day cannot be split further: whether more transactions lie
     /// past the page cannot be proven from the wire, so the interval is
@@ -148,8 +153,8 @@ impl FinamClient {
         account_id: &str,
         allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
-        self.get(format!("/v1/accounts/{account_id}"), &[], allowance)
-            .await
+        validate_account_id(account_id)?;
+        self.get_account(account_id, "", &[], allowance).await
     }
 
     /// Return the raw body of the account's transactions for a whole
@@ -176,6 +181,7 @@ impl FinamClient {
         to: Date,
         allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
+        validate_account_id(account_id)?;
         let transactions = self
             .transactions_interval(account_id, from, to, allowance)
             .await?;
@@ -247,11 +253,7 @@ impl FinamClient {
             ("limit", self.transactions_limit.to_string()),
         ];
         let body = self
-            .get(
-                format!("/v1/accounts/{account_id}/transactions"),
-                &query,
-                allowance,
-            )
+            .get_account(account_id, "/transactions", &query, allowance)
             .await?;
         let value: Value =
             serde_json::from_str(&body).map_err(|_| FinamError::MalformedResponse)?;
@@ -306,17 +308,23 @@ impl FinamClient {
     }
 
     /// Send a reading call over the session token.
-    async fn get(
+    async fn get_account(
         &self,
-        path: String,
+        account_id: &str,
+        suffix: &str,
         query: &[(&str, String)],
         allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
         let query = query.to_vec();
         self.authorized(allowance, move |token| {
-            let mut request = HttpRequest::get(Destination::FinamApi, &path)
-                .with_bare_token(token)
-                .with_request_allowance(allowance.clone());
+            let mut request = HttpRequest::get_with_encoded_path_segment(
+                Destination::FinamApi,
+                "/v1/accounts/",
+                account_id,
+                suffix,
+            )
+            .with_bare_token(token)
+            .with_request_allowance(allowance.clone());
             for (key, value) in &query {
                 request = request.with_query(key, value);
             }
@@ -485,6 +493,16 @@ impl FinamClient {
             .map_err(Step::Refused)?;
         String::from_utf8(response.body).map_err(|_| Step::Malformed)
     }
+}
+
+fn validate_account_id(account_id: &str) -> Result<(), FinamError> {
+    if account_id.is_empty()
+        || matches!(account_id, "." | "..")
+        || account_id.contains(['/', '\\', '%', '?', '#'])
+    {
+        return Err(FinamError::InvalidAccountId);
+    }
+    Ok(())
 }
 
 /// What a sent call came back with, before Finam's meaning is laid over it.
@@ -861,7 +879,13 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&directory).expect("egress directory created");
-        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+        std::fs::write(
+            directory.join("outbound-tally"),
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+        )
+        .expect("initialized tally created");
+        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+            .expect("initialized generation created");
         directory
     }
 
@@ -937,7 +961,7 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         client
-            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .get_portfolio("Main Account", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("portfolio");
         client
@@ -959,7 +983,10 @@ mod tests {
             exchange.body().map(iaam_http::RequestBody::payload),
             Some(r#"{"secret":"finam-invented-secret"}"#),
         );
-        assert_eq!(received[1].url(), "https://api.finam.ru/v1/accounts/Main");
+        assert_eq!(
+            received[1].url(),
+            "https://api.finam.ru/v1/accounts/Main%20Account"
+        );
         assert_eq!(
             received[2].url(),
             "https://api.finam.ru/v1/accounts/Main/transactions\
@@ -974,6 +1001,28 @@ mod tests {
                     .authorization()
                     .map(|value| value.expose().to_owned()),
                 Some(JWT_ONE.to_owned())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_account_ids_are_refused_before_the_session_or_data_request() {
+        for account_id in ["", ".", "..", "/", "\\", "%2e%2e", "?", "#"] {
+            let endpoint = Arc::new(Scripted::answering(200));
+            let (client, _) = client_over(BUDGETS, &endpoint);
+
+            let error = client
+                .get_portfolio(account_id, &iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect_err("unsafe account id must be refused");
+
+            assert!(
+                error.to_string().contains("Finam account id"),
+                "{account_id:?}: {error}"
+            );
+            assert!(
+                endpoint.received.lock().expect("received").is_empty(),
+                "{account_id:?} reached transport"
             );
         }
     }

@@ -41,6 +41,16 @@ const DAILY_CEILING: usize = 1_000;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn initialize_tally(directory: &Path) {
+    std::fs::write(
+        directory.join("outbound-tally"),
+        "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+    )
+    .unwrap_or_else(|error| panic!("create initialized tally: {error}"));
+    std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+        .unwrap_or_else(|error| panic!("create initialized generation: {error}"));
+}
+
 #[derive(Clone, Debug)]
 struct SendRecord {
     logical_at: Duration,
@@ -656,6 +666,7 @@ struct ProofTransport {
     inner: HttpClientHarness,
     clock: Arc<FakeTime>,
     advance_before_handoff: Mutex<Option<Duration>>,
+    advance_after_handoff: Mutex<Option<Duration>>,
 }
 
 impl ProofTransport {
@@ -663,12 +674,16 @@ impl ProofTransport {
         inner: HttpClientHarness,
         clock: Arc<FakeTime>,
         advance_before_handoff: Duration,
+        advance_after_handoff: Duration,
     ) -> Self {
         Self {
             inner,
             clock,
             advance_before_handoff: Mutex::new(
                 (!advance_before_handoff.is_zero()).then_some(advance_before_handoff),
+            ),
+            advance_after_handoff: Mutex::new(
+                (!advance_after_handoff.is_zero()).then_some(advance_after_handoff),
             ),
         }
     }
@@ -682,6 +697,13 @@ impl ProofTransport {
         {
             self.clock.advance(by);
         }
+    }
+
+    fn take_after_handoff(&self) -> Option<Duration> {
+        self.advance_after_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -698,13 +720,23 @@ impl Transport for ProofTransport {
         observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         self.advance_before_handoff();
-        Transport::send_observed(&self.inner, request, handoff, observe)
+        let after = self.take_after_handoff();
+        let clock = Arc::clone(&self.clock);
+        let delayed_handoff = Box::new(move || {
+            handoff()?;
+            if let Some(by) = after {
+                clock.advance(by);
+            }
+            Ok(())
+        });
+        Transport::send_observed(&self.inner, request, delayed_handoff, observe)
     }
 }
 
 struct ScenarioTiming {
     sleep_mode: SleepMode,
     advance_before_handoff: Duration,
+    advance_after_handoff: Duration,
 }
 
 struct Scenario {
@@ -734,6 +766,7 @@ impl Scenario {
             ScenarioTiming {
                 sleep_mode: SleepMode::Logical,
                 advance_before_handoff: Duration::ZERO,
+                advance_after_handoff: Duration::ZERO,
             },
         )
     }
@@ -752,6 +785,7 @@ impl Scenario {
             ScenarioTiming {
                 sleep_mode: SleepMode::Wire,
                 advance_before_handoff: Duration::ZERO,
+                advance_after_handoff: Duration::ZERO,
             },
         )
     }
@@ -770,6 +804,7 @@ impl Scenario {
             ScenarioTiming {
                 sleep_mode: SleepMode::Deadline,
                 advance_before_handoff: Duration::ZERO,
+                advance_after_handoff: Duration::ZERO,
             },
         );
         scenario.context.active_sync.store(1, Ordering::SeqCst);
@@ -790,6 +825,7 @@ impl Scenario {
             ScenarioTiming {
                 sleep_mode: SleepMode::ControlledDeadline,
                 advance_before_handoff: Duration::ZERO,
+                advance_after_handoff: Duration::ZERO,
             },
         )
     }
@@ -809,6 +845,28 @@ impl Scenario {
             ScenarioTiming {
                 sleep_mode: SleepMode::Logical,
                 advance_before_handoff,
+                advance_after_handoff: Duration::ZERO,
+            },
+        )
+    }
+
+    fn new_handoff_lag(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+        timeout: Duration,
+        advance_after_handoff: Duration,
+    ) -> Self {
+        Self::build(
+            label,
+            destination,
+            replies,
+            timeout,
+            true,
+            ScenarioTiming {
+                sleep_mode: SleepMode::Logical,
+                advance_before_handoff: Duration::ZERO,
+                advance_after_handoff,
             },
         )
     }
@@ -824,12 +882,11 @@ impl Scenario {
         let ScenarioTiming {
             sleep_mode,
             advance_before_handoff,
+            advance_after_handoff,
         } = timing;
         let directory = TempDir::new(label);
-        let tally = directory.path("outbound-tally");
         if egress {
-            std::fs::write(&tally, "")
-                .unwrap_or_else(|error| panic!("create {}: {error}", tally.display()));
+            initialize_tally(&directory.0);
         }
         let clock = FakeTime::new();
         let context = CallContext::new();
@@ -865,6 +922,7 @@ impl Scenario {
             HttpClientHarness::new(&server).with_timeout(timeout),
             Arc::clone(&clock),
             advance_before_handoff,
+            advance_after_handoff,
         );
         let sleeper: Arc<dyn Sleeper> = match sleep_mode {
             SleepMode::Wire => Arc::new(WireSleeper {
@@ -1728,6 +1786,54 @@ async fn exercise_record_failure_latch() -> Scenario {
     scenario
 }
 
+async fn exercise_lost_second_429() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new(
+        "lost-second-429",
+        destination,
+        [
+            LoopbackReply::complete(429, "limited").with_header("Retry-After", "600"),
+            LoopbackReply::held(429, "limited").with_header("Retry-After", "600"),
+        ],
+        Duration::from_secs(5),
+        true,
+    );
+    direct_send(&scenario, destination)
+        .await
+        .expect_err("the first 429 pauses the endpoint");
+    scenario.clock.advance(Duration::from_secs(601));
+
+    let outbound = Arc::clone(&scenario.outbound);
+    let second = tokio::spawn(async move {
+        outbound
+            .send(&direct_request(destination, direct_path(destination)), None)
+            .await
+    });
+    wait_for_arrivals(&scenario, 2).await;
+    let obstruction = scenario._directory.path("outbound-tally.tmp");
+    std::fs::create_dir(&obstruction)
+        .unwrap_or_else(|error| panic!("create second-429 obstruction: {error}"));
+    scenario.server.release_one();
+    let failed = second
+        .await
+        .unwrap_or_else(|error| panic!("join second-429 caller: {error}"))
+        .expect_err("the second 429 tally commit fails");
+    assert!(matches!(failed, GatewayError::TallyUnavailable { .. }));
+    std::fs::remove_dir(&obstruction)
+        .unwrap_or_else(|error| panic!("remove second-429 obstruction: {error}"));
+
+    let replayed = direct_send(&scenario, destination)
+        .await
+        .expect_err("the lost second 429 is replayed");
+    assert!(matches!(
+        replayed,
+        GatewayError::BrokerHostPaused { retry_after, .. }
+            if retry_after == Duration::from_secs(600)
+    ));
+    assert_eq!(scenario.server.requests_received(), 2);
+    scenario
+}
+
 async fn exercise_unresolved_boundary() -> Scenario {
     let destination = Destination::TinkoffSandbox;
     let scenario = Scenario::new(
@@ -1826,6 +1932,100 @@ async fn exercise_delayed_handoff_day() -> Scenario {
     scenario
 }
 
+async fn exercise_post_handoff_timeout() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new_handoff_lag(
+        "post-handoff-timeout",
+        destination,
+        [LoopbackReply::held(200, "never")],
+        Duration::from_millis(50),
+        Duration::from_secs(61),
+    );
+    direct_send(&scenario, destination)
+        .await
+        .expect_err("a response timeout is unresolved");
+    let closed = direct_send(&scenario, destination)
+        .await
+        .expect_err("the unresolved timeout closes the endpoint");
+    assert!(matches!(closed, GatewayError::BrokerHostClosed { .. }));
+    assert_eq!(scenario.server.requests_received(), 1);
+    scenario
+}
+
+async fn exercise_post_handoff_day() -> Scenario {
+    let destination = Destination::TinkoffSandbox;
+    let scenario = Scenario::new_handoff_lag(
+        "post-handoff-day",
+        destination,
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), DAILY_CEILING),
+        Duration::from_secs(5),
+        DAY,
+    );
+    for attempt in 0..DAILY_CEILING {
+        direct_send(&scenario, destination)
+            .await
+            .unwrap_or_else(|error| panic!("post-handoff-day send {attempt}: {error}"));
+    }
+    let refused = direct_send(&scenario, destination)
+        .await
+        .expect_err("the 1,001st departure in the post-handoff day is refused");
+    assert!(matches!(refused, GatewayError::DailyCeiling { .. }));
+    assert_eq!(scenario.server.requests_received(), DAILY_CEILING);
+    scenario
+}
+
+async fn exercise_empty_pair_ceiling() -> Scenario {
+    let destination = Destination::FinamApi;
+    let scenario = Scenario::new(
+        "empty-pair",
+        destination,
+        [LoopbackReply::complete(200, "{}")],
+        Duration::from_secs(5),
+        true,
+    );
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("empty-pair initial send: {error}"));
+    std::fs::write(scenario._directory.path("outbound-tally"), "")
+        .unwrap_or_else(|error| panic!("empty proof tally: {error}"));
+    std::fs::write(scenario._directory.path("outbound-tally-generation"), "")
+        .unwrap_or_else(|error| panic!("empty proof generation: {error}"));
+
+    let refused = direct_send(&scenario, destination)
+        .await
+        .expect_err("an empty pair starts at the day ceiling");
+    assert!(matches!(
+        refused,
+        GatewayError::DailyCeiling { retry_after, .. } if retry_after == DAY
+    ));
+    assert_eq!(scenario.server.requests_received(), 1);
+    scenario
+}
+
+async fn exercise_finam_path_aliases() -> Scenario {
+    let scenario = Scenario::new(
+        "finam-path-aliases",
+        Destination::FinamApi,
+        std::iter::empty(),
+        Duration::from_secs(5),
+        true,
+    );
+    for path in [
+        "/v1/accounts/Main\\child",
+        "/v1/accounts/%2e%2e",
+        "/v1/accounts/%2e%2e/transactions",
+    ] {
+        let refused = scenario
+            .outbound
+            .send(&direct_request(Destination::FinamApi, path), None)
+            .await
+            .expect_err("an alias-shaped Finam path has no budget");
+        assert!(matches!(refused, GatewayError::UnknownBudget { .. }));
+    }
+    assert_eq!(scenario.server.requests_received(), 0);
+    scenario
+}
+
 async fn exercise_tally_truncation() -> Scenario {
     let destination = Destination::TinkoffProd;
     let scenario = Scenario::new(
@@ -1864,16 +2064,21 @@ async fn exercise_tally_rollback() -> Scenario {
         .await
         .unwrap_or_else(|error| panic!("tally-rollback first send: {error}"));
     let tally_path = scenario._directory.path("outbound-tally");
-    let older = std::fs::read(&tally_path)
+    let generation_path = scenario._directory.path("outbound-tally-generation");
+    let older_tally = std::fs::read(&tally_path)
         .unwrap_or_else(|error| panic!("read older proof tally: {error}"));
+    let older_generation = std::fs::read(&generation_path)
+        .unwrap_or_else(|error| panic!("read older proof generation: {error}"));
     direct_send(&scenario, destination)
         .await
         .unwrap_or_else(|error| panic!("tally-rollback second send: {error}"));
-    std::fs::write(&tally_path, older)
+    std::fs::write(&tally_path, older_tally)
         .unwrap_or_else(|error| panic!("restore older proof tally: {error}"));
+    std::fs::write(&generation_path, older_generation)
+        .unwrap_or_else(|error| panic!("restore older proof generation: {error}"));
     let refused = direct_send(&scenario, destination)
         .await
-        .expect_err("a tally-generation rollback is refused");
+        .expect_err("a matching tally-generation rollback is refused");
     assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
     assert_eq!(scenario.server.requests_received(), 2);
     scenario
@@ -2174,12 +2379,11 @@ async fn process_child() {
 
 fn process_measurements() -> (Measurements, Measurements) {
     let directory = TempDir::new("processes");
-    let tally = directory.path("outbound-tally");
     let ready = directory.path("ready");
     let done = directory.path("done");
     let owner_result = directory.path("owner-result");
     let contender_result = directory.path("contender-result");
-    std::fs::write(&tally, "").unwrap_or_else(|error| panic!("process tally: {error}"));
+    initialize_tally(&directory.0);
     let executable = std::env::current_exe().unwrap_or_else(|error| panic!("test binary: {error}"));
     let child = |role: &str, result: &Path| {
         Command::new(&executable)
@@ -2242,51 +2446,71 @@ async fn killed_process_child() {
             .unwrap_or_else(|| panic!("killed child record path")),
     );
     let clock = FakeTime::new();
-    let observed_clock = Arc::clone(&clock);
-    let server = LoopbackServer::start_observed(
-        [LoopbackReply::held(200, "never")],
-        move |target, status| {
-            let line = format!(
-                "wire\t{}\t{}\t{}\t{}\nlocal\t0\n",
-                observed_clock.logical_now().as_nanos(),
-                Destination::TinkoffSandbox.base_url(),
-                method_for_target(target)
-                    .unwrap_or_else(|| panic!("unknown killed-process target: {target}")),
-                status
-            );
-            std::fs::write(&record, line)
-                .unwrap_or_else(|error| panic!("write killed-process record: {error}"));
-        },
-    )
+    let server = LoopbackServer::start([
+        LoopbackReply::held(429, "limited").with_header("Retry-After", "600")
+    ])
     .unwrap_or_else(|error| panic!("killed-process loopback: {error}"));
-    let gateway = Gateway::with_parts_in_directory(
-        ProofTransport::new(
-            HttpClientHarness::new(&server),
-            Arc::clone(&clock),
-            Duration::from_secs(61),
-        ),
-        BUDGETS,
-        Arc::clone(&clock) as Arc<dyn Clock>,
-        Arc::clone(&clock) as Arc<dyn Sleeper>,
-        BrokerEgress::On,
-        Path::new(&directory),
-    )
-    .unwrap_or_else(|error| panic!("killed-process gateway: {error}"));
-    let _ = gateway
-        .send(
-            &direct_request(
-                Destination::TinkoffSandbox,
-                direct_path(Destination::TinkoffSandbox),
+    let gateway = Arc::new(
+        Gateway::with_parts_in_directory(
+            ProofTransport::new(
+                HttpClientHarness::new(&server),
+                Arc::clone(&clock),
+                Duration::ZERO,
+                Duration::ZERO,
             ),
-            None,
+            BUDGETS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::clone(&clock) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            Path::new(&directory),
         )
-        .await;
+        .unwrap_or_else(|error| panic!("killed-process gateway: {error}")),
+    );
+    let sending = {
+        let gateway = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            gateway
+                .send(
+                    &direct_request(
+                        Destination::TinkoffSandbox,
+                        direct_path(Destination::TinkoffSandbox),
+                    ),
+                    None,
+                )
+                .await
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.requests_received() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "killed-process request did not reach the server"
+        );
+        tokio::task::yield_now().await;
+    }
+    let obstruction = PathBuf::from(&directory).join("outbound-tally.tmp");
+    std::fs::create_dir(&obstruction)
+        .unwrap_or_else(|error| panic!("create killed-process tally obstruction: {error}"));
+    server.release_one();
+    let refused = sending
+        .await
+        .unwrap_or_else(|error| panic!("join killed-process send: {error}"))
+        .expect_err("the arrived 429 cannot commit through the obstruction");
+    assert!(matches!(refused, GatewayError::TallyUnavailable { .. }));
+    let line = format!(
+        "wire\t{}\t{}\t{}\t429\nlocal\t0\n",
+        clock.logical_now().as_nanos(),
+        Destination::TinkoffSandbox.base_url(),
+        "OperationsService",
+    );
+    std::fs::write(&record, line)
+        .unwrap_or_else(|error| panic!("write killed-process record: {error}"));
+    std::future::pending::<()>().await;
 }
 
 async fn process_death_measurement() -> Measurements {
     let directory = TempDir::new("process-death");
-    std::fs::write(directory.path("outbound-tally"), "")
-        .unwrap_or_else(|error| panic!("process-death tally: {error}"));
+    initialize_tally(&directory.0);
     let record = directory.path("wire-record");
     let executable = std::env::current_exe().unwrap_or_else(|error| panic!("test binary: {error}"));
     let mut child = Command::new(executable)
@@ -2306,8 +2530,10 @@ async fn process_death_measurement() -> Measurements {
     child
         .wait()
         .unwrap_or_else(|error| panic!("reap pending child: {error}"));
+    std::fs::remove_dir(directory.path("outbound-tally.tmp"))
+        .unwrap_or_else(|error| panic!("remove killed-process obstruction: {error}"));
 
-    let server = LoopbackServer::start(std::iter::empty())
+    let server = LoopbackServer::start([LoopbackReply::complete(200, "{}")])
         .unwrap_or_else(|error| panic!("replacement loopback: {error}"));
     let clock = FakeTime::new();
     clock.advance(Duration::from_secs(61));
@@ -2336,9 +2562,21 @@ async fn process_death_measurement() -> Measurements {
             reason: "an earlier request has no committed status",
             retry_after,
             ..
-        } if retry_after == Duration::from_secs(90)
+        } if retry_after == DAY
     ));
     assert_eq!(server.requests_received(), 0);
+    clock.advance(DAY);
+    gateway
+        .send(
+            &direct_request(
+                Destination::TinkoffSandbox,
+                direct_path(Destination::TinkoffSandbox),
+            ),
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("replacement boundary send: {error}"));
+    assert_eq!(server.requests_received(), 1);
     let text = std::fs::read_to_string(&record)
         .unwrap_or_else(|error| panic!("read killed-process record: {error}"));
     let (records, local) = parse_process_records(&text);
@@ -2463,6 +2701,9 @@ async fn executable_ceiling_proof() {
     let record_failure = exercise_record_failure_latch().await;
     record_failure.verify_and_print("record-failure-latch", Destination::TinkoffProd, None);
 
+    let lost_second_429 = exercise_lost_second_429().await;
+    lost_second_429.verify_and_print("lost-second-429", Destination::TinkoffProd, None);
+
     let unresolved = exercise_unresolved_boundary().await;
     unresolved.verify_and_print("unresolved-90s", Destination::TinkoffSandbox, None);
 
@@ -2483,6 +2724,20 @@ async fn executable_ceiling_proof() {
     let delayed_day_measurement =
         delayed_day.verify_and_print("handoff-delay-24h", Destination::TinkoffSandbox, None);
     assert_eq!(delayed_day_measurement.max_day, DAILY_CEILING);
+
+    let post_handoff_timeout = exercise_post_handoff_timeout().await;
+    post_handoff_timeout.verify_and_print("post-handoff-timeout", Destination::TinkoffProd, None);
+
+    let post_handoff_day = exercise_post_handoff_day().await;
+    let post_handoff_day_measurement =
+        post_handoff_day.verify_and_print("post-handoff-day", Destination::TinkoffSandbox, None);
+    assert_eq!(post_handoff_day_measurement.max_day, DAILY_CEILING);
+
+    let empty_pair = exercise_empty_pair_ceiling().await;
+    empty_pair.verify_and_print("empty-pair-day-ceiling", Destination::FinamApi, None);
+
+    let finam_aliases = exercise_finam_path_aliases().await;
+    finam_aliases.verify_and_print("finam-path-aliases", Destination::FinamApi, None);
 
     let path_budget = exercise_path_derived_budget().await;
     let path_budget_measurement =

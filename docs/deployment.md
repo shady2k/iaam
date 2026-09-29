@@ -226,27 +226,38 @@ creates a separate owner and tally domain and is not safe. Processes on
 different machines do not share this coordination. Network filesystems and
 cross-machine tally sharing are outside the proof.
 
-Both tally records must already exist. Two empty records are initialized
-together on first use. Only the current `iaam-outbound-tally-v4` format is
-accepted; no older format was deployed, so any older header is corruption, not
-a migration source. During a controlled stop, recreate both records together
-rather than copying one over the other. Leftover temporary files are ignored;
+Both tally records must already exist. A pair of empty records is accepted only
+as a conservative recovery state: on first use iaam records 1,000 attempts at
+the current time for **each** broker endpoint, so every broker endpoint remains
+at its rolling-day ceiling for 24 hours. This is deliberate; an empty pair
+cannot prove that an earlier tally was unused. Only the current
+`iaam-outbound-tally-v4` format is accepted; no older format was deployed, so
+any older header is corruption, not a migration source. The two records carry
+the same generation. A process also remembers the highest matching generation
+it has read and refuses a later matching pair below that high-water mark, even
+if both files were rolled back together. Leftover temporary files are ignored;
 only the last complete tally and matching generation are read.
 
 Do not copy, alias, replace, delete or truncate a live egress directory or any
 record in it. The process verifies the path and held inodes before each
 transaction. A reservation becomes pending before network I/O and is cleared
 only after the response status is durably committed. Cancellation, deadline,
-transport failure, panic or process death leaves that attempt unresolved for
-the request timeout plus the mandatory 60-second rate-limit pause: 90 seconds
-from the persisted handoff. A new owner that finds a pending attempt restarts
-that full interval from its own acquisition. If a `429` remains in the prior
-ten-minute window, an unresolved attempt closes the endpoint for 30 minutes
-instead.
+transport failure or panic moves the reservation to the observation time before
+clearing it and closes the endpoint for the request timeout plus the mandatory
+60-second rate-limit pause: 90 seconds. Pruning retains the timestamps that
+belong to a pending attempt. Process death leaves the pending marker in place;
+a new owner that adopts it reinserts any timestamps lost by an older pruner at
+its own acquisition time and closes that endpoint for a full 24 hours from
+adoption. Other endpoint activity and the original handoff's age do not shorten
+that closure.
 
-Operational repair is a controlled stop: stop every process using the mount,
-repair or recreate both records, then start one process and run
-`make ceiling-proof` before restoring traffic.
+Operational repair is a controlled stop: stop every process using the mount and
+repair both records as one matched pair. If no trustworthy matched pair exists,
+empty both records together, start one process, and expect the documented
+24-hour daily-ceiling refusal on every broker endpoint. After that interval,
+run `make ceiling-proof` before restoring traffic. Never restore just one
+record or bypass the conservative interval by editing timestamps or generation
+numbers.
 
 
 `IAAM_SOURCE_PROFILES` names a directory of **source profiles** — reviewed JSON

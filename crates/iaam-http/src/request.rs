@@ -137,6 +137,7 @@ pub struct HttpRequest {
     destination: Destination,
     method: HttpMethod,
     path: String,
+    wire_path: Option<String>,
     query: Vec<(String, String)>,
     body: Option<RequestBody>,
     bearer: Option<Secret>,
@@ -158,6 +159,23 @@ impl HttpRequest {
         Self::new(destination, HttpMethod::Post, path, Some(body))
     }
 
+    /// Build a GET whose one caller-supplied path segment is encoded on the
+    /// wire while [`Self::path`] retains the raw spelling for policy checks.
+    #[must_use]
+    pub fn get_with_encoded_path_segment(
+        destination: Destination,
+        prefix: &str,
+        segment: &str,
+        suffix: &str,
+    ) -> Self {
+        let path = format!("{prefix}{segment}{suffix}");
+        let encoded = utf8_percent_encode(segment, NON_ALPHANUMERIC);
+        let wire_path = format!("{prefix}{encoded}{suffix}");
+        let mut request = Self::get(destination, &path);
+        request.wire_path = Some(wire_path);
+        request
+    }
+
     fn new(
         destination: Destination,
         method: HttpMethod,
@@ -168,6 +186,7 @@ impl HttpRequest {
             destination,
             method,
             path: path.to_owned(),
+            wire_path: None,
             query: Vec::new(),
             body,
             bearer: None,
@@ -299,7 +318,8 @@ impl HttpRequest {
     #[must_use]
     pub fn url(&self) -> String {
         let base = self.destination.base_url().trim_end_matches('/');
-        let path = self.path.trim_start_matches('/');
+        let path = self.wire_path.as_deref().unwrap_or(&self.path);
+        let path = path.trim_start_matches('/');
         let mut url = format!("{base}/{path}");
         if !self.query.is_empty() {
             url.push('?');
@@ -378,6 +398,22 @@ mod tests {
     fn a_url_joins_base_and_path_without_doubling_the_slash() {
         let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
         assert_eq!(request.url(), "https://iss.moex.com/iss/history.json");
+    }
+
+    #[test]
+    fn an_encoded_path_segment_keeps_its_raw_policy_path() {
+        let request = HttpRequest::get_with_encoded_path_segment(
+            Destination::FinamApi,
+            "/v1/accounts/",
+            "Main Account",
+            "/transactions",
+        );
+
+        assert_eq!(request.path(), "/v1/accounts/Main Account/transactions");
+        assert_eq!(
+            request.url(),
+            "https://api.finam.ru/v1/accounts/Main%20Account/transactions"
+        );
     }
 
     #[test]

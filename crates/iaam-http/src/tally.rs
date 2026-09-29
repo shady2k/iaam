@@ -9,6 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -36,6 +37,11 @@ const UNRESOLVED_ATTEMPT_NANOS: u128 = UNRESOLVED_ATTEMPT.as_nanos();
 const _: () = assert!(UNRESOLVED_ATTEMPT.as_secs() == 90 && UNRESOLVED_ATTEMPT.subsec_nanos() == 0);
 pub(crate) const TALLY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const DAILY_CEILING: u32 = 1_000;
+const BROKER_HOSTS: [&str; 3] = [
+    "https://invest-public-api.tbank.ru/rest",
+    "https://sandbox-invest-public-api.tbank.ru/rest",
+    "https://api.finam.ru",
+];
 
 #[derive(Debug, Error)]
 pub(crate) enum TallyError {
@@ -125,6 +131,7 @@ struct State {
     boot_high_water: Option<u128>,
     hosts: BTreeMap<String, HostState>,
     sends: BTreeMap<(String, String), Vec<u128>>,
+    pair_was_empty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +154,7 @@ struct EgressDirectoryInner {
     path: PathBuf,
     descriptor: OwnedFd,
     identity: FileIdentity,
+    generation_high_water: AtomicU64,
 }
 
 /// A retained descriptor for the one directory that owns the tally and every
@@ -187,6 +195,7 @@ impl EgressDirectory {
             path: path.to_owned(),
             descriptor,
             identity,
+            generation_high_water: AtomicU64::new(0),
         })))
     }
 
@@ -408,14 +417,48 @@ impl OutboundTally {
             let boot = read_boot(clock)?;
             let now_nanos = boot.elapsed().as_nanos();
             let mut changed = state.prepare_boot(&boot)?;
-            changed |= state.move_pending_to(host, now_nanos)?;
+            if state
+                .hosts
+                .get(host)
+                .is_some_and(|host_state| host_state.pending_since.is_some())
+            {
+                state.move_pending_to(host, now_nanos)?;
+                changed = true;
+            }
             changed |= state.prune(now_nanos);
             Ok(((), changed))
         })
     }
 
     pub(crate) fn adopt_pending(&self, host: &str, clock: &dyn Clock) -> Result<(), TallyError> {
-        self.acknowledge_handoff(host, clock)
+        self.transact(|state| {
+            let boot = read_boot(clock)?;
+            let now_nanos = boot.elapsed().as_nanos();
+            let mut changed = state.prepare_boot(&boot)?;
+            if state
+                .hosts
+                .get(host)
+                .is_some_and(|host_state| host_state.pending_since.is_some())
+            {
+                state.move_pending_to(host, now_nanos)?;
+                state.prune(now_nanos);
+                let host_state = state.host_for_boot(host, now_nanos);
+                host_state.pending_since = None;
+                host_state.pending_budget_key = None;
+                let closed_until = now_nanos.saturating_add(DAY_NANOS);
+                host_state.closed_until = Some(
+                    host_state
+                        .closed_until
+                        .unwrap_or_default()
+                        .max(closed_until),
+                );
+                host_state.closed_reason = Some(ClosureReason::UnresolvedAttempt);
+                changed = true;
+            } else {
+                changed |= state.prune(now_nanos);
+            }
+            Ok(((), changed))
+        })
     }
 
     pub(crate) fn record_response(
@@ -525,6 +568,7 @@ impl OutboundTally {
             let boot = read_boot(clock)?;
             let now_nanos = boot.elapsed().as_nanos();
             state.prepare_boot(&boot)?;
+            state.move_pending_to(host, now_nanos)?;
             state.prune(now_nanos);
             let host_state = state.host_for_boot(host, now_nanos);
             let pending_since = host_state.pending_since.take().unwrap_or(now_nanos);
@@ -587,11 +631,11 @@ impl OutboundTally {
         changed |= state.prune(now_nanos);
 
         state.host_for_boot(host, now_nanos);
-        let host_state = state
+        if let Some(pending_since) = state
             .hosts
-            .get_mut(host)
-            .ok_or_else(|| TallyError::Corrupt("the endpoint state was not created".to_owned()))?;
-        if let Some(pending_since) = host_state.pending_since {
+            .get(host)
+            .and_then(|host_state| host_state.pending_since)
+        {
             let until = pending_since.saturating_add(UNRESOLVED_ATTEMPT_NANOS);
             if until > now_nanos {
                 return Ok((
@@ -602,6 +646,10 @@ impl OutboundTally {
                     changed,
                 ));
             }
+            state.move_pending_to(host, now_nanos)?;
+            let host_state = state.hosts.get_mut(host).ok_or_else(|| {
+                TallyError::Corrupt("the endpoint state was not created".to_owned())
+            })?;
             host_state.pending_since = None;
             host_state.pending_budget_key = None;
             changed = true;
@@ -610,6 +658,10 @@ impl OutboundTally {
                 host_state.closed_reason = Some(ClosureReason::RateLimits);
             }
         }
+        let host_state = state
+            .hosts
+            .get_mut(host)
+            .ok_or_else(|| TallyError::Corrupt("the endpoint state was not created".to_owned()))?;
         if let Some(decision) = Self::active_refusal(host_state, now_nanos) {
             return Ok((decision, true));
         }
@@ -703,6 +755,10 @@ impl OutboundTally {
                     TallyError::Corrupt("the tally generation is exhausted".to_owned())
                 })?;
                 self.persist(&state, tally_identity, generation_identity)?;
+                self.directory
+                    .0
+                    .generation_high_water
+                    .fetch_max(state.generation, Ordering::AcqRel);
             } else {
                 self.directory.verify_child(TALLY_FILE, tally_identity)?;
                 self.directory
@@ -751,14 +807,20 @@ impl OutboundTally {
         self.directory
             .verify_child(GENERATION_FILE, generation_identity)?;
 
-        let state = State::parse(&tally_text)?;
+        let mut state = State::parse(&tally_text)?;
+        let process_generation = self
+            .directory
+            .0
+            .generation_high_water
+            .load(Ordering::Acquire);
         if tally_text.is_empty() {
             if !generation_text.is_empty() {
                 return Err(TallyError::Corrupt(
-                    "the outbound tally was emptied; restore the current tally and generation record before retrying"
+                    "the outbound tally was emptied without its generation record; empty or restore both records together during a controlled stop"
                         .to_owned(),
                 ));
             }
+            state.generation = process_generation;
         } else {
             let recorded_generation = parse_generation(&generation_text)?;
             if recorded_generation != state.generation {
@@ -767,6 +829,16 @@ impl OutboundTally {
                     state.generation
                 )));
             }
+            if state.generation < process_generation {
+                return Err(TallyError::Corrupt(format!(
+                    "the tally pair generation {} is older than this process generation high-water {process_generation}; no older tally format was deployed, so restore the current pair before retrying",
+                    state.generation
+                )));
+            }
+            self.directory
+                .0
+                .generation_high_water
+                .fetch_max(state.generation, Ordering::AcqRel);
         }
         Ok((state, tally_identity, generation_identity))
     }
@@ -842,7 +914,10 @@ impl OutboundTally {
 impl State {
     fn parse(text: &str) -> Result<Self, TallyError> {
         if text.is_empty() {
-            return Ok(Self::default());
+            return Ok(Self {
+                pair_was_empty: true,
+                ..Self::default()
+            });
         }
         let mut lines = text.lines();
         let header = lines.next();
@@ -969,62 +1044,49 @@ impl State {
         Ok(())
     }
 
-    fn move_pending_to(&mut self, host: &str, now_nanos: u128) -> Result<bool, TallyError> {
+    fn move_pending_to(&mut self, host: &str, now_nanos: u128) -> Result<(), TallyError> {
         let Some((pending_since, budget_key)) = self.hosts.get(host).and_then(|state| {
             state
                 .pending_since
                 .zip(state.pending_budget_key.as_ref())
                 .map(|(pending_since, budget_key)| (pending_since, budget_key.clone()))
         }) else {
-            return Ok(false);
+            return Ok(());
         };
-        if now_nanos <= pending_since {
-            let host_state = self.hosts.get_mut(host).ok_or_else(|| {
-                TallyError::Corrupt(format!("endpoint {host:?} state disappeared"))
-            })?;
-            let previous = host_state.last_send;
-            host_state.last_send = Some(previous.unwrap_or_default().max(pending_since));
-            return Ok(host_state.last_send != previous);
-        }
-
-        let sends = self
-            .sends
-            .get_mut(&(host.to_owned(), budget_key))
-            .ok_or_else(|| {
-                TallyError::Corrupt(format!(
-                    "endpoint {host:?} has a pending request without its method reservation"
-                ))
-            })?;
-        let method_send = sends.last_mut().ok_or_else(|| {
-            TallyError::Corrupt(format!(
-                "endpoint {host:?} has a pending request without a method timestamp"
-            ))
-        })?;
-        if *method_send != pending_since {
+        let moved_to = pending_since.max(now_nanos);
+        let key = (host.to_owned(), budget_key);
+        let method_last = self.sends.get(&key).and_then(|sent| sent.last()).copied();
+        let daily_last = self
+            .hosts
+            .get(host)
+            .and_then(|host_state| host_state.daily_sends.last())
+            .copied();
+        if method_last.is_some_and(|at| at != pending_since)
+            || daily_last.is_some_and(|at| at != pending_since)
+        {
             return Err(TallyError::Corrupt(format!(
-                "endpoint {host:?} pending request does not name the latest method timestamp"
+                "endpoint {host:?} pending request does not name the latest method and daily timestamps"
             )));
         }
-        *method_send = now_nanos;
 
+        let sent = self.sends.entry(key).or_default();
+        if let Some(method) = sent.last_mut() {
+            *method = moved_to;
+        } else {
+            sent.push(moved_to);
+        }
         let host_state = self
             .hosts
             .get_mut(host)
             .ok_or_else(|| TallyError::Corrupt(format!("endpoint {host:?} state disappeared")))?;
-        let daily_send = host_state.daily_sends.last_mut().ok_or_else(|| {
-            TallyError::Corrupt(format!(
-                "endpoint {host:?} has a pending request without a daily timestamp"
-            ))
-        })?;
-        if *daily_send != pending_since {
-            return Err(TallyError::Corrupt(format!(
-                "endpoint {host:?} pending request does not name the latest daily timestamp"
-            )));
+        if let Some(daily) = host_state.daily_sends.last_mut() {
+            *daily = moved_to;
+        } else {
+            host_state.daily_sends.push(moved_to);
         }
-        *daily_send = now_nanos;
-        host_state.last_send = Some(host_state.last_send.unwrap_or_default().max(now_nanos));
-        host_state.pending_since = Some(now_nanos);
-        Ok(true)
+        host_state.last_send = Some(host_state.last_send.unwrap_or_default().max(moved_to));
+        host_state.pending_since = Some(moved_to);
+        Ok(())
     }
 
     fn rollback_pending(&mut self, host: &str) -> Result<(), TallyError> {
@@ -1082,6 +1144,19 @@ impl State {
         for sent in self.sends.values_mut() {
             sent.fill(now);
         }
+        if self.pair_was_empty {
+            for host in BROKER_HOSTS {
+                self.hosts.insert(
+                    host.to_owned(),
+                    HostState {
+                        last_send: Some(now),
+                        daily_sends: vec![now; DAILY_CEILING as usize],
+                        ..HostState::default()
+                    },
+                );
+            }
+            self.pair_was_empty = false;
+        }
         Ok(true)
     }
 
@@ -1098,9 +1173,17 @@ impl State {
         let mut changed = false;
         let send_cutoff = now_nanos.checked_sub(TALLY_RETENTION.as_nanos());
         if let Some(send_cutoff) = send_cutoff {
-            self.sends.retain(|_, sent| {
+            let hosts = &self.hosts;
+            self.sends.retain(|(host, budget_key), sent| {
+                let pending = hosts.get(host).and_then(|state| {
+                    state
+                        .pending_since
+                        .zip(state.pending_budget_key.as_deref())
+                        .filter(|(_, pending_key)| *pending_key == budget_key)
+                        .map(|(at, _)| at)
+                });
                 let previous = sent.len();
-                sent.retain(|at| *at > send_cutoff);
+                sent.retain(|at| *at > send_cutoff || pending == Some(*at));
                 changed |= sent.len() != previous;
                 let keep = !sent.is_empty();
                 changed |= !keep;
@@ -1110,8 +1193,11 @@ impl State {
         let refusal_cutoff = now_nanos.checked_sub(REFUSAL_WINDOW_NANOS);
         for state in self.hosts.values_mut() {
             if let Some(send_cutoff) = send_cutoff {
+                let pending = state.pending_since;
                 let previous_daily = state.daily_sends.len();
-                state.daily_sends.retain(|at| *at > send_cutoff);
+                state
+                    .daily_sends
+                    .retain(|at| *at > send_cutoff || pending == Some(*at));
                 changed |= state.daily_sends.len() != previous_daily;
             }
             if let Some(refusal_cutoff) = refusal_cutoff {
@@ -1652,5 +1738,251 @@ mod tests {
             matches!(&refused, TallyError::InvalidPath(reason) if reason.contains("replaced")),
             "{refused}"
         );
+    }
+    #[test]
+    fn recording_an_unknown_outcome_moves_the_reservation_before_clearing_it() {
+        let (_temporary, _directory, tally) = tally("unknown-outcome-moves-reservation");
+        let host = "https://broker.invalid";
+        let sent = ready_send(&tally, host, Duration::from_secs(40_000));
+        let resolved = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(61));
+
+        tally
+            .record_unknown_outcome(host, &resolved)
+            .unwrap_or_else(|error| panic!("record unknown outcome: {error}"));
+        let (method, daily, pending) = tally
+            .transact(|state| {
+                let host_state = state.hosts.get(host).expect("host state");
+                Ok((
+                    (
+                        state
+                            .sends
+                            .get(&(host.to_owned(), "method".to_owned()))
+                            .and_then(|sent| sent.last())
+                            .copied(),
+                        host_state.daily_sends.last().copied(),
+                        host_state.pending_since,
+                    ),
+                    false,
+                ))
+            })
+            .expect("read moved reservation");
+
+        assert_eq!(method, Some(resolved.elapsed().as_nanos()));
+        assert_eq!(daily, Some(resolved.elapsed().as_nanos()));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn expiring_a_pending_attempt_moves_its_timestamps_before_clearing_it() {
+        let (_temporary, _directory, tally) = tally("expiry-moves-reservation");
+        let host = "https://broker.invalid";
+        let sent = ready_send(&tally, host, Duration::from_secs(50_000));
+        tally
+            .transact(|state| {
+                let pending = state
+                    .hosts
+                    .get(host)
+                    .and_then(|host_state| host_state.pending_since)
+                    .expect("pending reservation");
+                let host_state = state.hosts.get_mut(host).expect("host state");
+                host_state.daily_sends = vec![pending; DAILY_CEILING as usize];
+                Ok(((), true))
+            })
+            .expect("fill the rolling day");
+        let expired = BootTime::new(
+            "test-boot",
+            sent.elapsed() + UNRESOLVED_ATTEMPT + Duration::from_nanos(1),
+        );
+
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &expired),
+            Ok(TallyDecision::DailyCeiling { .. })
+        ));
+        let (method, daily, pending) = tally
+            .transact(|state| {
+                let host_state = state.hosts.get(host).expect("host state");
+                Ok((
+                    (
+                        state
+                            .sends
+                            .get(&(host.to_owned(), "method".to_owned()))
+                            .and_then(|sent| sent.last())
+                            .copied(),
+                        host_state.daily_sends.last().copied(),
+                        host_state.pending_since,
+                    ),
+                    false,
+                ))
+            })
+            .expect("read expired reservation");
+
+        assert_eq!(method, Some(expired.elapsed().as_nanos()));
+        assert_eq!(daily, Some(expired.elapsed().as_nanos()));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn adoption_reinserts_a_pruned_reservation_and_closes_for_one_day() {
+        let (_temporary, _directory, tally) = tally("adopt-pruned-reservation");
+        let host = "https://broker.invalid";
+        let sent = ready_send(&tally, host, Duration::from_secs(60_000));
+        let adopted = BootTime::new(
+            "test-boot",
+            sent.elapsed() + TALLY_RETENTION + Duration::from_secs(1),
+        );
+        let (retained_method, retained_daily) = tally
+            .transact(|state| {
+                let changed = state.prune(adopted.elapsed().as_nanos());
+                let host_state = state.hosts.get(host).expect("host state");
+                Ok((
+                    (
+                        state
+                            .sends
+                            .get(&(host.to_owned(), "method".to_owned()))
+                            .and_then(|sent| sent.last())
+                            .copied(),
+                        host_state.daily_sends.last().copied(),
+                    ),
+                    changed,
+                ))
+            })
+            .expect("prune old timestamps");
+        assert_eq!(retained_method, Some(sent.elapsed().as_nanos()));
+        assert_eq!(retained_daily, Some(sent.elapsed().as_nanos()));
+        assert!(matches!(
+            tally.decide_and_record(
+                "https://other-broker.invalid",
+                "other-method",
+                100,
+                Duration::from_secs(60),
+                &adopted,
+            ),
+            Ok(TallyDecision::Wait(wait)) if wait == Duration::from_secs(60)
+        ));
+        tally
+            .transact(|state| {
+                state.sends.remove(&(host.to_owned(), "method".to_owned()));
+                Ok(((), true))
+            })
+            .expect("plant an already-pruned reservation");
+
+        tally
+            .adopt_pending(host, &adopted)
+            .unwrap_or_else(|error| panic!("adopt pruned reservation: {error}"));
+        let (method, daily, pending, closed_until) = tally
+            .transact(|state| {
+                let host_state = state.hosts.get(host).expect("host state");
+                Ok((
+                    (
+                        state
+                            .sends
+                            .get(&(host.to_owned(), "method".to_owned()))
+                            .and_then(|sent| sent.last())
+                            .copied(),
+                        host_state.daily_sends.last().copied(),
+                        host_state.pending_since,
+                        host_state.closed_until,
+                    ),
+                    false,
+                ))
+            })
+            .expect("read adopted reservation");
+        let adopted_nanos = adopted.elapsed().as_nanos();
+
+        assert_eq!(method, Some(adopted_nanos));
+        assert_eq!(daily, Some(adopted_nanos));
+        assert_eq!(pending, None);
+        assert_eq!(closed_until, Some(adopted_nanos + DAY_NANOS));
+    }
+
+    #[test]
+    fn a_pending_attempt_refuses_mismatched_remaining_evidence() {
+        for mismatch in ["method", "daily"] {
+            let label = format!("pending-mismatch-{mismatch}");
+            let (_temporary, _directory, tally) = tally(&label);
+            let host = "https://broker.invalid";
+            let sent = ready_send(&tally, host, Duration::from_secs(65_000));
+            tally
+                .transact(|state| {
+                    let earlier = sent.elapsed().as_nanos().saturating_sub(1);
+                    if mismatch == "method" {
+                        *state
+                            .sends
+                            .get_mut(&(host.to_owned(), "method".to_owned()))
+                            .and_then(|sent| sent.last_mut())
+                            .expect("method reservation") = earlier;
+                    } else {
+                        *state
+                            .hosts
+                            .get_mut(host)
+                            .and_then(|state| state.daily_sends.last_mut())
+                            .expect("daily reservation") = earlier;
+                    }
+                    Ok(((), true))
+                })
+                .expect("plant mismatched evidence");
+
+            let adopted = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(1));
+            let refused = tally.adopt_pending(host, &adopted);
+            assert!(
+                matches!(&refused, Err(TallyError::Corrupt(reason)) if reason.contains("latest method and daily")),
+                "{mismatch}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_record_pair_starts_each_endpoint_at_the_day_ceiling() {
+        let (_temporary, _directory, tally) = tally("empty-pair-day-ceiling");
+        let started = BootTime::new("test-boot", Duration::from_secs(70_000));
+        for host in BROKER_HOSTS {
+            assert!(matches!(
+                tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &started),
+                Ok(TallyDecision::DailyCeiling { retry_after })
+                    if retry_after == TALLY_RETENTION
+            ));
+        }
+        let boundary = BootTime::new("test-boot", started.elapsed() + TALLY_RETENTION);
+
+        for host in BROKER_HOSTS {
+            assert!(matches!(
+                tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &boundary),
+                Ok(TallyDecision::Send)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_process_refuses_a_matching_pair_rolled_below_its_generation_high_water() {
+        let (temporary, _directory, tally) = tally("matching-pair-rollback");
+        let host = "https://broker.invalid";
+        let first = ready_send(&tally, host, Duration::from_secs(80_000));
+        tally
+            .record_response(host, 200, None, &first)
+            .unwrap_or_else(|error| panic!("record first response: {error}"));
+        let older_tally = std::fs::read(temporary.0.join(TALLY_FILE))
+            .unwrap_or_else(|error| panic!("read older tally: {error}"));
+        let older_generation = std::fs::read(temporary.0.join(GENERATION_FILE))
+            .unwrap_or_else(|error| panic!("read older generation: {error}"));
+        let second = BootTime::new("test-boot", first.elapsed() + Duration::from_secs(1));
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &second),
+            Ok(TallyDecision::Send)
+        ));
+        tally
+            .record_response(host, 200, None, &second)
+            .unwrap_or_else(|error| panic!("record second response: {error}"));
+
+        std::fs::write(temporary.0.join(TALLY_FILE), older_tally)
+            .unwrap_or_else(|error| panic!("restore older tally: {error}"));
+        std::fs::write(temporary.0.join(GENERATION_FILE), older_generation)
+            .unwrap_or_else(|error| panic!("restore older generation: {error}"));
+        let refused =
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &second);
+
+        let Err(TallyError::Corrupt(reason)) = refused else {
+            panic!("matching pair rollback was not refused as corrupt");
+        };
+        assert!(reason.contains("process generation high-water"), "{reason}");
     }
 }

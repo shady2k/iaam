@@ -1193,7 +1193,13 @@ pub(crate) mod fake {
             std::process::id()
         ));
         std::fs::create_dir(&directory).expect("egress directory created");
-        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+        std::fs::write(
+            directory.join("outbound-tally"),
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+        )
+        .expect("initialized tally created");
+        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+            .expect("initialized generation created");
         directory
     }
 

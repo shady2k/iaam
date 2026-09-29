@@ -791,7 +791,7 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
         }
         Destination::FinamApi => {
             let path = path.trim_start_matches('/');
-            if path.contains(['?', '#'])
+            if path.contains(['?', '#', '\\', '%'])
                 || path.split('/').any(|segment| matches!(segment, "." | ".."))
             {
                 return None;

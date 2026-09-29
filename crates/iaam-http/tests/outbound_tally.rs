@@ -325,7 +325,13 @@ fn gateway<T: Transport + 'static>(transport: T, time: &Arc<FakeTime>, tally: &P
 
 fn empty_tally(directory: &TempDir) -> PathBuf {
     let tally = directory.file("outbound-tally");
-    std::fs::write(&tally, "").expect("empty tally created");
+    std::fs::write(
+        &tally,
+        "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+    )
+    .expect("initialized tally created");
+    std::fs::write(directory.file("outbound-tally-generation"), "0\n")
+        .expect("initialized generation created");
     tally
 }
 
@@ -870,6 +876,9 @@ async fn finam_account_path_near_misses_are_refused_without_sending() {
         "/v1/accounts/../transactions",
         "/v1/accounts/account?mode=full",
         "/v1/accounts/account#fragment",
+        "/v1/accounts/account\\child",
+        "/v1/accounts/%2e%2e",
+        "/v1/accounts/%2e%2e/transactions",
     ] {
         let request = HttpRequest::get(Destination::FinamApi, path)
             .with_request_allowance(RequestAllowance::new(u32::MAX));
@@ -1084,6 +1093,59 @@ async fn a_failed_429_commit_replays_its_status_delay_and_rate_limit() {
 }
 
 #[tokio::test]
+async fn a_lost_second_429_is_replayed_after_the_first_has_aged_out() {
+    let directory = TempDir::create("lost-second-429");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let break_once = Arc::new(AtomicBool::new(true));
+    let gateway = gateway(
+        BreakTallyTransport {
+            sent: Arc::clone(&sent),
+            directory: directory.path.clone(),
+            status: 429,
+            retry_after: Some(Duration::from_secs(600)),
+            break_once: Arc::clone(&break_once),
+        },
+        &time,
+        &tally,
+    );
+
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the first 429 commit is planted to fail");
+    std::fs::remove_dir(directory.file("outbound-tally.tmp")).expect("first obstruction removed");
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the first 429 is replayed");
+    assert!(matches!(
+        first,
+        GatewayError::BrokerHostPaused { retry_after, .. }
+            if retry_after == Duration::from_secs(600)
+    ));
+
+    time.advance(Duration::from_secs(601));
+    break_once.store(true, Ordering::SeqCst);
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the second 429 commit is planted to fail");
+    std::fs::remove_dir(directory.file("outbound-tally.tmp")).expect("second obstruction removed");
+    let second = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the second 429 is replayed after the first aged out");
+    assert!(matches!(
+        second,
+        GatewayError::BrokerHostPaused { retry_after, .. }
+            if retry_after == Duration::from_secs(600)
+    ));
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn a_short_retry_after_still_persists_the_sixty_second_floor() {
     let directory = TempDir::create("short-429-delay");
     let tally = empty_tally(&directory);
@@ -1268,7 +1330,7 @@ fn pending_attempt_child() {
 }
 
 #[tokio::test]
-async fn process_death_leaves_the_pending_attempt_closed_for_ninety_seconds() {
+async fn process_death_leaves_the_pending_attempt_closed_for_one_day_from_adoption() {
     let directory = TempDir::create("process-death");
     let tally = empty_tally(&directory);
     let ready = directory.file("pending-ready");
@@ -1301,11 +1363,18 @@ async fn process_death_leaves_the_pending_attempt_closed_for_ninety_seconds() {
                 reason: "an earlier request has no committed status",
                 retry_after,
                 ..
-            } if retry_after == Duration::from_secs(90)
+            } if retry_after == Duration::from_secs(24 * 60 * 60)
         ),
         "{refused:?}"
     );
     assert!(transport.sent().is_empty());
+
+    time.advance(Duration::from_secs(24 * 60 * 60));
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("the endpoint reopens at the adoption-day boundary");
+    assert_eq!(transport.sent().len(), 1);
 }
 
 #[test]

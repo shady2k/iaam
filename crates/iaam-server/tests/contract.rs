@@ -535,7 +535,13 @@ impl FinamScript {
         let directory =
             std::env::temp_dir().join(format!("iaam-contract-finam-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).expect("egress directory created");
-        std::fs::write(directory.join("outbound-tally"), "").expect("empty tally created");
+        std::fs::write(
+            directory.join("outbound-tally"),
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
+        )
+        .expect("initialized tally created");
+        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+            .expect("initialized generation created");
         let time = FinamTime::new();
         Arc::new(
             Gateway::with_parts_in_directory(

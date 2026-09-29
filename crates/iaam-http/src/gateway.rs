@@ -314,17 +314,21 @@ pub trait Transport: Send + Sync {
         request: &'a HttpRequest,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a;
 
-    /// Send while exposing the response status before the body is consumed.
+    /// Send while exposing the transport hand-off and response status before
+    /// the body is consumed.
     ///
     /// Scripted transports get the safe default. `HttpClient` overrides it so
-    /// a broker stop signal is persisted from the status line even when the
-    /// body later stalls or fails.
+    /// the hand-off is acknowledged after request construction and immediately
+    /// before execution, and a broker stop signal is persisted from the status
+    /// line even when the body later stalls or fails.
     fn send_observed<'a>(
         &'a self,
         request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
         observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         async move {
+            handoff()?;
             let response = self.send(request).await?;
             observe(response.status, response.retry_after);
             Ok(response)
@@ -343,9 +347,10 @@ impl Transport for HttpClient {
     fn send_observed<'a>(
         &'a self,
         request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
         observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
-        Self::send_observed(self, request, observe)
+        Self::send_observed(self, request, handoff, observe)
     }
 }
 
@@ -786,6 +791,11 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
         }
         Destination::FinamApi => {
             let path = path.trim_start_matches('/');
+            if path.contains(['?', '#'])
+                || path.split('/').any(|segment| matches!(segment, "." | ".."))
+            {
+                return None;
+            }
             if matches!(path, "v1/sessions" | "v1/sessions/details") {
                 return Some("AuthService.Sessions");
             }
@@ -802,6 +812,15 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
         | Destination::CbrDailyInfo
         | Destination::TinvestContract => None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TallyLatch {
+    Unknown,
+    Response {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
 }
 
 /// What the gateway remembers about one host.
@@ -828,9 +847,10 @@ struct Lane {
     /// recording all run while this lane is held, so the next decision cannot
     /// overtake the previous response.
     owner: Option<EndpointOwner>,
-    /// A tally write failed after handoff. Until a conservative pause has
-    /// been durably written, this process may not hand off another request.
-    tally_latched: bool,
+    /// A tally write failed after handoff. The observed response is retained
+    /// until that exact status and delay, or a conservative unknown outcome,
+    /// has been durably written.
+    tally_latched: Option<TallyLatch>,
 }
 
 impl Lane {
@@ -1242,48 +1262,87 @@ impl<T: Transport + 'static> Gateway<T> {
                         .ok_or(GatewayError::BrokerEgressOff)?;
                     let lock_name =
                         endpoint_lock_name(destination).ok_or(GatewayError::BrokerEgressOff)?;
-                    lane.owner = Some(
-                        EndpointOwner::acquire(
-                            directory.clone(),
-                            destination.base_url(),
-                            lock_name,
-                        )
-                        .map_err(|error| {
-                            tally_gateway_error(destination, &directory.tally_path(), error)
-                        })?,
-                    );
-                }
-                if broker && lane.tally_latched {
-                    let directory = self
-                        .egress_directory
-                        .as_ref()
-                        .ok_or(GatewayError::BrokerEgressOff)?;
-                    let boot = self.clock.now_boot().map_err(|reason| {
-                        tally_gateway_error(
-                            destination,
-                            &directory.tally_path(),
-                            TallyError::Clock(reason),
-                        )
+                    let owner = EndpointOwner::acquire(
+                        directory.clone(),
+                        destination.base_url(),
+                        lock_name,
+                    )
+                    .map_err(|error| {
+                        tally_gateway_error(destination, &directory.tally_path(), error)
                     })?;
-                    let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
-                    let retry_after = owner
+                    owner
                         .tally()
                         .and_then(|tally| {
-                            tally.record_unknown_outcome(destination.base_url(), &boot)
+                            tally.adopt_pending(destination.base_url(), self.clock.as_ref())
                         })
                         .map_err(|error| {
                             tally_gateway_error(destination, &directory.tally_path(), error)
                         })?;
-                    lane.tally_latched = false;
-                    return Err(GatewayError::BrokerHostClosed {
-                        destination,
-                        host: destination.base_url(),
-                        reason: ClosureReason::UnresolvedAttempt.description(),
-                        reopens_at: format!("{retry_after:?} on the boot clock"),
-                        retry_after,
-                        status: None,
-                        attempts,
-                    });
+                    lane.owner = Some(owner);
+                }
+                if broker && let Some(latch) = lane.tally_latched {
+                    let directory = self
+                        .egress_directory
+                        .as_ref()
+                        .ok_or(GatewayError::BrokerEgressOff)?;
+                    let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
+                    let tally = owner.tally().map_err(|error| {
+                        tally_gateway_error(destination, &directory.tally_path(), error)
+                    })?;
+                    match latch {
+                        TallyLatch::Response {
+                            status: latched_status,
+                            retry_after: latched_retry_after,
+                        } => {
+                            let recorded = tally
+                                .record_response(
+                                    destination.base_url(),
+                                    latched_status,
+                                    latched_retry_after,
+                                    self.clock.as_ref(),
+                                )
+                                .map_err(|error| {
+                                    tally_gateway_error(destination, &directory.tally_path(), error)
+                                })?;
+                            lane.tally_latched = None;
+                            match recorded {
+                                TallyResponseDecision::Paused { retry_after } => {
+                                    return Err(GatewayError::BrokerHostPaused {
+                                        destination,
+                                        host: destination.base_url(),
+                                        reopens_at: format!("{retry_after:?} on the boot clock"),
+                                        retry_after,
+                                        attempts,
+                                    });
+                                }
+                                TallyResponseDecision::Recorded => {
+                                    return Err(GatewayError::TallyUnavailable {
+                                        path: directory.tally_path(),
+                                        reason: format!(
+                                            "the previously observed broker status {latched_status} was persisted; retry the request"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        TallyLatch::Unknown => {
+                            let retry_after = tally
+                                .record_unknown_outcome(destination.base_url(), self.clock.as_ref())
+                                .map_err(|error| {
+                                    tally_gateway_error(destination, &directory.tally_path(), error)
+                                })?;
+                            lane.tally_latched = None;
+                            return Err(GatewayError::BrokerHostClosed {
+                                destination,
+                                host: destination.base_url(),
+                                reason: ClosureReason::UnresolvedAttempt.description(),
+                                reopens_at: format!("{retry_after:?} on the boot clock"),
+                                retry_after,
+                                status: None,
+                                attempts,
+                            });
+                        }
+                    }
                 }
                 if let Some(retry_after) = lane.refusing(self.clock.now()) {
                     return Err(GatewayError::CircuitOpen {
@@ -1351,17 +1410,6 @@ impl<T: Transport + 'static> Gateway<T> {
                             ceiling: allowance.ceiling(),
                         });
                     }
-                    let boot = match self.clock.now_boot() {
-                        Ok(boot) => boot,
-                        Err(reason) => {
-                            allowance.give_back();
-                            return Err(tally_gateway_error(
-                                destination,
-                                &directory.tally_path(),
-                                TallyError::Clock(reason),
-                            ));
-                        }
-                    };
                     let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
                     let owner_tally = owner.tally().map_err(|error| {
                         tally_gateway_error(destination, &directory.tally_path(), error)
@@ -1371,7 +1419,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         key.unwrap_or("*"),
                         budget.used,
                         budget.window,
-                        &boot,
+                        self.clock.as_ref(),
                     ) {
                         Ok(decision) => decision,
                         Err(error) => {
@@ -1440,7 +1488,7 @@ impl<T: Transport + 'static> Gateway<T> {
                     lane.record_start(key, &budget, self.clock.now());
                 }
                 attempts += 1;
-                let (mut lane, mut answer, observed, unknown, cleanup_error) = if broker {
+                let (mut lane, mut answer, handoff, observed, unknown, cleanup_error) = if broker {
                     let directory = self
                         .egress_directory
                         .as_ref()
@@ -1453,8 +1501,31 @@ impl<T: Transport + 'static> Gateway<T> {
                     let request = request.clone();
                     let clock = Arc::clone(&self.clock);
                     let tally_path = directory.tally_path();
-                    let budget_key = key.unwrap_or("*");
                     let task = tokio::spawn(async move {
+                        let handoff =
+                            Arc::new(std::sync::Mutex::new(None::<Result<(), GatewayError>>));
+                        let callback_handoff = Arc::clone(&handoff);
+                        let handoff_clock = Arc::clone(&clock);
+                        let handoff_tally = owner_tally.clone();
+                        let handoff_path = tally_path.clone();
+                        let acknowledge = Box::new(move || {
+                            let result = handoff_tally
+                                .acknowledge_handoff(destination.base_url(), handoff_clock.as_ref())
+                                .map_err(|error| {
+                                    tally_gateway_error(destination, &handoff_path, error)
+                                });
+                            let failed = result.is_err();
+                            *callback_handoff
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+                            if failed {
+                                Err(HttpError::RequestNotBuilt(
+                                    "the outbound tally did not acknowledge hand-off".to_owned(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        });
                         let observed = Arc::new(std::sync::Mutex::new(
                             None::<(
                                 u16,
@@ -1468,64 +1539,45 @@ impl<T: Transport + 'static> Gateway<T> {
                         let callback_path = tally_path.clone();
                         let observe = Box::new(move |status, retry_after: Option<Duration>| {
                             let retry_after = retry_after.map(|delay| delay.min(TALLY_RETENTION));
-                            let recorded = callback_clock
-                                .now_boot()
-                                .map_err(|reason| {
-                                    tally_gateway_error(
-                                        destination,
-                                        &callback_path,
-                                        TallyError::Clock(reason),
-                                    )
-                                })
-                                .and_then(|boot| {
-                                    callback_tally
-                                        .record_response(
-                                            destination.base_url(),
-                                            status,
-                                            retry_after,
-                                            &boot,
-                                        )
-                                        .map_err(|error| {
-                                            tally_gateway_error(destination, &callback_path, error)
-                                        })
+                            let recorded = callback_tally
+                                .record_response(
+                                    destination.base_url(),
+                                    status,
+                                    retry_after,
+                                    callback_clock.as_ref(),
+                                )
+                                .map_err(|error| {
+                                    tally_gateway_error(destination, &callback_path, error)
                                 });
                             *callback_observed
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                 Some((status, retry_after, recorded));
                         });
-                        let answer = transport.send_observed(&request, observe).await;
+                        let answer = transport
+                            .send_observed(&request, acknowledge, observe)
+                            .await;
+                        let handoff = handoff
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
                         let observed = observed
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .take();
                         let unknown =
                             if matches!(answer, Err(HttpError::Network | HttpError::Timeout))
+                                && handoff.as_ref().is_some_and(Result::is_ok)
                                 && observed.is_none()
                             {
                                 Some(
-                                    clock
-                                        .now_boot()
-                                        .map_err(|reason| {
-                                            tally_gateway_error(
-                                                destination,
-                                                &tally_path,
-                                                TallyError::Clock(reason),
-                                            )
-                                        })
-                                        .and_then(|boot| {
-                                            owner_tally
-                                                .record_unknown_outcome(
-                                                    destination.base_url(),
-                                                    &boot,
-                                                )
-                                                .map_err(|error| {
-                                                    tally_gateway_error(
-                                                        destination,
-                                                        &tally_path,
-                                                        error,
-                                                    )
-                                                })
+                                    owner_tally
+                                        .record_unknown_outcome(
+                                            destination.base_url(),
+                                            clock.as_ref(),
+                                        )
+                                        .map_err(|error| {
+                                            tally_gateway_error(destination, &tally_path, error)
                                         }),
                                 )
                             } else {
@@ -1536,40 +1588,41 @@ impl<T: Transport + 'static> Gateway<T> {
                             Err(HttpError::ClientNotBuilt(_)
                                 | HttpError::TrustAnchorNotParsed(_)
                                 | HttpError::RequestNotBuilt(_))
-                        ) && observed.is_none()
+                        ) && handoff.is_none()
+                            && observed.is_none()
                         {
-                            clock
-                                .now_boot()
-                                .map_err(|reason| {
-                                    tally_gateway_error(
-                                        destination,
-                                        &tally_path,
-                                        TallyError::Clock(reason),
-                                    )
-                                })
-                                .and_then(|boot| {
-                                    owner_tally
-                                        .record_not_handed_off(
-                                            destination.base_url(),
-                                            budget_key,
-                                            &boot,
-                                        )
-                                        .map_err(|error| {
-                                            tally_gateway_error(destination, &tally_path, error)
-                                        })
+                            owner_tally
+                                .record_not_handed_off(destination.base_url(), clock.as_ref())
+                                .map_err(|error| {
+                                    tally_gateway_error(destination, &tally_path, error)
                                 })
                                 .err()
                         } else {
                             None
                         };
-                        if matches!(observed, Some((_, _, Err(_))))
-                            || matches!(unknown, Some(Err(_)))
+                        if let Some((status, retry_after, Err(_))) = observed.as_ref() {
+                            lane.tally_latched = Some(if (200..300).contains(status) {
+                                TallyLatch::Unknown
+                            } else {
+                                TallyLatch::Response {
+                                    status: *status,
+                                    retry_after: *retry_after,
+                                }
+                            });
+                        } else if handoff.as_ref().is_some_and(Result::is_err)
+                            || unknown.as_ref().is_some_and(Result::is_err)
                             || cleanup_error.is_some()
                         {
-                            lane.tally_latched = true;
-                            lane.hold_until(clock.now() + Duration::from_secs(60));
+                            lane.tally_latched = Some(TallyLatch::Unknown);
                         }
-                        (lane, Some(answer), observed, unknown, cleanup_error)
+                        (
+                            lane,
+                            Some(answer),
+                            handoff,
+                            observed,
+                            unknown,
+                            cleanup_error,
+                        )
                     });
                     // Arm the detached attempt before starting the caller's
                     // deadline race. This gives an immediately-ready
@@ -1596,8 +1649,12 @@ impl<T: Transport + 'static> Gateway<T> {
                         None,
                         None,
                         None,
+                        None,
                     )
                 };
+                if let Some(Err(error)) = handoff {
+                    return Err(error);
+                }
                 if let Some(error) = cleanup_error {
                     return Err(error);
                 }
@@ -2026,13 +2083,15 @@ mod tests {
         ));
         std::fs::create_dir(&directory).expect("egress directory created");
         let initialized = format!(
-            "iaam-outbound-tally-v2\nboot\ttest-boot\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\n",
+            "iaam-outbound-tally-v4\ngeneration\t0\nboot\ttest-boot\nhigh-water\t0\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\t-\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\t-\t-\nhost\t{}\t-\t\t-\t-\t-\t-\t\t\t-\t-\t-\n",
             Destination::TinkoffProd.base_url(),
             Destination::TinkoffSandbox.base_url(),
             Destination::FinamApi.base_url(),
         );
         std::fs::write(directory.join(crate::tally::TALLY_FILE), initialized)
             .expect("initialized tally created");
+        std::fs::write(directory.join(crate::tally::GENERATION_FILE), "0\n")
+            .expect("tally generation created");
         directory
     }
 

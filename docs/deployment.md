@@ -82,18 +82,22 @@ This makes accidental concurrent servers observable instead of trying to share
 one broker allowance between them.
 
 Within an owned endpoint, the gateway allows one request in flight. The HTTP
-client follows no redirect and performs no retry below the gateway. It records
-the status line and a Retry-After clamped to one day before consuming the body,
-and the next request cannot decide before that record exists. The shared
-`outbound-tally.lock` is held only for a tally transaction; waits and HTTP requests do
-not hold it. The tally preserves:
+client follows no redirect and performs no retry below the gateway. It commits
+the reservation at transport handoff, then records the status line and a
+Retry-After clamped to one day before consuming the body. The method, rolling
+day and one-second spacing timestamps all move to the later of the original
+decision and the handoff or status commit; delayed handoff cannot age an
+allowance before a byte is sent. The next request cannot decide before that
+record exists. The shared `outbound-tally.lock` is held only for a tally
+transaction; the boot clock is sampled while this lock is held, and waits and
+HTTP requests do not hold it. The tally preserves:
 
 - the per-method minute budgets from the gateway table;
 - at least one second between sends to the same broker host;
 - at most 1,000 sends per endpoint in any rolling 24-hour interval;
 - recent permanent broker refusals and their 30-minute host closure;
-- broker `429` pauses and the 30-minute closure after a second `429` in ten
-  minutes.
+- broker `429` pauses of at least 60 seconds and the 30-minute closure after a
+  second `429` in ten minutes.
 
 The persisted time source is Linux boot identity plus `CLOCK_BOOTTIME`, not
 wall time. Wall-clock steps therefore cannot shorten a pause, closure, spacing
@@ -104,10 +108,13 @@ from the new boot, and the first send to each endpoint waits 60 seconds.
 
 The gateway opens the compiled directory `/var/lib/iaam/egress` when broker
 egress is enabled and keeps that directory descriptor for its lifetime. Its
-`outbound-tally`, lock, owner and temporary records are opened relative to the
-descriptor without following symlinks, then checked again by device and inode.
-A missing, unreadable, replaced, symlinked, hard-linked or corrupt record
-refuses broker operation; there is no in-memory allowance fallback.
+`outbound-tally`, `outbound-tally-generation`, lock, owner and temporary records
+are opened relative to the descriptor without following symlinks, then checked
+again by device and inode. The tally and its separate generation record advance
+together; an emptied tally or a generation mismatch refuses operation instead
+of accepting truncation or rollback. A missing, unreadable, replaced,
+symlinked, hard-linked or corrupt record refuses broker operation; there is no
+in-memory allowance fallback.
 
 Run the executable ceiling proof before enabling broker egress:
 
@@ -200,38 +207,45 @@ refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
 or network is touched. `on` requires the compiled directory
 `/var/lib/iaam/egress`; there is no environment-variable path override.
 
-Create the directory and its one existing tally before startup:
+Create the directory and its two existing tally records before startup:
 
 ```console
 $ install -d -m 0700 /var/lib/iaam/egress
 $ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally
+$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally-generation
 $ export IAAM_BROKER_EGRESS=on
 ```
 
 Every iaam process on the machine that may contact a broker must see that exact
-persistent mount and run as an OS user able to read, write and sync the tally;
-create and lock its lock and three endpoint-owner records; create its temporary
-record; atomically rename within the directory; and sync the directory. A
-container must bind the same host directory at `/var/lib/iaam/egress`; a
-container-private directory or a different host path creates a separate owner
-and tally domain and is not safe. Processes on different machines do not share
-this coordination. Network filesystems and cross-machine tally sharing are
-outside the proof.
+persistent mount and run as an OS user able to read, write and sync both tally
+records; create and lock its lock and three endpoint-owner records; create its
+temporary records; atomically rename within the directory; and sync the
+directory. A container must bind the same host directory at
+`/var/lib/iaam/egress`; a container-private directory or a different host path
+creates a separate owner and tally domain and is not safe. Processes on
+different machines do not share this coordination. Network filesystems and
+cross-machine tally sharing are outside the proof.
 
-The tally must already exist. An empty tally is initialized on first use. A v1
-tally is refused because it cannot prove rolling 24-hour history; remove it only
-during a controlled stop and recreate the empty file. A leftover temporary file
-is ignored; only the last complete tally is read.
+Both tally records must already exist. Two empty records are initialized
+together on first use. Only the current `iaam-outbound-tally-v4` format is
+accepted; no older format was deployed, so any older header is corruption, not
+a migration source. During a controlled stop, recreate both records together
+rather than copying one over the other. Leftover temporary files are ignored;
+only the last complete tally and matching generation are read.
 
 Do not copy, alias, replace, delete or truncate a live egress directory or any
 record in it. The process verifies the path and held inodes before each
-transaction. A handoff is recorded as pending before network I/O and cleared
+transaction. A reservation becomes pending before network I/O and is cleared
 only after the response status is durably committed. Cancellation, deadline,
-transport failure, panic or process death leaves that attempt unresolved and
-closes the host for the remaining request-timeout-plus-60-second window.
+transport failure, panic or process death leaves that attempt unresolved for
+the request timeout plus the mandatory 60-second rate-limit pause: 90 seconds
+from the persisted handoff. A new owner that finds a pending attempt restarts
+that full interval from its own acquisition. If a `429` remains in the prior
+ten-minute window, an unresolved attempt closes the endpoint for 30 minutes
+instead.
 
 Operational repair is a controlled stop: stop every process using the mount,
-repair or recreate the records, then start one process and run
+repair or recreate both records, then start one process and run
 `make ceiling-proof` before restoring traffic.
 
 

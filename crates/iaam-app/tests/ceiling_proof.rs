@@ -694,10 +694,11 @@ impl Transport for ProofTransport {
     fn send_observed<'a>(
         &'a self,
         request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
         observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         self.advance_before_handoff();
-        Transport::send_observed(&self.inner, request, observe)
+        Transport::send_observed(&self.inner, request, handoff, observe)
     }
 }
 
@@ -1670,7 +1671,10 @@ async fn exercise_record_failure_latch() -> Scenario {
     let scenario = Scenario::new(
         "record-failure",
         destination,
-        [LoopbackReply::held(429, "limited")],
+        [
+            LoopbackReply::held(429, "limited").with_header("Retry-After", "600"),
+            LoopbackReply::complete(429, "limited"),
+        ],
         Duration::from_secs(5),
         true,
     );
@@ -1693,15 +1697,34 @@ async fn exercise_record_failure_latch() -> Scenario {
     std::fs::remove_dir(&obstruction)
         .unwrap_or_else(|error| panic!("remove tally obstruction: {error}"));
 
-    let closed = direct_send(&scenario, destination)
+    let paused = direct_send(&scenario, destination)
         .await
-        .expect_err("the latch persists a closure before another handoff");
-    assert!(matches!(closed, GatewayError::BrokerHostClosed { .. }));
+        .expect_err("the latch persists the exact 429 before another handoff");
+    assert_eq!(
+        scenario.remember_last_pause(&paused),
+        Duration::from_secs(600)
+    );
     assert_eq!(
         scenario.server.requests_received(),
         1,
         "record failure allowed another wire departure"
     );
+
+    scenario.clock.advance(Duration::from_secs(600));
+    let second = direct_send(&scenario, destination)
+        .await
+        .expect_err("the second 429 closes the endpoint");
+    assert_eq!(
+        second
+            .retry_after()
+            .unwrap_or_else(|| panic!("second 429 had no closure delay: {second:?}")),
+        CLOSURE
+    );
+    let closed = direct_send(&scenario, destination)
+        .await
+        .expect_err("the persisted second-429 closure refuses locally");
+    assert!(matches!(closed, GatewayError::BrokerHostClosed { .. }));
+    assert_eq!(scenario.server.requests_received(), 2);
     scenario
 }
 
@@ -1757,6 +1780,102 @@ async fn exercise_stale_reservation() -> Scenario {
         records[1].logical_at.saturating_sub(records[0].logical_at) >= Duration::from_secs(1),
         "the response-time status commit did not refresh spacing"
     );
+    scenario
+}
+
+async fn exercise_delayed_handoff_minute() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new_stale_reservation(
+        "handoff-delay-minute",
+        destination,
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), 51),
+        Duration::from_secs(61),
+    );
+    for attempt in 0..51 {
+        direct_send(&scenario, destination)
+            .await
+            .unwrap_or_else(|error| panic!("handoff-delay-minute send {attempt}: {error}"));
+    }
+    scenario
+}
+
+async fn exercise_delayed_handoff_day() -> Scenario {
+    let destination = Destination::TinkoffSandbox;
+    let scenario = Scenario::new_stale_reservation(
+        "handoff-delay-day",
+        destination,
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), 1_001),
+        Duration::from_secs(24 * 60 * 60 + 1),
+    );
+    for attempt in 0..1_000 {
+        direct_send(&scenario, destination)
+            .await
+            .unwrap_or_else(|error| panic!("handoff-delay-day send {attempt}: {error}"));
+    }
+    let retry_after = match direct_send(&scenario, destination)
+        .await
+        .expect_err("the delayed first handoff still occupies the rolling day")
+    {
+        GatewayError::DailyCeiling { retry_after, .. } => retry_after,
+        other => panic!("delayed handoff had the wrong daily refusal: {other:?}"),
+    };
+    scenario.clock.advance(retry_after);
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("handoff-delay-day boundary send: {error}"));
+    scenario
+}
+
+async fn exercise_tally_truncation() -> Scenario {
+    let destination = Destination::TinkoffProd;
+    let scenario = Scenario::new(
+        "tally-truncation",
+        destination,
+        [LoopbackReply::complete(200, "{}")],
+        Duration::from_secs(5),
+        true,
+    );
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("tally-truncation initial send: {error}"));
+    std::fs::write(scenario._directory.path("outbound-tally"), "")
+        .unwrap_or_else(|error| panic!("truncate proof tally: {error}"));
+    let refused = direct_send(&scenario, destination)
+        .await
+        .expect_err("a truncated committed tally is refused");
+    assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
+    assert_eq!(scenario.server.requests_received(), 1);
+    scenario
+}
+
+async fn exercise_tally_rollback() -> Scenario {
+    let destination = Destination::TinkoffSandbox;
+    let scenario = Scenario::new(
+        "tally-rollback",
+        destination,
+        [
+            LoopbackReply::complete(200, "{}"),
+            LoopbackReply::complete(200, "{}"),
+        ],
+        Duration::from_secs(5),
+        true,
+    );
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("tally-rollback first send: {error}"));
+    let tally_path = scenario._directory.path("outbound-tally");
+    let older = std::fs::read(&tally_path)
+        .unwrap_or_else(|error| panic!("read older proof tally: {error}"));
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("tally-rollback second send: {error}"));
+    std::fs::write(&tally_path, older)
+        .unwrap_or_else(|error| panic!("restore older proof tally: {error}"));
+    let refused = direct_send(&scenario, destination)
+        .await
+        .expect_err("a tally-generation rollback is refused");
+    assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
+    assert_eq!(scenario.server.requests_received(), 2);
     scenario
 }
 
@@ -2141,7 +2260,11 @@ async fn killed_process_child() {
     )
     .unwrap_or_else(|error| panic!("killed-process loopback: {error}"));
     let gateway = Gateway::with_parts_in_directory(
-        HttpClientHarness::new(&server),
+        ProofTransport::new(
+            HttpClientHarness::new(&server),
+            Arc::clone(&clock),
+            Duration::from_secs(61),
+        ),
         BUDGETS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         Arc::clone(&clock) as Arc<dyn Sleeper>,
@@ -2187,6 +2310,7 @@ async fn process_death_measurement() -> Measurements {
     let server = LoopbackServer::start(std::iter::empty())
         .unwrap_or_else(|error| panic!("replacement loopback: {error}"));
     let clock = FakeTime::new();
+    clock.advance(Duration::from_secs(61));
     let gateway = Gateway::with_parts_in_directory(
         HttpClientHarness::new(&server),
         BUDGETS,
@@ -2259,6 +2383,14 @@ async fn executable_ceiling_proof() {
     .await;
     retry_after.verify_and_print("429-retry-after", Destination::TinkoffProd, None);
 
+    let short_retry_after = exercise_rate_limit(
+        "short-retry-after",
+        Destination::FinamApi,
+        LoopbackReply::complete(429, "limited").with_header("Retry-After", "5"),
+        MINUTE,
+    )
+    .await;
+    short_retry_after.verify_and_print("429-short-retry-after", Destination::FinamApi, None);
     let no_header = exercise_rate_limit(
         "no-retry-after",
         Destination::TinkoffSandbox,
@@ -2337,6 +2469,21 @@ async fn executable_ceiling_proof() {
     let stale_reservation = exercise_stale_reservation().await;
     stale_reservation.verify_and_print("stale-reservation", Destination::FinamApi, None);
 
+    let delayed_minute = exercise_delayed_handoff_minute().await;
+    let delayed_minute_measurement =
+        delayed_minute.verify_and_print("handoff-delay-61s", Destination::TinkoffProd, None);
+    let operations = delayed_minute_measurement
+        .pairs
+        .iter()
+        .find(|pair| pair.method == "OperationsService")
+        .unwrap_or_else(|| panic!("delayed handoff proof has no OperationsService row"));
+    assert_eq!((operations.reached, operations.ceiling), (50, 50));
+
+    let delayed_day = exercise_delayed_handoff_day().await;
+    let delayed_day_measurement =
+        delayed_day.verify_and_print("handoff-delay-24h", Destination::TinkoffSandbox, None);
+    assert_eq!(delayed_day_measurement.max_day, DAILY_CEILING);
+
     let path_budget = exercise_path_derived_budget().await;
     let path_budget_measurement =
         path_budget.verify_and_print("path-derived-budget", Destination::TinkoffProd, None);
@@ -2346,6 +2493,12 @@ async fn executable_ceiling_proof() {
         .find(|pair| pair.method == "UsersService")
         .unwrap_or_else(|| panic!("path-derived proof has no UsersService row"));
     assert_eq!((users.reached, users.ceiling), (25, 25));
+
+    let truncated = exercise_tally_truncation().await;
+    truncated.verify_and_print("tally-truncation", Destination::TinkoffProd, None);
+
+    let rolled_back = exercise_tally_rollback().await;
+    rolled_back.verify_and_print("tally-rollback", Destination::TinkoffSandbox, None);
 
     let boot = exercise_boot_change().await;
     boot.verify_and_print("boot-id-change", Destination::TinkoffProd, None);

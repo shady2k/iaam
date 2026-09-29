@@ -3,7 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -146,6 +146,32 @@ impl Transport for RecordingTransport {
             .pop_front()
             .unwrap_or_else(|| Ok(status(self.default_status)))
     }
+
+    async fn send_observed<'a>(
+        &'a self,
+        request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+    ) -> Result<HttpResponse, HttpError> {
+        let answer = self
+            .answers
+            .lock()
+            .expect("answers")
+            .pop_front()
+            .unwrap_or_else(|| Ok(status(self.default_status)));
+        if matches!(&answer, Err(HttpError::RequestNotBuilt(_))) {
+            return answer;
+        }
+        handoff()?;
+        self.sent
+            .lock()
+            .expect("sent requests")
+            .push((request.destination(), self.time.wall()));
+        if let Ok(response) = &answer {
+            observe(response.status, response.retry_after);
+        }
+        answer
+    }
 }
 
 #[derive(Clone)]
@@ -162,11 +188,15 @@ impl Transport for StatusThenBodyError {
     fn send_observed<'a>(
         &'a self,
         _request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
         observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         self.sends.fetch_add(1, Ordering::SeqCst);
-        observe(429, Some(Duration::MAX));
-        async { Err(HttpError::Timeout) }
+        async move {
+            handoff()?;
+            observe(429, Some(Duration::MAX));
+            Err(HttpError::Timeout)
+        }
     }
 }
 
@@ -188,15 +218,46 @@ impl Transport for HoldingTransport {
         Ok(status(200))
     }
 }
+
 #[derive(Clone)]
-struct PanickingTransport {
+struct DelayedPanickingTransport {
+    sent: Arc<AtomicUsize>,
+    time: Arc<FakeTime>,
+    delay: Duration,
+}
+
+impl Transport for DelayedPanickingTransport {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        panic!("send_observed is the required path");
+    }
+
+    async fn send_observed<'a>(
+        &'a self,
+        _request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
+        _observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+    ) -> Result<HttpResponse, HttpError> {
+        self.time.advance(self.delay);
+        handoff()?;
+        self.sent.fetch_add(1, Ordering::SeqCst);
+        panic!("invented transport panic after delayed handoff");
+    }
+}
+
+#[derive(Clone)]
+struct RateLimitThenBuildErrorTransport {
     sent: Arc<AtomicUsize>,
 }
 
-impl Transport for PanickingTransport {
+impl Transport for RateLimitThenBuildErrorTransport {
     async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        self.sent.fetch_add(1, Ordering::SeqCst);
-        panic!("invented transport panic");
+        if self.sent.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(status(429))
+        } else {
+            Err(HttpError::ClientNotBuilt(
+                "invented post-handoff client failure".to_owned(),
+            ))
+        }
     }
 }
 
@@ -204,14 +265,23 @@ impl Transport for PanickingTransport {
 struct BreakTallyTransport {
     sent: Arc<AtomicUsize>,
     directory: PathBuf,
+    status: u16,
+    retry_after: Option<Duration>,
+    break_once: Arc<AtomicBool>,
 }
 
 impl Transport for BreakTallyTransport {
     async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         self.sent.fetch_add(1, Ordering::SeqCst);
-        std::fs::create_dir(self.directory.join("outbound-tally.tmp"))
-            .expect("temporary tally path blocked");
-        Ok(status(200))
+        if self.break_once.swap(false, Ordering::SeqCst) {
+            std::fs::create_dir(self.directory.join("outbound-tally.tmp"))
+                .expect("temporary tally path blocked");
+        }
+        Ok(HttpResponse {
+            status: self.status,
+            body: Vec::new(),
+            retry_after: self.retry_after,
+        })
     }
 }
 
@@ -721,28 +791,43 @@ async fn a_corrupt_tally_is_refused_without_transport_and_names_the_path() {
     assert!(transport.sent().is_empty());
 }
 #[tokio::test]
-async fn a_v1_tally_is_refused_with_a_recreation_remedy() {
-    let directory = TempDir::create("v1-refused");
-    let tally = directory.file("outbound-tally");
-    std::fs::write(
-        &tally,
-        "iaam-outbound-tally-v1\nhost\thttps://invest-public-api.tbank.ru/rest\t1\t1\t1\t-\n",
-    )
-    .expect("v1 tally written");
-    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
-    let transport = RecordingTransport::answering(&time);
-    let gateway = gateway(transport.clone(), &time, &tally);
+async fn every_older_tally_format_is_refused_with_a_recreation_remedy() {
+    for (label, contents) in [
+        (
+            "v1",
+            "iaam-outbound-tally-v1\nhost\thttps://invest-public-api.tbank.ru/rest\t1\t1\t1\t-\n",
+        ),
+        (
+            "v2",
+            "iaam-outbound-tally-v2\nboot\ttest-boot\nhost\thttps://invest-public-api.tbank.ru/rest\t-\t\t-\t-\t-\t-\t\t\t-\n",
+        ),
+        (
+            "v3",
+            "iaam-outbound-tally-v3\nboot\ttest-boot\nhigh-water\t1\n",
+        ),
+    ] {
+        let directory = TempDir::create(&format!("{label}-refused"));
+        let tally = directory.file("outbound-tally");
+        std::fs::write(&tally, contents).expect("older tally written");
+        let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        let transport = RecordingTransport::answering(&time);
+        let gateway = gateway(transport.clone(), &time, &tally);
 
-    let refused = gateway
-        .send(&operations(), None)
-        .await
-        .expect_err("v1 tally cannot prove a rolling day");
-    let message = refused.to_string();
+        let refused = match gateway.send(&operations(), None).await {
+            Ok(_) => panic!("{label} tally was accepted"),
+            Err(error) => error,
+        };
+        let message = refused.to_string();
 
-    assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
-    assert!(message.contains("v1"), "{message}");
-    assert!(message.contains("recreate"), "{message}");
-    assert!(transport.sent().is_empty());
+        assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
+        assert!(message.contains(label), "{message}");
+        assert!(
+            message.contains("no older tally format was deployed"),
+            "{message}"
+        );
+        assert!(message.contains("recreate"), "{message}");
+        assert!(transport.sent().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -781,6 +866,10 @@ async fn finam_account_path_near_misses_are_refused_without_sending() {
         "/v1/accounts//transactions",
         "/v1/accounts/account/child",
         "/v1/accounts/account/child/transactions",
+        "/v1/accounts/./transactions",
+        "/v1/accounts/../transactions",
+        "/v1/accounts/account?mode=full",
+        "/v1/accounts/account#fragment",
     ] {
         let request = HttpRequest::get(Destination::FinamApi, path)
             .with_request_allowance(RequestAllowance::new(u32::MAX));
@@ -839,8 +928,10 @@ async fn a_transport_panic_leaves_a_durable_unresolved_attempt() {
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
     let sent = Arc::new(AtomicUsize::new(0));
     let gateway = gateway(
-        PanickingTransport {
+        DelayedPanickingTransport {
             sent: Arc::clone(&sent),
+            time: Arc::clone(&time),
+            delay: Duration::from_secs(61),
         },
         &time,
         &tally,
@@ -861,8 +952,9 @@ async fn a_transport_panic_leaves_a_durable_unresolved_attempt() {
             second,
             GatewayError::BrokerHostClosed {
                 reason: "an earlier request has no committed status",
+                retry_after,
                 ..
-            }
+            } if retry_after == Duration::from_secs(90)
         ),
         "{second:?}"
     );
@@ -879,6 +971,9 @@ async fn a_tally_commit_failure_latches_until_a_pause_is_persisted() {
         BreakTallyTransport {
             sent: Arc::clone(&sent),
             directory: directory.path.clone(),
+            status: 200,
+            retry_after: None,
+            break_once: Arc::new(AtomicBool::new(true)),
         },
         &time,
         &tally,
@@ -891,8 +986,6 @@ async fn a_tally_commit_failure_latches_until_a_pause_is_persisted() {
     assert!(matches!(first, GatewayError::TallyUnavailable { .. }));
     std::fs::remove_dir(directory.file("outbound-tally.tmp"))
         .expect("temporary obstruction removed");
-    std::fs::write(&tally, "")
-        .expect("remove the durable pending fallback so the in-memory latch is isolated");
 
     let second = gateway
         .send(&operations(), None)
@@ -903,6 +996,255 @@ async fn a_tally_commit_failure_latches_until_a_pause_is_persisted() {
         "{second:?}"
     );
     assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_successful_response_never_installs_its_named_delay() {
+    let directory = TempDir::create("successful-named-delay");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    transport
+        .answers
+        .lock()
+        .expect("answers")
+        .push_back(Ok(HttpResponse {
+            status: 200,
+            body: Vec::new(),
+            retry_after: Some(Duration::from_secs(600)),
+        }));
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("successful response is returned");
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("the successful response's named delay is ignored");
+
+    assert_eq!(transport.sent().len(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_429_commit_replays_its_status_delay_and_rate_limit() {
+    let directory = TempDir::create("failed-429-commit");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let gateway = gateway(
+        BreakTallyTransport {
+            sent: Arc::clone(&sent),
+            directory: directory.path.clone(),
+            status: 429,
+            retry_after: Some(Duration::from_secs(600)),
+            break_once: Arc::new(AtomicBool::new(true)),
+        },
+        &time,
+        &tally,
+    );
+
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the planted 429 commit fails");
+    assert!(matches!(first, GatewayError::TallyUnavailable { .. }));
+    std::fs::remove_dir(directory.file("outbound-tally.tmp"))
+        .expect("temporary obstruction removed");
+
+    let replayed = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the latched 429 is persisted before another handoff");
+    assert!(
+        matches!(
+            replayed,
+            GatewayError::BrokerHostPaused {
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(600)
+        ),
+        "{replayed:?}"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+
+    time.advance(Duration::from_secs(600));
+    let second_429 = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the second 429 closes the endpoint");
+    assert!(
+        second_429
+            .retry_after()
+            .is_some_and(|delay| delay == Duration::from_secs(30 * 60)),
+        "{second_429:?}"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_short_retry_after_still_persists_the_sixty_second_floor() {
+    let directory = TempDir::create("short-429-delay");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    transport
+        .answers
+        .lock()
+        .expect("answers")
+        .push_back(Ok(HttpResponse {
+            status: 429,
+            body: Vec::new(),
+            retry_after: Some(Duration::from_secs(5)),
+        }));
+    let gateway = gateway(transport, &time, &tally);
+
+    let refused = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("429 pauses the endpoint");
+    assert!(
+        matches!(
+            refused,
+            GatewayError::BrokerHostPaused {
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(60)
+        ),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unresolved_attempt_after_a_recent_429_closes_for_thirty_minutes() {
+    let directory = TempDir::create("recent-429-unresolved");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    transport
+        .answers
+        .lock()
+        .expect("answers")
+        .extend([Ok(status(429)), Err(HttpError::Network)]);
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the first 429 pauses the endpoint");
+    assert!(matches!(first, GatewayError::BrokerHostPaused { .. }));
+    time.advance(Duration::from_secs(9 * 60));
+
+    let unresolved = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the unresolved attempt after a recent 429 closes the endpoint");
+    assert!(
+        matches!(
+            unresolved,
+            GatewayError::BrokerHostClosed {
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(30 * 60)
+        ),
+        "{unresolved:?}"
+    );
+    assert_eq!(transport.sent().len(), 2);
+}
+
+#[tokio::test]
+async fn expiry_after_a_recent_429_closes_for_thirty_minutes() {
+    let directory = TempDir::create("recent-429-expired-pending");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let gateway = gateway(
+        RateLimitThenBuildErrorTransport {
+            sent: Arc::clone(&sent),
+        },
+        &time,
+        &tally,
+    );
+
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the first 429 pauses the endpoint");
+    assert!(matches!(first, GatewayError::BrokerHostPaused { .. }));
+    time.advance(Duration::from_secs(60));
+
+    let handed_off = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the planted post-handoff failure leaves a pending request");
+    assert!(matches!(handed_off, GatewayError::Transport { .. }));
+    time.advance(Duration::from_secs(90));
+
+    let expired = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the recent 429 turns pending expiry into a closure");
+    assert!(
+        matches!(
+            expired,
+            GatewayError::BrokerHostClosed {
+                retry_after,
+                ..
+            } if retry_after == Duration::from_secs(30 * 60)
+        ),
+        "{expired:?}"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn truncating_a_committed_tally_is_refused_without_transport() {
+    let directory = TempDir::create("truncated-current-tally");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("the first generation is committed");
+    std::fs::write(&tally, "").expect("the tally is truncated");
+
+    let refused = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("a truncated committed tally is refused");
+    assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
+    assert_eq!(transport.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn rolling_back_only_the_tally_is_refused_without_transport() {
+    let directory = TempDir::create("rolled-back-current-tally");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("the first generation is committed");
+    let older = std::fs::read(&tally).expect("the older tally is read");
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("a newer generation is committed");
+    std::fs::write(&tally, older).expect("only the tally is rolled back");
+
+    let refused = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("a tally-generation mismatch is refused");
+    assert!(matches!(refused, GatewayError::TallyCorrupt { .. }));
+    assert_eq!(transport.sent().len(), 2);
 }
 
 #[test]
@@ -945,7 +1287,7 @@ async fn process_death_leaves_the_pending_attempt_closed_for_ninety_seconds() {
     child.kill().expect("pending child killed");
     child.wait().expect("pending child reaped");
 
-    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_120));
     let transport = RecordingTransport::answering(&time);
     let gateway = gateway(transport.clone(), &time, &tally);
     let refused = gateway

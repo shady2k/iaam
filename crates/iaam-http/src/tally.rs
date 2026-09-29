@@ -13,23 +13,27 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::gateway::BootTime;
+use crate::client::REQUEST_TIMEOUT;
+use crate::gateway::{BootTime, Clock};
 
-const HEADER_V1: &str = "iaam-outbound-tally-v1";
-const HEADER_V2: &str = "iaam-outbound-tally-v2";
-const HEADER: &str = "iaam-outbound-tally-v3";
+const HEADER: &str = "iaam-outbound-tally-v4";
 pub(crate) const TALLY_FILE: &str = "outbound-tally";
 const TALLY_LOCK_FILE: &str = "outbound-tally.lock";
 const TALLY_TEMP_FILE: &str = "outbound-tally.tmp";
+pub(crate) const GENERATION_FILE: &str = "outbound-tally-generation";
+const GENERATION_TEMP_FILE: &str = "outbound-tally-generation.tmp";
 const MINUTE_NANOS: u128 = 60_000_000_000;
 const SECOND_NANOS: u128 = 1_000_000_000;
 const DEPARTURE_SPACING_NANOS: u128 = SECOND_NANOS;
 const REFUSAL_WINDOW_NANOS: u128 = 10 * MINUTE_NANOS;
-const RATE_LIMIT_PAUSE_NANOS: u128 = MINUTE_NANOS;
+const RATE_LIMIT_PAUSE: Duration = Duration::from_secs(60);
+const RATE_LIMIT_PAUSE_NANOS: u128 = RATE_LIMIT_PAUSE.as_nanos();
 const CLOSURE_NANOS: u128 = 30 * MINUTE_NANOS;
 const DAY_NANOS: u128 = 24 * 60 * MINUTE_NANOS;
 const FIRST_SEND_WAIT_NANOS: u128 = MINUTE_NANOS;
-const UNRESOLVED_ATTEMPT_NANOS: u128 = 90 * SECOND_NANOS;
+const UNRESOLVED_ATTEMPT: Duration = REQUEST_TIMEOUT.saturating_add(RATE_LIMIT_PAUSE);
+const UNRESOLVED_ATTEMPT_NANOS: u128 = UNRESOLVED_ATTEMPT.as_nanos();
+const _: () = assert!(UNRESOLVED_ATTEMPT.as_secs() == 90 && UNRESOLVED_ATTEMPT.subsec_nanos() == 0);
 pub(crate) const TALLY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const DAILY_CEILING: u32 = 1_000;
 
@@ -111,10 +115,12 @@ struct HostState {
     rate_limits: Vec<u128>,
     boot_wait_until: Option<u128>,
     pending_since: Option<u128>,
+    pending_budget_key: Option<String>,
 }
 
 #[derive(Default)]
 struct State {
+    generation: u64,
     boot_id: Option<String>,
     boot_high_water: Option<u128>,
     hosts: BTreeMap<String, HostState>,
@@ -363,6 +369,12 @@ impl OutboundTally {
         let (file, _) =
             directory.open_child(TALLY_FILE, OFlags::RDONLY, "open the outbound tally")?;
         drop(file);
+        let (generation, _) = directory.open_child(
+            GENERATION_FILE,
+            OFlags::RDWR | OFlags::CREATE,
+            "open the outbound tally generation",
+        )?;
+        drop(generation);
         Ok(Self { directory })
     }
 
@@ -372,16 +384,38 @@ impl OutboundTally {
         budget_key: &str,
         budget_limit: u32,
         budget_window: Duration,
-        boot: &BootTime,
+        clock: &dyn Clock,
     ) -> Result<TallyDecision, TallyError> {
-        let request = DecisionRequest {
-            host,
-            budget_key,
-            budget_limit,
-            budget_window,
-            boot,
-        };
-        self.transact(|state| Self::decide(state, &request))
+        self.transact(|state| {
+            let boot = read_boot(clock)?;
+            let request = DecisionRequest {
+                host,
+                budget_key,
+                budget_limit,
+                budget_window,
+                boot: &boot,
+            };
+            Self::decide(state, &request)
+        })
+    }
+
+    pub(crate) fn acknowledge_handoff(
+        &self,
+        host: &str,
+        clock: &dyn Clock,
+    ) -> Result<(), TallyError> {
+        self.transact(|state| {
+            let boot = read_boot(clock)?;
+            let now_nanos = boot.elapsed().as_nanos();
+            let mut changed = state.prepare_boot(&boot)?;
+            changed |= state.move_pending_to(host, now_nanos)?;
+            changed |= state.prune(now_nanos);
+            Ok(((), changed))
+        })
+    }
+
+    pub(crate) fn adopt_pending(&self, host: &str, clock: &dyn Clock) -> Result<(), TallyError> {
+        self.acknowledge_handoff(host, clock)
     }
 
     pub(crate) fn record_response(
@@ -389,16 +423,29 @@ impl OutboundTally {
         host: &str,
         status: u16,
         retry_after: Option<Duration>,
-        boot: &BootTime,
+        clock: &dyn Clock,
     ) -> Result<TallyResponseDecision, TallyError> {
-        let now_nanos = boot.elapsed().as_nanos();
         self.transact(|state| {
-            state.prepare_boot(boot)?;
+            let boot = read_boot(clock)?;
+            let now_nanos = boot.elapsed().as_nanos();
+            state.prepare_boot(&boot)?;
+            if !state
+                .hosts
+                .get(host)
+                .is_some_and(|state| state.pending_since.is_some())
+            {
+                return Err(TallyError::Corrupt(format!(
+                    "endpoint {host:?} returned a status without a pending request"
+                )));
+            }
+            state.move_pending_to(host, now_nanos)?;
             state.prune(now_nanos);
             let host_state = state.host_for_boot(host, now_nanos);
             host_state.pending_since = None;
-            host_state.last_send = Some(now_nanos);
-            let named_pause = retry_after.map(|delay| delay.as_nanos().min(DAY_NANOS));
+            host_state.pending_budget_key = None;
+            let named_pause = (!(200..300).contains(&status))
+                .then(|| retry_after.map(|delay| delay.as_nanos().min(DAY_NANOS)))
+                .flatten();
             if let Some(pause) = named_pause {
                 let paused_until = now_nanos.saturating_add(pause);
                 if host_state
@@ -472,58 +519,54 @@ impl OutboundTally {
     pub(crate) fn record_unknown_outcome(
         &self,
         host: &str,
-        boot: &BootTime,
+        clock: &dyn Clock,
     ) -> Result<Duration, TallyError> {
-        let now_nanos = boot.elapsed().as_nanos();
         self.transact(|state| {
-            state.prepare_boot(boot)?;
+            let boot = read_boot(clock)?;
+            let now_nanos = boot.elapsed().as_nanos();
+            state.prepare_boot(&boot)?;
             state.prune(now_nanos);
             let host_state = state.host_for_boot(host, now_nanos);
             let pending_since = host_state.pending_since.take().unwrap_or(now_nanos);
-            let closed_until = pending_since
-                .saturating_add(UNRESOLVED_ATTEMPT_NANOS)
-                .max(now_nanos.saturating_add(RATE_LIMIT_PAUSE_NANOS));
+            host_state.pending_budget_key = None;
+            let (closed_until, reason) = if host_state.rate_limits.is_empty() {
+                (
+                    pending_since
+                        .saturating_add(UNRESOLVED_ATTEMPT_NANOS)
+                        .max(now_nanos.saturating_add(RATE_LIMIT_PAUSE_NANOS)),
+                    ClosureReason::UnresolvedAttempt,
+                )
+            } else {
+                (
+                    now_nanos.saturating_add(CLOSURE_NANOS),
+                    ClosureReason::RateLimits,
+                )
+            };
             host_state.closed_until = Some(
                 host_state
                     .closed_until
                     .unwrap_or_default()
                     .max(closed_until),
             );
-            host_state.closed_reason = Some(ClosureReason::UnresolvedAttempt);
+            host_state.closed_reason = Some(reason);
             Ok((
                 duration_from_nanos(closed_until.saturating_sub(now_nanos)),
                 true,
             ))
         })
     }
+
     pub(crate) fn record_not_handed_off(
         &self,
         host: &str,
-        budget_key: &str,
-        boot: &BootTime,
+        clock: &dyn Clock,
     ) -> Result<(), TallyError> {
-        let now_nanos = boot.elapsed().as_nanos();
         self.transact(|state| {
-            state.prepare_boot(boot)?;
+            let boot = read_boot(clock)?;
+            let now_nanos = boot.elapsed().as_nanos();
+            state.prepare_boot(&boot)?;
             state.prune(now_nanos);
-            let pending_since = {
-                let host_state = state.host_for_boot(host, now_nanos);
-                let pending_since = host_state.pending_since.take();
-                if pending_since.is_some()
-                    && host_state.daily_sends.last() == pending_since.as_ref()
-                {
-                    host_state.daily_sends.pop();
-                }
-                pending_since
-            };
-            if let Some(pending_since) = pending_since
-                && let Some(sends) = state
-                    .sends
-                    .get_mut(&(host.to_owned(), budget_key.to_owned()))
-                && sends.last() == Some(&pending_since)
-            {
-                sends.pop();
-            }
+            state.rollback_pending(host)?;
             Ok(((), true))
         })
     }
@@ -560,7 +603,12 @@ impl OutboundTally {
                 ));
             }
             host_state.pending_since = None;
+            host_state.pending_budget_key = None;
             changed = true;
+            if !host_state.rate_limits.is_empty() {
+                host_state.closed_until = Some(now_nanos.saturating_add(CLOSURE_NANOS));
+                host_state.closed_reason = Some(ClosureReason::RateLimits);
+            }
         }
         if let Some(decision) = Self::active_refusal(host_state, now_nanos) {
             return Ok((decision, true));
@@ -610,6 +658,7 @@ impl OutboundTally {
         host_state.daily_sends.push(now_nanos);
         host_state.boot_wait_until = None;
         host_state.pending_since = Some(now_nanos);
+        host_state.pending_budget_key = Some(budget_key.to_owned());
         Ok((TallyDecision::Send, true))
     }
 
@@ -647,12 +696,17 @@ impl OutboundTally {
             .verify_child(TALLY_LOCK_FILE, lock_identity)?;
 
         let result = (|| {
-            let (mut state, tally_identity) = self.read_state()?;
+            let (mut state, tally_identity, generation_identity) = self.read_state()?;
             let (value, changed) = update(&mut state)?;
             if changed {
-                self.persist(&state, tally_identity)?;
+                state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                    TallyError::Corrupt("the tally generation is exhausted".to_owned())
+                })?;
+                self.persist(&state, tally_identity, generation_identity)?;
             } else {
                 self.directory.verify_child(TALLY_FILE, tally_identity)?;
+                self.directory
+                    .verify_child(GENERATION_FILE, generation_identity)?;
             }
             Ok(value)
         })();
@@ -667,42 +721,112 @@ impl OutboundTally {
         }
     }
 
-    fn read_state(&self) -> Result<(State, FileIdentity), TallyError> {
-        let (mut file, identity) =
+    fn read_state(&self) -> Result<(State, FileIdentity, FileIdentity), TallyError> {
+        let (mut tally_file, tally_identity) =
             self.directory
                 .open_child(TALLY_FILE, OFlags::RDONLY, "open the tally file")?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        let mut tally_bytes = Vec::new();
+        tally_file
+            .read_to_end(&mut tally_bytes)
             .map_err(|source| TallyError::File {
                 action: "read the tally file",
                 source,
             })?;
-        self.directory.verify_child(TALLY_FILE, identity)?;
-        let text = String::from_utf8(bytes)
-            .map_err(|_| TallyError::Corrupt("the file is not UTF-8".to_owned()))?;
-        Ok((State::parse(&text)?, identity))
+        self.directory.verify_child(TALLY_FILE, tally_identity)?;
+        let tally_text = String::from_utf8(tally_bytes)
+            .map_err(|_| TallyError::Corrupt("the tally file is not UTF-8".to_owned()))?;
+
+        let (mut generation_file, generation_identity) = self.directory.open_child(
+            GENERATION_FILE,
+            OFlags::RDONLY,
+            "open the outbound tally generation",
+        )?;
+        let mut generation_text = String::new();
+        generation_file
+            .read_to_string(&mut generation_text)
+            .map_err(|source| TallyError::File {
+                action: "read the outbound tally generation",
+                source,
+            })?;
+        self.directory
+            .verify_child(GENERATION_FILE, generation_identity)?;
+
+        let state = State::parse(&tally_text)?;
+        if tally_text.is_empty() {
+            if !generation_text.is_empty() {
+                return Err(TallyError::Corrupt(
+                    "the outbound tally was emptied; restore the current tally and generation record before retrying"
+                        .to_owned(),
+                ));
+            }
+        } else {
+            let recorded_generation = parse_generation(&generation_text)?;
+            if recorded_generation != state.generation {
+                return Err(TallyError::Corrupt(format!(
+                    "the outbound tally generation rolled back from {recorded_generation} to {}; restore the current tally and generation record before retrying",
+                    state.generation
+                )));
+            }
+        }
+        Ok((state, tally_identity, generation_identity))
     }
 
-    fn persist(&self, state: &State, expected: FileIdentity) -> Result<(), TallyError> {
-        self.directory.verify_child(TALLY_FILE, expected)?;
+    fn persist(
+        &self,
+        state: &State,
+        expected_tally: FileIdentity,
+        expected_generation: FileIdentity,
+    ) -> Result<(), TallyError> {
+        self.directory.verify_child(TALLY_FILE, expected_tally)?;
+        self.directory
+            .verify_child(GENERATION_FILE, expected_generation)?;
         let encoded = state.encode()?;
-        let (mut file, temporary_identity) = self.directory.open_child(
+        let (mut tally_file, tally_temporary_identity) = self.directory.open_child(
             TALLY_TEMP_FILE,
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             "open the temporary tally file",
         )?;
-        file.write_all(encoded.as_bytes())
+        tally_file
+            .write_all(encoded.as_bytes())
             .map_err(|source| TallyError::File {
                 action: "write the temporary tally file",
                 source,
             })?;
-        file.sync_all().map_err(|source| TallyError::File {
+        tally_file.sync_all().map_err(|source| TallyError::File {
             action: "persist the temporary tally file",
             source,
         })?;
+
+        let (mut generation_file, generation_temporary_identity) = self.directory.open_child(
+            GENERATION_TEMP_FILE,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+            "open the temporary tally generation",
+        )?;
+        writeln!(generation_file, "{}", state.generation).map_err(|source| TallyError::File {
+            action: "write the temporary tally generation",
+            source,
+        })?;
+        generation_file
+            .sync_all()
+            .map_err(|source| TallyError::File {
+                action: "persist the temporary tally generation",
+                source,
+            })?;
+
         self.directory
-            .verify_child(TALLY_TEMP_FILE, temporary_identity)?;
-        self.directory.verify_child(TALLY_FILE, expected)?;
+            .verify_child(TALLY_TEMP_FILE, tally_temporary_identity)?;
+        self.directory
+            .verify_child(GENERATION_TEMP_FILE, generation_temporary_identity)?;
+        self.directory.verify_child(TALLY_FILE, expected_tally)?;
+        self.directory
+            .verify_child(GENERATION_FILE, expected_generation)?;
+        renameat(
+            &self.directory.0.descriptor,
+            GENERATION_TEMP_FILE,
+            &self.directory.0.descriptor,
+            GENERATION_FILE,
+        )
+        .map_err(|source| file_error("replace the tally generation", source))?;
         renameat(
             &self.directory.0.descriptor,
             TALLY_TEMP_FILE,
@@ -722,30 +846,25 @@ impl State {
         }
         let mut lines = text.lines();
         let header = lines.next();
-        if header == Some(HEADER_V1) {
-            return Err(TallyError::Corrupt(
-                "v1 cannot prove the rolling 24-hour history; remove it and recreate the outbound tally"
-                    .to_owned(),
-            ));
-        }
-        if header != Some(HEADER) && header != Some(HEADER_V2) {
-            return Err(TallyError::Corrupt(format!("missing header {HEADER:?}")));
+        if header != Some(HEADER) {
+            return Err(TallyError::Corrupt(format!(
+                "tally format {header:?} is not the current {HEADER:?}; no older tally format was deployed, so recreate the tally and generation record during a controlled stop"
+            )));
         }
         let mut state = Self::default();
+        let mut generation = None;
         for (index, line) in lines.enumerate() {
             let number = index + 2;
             let fields: Vec<_> = line.split('\t').collect();
             match fields.as_slice() {
+                ["generation", value] if generation.is_none() => {
+                    generation = Some(parse_number(value, number, "generation")?);
+                }
                 ["boot", boot_id] if state.boot_id.is_none() => {
                     validate_atom(boot_id, number)?;
                     state.boot_id = Some((*boot_id).to_owned());
                 }
-                ["high-water", high_water] if header == Some(HEADER) => {
-                    if state.boot_high_water.is_some() {
-                        return Err(TallyError::Corrupt(format!(
-                            "line {number} repeats the boot high-water mark"
-                        )));
-                    }
+                ["high-water", high_water] if state.boot_high_water.is_none() => {
                     state.boot_high_water =
                         Some(parse_number(high_water, number, "boot high-water mark")?);
                 }
@@ -761,50 +880,9 @@ impl State {
                     refusals,
                     rate_limits,
                     boot_wait_until,
-                ] if header == Some(HEADER_V2) => {
-                    let closed_until = parse_optional_nanos(closed_until, number)?;
-                    let closed_reason = parse_optional_reason(closed_reason, number)?;
-                    let paused_until = parse_optional_nanos(paused_until, number)?;
-                    let paused_for = parse_optional_nanos(paused_for, number)?;
-                    validate_optional_pairs(
-                        number,
-                        closed_until,
-                        closed_reason,
-                        paused_until,
-                        paused_for,
-                    )?;
-                    Self::insert_host(
-                        &mut state,
-                        host,
-                        number,
-                        HostState {
-                            last_send: parse_optional_nanos(last_send, number)?,
-                            daily_sends: parse_timestamps(daily_sends, number, "daily send time")?,
-                            closed_until,
-                            closed_reason,
-                            paused_until,
-                            paused_for,
-                            refusals: parse_timestamps(refusals, number, "refusal time")?,
-                            rate_limits: parse_timestamps(rate_limits, number, "rate-limit time")?,
-                            boot_wait_until: parse_optional_nanos(boot_wait_until, number)?,
-                            pending_since: None,
-                        },
-                    )?;
-                }
-                [
-                    "host",
-                    host,
-                    last_send,
-                    daily_sends,
-                    closed_until,
-                    closed_reason,
-                    paused_until,
-                    paused_for,
-                    refusals,
-                    rate_limits,
-                    boot_wait_until,
                     pending_since,
-                ] if header == Some(HEADER) => {
+                    pending_budget_key,
+                ] => {
                     let closed_until = parse_optional_nanos(closed_until, number)?;
                     let closed_reason = parse_optional_reason(closed_reason, number)?;
                     let paused_until = parse_optional_nanos(paused_until, number)?;
@@ -816,6 +894,14 @@ impl State {
                         paused_until,
                         paused_for,
                     )?;
+                    let pending_since = parse_optional_nanos(pending_since, number)?;
+                    let pending_budget_key =
+                        parse_optional_atom(pending_budget_key, number, "pending budget key")?;
+                    if pending_since.is_some() != pending_budget_key.is_some() {
+                        return Err(TallyError::Corrupt(format!(
+                            "line {number} must carry the pending time and budget key together"
+                        )));
+                    }
                     Self::insert_host(
                         &mut state,
                         host,
@@ -830,7 +916,8 @@ impl State {
                             refusals: parse_timestamps(refusals, number, "refusal time")?,
                             rate_limits: parse_timestamps(rate_limits, number, "rate-limit time")?,
                             boot_wait_until: parse_optional_nanos(boot_wait_until, number)?,
-                            pending_since: parse_optional_nanos(pending_since, number)?,
+                            pending_since,
+                            pending_budget_key,
                         },
                     )?;
                 }
@@ -849,17 +936,19 @@ impl State {
                 }
                 _ => {
                     return Err(TallyError::Corrupt(format!(
-                        "line {number} has an unknown record shape"
+                        "line {number} has an unknown or repeated record shape"
                     )));
                 }
             }
         }
+        state.generation = generation
+            .ok_or_else(|| TallyError::Corrupt("the tally has no generation".to_owned()))?;
         if state.boot_id.is_none() {
             return Err(TallyError::Corrupt("the tally has no boot id".to_owned()));
         }
-        if header == Some(HEADER) && state.boot_high_water.is_none() {
+        if state.boot_high_water.is_none() {
             return Err(TallyError::Corrupt(
-                "the v3 tally has no boot high-water mark".to_owned(),
+                "the tally has no boot high-water mark".to_owned(),
             ));
         }
         Ok(state)
@@ -876,6 +965,90 @@ impl State {
             return Err(TallyError::Corrupt(format!(
                 "line {number} repeats host {host:?}"
             )));
+        }
+        Ok(())
+    }
+
+    fn move_pending_to(&mut self, host: &str, now_nanos: u128) -> Result<bool, TallyError> {
+        let Some((pending_since, budget_key)) = self.hosts.get(host).and_then(|state| {
+            state
+                .pending_since
+                .zip(state.pending_budget_key.as_ref())
+                .map(|(pending_since, budget_key)| (pending_since, budget_key.clone()))
+        }) else {
+            return Ok(false);
+        };
+        if now_nanos <= pending_since {
+            let host_state = self.hosts.get_mut(host).ok_or_else(|| {
+                TallyError::Corrupt(format!("endpoint {host:?} state disappeared"))
+            })?;
+            let previous = host_state.last_send;
+            host_state.last_send = Some(previous.unwrap_or_default().max(pending_since));
+            return Ok(host_state.last_send != previous);
+        }
+
+        let sends = self
+            .sends
+            .get_mut(&(host.to_owned(), budget_key))
+            .ok_or_else(|| {
+                TallyError::Corrupt(format!(
+                    "endpoint {host:?} has a pending request without its method reservation"
+                ))
+            })?;
+        let method_send = sends.last_mut().ok_or_else(|| {
+            TallyError::Corrupt(format!(
+                "endpoint {host:?} has a pending request without a method timestamp"
+            ))
+        })?;
+        if *method_send != pending_since {
+            return Err(TallyError::Corrupt(format!(
+                "endpoint {host:?} pending request does not name the latest method timestamp"
+            )));
+        }
+        *method_send = now_nanos;
+
+        let host_state = self
+            .hosts
+            .get_mut(host)
+            .ok_or_else(|| TallyError::Corrupt(format!("endpoint {host:?} state disappeared")))?;
+        let daily_send = host_state.daily_sends.last_mut().ok_or_else(|| {
+            TallyError::Corrupt(format!(
+                "endpoint {host:?} has a pending request without a daily timestamp"
+            ))
+        })?;
+        if *daily_send != pending_since {
+            return Err(TallyError::Corrupt(format!(
+                "endpoint {host:?} pending request does not name the latest daily timestamp"
+            )));
+        }
+        *daily_send = now_nanos;
+        host_state.last_send = Some(host_state.last_send.unwrap_or_default().max(now_nanos));
+        host_state.pending_since = Some(now_nanos);
+        Ok(true)
+    }
+
+    fn rollback_pending(&mut self, host: &str) -> Result<(), TallyError> {
+        let Some((pending_since, budget_key)) = self.hosts.get(host).and_then(|state| {
+            state
+                .pending_since
+                .zip(state.pending_budget_key.as_deref())
+                .map(|(pending, key)| (pending, key.to_owned()))
+        }) else {
+            return Ok(());
+        };
+        let host_state = self
+            .hosts
+            .get_mut(host)
+            .ok_or_else(|| TallyError::Corrupt(format!("endpoint {host:?} state disappeared")))?;
+        if host_state.daily_sends.last() == Some(&pending_since) {
+            host_state.daily_sends.pop();
+        }
+        host_state.pending_since = None;
+        host_state.pending_budget_key = None;
+        if let Some(sends) = self.sends.get_mut(&(host.to_owned(), budget_key))
+            && sends.last() == Some(&pending_since)
+        {
+            sends.pop();
         }
         Ok(())
     }
@@ -946,7 +1119,7 @@ impl State {
                 state.refusals.retain(|at| *at > refusal_cutoff);
                 changed |= state.refusals.len() != previous_refusals;
                 let previous_rate_limits = state.rate_limits.len();
-                state.rate_limits.retain(|at| *at > refusal_cutoff);
+                state.rate_limits.retain(|at| *at >= refusal_cutoff);
                 changed |= state.rate_limits.len() != previous_rate_limits;
             }
             if state.closed_until.is_some_and(|until| until <= now_nanos) {
@@ -981,6 +1154,9 @@ impl State {
         validate_atom(boot_id, 0)?;
         let mut text = String::from(HEADER);
         text.push('\n');
+        text.push_str("generation\t");
+        text.push_str(&self.generation.to_string());
+        text.push('\n');
         text.push_str("boot\t");
         text.push_str(boot_id);
         text.push('\n');
@@ -1011,6 +1187,13 @@ impl State {
             text.push_str(&format_optional_nanos(state.boot_wait_until));
             text.push('\t');
             text.push_str(&format_optional_nanos(state.pending_since));
+            text.push('\t');
+            if let Some(pending_budget_key) = state.pending_budget_key.as_deref() {
+                validate_atom(pending_budget_key, 0)?;
+                text.push_str(pending_budget_key);
+            } else {
+                text.push('-');
+            }
             text.push('\n');
         }
         for ((host, budget_key), sent) in &self.sends {
@@ -1036,6 +1219,38 @@ fn duration_from_nanos(nanos: u128) -> Duration {
         u32::try_from(nanos % SECOND_NANOS).unwrap_or(999_999_999)
     };
     Duration::new(seconds, subsecond)
+}
+
+fn read_boot(clock: &dyn Clock) -> Result<BootTime, TallyError> {
+    clock.now_boot().map_err(TallyError::Clock)
+}
+
+fn parse_generation(text: &str) -> Result<u64, TallyError> {
+    let value = text.strip_suffix('\n').unwrap_or(text);
+    if value.is_empty() || value.contains('\n') {
+        return Err(TallyError::Corrupt(
+            "the outbound tally generation record is empty or malformed; restore the current tally and generation record before retrying"
+                .to_owned(),
+        ));
+    }
+    parse_number(value, 0, "outbound tally generation")
+}
+
+fn parse_optional_atom(
+    value: &str,
+    line: usize,
+    field: &str,
+) -> Result<Option<String>, TallyError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    validate_atom(value, line)?;
+    if value.is_empty() {
+        return Err(TallyError::Corrupt(format!(
+            "line {line} has invalid {field}"
+        )));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 fn parse_optional_nanos(value: &str, line: usize) -> Result<Option<u128>, TallyError> {
@@ -1135,8 +1350,20 @@ fn validate_atom(value: &str, line: usize) -> Result<(), TallyError> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, mpsc};
+    use std::time::Instant;
 
     use super::*;
+
+    impl Clock for BootTime {
+        fn now(&self) -> std::time::Instant {
+            std::time::Instant::now()
+        }
+
+        fn now_boot(&self) -> Result<BootTime, String> {
+            Ok(self.clone())
+        }
+    }
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1203,6 +1430,24 @@ mod tests {
         ));
 
         let later = BootTime::new("test-boot", sent.elapsed() + Duration::from_secs(10));
+        tally
+            .transact(|state| {
+                let now = later.elapsed().as_nanos();
+                state
+                    .sends
+                    .entry((host.to_owned(), "method".to_owned()))
+                    .or_default()
+                    .push(now);
+                let host_state = state
+                    .hosts
+                    .get_mut(host)
+                    .expect("the first response created host state");
+                host_state.daily_sends.push(now);
+                host_state.pending_since = Some(now);
+                host_state.pending_budget_key = Some("method".to_owned());
+                Ok(((), true))
+            })
+            .expect("an overlapping admitted request is persisted");
         assert!(matches!(
             tally.record_response(
                 host,
@@ -1305,5 +1550,107 @@ mod tests {
             ),
             Ok(TallyDecision::Send)
         ));
+    }
+
+    #[test]
+    fn boot_clock_is_not_sampled_until_the_tally_lock_is_held() {
+        struct SignallingClock {
+            sampled: Mutex<Option<mpsc::Sender<()>>>,
+        }
+
+        impl Clock for SignallingClock {
+            fn now(&self) -> Instant {
+                Instant::now()
+            }
+
+            fn now_boot(&self) -> Result<BootTime, String> {
+                if let Some(sampled) = self
+                    .sampled
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    sampled.send(()).expect("clock sample observed");
+                }
+                Ok(BootTime::new("test-boot", Duration::from_secs(1)))
+            }
+        }
+
+        let (_temporary, directory, tally) = tally("clock-inside-lock");
+        let (lock, _) = directory
+            .open_child(
+                TALLY_LOCK_FILE,
+                OFlags::RDWR | OFlags::CREATE,
+                "open the test tally lock",
+            )
+            .expect("tally lock opened");
+        lock.lock_exclusive().expect("test holds tally lock");
+        let (sampled_tx, sampled_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let clock = Arc::new(SignallingClock {
+            sampled: Mutex::new(Some(sampled_tx)),
+        });
+        let thread_tally = tally.clone();
+        let thread_clock = Arc::clone(&clock);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).expect("worker started");
+            thread_tally.decide_and_record(
+                "https://broker.invalid",
+                "method",
+                100,
+                Duration::from_secs(60),
+                thread_clock.as_ref(),
+            )
+        });
+        started_rx.recv().expect("worker reached the transaction");
+        assert!(
+            sampled_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the boot clock was sampled before the tally lock became available"
+        );
+
+        FileExt::unlock(&lock).expect("test releases tally lock");
+        sampled_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("clock sampled after lock acquisition");
+        assert!(matches!(
+            worker.join().expect("worker did not panic"),
+            Ok(TallyDecision::Wait(wait)) if wait == Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn replacing_the_egress_directory_is_refused() {
+        let temporary = TempDir::new("replace-directory");
+        let directory = EgressDirectory::open(&temporary.0).expect("egress directory opened");
+        let moved = temporary.0.with_extension("replaced");
+        std::fs::rename(&temporary.0, &moved).expect("original directory moved");
+        std::fs::create_dir(&temporary.0).expect("replacement directory created");
+
+        let refused = directory.verify().expect_err("replacement must be refused");
+        assert!(
+            matches!(&refused, TallyError::InvalidPath(reason) if reason.contains("replaced")),
+            "{refused}"
+        );
+        std::fs::remove_dir_all(&moved).expect("moved directory removed");
+    }
+
+    #[test]
+    fn replacing_a_held_child_record_is_refused() {
+        let temporary = TempDir::new("replace-child");
+        let directory = EgressDirectory::open(&temporary.0).expect("egress directory opened");
+        let (_held, identity) = directory
+            .open_child(TALLY_FILE, OFlags::RDONLY, "open held tally")
+            .expect("held tally opened");
+        let moved = temporary.0.join("old-outbound-tally");
+        std::fs::rename(temporary.0.join(TALLY_FILE), &moved).expect("old tally moved");
+        std::fs::write(temporary.0.join(TALLY_FILE), "").expect("replacement tally created");
+
+        let refused = directory
+            .verify_child(TALLY_FILE, identity)
+            .expect_err("child replacement must be refused");
+        assert!(
+            matches!(&refused, TallyError::InvalidPath(reason) if reason.contains("replaced")),
+            "{refused}"
+        );
     }
 }

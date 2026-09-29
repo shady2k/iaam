@@ -85,7 +85,7 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Rules:** `.backlog/rules/check.mjs` with `time-format.mjs` beside it,
   `check-commits.mjs`, `check-docs.mjs`, and `check-present.mjs` with
   `document-format.mjs` beside it, byte-for-byte copies of shady2k-skills
-  0.67.0 (setup 0.35.0), `skills/backlog/setup-shady2k-skills/`. Their
+  0.73.0 (setup 0.37.0), `skills/backlog/setup-shady2k-skills/`. Their
   `--version` is the installation.
 - **Present documents:** `make present` (`node .backlog/rules/check-present.mjs
   --config .backlog/config.json --base <rev>`; `BASE` defaults to the merge base
@@ -122,6 +122,17 @@ are the repository's installation, and each person's plugin and hooks are theirs
   adds the three blocks, sets `iaam.backlog=on` and runs the gate once; it
   refuses with what is missing and disconnects again if the gate cannot run.
 - **CI:** none for these checks (personal scope).
+- **Push ranges:** no pre-push hook and no CI run the range checks here, so
+  the rule for what a push introduces has no entry point yet. The commit-link
+  check runs per commit in `commit-msg`; `commits.mjs --range` is run by hand.
+- **Jev:** the owner consented on 2026-09-29, route `openrouter`. The key's
+  place is this machine's (`~/.config/shady2k-skills/jev.json`), never the
+  repository's. The config's `idPattern` masks item ids but not crate names
+  (`iaam-http` stays), and `maskPatterns` adds card- and account-number
+  shapes. Masking goes by shape: a counterparty's name or an amount in a
+  session transcript is not masked, so text known to carry the owner's
+  statement data is not sent. Check with `jev.mjs status --config
+  .backlog/config.json` from the set's skill directory.
 - **Bulk-edit age correction:** `gate.mjs` passes `--ages-from` and
   `--ages-through` from the two `.git/shady2k/` snapshots when the clone has them.
 - **Static checks:** `make fmt lint arch privacy skill-doc`.

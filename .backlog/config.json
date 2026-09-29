@@ -28,6 +28,15 @@
     "reviewPreference": "different-model",
     "reviewFallback": "same-model independent reviewer"
   },
+  "jev": {
+    "consent": true,
+    "route": "openrouter",
+    "idPattern": "\\biaam-(?!(?:app|bootstrap|broker|core|http|ingest|market|oracle|server|store)\\b)[a-z0-9]{3,5}(?:\\.[0-9]+)*\\b",
+    "maskPatterns": [
+      {"name": "card", "pattern": "\\b\\d{4}(?:[ -]?\\d{4}){3}\\b"},
+      {"name": "account", "pattern": "\\b\\d{12,20}\\b"}
+    ]
+  },
   "scope": "personal",
   "artifactLanguage": "en",
   "projectWords": ["iaam", "IAAM"],

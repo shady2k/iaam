@@ -791,7 +791,8 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
         }
         Destination::FinamApi => {
             let path = path.trim_start_matches('/');
-            if path.contains(['?', '#', '\\', '%'])
+            if path.bytes().any(|byte| byte.is_ascii_control())
+                || path.contains(['?', '#', '\\', '%'])
                 || path.split('/').any(|segment| matches!(segment, "." | ".."))
             {
                 return None;
@@ -851,6 +852,36 @@ struct Lane {
     /// until that exact status and delay, or a conservative unknown outcome,
     /// has been durably written.
     tally_latched: Option<TallyLatch>,
+    /// Set while a detached attempt unwinds. Its drop guard publishes the
+    /// failure before releasing this lane, so the next holder durably adopts
+    /// the unresolved attempt instead of letting its short expiry send.
+    detached_attempt_failed: Arc<AtomicBool>,
+}
+
+struct DetachedAttemptGuard {
+    failed: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl DetachedAttemptGuard {
+    fn new(lane: &Lane) -> Self {
+        Self {
+            failed: Arc::clone(&lane.detached_attempt_failed),
+            armed: true,
+        }
+    }
+
+    fn complete(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DetachedAttemptGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.failed.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Lane {
@@ -1280,6 +1311,22 @@ impl<T: Transport + 'static> Gateway<T> {
                         })?;
                     lane.owner = Some(owner);
                 }
+                if broker && lane.detached_attempt_failed.load(Ordering::SeqCst) {
+                    let directory = self
+                        .egress_directory
+                        .as_ref()
+                        .ok_or(GatewayError::BrokerEgressOff)?;
+                    let owner = lane.owner.as_ref().ok_or(GatewayError::BrokerEgressOff)?;
+                    owner
+                        .tally()
+                        .and_then(|tally| {
+                            tally.record_join_failure(destination.base_url(), self.clock.as_ref())
+                        })
+                        .map_err(|error| {
+                            tally_gateway_error(destination, &directory.tally_path(), error)
+                        })?;
+                    lane.detached_attempt_failed.store(false, Ordering::SeqCst);
+                }
                 if broker && let Some(latch) = lane.tally_latched {
                     let directory = self
                         .egress_directory
@@ -1502,6 +1549,10 @@ impl<T: Transport + 'static> Gateway<T> {
                     let clock = Arc::clone(&self.clock);
                     let tally_path = directory.tally_path();
                     let task = tokio::spawn(async move {
+                        let mut lane = lane;
+                        // This guard is created after the lane, so panic
+                        // unwinding publishes the failure before releasing it.
+                        let attempt = DetachedAttemptGuard::new(&lane);
                         let handoff =
                             Arc::new(std::sync::Mutex::new(None::<Result<(), GatewayError>>));
                         let callback_handoff = Arc::clone(&handoff);
@@ -1615,6 +1666,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         {
                             lane.tally_latched = Some(TallyLatch::Unknown);
                         }
+                        attempt.complete();
                         (
                             lane,
                             Some(answer),

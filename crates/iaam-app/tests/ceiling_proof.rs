@@ -478,6 +478,7 @@ struct FakeTime {
     boot_id: Mutex<String>,
     boot_elapsed: Mutex<Duration>,
     panic_next_boot: AtomicBool,
+    label: Mutex<String>,
 }
 
 impl FakeTime {
@@ -489,6 +490,7 @@ impl FakeTime {
             boot_id: Mutex::new("proof-boot-a".to_owned()),
             boot_elapsed: Mutex::new(Duration::from_secs(10_000)),
             panic_next_boot: AtomicBool::new(false),
+            label: Mutex::new(String::new()),
         })
     }
 
@@ -505,6 +507,20 @@ impl FakeTime {
 
     fn logical_now(&self) -> Duration {
         self.now().saturating_duration_since(self.origin)
+    }
+
+    fn set_label(&self, label: &str) {
+        *self
+            .label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = label.to_owned();
+    }
+
+    fn scenario_label(&self) -> String {
+        self.label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn change_boot(&self, id: &str) {
@@ -534,7 +550,8 @@ impl Clock for FakeTime {
     fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
         assert!(
             !self.panic_next_boot.swap(false, Ordering::SeqCst),
-            "planted boot-clock panic"
+            "planted boot-clock panic (scenario: {})",
+            self.scenario_label()
         );
         let id = self
             .boot_id
@@ -663,21 +680,48 @@ impl<T: Transport + 'static> Outbound for ObservedOutbound<T> {
 }
 
 struct ProofTransport {
+    /// Short-deadline harness: the calls the scenario must see time out.
     inner: HttpClientHarness,
+    /// Roomy harness on the production timeout: a loaded machine cannot race
+    /// a complete reply's body through it.
+    routine: HttpClientHarness,
+    /// How many more calls are still routed through the short harness.
+    short_remaining: AtomicUsize,
     clock: Arc<FakeTime>,
     advance_before_handoff: Mutex<Option<Duration>>,
     advance_after_handoff: Mutex<Option<Duration>>,
 }
 
 impl ProofTransport {
+    /// Route a call to its harness: the first `short_deadline_calls` calls
+    /// carry the scenario's own deadline, the rest ride the roomy harness.
+    fn routed(&self) -> &HttpClientHarness {
+        let mut current = self.short_remaining.load(Ordering::SeqCst);
+        while current != 0 {
+            if self
+                .short_remaining
+                .compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return &self.inner;
+            }
+            current = self.short_remaining.load(Ordering::SeqCst);
+        }
+        &self.routine
+    }
+
     fn new(
         inner: HttpClientHarness,
+        routine: HttpClientHarness,
         clock: Arc<FakeTime>,
         advance_before_handoff: Duration,
         advance_after_handoff: Duration,
+        short_deadline_calls: usize,
     ) -> Self {
         Self {
             inner,
+            routine,
+            short_remaining: AtomicUsize::new(short_deadline_calls),
             clock,
             advance_before_handoff: Mutex::new(
                 (!advance_before_handoff.is_zero()).then_some(advance_before_handoff),
@@ -709,8 +753,7 @@ impl ProofTransport {
 
 impl Transport for ProofTransport {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        self.advance_before_handoff();
-        self.inner.send(request).await
+        self.routed().send(request).await
     }
 
     fn send_observed<'a>(
@@ -722,6 +765,7 @@ impl Transport for ProofTransport {
         self.advance_before_handoff();
         let after = self.take_after_handoff();
         let clock = Arc::clone(&self.clock);
+        let harness = self.routed();
         let delayed_handoff = Box::new(move || {
             handoff()?;
             if let Some(by) = after {
@@ -729,7 +773,7 @@ impl Transport for ProofTransport {
             }
             Ok(())
         });
-        Transport::send_observed(&self.inner, request, delayed_handoff, observe)
+        Transport::send_observed(harness, request, delayed_handoff, observe)
     }
 }
 
@@ -737,6 +781,9 @@ struct ScenarioTiming {
     sleep_mode: SleepMode,
     advance_before_handoff: Duration,
     advance_after_handoff: Duration,
+    /// Calls routed through the short-deadline harness, the first ones in
+    /// flight order. Zero uses the roomy harness everywhere.
+    short_deadline_calls: usize,
 }
 
 struct Scenario {
@@ -767,6 +814,7 @@ impl Scenario {
                 sleep_mode: SleepMode::Logical,
                 advance_before_handoff: Duration::ZERO,
                 advance_after_handoff: Duration::ZERO,
+                short_deadline_calls: 0,
             },
         )
     }
@@ -786,6 +834,7 @@ impl Scenario {
                 sleep_mode: SleepMode::Wire,
                 advance_before_handoff: Duration::ZERO,
                 advance_after_handoff: Duration::ZERO,
+                short_deadline_calls: 0,
             },
         )
     }
@@ -805,6 +854,7 @@ impl Scenario {
                 sleep_mode: SleepMode::Deadline,
                 advance_before_handoff: Duration::ZERO,
                 advance_after_handoff: Duration::ZERO,
+                short_deadline_calls: 0,
             },
         );
         scenario.context.active_sync.store(1, Ordering::SeqCst);
@@ -826,6 +876,7 @@ impl Scenario {
                 sleep_mode: SleepMode::ControlledDeadline,
                 advance_before_handoff: Duration::ZERO,
                 advance_after_handoff: Duration::ZERO,
+                short_deadline_calls: 0,
             },
         )
     }
@@ -846,6 +897,7 @@ impl Scenario {
                 sleep_mode: SleepMode::Logical,
                 advance_before_handoff,
                 advance_after_handoff: Duration::ZERO,
+                short_deadline_calls: 0,
             },
         )
     }
@@ -867,6 +919,7 @@ impl Scenario {
                 sleep_mode: SleepMode::Logical,
                 advance_before_handoff: Duration::ZERO,
                 advance_after_handoff,
+                short_deadline_calls: 1,
             },
         )
     }
@@ -883,12 +936,14 @@ impl Scenario {
             sleep_mode,
             advance_before_handoff,
             advance_after_handoff,
+            short_deadline_calls,
         } = timing;
         let directory = TempDir::new(label);
         if egress {
             initialize_tally(&directory.0);
         }
         let clock = FakeTime::new();
+        clock.set_label(label);
         let context = CallContext::new();
         let records = Arc::new(Mutex::new(Vec::new()));
         let deadline_control = Arc::new(DeadlineControl::default());
@@ -918,11 +973,21 @@ impl Scenario {
             observed_context.arrivals.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap_or_else(|error| panic!("start loopback server: {error}"));
+        let timed = HttpClientHarness::new(&server).with_timeout(timeout);
+        let routine = if short_deadline_calls == 0 {
+            HttpClientHarness::new(&server).with_timeout(timeout)
+        } else {
+            // A complete reply's body must survive a loaded machine: the
+            // production timeout, not the scenario's short deadline.
+            HttpClientHarness::new(&server)
+        };
         let transport = ProofTransport::new(
-            HttpClientHarness::new(&server).with_timeout(timeout),
+            timed,
+            routine,
             Arc::clone(&clock),
             advance_before_handoff,
             advance_after_handoff,
+            short_deadline_calls,
         );
         let sleeper: Arc<dyn Sleeper> = match sleep_mode {
             SleepMode::Wire => Arc::new(WireSleeper {
@@ -1061,28 +1126,45 @@ async fn assert_refused_until_boundary(
     assert!(duration > instant, "{label}: duration is not positive");
     scenario.clock.advance(duration - instant);
     let before = scenario.server.requests_received();
-    let refused = direct_send(scenario, destination)
-        .await
-        .expect_err("one instant before the boundary must stay refused");
+    let refused = match direct_send(scenario, destination).await {
+        Err(refused) => refused,
+        Ok(response) => panic!(
+            "{label}: one instant before the boundary reached the wire: {response:?}; accepted={}; targets={:?}",
+            scenario.server.connections_accepted(),
+            scenario.server.request_targets()
+        ),
+    };
     assert_eq!(
         refused.retry_after(),
         Some(instant),
-        "{label}: the refusal did not preserve the exact boundary"
+        "{label}: the refusal did not preserve the exact boundary; accepted={}; targets={:?}",
+        scenario.server.connections_accepted(),
+        scenario.server.request_targets()
     );
     assert_eq!(
         scenario.server.requests_received(),
         before,
-        "{label}: a request departed before the boundary"
+        "{label}: a request departed before the boundary; accepted={}; targets={:?}",
+        scenario.server.connections_accepted(),
+        scenario.server.request_targets()
     );
 
     scenario.clock.advance(instant);
     direct_send(scenario, destination)
         .await
-        .unwrap_or_else(|error| panic!("{label}: exact boundary stayed closed: {error}"));
+        .unwrap_or_else(|error| {
+            panic!(
+                "{label}: exact boundary stayed closed: {error}; accepted={}; targets={:?}",
+                scenario.server.connections_accepted(),
+                scenario.server.request_targets()
+            )
+        });
     assert_eq!(
         scenario.server.requests_received(),
         before + 1,
-        "{label}: exact boundary did not reach the wire"
+        "{label}: exact boundary did not reach the wire; accepted={}; targets={:?}",
+        scenario.server.connections_accepted(),
+        scenario.server.request_targets()
     );
 }
 
@@ -1691,7 +1773,10 @@ async fn exercise_status_commit_panic() -> Scenario {
     let scenario = Scenario::new(
         "status-commit-panic",
         destination,
-        [LoopbackReply::held(200, "{}")],
+        [
+            LoopbackReply::held(429, "limited").with_header("Retry-After", "600"),
+            LoopbackReply::complete(200, "{}"),
+        ],
         Duration::from_secs(5),
         true,
     );
@@ -1702,6 +1787,16 @@ async fn exercise_status_commit_panic() -> Scenario {
             .await
     });
     wait_for_arrivals(&scenario, 1).await;
+    scenario.clock.advance(Duration::from_secs(91));
+    let next_outbound = Arc::clone(&scenario.outbound);
+    let next = tokio::spawn(async move {
+        next_outbound
+            .send(&direct_request(destination, direct_path(destination)), None)
+            .await
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
     scenario.clock.panic_next_boot_read();
     scenario.server.release_one();
     let failed = first
@@ -1710,17 +1805,50 @@ async fn exercise_status_commit_panic() -> Scenario {
         .expect_err("the detached status commit panic is reported");
     assert!(matches!(failed, GatewayError::TallyUnavailable { .. }));
 
-    let closed = direct_send(&scenario, destination)
+    let after_ninety_one = next
         .await
-        .expect_err("the panic leaves a durable unresolved attempt");
+        .unwrap_or_else(|error| panic!("next lane holder task: {error}"))
+        .expect_err("the next lane holder commits an unresolved day closure");
     assert!(matches!(
-        closed,
+        after_ninety_one,
         GatewayError::BrokerHostClosed {
             reason: "an earlier request has no committed status",
+            retry_after,
             ..
-        }
+        } if retry_after == DAY
     ));
-    assert_eq!(scenario.server.requests_received(), 1);
+
+    scenario.clock.advance(Duration::from_secs(600 - 91));
+    let after_named_delay = direct_send(&scenario, destination)
+        .await
+        .expect_err("the lost 429 cannot shorten the unresolved day closure");
+    assert!(matches!(
+        after_named_delay,
+        GatewayError::BrokerHostClosed { retry_after, .. }
+            if retry_after == DAY - Duration::from_secs(600 - 91)
+    ));
+
+    scenario.clock.change_boot("status-panic-boot-b");
+    let rebooted = direct_send(&scenario, destination)
+        .await
+        .expect_err("reboot restarts the unresolved day closure");
+    assert!(matches!(
+        rebooted,
+        GatewayError::BrokerHostClosed { retry_after, .. } if retry_after == DAY
+    ));
+    scenario.clock.advance(CLOSURE);
+    let after_thirty_minutes = direct_send(&scenario, destination)
+        .await
+        .expect_err("the rebooted unresolved closure exceeds thirty minutes");
+    assert!(matches!(
+        after_thirty_minutes,
+        GatewayError::BrokerHostClosed { retry_after, .. } if retry_after == DAY - CLOSURE
+    ));
+    scenario.clock.advance(DAY - CLOSURE);
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("the rebooted unresolved day did not expire: {error}"));
+    assert_eq!(scenario.server.requests_received(), 2);
     scenario
 }
 
@@ -1792,7 +1920,7 @@ async fn exercise_lost_second_429() -> Scenario {
         "lost-second-429",
         destination,
         [
-            LoopbackReply::complete(429, "limited").with_header("Retry-After", "600"),
+            LoopbackReply::complete(429, "limited").with_header("Retry-After", "60"),
             LoopbackReply::held(429, "limited").with_header("Retry-After", "600"),
         ],
         Duration::from_secs(5),
@@ -1801,7 +1929,7 @@ async fn exercise_lost_second_429() -> Scenario {
     direct_send(&scenario, destination)
         .await
         .expect_err("the first 429 pauses the endpoint");
-    scenario.clock.advance(Duration::from_secs(601));
+    scenario.clock.advance(Duration::from_secs(60));
 
     let outbound = Arc::clone(&scenario.outbound);
     let second = tokio::spawn(async move {
@@ -1827,9 +1955,12 @@ async fn exercise_lost_second_429() -> Scenario {
         .expect_err("the lost second 429 is replayed");
     assert!(matches!(
         replayed,
-        GatewayError::BrokerHostPaused { retry_after, .. }
-            if retry_after == Duration::from_secs(600)
+        GatewayError::BrokerHostPaused { retry_after, .. } if retry_after == CLOSURE
     ));
+    let closed = direct_send(&scenario, destination)
+        .await
+        .expect_err("the two 429 responses close the endpoint");
+    assert!(matches!(closed, GatewayError::BrokerHostClosed { .. }));
     assert_eq!(scenario.server.requests_received(), 2);
     scenario
 }
@@ -1937,38 +2068,123 @@ async fn exercise_post_handoff_timeout() -> Scenario {
     let scenario = Scenario::new_handoff_lag(
         "post-handoff-timeout",
         destination,
-        [LoopbackReply::held(200, "never")],
+        std::iter::once(LoopbackReply::held(200, "never")).chain(std::iter::repeat_n(
+            LoopbackReply::complete(200, "{}"),
+            DAILY_CEILING - 1,
+        )),
         Duration::from_millis(50),
-        Duration::from_secs(61),
+        DAY,
     );
-    direct_send(&scenario, destination)
+    let unresolved = direct_send(&scenario, destination)
         .await
         .expect_err("a response timeout is unresolved");
-    let closed = direct_send(&scenario, destination)
+    assert!(matches!(
+        unresolved,
+        GatewayError::BrokerHostClosed { retry_after, .. }
+            if retry_after == Duration::from_secs(90)
+    ));
+    scenario.clock.advance(Duration::from_secs(90));
+    for attempt in 0..DAILY_CEILING - 1 {
+        direct_send(&scenario, destination)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "post-handoff-timeout send {attempt}: {error}; expected={}; accepted={}; received={}; {}",
+                    attempt + 2,
+                    scenario.server.connections_accepted(),
+                    scenario.server.requests_received(),
+                    call_census(&scenario.records())
+                );
+            });
+    }
+    let refused = direct_send(&scenario, destination)
         .await
-        .expect_err("the unresolved timeout closes the endpoint");
-    assert!(matches!(closed, GatewayError::BrokerHostClosed { .. }));
-    assert_eq!(scenario.server.requests_received(), 1);
+        .expect_err("the unknown outcome still occupies the rolling day");
+    assert!(matches!(refused, GatewayError::DailyCeiling { .. }));
+    assert_eq!(scenario.server.requests_received(), DAILY_CEILING);
     scenario
+}
+
+fn call_census(records: &[SendRecord]) -> String {
+    let mut calls: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    for record in records {
+        *calls.entry(record.call).or_default() += 1;
+    }
+    let doubles: Vec<String> = calls
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(call, count)| format!("{call}x{count}"))
+        .collect();
+    let mut summary = format!(
+        "arrivals={} calls={} >once:[{}]",
+        records.len(),
+        calls.len(),
+        doubles.join(" ")
+    );
+    if let Some((last_call, last_count)) = calls.iter().next_back().map(|kv| (*kv.0, *kv.1)) {
+        let mirrored: Vec<String> = calls
+            .iter()
+            .rev()
+            .take(3)
+            .map(|(call, count)| format!("{call}x{count}"))
+            .collect();
+        summary = format!(
+            "{summary}; last_call={last_call} last_count={last_count} tail:{}",
+            mirrored.join(" ")
+        );
+    }
+    summary
+}
+
+fn plant_pending_from_last_send(scenario: &Scenario, destination: Destination, budget_key: &str) {
+    let path = scenario._directory.path("outbound-tally");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read post-handoff tally: {error}"));
+    let host = destination.base_url();
+    let mut found = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split('\t').map(str::to_owned).collect::<Vec<_>>();
+        if fields.first().is_some_and(|field| field == "host")
+            && fields.get(1).is_some_and(|field| field == host)
+        {
+            assert_eq!(fields.len(), 13, "unexpected tally host record: {line:?}");
+            let pending_since = fields[2].clone();
+            assert_ne!(pending_since, "-", "host has no completed send to plant");
+            fields[11] = pending_since;
+            fields[12] = budget_key.to_owned();
+            found = true;
+        }
+        lines.push(fields.join("\t"));
+    }
+    assert!(found, "tally has no host record for {host}");
+    std::fs::write(&path, format!("{}\n", lines.join("\n")))
+        .unwrap_or_else(|error| panic!("plant post-handoff pending record: {error}"));
 }
 
 async fn exercise_post_handoff_day() -> Scenario {
     let destination = Destination::TinkoffSandbox;
-    let scenario = Scenario::new_handoff_lag(
+    let scenario = Scenario::new(
         "post-handoff-day",
         destination,
         std::iter::repeat_n(LoopbackReply::complete(200, "{}"), DAILY_CEILING),
         Duration::from_secs(5),
-        DAY,
+        true,
     );
-    for attempt in 0..DAILY_CEILING {
+    direct_send(&scenario, destination)
+        .await
+        .unwrap_or_else(|error| panic!("post-handoff-day initial send: {error}"));
+    plant_pending_from_last_send(&scenario, destination, "OperationsService");
+    scenario.clock.advance(DAY + Duration::from_secs(1));
+
+    for attempt in 0..DAILY_CEILING - 1 {
         direct_send(&scenario, destination)
             .await
             .unwrap_or_else(|error| panic!("post-handoff-day send {attempt}: {error}"));
     }
     let refused = direct_send(&scenario, destination)
         .await
-        .expect_err("the 1,001st departure in the post-handoff day is refused");
+        .expect_err("the expired pending departure still occupies the rolling day");
     assert!(matches!(refused, GatewayError::DailyCeiling { .. }));
     assert_eq!(scenario.server.requests_received(), DAILY_CEILING);
     scenario
@@ -2010,14 +2226,23 @@ async fn exercise_finam_path_aliases() -> Scenario {
         Duration::from_secs(5),
         true,
     );
-    for path in [
+    let mut paths = [
         "/v1/accounts/Main\\child",
         "/v1/accounts/%2e%2e",
         "/v1/accounts/%2e%2e/transactions",
-    ] {
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    paths.extend(
+        (0_u8..=0x1f)
+            .chain([0x7f])
+            .map(|byte| format!("/v1/accounts/Main{}child", char::from(byte))),
+    );
+    for path in paths {
         let refused = scenario
             .outbound
-            .send(&direct_request(Destination::FinamApi, path), None)
+            .send(&direct_request(Destination::FinamApi, &path), None)
             .await
             .expect_err("an alias-shaped Finam path has no budget");
         assert!(matches!(refused, GatewayError::UnknownBudget { .. }));
@@ -2454,9 +2679,11 @@ async fn killed_process_child() {
         Gateway::with_parts_in_directory(
             ProofTransport::new(
                 HttpClientHarness::new(&server),
+                HttpClientHarness::new(&server),
                 Arc::clone(&clock),
                 Duration::ZERO,
                 Duration::ZERO,
+                0,
             ),
             BUDGETS,
             Arc::clone(&clock) as Arc<dyn Clock>,
@@ -2726,12 +2953,21 @@ async fn executable_ceiling_proof() {
     assert_eq!(delayed_day_measurement.max_day, DAILY_CEILING);
 
     let post_handoff_timeout = exercise_post_handoff_timeout().await;
-    post_handoff_timeout.verify_and_print("post-handoff-timeout", Destination::TinkoffProd, None);
+    let post_handoff_timeout_measurement = post_handoff_timeout.verify_and_print(
+        "post-handoff-timeout",
+        Destination::TinkoffProd,
+        None,
+    );
+    assert_eq!(post_handoff_timeout_measurement.max_day, DAILY_CEILING);
 
     let post_handoff_day = exercise_post_handoff_day().await;
     let post_handoff_day_measurement =
         post_handoff_day.verify_and_print("post-handoff-day", Destination::TinkoffSandbox, None);
-    assert_eq!(post_handoff_day_measurement.max_day, DAILY_CEILING);
+    assert_eq!(
+        post_handoff_day_measurement.max_day,
+        DAILY_CEILING - 1,
+        "the receiver sees 999 current arrivals while the moved expired departure occupies slot 1,000"
+    );
 
     let empty_pair = exercise_empty_pair_ceiling().await;
     empty_pair.verify_and_print("empty-pair-day-ceiling", Destination::FinamApi, None);

@@ -267,6 +267,13 @@ impl LoopbackServer {
 
 impl Drop for LoopbackServer {
     fn drop(&mut self) {
+        if thread::panicking() {
+            eprintln!(
+                "loopback failure diagnostics: accepted={}; targets={:?}",
+                self.connections_accepted(),
+                self.request_targets()
+            );
+        }
         self.stopping.store(true, Ordering::SeqCst);
         self.reply_gate.stop();
         drop(TcpStream::connect(self.address));

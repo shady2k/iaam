@@ -15,6 +15,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::client::REQUEST_TIMEOUT;
+use crate::destination::Destination;
 use crate::gateway::{BootTime, Clock};
 
 const HEADER: &str = "iaam-outbound-tally-v4";
@@ -38,9 +39,9 @@ const _: () = assert!(UNRESOLVED_ATTEMPT.as_secs() == 90 && UNRESOLVED_ATTEMPT.s
 pub(crate) const TALLY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const DAILY_CEILING: u32 = 1_000;
 const BROKER_HOSTS: [&str; 3] = [
-    "https://invest-public-api.tbank.ru/rest",
-    "https://sandbox-invest-public-api.tbank.ru/rest",
-    "https://api.finam.ru",
+    Destination::TinkoffProd.base_url(),
+    Destination::TinkoffSandbox.base_url(),
+    Destination::FinamApi.base_url(),
 ];
 
 #[derive(Debug, Error)]
@@ -105,6 +106,13 @@ impl ClosureReason {
             Self::RateLimits => "rate-limits",
             Self::RepeatedResponses => "repeated-responses",
             Self::UnresolvedAttempt => "unresolved-attempt",
+        }
+    }
+
+    const fn duration_after_boot_change(self) -> u128 {
+        match self {
+            Self::UnresolvedAttempt => DAY_NANOS,
+            Self::Refusals | Self::RateLimits | Self::RepeatedResponses => CLOSURE_NANOS,
         }
     }
 }
@@ -458,6 +466,38 @@ impl OutboundTally {
                 changed |= state.prune(now_nanos);
             }
             Ok(((), changed))
+        })
+    }
+
+    pub(crate) fn record_join_failure(
+        &self,
+        host: &str,
+        clock: &dyn Clock,
+    ) -> Result<(), TallyError> {
+        self.transact(|state| {
+            let boot = read_boot(clock)?;
+            let now_nanos = boot.elapsed().as_nanos();
+            state.prepare_boot(&boot)?;
+            if state
+                .hosts
+                .get(host)
+                .is_some_and(|host_state| host_state.pending_since.is_some())
+            {
+                state.move_pending_to(host, now_nanos)?;
+            }
+            state.prune(now_nanos);
+            let host_state = state.host_for_boot(host, now_nanos);
+            host_state.pending_since = None;
+            host_state.pending_budget_key = None;
+            let closed_until = now_nanos.saturating_add(DAY_NANOS);
+            host_state.closed_until = Some(
+                host_state
+                    .closed_until
+                    .unwrap_or_default()
+                    .max(closed_until),
+            );
+            host_state.closed_reason = Some(ClosureReason::UnresolvedAttempt);
+            Ok(((), true))
         })
     }
 
@@ -1132,7 +1172,17 @@ impl State {
         for host in self.hosts.values_mut() {
             host.last_send = host.last_send.map(|_| now);
             host.daily_sends.fill(now);
-            host.closed_until = host.closed_until.map(|_| now.saturating_add(CLOSURE_NANOS));
+            host.closed_until = match (host.closed_until, host.closed_reason) {
+                (Some(_), Some(reason)) => {
+                    Some(now.saturating_add(reason.duration_after_boot_change()))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(TallyError::Corrupt(
+                        "an endpoint closure must carry its reason".to_owned(),
+                    ));
+                }
+            };
             host.paused_until = host
                 .paused_until
                 .map(|_| now.saturating_add(host.paused_for.unwrap_or(RATE_LIMIT_PAUSE_NANOS)));

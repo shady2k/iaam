@@ -245,6 +245,29 @@ impl Transport for DelayedPanickingTransport {
 }
 
 #[derive(Clone)]
+struct ObservedPanickingTransport {
+    sent: Arc<AtomicUsize>,
+}
+
+impl Transport for ObservedPanickingTransport {
+    async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        panic!("send_observed is the required path");
+    }
+
+    async fn send_observed<'a>(
+        &'a self,
+        _request: &'a HttpRequest,
+        handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
+        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+    ) -> Result<HttpResponse, HttpError> {
+        handoff()?;
+        self.sent.fetch_add(1, Ordering::SeqCst);
+        observe(200, None);
+        panic!("invented transport panic after observing the status");
+    }
+}
+
+#[derive(Clone)]
 struct RateLimitThenBuildErrorTransport {
     sent: Arc<AtomicUsize>,
 }
@@ -466,6 +489,76 @@ async fn a_boot_id_change_restarts_an_active_closure_in_full() {
         } if retry_after == Duration::from_secs(30 * 60)
     ));
     assert_eq!(transport.sent().len(), 3);
+}
+
+#[tokio::test]
+async fn an_adopted_unresolved_closure_survives_reboot_for_a_full_day() {
+    let directory = TempDir::create("reboot-adopted-closure");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let panicked_sends = Arc::new(AtomicUsize::new(0));
+    {
+        let gateway = gateway(
+            DelayedPanickingTransport {
+                sent: Arc::clone(&panicked_sends),
+                time: Arc::clone(&time),
+                delay: Duration::from_secs(61),
+            },
+            &time,
+            &tally,
+        );
+        let failed = gateway
+            .send(&operations(), None)
+            .await
+            .expect_err("transport task panic is reported");
+        assert!(matches!(failed, GatewayError::TallyUnavailable { .. }));
+    }
+
+    let transport = RecordingTransport::answering(&time);
+    let gateway = gateway(transport.clone(), &time, &tally);
+    let adopted = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the replacement owner adopts the unresolved attempt");
+    assert!(matches!(
+        adopted,
+        GatewayError::BrokerHostClosed {
+            reason: "an earlier request has no committed status",
+            retry_after,
+            attempts: 0,
+            ..
+        } if retry_after == Duration::from_secs(24 * 60 * 60)
+    ));
+
+    time.reboot("boot-b");
+    let rebooted = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("reboot keeps the adopted day closure");
+    assert!(matches!(
+        rebooted,
+        GatewayError::BrokerHostClosed { retry_after, .. }
+            if retry_after == Duration::from_secs(24 * 60 * 60)
+    ));
+
+    time.advance(Duration::from_secs(30 * 60));
+    let after_thirty_minutes = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the unresolved closure is longer than thirty minutes");
+    assert!(matches!(
+        after_thirty_minutes,
+        GatewayError::BrokerHostClosed { retry_after, .. }
+            if retry_after == Duration::from_secs(23 * 60 * 60 + 30 * 60)
+    ));
+
+    time.advance(Duration::from_secs(23 * 60 * 60 + 30 * 60));
+    gateway
+        .send(&operations(), None)
+        .await
+        .expect("the full adopted day has elapsed");
+    assert_eq!(panicked_sends.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.sent().len(), 1);
 }
 
 #[tokio::test]
@@ -866,8 +959,7 @@ async fn finam_account_path_near_misses_are_refused_without_sending() {
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
     let transport = RecordingTransport::answering(&time);
     let gateway = gateway(transport.clone(), &time, &tally);
-
-    for path in [
+    let mut paths = [
         "/v1/accounts/",
         "/v1/accounts//transactions",
         "/v1/accounts/account/child",
@@ -879,8 +971,18 @@ async fn finam_account_path_near_misses_are_refused_without_sending() {
         "/v1/accounts/account\\child",
         "/v1/accounts/%2e%2e",
         "/v1/accounts/%2e%2e/transactions",
-    ] {
-        let request = HttpRequest::get(Destination::FinamApi, path)
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    paths.extend(
+        (0_u8..=0x1f)
+            .chain([0x7f])
+            .map(|byte| format!("/v1/accounts/account{}child", char::from(byte))),
+    );
+
+    for path in paths {
+        let request = HttpRequest::get(Destination::FinamApi, &path)
             .with_request_allowance(RequestAllowance::new(u32::MAX));
         let refused = gateway
             .send(&request, None)
@@ -892,9 +994,9 @@ async fn finam_account_path_near_misses_are_refused_without_sending() {
                 GatewayError::UnknownBudget {
                     destination: Destination::FinamApi,
                     path: ref refused_path
-                } if refused_path == path
+                } if refused_path == &path
             ),
-            "{path}: {refused:?}"
+            "{path:?}: {refused:?}"
         );
     }
     assert!(transport.sent().is_empty());
@@ -931,7 +1033,7 @@ async fn caller_cancellation_does_not_cancel_status_commit() {
 }
 
 #[tokio::test]
-async fn a_transport_panic_leaves_a_durable_unresolved_attempt() {
+async fn a_transport_panic_is_adopted_by_the_next_lane_holder_for_a_full_day() {
     let directory = TempDir::create("panic-pending");
     let tally = empty_tally(&directory);
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
@@ -952,18 +1054,59 @@ async fn a_transport_panic_leaves_a_durable_unresolved_attempt() {
         .expect_err("transport task panic is reported");
     assert!(matches!(first, GatewayError::TallyUnavailable { .. }));
 
+    time.advance(Duration::from_secs(91));
     let second = gateway
         .send(&operations(), None)
         .await
-        .expect_err("the unresolved attempt closes the host");
+        .expect_err("the next lane holder adopts the unresolved attempt");
     assert!(
         matches!(
             second,
             GatewayError::BrokerHostClosed {
                 reason: "an earlier request has no committed status",
                 retry_after,
+                attempts: 0,
                 ..
-            } if retry_after == Duration::from_secs(90)
+            } if retry_after == Duration::from_secs(24 * 60 * 60)
+        ),
+        "{second:?}"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn every_transport_task_panic_closes_for_a_full_day() {
+    let directory = TempDir::create("panic-after-observed");
+    let tally = empty_tally(&directory);
+    let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let gateway = gateway(
+        ObservedPanickingTransport {
+            sent: Arc::clone(&sent),
+        },
+        &time,
+        &tally,
+    );
+
+    let first = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("transport task panic is reported");
+    assert!(matches!(first, GatewayError::TallyUnavailable { .. }));
+
+    let second = gateway
+        .send(&operations(), None)
+        .await
+        .expect_err("the next lane holder commits the task failure");
+    assert!(
+        matches!(
+            second,
+            GatewayError::BrokerHostClosed {
+                reason: "an earlier request has no committed status",
+                retry_after,
+                attempts: 0,
+                ..
+            } if retry_after == Duration::from_secs(24 * 60 * 60)
         ),
         "{second:?}"
     );

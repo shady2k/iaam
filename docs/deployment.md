@@ -88,9 +88,12 @@ Retry-After clamped to one day before consuming the body. The method, rolling
 day and one-second spacing timestamps all move to the later of the original
 decision and the handoff or status commit; delayed handoff cannot age an
 allowance before a byte is sent. The next request cannot decide before that
-record exists. The shared `outbound-tally.lock` is held only for a tally
-transaction; the boot clock is sampled while this lock is held, and waits and
-HTTP requests do not hold it. The tally preserves:
+record exists. If the detached transport/status task panics, its lane records
+that failure before unlocking; the next lane holder durably closes the endpoint
+for 24 hours before deciding, even when the status line was already recorded.
+The shared `outbound-tally.lock` is held only for a tally transaction; the boot clock is
+sampled while this lock is held, and waits and HTTP requests do not hold it. The
+tally preserves:
 
 - the per-method minute budgets from the gateway table;
 - at least one second between sends to the same broker host;
@@ -102,9 +105,11 @@ HTTP requests do not hold it. The tally preserves:
 The persisted time source is Linux boot identity plus `CLOCK_BOOTTIME`, not
 wall time. Wall-clock steps therefore cannot shorten a pause, closure, spacing
 window or rolling daily window. After a boot identity change, iaam cannot know
-how much suspended time elapsed before the reboot: every active pause and
-closure restarts for its full stored duration, old request histories restart
-from the new boot, and the first send to each endpoint waits 60 seconds.
+how much suspended time elapsed before the reboot: every active pause restarts
+for its stored duration; every closure restarts from its persisted reason
+(30 minutes for repeated broker refusals or rate limits, 24 hours for an
+unresolved attempt); old request histories restart from the new boot; and the
+first send to each endpoint waits 60 seconds.
 
 The gateway opens the compiled directory `/var/lib/iaam/egress` when broker
 egress is enabled and keeps that directory descriptor for its lifetime. Its

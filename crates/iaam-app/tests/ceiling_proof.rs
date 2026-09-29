@@ -34,6 +34,7 @@ use time::macros::date;
 use tokio::sync::Notify;
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+const UNRESOLVED_CLOSURE: Duration = Duration::from_secs(60 * 60);
 const MINUTE: Duration = Duration::from_secs(60);
 const CLOSURE: Duration = Duration::from_secs(30 * 60);
 const REFUSAL_WINDOW: Duration = Duration::from_secs(10 * 60);
@@ -1808,33 +1809,33 @@ async fn exercise_status_commit_panic() -> Scenario {
     let after_ninety_one = next
         .await
         .unwrap_or_else(|error| panic!("next lane holder task: {error}"))
-        .expect_err("the next lane holder commits an unresolved day closure");
+        .expect_err("the next lane holder commits an unresolved one-hour closure");
     assert!(matches!(
         after_ninety_one,
         GatewayError::BrokerHostClosed {
             reason: "an earlier request has no committed status",
             retry_after,
             ..
-        } if retry_after == DAY
+        } if retry_after == UNRESOLVED_CLOSURE
     ));
 
     scenario.clock.advance(Duration::from_secs(600 - 91));
     let after_named_delay = direct_send(&scenario, destination)
         .await
-        .expect_err("the lost 429 cannot shorten the unresolved day closure");
+        .expect_err("the lost 429 cannot shorten the unresolved one-hour closure");
     assert!(matches!(
         after_named_delay,
         GatewayError::BrokerHostClosed { retry_after, .. }
-            if retry_after == DAY - Duration::from_secs(600 - 91)
+            if retry_after == UNRESOLVED_CLOSURE - Duration::from_secs(600 - 91)
     ));
 
     scenario.clock.change_boot("status-panic-boot-b");
     let rebooted = direct_send(&scenario, destination)
         .await
-        .expect_err("reboot restarts the unresolved day closure");
+        .expect_err("reboot restarts the unresolved one-hour closure");
     assert!(matches!(
         rebooted,
-        GatewayError::BrokerHostClosed { retry_after, .. } if retry_after == DAY
+        GatewayError::BrokerHostClosed { retry_after, .. } if retry_after == UNRESOLVED_CLOSURE
     ));
     scenario.clock.advance(CLOSURE);
     let after_thirty_minutes = direct_send(&scenario, destination)
@@ -1842,12 +1843,12 @@ async fn exercise_status_commit_panic() -> Scenario {
         .expect_err("the rebooted unresolved closure exceeds thirty minutes");
     assert!(matches!(
         after_thirty_minutes,
-        GatewayError::BrokerHostClosed { retry_after, .. } if retry_after == DAY - CLOSURE
+        GatewayError::BrokerHostClosed { retry_after, .. } if retry_after == UNRESOLVED_CLOSURE - CLOSURE
     ));
-    scenario.clock.advance(DAY - CLOSURE);
+    scenario.clock.advance(UNRESOLVED_CLOSURE - CLOSURE);
     direct_send(&scenario, destination)
         .await
-        .unwrap_or_else(|error| panic!("the rebooted unresolved day did not expire: {error}"));
+        .unwrap_or_else(|error| panic!("the rebooted unresolved hour did not expire: {error}"));
     assert_eq!(scenario.server.requests_received(), 2);
     scenario
 }
@@ -2789,10 +2790,10 @@ async fn process_death_measurement() -> Measurements {
             reason: "an earlier request has no committed status",
             retry_after,
             ..
-        } if retry_after == DAY
+        } if retry_after == UNRESOLVED_CLOSURE
     ));
     assert_eq!(server.requests_received(), 0);
-    clock.advance(DAY);
+    clock.advance(UNRESOLVED_CLOSURE);
     gateway
         .send(
             &direct_request(

@@ -492,7 +492,7 @@ async fn a_boot_id_change_restarts_an_active_closure_in_full() {
 }
 
 #[tokio::test]
-async fn an_adopted_unresolved_closure_survives_reboot_for_a_full_day() {
+async fn an_adopted_unresolved_closure_survives_reboot_for_a_full_hour() {
     let directory = TempDir::create("reboot-adopted-closure");
     let tally = empty_tally(&directory);
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
@@ -527,18 +527,18 @@ async fn an_adopted_unresolved_closure_survives_reboot_for_a_full_day() {
             retry_after,
             attempts: 0,
             ..
-        } if retry_after == Duration::from_secs(24 * 60 * 60)
+        } if retry_after == Duration::from_secs(60 * 60)
     ));
 
     time.reboot("boot-b");
     let rebooted = gateway
         .send(&operations(), None)
         .await
-        .expect_err("reboot keeps the adopted day closure");
+        .expect_err("reboot keeps the adopted one-hour closure");
     assert!(matches!(
         rebooted,
         GatewayError::BrokerHostClosed { retry_after, .. }
-            if retry_after == Duration::from_secs(24 * 60 * 60)
+            if retry_after == Duration::from_secs(60 * 60)
     ));
 
     time.advance(Duration::from_secs(30 * 60));
@@ -549,14 +549,14 @@ async fn an_adopted_unresolved_closure_survives_reboot_for_a_full_day() {
     assert!(matches!(
         after_thirty_minutes,
         GatewayError::BrokerHostClosed { retry_after, .. }
-            if retry_after == Duration::from_secs(23 * 60 * 60 + 30 * 60)
+            if retry_after == Duration::from_secs(30 * 60)
     ));
 
-    time.advance(Duration::from_secs(23 * 60 * 60 + 30 * 60));
+    time.advance(Duration::from_secs(30 * 60));
     gateway
         .send(&operations(), None)
         .await
-        .expect("the full adopted day has elapsed");
+        .expect("the full adopted hour has elapsed");
     assert_eq!(panicked_sends.load(Ordering::SeqCst), 1);
     assert_eq!(transport.sent().len(), 1);
 }
@@ -1033,7 +1033,7 @@ async fn caller_cancellation_does_not_cancel_status_commit() {
 }
 
 #[tokio::test]
-async fn a_transport_panic_is_adopted_by_the_next_lane_holder_for_a_full_day() {
+async fn a_transport_panic_is_adopted_by_the_next_lane_holder_for_a_full_hour() {
     let directory = TempDir::create("panic-pending");
     let tally = empty_tally(&directory);
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
@@ -1067,7 +1067,7 @@ async fn a_transport_panic_is_adopted_by_the_next_lane_holder_for_a_full_day() {
                 retry_after,
                 attempts: 0,
                 ..
-            } if retry_after == Duration::from_secs(24 * 60 * 60)
+            } if retry_after == Duration::from_secs(60 * 60)
         ),
         "{second:?}"
     );
@@ -1075,7 +1075,7 @@ async fn a_transport_panic_is_adopted_by_the_next_lane_holder_for_a_full_day() {
 }
 
 #[tokio::test]
-async fn every_transport_task_panic_closes_for_a_full_day() {
+async fn every_transport_task_panic_closes_for_a_full_hour() {
     let directory = TempDir::create("panic-after-observed");
     let tally = empty_tally(&directory);
     let time = FakeTime::at(UNIX_EPOCH + Duration::from_secs(1_800_000_000));
@@ -1106,7 +1106,7 @@ async fn every_transport_task_panic_closes_for_a_full_day() {
                 retry_after,
                 attempts: 0,
                 ..
-            } if retry_after == Duration::from_secs(24 * 60 * 60)
+            } if retry_after == Duration::from_secs(60 * 60)
         ),
         "{second:?}"
     );
@@ -1473,7 +1473,7 @@ fn pending_attempt_child() {
 }
 
 #[tokio::test]
-async fn process_death_leaves_the_pending_attempt_closed_for_one_day_from_adoption() {
+async fn process_death_leaves_the_pending_attempt_closed_for_one_hour_from_adoption() {
     let directory = TempDir::create("process-death");
     let tally = empty_tally(&directory);
     let ready = directory.file("pending-ready");
@@ -1506,17 +1506,17 @@ async fn process_death_leaves_the_pending_attempt_closed_for_one_day_from_adopti
                 reason: "an earlier request has no committed status",
                 retry_after,
                 ..
-            } if retry_after == Duration::from_secs(24 * 60 * 60)
+            } if retry_after == Duration::from_secs(60 * 60)
         ),
         "{refused:?}"
     );
     assert!(transport.sent().is_empty());
 
-    time.advance(Duration::from_secs(24 * 60 * 60));
+    time.advance(Duration::from_secs(60 * 60));
     gateway
         .send(&operations(), None)
         .await
-        .expect("the endpoint reopens at the adoption-day boundary");
+        .expect("the endpoint reopens at the adoption-hour boundary");
     assert_eq!(transport.sent().len(), 1);
 }
 

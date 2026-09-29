@@ -32,6 +32,11 @@ const RATE_LIMIT_PAUSE: Duration = Duration::from_secs(60);
 const RATE_LIMIT_PAUSE_NANOS: u128 = RATE_LIMIT_PAUSE.as_nanos();
 const CLOSURE_NANOS: u128 = 30 * MINUTE_NANOS;
 const DAY_NANOS: u128 = 24 * 60 * MINUTE_NANOS;
+/// How long an endpoint stays closed after a request whose outcome was never
+/// recorded (an adopted pending attempt, a failed detached task, and every
+/// such closure again after a boot change). One hour by the owner's decision
+/// of 2026-09-29, replacing the 24-hour `Retry-After` clamp.
+const UNRESOLVED_CLOSURE_NANOS: u128 = 60 * MINUTE_NANOS;
 const FIRST_SEND_WAIT_NANOS: u128 = MINUTE_NANOS;
 const UNRESOLVED_ATTEMPT: Duration = REQUEST_TIMEOUT.saturating_add(RATE_LIMIT_PAUSE);
 const UNRESOLVED_ATTEMPT_NANOS: u128 = UNRESOLVED_ATTEMPT.as_nanos();
@@ -111,7 +116,7 @@ impl ClosureReason {
 
     const fn duration_after_boot_change(self) -> u128 {
         match self {
-            Self::UnresolvedAttempt => DAY_NANOS,
+            Self::UnresolvedAttempt => UNRESOLVED_CLOSURE_NANOS,
             Self::Refusals | Self::RateLimits | Self::RepeatedResponses => CLOSURE_NANOS,
         }
     }
@@ -453,7 +458,7 @@ impl OutboundTally {
                 let host_state = state.host_for_boot(host, now_nanos);
                 host_state.pending_since = None;
                 host_state.pending_budget_key = None;
-                let closed_until = now_nanos.saturating_add(DAY_NANOS);
+                let closed_until = now_nanos.saturating_add(UNRESOLVED_CLOSURE_NANOS);
                 host_state.closed_until = Some(
                     host_state
                         .closed_until
@@ -489,7 +494,7 @@ impl OutboundTally {
             let host_state = state.host_for_boot(host, now_nanos);
             host_state.pending_since = None;
             host_state.pending_budget_key = None;
-            let closed_until = now_nanos.saturating_add(DAY_NANOS);
+            let closed_until = now_nanos.saturating_add(UNRESOLVED_CLOSURE_NANOS);
             host_state.closed_until = Some(
                 host_state
                     .closed_until
@@ -1872,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn adoption_reinserts_a_pruned_reservation_and_closes_for_one_day() {
+    fn adoption_reinserts_a_pruned_reservation_and_closes_for_one_hour() {
         let (_temporary, _directory, tally) = tally("adopt-pruned-reservation");
         let host = "https://broker.invalid";
         let sent = ready_send(&tally, host, Duration::from_secs(60_000));
@@ -1942,7 +1947,7 @@ mod tests {
         assert_eq!(method, Some(adopted_nanos));
         assert_eq!(daily, Some(adopted_nanos));
         assert_eq!(pending, None);
-        assert_eq!(closed_until, Some(adopted_nanos + DAY_NANOS));
+        assert_eq!(closed_until, Some(adopted_nanos + UNRESOLVED_CLOSURE_NANOS));
     }
 
     #[test]

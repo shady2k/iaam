@@ -90,7 +90,7 @@ decision and the handoff or status commit; delayed handoff cannot age an
 allowance before a byte is sent. The next request cannot decide before that
 record exists. If the detached transport/status task panics, its lane records
 that failure before unlocking; the next lane holder durably closes the endpoint
-for 24 hours before deciding, even when the status line was already recorded.
+for one hour before deciding, even when the status line was already recorded.
 The shared `outbound-tally.lock` is held only for a tally transaction; the boot clock is
 sampled while this lock is held, and waits and HTTP requests do not hold it. The
 tally preserves:
@@ -107,7 +107,7 @@ wall time. Wall-clock steps therefore cannot shorten a pause, closure, spacing
 window or rolling daily window. After a boot identity change, iaam cannot know
 how much suspended time elapsed before the reboot: every active pause restarts
 for its stored duration; every closure restarts from its persisted reason
-(30 minutes for repeated broker refusals or rate limits, 24 hours for an
+(30 minutes for repeated broker refusals or rate limits, one hour for an
 unresolved attempt); old request histories restart from the new boot; and the
 first send to each endpoint waits 60 seconds.
 
@@ -252,7 +252,7 @@ clearing it and closes the endpoint for the request timeout plus the mandatory
 60-second rate-limit pause: 90 seconds. Pruning retains the timestamps that
 belong to a pending attempt. Process death leaves the pending marker in place;
 a new owner that adopts it reinserts any timestamps lost by an older pruner at
-its own acquisition time and closes that endpoint for a full 24 hours from
+its own acquisition time and closes that endpoint for a full hour from
 adoption. Other endpoint activity and the original handoff's age do not shorten
 that closure.
 

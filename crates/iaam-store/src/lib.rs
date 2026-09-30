@@ -87,6 +87,16 @@ pub enum StoreError {
     /// look exactly like.
     #[error("no database at {path}")]
     DatabaseMissing { path: String },
+    /// The database's place could not be examined (for example, permission
+    /// denied on a directory above it). Kept apart from `DatabaseMissing` so
+    /// an existing portfolio behind a permission error is never reported as
+    /// absent, which would send the owner to create a new one.
+    #[error("cannot reach the database at {path}: {source}")]
+    DatabaseInaccessible {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("active alias {namespace}:{value} not found for instrument {instrument}")]
     AliasNotFoundForInstrument {
         namespace: &'static str,
@@ -275,10 +285,27 @@ impl SqliteStore {
     /// command-facing refusal lives with the commands, which know the
     /// command that creates.
     pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
-        if !path.is_file() {
-            return Err(StoreError::DatabaseMissing {
-                path: path.display().to_string(),
-            });
+        // `metadata`, not `is_file`: `is_file` answers `false` for a
+        // permission error too, and an existing portfolio behind one must
+        // not be reported as absent.
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(StoreError::DatabaseMissing {
+                    path: path.display().to_string(),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::DatabaseMissing {
+                    path: path.display().to_string(),
+                });
+            }
+            Err(source) => {
+                return Err(StoreError::DatabaseInaccessible {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
         }
         // One flag, not the default set: `READ_WRITE` without `CREATE` is
         // the whole contract. The `URI` flag of a default open would parse
@@ -408,6 +435,32 @@ mod tests {
             parsed.year() >= 2025,
             "timestamp is not from a previous century: {stamp}"
         );
+    }
+
+    #[test]
+    fn open_existing_keeps_the_cause_when_the_database_cannot_be_reached() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-blocked-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("iaam.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = SqliteStore::open_existing(&path);
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+        match result {
+            Err(StoreError::DatabaseInaccessible { path: named, source }) => {
+                assert!(named.contains("iaam.sqlite"), "{named}");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            Err(other) => panic!("the cause must be kept, got {other}"),
+            Ok(_) => panic!("an unreachable database must not open"),
+        }
     }
 
     #[test]

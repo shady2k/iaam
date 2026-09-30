@@ -35,7 +35,7 @@ pub enum InstanceError {
          `iaam claim`, no other command creates one"
     )]
     DatabaseMissing { path: String },
-    #[error("cannot open the database {path}")]
+    #[error("cannot open the database {path}: {source}")]
     DatabaseUnreadable {
         path: String,
         #[source]

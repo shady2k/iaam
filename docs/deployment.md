@@ -992,9 +992,9 @@ does, and creates nothing:
 
 ```console
 $ iaam broker connect finam
-error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim --label <label>`, no other command creates one
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim`, no other command creates one
 $ iaam broker off
-error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim --label <label>`, no other command creates one
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim`, no other command creates one
 ```
 
 After `iaam claim`, an empty paste is refused before anything is sent, and
@@ -1290,7 +1290,7 @@ supplies what is missing and with which command.
 | `error: variable IAAM_LISTEN is invalid: 8080; allowed values: socket address such as 127.0.0.1:8080` | a port without a host | use `0.0.0.0:8080` in a container, `127.0.0.1:8080` on a host |
 | ``error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue` `` | a retired provisioning variable is set (§2.4) | remove it from the unit, profile or compose file and run the subcommand |
 | `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue owner` (§7.3) |
-| ``error: instance has no owner: run `iaam claim --label <label>` first`` | `token issue`, or `bundle export`/`bundle import`, against an empty database | run `iaam claim --label console` (§3.5, §4.4) |
+| ``error: instance has no owner: run `iaam claim` first`` | `token issue`, or `bundle export`/`bundle import`, against an empty database | run `iaam claim` (§3.5, §4.4) |
 | `error: multiple owners recorded in the database: …` | `bundle export`/`bundle import` against a database with more than one owner | inspect the database; this is corruption in a single-owner system, not something the command guesses past |
 | `error: this instance already holds journal facts; restoring would merge the archive into them …` | `bundle import` against a database that is not empty, without `--merge` | pass `--merge` if merging is what is wanted (§9); otherwise restore into an empty database |
 | `error: … already exists: refusing to overwrite an existing archive` | `bundle export --output` names a file that is already there | choose a new path, or move the existing archive aside first |

@@ -51,7 +51,7 @@ pub enum ConnectError {
          and press Enter"
     )]
     TokenEmpty,
-    #[error("instance has no owner: run `iaam claim --label <label>` first")]
+    #[error("instance has no owner: run `iaam claim` first")]
     NoOwner,
     #[error("multiple owners: choosing which one should receive access is impossible")]
     SeveralOwners,

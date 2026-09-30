@@ -207,6 +207,10 @@ entry in the same commit. Moved here from the tracker's memory store on
   `target/mutants/<module>/mutants.out/`; the survivors are
   `cat target/mutants/*/mutants.out/missed.txt`. Judge a run by its exit code
   and those files, never by the tail of its output.
-- **Every worktree builds its own `target/`**, 15–20 GB each; a full disk shows
-  up as an opaque rustc exit 101. Remove a worktree as soon as its branch is
-  merged (`make sweep`), and keep at most a few alive.
+- **Every checkout builds into the main checkout's `target/`**: the dev shell
+  sets `CARGO_TARGET_DIR` from git's common directory (a value you set wins),
+  turns incremental compilation off, and the dev profile keeps only line
+  tables of debug information (iaam-eoji9). Builds running at once wait on
+  cargo's lock; that is the price. A full disk still shows up as an opaque
+  rustc exit 101: remove merged worktrees (`make sweep`) and, when
+  `target/` itself has grown, `cargo clean` costs one full rebuild.

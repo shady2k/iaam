@@ -38,6 +38,24 @@
             # any redirected output and corrupts it. The fixture generator
             # writes JSON to stdout, and the banner made it impossible to parse.
             echo "iaam dev shell · $(rustc --version)" >&2
+
+            # One build directory per repository (iaam-eoji9): every checkout,
+            # the main one and each git worktree under ~/.herdr/worktrees or
+            # .claude/worktrees, builds into the main checkout's target/, found
+            # through git's common directory. A per-worktree target/ was 11-25 GB
+            # each and filled the disk during parallel runs. A value the caller
+            # set is kept. Outside a git checkout nothing is set.
+            if [ -z "''${CARGO_TARGET_DIR:-}" ]; then
+              if iaam_common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+                export CARGO_TARGET_DIR="$(dirname "$iaam_common")/target"
+              fi
+              unset iaam_common
+            fi
+            # Incremental caches are kept per branch and were most of the shared
+            # directory's growth (70 GB measured on 2026-09-28); a worker builds
+            # its branch a few times, so they buy it little. A value the caller
+            # set is kept.
+            export CARGO_INCREMENTAL="''${CARGO_INCREMENTAL:-0}"
           '';
         };
       });

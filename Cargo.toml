@@ -13,6 +13,15 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 
+# Debug information in the dev profile is cut to line tables (iaam-eoji9):
+# file and line in a panic and a backtrace stay, and only variable
+# inspection in a debugger goes, which nothing here uses. With full debug
+# information every test binary carries the whole dependency graph's, which
+# measured 228 MB against 60 MB for one test target (see the mutant profile
+# below) and filled the disk once several checkouts built at the same time.
+[profile.dev]
+debug = "line-tables-only"
+
 # Профиль мутационного прогона. Отличается от `dev` ровно одним:
 # отладочная информация урезана до таблиц строк.
 #

@@ -199,12 +199,17 @@ pub async fn run(
             message: explain_check_failure(display, broker, environment, &failure),
         })?;
 
-    if replace {
-        provision::replace_broker_access(store, key, broker, environment, &token)?;
-    } else {
-        provision::add_broker_access(store, key, broker, environment, &token)?;
-    }
-    store.set_broker_egress_enabled(true)?;
+    // One transaction in the store: the credential and the enabling commit
+    // together, so no failure between them can leave a credential stored
+    // beside a switch that is still off.
+    provision::store_credential_and_enable_egress(
+        store,
+        key,
+        broker,
+        environment,
+        &token,
+        replace,
+    )?;
     Ok(format!(
         "{display} connected: the token sees {accounts} {}. \
          Broker requests are on; turn them off with `iaam broker off`.",
@@ -464,14 +469,62 @@ pub fn key_for_connect(place: &Place) -> Result<Key, Box<dyn std::error::Error>>
     Ok(crate::read_broker_key(&place.path)?)
 }
 
+/// The byte a Ctrl-C press becomes while the hidden read has `ISIG`
+/// cleared: the signal character arrives as data, so it can be refused
+/// here instead of killing the process.
+const CANCEL: char = '\u{3}';
+
+/// The refusal for a cancelled paste: nothing was stored, nothing was
+/// sent, and the command that asks again is named.
+fn cancel_refused() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "cancelled at Ctrl-C: nothing was stored and nothing was sent; \
+         run `iaam broker connect <broker>` to paste the token again",
+    )
+}
+
+/// A line carrying the cancel byte is a cancellation, never a token.
+fn without_cancel(
+    read: Result<Zeroizing<String>, std::io::Error>,
+) -> Result<Zeroizing<String>, std::io::Error> {
+    match read {
+        Ok(line) if line.contains(CANCEL) => Err(cancel_refused()),
+        other => other,
+    }
+}
+
+/// Restores the saved terminal modes whenever the hidden read ends: a
+/// return, a refusal, or an error from the read itself. The terminal must
+/// not keep a hidden echo because a paste failed.
+struct RestoreTermios {
+    fd: BorrowedFd<'static>,
+    saved: Termios,
+}
+
+impl Drop for RestoreTermios {
+    fn drop(&mut self) {
+        if let Err(error) = tcsetattr(self.fd, OptionalActions::Drain, &self.saved) {
+            eprintln!(
+                "warning: the terminal echo could not be restored: {error}; \
+                 run `reset` in this terminal before typing anything secret"
+            );
+        }
+    }
+}
+
 /// Read the token from standard input, hidden on a terminal.
 ///
 /// On a terminal the echo is switched off for the read and restored
-/// afterwards, whatever the read returned; the pasted line is not shown and
-/// does not land in the terminal's scrollback. From a pipe or a file — how
-/// the tests and the documentation runs feed the token — the line is read
-/// plainly. In both modes the token is one line, returned in zeroizing
-/// memory.
+/// afterwards, whatever the read returned — the saved terminal modes are
+/// restored by a guard on every return path, so a refusal or an error
+/// cannot leave the terminal silent. `ISIG` is cleared with the echo: a
+/// Ctrl-C during the read arrives as the byte [`CANCEL`] and is refused as
+/// a cancellation that stored nothing, instead of killing the process with
+/// the echo still off. From a pipe or a file — how the tests and the
+/// documentation runs feed the token — the line is read plainly; a Ctrl-C
+/// byte in it is the same cancellation, never part of a token. In both
+/// modes the token is one line, returned in zeroizing memory.
 ///
 /// # Errors
 /// Standard input could not be read, or the terminal state could not be
@@ -487,20 +540,25 @@ pub fn read_token_hidden(
     );
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
-        return read_line(&stdin);
+        return without_cancel(read_line(&stdin));
     }
     let fd: BorrowedFd<'_> = rustix::stdio::stdin();
     let original: Termios =
         tcgetattr(fd).map_err(|error| hidden_input_refused("read the terminal state", error))?;
     let mut concealed = original.clone();
     concealed.local_modes.remove(LocalModes::ECHO);
+    // `ISIG` cleared with the echo: a Ctrl-C during the read arrives as
+    // the byte [`CANCEL`] — refused below — instead of killing the
+    // process with the echo still off.
+    concealed.local_modes.remove(LocalModes::ISIG);
+    let restore = RestoreTermios {
+        fd,
+        saved: original,
+    };
     tcsetattr(fd, OptionalActions::Drain, &concealed)
         .map_err(|error| hidden_input_refused("hide the input", error))?;
-    let read = read_line(&stdin);
-    // Restored on every path: the terminal must not keep a hidden echo
-    // because the paste was empty or the pipe closed.
-    tcsetattr(fd, OptionalActions::Drain, &original)
-        .map_err(|error| hidden_input_refused("restore the terminal echo", error))?;
+    let read = without_cancel(read_line(&stdin));
+    drop(restore);
     eprintln!();
     read
 }
@@ -947,6 +1005,28 @@ mod tests {
             text.contains("daily ceiling") || text.contains("allowance"),
             "the conservative day is named: {text}"
         );
+    }
+
+    #[test]
+    fn a_cancel_byte_is_a_cancellation_never_a_token() {
+        let cancelled = without_cancel(Ok(Zeroizing::new("tok\u{3}en".to_owned())))
+            .expect_err("a Ctrl-C byte is a cancellation");
+        assert_eq!(
+            cancelled.kind(),
+            std::io::ErrorKind::Interrupted,
+            "{cancelled}"
+        );
+        let text = cancelled.to_string();
+        assert!(text.contains("cancelled"), "{text}");
+        assert!(text.contains("nothing was stored"), "{text}");
+
+        let kept = without_cancel(Ok(Zeroizing::new("a plain paste".to_owned())))
+            .expect("an ordinary line is kept");
+        assert_eq!(kept.as_str(), "a plain paste");
+
+        let failure = without_cancel(Err(std::io::Error::other("the pipe closed")))
+            .expect_err("a read error passes through unchanged");
+        assert_eq!(failure.to_string(), "the pipe closed");
     }
 
     #[test]

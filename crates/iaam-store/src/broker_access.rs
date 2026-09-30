@@ -47,6 +47,28 @@ pub struct BrokerAccessCiphertext {
     pub ciphertext: Vec<u8>,
 }
 
+/// The credential write of one `iaam broker connect`, stored together with
+/// the enabling of the egress switch in one transaction.
+///
+/// `connect` must not be able to leave a stored credential beside a switch
+/// that is still off: a failure after the credential write would leave the
+/// instance holding a secret it cannot use, a retry refused as "already
+/// exists", or a replaced credential lost. Both writes commit together or
+/// not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerCredentialWrite {
+    /// A first credential for this broker and environment, with the
+    /// operation dictionary every production path stores beside it.
+    Insert {
+        access: NewBrokerAccess,
+        dictionary: String,
+        entries: Vec<BrokerOperationKind>,
+    },
+    /// A replacement ciphertext for an existing record: the record's
+    /// identity and history are preserved, only the ciphertext changes.
+    Replace(BrokerAccessCiphertext),
+}
+
 /// Stored access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrokerAccess {
@@ -219,6 +241,61 @@ impl SqliteStore {
                 });
             }
         }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// The commit of one `iaam broker connect`: the credential write —
+    /// first or replaced — and the enabling of the stored egress switch,
+    /// including its first-enabling moment, as one transaction.
+    ///
+    /// A refusal, crash or failure between the two writes must not leave a
+    /// credential stored beside a switch that is still off: the instance
+    /// would hold a secret it cannot use, a retry would be refused as
+    /// "already exists", and a replaced credential would be lost. The
+    /// access commands keep their own single-write behaviour; they do not
+    /// touch the switch.
+    pub fn store_broker_credential_and_enable_egress(
+        &mut self,
+        write: BrokerCredentialWrite,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match write {
+            BrokerCredentialWrite::Insert {
+                access,
+                dictionary,
+                entries,
+            } => {
+                insert_broker_access_in_transaction(&transaction, &access)?;
+                Self::extend_broker_operation_kinds_in_transaction(
+                    &transaction,
+                    &access.broker,
+                    &dictionary,
+                    &entries,
+                )?;
+            }
+            BrokerCredentialWrite::Replace(replacement) => {
+                let changed = transaction.execute(
+                    "UPDATE broker_access
+                     SET nonce = ?1, ciphertext = ?2
+                     WHERE id = ?3",
+                    params![
+                        replacement.nonce,
+                        replacement.ciphertext,
+                        replacement.id.to_string()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StoreError::NotFound {
+                        what: "broker access",
+                        id: replacement.id.to_string(),
+                    });
+                }
+            }
+        }
+        crate::broker_egress::set_enabled_in_transaction(&transaction, true)?;
         transaction.commit()?;
         Ok(())
     }
@@ -449,5 +526,138 @@ mod tests {
                 .is_none()
         );
         assert!(store.broker_operation_kinds(&broker).unwrap().is_empty());
+    }
+
+    /// The connect write's failure injection: triggers refuse every write
+    /// to `broker_egress`, so the switch statement inside the transaction
+    /// fails after the credential statement succeeded — the way any real
+    /// refusal of that write (a constraint, a full disk) would fail it.
+    fn deny_broker_egress_writes(store: &SqliteStore) {
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_egress_insert
+             BEFORE INSERT ON broker_egress
+             BEGIN SELECT RAISE(ABORT, 'injected refusal of the switch write'); END;
+             CREATE TRIGGER refuse_egress_update
+             BEFORE UPDATE ON broker_egress
+             BEGIN SELECT RAISE(ABORT, 'injected refusal of the switch write'); END;",
+            )
+            .expect("the refusing triggers are created");
+    }
+
+    fn allow_everything_again(store: &SqliteStore) {
+        store
+            .conn
+            .execute_batch(
+                "DROP TRIGGER refuse_egress_insert;
+                 DROP TRIGGER refuse_egress_update;",
+            )
+            .expect("the refusing triggers are dropped");
+    }
+
+    fn credential(broker: &str, byte: u8) -> NewBrokerAccess {
+        NewBrokerAccess {
+            id: Uuid::new_v4(),
+            owner: OwnerId::new_random(),
+            broker: BrokerCode::parse(broker).unwrap(),
+            environment: "prod".to_owned(),
+            scope: "read_only".to_owned(),
+            nonce: vec![byte; 12],
+            ciphertext: vec![byte + 1; 16],
+        }
+    }
+
+    #[test]
+    fn a_denied_switch_write_stores_no_first_credential() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let access = credential("tinkoff", 1);
+        deny_broker_egress_writes(&store);
+
+        let error = store
+            .store_broker_credential_and_enable_egress(BrokerCredentialWrite::Insert {
+                access: access.clone(),
+                dictionary: "test dictionary".to_owned(),
+                entries: vec![],
+            })
+            .expect_err("the denied switch write fails the whole write");
+        allow_everything_again(&store);
+
+        assert!(
+            matches!(error, StoreError::Sqlite(_)),
+            "the switch's denial is the failure: {error}"
+        );
+        assert!(
+            store
+                .find_broker_access(access.owner, &access.broker, "prod")
+                .unwrap()
+                .is_none(),
+            "no credential is stored beside a switch that is still off"
+        );
+    }
+
+    #[test]
+    fn a_denied_switch_write_leaves_the_replaced_credential_intact() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let existing = credential("tinkoff", 1);
+        store.insert_broker_access(&existing).unwrap();
+        // The switch row already exists (off): the upsert takes its UPDATE
+        // branch, which the trigger refuses like the INSERT branch.
+        store.set_broker_egress_enabled(false).unwrap();
+        deny_broker_egress_writes(&store);
+
+        let error = store
+            .store_broker_credential_and_enable_egress(BrokerCredentialWrite::Replace(
+                BrokerAccessCiphertext {
+                    id: existing.id,
+                    nonce: vec![7; 12],
+                    ciphertext: vec![8; 16],
+                },
+            ))
+            .expect_err("the denied switch write fails the whole write");
+        allow_everything_again(&store);
+
+        assert!(matches!(error, StoreError::Sqlite(_)), "{error}");
+        let kept = store
+            .find_broker_access(existing.owner, &existing.broker, "prod")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.nonce, existing.nonce, "the old credential stands");
+        assert_eq!(kept.ciphertext, existing.ciphertext);
+        let setting = store.broker_egress().unwrap();
+        assert!(!setting.enabled, "the switch is untouched");
+        assert!(
+            setting.first_enabled_at.is_none(),
+            "no enabling was recorded either"
+        );
+    }
+
+    #[test]
+    fn the_connect_write_stores_the_credential_and_enables_the_switch_together() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let existing = credential("tinkoff", 1);
+        store.insert_broker_access(&existing).unwrap();
+
+        store
+            .store_broker_credential_and_enable_egress(BrokerCredentialWrite::Replace(
+                BrokerAccessCiphertext {
+                    id: existing.id,
+                    nonce: vec![7; 12],
+                    ciphertext: vec![8; 16],
+                },
+            ))
+            .expect("the write commits");
+
+        let kept = store
+            .find_broker_access(existing.owner, &existing.broker, "prod")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.nonce, vec![7; 12], "the credential was replaced");
+        let setting = store.broker_egress().unwrap();
+        assert!(setting.enabled, "the switch rides in the same transaction");
+        assert!(
+            setting.first_enabled_at.is_some(),
+            "the first enabling is recorded"
+        );
     }
 }

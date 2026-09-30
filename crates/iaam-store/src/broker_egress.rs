@@ -13,6 +13,8 @@
 //! set, never again — a deleted or emptied egress directory is the
 //! conservative recovery state, and no later command restores an allowance.
 
+use rusqlite::TransactionBehavior;
+
 use crate::{SqliteStore, StoreError, now};
 
 /// The stored broker-egress switch of one instance.
@@ -61,24 +63,41 @@ impl SqliteStore {
     /// Disabling leaves the first enabling standing — turning the switch off
     /// does not un-happen it.
     pub fn set_broker_egress_enabled(&mut self, enabled: bool) -> Result<(), StoreError> {
-        let at = now();
-        self.conn.execute(
-            "INSERT INTO broker_egress (setting, enabled, first_enabled_at, recorded_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(setting) DO UPDATE SET
-                enabled = excluded.enabled,
-                first_enabled_at =
-                    COALESCE(broker_egress.first_enabled_at, excluded.first_enabled_at),
-                recorded_at = excluded.recorded_at",
-            rusqlite::params![
-                SETTING,
-                i64::from(enabled),
-                enabled.then_some(at.as_str()),
-                at.as_str(),
-            ],
-        )?;
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        set_enabled_in_transaction(&transaction, enabled)?;
+        transaction.commit()?;
         Ok(())
     }
+}
+
+/// The switch's one row, written inside a transaction the caller commits.
+///
+/// This is how `connect` turns the switch on in the same transaction that
+/// stores the credential: the enabling — including the first-enabling
+/// moment — either lands with that write or not at all.
+pub(crate) fn set_enabled_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    enabled: bool,
+) -> Result<(), StoreError> {
+    let at = now();
+    transaction.execute(
+        "INSERT INTO broker_egress (setting, enabled, first_enabled_at, recorded_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(setting) DO UPDATE SET
+            enabled = excluded.enabled,
+            first_enabled_at =
+                COALESCE(broker_egress.first_enabled_at, excluded.first_enabled_at),
+            recorded_at = excluded.recorded_at",
+        rusqlite::params![
+            SETTING,
+            i64::from(enabled),
+            enabled.then_some(at.as_str()),
+            at.as_str(),
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

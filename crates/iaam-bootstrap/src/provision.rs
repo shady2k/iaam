@@ -7,7 +7,9 @@
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_store::SqliteStore;
-use iaam_store::broker_access::{BrokerAccessCiphertext, NewBrokerAccess, SoleOwner};
+use iaam_store::broker_access::{
+    BrokerAccessCiphertext, BrokerCredentialWrite, NewBrokerAccess, SoleOwner,
+};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::documents::BrokerCode;
 use thiserror::Error;
@@ -118,6 +120,85 @@ pub fn replace_broker_access(
         ciphertext: sealed.ciphertext().to_vec(),
     }])?;
     Ok(access.id)
+}
+
+/// The one store write of one `iaam broker connect`: the credential — first
+/// or replaced — and the enabling of the stored egress switch, committed as
+/// a single transaction in the store.
+///
+/// The broker has already accepted the token when this runs; a refusal
+/// never reaches here. What must not happen afterwards is a half commit: a
+/// credential stored beside a switch that is still off would make a retry
+/// a refusal "already exists", and would leave a replaced credential lost
+/// if the enabling alone failed. `broker access add` and `broker access
+/// rotate` keep [`add_broker_access`] and [`replace_broker_access`], whose
+/// single credential write leaves the switch as the owner left it.
+pub fn store_credential_and_enable_egress(
+    store: &mut SqliteStore,
+    key: &Key,
+    broker: &str,
+    environment: Environment,
+    token: &str,
+    replace: bool,
+) -> Result<Uuid, ProvisionError> {
+    let broker = BrokerCode::parse(broker).ok_or(ProvisionError::BrokerNotNamed)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(ProvisionError::TokenEmpty);
+    }
+    let owner = match store.sole_token_owner()? {
+        SoleOwner::Single(owner) => owner,
+        SoleOwner::None => return Err(ProvisionError::NoOwner),
+        SoleOwner::Several => return Err(ProvisionError::SeveralOwners),
+    };
+    if replace {
+        let access = store
+            .find_broker_access(owner, &broker, environment.code())?
+            .ok_or(ProvisionError::AccessNotFound)?;
+        let sealed = seal(key, token);
+        let id = access.id;
+        store.store_broker_credential_and_enable_egress(BrokerCredentialWrite::Replace(
+            BrokerAccessCiphertext {
+                id,
+                nonce: sealed.nonce().to_vec(),
+                ciphertext: sealed.ciphertext().to_vec(),
+            },
+        ))?;
+        Ok(id)
+    } else {
+        let (dictionary, seed) = iaam_broker::operation_kind::seed_for(broker.as_str())
+            .ok_or_else(|| ProvisionError::UnknownDictionary {
+                broker: broker.as_str().to_owned(),
+            })?;
+        let entries: Vec<BrokerOperationKind> = seed
+            .iter()
+            .map(|(source_kind, kind)| BrokerOperationKind {
+                source_kind: (*source_kind).to_owned(),
+                kind: (*kind).to_owned(),
+            })
+            .collect();
+        let sealed = seal(key, token);
+        let access = NewBrokerAccess {
+            id: Uuid::new_v4(),
+            owner,
+            broker,
+            // The environment is named at provisioning: tokens differ by
+            // environment, and no choice can be made for the user.
+            environment: environment.code().to_owned(),
+            // The permission scope is set here rather than accepted from the
+            // outside: trading permissions are never requested (§14).
+            scope: BrokerScope::ReadOnly.code().to_owned(),
+            nonce: sealed.nonce().to_vec(),
+            ciphertext: sealed.ciphertext().to_vec(),
+        };
+        let id = access.id;
+        store.store_broker_credential_and_enable_egress(BrokerCredentialWrite::Insert {
+            access,
+            dictionary: dictionary.to_owned(),
+            entries,
+        })?;
+        Ok(id)
+    }
 }
 
 /// Re-encrypt the entire access history in one storage transaction.

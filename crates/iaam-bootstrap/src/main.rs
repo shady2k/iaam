@@ -253,8 +253,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// nobody else, so a container that names no key place cannot stand
 /// between the owner and `claim`, `status`, the token commands or the
 /// bundle commands. `status` and `broker key generate` need the places
-/// alone, while the commands that open the instance's database resolve the
-/// whole configuration. No arm creates anything by accident: creation
+/// alone; so are `broker off` and `broker key rotate`, whose two keys are
+/// its own arguments. The commands that read the key — `serve`, `broker
+/// connect` and the access commands — resolve the whole configuration. No arm creates anything by accident: creation
 /// belongs to `claim` (the database, with its directory) and to `broker
 /// key generate` (the key, with its directory). Every command that finds
 /// no database refuses, naming the place it looked at, having created no
@@ -338,8 +339,8 @@ where
                     command: BrokerKeyCommand::Rotate { old, new },
                 },
         } => {
-            let config = Config::from_lookup(&get)?;
-            let mut store = open_database(&config.database)?;
+            let places = Places::from_lookup(&get)?;
+            let mut store = open_database(&places.database)?;
             let old_key = read_broker_key(&old).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -458,8 +459,8 @@ where
         Command::Broker {
             command: BrokerCommand::Off,
         } => {
-            let config = Config::from_lookup(&get)?;
-            let mut store = open_database(&config.database)?;
+            let places = Places::from_lookup(&get)?;
+            let mut store = open_database(&places.database)?;
             store.set_broker_egress_enabled(false)?;
             println!(
                 "broker requests are off: `serve` will not send them; \
@@ -721,7 +722,7 @@ async fn shutdown() {
 mod tests {
     use super::{
         BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, BrokerKeyCommand, BundleCommand,
-        Cli, Command, Config, Places, SqliteAdapter, TokenCommand, claim_owner, execute,
+        Cli, Command, Config, Key, Places, SqliteAdapter, TokenCommand, claim_owner, execute,
         format_error_chain, legacy_replacement, read_broker_key, serve, status_report,
     };
     use crate::token::TokenScopeArg;
@@ -1333,6 +1334,65 @@ mod tests {
         assert!(report.contains("broker requests: off"), "{report}");
         assert!(report.contains("connected brokers: none"), "{report}");
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A no-`HOME` deployment names only `IAAM_DATABASE`. `broker off` and
+    /// `broker key rotate` use the database alone — the rotate's two keys
+    /// are its own arguments — so the key place is nobody's question here,
+    /// and neither command may refuse for a key place it never reads.
+    #[tokio::test]
+    async fn broker_off_and_key_rotate_need_no_key_place() {
+        let database = std::env::temp_dir().join(format!(
+            "iaam-bootstrap-off-no-key-place-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let values = [("IAAM_DATABASE", database.to_str().unwrap())];
+        let lookup = lookup_with(&values);
+        execute(
+            Command::Claim {
+                label: Some("Main".to_owned()),
+            },
+            lookup,
+        )
+        .await
+        .expect("claim creates the instance");
+
+        execute(
+            Command::Broker {
+                command: BrokerCommand::Off,
+            },
+            lookup_with(&[("IAAM_DATABASE", database.to_str().unwrap())]),
+        )
+        .await
+        .expect("broker off needs only the database place");
+
+        let directory = std::env::temp_dir().join(format!(
+            "iaam-bootstrap-rotate-keys-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let old = directory.join("old.key");
+        let new = directory.join("new.key");
+        Key::create_at(&old).unwrap();
+        Key::create_at(&new).unwrap();
+        execute(
+            Command::Broker {
+                command: BrokerCommand::Key {
+                    command: BrokerKeyCommand::Rotate {
+                        old: old.clone(),
+                        new: new.clone(),
+                    },
+                },
+            },
+            lookup_with(&[("IAAM_DATABASE", database.to_str().unwrap())]),
+        )
+        .await
+        .expect("rotate needs only the database place and its two key files");
+
+        let store = iaam_store::SqliteStore::open_existing(&database).unwrap();
+        assert!(!store.broker_egress().unwrap().enabled, "the switch is off");
+        std::fs::remove_file(&database).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     /// The documented container invocation: an explicit database and no

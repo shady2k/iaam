@@ -267,12 +267,12 @@ where
         Command::Serve => serve(Config::from_lookup(&get)?).await,
         Command::Status => {
             let places = Places::from_lookup(&get)?;
-            // The stored switch and the connected brokers read only when
-            // there is a database to read: `status` stays safe to run before
-            // anything exists, and an instance without a database has no
-            // broker word stored anywhere — the effective answer is off.
-            let broker_lines = crate::connect::broker_status_lines(&places.database);
-            print!("{}", status_report(&places, broker_lines?.as_deref()));
+            // The standing reads the place, then the database through the
+            // one non-creating open: `status` stays safe to run before
+            // anything exists, and an unreachable database is named with
+            // its cause instead of being read as absence.
+            let standing = crate::connect::database_standing(&places.database);
+            print!("{}", status_report(&places, &standing));
             Ok(())
         }
         Command::Broker {
@@ -633,12 +633,14 @@ fn broker_key_for_serve(place: &Place) -> Result<Option<Key>, Box<dyn std::error
 
 /// The report `iaam status` prints: where the instance's database and
 /// broker key live, whether each file is there, who chose the place, and —
-/// when the database exists — the stored broker word: whether broker
+/// when the database opened — the stored broker word: whether broker
 /// requests are on and which brokers are connected, names and environments
 /// only. No secret is read at all — this command exists to be safe to run
 /// before anything exists. A place counts as present only when a regular
-/// file is there: a directory in its way is reported as absent.
-fn status_report(places: &Places, broker_lines: Option<&str>) -> String {
+/// file is there: a directory in its way is reported as absent, and a file
+/// that cannot be read is reported as unreachable with its cause, never as
+/// absent.
+fn status_report(places: &Places, database: &crate::connect::DatabaseStanding) -> String {
     // A key place that does not exist is not an error for `status`: the
     // command still answers for the database, and the reason is the answer
     // for the key.
@@ -651,17 +653,25 @@ fn status_report(places: &Places, broker_lines: Option<&str>) -> String {
         ),
         Err(reason) => format!("broker key: {reason}"),
     };
+    let (database_word, broker_lines) = match database {
+        crate::connect::DatabaseStanding::Absent => (
+            "absent".to_owned(),
+            "broker requests: off (no database yet, so nothing is stored anywhere)\n".to_owned(),
+        ),
+        crate::connect::DatabaseStanding::Unreachable { cause } => (
+            format!("unreachable: {cause}"),
+            format!("broker requests: off (unreachable: {cause})\n"),
+        ),
+        crate::connect::DatabaseStanding::Read { broker_lines } => {
+            ("present".to_owned(), broker_lines.clone())
+        }
+    };
     let mut report = format!(
-        "database: {} ({}; {})\n{broker_key}\n",
+        "database: {} ({}; {database_word})\n{broker_key}\n",
         places.database.path.display(),
         place_source_text(places.database.source, "IAAM_DATABASE"),
-        existence_text(places.database.path.is_file()),
     );
-    match broker_lines {
-        Some(lines) => report.push_str(lines),
-        None => report
-            .push_str("broker requests: off (no database yet, so nothing is stored anywhere)\n"),
-    }
+    report.push_str(&broker_lines);
     report
 }
 
@@ -1242,10 +1252,38 @@ mod tests {
         std::fs::create_dir_all(home.join(".local/share/iaam/iaam.db")).unwrap();
         std::fs::create_dir_all(home.join(".config/iaam/broker-key")).unwrap();
 
-        let report = status_report(&places_with(&[("HOME", home.to_str().unwrap())]), None);
+        let places = places_with(&[("HOME", home.to_str().unwrap())]);
+        let standing = crate::connect::database_standing(&places.database);
+        let report = status_report(&places, &standing);
 
         assert!(!report.contains("present"), "{report}");
         assert_eq!(report.matches("(default; absent)").count(), 2, "{report}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn status_reports_an_unreachable_database_with_its_cause() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home("status-unreachable");
+        std::fs::create_dir_all(home.join(".local/share/iaam")).unwrap();
+        std::fs::write(home.join(".local/share/iaam/iaam.db"), b"not a database").unwrap();
+
+        let places = places_with(&[("HOME", home.to_str().unwrap())]);
+        // The directory is made unreadable after the places are resolved:
+        // the file is there, but nothing about it can be examined. The old
+        // is-file check read this as absence.
+        let directory = home.join(".local/share/iaam");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let standing = crate::connect::database_standing(&places.database);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let report = status_report(&places, &standing);
+
+        assert!(report.contains("(default; unreachable: "), "{report}");
+        assert!(report.contains("Permission denied"), "{report}");
+        assert!(
+            report.contains("broker requests: off (unreachable: "),
+            "{report}"
+        );
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -1254,8 +1292,9 @@ mod tests {
         let home = temp_home("status");
         let database = home.join(".local/share/iaam/iaam.db");
         let key = home.join(".config/iaam/broker-key");
-
-        let report = status_report(&places_with(&[("HOME", home.to_str().unwrap())]), None);
+        let places = places_with(&[("HOME", home.to_str().unwrap())]);
+        let standing = crate::connect::database_standing(&places.database);
+        let report = status_report(&places, &standing);
         assert!(
             report.contains(database.display().to_string().as_str()),
             "{report}"
@@ -1276,14 +1315,23 @@ mod tests {
         )
         .await
         .unwrap();
+        let standing = crate::connect::database_standing(
+            &places_with(&[
+                ("HOME", home.to_str().unwrap()),
+                ("IAAM_DATABASE", database.to_str().unwrap()),
+            ])
+            .database,
+        );
         let report = status_report(
             &places_with(&[
                 ("HOME", home.to_str().unwrap()),
                 ("IAAM_DATABASE", database.to_str().unwrap()),
             ]),
-            None,
+            &standing,
         );
         assert!(report.contains("(IAAM_DATABASE; present)"), "{report}");
+        assert!(report.contains("broker requests: off"), "{report}");
+        assert!(report.contains("connected brokers: none"), "{report}");
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -1347,7 +1395,8 @@ mod tests {
     #[test]
     fn status_says_why_the_key_has_no_place() {
         let places = places_with(&[("IAAM_DATABASE", "/var/lib/iaam/iaam.db")]);
-        let report = status_report(&places, None);
+        let standing = crate::connect::database_standing(&places.database);
+        let report = status_report(&places, &standing);
 
         assert!(
             report.contains("database: /var/lib/iaam/iaam.db (IAAM_DATABASE; absent)"),

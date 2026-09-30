@@ -27,8 +27,10 @@ an empty or relative `HOME`. An override variable (`IAAM_DATABASE`,
 `IAAM_BROKER_KEY_FILE`) set to an empty value is refused, not treated as
 unset: a setting that was silently ignored looks exactly like one that was
 never read. The key place is asked for only by the commands that need the
-key (`iaam broker key …`, `iaam broker access …`, `iaam serve`), so `iaam
-claim` and `iaam status` work where only the database is named — `iaam
+key (`iaam broker key generate`, `iaam broker access …`, `iaam broker
+connect`, `iaam serve`), so `iaam claim`, `iaam status`, the token
+commands, `iaam broker off` and `iaam broker key rotate` (whose two keys
+are its own arguments) work where only the database is named. `iaam
 status` reports the key place and, when it has no place at all, says why
 instead of failing.
 
@@ -49,7 +51,7 @@ and it has two roles.
 | Role | Command | Run by |
 |---|---|---|
 | HTTP service | `iaam serve` | a service manager, unattended |
-| local administration | `iaam status`, `iaam claim`, `iaam token issue`, `iaam broker key …`, `iaam broker access …`, `iaam bundle export`, `iaam bundle import` | the owner, at a console |
+| local administration | `iaam status`, `iaam claim`, `iaam token issue`, `iaam token list`, `iaam token revoke`, `iaam broker key …`, `iaam broker access …`, `iaam broker connect`, `iaam broker off`, `iaam bundle export`, `iaam bundle import` | the owner, at a console |
 
 The second role is not a convenience wrapper. Under
 [ADR-0003](decisions/0003-the-owner-speaks-to-an-agent-and-a-cli-keeps-the-secrets.md)
@@ -254,13 +256,17 @@ rather than create:
 $ iaam status
 database: /home/dev/.local/share/iaam/iaam.db (default; absent)
 broker key: /home/dev/.config/iaam/broker-key (default; absent)
+broker requests: off (no database yet, so nothing is stored anywhere)
 $ iaam token issue owner
 error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim`, no other command creates one
 $ iaam claim --label console
 1f0c…  (64 hexadecimal characters, on one line)
+shown only now: put it in the owner's password manager or the agent's configuration; it cannot be shown again
 $ iaam status
 database: /home/dev/.local/share/iaam/iaam.db (default; present)
 broker key: /home/dev/.config/iaam/broker-key (default; absent)
+broker requests: off
+connected brokers: none
 ```
 
 `IAAM_DATABASE` and `IAAM_BROKER_KEY_FILE` still override the places when a
@@ -783,6 +789,8 @@ its anatomy, one step at a time: the key, the service's view of the key, the
 stored credential, its replacement, the key's rotation, and how the key is
 delivered in production.
 
+### 6.1 Generate the encryption key
+
 Container route:
 
 ```console
@@ -1009,10 +1017,15 @@ $ iaam broker off
 broker requests are off: `serve` will not send them; `iaam broker connect <broker>` turns them on again, and IAAM_BROKER_EGRESS=on still forces them on for developer tools.
 $ iaam status
 database: /home/dev/.local/share/iaam/iaam.db (default; present)
-broker key: /home/dev/.config/iaam/broker-key (default; absent)
+broker key: /home/dev/.config/iaam/broker-key (default; present)
 broker requests: off
 connected brokers: none
 ```
+
+The key line reads `present` because the refused connect had already
+created it — the command creates the key when there is none, before it
+asks for the token. The stored switch and the connected brokers still say
+what the database holds: nothing was stored, nothing was turned on.
 
 The broker's own refusals are the command's contract, and they are the lines
 **not run** here, for the same reason:

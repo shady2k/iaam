@@ -519,28 +519,57 @@ fn read_line(stdin: &std::io::Stdin) -> Result<Zeroizing<String>, std::io::Error
     Ok(Zeroizing::new(trimmed))
 }
 
-/// The broker lines of `iaam status`: whether the stored switch is on and
-/// which brokers are connected, read from the instance's database.
+/// What `status` learns about the instance's database at its place.
+#[derive(Debug)]
+pub(crate) enum DatabaseStanding {
+    /// No database at the place: no instance, so no stored word anywhere.
+    Absent,
+    /// A database file is there, but the instance cannot be read from it.
+    Unreachable { cause: String },
+    /// The database opened, and this is its broker word.
+    Read { broker_lines: String },
+}
+
+/// Examines the database's place, then opens it through the one
+/// non-creating open every command shares.
 ///
-/// `Ok(None)` when the database does not exist yet: there is no instance, so
-/// no stored word and no connected broker anywhere — `status` stays safe to
-/// run before anything exists. A database that exists but cannot be read is
-/// an error, never a silent "off".
-///
-/// # Errors
-/// The database could not be opened or read.
-pub fn broker_status_lines(database: &Place) -> Result<Option<String>, iaam_store::StoreError> {
-    if !database.path.is_file() {
-        return Ok(None);
+/// `std::fs::metadata` decides absence before anything is opened, so a
+/// permission error is never read as absence (`NotFound` and a non-file
+/// are absence; every other look is unreachable with its cause), and the
+/// open is `instance::open_database` — a database removed between the look
+/// and the open cannot be re-created here, because `status` holds no
+/// creating open at all.
+pub(crate) fn database_standing(database: &Place) -> DatabaseStanding {
+    match std::fs::metadata(&database.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DatabaseStanding::Absent,
+        Err(cause) => DatabaseStanding::Unreachable {
+            cause: cause.to_string(),
+        },
+        Ok(metadata) if !metadata.is_file() => DatabaseStanding::Absent,
+        Ok(_) => match crate::instance::open_database(database) {
+            Ok(store) => match read_broker_lines(&store) {
+                Ok(broker_lines) => DatabaseStanding::Read { broker_lines },
+                Err(error) => DatabaseStanding::Unreachable {
+                    cause: error.to_string(),
+                },
+            },
+            Err(error) => DatabaseStanding::Unreachable {
+                cause: error.to_string(),
+            },
+        },
     }
-    let store = SqliteStore::open(&database.path)?;
+}
+
+/// The broker lines of an opened database: whether the stored switch is on
+/// and which brokers are connected.
+fn read_broker_lines(store: &SqliteStore) -> Result<String, iaam_store::StoreError> {
     let setting = store.broker_egress()?;
     let connected = store
         .active_broker_environments()?
         .into_iter()
         .map(|(broker, environment)| format!("{broker} ({environment})"))
         .collect::<Vec<_>>();
-    Ok(Some(format!(
+    Ok(format!(
         "broker requests: {}\nconnected brokers: {}\n",
         if setting.enabled { "on" } else { "off" },
         if connected.is_empty() {
@@ -548,7 +577,7 @@ pub fn broker_status_lines(database: &Place) -> Result<Option<String>, iaam_stor
         } else {
             connected.join(", ")
         }
-    )))
+    ))
 }
 
 #[cfg(test)]
@@ -982,27 +1011,85 @@ mod tests {
     }
 
     #[test]
-    fn status_lines_read_the_database_and_absent_database_reads_none() {
-        let mut instance = Instance::new("status");
+    fn an_absent_or_non_file_database_stands_as_absent() {
+        let instance = Instance::new("status-absent");
+        let absent = crate::config::Place {
+            path: instance.root.join("absent.db"),
+            source: crate::config::PlaceSource::Default,
+        };
+        assert!(
+            matches!(database_standing(&absent), DatabaseStanding::Absent),
+            "no database, no stored word"
+        );
+
+        std::fs::create_dir_all(instance.root.join("directory.db")).unwrap();
+        let directory = crate::config::Place {
+            path: instance.root.join("directory.db"),
+            source: crate::config::PlaceSource::Default,
+        };
+        assert!(
+            matches!(database_standing(&directory), DatabaseStanding::Absent),
+            "a directory in the database's place is absent, not unreachable"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_database_names_its_cause_instead_of_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let instance = Instance::new("status-unreachable");
         let database = crate::config::Place {
             path: instance.database.clone(),
             source: crate::config::PlaceSource::Default,
         };
-        assert!(
-            broker_status_lines(&crate::config::Place {
-                path: instance.root.join("absent.db"),
-                source: crate::config::PlaceSource::Default,
-            })
-            .expect("absent reads")
-            .is_none(),
-            "no database, no stored word"
-        );
+        // The directory is made unreadable: the file is there, but nothing
+        // about it can be examined — exactly the case the old is-file check
+        // read as absence.
+        let parent = instance.database.parent().unwrap().to_owned();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let standing = database_standing(&database);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let lines = broker_status_lines(&database)
-            .expect("the lines read")
-            .expect("a database gives lines");
-        assert!(lines.contains("broker requests: off"), "{lines}");
-        assert!(lines.contains("connected brokers: none"), "{lines}");
+        match &standing {
+            DatabaseStanding::Unreachable { cause } => {
+                assert!(cause.contains("Permission denied"), "{cause}");
+            }
+            other => panic!("an unreachable database is not absent: {other:?}"),
+        }
+
+        // An examinable but unreadable file is unreachable too: the cause
+        // is the open's refusal, still not absence.
+        std::fs::set_permissions(&instance.database, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let standing = database_standing(&database);
+        std::fs::set_permissions(&instance.database, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        match &standing {
+            DatabaseStanding::Unreachable { cause } => {
+                assert!(cause.contains("cannot open the database"), "{cause}");
+            }
+            other => panic!("an unreadable database is not absent: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_database_reports_the_switch_and_the_connected_brokers() {
+        let mut instance = Instance::new("status-read");
+        let database = crate::config::Place {
+            path: instance.database.clone(),
+            source: crate::config::PlaceSource::Default,
+        };
+        let standing = database_standing(&database);
+        let DatabaseStanding::Read { broker_lines } = standing else {
+            panic!("a claimed database reads: {standing:?}");
+        };
+        assert!(
+            broker_lines.contains("broker requests: off"),
+            "{broker_lines}"
+        );
+        assert!(
+            broker_lines.contains("connected brokers: none"),
+            "{broker_lines}"
+        );
 
         let key = instance.key();
         let broker = broker_answering(vec![body(200, &accounts_reply(1))], &instance);
@@ -1016,13 +1103,17 @@ mod tests {
         ))
         .expect("the connection succeeds");
 
-        let lines = broker_status_lines(&database)
-            .expect("the lines read")
-            .expect("a database gives lines");
-        assert!(lines.contains("broker requests: on"), "{lines}");
+        let standing = database_standing(&database);
+        let DatabaseStanding::Read { broker_lines } = standing else {
+            panic!("a connected database reads");
+        };
         assert!(
-            lines.contains("connected brokers: tinkoff (prod)"),
-            "{lines}"
+            broker_lines.contains("broker requests: on"),
+            "{broker_lines}"
+        );
+        assert!(
+            broker_lines.contains("connected brokers: tinkoff (prod)"),
+            "{broker_lines}"
         );
     }
 }

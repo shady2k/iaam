@@ -216,8 +216,8 @@ open breakers are still lost on restart.
 | Variable | Kind | Default | Read by |
 |---|---|---|---|
 | `IAAM_DATABASE` | path to the database | `$XDG_DATA_HOME/iaam/iaam.db`, else `$HOME/.local/share/iaam/iaam.db` | every command, including `serve` |
-| `IAAM_BROKER_KEY_FILE` | path to a secret | `$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key` | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
-| `IAAM_BROKER_EGRESS` | `off` or `on` | `off` | `serve`, broker examples, ignored live sandbox test |
+| `IAAM_BROKER_KEY_FILE` | path to a secret | `$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key` | `broker key generate`, `broker connect`, `broker access add`, `broker access rotate`; optional for `serve` |
+| `IAAM_BROKER_EGRESS` | `off` or `on` | the instance's stored switch (§6.8): on after `iaam broker connect`, off otherwise; `off` here still forces broker requests off | `serve` reads it over the stored switch; developer tools may set `on` |
 | the egress directory | directory beside the database (`<database>.egress`), created by the process when missing | derived from `IAAM_DATABASE` — no variable and no override | `serve`, broker examples, ignored live sandbox test |
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
 | `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
@@ -268,15 +268,34 @@ different call.
 `GET /v1/broker-access` is not one of them: it lists metadata, decrypts nothing,
 and answers `200` with or without the key (§6.2).
 
-`IAAM_BROKER_EGRESS` is a fail-closed deployment switch. Unset and `off` both
-refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
-or network is touched. `on` derives the tally directory from the instance's
-database (§2.1, `IAAM_DATABASE`); there is no separate path override, so one
-instance cannot be given a second tally.
+The instance's broker requests are governed by **a stored switch**
+(migration `0008`, read with `iaam status`). `iaam broker connect` turns it
+on as part of connecting; `iaam broker off` turns it off. `serve` reads the
+stored switch at start. The `IAAM_BROKER_EGRESS` variable still overrides it:
+`off` forces a deployment that must not call a broker to stay silent, and
+`on` stays accepted as an override for developer tools. Unset, the stored
+word stands; an invalid value is refused, as before.
+
+Broker requests still refuse — before the tally or the network is touched —
+whenever the effective switch is off, and the tally directory is still
+derived from the instance's database (§2.1, `IAAM_DATABASE`); there is no
+separate path override, so one instance cannot be given a second tally.
 
 No preparation step exists: when the directory or the two fresh tally records
 are missing, the process creates them (mode 0700 on the directory) beside the
 database before opening them.
+
+**The first enabling mints a fresh zero tally.** On the instance's first
+`broker connect` — while the database records no first enabling — iaam
+writes the pair beside the database not as the empty pair below but as a
+fresh zero pair: current format, current boot, matched generation, no
+recorded attempt anywhere. Every ceiling still holds and nothing is spent,
+so the connect command's one checking call goes out at once instead of
+sitting out the conservative day. The database records that first enabling,
+and from then on the rule below applies exactly as before: a deleted or
+emptied egress directory restores nothing, because the database vouches only
+for the pair it watched being minted. Deleting the directory after the first
+enabling spends the day, exactly as emptying it always did.
 
 Every iaam process of one instance must reach the same database — and thereby
 the same egress directory — and run as an OS user able to read, write and sync
@@ -288,7 +307,8 @@ different machines do not share this coordination. Network filesystems and
 cross-machine tally sharing are outside the proof.
 
 A pair of empty records — including the fresh pair the process itself creates
-when the place is missing — is accepted only
+when the place is missing, and **excepting only the fresh zero pair the first
+enabling itself writes (above)** — is accepted only
 as a conservative recovery state: on first use iaam records 1,000 attempts at
 the current time for **each** broker endpoint, so every broker endpoint remains
 at its rolling-day ceiling for 24 hours. This is deliberate; an empty pair
@@ -745,7 +765,10 @@ A broker token grants access to a real account, so the database holds only
 ciphertext and the key lives outside the database. `serve` reads the key; only
 the console writes credentials.
 
-### 6.1 Create the key
+§6.8 is the one command the owner runs to connect a broker. The rest of §6 is
+its anatomy, one step at a time: the key, the service's view of the key, the
+stored credential, its replacement, the key's rotation, and how the key is
+delivered in production.
 
 Container route:
 
@@ -928,6 +951,79 @@ without a human will decrypt for whoever owns it. The only way to exclude it is
 to derive the key from a passphrase entered at every start, which costs
 unattended restarts and does not exist here. The damage is bounded by
 construction instead: the token has no trading rights.
+
+### 6.8 Connect a broker with one command
+
+`iaam broker connect` is the one command the owner remembers. It finds the
+instance by the default places, creates the encryption key when there is
+none, asks for the token on the terminal without echoing it, makes **one**
+read-only call through the gateway to check it — the same tally and ceilings
+as every broker request, with the fresh zero pair of §2.1 minted first on the
+instance's first enabling — and only after the broker answered does it store
+the credential (the §6.4 path) and turn the stored switch on. Finam has only
+production; T-Invest takes `--sandbox` for its sandbox:
+
+```console
+$ iaam broker connect finam
+paste the finam token for the prod environment and press Enter (it stays hidden):
+Finam connected: the token sees 2 accounts. Broker requests are on; turn them off with `iaam broker off`.
+```
+
+That success line is **described, not run**: running it calls the real
+broker, and no real broker is called for this document. The number is the
+count of accounts the token sees at the broker, read from the check call's
+own answer.
+
+Until the instance exists, the command refuses exactly as every command
+does, and creates nothing:
+
+```console
+$ iaam broker connect finam
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim --label <label>`, no other command creates one
+$ iaam broker off
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim --label <label>`, no other command creates one
+```
+
+After `iaam claim`, an empty paste is refused before anything is sent, and
+`iaam status` carries the broker lines — whether requests are on and which
+brokers are connected, names and environments only, never secrets:
+
+```console
+$ iaam broker connect finam
+paste the finam token for the prod environment and press Enter (it stays hidden):
+error: the token is empty: paste the token from the broker's own token page and press Enter
+$ iaam broker off
+broker requests are off: `serve` will not send them; `iaam broker connect <broker>` turns them on again, and IAAM_BROKER_EGRESS=on still forces them on for developer tools.
+$ iaam status
+database: /home/dev/.local/share/iaam/iaam.db (default; present)
+broker key: /home/dev/.config/iaam/broker-key (default; absent)
+broker requests: off
+connected brokers: none
+```
+
+The broker's own refusals are the command's contract, and they are the lines
+**not run** here, for the same reason:
+
+- the broker refuses the token (a 401 or 403, or the broker's own token
+  error): `Finam refused the token. Nothing was stored and the switch is as
+  it was: check the token for this environment and run `iaam broker connect
+  finam` again.` — the token is never named and never printed;
+- the broker is paused or closed: the line names when the endpoint reopens
+  and nothing is stored;
+- the network is unreachable: the line says how many attempts were made and
+  nothing is stored.
+
+An active credential for the same broker and environment refuses the command
+until `--replace` is passed; `--replace` runs the same check and then
+replaces the credential in place (§6.4), so a bad new token cannot destroy a
+working one.
+
+The check goes out through the process's one gateway, so it spends the same
+allowance as every broker request — on the instance's first enabling from
+the fresh zero pair, and afterwards from whatever the pair beside the
+database holds. Deleting or emptying that pair after the first enabling
+spends the day (§2.1); the command then refuses with the ceiling it finds,
+and nothing restores the allowance.
 
 ---
 

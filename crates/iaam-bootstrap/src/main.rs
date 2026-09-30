@@ -5,6 +5,7 @@
 
 mod bundle;
 mod config;
+mod connect;
 mod instance;
 mod provision;
 
@@ -124,6 +125,21 @@ impl From<TokenScopeArg> for Scope {
 
 #[derive(Debug, Subcommand)]
 enum BrokerCommand {
+    /// Connect a broker with one command: key, hidden token, one checking
+    /// call, stored credential, and the instance's broker requests on.
+    Connect {
+        /// The broker to connect: `finam` or `tinkoff`.
+        broker: String,
+        /// T-Invest's sandbox. Finam has only production and refuses it.
+        #[arg(long)]
+        sandbox: bool,
+        /// Replace the active credential for this broker and environment
+        /// after the same check, instead of refusing while one exists.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Turn the instance's stored broker-egress switch off.
+    Off,
     /// Manage the broker encryption key.
     Key {
         #[command(subcommand)]
@@ -273,7 +289,12 @@ where
         Command::Serve => serve(Config::from_lookup(&get)?).await,
         Command::Status => {
             let places = Places::from_lookup(&get)?;
-            print!("{}", status_report(&places));
+            // The stored switch and the connected brokers read only when
+            // there is a database to read: `status` stays safe to run before
+            // anything exists, and an instance without a database has no
+            // broker word stored anywhere — the effective answer is off.
+            let broker_lines = crate::connect::broker_status_lines(&places.database);
+            print!("{}", status_report(&places, broker_lines?.as_deref()));
             Ok(())
         }
         Command::Broker {
@@ -383,6 +404,66 @@ where
             );
             Ok(())
         }
+        Command::Broker {
+            command:
+                BrokerCommand::Connect {
+                    broker,
+                    sandbox,
+                    replace,
+                },
+        } => {
+            let config = Config::from_lookup(&get)?;
+            let mut store = open_database(&config.database)?;
+            let key = crate::connect::key_for_connect(&config.broker_key)?;
+            // The owner is connecting: the check goes out under the same
+            // gateway and tally as every broker request, whether or not the
+            // stored switch was on before. On success the stored switch is
+            // turned on; on refusal it is left as it was.
+            let gateway = Arc::new(Gateway::production(
+                BrokerEgress::On,
+                &config.database.path,
+            )?);
+            let environment = if sandbox {
+                Environment::Sandbox
+            } else {
+                Environment::Prod
+            };
+            let (display, _) = crate::connect::broker_display(&broker, environment).ok_or_else(
+                || -> Box<dyn std::error::Error> {
+                    crate::connect::ConnectError::UnsupportedBroker {
+                        broker: broker.clone(),
+                    }
+                    .into()
+                },
+            )?;
+            let token = crate::connect::read_token_hidden(display, environment)?;
+            let message = crate::connect::run(crate::connect::ConnectRun {
+                store: &mut store,
+                key: &key,
+                database: &config.database.path,
+                gateway,
+                broker: &broker,
+                environment,
+                token,
+                replace,
+            })
+            .await?;
+            println!("{message}");
+            Ok(())
+        }
+        Command::Broker {
+            command: BrokerCommand::Off,
+        } => {
+            let config = Config::from_lookup(&get)?;
+            let mut store = open_database(&config.database)?;
+            store.set_broker_egress_enabled(false)?;
+            println!(
+                "broker requests are off: `serve` will not send them; \
+                 `iaam broker connect <broker>` turns them on again, \
+                 and IAAM_BROKER_EGRESS=on still forces them on for developer tools."
+            );
+            Ok(())
+        }
         Command::Bundle {
             command: BundleCommand::Export { output },
         } => {
@@ -449,7 +530,14 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // The one gateway of the process. Each broker endpoint is owned by one
     // process for this gateway's lifetime; boot-clock budgets, spacing and the
     // rolling 24-hour ceiling persist in the configured outbound tally.
-    let broker_egress = BrokerEgress::from_env()?;
+    // The switch is the instance's stored word (migration 0008): a successful
+    // `broker connect` turned it on and `broker off` turns it off. The
+    // environment variable still overrides it: `off` forces a deployment that
+    // must not call a broker, `on` serves developer tools.
+    let broker_egress = BrokerEgress::resolve(
+        |name| std::env::var_os(name),
+        store.broker_egress()?.enabled,
+    )?;
     let gateway = Arc::new(Gateway::production(broker_egress, &config.database.path)?);
     let http = Arc::new(HttpOutbound::new(gateway.clone()));
 
@@ -540,11 +628,13 @@ fn broker_key_for_serve(place: &Place) -> Result<Option<Key>, Box<dyn std::error
 }
 
 /// The report `iaam status` prints: where the instance's database and
-/// broker key live, whether each file is there, and who chose the place.
-/// Nothing is read from inside the database and no secret is read at all —
-/// this command exists to be safe to run before anything exists.
-fn status_report(places: &Places) -> String {
-    format!(
+/// broker key live, whether each file is there, who chose the place, and —
+/// when the database exists — the stored broker word: whether broker
+/// requests are on and which brokers are connected, names and environments
+/// only. No secret is read at all — this command exists to be safe to run
+/// before anything exists.
+fn status_report(places: &Places, broker_lines: Option<&str>) -> String {
+    let mut report = format!(
         "database: {} ({}; {})\nbroker key: {} ({}; {})\n",
         places.database.path.display(),
         place_source_text(places.database.source, "IAAM_DATABASE"),
@@ -552,7 +642,13 @@ fn status_report(places: &Places) -> String {
         places.broker_key.path.display(),
         place_source_text(places.broker_key.source, "IAAM_BROKER_KEY_FILE"),
         existence_text(places.broker_key.path.exists()),
-    )
+    );
+    match broker_lines {
+        Some(lines) => report.push_str(lines),
+        None => report
+            .push_str("broker requests: off (no database yet, so nothing is stored anywhere)\n"),
+    }
+    report
 }
 
 /// `iaam broker key generate`: writes the key at the resolved place, but
@@ -1145,7 +1241,7 @@ mod tests {
         let database = home.join(".local/share/iaam/iaam.db");
         let key = home.join(".config/iaam/broker-key");
 
-        let report = status_report(&places_with(&[("HOME", home.to_str().unwrap())]));
+        let report = status_report(&places_with(&[("HOME", home.to_str().unwrap())]), None);
         assert!(
             report.contains(database.display().to_string().as_str()),
             "{report}"
@@ -1166,10 +1262,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let report = status_report(&places_with(&[
-            ("HOME", home.to_str().unwrap()),
-            ("IAAM_DATABASE", database.to_str().unwrap()),
-        ]));
+        let report = status_report(
+            &places_with(&[
+                ("HOME", home.to_str().unwrap()),
+                ("IAAM_DATABASE", database.to_str().unwrap()),
+            ]),
+            None,
+        );
         assert!(report.contains("(IAAM_DATABASE; present)"), "{report}");
         std::fs::remove_dir_all(&home).unwrap();
     }

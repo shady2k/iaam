@@ -22,6 +22,7 @@ use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::ids::{AccountId, OwnerId, SourceId};
 
 use iaam_http::gateway::{BUDGETS, Budget, Clock, MethodScope, Sleeper, Transport};
+use iaam_http::initialize_fresh_tally;
 use iaam_http::test_support::{HttpClientHarness, LoopbackReply, LoopbackServer};
 use iaam_http::{
     BrokerEgress, Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse,
@@ -984,7 +985,7 @@ impl Scenario {
                 .push(SendRecord {
                     logical_at: observed_clock.logical_now(),
                     wire_at: Instant::now().saturating_duration_since(wire_origin),
-                    host: host.clone(),
+                    host: host.to_owned(),
                     method,
                     sync: observed_context.active_sync.load(Ordering::SeqCst),
                     call: observed_context.active_call.load(Ordering::SeqCst),
@@ -3156,4 +3157,245 @@ fn documented_budget_table_keeps_half_the_published_limits() {
             assert_eq!(*used * 2, *published);
         }
     }
+}
+
+// --- The first enabling and the tally it vouches for (iaam-h0b8i.1.2). ---
+//
+// Row (a): on a fresh instance the first enabling mints the fresh zero pair
+// beside the database, and the checking call goes out at once — no
+// conservative day, no boot wait — and stays under every ceiling.
+// Row (b): after that first enabling, a deleted or emptied pair is the
+// conservative state exactly as documented: a restarted gateway sends
+// nothing and no allowance is restored.
+//
+// Each row is shown failing against its planted breach: the at-once bound
+// refuses a planted late arrival, and a gateway over a pair the mint never
+// upgraded is refused where the row's send must arrive.
+
+/// The at-once bound of row (a): the first arrival carries no wait, so its
+/// logical time sits inside the first second of the proof.
+fn sent_at_once_bound(records: &[SendRecord]) -> Result<(), String> {
+    let Some(first) = records.first() else {
+        return Err("no arrival was recorded".to_owned());
+    };
+    if first.logical_at >= Duration::from_secs(1) {
+        return Err(format!(
+            "the first send waited {:?} past the proof's start: a fresh pair \
+             must not carry the boot wait or the conservative day",
+            first.logical_at
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_enabling_sends_at_once_and_a_deleted_tally_restores_nothing() {
+    let directory = TempDir::new("first-enabling");
+    let database = directory.0.join("iaam.sqlite");
+    std::fs::write(&database, "").expect("database file written");
+    let place = egress_directory_for(&database).expect("place derived");
+    assert!(!place.exists(), "a fresh instance has no egress place yet");
+    let clock = FakeTime::new();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed_records = Arc::clone(&records);
+    let observed_clock = Arc::clone(&clock);
+    let observed_calls = Arc::clone(&calls);
+    let wire_origin = Instant::now();
+    let host = Destination::TinkoffProd.base_url();
+    let server = LoopbackServer::start_observed(
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), 5),
+        move |target, status| {
+            let method = method_for_target(target)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("unknown:{target}"));
+            observed_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(SendRecord {
+                    logical_at: observed_clock.logical_now(),
+                    wire_at: Instant::now().saturating_duration_since(wire_origin),
+                    host: host.to_owned(),
+                    method,
+                    sync: 1,
+                    call: observed_calls.load(Ordering::SeqCst),
+                    status,
+                    pause_for: None,
+                });
+        },
+    )
+    .unwrap_or_else(|error| panic!("first-enabling loopback: {error}"));
+
+    // (a) The mint is the real first-enabling code over this proof's clock.
+    let minted = initialize_fresh_tally(&database, &*clock)
+        .unwrap_or_else(|error| panic!("the first enabling mints the fresh pair: {error}"));
+    assert!(minted, "a missing pair is minted");
+
+    let build_gateway = || {
+        Gateway::with_parts_for_database(
+            HttpClientHarness::new(&server),
+            BUDGETS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::clone(&clock) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            &database,
+        )
+        .unwrap_or_else(|error| panic!("first-enabling gateway: {error}"))
+    };
+
+    // The checking call goes out on the first gateway, with no clock advance
+    // at all before it.
+    let gateway = build_gateway();
+    let request = direct_request(
+        Destination::TinkoffProd,
+        direct_path(Destination::TinkoffProd),
+    );
+    calls.fetch_add(1, Ordering::SeqCst);
+    gateway
+        .send(&request, None)
+        .await
+        .unwrap_or_else(|error| panic!("the checking call must go out at once: {error}"));
+    assert_eq!(
+        records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1
+    );
+    sent_at_once_bound(
+        &records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+
+    // A few more sends, still under every ceiling, then the printed row.
+    for _ in 0..4 {
+        calls.fetch_add(1, Ordering::SeqCst);
+        gateway
+            .send(&request, None)
+            .await
+            .unwrap_or_else(|error| panic!("a following send failed: {error}"));
+    }
+    let taken = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let measured = measure(&taken, 0, Some(1))
+        .unwrap_or_else(|error| panic!("measure first-enabling arrivals: {error}"));
+    assert_within_ceilings("first-enabling", &measured);
+    print_row(
+        "first-enabling",
+        Destination::TinkoffProd.base_url(),
+        &measured,
+    );
+
+    // (b) The documented controlled stop: the owning process stops (the
+    // gateway drops, releasing the endpoint), then both records are emptied
+    // together. A restarted gateway finds the empty pair and refuses before
+    // transport.
+    drop(gateway);
+    std::fs::write(place.join("outbound-tally"), "").expect("tally emptied");
+    std::fs::write(place.join("outbound-tally-generation"), "").expect("generation emptied");
+    let restarted = build_gateway();
+    let refused = restarted
+        .send(&request, None)
+        .await
+        .expect_err("an emptied pair is the conservative state");
+    assert!(
+        matches!(refused, GatewayError::DailyCeiling { .. }),
+        "the emptied pair spends the day: {refused:?}"
+    );
+    assert_eq!(
+        records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        5,
+        "the refusal came before the transport"
+    );
+
+    // Deleting the directory entirely is the same conservative state: the
+    // restarted process recreates the place with the empty pair in it.
+    std::fs::remove_dir_all(&place).expect("the egress directory is deleted");
+    let restarted = build_gateway();
+    let refused = restarted
+        .send(&request, None)
+        .await
+        .expect_err("a deleted pair is the conservative state");
+    assert!(
+        matches!(refused, GatewayError::DailyCeiling { .. }),
+        "the recreated empty pair spends the day: {refused:?}"
+    );
+    assert_eq!(
+        records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        5,
+        "still no wire arrival after the deletion"
+    );
+}
+
+#[test]
+fn the_first_enabling_row_fails_against_a_planted_late_arrival() {
+    let host = Destination::TinkoffProd.base_url();
+    let on_time = vec![planted_record(
+        Duration::from_millis(40),
+        host,
+        "UsersService",
+        1,
+        1,
+    )];
+    assert!(
+        sent_at_once_bound(&on_time).is_ok(),
+        "an arrival in the first second is the row's passing shape"
+    );
+
+    let planted = vec![planted_record(
+        Duration::from_secs(75),
+        host,
+        "UsersService",
+        1,
+        1,
+    )];
+    let error =
+        sent_at_once_bound(&planted).expect_err("a planted late arrival must fail the bound");
+    assert!(error.contains("waited"), "{error}");
+}
+
+#[tokio::test]
+async fn the_first_enabling_row_fails_when_the_pair_the_mint_leaves_is_empty() {
+    // The red shape of row (a): over a pair the mint never upgraded — here
+    // the plain empty pair a gateway creates when it finds the place
+    // missing — the checking call is refused where the row needs an arrival.
+    let directory = TempDir::new("first-enabling-red");
+    let database = directory.0.join("iaam.sqlite");
+    std::fs::write(&database, "").expect("database file written");
+    let clock = FakeTime::new();
+    let server = LoopbackServer::start(std::iter::empty())
+        .unwrap_or_else(|error| panic!("red loopback: {error}"));
+    let gateway = Gateway::with_parts_for_database(
+        HttpClientHarness::new(&server),
+        BUDGETS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&clock) as Arc<dyn Sleeper>,
+        BrokerEgress::On,
+        &database,
+    )
+    .unwrap_or_else(|error| panic!("red gateway: {error}"));
+    let refused = gateway
+        .send(
+            &direct_request(
+                Destination::TinkoffProd,
+                direct_path(Destination::TinkoffProd),
+            ),
+            None,
+        )
+        .await
+        .expect_err("without the mint the conservative day refuses the first send");
+    assert!(
+        matches!(refused, GatewayError::DailyCeiling { .. }),
+        "{refused:?}"
+    );
 }

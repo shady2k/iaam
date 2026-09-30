@@ -485,9 +485,11 @@ done
 # gateway is a second allowance against the same destination and halves
 # nothing (docs/deployment.md §1.1). A merge once left two of them in
 # iaam-bootstrap. Production code — every `src` tree outside iaam-http, which
-# defines the constructors — builds a gateway exactly once, with
-# `Gateway::production()`, in `serve` of iaam-bootstrap, which shares it as
-# an `Arc`. Every constructor counts: `production`, `new` and `with_parts`,
+# defines the constructors — builds a gateway once per sending process:
+# `Gateway::production()` in `serve` of iaam-bootstrap, which shares it as
+# an `Arc`, and once more in the `broker connect` command, a one-shot
+# process of its own (iaam-h0b8i.1.2). Every constructor counts:
+# `production`, `new` and `with_parts`,
 # however the type is spelled (`Gateway::<T>::new`, `<Gateway<T>>::new`).
 # Tests, examples and live probes build their own; they are not the process.
 #
@@ -649,9 +651,19 @@ count=$(printf '%s' "$found" | { grep -oE "$GATEWAY_CONSTRUCTOR" || true; } | { 
 located=$(printf '%s' "$found" | cut -d: -f1,3)
 # Captured text is compared, never piped into `grep -q`: an early exit of
 # grep under pipefail reads as "no match" (see guard 4).
-if [ "$count" -ne 1 ] || [ "$located" != "crates/iaam-bootstrap/src/main.rs:serve" ] \
+# Two sanctioned constructions, one per sending process (iaam-h0b8i.1.2):
+# `serve`'s, and the `broker connect` check call's. The connect command is
+# its own one-shot process — it holds the endpoint-owner lock while it
+# sends, shares no in-process lane or breaker with `serve`, and its tally is
+# the same on-disk pair beside the database (docs/deployment.md §1.1, §6.8).
+# Every third construction is still refused, wherever it sits.
+serve_site='crates/iaam-bootstrap/src/main.rs:serve'
+located_sorted=$(printf '%s' "$located" | sort | paste -sd/ -)
+expected_sorted='crates/iaam-bootstrap/src/main.rs:execute/crates/iaam-bootstrap/src/main.rs:serve'
+if [ "$count" -ne 2 ] \
+    || [ "$located_sorted" != "$expected_sorted" ] \
     || [[ "$found" != *"Gateway::production("* ]]; then
-  err "production code must build a gateway exactly once, with Gateway::production() in serve of iaam-bootstrap; found $count:"
+  err "production code builds a gateway once per sending process: serve, and the broker connect check; found $count:"
   printf '%s\n' "$found" >&2
 fi
 hits=$(gateway_aliases "${production_src[@]}")

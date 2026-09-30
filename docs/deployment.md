@@ -490,14 +490,16 @@ is skipped, the next step fails with `unable to open database file`.
 ### 3.5 Claim the instance
 
 This creates the owner and prints the owner token. It happens **once** in the
-life of a database.
+life of a database. `--label` names the token for `iaam token list`; without
+it the token is named `owner`.
 
 ```console
 $ docker run --rm \
     --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
     --env IAAM_DATABASE=/var/lib/iaam/iaam.db \
-    iaam:0.1.0 claim --label console
-1f0c…  (64 hexadecimal characters, on one line)
+    iaam:0.1.0 claim
+c35d72df…  (64 hexadecimal characters, on one line)
+shown only now: put it in the owner's password manager or the agent's configuration; it cannot be shown again
 ```
 
 Record it in the operator's password manager now. Then check that the claim took
@@ -505,7 +507,7 @@ effect, by making it a second time:
 
 ```console
 $ docker run --rm --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
-    --env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam:0.1.0 claim --label console
+    --env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam:0.1.0 claim
 error: instance is already claimed
 $ echo $?
 1
@@ -608,8 +610,8 @@ iaam iaam 700
 ### 4.4 Claim the instance
 
 ```console
-$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam claim --label console
-1f0c…  (64 hexadecimal characters, on one line)
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam claim
+c35d72df…  (64 hexadecimal characters, on one line)
 ```
 
 `sudo -u iaam` is the point of the step: the command must run as the identity
@@ -939,7 +941,16 @@ from again.
 
 ### 7.1 Issue a token for an agent
 
-The owner token issues the rest over the API:
+From the console — the scope is the positional argument, `--label` is
+optional and defaults to the scope and the day (`agent 2026-09-30`):
+
+```console
+$ iaam token issue agent
+0252baae…  (64 hexadecimal characters, on one line)
+shown only now: put it in the owner's password manager or the agent's configuration; it cannot be shown again
+```
+
+Over the API, the owner token issues the rest:
 
 ```console
 $ curl -sS -X POST http://127.0.0.1:8080/v1/tokens \
@@ -972,6 +983,34 @@ between the model's context and the host's configuration.
 
 ### 7.2 List and revoke
 
+From the console: one line per token — the id, the label, the scope, when it
+was created, and `active` or `revoked <time>` — active first, then the
+revoked ones. The secret and its hash are never in the list:
+
+```console
+$ iaam token list
+e8873921-246f-4724-b457-821f481d2669  owner  owner  created 2026-09-30T08:33:53.696868051Z  active
+de87122d-718e-4c70-8395-0778dab631f3  read-only 2026-09-30  read-only  created 2026-09-30T08:33:53.780679107Z  active
+4987c35e-576f-48e9-a5fa-0841c938ca81  agent 2026-09-30  agent  created 2026-09-30T08:33:53.751428155Z  revoked 2026-09-30T08:33:53.835333474Z
+
+$ iaam token revoke "agent 2026-09-30"
+revoked: agent 2026-09-30 (agent, id 4987c35e-576f-48e9-a5fa-0841c938ca81)
+```
+
+A label naming two active tokens (the default label is the scope and the
+day) is refused with their ids, and the owner revokes one by id:
+
+```console
+$ iaam token revoke "agent 2026-09-30"
+error: label "agent 2026-09-30" names 2 active tokens; revoke one by its id:
+  4cf1035d-d3fb-4800-9865-8a62de55a990  created 2026-09-30T08:34:04.545094219Z
+  796af525-d7af-4df2-9fa4-8566f6feedd9  created 2026-09-30T08:34:04.577454703Z
+$ iaam token revoke 4cf1035d-d3fb-4800-9865-8a62de55a990
+revoked: agent 2026-09-30 (agent, id 4cf1035d-d3fb-4800-9865-8a62de55a990)
+```
+
+The same two acts over the API:
+
 ```console
 $ curl -sS http://127.0.0.1:8080/v1/tokens -H "authorization: Bearer $OWNER"
 [{"id":"9520643a-…","label":"console","scope":"owner","created_at":"…","revoked_at":null}, …]
@@ -985,27 +1024,30 @@ Labels and scopes are listed; tokens and hashes are not, and cannot be — the
 hash is all an attacker would need. Revoked tokens stay in the list, because
 "when did this token stop working" is a question that needs an answer. A revoked
 token is then indistinguishable from an unknown one: both get `401`.
+Revoking from the console takes effect at once: the next request with the
+token is refused.
 
 ### 7.3 A lost owner token
 
 Recovery is by console, and only by console:
 
 ```console
-$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam token issue --label console --scope owner
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam token issue owner
 1f0c…
 ```
 
 On the container route, the `docker run` form of §3.5 with
-`token issue --label console --scope owner` in place of `claim`. The command
+`token issue owner` in place of `claim`. The command
 takes the single existing owner from the database, prints a new owner token once
-and exits without starting a server. On an empty database it refuses:
+and exits without starting a server. On a database with no owner it refuses:
 
 ```console
-error: instance has no owner: run `iaam claim --label <label>` first
+error: instance has no owner: run `iaam claim` first
 ```
 
 The lost token is **not** revoked by this: revoke it with
-`DELETE /v1/tokens/{id}`, or it keeps working.
+`iaam token revoke <label-or-id>` (or `DELETE /v1/tokens/{id}` over the
+API), or it keeps working.
 
 ---
 

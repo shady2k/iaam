@@ -984,7 +984,11 @@ read-only call through the gateway to check it — the same tally and ceilings
 as every broker request, with the fresh zero pair of §2.1 minted first on the
 instance's first enabling — and only after the broker answered does it store
 the credential (the §6.4 path) and turn the stored switch on. Finam has only
-production; T-Invest takes `--sandbox` for its sandbox:
+production; T-Invest takes `--sandbox` for its sandbox.
+
+The token comes from the broker, read-only: Finam's are created at
+<https://api.finam.ru/tokens/>.
+
 
 ```console
 $ iaam broker connect finam
@@ -992,10 +996,11 @@ paste the finam token for the prod environment and press Enter (it stays hidden)
 Finam connected: the token sees 2 accounts. Broker requests are on; turn them off with `iaam broker off`.
 ```
 
-That success line is **described, not run**: running it calls the real
-broker, and no real broker is called for this document. The number is the
-count of accounts the token sees at the broker, read from the check call's
-own answer.
+That success line is not produced for this document, because running it
+calls the real broker; its shape was confirmed by the owner's first live
+connection to Finam on 2026-09-30 (the account count above is invented). The
+number is the count of accounts the token sees at the broker, read from the
+check call's own answer.
 
 Until the instance exists, the command refuses exactly as every command
 does, and creates nothing:

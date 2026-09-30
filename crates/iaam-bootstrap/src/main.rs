@@ -661,7 +661,7 @@ fn status_report(places: &Places, database: &crate::connect::DatabaseStanding) -
         ),
         crate::connect::DatabaseStanding::Unreachable { cause } => (
             format!("unreachable: {cause}"),
-            format!("broker requests: off (unreachable: {cause})\n"),
+            format!("broker requests: unknown, the database cannot be read ({cause})\n"),
         ),
         crate::connect::DatabaseStanding::Read { broker_lines } => {
             ("present".to_owned(), broker_lines.clone())
@@ -1282,7 +1282,7 @@ mod tests {
         assert!(report.contains("(default; unreachable: "), "{report}");
         assert!(report.contains("Permission denied"), "{report}");
         assert!(
-            report.contains("broker requests: off (unreachable: "),
+            report.contains("broker requests: unknown, the database cannot be read ("),
             "{report}"
         );
         std::fs::remove_dir_all(&home).unwrap();

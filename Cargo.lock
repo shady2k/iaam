@@ -1044,6 +1044,7 @@ dependencies = [
  "iaam-http",
  "iaam-server",
  "iaam-store",
+ "rustix",
  "serde_json",
  "thiserror",
  "time",

@@ -6,6 +6,7 @@
 //! stops the executor (§3.2).
 
 pub mod broker_access;
+pub mod broker_egress;
 pub mod broker_operation_kinds;
 pub mod market;
 pub mod market_source_codes;

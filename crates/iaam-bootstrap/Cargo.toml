@@ -27,7 +27,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 # Брокерский токен живёт открытым ровно до шифрования и зануляется.
+# Брокерский токен живёт открытым ровно до шифрования и зануляется.
 zeroize = { version = "1", features = ["alloc"] }
+# The hidden token read on a terminal: one tcsetattr of the echo flag.
+rustix = { version = "1", features = ["termios", "stdio"] }
 
 [dev-dependencies]
 time = { version = "0.3", default-features = false, features = ["macros"] }

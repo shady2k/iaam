@@ -1069,6 +1069,41 @@ impl Gateway<HttpClient> {
     }
 }
 
+/// Mint the fresh zero tally of the instance's first broker enabling, beside
+/// its database.
+///
+/// The one writer is `iaam broker connect`'s first enabling: the owner said
+/// this instance talks to a broker, the pair beside the database does not
+/// exist yet (or is the empty pair a process creates when it finds the place
+/// missing), and without a fresh pair the very first checking call would sit
+/// at the conservative daily ceiling for a day. See
+/// `OutboundTally::initialize_fresh_pair` for what freshness proves. A pair
+/// that already holds anything governs: the answer is `false` and nothing is
+/// written, so running `connect` again can never restore an allowance.
+///
+/// # Errors
+/// `GatewayError::EgressPlace` when the database cannot be resolved;
+/// `GatewayError::TallyUnavailable` when the pair cannot be opened or
+/// persisted.
+pub fn initialize_fresh_tally(database: &Path, clock: &dyn Clock) -> Result<bool, GatewayError> {
+    let place = egress_directory_for(database).map_err(|error| GatewayError::EgressPlace {
+        database: database.to_owned(),
+        reason: error.to_string(),
+    })?;
+    let directory = EgressDirectory::open_or_create(&place).map_err(|error| {
+        GatewayError::TallyUnavailable {
+            path: place.join(crate::tally::TALLY_FILE),
+            reason: error.to_string(),
+        }
+    })?;
+    let tally = OutboundTally::new(directory.clone()).map_err(|error| {
+        tally_gateway_error(Destination::FinamApi, &directory.tally_path(), error)
+    })?;
+    tally
+        .initialize_fresh_pair(clock)
+        .map_err(|error| tally_gateway_error(Destination::FinamApi, &directory.tally_path(), error))
+}
+
 impl<T: Transport + 'static> Gateway<T> {
     /// A gateway with the documented budgets, system clock and tokio timer
     /// over `transport`.

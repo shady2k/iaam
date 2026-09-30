@@ -419,7 +419,7 @@ impl OutboundTally {
         Ok(())
     }
 
-    fn new(directory: EgressDirectory) -> Result<Self, TallyError> {
+    pub(crate) fn new(directory: EgressDirectory) -> Result<Self, TallyError> {
         let (file, _) =
             directory.open_child(TALLY_FILE, OFlags::RDONLY, "open the outbound tally")?;
         drop(file);
@@ -430,6 +430,75 @@ impl OutboundTally {
         )?;
         drop(generation);
         Ok(Self { directory })
+    }
+
+    /// Mint the fresh zero tally of the instance's first broker enabling.
+    ///
+    /// A missing or empty pair is the conservative recovery state: on first
+    /// use iaam records a full day of attempts for every broker endpoint, so a
+    /// lost record restores no allowance. That is right for a *lost* record —
+    /// and wrong for the instance's first `connect`, which would spend its
+    /// first day refused. The first enabling therefore writes a pair that
+    /// proves its own freshness: the current format, the current boot, a
+    /// matched generation, and no recorded attempt anywhere — every ceiling
+    /// still holds, and nothing is spent.
+    ///
+    /// The mint never overwrites a non-empty pair and answers `false` then:
+    /// whatever the pair holds governs, exactly as for `serve`. The empty-pair
+    /// check runs under the tally lock, so a concurrent decision either
+    /// happened before the mint saw an empty file or after it saw a full one.
+    ///
+    /// # Errors
+    /// The pair could not be opened, read, written or persisted; or the
+    /// generation record carries content beside an empty tally.
+    pub(crate) fn initialize_fresh_pair(&self, clock: &dyn Clock) -> Result<bool, TallyError> {
+        let (lock, lock_identity) = self.directory.open_child(
+            TALLY_LOCK_FILE,
+            OFlags::RDWR | OFlags::CREATE,
+            "open the tally lock file",
+        )?;
+        FileExt::lock_exclusive(&lock).map_err(|source| TallyError::File {
+            action: "lock the tally lock file",
+            source,
+        })?;
+        self.directory
+            .verify_child(TALLY_LOCK_FILE, lock_identity)?;
+
+        let result = (|| {
+            let (mut state, tally_identity, generation_identity) = self.read_state()?;
+            if !state.pair_was_empty {
+                return Ok(false);
+            }
+            let boot = read_boot(clock)?;
+            state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                TallyError::Corrupt("the tally generation is exhausted".to_owned())
+            })?;
+            state.boot_id = Some(boot.id().to_owned());
+            state.boot_high_water = Some(boot.elapsed().as_nanos());
+            // Every endpoint stands at zero: no send, no wait, no closure, no
+            // pause. The rows exist so the first decision on each finds its
+            // host already held at zero instead of inserting it at the
+            // boot-change wait, while a later boot change keeps the documented
+            // first-send wait.
+            for host in BROKER_HOSTS {
+                state.hosts.insert(host.to_owned(), HostState::default());
+            }
+            self.persist(&state, tally_identity, generation_identity)?;
+            self.directory
+                .0
+                .generation_high_water
+                .fetch_max(state.generation, Ordering::AcqRel);
+            Ok(true)
+        })();
+        let unlocked = FileExt::unlock(&lock).map_err(|source| TallyError::File {
+            action: "unlock the tally lock file",
+            source,
+        });
+        match (result, unlocked) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(minted), Ok(())) => Ok(minted),
+        }
     }
 
     pub(crate) fn decide_and_record(
@@ -2147,5 +2216,100 @@ mod tests {
             panic!("matching pair rollback was not refused as corrupt");
         };
         assert!(reason.contains("process generation high-water"), "{reason}");
+    }
+
+    #[test]
+    fn the_first_enabling_wrapper_mints_beside_the_database_once() {
+        let outside = TempDir::new("wrapper-mint");
+        let database = outside.0.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+        let place = crate::egress_directory_for(&database).expect("place derived");
+        assert!(!place.exists(), "a fresh instance has no egress place");
+
+        let minted = super::super::initialize_fresh_tally(
+            &database,
+            &BootTime::new("wrapper-boot", Duration::from_secs(1_000)),
+        )
+        .expect("the first enabling wrapper mints");
+        assert!(minted, "a missing pair is minted");
+        let text = std::fs::read_to_string(place.join(TALLY_FILE)).expect("the pair reads");
+        assert!(!text.is_empty(), "the pair is no longer the empty pair");
+
+        let again = super::super::initialize_fresh_tally(
+            &database,
+            &BootTime::new("wrapper-boot", Duration::from_secs(1_000)),
+        )
+        .expect("the second call still reads the pair");
+        assert!(!again, "the wrapper never overwrites a pair that governs");
+    }
+
+    #[test]
+    fn the_first_enabling_mints_a_pair_that_holds_no_attempt() {
+        let (_temporary, directory, tally) = tally("fresh-mint");
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+
+        let minted = tally
+            .initialize_fresh_pair(&clock)
+            .expect("the first enabling mints the fresh pair");
+
+        assert!(minted, "an empty pair is minted");
+        let text =
+            std::fs::read_to_string(directory.tally_path()).expect("the minted tally record reads");
+        assert!(!text.is_empty(), "the pair is no longer empty");
+        let state = State::parse(&text).expect("the minted pair parses");
+        assert_eq!(state.boot_id.as_deref(), Some("boot-1"));
+        for host in BROKER_HOSTS {
+            let held = state
+                .hosts
+                .get(host)
+                .expect("every broker endpoint is held");
+            assert!(held.daily_sends.is_empty(), "{host} holds no attempt");
+            assert!(held.last_send.is_none());
+            assert!(held.boot_wait_until.is_none());
+            assert!(held.closed_until.is_none());
+            assert!(held.paused_until.is_none());
+        }
+    }
+
+    #[test]
+    fn a_minted_pair_sends_at_once_under_every_ceiling() {
+        let (_temporary, _directory, tally) = tally("fresh-sends");
+        let host = BROKER_HOSTS[0];
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+        tally
+            .initialize_fresh_pair(&clock)
+            .expect("the first enabling mints the fresh pair");
+
+        let decision = tally
+            .decide_and_record(host, "method", 100, Duration::from_secs(60), &clock)
+            .expect("the first decision decides");
+
+        assert!(
+            matches!(decision, TallyDecision::Send),
+            "the checking call goes out at once, not at the conservative ceiling"
+        );
+    }
+
+    #[test]
+    fn a_mint_never_overwrites_a_pair_that_governs() {
+        let (_temporary, _directory, tally) = tally("mint-keeps");
+        let host = BROKER_HOSTS[0];
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+        tally
+            .initialize_fresh_pair(&clock)
+            .expect("the first enabling mints the fresh pair");
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &clock),
+            Ok(TallyDecision::Send)
+        ));
+
+        let minted = tally
+            .initialize_fresh_pair(&clock)
+            .expect("a later mint still reads the pair");
+
+        assert!(
+            !minted,
+            "whatever the pair holds governs; the mint never restores an allowance"
+        );
     }
 }

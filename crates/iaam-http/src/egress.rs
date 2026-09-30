@@ -25,12 +25,10 @@ pub enum BrokerEgressConfigError {
 }
 
 impl BrokerEgress {
-    /// Read the process's broker-egress switch.
+    /// Read the process's broker-egress switch alone: unset means off.
     ///
-    /// The switch defaults to `off`. When it is `on`, the gateway derives the
-    /// instance's egress directory from its database path
-    /// ([`egress_directory_for`]); no environment variable can choose another
-    /// tally or endpoint-owner identity.
+    /// Commands that do not read the instance's database — and every caller
+    /// from before the switch was stored in it — ask this.
     ///
     /// # Errors
     /// An invalid switch value or a non-Unicode switch.
@@ -38,13 +36,28 @@ impl BrokerEgress {
         Self::from_lookup(|name| std::env::var_os(name))
     }
 
-    fn from_lookup<F>(get: F) -> Result<Self, BrokerEgressConfigError>
+    /// The effective switch: the environment variable over the instance's
+    /// stored one (migration `0008`).
+    ///
+    /// Unset, the stored word stands: a successful `iaam broker connect`
+    /// turned the switch on, and `serve` reads it at start. `off` still forces
+    /// broker requests off — a deployment that must not call a broker wins
+    /// over the stored word — and `on` stays accepted as an override for
+    /// developer tools run against an instance whose switch is off.
+    ///
+    /// # Errors
+    /// As [`Self::from_env`].
+    pub fn resolve<F>(get: F, stored: bool) -> Result<Self, BrokerEgressConfigError>
     where
         F: Fn(&str) -> Option<OsString>,
     {
-        let Some(value) = get(BROKER_EGRESS_ENV) else {
-            return Ok(Self::Off);
-        };
+        match get(BROKER_EGRESS_ENV) {
+            None => Ok(if stored { Self::On } else { Self::Off }),
+            Some(value) => Self::parse(value),
+        }
+    }
+
+    fn parse(value: OsString) -> Result<Self, BrokerEgressConfigError> {
         let value = value
             .into_string()
             .map_err(|_| BrokerEgressConfigError::NonUnicodeSwitch)?;
@@ -53,6 +66,13 @@ impl BrokerEgress {
             "on" => Ok(Self::On),
             _ => Err(BrokerEgressConfigError::InvalidSwitch { value }),
         }
+    }
+
+    fn from_lookup<F>(get: F) -> Result<Self, BrokerEgressConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        Self::resolve(get, false)
     }
 }
 
@@ -273,5 +293,50 @@ mod derivation_tests {
         let second_directory = egress_directory_for(&second).expect("second resolves");
 
         assert_ne!(first_directory, second_directory);
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn lookup_off(_name: &str) -> Option<OsString> {
+        Some(OsString::from("off"))
+    }
+
+    #[test]
+    fn an_unset_variable_lets_the_stored_word_stand() {
+        assert_eq!(
+            BrokerEgress::resolve(|_| None, true).ok(),
+            Some(BrokerEgress::On)
+        );
+        assert_eq!(
+            BrokerEgress::resolve(|_| None, false).ok(),
+            Some(BrokerEgress::Off)
+        );
+    }
+
+    #[test]
+    fn an_explicit_off_wins_over_a_stored_on() {
+        assert_eq!(
+            BrokerEgress::resolve(lookup_off, true).ok(),
+            Some(BrokerEgress::Off),
+            "a deployment that must not call a broker wins over the stored word"
+        );
+    }
+
+    #[test]
+    fn an_explicit_on_overrides_a_stored_off_for_developer_tools() {
+        assert_eq!(
+            BrokerEgress::resolve(|_| Some(OsString::from("on")), false).ok(),
+            Some(BrokerEgress::On)
+        );
+    }
+
+    #[test]
+    fn an_invalid_value_is_refused_whatever_is_stored() {
+        let error = BrokerEgress::resolve(|_| Some(OsString::from("maybe")), true)
+            .expect_err("an unknown word is refused");
+        assert!(error.to_string().contains("use `on` or `off`"), "{error}");
     }
 }

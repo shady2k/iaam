@@ -27,8 +27,8 @@ use iaam_server::{ServerState, build};
 use iaam_store::SqliteStore;
 use zeroize::Zeroizing;
 
-use crate::config::{Config, Place, PlaceSource};
-use crate::instance::ensure_private_directory;
+use crate::config::{Config, Place, PlaceSource, Places};
+use crate::instance::{ensure_private_directory, open_database};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -253,41 +253,27 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     reject_legacy_environment()?;
     let cli = Cli::parse();
-    let config = Config::from_env()?;
-
-    execute(cli.command, config).await
+    execute(cli.command, |name| std::env::var(name).ok()).await
 }
 
 /// Runs one command against one resolved instance.
 ///
-/// Every arm takes its places from `config` alone — no command resolves a
-/// path from the environment here — and no arm creates anything by
-/// accident: creation belongs to `claim` (the database, with its
-/// directory) and to `broker key generate` (the key, with its directory).
-/// Every other command that finds no database refuses, naming the place it
-/// looked at, having created no file and no directory.
-async fn execute(command: Command, config: Config) -> Result<(), Box<dyn std::error::Error>> {
+/// The resolver decides both places for every command; `status` and `broker
+/// key generate` need the places alone, while the commands that open the
+/// instance's database resolve the whole configuration. No arm creates
+/// anything by accident: creation belongs to `claim` (the database, with
+/// its directory) and to `broker key generate` (the key, with its
+/// directory). Every command that finds no database refuses, naming the
+/// place it looked at, having created no file and no directory.
+async fn execute<F>(command: Command, get: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(&str) -> Option<String>,
+{
     match command {
-        Command::Serve => serve(config).await,
+        Command::Serve => serve(Config::from_lookup(&get)?).await,
         Command::Status => {
-            print!("{}", status_report(&config));
-            Ok(())
-        }
-        Command::Claim { label } => {
-            ensure_private_directory(&config.database.path, "the instance's database")?;
-            let store = SqliteStore::open(&config.database.path)?;
-            let admin = SqliteAdapter::new(store);
-            let token = claim_owner(&admin, &label).await?;
-            println!("{token}");
-            Ok(())
-        }
-        Command::Token {
-            command: TokenCommand::Issue { label, scope },
-        } => {
-            let store = SqliteStore::open_existing(&config.database.path)?;
-            let admin = SqliteAdapter::new(store);
-            let token = issue_token(&admin, &label, scope.into()).await?;
-            println!("{token}");
+            let places = Places::from_lookup(&get)?;
+            print!("{}", status_report(&places));
             Ok(())
         }
         Command::Broker {
@@ -296,9 +282,29 @@ async fn execute(command: Command, config: Config) -> Result<(), Box<dyn std::er
                     command: BrokerKeyCommand::Generate,
                 },
         } => {
-            ensure_private_directory(&config.broker_key.path, "the broker key file")?;
-            Key::create_at(&config.broker_key.path)?;
-            println!("key created: {}", config.broker_key.path.display());
+            let places = Places::from_lookup(&get)?;
+            generate_key(&places).await
+        }
+        Command::Claim { label } => {
+            let Places {
+                database,
+                broker_key: _,
+            } = Places::from_lookup(&get)?;
+            ensure_private_directory(&database.path, "the instance's database")?;
+            let store = SqliteStore::open(&database.path)?;
+            let admin = SqliteAdapter::new(store);
+            let token = claim_owner(&admin, &label).await?;
+            println!("{token}");
+            Ok(())
+        }
+        Command::Token {
+            command: TokenCommand::Issue { label, scope },
+        } => {
+            let config = Config::from_lookup(&get)?;
+            let store = open_database(&config.database)?;
+            let admin = SqliteAdapter::new(store);
+            let token = issue_token(&admin, &label, scope.into()).await?;
+            println!("{token}");
             Ok(())
         }
         Command::Broker {
@@ -307,7 +313,8 @@ async fn execute(command: Command, config: Config) -> Result<(), Box<dyn std::er
                     command: BrokerKeyCommand::Rotate { old, new },
                 },
         } => {
-            let mut store = SqliteStore::open_existing(&config.database.path)?;
+            let config = Config::from_lookup(&get)?;
+            let mut store = open_database(&config.database)?;
             let old_key = read_broker_key(&old).map_err(|error| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -334,7 +341,8 @@ async fn execute(command: Command, config: Config) -> Result<(), Box<dyn std::er
                         },
                 },
         } => {
-            let mut store = SqliteStore::open_existing(&config.database.path)?;
+            let config = Config::from_lookup(&get)?;
+            let mut store = open_database(&config.database)?;
             let key = read_broker_key(&config.broker_key.path)?;
             let id = provision::add_broker_access(
                 &mut store,
@@ -359,7 +367,8 @@ async fn execute(command: Command, config: Config) -> Result<(), Box<dyn std::er
                         },
                 },
         } => {
-            let mut store = SqliteStore::open_existing(&config.database.path)?;
+            let config = Config::from_lookup(&get)?;
+            let mut store = open_database(&config.database)?;
             let key = read_broker_key(&config.broker_key.path)?;
             let id = provision::replace_broker_access(
                 &mut store,
@@ -377,7 +386,8 @@ async fn execute(command: Command, config: Config) -> Result<(), Box<dyn std::er
         Command::Bundle {
             command: BundleCommand::Export { output },
         } => {
-            let store = SqliteStore::open_existing(&config.database.path)?;
+            let config = Config::from_lookup(&get)?;
+            let store = open_database(&config.database)?;
             let summary = bundle::export_to_file(&store, &output)?;
             println!("{summary}");
             Ok(())
@@ -385,14 +395,14 @@ async fn execute(command: Command, config: Config) -> Result<(), Box<dyn std::er
         Command::Bundle {
             command: BundleCommand::Import { input, merge },
         } => {
-            let mut store = SqliteStore::open_existing(&config.database.path)?;
+            let config = Config::from_lookup(&get)?;
+            let mut store = open_database(&config.database)?;
             let report = bundle::import_from_file(&mut store, &input, merge)?;
             println!("{report}");
             Ok(())
         }
     }
 }
-
 fn legacy_replacement(is_set: impl Fn(&str) -> bool) -> Option<(&'static str, &'static str)> {
     [
         ("IAAM_ISSUE_OWNER_TOKEN", "token issue"),
@@ -433,9 +443,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let store = SqliteStore::open_existing(&config.database.path)?;
+    let store = open_database(&config.database)?;
     let broker_key = broker_key_for_serve(&config.broker_key)?;
-    let market_store = SqliteStore::open_existing(&config.database.path)?;
+    let market_store = open_database(&config.database)?;
     // The one gateway of the process. Each broker endpoint is owned by one
     // process for this gateway's lifetime; boot-clock budgets, spacing and the
     // rolling 24-hour ceiling persist in the configured outbound tally.
@@ -533,16 +543,28 @@ fn broker_key_for_serve(place: &Place) -> Result<Option<Key>, Box<dyn std::error
 /// broker key live, whether each file is there, and who chose the place.
 /// Nothing is read from inside the database and no secret is read at all —
 /// this command exists to be safe to run before anything exists.
-fn status_report(config: &Config) -> String {
+fn status_report(places: &Places) -> String {
     format!(
         "database: {} ({}; {})\nbroker key: {} ({}; {})\n",
-        config.database.path.display(),
-        place_source_text(config.database.source, "IAAM_DATABASE"),
-        existence_text(config.database.path.exists()),
-        config.broker_key.path.display(),
-        place_source_text(config.broker_key.source, "IAAM_BROKER_KEY_FILE"),
-        existence_text(config.broker_key.path.exists()),
+        places.database.path.display(),
+        place_source_text(places.database.source, "IAAM_DATABASE"),
+        existence_text(places.database.path.exists()),
+        places.broker_key.path.display(),
+        place_source_text(places.broker_key.source, "IAAM_BROKER_KEY_FILE"),
+        existence_text(places.broker_key.path.exists()),
     )
+}
+
+/// `iaam broker key generate`: writes the key at the resolved place, but
+/// only onto an instance that exists — the database is opened first, so a
+/// command refused for a missing instance has created no file and no
+/// directory, not even the key's.
+async fn generate_key(places: &Places) -> Result<(), Box<dyn std::error::Error>> {
+    open_database(&places.database)?;
+    ensure_private_directory(&places.broker_key.path, "the broker key file")?;
+    Key::create_at(&places.broker_key.path)?;
+    println!("key created: {}", places.broker_key.path.display());
+    Ok(())
 }
 
 fn place_source_text(source: PlaceSource, variable: &'static str) -> &'static str {
@@ -622,8 +644,8 @@ async fn shutdown() {
 mod tests {
     use super::{
         BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, BrokerKeyCommand, BundleCommand,
-        Cli, Command, Config, SqliteAdapter, TokenCommand, TokenScopeArg, claim_owner, execute,
-        format_error_chain, legacy_replacement, read_broker_key, serve, status_report,
+        Cli, Command, Config, Places, SqliteAdapter, TokenCommand, TokenScopeArg, claim_owner,
+        execute, format_error_chain, legacy_replacement, read_broker_key, serve, status_report,
     };
     use clap::Parser;
 
@@ -828,21 +850,27 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// A config resolved against a private temporary home: the lookup
-    /// closure stands in for the environment, so the real home directory is
-    /// never touched.
-    fn config_with(values: &[(&str, &str)]) -> Config {
+    /// A lookup closure over a private temporary home: it stands in for the
+    /// environment, so the real home directory is never touched.
+    fn lookup_with(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let owned: Vec<(String, String)> = values
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
-        Config::from_lookup(move |name| {
+        move |name| {
             owned
                 .iter()
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value.clone())
-        })
-        .unwrap()
+        }
+    }
+
+    fn places_with(values: &[(&str, &str)]) -> Places {
+        Places::from_lookup(lookup_with(values)).unwrap()
+    }
+
+    fn config_with(values: &[(&str, &str)]) -> Config {
+        Config::from_lookup(lookup_with(values)).unwrap()
     }
 
     fn temp_home(tag: &str) -> std::path::PathBuf {
@@ -861,7 +889,9 @@ mod tests {
     async fn token_issue_without_a_database_refuses_and_creates_nothing() {
         let home = temp_home("token-refusal");
         let database = home.join(".local/share/iaam/iaam.db");
-        let config = config_with(&[("HOME", home.to_str().unwrap())]);
+        let home_str = home.to_str().unwrap();
+        let values = [("HOME", home_str)];
+        let lookup = lookup_with(&values);
 
         let error = execute(
             Command::Token {
@@ -870,7 +900,7 @@ mod tests {
                     scope: TokenScopeArg::Owner,
                 },
             },
-            config,
+            lookup,
         )
         .await
         .unwrap_err();
@@ -898,7 +928,9 @@ mod tests {
         let home = temp_home("bundle-refusal");
         let database = home.join(".local/share/iaam/iaam.db");
         let output = home.join("out.bundle.json");
-        let config = config_with(&[("HOME", home.to_str().unwrap())]);
+        let home_str = home.to_str().unwrap();
+        let values = [("HOME", home_str)];
+        let lookup = lookup_with(&values);
 
         let error = execute(
             Command::Bundle {
@@ -906,7 +938,7 @@ mod tests {
                     output: output.clone(),
                 },
             },
-            config,
+            lookup,
         )
         .await
         .unwrap_err();
@@ -926,7 +958,9 @@ mod tests {
     async fn broker_access_add_without_a_database_refuses_before_reading_input() {
         let home = temp_home("access-refusal");
         let database = home.join(".local/share/iaam/iaam.db");
-        let config = config_with(&[("HOME", home.to_str().unwrap())]);
+        let home_str = home.to_str().unwrap();
+        let values = [("HOME", home_str)];
+        let lookup = lookup_with(&values);
 
         let error = execute(
             Command::Broker {
@@ -937,7 +971,7 @@ mod tests {
                     },
                 },
             },
-            config,
+            lookup,
         )
         .await
         .unwrap_err();
@@ -956,9 +990,10 @@ mod tests {
     async fn serve_without_a_database_refuses_and_creates_nothing() {
         let home = temp_home("serve-refusal");
         let database = home.join(".local/share/iaam/iaam.db");
-        let config = config_with(&[("HOME", home.to_str().unwrap())]);
+        let home_str = home.to_str().unwrap();
+        let values = [("HOME", home_str)];
 
-        let error = serve(config).await.unwrap_err();
+        let error = serve(config_with(&values)).await.unwrap_err();
 
         let text = format_error_chain(error.as_ref());
         assert!(text.contains("no database at"), "{text}");
@@ -974,13 +1009,15 @@ mod tests {
     async fn claim_creates_the_database_and_its_private_directory() {
         let home = temp_home("claim-creates");
         let database = home.join(".local/share/iaam/iaam.db");
-        let config = config_with(&[("HOME", home.to_str().unwrap())]);
+        let home_str = home.to_str().unwrap();
+        let values = [("HOME", home_str)];
+        let lookup = lookup_with(&values);
 
         execute(
             Command::Claim {
                 label: "Main".to_owned(),
             },
-            config,
+            lookup,
         )
         .await
         .expect("claim creates the instance");
@@ -997,17 +1034,19 @@ mod tests {
     #[tokio::test]
     async fn a_set_variable_moves_the_instance_and_the_default_place_stays_untouched() {
         let home = temp_home("override");
+        let home_str = home.to_str().unwrap();
         let database = home.join("other.db");
-        let config = config_with(&[
+        let values = [
             ("IAAM_DATABASE", database.to_str().unwrap()),
-            ("HOME", home.to_str().unwrap()),
-        ]);
+            ("HOME", home_str),
+        ];
+        let lookup = lookup_with(&values);
 
         execute(
             Command::Claim {
                 label: "Main".to_owned(),
             },
-            config,
+            lookup,
         )
         .await
         .expect("claim honours the override");
@@ -1021,18 +1060,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broker_key_generate_without_an_instance_refuses_and_creates_nothing() {
+        let home = temp_home("generate-refusal");
+        let database = home.join(".local/share/iaam/iaam.db");
+        let home_str = home.to_str().unwrap();
+        let values = [("HOME", home_str)];
+        let lookup = lookup_with(&values);
+
+        let error = execute(
+            Command::Broker {
+                command: BrokerCommand::Key {
+                    command: BrokerKeyCommand::Generate,
+                },
+            },
+            lookup,
+        )
+        .await
+        .unwrap_err();
+
+        let text = format_error_chain(error.as_ref());
+        assert!(text.contains("no database at"), "{text}");
+        assert!(
+            text.contains(database.display().to_string().as_str()),
+            "{text}"
+        );
+        assert!(text.contains("iaam claim"), "{text}");
+        assert!(!database.exists());
+        assert!(
+            !home.join(".config").exists(),
+            "a refused generate creates not even the key directory"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
     async fn broker_key_generate_creates_its_directory_and_never_overwrites() {
         let home = temp_home("key-generate");
         let key = home.join(".config/iaam/broker-key");
-        let config = config_with(&[("HOME", home.to_str().unwrap())]);
 
+        // The documented order: the instance is claimed, then the key is
+        // generated for it.
+        execute(
+            Command::Claim {
+                label: "Main".to_owned(),
+            },
+            lookup_with(&[("HOME", home.to_str().unwrap())]),
+        )
+        .await
+        .expect("claim creates the instance");
         execute(
             Command::Broker {
                 command: BrokerCommand::Key {
                     command: BrokerKeyCommand::Generate,
                 },
             },
-            config.clone(),
+            lookup_with(&[("HOME", home.to_str().unwrap())]),
         )
         .await
         .expect("generate creates the key");
@@ -1046,7 +1128,7 @@ mod tests {
                     command: BrokerKeyCommand::Generate,
                 },
             },
-            config,
+            lookup_with(&[("HOME", home.to_str().unwrap())]),
         )
         .await
         .unwrap_err();
@@ -1062,9 +1144,8 @@ mod tests {
         let home = temp_home("status");
         let database = home.join(".local/share/iaam/iaam.db");
         let key = home.join(".config/iaam/broker-key");
-        let config = config_with(&[("HOME", home.to_str().unwrap())]);
 
-        let report = status_report(&config);
+        let report = status_report(&places_with(&[("HOME", home.to_str().unwrap())]));
         assert!(
             report.contains(database.display().to_string().as_str()),
             "{report}"
@@ -1081,15 +1162,14 @@ mod tests {
             Command::Claim {
                 label: "Main".to_owned(),
             },
-            config,
+            lookup_with(&[("HOME", home.to_str().unwrap())]),
         )
         .await
         .unwrap();
-        let overridden = config_with(&[
+        let report = status_report(&places_with(&[
             ("HOME", home.to_str().unwrap()),
             ("IAAM_DATABASE", database.to_str().unwrap()),
-        ]);
-        let report = status_report(&overridden);
+        ]));
         assert!(report.contains("(IAAM_DATABASE; present)"), "{report}");
         std::fs::remove_dir_all(&home).unwrap();
     }

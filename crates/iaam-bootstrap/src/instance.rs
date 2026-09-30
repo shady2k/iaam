@@ -2,18 +2,21 @@
 //!
 //! One rule guards everything here: **only `iaam claim` creates a
 //! database.** The resolver in `config` says where the instance's files
-//! live; this module creates what the creating commands create, and nothing
-//! else. An empty database or an empty key appearing silently under a
-//! default path is indistinguishable from a lost portfolio, so no command
-//! but the two named ones makes a file or a directory at these places.
-
-use std::os::unix::fs::PermissionsExt;
+//! live; this module creates what the creating commands create, opens what
+//! every other command opens, and nothing else. An empty database or an
+//! empty key appearing silently under a default path is indistinguishable
+//! from a lost portfolio, so no command but the two named ones makes a file
+//! or a directory at these places.
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use iaam_store::{SqliteStore, StoreError};
 use thiserror::Error;
+
+use crate::config::Place;
 
 #[derive(Debug, Error)]
 pub enum InstanceError {
@@ -24,6 +27,37 @@ pub enum InstanceError {
         #[source]
         source: io::Error,
     },
+    /// No database exists where the command resolved it. The command-facing
+    /// refusal lives here, beside the commands that name `iaam claim`; the
+    /// store only says that the place is empty.
+    #[error(
+        "no database at {path}: a database is created only by \
+         `iaam claim --label <label>`, no other command creates one"
+    )]
+    DatabaseMissing { path: String },
+    #[error("cannot open the database {path}")]
+    DatabaseUnreadable {
+        path: String,
+        #[source]
+        source: StoreError,
+    },
+}
+
+/// Opens the instance's database for every command that must not create it.
+///
+/// This is the one open path of the non-claiming commands — `serve`, the
+/// token, broker and bundle commands, and the existence check of `broker
+/// key generate` all go through it — so a missing database is refused with
+/// one message naming the place and the command that creates, and no
+/// branch can reach a create-if-missing open by accident.
+pub fn open_database(place: &Place) -> Result<SqliteStore, InstanceError> {
+    SqliteStore::open_existing(&place.path).map_err(|source| match source {
+        StoreError::DatabaseMissing { path } => InstanceError::DatabaseMissing { path },
+        source => InstanceError::DatabaseUnreadable {
+            path: place.path.display().to_string(),
+            source,
+        },
+    })
 }
 
 /// Creates the directory that holds the file `of`, mode `0700`, when it is
@@ -59,7 +93,8 @@ pub fn ensure_private_directory(of: &Path, what: &'static str) -> Result<(), Ins
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_private_directory;
+    use super::{ensure_private_directory, open_database};
+    use crate::config::{Place, PlaceSource};
 
     #[test]
     fn a_created_directory_is_private_and_an_existing_one_is_untouched() {
@@ -88,5 +123,50 @@ mod tests {
     fn a_bare_relative_name_needs_no_directory() {
         ensure_private_directory(std::path::Path::new("iaam.db"), "test place")
             .expect("the current directory exists");
+    }
+
+    #[test]
+    fn a_missing_database_refuses_naming_the_place_and_the_creating_command() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-bootstrap-open-database-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let place = Place {
+            path: path.clone(),
+            source: PlaceSource::Default,
+        };
+
+        let error = match open_database(&place) {
+            Ok(_) => panic!("a missing database is refused, never created"),
+            Err(error) => error,
+        };
+
+        let text = error.to_string();
+        assert!(text.contains("no database at"), "{text}");
+        assert!(text.contains(path.display().to_string().as_str()), "{text}");
+        assert!(text.contains("iaam claim"), "{text}");
+        assert!(!path.exists(), "the refused open must not create the file");
+    }
+
+    #[test]
+    fn a_file_that_is_no_database_is_refused_as_unreadable() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-bootstrap-open-database-garbage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"this is not a database").unwrap();
+        let place = Place {
+            path: path.clone(),
+            source: PlaceSource::Default,
+        };
+
+        let error = match open_database(&place) {
+            Ok(_) => panic!("garbage is not accepted as a database"),
+            Err(error) => error,
+        };
+
+        let text = error.to_string();
+        assert!(text.contains("cannot open the database"), "{text}");
+        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -84,10 +84,7 @@ pub enum StoreError {
     /// `iaam claim` does, and a command that opened with create-if-missing
     /// would leave an empty database in the place a lost portfolio would
     /// look exactly like.
-    #[error(
-        "no database at {path}: a database is created only by \
-         `iaam claim --label <label>`, no other command creates one"
-    )]
+    #[error("no database at {path}")]
     DatabaseMissing { path: String },
     #[error("active alias {namespace}:{value} not found for instrument {instrument}")]
     AliasNotFoundForInstrument {
@@ -269,11 +266,13 @@ impl SqliteStore {
     /// SQLite's create-if-missing open ([`Self::open`]) would answer a
     /// command whose database is simply somewhere else with a brand-new
     /// empty database under the default path — a lost portfolio made of
-    /// silence. Only the claim command may create a database; every other
-    /// caller opens with this and refuses with [`StoreError::DatabaseMissing`],
-    /// naming the place it looked at. The flags say `READ_WRITE` without
-    /// `CREATE` so that even a race with the file's deletion cannot make
-    /// SQLite manufacture an empty one.
+    /// silence. Only one command in the product may create a database;
+    /// every other caller opens with this and receives
+    /// [`StoreError::DatabaseMissing`], naming the place it looked at. The
+    /// flags say `READ_WRITE` without `CREATE` so that even a race with the
+    /// file's deletion cannot make SQLite manufacture an empty one. The
+    /// command-facing refusal lives with the commands, which know the
+    /// command that creates.
     pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
         if !path.is_file() {
             return Err(StoreError::DatabaseMissing {
@@ -426,10 +425,6 @@ mod tests {
         assert!(
             text.contains(&path.display().to_string()),
             "names the path: {text}"
-        );
-        assert!(
-            text.contains("iaam claim"),
-            "names the creating command: {text}"
         );
         assert!(!path.exists(), "the refused open must not create the file");
     }

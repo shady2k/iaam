@@ -48,10 +48,23 @@ pub enum PlaceSource {
     Default,
 }
 
-/// The inputs that decide one place: the variable that overrides it, the XDG
-/// variable that moves the default, the subpath under each, and what the
-/// place holds — the last one so the refusal can name the variables that
-/// would supply it.
+/// The two places of one instance, and who chose each.
+///
+/// Everything that touches only the places — `iaam status`, and the key
+/// command's existence check — resolves this and nothing else, so an
+/// unrelated serve setting cannot stand between the owner and the answer
+/// to "where is my instance".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Places {
+    pub database: Place,
+    pub broker_key: Place,
+}
+
+/// The inputs that decide one place: the variable that overrides it, the
+/// XDG variable that moves the default, the subpath under each, what the
+/// place holds and what a value must look like — the last two so the
+/// refusals can name the variables that would supply the place and say
+/// what was wrong with the value that was supplied instead.
 struct PlaceSpec {
     variable: &'static str,
     xdg_variable: &'static str,
@@ -60,6 +73,7 @@ struct PlaceSpec {
     xdg_tail: &'static str,
     /// Subpath under the home directory, `$HOME/.local/share/iaam/iaam.db`.
     home_tail: &'static str,
+    allowed: &'static str,
 }
 
 const DATABASE_PLACE: PlaceSpec = PlaceSpec {
@@ -68,6 +82,7 @@ const DATABASE_PLACE: PlaceSpec = PlaceSpec {
     what: "the instance's database",
     xdg_tail: "iaam/iaam.db",
     home_tail: ".local/share/iaam/iaam.db",
+    allowed: "a path to the database file",
 };
 
 const BROKER_KEY_PLACE: PlaceSpec = PlaceSpec {
@@ -76,7 +91,75 @@ const BROKER_KEY_PLACE: PlaceSpec = PlaceSpec {
     what: "the broker key file",
     xdg_tail: "iaam/broker-key",
     home_tail: ".config/iaam/broker-key",
+    allowed: "a path to the key file",
 };
+
+/// Resolves both places of the instance from one lookup. This is the one
+/// resolver: every command's places come from here, and no command
+/// resolves a path from the environment on its own.
+fn resolve_places<F>(get: &F) -> Result<Places, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(Places {
+        database: resolve_place(&DATABASE_PLACE, get)?,
+        broker_key: resolve_place(&BROKER_KEY_PLACE, get)?,
+    })
+}
+
+/// Resolves one place of the instance: the override variable wins, else the
+/// XDG directory when it is set and absolute, else the home directory. The
+/// XDG spec counts a relative value as unset, and the same rule applies to
+/// `HOME` — a place hanging off a relative path would move with the working
+/// directory. An override that is set but empty is invalid input and an
+/// error, never a silent default.
+fn resolve_place<F>(spec: &PlaceSpec, get: &F) -> Result<Place, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = get(spec.variable) {
+        if value.is_empty() {
+            return Err(ConfigError::Invalid {
+                name: spec.variable,
+                value,
+                allowed: spec.allowed,
+            });
+        }
+        return Ok(Place {
+            path: PathBuf::from(value),
+            source: PlaceSource::Variable,
+        });
+    }
+    let default = |base: String, tail: &'static str| Place {
+        path: Path::new(&base).join(tail),
+        source: PlaceSource::Default,
+    };
+    if let Some(xdg) = absolute(get(spec.xdg_variable)) {
+        return Ok(default(xdg, spec.xdg_tail));
+    }
+    if let Some(home) = absolute(get("HOME")) {
+        return Ok(default(home, spec.home_tail));
+    }
+    Err(ConfigError::NoPlace {
+        what: spec.what,
+        variable: spec.variable,
+        xdg_variable: spec.xdg_variable,
+    })
+}
+
+/// A lookup result that is present and usable: non-empty and absolute.
+fn absolute(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty() && Path::new(value).is_absolute())
+}
+
+impl Places {
+    pub(crate) fn from_lookup<F>(get: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        resolve_places(&get)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -114,22 +197,18 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read configuration from the environment.
-    ///
-    /// Every place has a default now; a variable set to an empty value
-    /// counts as unset. What no default ever does is create anything:
-    /// only `iaam claim` creates the database, and only
-    /// `iaam broker key generate` creates the key.
-    pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
-    }
-
+    /// Read configuration from the environment through `from_lookup`, the
+    /// seam every caller here uses. Every place has a default now. What no
+    /// default ever does is create anything: only `iaam claim` creates the
+    /// database, and only `iaam broker key generate` creates the key.
     pub(crate) fn from_lookup<F>(get: F) -> Result<Self, ConfigError>
     where
         F: Fn(&str) -> Option<String>,
     {
-        let database = resolve_place(&DATABASE_PLACE, &get)?;
-        let broker_key = resolve_place(&BROKER_KEY_PLACE, &get)?;
+        let Places {
+            database,
+            broker_key,
+        } = resolve_places(&get)?;
         let listen = get("IAAM_LISTEN").unwrap_or_else(|| "127.0.0.1:8080".into());
         let listen = listen.parse().map_err(|_| ConfigError::Invalid {
             name: "IAAM_LISTEN",
@@ -151,49 +230,6 @@ impl Config {
     }
 }
 
-/// Resolves one place of the instance: the override variable wins, else the
-/// XDG directory when it is set and absolute, else the home directory. The
-/// XDG spec counts a relative value as unset, and the same rule applies to
-/// `HOME` — a place hanging off a relative path would move with the working
-/// directory. Set but empty counts as unset for every variable consulted
-/// here.
-fn resolve_place<F>(spec: &PlaceSpec, get: &F) -> Result<Place, ConfigError>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    if let Some(value) = supplied(get(spec.variable)) {
-        return Ok(Place {
-            path: PathBuf::from(value),
-            source: PlaceSource::Variable,
-        });
-    }
-    let default = |base: String, tail: &'static str| Place {
-        path: Path::new(&base).join(tail),
-        source: PlaceSource::Default,
-    };
-    if let Some(xdg) = absolute(get(spec.xdg_variable)) {
-        return Ok(default(xdg, spec.xdg_tail));
-    }
-    if let Some(home) = absolute(get("HOME")) {
-        return Ok(default(home, spec.home_tail));
-    }
-    Err(ConfigError::NoPlace {
-        what: spec.what,
-        variable: spec.variable,
-        xdg_variable: spec.xdg_variable,
-    })
-}
-
-/// A lookup result that is present and usable: non-empty and absolute.
-fn absolute(value: Option<String>) -> Option<String> {
-    value.filter(|value| !value.is_empty() && Path::new(value).is_absolute())
-}
-
-/// A lookup result that is present and non-empty.
-fn supplied(value: Option<String>) -> Option<String> {
-    value.filter(|value| !value.is_empty())
-}
-
 fn parse_u32<F>(name: &'static str, default: u32, get: &F) -> Result<u32, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -210,7 +246,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, PlaceSource};
+    use super::{Config, ConfigError, PlaceSource, Places};
 
     fn values<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |name| {
@@ -336,11 +372,42 @@ mod tests {
     }
 
     #[test]
-    fn empty_override_variables_do_not_count_as_set() {
-        let config =
-            Config::from_lookup(values(&[("IAAM_DATABASE", ""), ("HOME", "/home/dev")])).unwrap();
+    fn empty_override_variable_is_an_error_not_a_default() {
+        let error = Config::from_lookup(values(&[("IAAM_DATABASE", ""), ("HOME", "/home/dev")]))
+            .unwrap_err();
 
-        assert_eq!(config.database.source, PlaceSource::Default);
+        assert!(matches!(
+            error,
+            ConfigError::Invalid {
+                name: "IAAM_DATABASE",
+                ..
+            }
+        ));
+        let text = error.to_string();
+        assert!(text.contains("IAAM_DATABASE"), "{text}");
+        assert!(text.contains("invalid"), "{text}");
+    }
+
+    #[test]
+    fn places_resolve_without_the_serve_settings() {
+        // `iaam status` and the key command answer for the places alone: a
+        // broken serve setting must not stand between the owner and the
+        // answer to "where is my instance".
+        let places = Places::from_lookup(values(&[
+            ("HOME", "/home/dev"),
+            ("IAAM_LISTEN", "not an address"),
+            ("IAAM_RATE_LIMIT", "zero"),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            places.database.path,
+            std::path::Path::new("/home/dev/.local/share/iaam/iaam.db")
+        );
+        assert_eq!(
+            places.broker_key.path,
+            std::path::Path::new("/home/dev/.config/iaam/broker-key")
+        );
     }
 
     #[test]

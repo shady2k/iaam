@@ -256,7 +256,10 @@ mod derivation_tests {
             };
             let text = error.to_string();
             assert!(text.contains("2 names"), "{text}");
-            assert!(text.contains("iaam.sqlite") || text.contains("alias.sqlite"), "{text}");
+            assert!(
+                text.contains("iaam.sqlite") || text.contains("alias.sqlite"),
+                "{text}"
+            );
         }
     }
 

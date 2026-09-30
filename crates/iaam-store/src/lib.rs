@@ -454,7 +454,10 @@ mod tests {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(&parent).unwrap();
         match result {
-            Err(StoreError::DatabaseInaccessible { path: named, source }) => {
+            Err(StoreError::DatabaseInaccessible {
+                path: named,
+                source,
+            }) => {
                 assert!(named.contains("iaam.sqlite"), "{named}");
                 assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
             }

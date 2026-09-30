@@ -6,13 +6,29 @@ A step whose success cannot be observed by running something is not a step and
 is not in here. Where a step can fail, the failure names what is missing, who
 supplies it, and the command that supplies it.
 
-Nothing here is a "sensible location". `/var/lib/iaam/iaam.db`,
-`/etc/iaam/broker-key`, the image tag `iaam:0.1.0` and the container name `iaam`
-are literal values that the commands below actually pass, and you may replace
-them with other literal values — but nothing in the program, the image or this
-repository will guess them for you. There are no defaults for a path, and there
-will not be: a database in an unexpected place looks exactly like a lost
-portfolio.
+The instance has one default place for each of its two files, chosen by
+the XDG rules: the database at `$XDG_DATA_HOME/iaam/iaam.db`, else
+`$HOME/.local/share/iaam/iaam.db`; the broker key at
+`$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key` —
+apart from the data on purpose, so copying the data directory does not carry
+the key. Two rules keep a database in an expected place from ever looking
+like a lost portfolio:
+
+- **Only `iaam claim` creates a database.** Every other command that finds
+  no database at the place it resolved refuses, names the place it looked
+  at, and creates no file and no directory. An empty database never appears
+  silently anywhere.
+- **`iaam status` says where the instance is**: the database place and the
+  key place, whether each file exists, and for each whether the place came
+  from a variable or is the default.
+
+A relative `XDG_*` value counts as unset, as the XDG spec says; a variable
+set to an empty value counts as unset too. The image tag `iaam:0.1.0` and
+the container name `iaam` are still literal values that the commands below
+actually pass. A service or a container still passes explicit paths: inside
+a container there is no home directory worth a default, and a service names
+its paths so the unit file is the whole truth about where the data is. On
+the owner's own console no path is typed at all.
 
 ---
 
@@ -24,7 +40,7 @@ and it has two roles.
 | Role | Command | Run by |
 |---|---|---|
 | HTTP service | `iaam serve` | a service manager, unattended |
-| local administration | `iaam claim`, `iaam token issue`, `iaam broker key …`, `iaam broker access …`, `iaam bundle export`, `iaam bundle import` | the owner, at a console |
+| local administration | `iaam status`, `iaam claim`, `iaam token issue`, `iaam broker key …`, `iaam broker access …`, `iaam bundle export`, `iaam bundle import` | the owner, at a console |
 
 The second role is not a convenience wrapper. Under
 [ADR-0003](decisions/0003-the-owner-speaks-to-an-agent-and-a-cli-keeps-the-secrets.md)
@@ -188,8 +204,8 @@ open breakers are still lost on restart.
 
 | Variable | Kind | Default | Read by |
 |---|---|---|---|
-| `IAAM_DATABASE` | **required** | none — every subcommand refuses without it | every subcommand, including `serve` |
-| `IAAM_BROKER_KEY_FILE` | path to a secret | none | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
+| `IAAM_DATABASE` | path to the database | `$XDG_DATA_HOME/iaam/iaam.db`, else `$HOME/.local/share/iaam/iaam.db` | every command, including `serve` |
+| `IAAM_BROKER_KEY_FILE` | path to a secret | `$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key` | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
 | `IAAM_BROKER_EGRESS` | `off` or `on` | `off` | `serve`, broker examples, ignored live sandbox test |
 | `/var/lib/iaam/egress` | compiled persistent state directory, required when broker egress is `on` | fixed path | `serve`, broker examples, ignored live sandbox test |
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
@@ -198,12 +214,46 @@ open breakers are still lost on restart.
 | `IAAM_SOURCE_PROFILES` | path to a read-only directory | none | `serve` |
 | `RUST_LOG` | optional | `info` | `serve` |
 
+With no `HOME` and no override, a command refuses and names the variables
+that would supply the place:
+
+```console
+$ env -u HOME -u XDG_DATA_HOME -u XDG_CONFIG_HOME iaam status
+error: no place for the instance's database: set IAAM_DATABASE, or XDG_DATA_HOME, or HOME; none of them is set
+$ echo $?
+1
+```
+
+The short forms need no variable at all. `iaam status` first, then the one
+creating command, then the refusal that proves every other command refuses
+rather than create:
+
+```console
+$ iaam status
+database: /home/dev/.local/share/iaam/iaam.db (default; absent)
+broker key: /home/dev/.config/iaam/broker-key (default; absent)
+$ iaam token issue --label console
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim --label <label>`, no other command creates one
+$ iaam claim --label console
+1f0c…  (64 hexadecimal characters, on one line)
+$ iaam status
+database: /home/dev/.local/share/iaam/iaam.db (default; present)
+broker key: /home/dev/.config/iaam/broker-key (default; absent)
+```
+
+`IAAM_DATABASE` and `IAAM_BROKER_KEY_FILE` still override the places when a
+deployment names them; every example below that passes them is a service or
+a container, which name their paths explicitly.
+
 `IAAM_BROKER_KEY_FILE` is optional for `serve` only in the sense that a service
-that never talks to a broker can run without it. If it is set and the file is
-absent, `serve` refuses to start rather than starting silently without
-encryption. Broker routes that **use** a credential — a sync, anything that
-decrypts — answer `{"code":"not_configured", …}` on a server started without it,
-and the fix is a restart with the key, not a different call.
+that never talks to a broker can run without it. `serve` reads the key from
+the resolved place when a file is there. When the place was named by the
+variable and the file is absent, `serve` refuses to start rather than
+starting silently without encryption; when only the default place is empty,
+it starts without encryption. Broker routes that **use** a credential — a
+sync, anything that decrypts — answer `{"code":"not_configured", …}` on a
+server started without a key, and the fix is a restart with the key, not a
+different call.
 `GET /v1/broker-access` is not one of them: it lists metadata, decrypts nothing,
 and answers `200` with or without the key (§6.2).
 
@@ -293,7 +343,7 @@ conversation.
 
 | Secret | Where it lives | How it is created |
 |---|---|---|
-| broker encryption key | a file outside the database, mode `0600`, e.g. `/etc/iaam/broker-key` | `iaam broker key generate` (§6.1) |
+| broker encryption key | a file outside the database, mode `0600`, at `$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key`; `IAAM_BROKER_KEY_FILE` names a different place. The key lives apart from the data on purpose: copying the data directory does not carry the key | `iaam broker key generate` (§6.1) |
 | owner token | the operator's password manager; only its hash is in the database | `iaam claim` (§3.5, §4.4) |
 | agent / read-only tokens | the agent host's configuration | `POST /v1/tokens` (§7) |
 | the broker's own token | nowhere in configuration — it is pasted on standard input and stored only as ciphertext | `iaam broker access add` (§6.3) |
@@ -394,9 +444,11 @@ Usage: iaam <COMMAND>
 
 Commands:
   serve   Run the iaam server
+  status  Show where the instance's database and broker key live
   claim   Claim a fresh instance and print its owner token once
   token   Manage API tokens
   broker  Manage broker credentials and access
+  bundle  Move an instance's transferable state in and out of a file (§14)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -458,8 +510,10 @@ visit (§7.3), not the instance.
 
 **On failure** — `error: SQLite error: unable to open database file:
 /var/lib/iaam/iaam.db` is §3.4 not done: the directory exists but the container's
-uid cannot write to it. `error: variable IAAM_DATABASE is not set …` is a missing
-`--env`, supplied by whoever writes the run command.
+uid cannot write to it. `error: no place for the instance's database: set
+IAAM_DATABASE, …` is a missing `--env`: the image sets no `HOME`, so inside
+a container there is no default place. Supplied by whoever writes the run
+command.
 
 ### 3.6 Start the service
 
@@ -1074,7 +1128,8 @@ supplies what is missing and with which command.
 
 | Message | Meaning | Fix |
 |---|---|---|
-| `error: variable IAAM_DATABASE is not set; set it (allowed values: database file path)` | no database path given; there is no default | whoever writes the run command: add `--env IAAM_DATABASE=/var/lib/iaam/iaam.db` or `Environment=IAAM_DATABASE=…` |
+| `error: no place for the instance's database: set IAAM_DATABASE, or XDG_DATA_HOME, or HOME; none of them is set` | no database path given and no home to hang the default place on — a bare container has no `HOME` | whoever writes the run command: add `--env IAAM_DATABASE=/var/lib/iaam/iaam.db` or `Environment=IAAM_DATABASE=…` |
+| ``error: no database at <path>: a database is created only by `iaam claim --label <label>`, no other command creates one`` | the resolved place holds no database, and the command created nothing there | the owner, at a console: `iaam claim --label console` (§2.1, §3.5, §4.4) |
 | `error: variable IAAM_LISTEN is invalid: 8080; allowed values: socket address such as 127.0.0.1:8080` | a port without a host | use `0.0.0.0:8080` in a container, `127.0.0.1:8080` on a host |
 | ``error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue` `` | a retired provisioning variable is set (§2.4) | remove it from the unit, profile or compose file and run the subcommand |
 | `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue --scope owner` (§7.3) |

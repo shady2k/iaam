@@ -28,7 +28,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -79,6 +79,16 @@ pub enum StoreError {
     SchemaGenerationMismatch { found: u32, current: u32 },
     #[error("record {what} {id} not found in database")]
     NotFound { what: &'static str, id: String },
+    /// No database file exists at the path this command resolved. Separate
+    /// from `Sqlite` so the message can say who may create the file: only
+    /// `iaam claim` does, and a command that opened with create-if-missing
+    /// would leave an empty database in the place a lost portfolio would
+    /// look exactly like.
+    #[error(
+        "no database at {path}: a database is created only by \
+         `iaam claim --label <label>`, no other command creates one"
+    )]
+    DatabaseMissing { path: String },
     #[error("active alias {namespace}:{value} not found for instrument {instrument}")]
     AliasNotFoundForInstrument {
         namespace: &'static str,
@@ -253,6 +263,30 @@ impl SqliteStore {
         Self::prepare(conn)
     }
 
+    /// Opens an existing database file and applies migrations, and never
+    /// creates one.
+    ///
+    /// SQLite's create-if-missing open ([`Self::open`]) would answer a
+    /// command whose database is simply somewhere else with a brand-new
+    /// empty database under the default path — a lost portfolio made of
+    /// silence. Only the claim command may create a database; every other
+    /// caller opens with this and refuses with [`StoreError::DatabaseMissing`],
+    /// naming the place it looked at. The flags say `READ_WRITE` without
+    /// `CREATE` so that even a race with the file's deletion cannot make
+    /// SQLite manufacture an empty one.
+    pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
+        if !path.is_file() {
+            return Err(StoreError::DatabaseMissing {
+                path: path.display().to_string(),
+            });
+        }
+        // One flag, not the default set: `READ_WRITE` without `CREATE` is
+        // the whole contract. The `URI` flag of a default open would parse
+        // `?` in an ordinary filename, and the store owns its connection
+        // exclusively, so the extra mutex mode buys nothing here.
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        Self::prepare(conn)
+    }
     /// In-memory database. Needed by tests: a file-based database leaves
     /// residue in the test and makes tests dependent on one another.
     pub fn open_in_memory() -> Result<Self, StoreError> {
@@ -374,5 +408,42 @@ mod tests {
             parsed.year() >= 2025,
             "timestamp is not from a previous century: {stamp}"
         );
+    }
+
+    #[test]
+    fn open_existing_refuses_a_missing_database_and_creates_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+
+        let error = match SqliteStore::open_existing(&path) {
+            Ok(_) => panic!("a missing database is refused, never created"),
+            Err(error) => error,
+        };
+
+        let text = error.to_string();
+        assert!(
+            text.contains(&path.display().to_string()),
+            "names the path: {text}"
+        );
+        assert!(
+            text.contains("iaam claim"),
+            "names the creating command: {text}"
+        );
+        assert!(!path.exists(), "the refused open must not create the file");
+    }
+
+    #[test]
+    fn open_existing_opens_a_database_open_created() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-existing-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        drop(SqliteStore::open(&path).expect("creating open"));
+
+        SqliteStore::open_existing(&path).expect("existing database opens");
+
+        std::fs::remove_file(&path).expect("cleanup");
     }
 }

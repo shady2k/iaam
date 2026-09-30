@@ -1191,7 +1191,7 @@ mod tests {
             lookup_with(&[("IAAM_DATABASE", database.to_str().unwrap())]),
         )
         .await
-        .expect("claim resolves without a key place");
+        .unwrap();
 
         assert!(database.is_file(), "claim created the database");
         std::fs::remove_file(database).unwrap();

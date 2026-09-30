@@ -447,8 +447,7 @@ mod tests {
         // home directory. The places resolve; the key place is the only one
         // that may come back with a reason instead of a path.
         let places = Places::from_lookup(values(&[("IAAM_DATABASE", "/var/lib/iaam/iaam.db")]));
-        let places = places
-            .expect("the database place resolves without a key place: no command that needs no key may refuse here");
+        let places = places.unwrap();
         assert_eq!(
             places.database.path,
             std::path::Path::new("/var/lib/iaam/iaam.db")
@@ -490,10 +489,7 @@ mod tests {
             std::path::Path::new("/home/dev/.local/share/iaam/iaam.db")
         );
         assert_eq!(
-            places
-                .broker_key
-                .expect("the key place resolves under a home")
-                .path,
+            places.broker_key.unwrap().path,
             std::path::Path::new("/home/dev/.config/iaam/broker-key")
         );
     }

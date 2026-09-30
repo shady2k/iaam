@@ -254,13 +254,35 @@ impl SqliteStore {
         )
     }
 
+    /// The active credentials as names: one `(broker, environment)` pair per
+    /// distinct pair the owner holds, sorted, no secret of any kind.
+    ///
+    /// This is what `iaam status` prints ("which brokers are connected"), and
+    /// the only listing that answers without carrying a nonce or a ciphertext
+    /// out of the store.
+    pub fn active_broker_environments(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT broker, environment FROM broker_access
+             WHERE revoked_at IS NULL
+             ORDER BY broker, environment",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut pairs = Vec::new();
+        for row in rows {
+            pairs.push(row?);
+        }
+        Ok(pairs)
+    }
+
     /// Revoke access.
     ///
     /// Not deletion: revoked access remains part of the history—“when the
     /// system stopped accessing the broker” is a question
     /// that needs an answer.
     ///
-    /// All accesses for all owners, including revoked ones.
+    /// All of the owner's accesses, including revoked ones.
     pub fn all_broker_access_history(&self) -> Result<Vec<BrokerAccess>, StoreError> {
         let mut statement = self
             .conn
@@ -339,6 +361,61 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_fixture(
+        store: &mut SqliteStore,
+        owner: OwnerId,
+        broker: &str,
+        environment: &str,
+    ) -> Uuid {
+        let access = NewBrokerAccess {
+            id: Uuid::new_v4(),
+            owner,
+            broker: BrokerCode::parse(broker).unwrap(),
+            environment: environment.to_owned(),
+            scope: "read_only".to_owned(),
+            nonce: vec![1, 2, 3],
+            ciphertext: vec![4, 5, 6],
+        };
+        let id = access.id;
+        store.insert_broker_access(&access).unwrap();
+        id
+    }
+
+    #[test]
+    fn active_environments_list_each_pair_once_and_skip_revoked() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let owner = OwnerId::new_random();
+
+        assert!(store.active_broker_environments().unwrap().is_empty());
+
+        insert_fixture(&mut store, owner, "tinkoff", "sandbox");
+        insert_fixture(&mut store, owner, "tinkoff", "prod");
+        insert_fixture(&mut store, owner, "finam", "prod");
+        assert_eq!(
+            store.active_broker_environments().unwrap(),
+            vec![
+                ("finam".to_owned(), "prod".to_owned()),
+                ("tinkoff".to_owned(), "prod".to_owned()),
+                ("tinkoff".to_owned(), "sandbox".to_owned()),
+            ],
+            "sorted by broker then environment, one pair per distinct pair"
+        );
+
+        let active = store
+            .find_broker_access(owner, &BrokerCode::parse("finam").unwrap(), "prod")
+            .unwrap()
+            .unwrap();
+        store.revoke_broker_access(owner, active.id).unwrap();
+        assert_eq!(
+            store.active_broker_environments().unwrap(),
+            vec![
+                ("tinkoff".to_owned(), "prod".to_owned()),
+                ("tinkoff".to_owned(), "sandbox".to_owned()),
+            ],
+            "a revoked credential is not a connected broker"
+        );
+    }
 
     #[test]
     fn access_and_dictionary_are_rolled_back_together() {

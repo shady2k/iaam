@@ -6508,6 +6508,9 @@ async fn broker_sync_returns_the_scenario_outcome() {
     assert_eq!(response["binding_recorded"], false);
     assert_eq!(response["recorded"], json!([]));
     assert_eq!(response["duplicates"], 0);
+    // The set-aside count rides every sync answer, empty included
+    // (iaam-vg8te.1.2): a client reads the row list for the reasons.
+    assert_eq!(response["set_aside"], 0);
     assert_eq!(response["assertions"], 0);
     assert!(!response.to_string().contains(BROKER_TOKEN), "{response}");
 }
@@ -35648,15 +35651,22 @@ async fn a_market_source_that_refuses_answers_502() {
     );
 }
 
+/// A broker answer that cannot be read as a whole is the source's answer
+/// failing, not our store: 502 with `source_unreadable`, like the source
+/// refusing — calling again unchanged gets the same unreadable answer
+/// (iaam-vg8te.1.2).
 #[tokio::test]
-async fn an_unparsable_broker_answer_is_still_500() {
+async fn an_unparsable_broker_answer_is_the_source_unreadable_not_the_store() {
     let (status, _headers, response) = sync_through_failing_broker(BrokerError::Unparsable {
         broker: "tinkoff".to_owned(),
         detail: "not JSON".to_owned(),
     })
     .await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{response}");
-    assert_eq!(response["code"], "store_unavailable");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+    assert_eq!(response["code"], "source_unreadable");
+    let message = response["message"].as_str().expect("a message");
+    assert!(message.contains("tinkoff"), "{message}");
+    assert!(message.contains("not JSON"), "{message}");
 }
 
 #[tokio::test]
@@ -35677,6 +35687,8 @@ async fn the_broker_sync_openapi_declares_its_ceiling_unreachable_and_refusing_a
         .as_str()
         .unwrap_or_else(|| panic!("the sync route declares no 502: {responses}"));
     assert!(refused.contains("refused"), "{refused}");
+    assert!(refused.contains("source_refused"), "{refused}");
+    assert!(refused.contains("source_unreadable"), "{refused}");
     let ceiling = responses["422"]["description"]
         .as_str()
         .unwrap_or_else(|| panic!("the sync route declares no 422: {responses}"));

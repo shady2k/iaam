@@ -911,6 +911,80 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
     );
 }
 
+/// A portfolio row the channel reported and this system could not turn into
+/// a claim is set aside like a quarantined operation: it reaches the owner
+/// in the sync's answer with its reason, the answer counts it, the readable
+/// claims still import, and the row stands in the journal as a coverage gap
+/// naming the positions dimension (iaam-vg8te.1.2).
+#[tokio::test]
+async fn a_refused_position_reaches_the_owner_counted_and_gapped() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    let operation = trade_without_custody(account, instrument);
+    let mut broker = api(account, SourceId::new_random(), operation);
+    broker.operations = Ok(ParsedOperations {
+        accepted: Vec::new(),
+        quarantined: Vec::new(),
+    });
+    broker.portfolio = Ok(PortfolioSnapshot {
+        as_of: PortfolioAsOf::Current,
+        claims: vec![cash_opening_claim()],
+        refused: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::json!({"symbol": "SBER@MISX", "quantity": {"value": "10"}}),
+            reason: "symbol SBER@MISX is not resolved to an instrument".to_owned(),
+            dimensions: dimensions(&[Dimension::Positions]),
+        }],
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    // The set-aside row reaches the owner in the sync's answer, with its
+    // reason.
+    assert!(
+        outcome.recorded.iter().any(|verdict| matches!(
+            verdict,
+            Verdict::Quarantined { reason }
+                if reason.contains("not resolved to an instrument")
+        )),
+        "{:?}",
+        outcome.recorded
+    );
+    // The answer counts every row set aside.
+    assert_eq!(outcome.set_aside, 1);
+    // The readable claim still imported.
+    assert_eq!(outcome.assertions, 1);
+    // And the row stands in the journal as a coverage gap naming positions.
+    let events = load_all(&services, owner).await;
+    let gap = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ImportCoverageGap {
+                dimensions,
+                refused,
+                ..
+            } => Some((dimensions, refused)),
+            _ => None,
+        })
+        .expect("coverage gap");
+    assert_eq!(gap.0, &dimensions(&[Dimension::Positions]));
+    assert_eq!(*gap.1, 1);
+}
+
 #[tokio::test]
 async fn repeating_refused_sync_appends_one_coverage_gap() {
     let owner = OwnerId::new_random();
@@ -2789,14 +2863,24 @@ async fn a_broker_refusal_is_not_a_store_failure() {
     }
 }
 
+/// An answer that cannot be read is the source's answer failing, not our
+/// store: the classification says whose side failed, and a repeat of the
+/// same call meets the same unreadable answer (iaam-vg8te.1.2).
 #[tokio::test]
-async fn an_unparsable_broker_answer_is_still_our_failure() {
+async fn an_unparsable_broker_answer_is_the_source_unreadable() {
     let error = sync_error(&failing_broker(BrokerError::Unparsable {
         broker: "test".to_owned(),
         detail: "not json".to_owned(),
     }))
     .await;
-    assert!(matches!(error, AppError::Store(_)), "{error:?}");
+    match &error {
+        AppError::SourceUnreadable { origin, detail } => {
+            assert_eq!(origin, "test");
+            assert_eq!(detail, "not json");
+            assert_eq!(error.code(), "source_unreadable");
+        }
+        other => panic!("expected a source-unreadable classification, got {other:?}"),
+    }
 }
 
 /// **Nothing is written until both of the broker's answers are in.** A sync

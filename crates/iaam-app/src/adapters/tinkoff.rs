@@ -148,6 +148,11 @@ impl BrokerChannel for TinkoffChannel {
 /// Turns the channel's portfolio answer into claims, refusing any instrument
 /// two rows disagree about instead of guessing which one is right.
 ///
+/// A row the parser could not read whole travels in `refused` beside the
+/// duplicate refusals, each with its reason and its original JSON — one
+/// instrument's unreadable row withholds an opinion about that instrument,
+/// not about the rest of the holdings (`iaam-vg8te.1.2`).
+///
 /// `parse_portfolio` still does the lossy projection (§`parse_portfolio`'s
 /// own doc comment): one `ControlClaim::PositionQuantity` per row, with no
 /// way for either of two rows for one instrument to say why there are two.
@@ -157,11 +162,11 @@ impl BrokerChannel for TinkoffChannel {
 /// row, and reports the dropped rows as `refused` instead of silently
 /// discarding an opinion the channel never gave.
 fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
-    let claims = parse_portfolio(body).map_err(parse_error)?;
+    let parsed = parse_portfolio(body).map_err(parse_error)?;
     let positions = parse_portfolio_positions(body).map_err(parse_error)?;
 
     let mut by_instrument: HashMap<&str, Vec<&ChannelPortfolioPosition>> = HashMap::new();
-    for position in &positions {
+    for position in &positions.positions {
         by_instrument
             .entry(position.instrument_uid.as_str())
             .or_default()
@@ -172,12 +177,27 @@ fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
         .filter(|(_, rows)| rows.len() > 1)
         .map(|(instrument, _)| *instrument)
         .collect();
-    let refused = duplicated
+    // Rows the parser set aside come first, in the channel's own order; the
+    // duplicate refusals follow them.
+    let mut refused: Vec<Quarantined> = parsed
+        .refused
         .iter()
-        .map(|instrument| duplicate_position_refusal(instrument, &by_instrument[instrument]))
+        .map(|row| Quarantined {
+            raw: row.raw.clone(),
+            // The same refusal shape the operations path prints: the named
+            // variant for the machine, the sentence for the owner.
+            reason: format!("{:?}: {}", row.reason, row.reason),
+            dimensions: [Dimension::Positions].into_iter().collect(),
+        })
         .collect();
+    refused.extend(
+        duplicated
+            .iter()
+            .map(|instrument| duplicate_position_refusal(instrument, &by_instrument[instrument])),
+    );
 
-    let claims = claims
+    let claims = parsed
+        .claims
         .into_iter()
         .filter(|claim| match claim {
             ControlClaim::PositionQuantity { instrument, .. } => {
@@ -2493,6 +2513,45 @@ mod tests {
         );
     }
 
+    /// A row whose identifier is not a UUID is set aside beside the claims,
+    /// with its reason and its own JSON — the sync must not stop on it, and
+    /// the readable rows must still import (iaam-vg8te.1.2).
+    #[test]
+    fn a_position_with_an_unreadable_identifier_is_set_aside_beside_the_claims() {
+        let body = r#"{
+            "positions": [
+                {
+                    "instrumentType": "share",
+                    "quantity": {"units": "3", "nano": 0},
+                    "positionUid": "bbbbbbbb-0000-0000-0000-000000000001",
+                    "instrumentUid": "dddddddd-0000-0000-0000-000000000042",
+                    "blocked": false
+                },
+                {
+                    "quantity": {"units": "1", "nano": 0},
+                    "positionUid": "not-a-uuid",
+                    "instrumentUid": "also-not-a-uuid"
+                }
+            ]
+        }"#;
+
+        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+
+        assert_eq!(snapshot.claims.len(), 1, "{:?}", snapshot.claims);
+        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
+        let refusal = &snapshot.refused[0];
+        assert!(refusal.reason.contains("not a UUID"), "{}", refusal.reason);
+        assert!(
+            refusal.reason.contains("also-not-a-uuid"),
+            "{}",
+            refusal.reason
+        );
+        assert_eq!(
+            refusal.dimensions,
+            [Dimension::Positions].into_iter().collect()
+        );
+    }
+
     /// An opening position assertion of nothing held, for the instrument and
     /// depository the portfolio claim names.
     ///
@@ -2537,6 +2596,7 @@ mod tests {
             "../../../../tests/fixtures/api/tinkoff-portfolio.json"
         ))
         .expect("portfolio parsing")
+        .claims
         .into_iter()
         .find(|claim| matches!(claim, ControlClaim::PositionQuantity { .. }))
         .expect("SBER position claim");

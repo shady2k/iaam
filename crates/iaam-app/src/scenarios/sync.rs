@@ -57,6 +57,11 @@ pub struct SyncOutcome {
     pub recorded: Vec<Verdict>,
     pub duplicates: usize,
     pub possible_duplicates: usize,
+    /// Rows this synchronisation set aside with a reason instead of
+    /// recording — rejected as unreadable, or quarantined as unrecordable.
+    /// A count over `recorded`, published because the owner asks "how much
+    /// did not come through" before reading the rows (iaam-vg8te.1.2).
+    pub set_aside: usize,
     pub assertions: usize,
     pub assertions_withheld: Option<AssertionsWithheld>,
     /// True when this sync recorded the binding itself: no binding stood,
@@ -266,10 +271,19 @@ pub async fn sync_broker(
     let mut possible_duplicates = 0;
     // Every refused row is named. A row the source identified is keyed by that
     // identifier; one it did not is keyed by a fingerprint of its raw payload,
-    // which a later import of the same unchanged row reproduces exactly.
+    // which a later import of the same unchanged row reproduces exactly. A
+    // portfolio row the channel reported but nothing here could turn into a
+    // claim is refused the same way — an operation and a position are set
+    // aside alike (iaam-vg8te.1.2).
     let mut refusals: Vec<RefusedRow> = parsed
         .quarantined
         .iter()
+        .chain(
+            snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.refused.as_slice())
+                .unwrap_or_default(),
+        )
         .map(|row| RefusedRow {
             key: SourceRowKey {
                 source: channel.source,
@@ -350,10 +364,20 @@ pub async fn sync_broker(
     }
 
     // A refused row is reported whatever else happens to this response: its
-    // reason names what is missing, and it reaches the owner nowhere else.
+    // reason names what is missing, and it reaches the owner nowhere else. A
+    // set-aside position row reaches the owner the same way.
     recorded.extend(parsed.quarantined.iter().map(|row| Verdict::Quarantined {
         reason: row.reason.clone(),
     }));
+    recorded.extend(
+        snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.refused.iter())
+            .unwrap_or_default()
+            .map(|row| Verdict::Quarantined {
+                reason: row.reason.clone(),
+            }),
+    );
     u32::try_from(refusals.len()).map_err(|_| AppError::Invalid {
         field: "refused".to_owned(),
         expected: "at most u32::MAX rows".to_owned(),
@@ -399,10 +423,12 @@ pub async fn sync_broker(
     // why no portfolio was fetched for it; refusals only add the coverage gap
     // above and do not suppress the portfolio answer.
     let Some(snapshot) = snapshot else {
+        let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
             duplicates,
             possible_duplicates,
+            set_aside,
             assertions: 0,
             assertions_withheld: None,
             binding_recorded,
@@ -416,10 +442,12 @@ pub async fn sync_broker(
         }
     };
     if assertions_withheld.is_some() {
+        let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
             duplicates,
             possible_duplicates,
+            set_aside,
             assertions: 0,
             assertions_withheld,
             binding_recorded,
@@ -466,10 +494,12 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
+    let set_aside = set_aside(&recorded);
     Ok(SyncOutcome {
         recorded,
         duplicates,
         possible_duplicates,
+        set_aside,
         assertions,
         assertions_withheld: None,
         binding_recorded,
@@ -502,13 +532,34 @@ fn broker_error(error: crate::ports::BrokerError) -> AppError {
             origin: broker,
             detail: format!("{detail}; check the broker access configured for this owner"),
         },
-        other @ (BrokerError::Unparsable { .. }
-        | BrokerError::Adapter { .. }
+        // An answer that cannot be read is the source's answer failing, not
+        // our store: the classification alone says whose side failed, and a
+        // repeat of the same call meets the same unreadable answer.
+        BrokerError::Unparsable { broker, detail } => AppError::SourceUnreadable {
+            origin: broker,
+            detail,
+        },
+        other @ (BrokerError::Adapter { .. }
         | BrokerError::NoAccess { .. }
         | BrokerError::ScopeNotReadOnly { .. }) => {
             AppError::Store(format!("broker synchronisation: {other}"))
         }
     }
+}
+
+/// Rows this synchronisation set aside: refused with a reason rather than
+/// recorded. Derived over the answer's own verdicts, so the count and the
+/// list cannot disagree.
+fn set_aside(recorded: &[Verdict]) -> usize {
+    recorded
+        .iter()
+        .filter(|verdict| {
+            matches!(
+                verdict,
+                Verdict::Rejected { .. } | Verdict::Quarantined { .. }
+            )
+        })
+        .count()
 }
 
 /// Fingerprint of a raw source row, for a row the source did not identify.

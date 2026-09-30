@@ -4,6 +4,7 @@ use iaam_core::event::provenance::ParserVersion;
 // `finam::ChannelOperationKind` continue to mean the same type:
 // channel names remain familiar while the type behind them is shared.
 pub use crate::operation_kind::ChannelOperationKind;
+use iaam_core::ids::InstrumentId;
 use iaam_core::money::{CalcMoney, CurrencyCode, PostedMinor, Quantity};
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
 use serde::Deserialize;
@@ -205,6 +206,40 @@ pub fn parse_operations(body: &str) -> Result<OperationsPage, ParseError> {
     })
 }
 
+/// A portfolio answer: the claims read from it, and the position rows that
+/// could not become claims.
+///
+/// `refused` carries each unfit row with its reason and its original JSON,
+/// exactly as [`parse_operations`] carries a rejected operation: the
+/// readable rows still become claims, and the unfit rows reach the owner
+/// instead of stopping the sync (iaam-vg8te.1.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPortfolio {
+    pub claims: Vec<ControlClaim>,
+    pub refused: Vec<RefusedPosition>,
+}
+
+/// One portfolio row the channel reported that could not become a claim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefusedPosition {
+    /// The row as the channel printed it, kept beside the reason so the
+    /// owner can read what was set aside.
+    pub raw: Value,
+    pub reason: ParseError,
+}
+
+/// The portfolio positions with everything the response stated about them,
+/// and the rows that could not be read at all.
+///
+/// Both portfolio readers share one acceptance rule — a row is read whole or
+/// refused whole — so the duplicate guard that compares this page's rows
+/// against `parse_portfolio`'s claims compares like with like.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPortfolioPositions {
+    pub positions: Vec<ChannelPortfolioPosition>,
+    pub refused: Vec<RefusedPosition>,
+}
+
 /// Parse portfolio cash and positions into control claims.
 ///
 /// A control claim can only say what `ControlClaim::PositionQuantity`
@@ -215,44 +250,121 @@ pub fn parse_operations(body: &str) -> Result<OperationsPage, ParseError> {
 /// [`ChannelPortfolioPosition`] and reachable through
 /// [`parse_portfolio_positions`], the boundary that keeps it available to a
 /// caller that can eventually express it.
-pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
-    let response: RawPortfolioResponse = parse_json(body)?;
+///
+/// A position row that cannot be read whole is set aside with its reason and
+/// its original JSON instead of refusing the answer: one instrument's
+/// unreadable row withholds an opinion about that instrument, not about the
+/// rest of the holdings (`iaam-vg8te.1.2`). A currency row that cannot be
+/// read is refused the same way.
+pub fn parse_portfolio(body: &str) -> Result<ParsedPortfolio, ParseError> {
+    let (rows, mut refused) = read_position_rows(body)?;
     let mut claims = Vec::new();
-    for position in response.positions.unwrap_or_default() {
-        if position.instrument_type.as_deref() == Some("currency") {
-            let quantity = position
-                .quantity
-                .as_ref()
-                .ok_or(ParseError::MissingField { field: "quantity" })?;
-            let currency = position_currency(&position)?;
-            let money = parse_money(
-                &RawMoneyValue {
-                    units: quantity.units.clone(),
-                    nano: quantity.nano,
-                    currency: Some(currency.code().to_owned()),
-                },
-                "quantity",
-            )?;
-            claims.push(ControlClaim::CashBalance {
-                currency: money.currency,
-                amount: money.amount,
-                at: BalancePoint::Closing,
-            });
-            continue;
+    for row in rows {
+        let claim = if row.position.instrument_type.as_deref() == Some("currency") {
+            currency_claim(&row.position)
+        } else {
+            // The shared row helper keeps everything the response stated
+            // about the position; the claim can still carry only the
+            // quantity. Custody is gone from the claim because a position is
+            // an account and an instrument (iaam-xep0), and this channel's
+            // handle was never a place anyway.
+            position_claim(&row.position)
+        };
+        match claim {
+            Ok(claim) => claims.push(claim),
+            Err(reason) => refused.push(RefusedPosition {
+                raw: row.raw,
+                reason,
+            }),
         }
-
-        // The shared row helper keeps everything the response stated about the
-        // position; the claim can still carry only the quantity. Custody is gone
-        // from the claim because a position is an account and an instrument
-        // (iaam-xep0), and this channel's handle was never a place anyway.
-        let parsed = parse_portfolio_position_row(&position)?;
-        claims.push(ControlClaim::PositionQuantity {
-            instrument: parse_identifier(&parsed.instrument_uid, "instrumentUid")?,
-            quantity: parsed.quantity,
-            at: BalancePoint::Closing,
-        });
     }
-    Ok(claims)
+    Ok(ParsedPortfolio { claims, refused })
+}
+
+/// One read position row: the row as printed, beside the typed shape both
+/// portfolio readers project it into.
+struct ReadPositionRow {
+    raw: Value,
+    position: RawPortfolioPosition,
+}
+
+/// The response's position rows, each either typed or refused with its
+/// reason.
+///
+/// One deserialisation pass shared by [`parse_portfolio`] and
+/// [`parse_portfolio_positions`], so the two readers of one body cannot
+/// disagree about which rows it held.
+fn read_position_rows(
+    body: &str,
+) -> Result<(Vec<ReadPositionRow>, Vec<RefusedPosition>), ParseError> {
+    let response: RawPortfolioResponse = parse_json(body)?;
+    let mut rows = Vec::new();
+    let mut refused = Vec::new();
+    for raw in response.positions.unwrap_or_default() {
+        match serde_json::from_value::<RawPortfolioPosition>(raw.clone()) {
+            Ok(position) => rows.push(ReadPositionRow { raw, position }),
+            Err(error) => refused.push(RefusedPosition {
+                raw,
+                reason: ParseError::Json(error.to_string()),
+            }),
+        }
+    }
+    Ok((rows, refused))
+}
+
+/// A currency position row as the cash claim it is.
+fn currency_claim(position: &RawPortfolioPosition) -> Result<ControlClaim, ParseError> {
+    let quantity = position
+        .quantity
+        .as_ref()
+        .ok_or(ParseError::MissingField { field: "quantity" })?;
+    let currency = position_currency(position)?;
+    let money = parse_money(
+        &RawMoneyValue {
+            units: quantity.units.clone(),
+            nano: quantity.nano,
+            currency: Some(currency.code().to_owned()),
+        },
+        "quantity",
+    )?;
+    Ok(ControlClaim::CashBalance {
+        currency: money.currency,
+        amount: money.amount,
+        at: BalancePoint::Closing,
+    })
+}
+
+/// A security position row as the single claim this channel can state about
+/// it: the row is read whole — quantity, both identifiers, the stated lots —
+/// or refused whole, so both portfolio readers accept exactly the same rows.
+fn position_claim(position: &RawPortfolioPosition) -> Result<ControlClaim, ParseError> {
+    let parsed = read_position(position)?;
+    let instrument: InstrumentId =
+        serde_json::from_value(Value::String(parsed.instrument_uid.clone())).map_err(|_| {
+            ParseError::InvalidIdentifier {
+                field: "instrumentUid",
+                value: parsed.instrument_uid.clone(),
+            }
+        })?;
+    Ok(ControlClaim::PositionQuantity {
+        instrument,
+        quantity: parsed.quantity,
+        at: BalancePoint::Closing,
+    })
+}
+
+/// One non-currency portfolio position as the response stated it, read
+/// whole: the quantity, both identifiers and every stated lot must parse, or
+/// the row is refused rather than carried half-read.
+fn read_position(position: &RawPortfolioPosition) -> Result<ChannelPortfolioPosition, ParseError> {
+    let parsed = parse_portfolio_position_row(position)?;
+    serde_json::from_value::<InstrumentId>(Value::String(parsed.instrument_uid.clone())).map_err(
+        |_| ParseError::InvalidIdentifier {
+            field: "instrumentUid",
+            value: parsed.instrument_uid.clone(),
+        },
+    )?;
+    Ok(parsed)
 }
 
 /// One non-currency portfolio position as the response stated it, before it
@@ -305,15 +417,22 @@ pub struct ChannelPortfolioPosition {
 /// `CashBalance` claims rather than `PositionQuantity` ones, and an
 /// encumbrance on cash is a different concept this parser has not been asked
 /// to represent.
-pub fn parse_portfolio_positions(body: &str) -> Result<Vec<ChannelPortfolioPosition>, ParseError> {
-    let response: RawPortfolioResponse = parse_json(body)?;
-    response
-        .positions
-        .unwrap_or_default()
-        .iter()
-        .filter(|position| position.instrument_type.as_deref() != Some("currency"))
-        .map(parse_portfolio_position_row)
-        .collect()
+pub fn parse_portfolio_positions(body: &str) -> Result<ParsedPortfolioPositions, ParseError> {
+    let (rows, mut refused) = read_position_rows(body)?;
+    let mut positions = Vec::new();
+    for row in rows {
+        if row.position.instrument_type.as_deref() == Some("currency") {
+            continue;
+        }
+        match read_position(&row.position) {
+            Ok(position) => positions.push(position),
+            Err(reason) => refused.push(RefusedPosition {
+                raw: row.raw,
+                reason,
+            }),
+        }
+    }
+    Ok(ParsedPortfolioPositions { positions, refused })
 }
 
 /// The account identifiers this access sees, from `UsersService/GetAccounts`
@@ -726,18 +845,6 @@ fn decimal_text(value: &RawQuotation, field: &'static str) -> Result<String, Par
     Ok(format!("{sign}{whole}.{fraction_text}"))
 }
 
-fn parse_identifier<T: DeserializeOwned>(
-    value: &str,
-    field: &'static str,
-) -> Result<T, ParseError> {
-    serde_json::from_value(Value::String(value.to_owned())).map_err(|_| {
-        ParseError::InvalidIdentifier {
-            field,
-            value: value.to_owned(),
-        }
-    })
-}
-
 fn parse_currency(value: &str) -> Result<CurrencyCode, ParseError> {
     match value.to_ascii_lowercase().as_str() {
         "rub" => Ok(CurrencyCode::Rub),
@@ -893,7 +1000,7 @@ struct RawTrade {
 /// guessed at.
 #[derive(Debug, Deserialize)]
 struct RawPortfolioResponse {
-    positions: Option<Vec<RawPortfolioPosition>>,
+    positions: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize)]

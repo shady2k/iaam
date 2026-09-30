@@ -243,16 +243,27 @@ fn adapt_operations(
 /// Turns the channel's portfolio answer into a snapshot.
 ///
 /// Finam's account answer is its present holdings: the snapshot is recorded
-/// as a current fact, whatever date was asked. `parse_portfolio` refuses a
-/// row it cannot read by refusing the whole answer with that reason — there
-/// is no partial snapshot for this channel, so nothing is dropped and
-/// nothing is guessed.
+/// as a current fact, whatever date was asked. A position row the parser
+/// set aside travels in `refused` with its reason and its original JSON, the
+/// way a quarantined operation does — one instrument's unreadable row
+/// withholds an opinion about that instrument, not about the rest of the
+/// holdings (`iaam-vg8te.1.2`).
 fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
-    let claims = parse_portfolio(body).map_err(parse_error)?;
+    let parsed = parse_portfolio(body).map_err(parse_error)?;
     Ok(PortfolioSnapshot {
         as_of: PortfolioAsOf::Current,
-        claims,
-        refused: Vec::new(),
+        claims: parsed.claims,
+        refused: parsed
+            .refused
+            .into_iter()
+            .map(|row| Quarantined {
+                raw: row.raw,
+                // The same refusal shape the operations path prints: the
+                // named variant for the machine, the sentence for the owner.
+                reason: format!("{:?}: {}", row.reason, row.reason),
+                dimensions: [Dimension::Positions].into_iter().collect(),
+            })
+            .collect(),
     })
 }
 
@@ -1541,6 +1552,47 @@ mod tests {
             ControlClaim::PositionQuantity { quantity, .. }
                 if quantity.0.inner().to_string() == "7"
         )));
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_position_symbol_is_set_aside_beside_the_claims() {
+        let body = json!({
+            "cash": [ { "units": "100", "nanos": 0, "currencyCode": "rub" } ],
+            "positions": [
+                { "symbol": SYMBOL, "quantity": { "value": "7" } },
+                { "symbol": "SBER@MISX", "quantity": { "value": "10" } }
+            ],
+        })
+        .to_string();
+        let channel = channel(fake::gateway(vec![session_answer(), page(&body)], None).0);
+
+        let snapshot = channel
+            .fetch_portfolio(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("the portfolio is parsed");
+
+        // The readable row still becomes a claim beside the cash; only the
+        // row whose symbol nothing here can resolve is set aside, with its
+        // reason and its own JSON (iaam-vg8te.1.2).
+        assert_eq!(snapshot.claims.len(), 2, "{:?}", snapshot.claims);
+        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
+        let refused = &snapshot.refused[0];
+        assert_eq!(refused.raw["symbol"], json!("SBER@MISX"), "{refused:?}");
+        assert!(
+            refused.reason.contains("not resolved to an instrument"),
+            "{}",
+            refused.reason
+        );
+        assert_eq!(
+            refused.dimensions,
+            [Dimension::Positions].into_iter().collect(),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test]

@@ -529,6 +529,23 @@ impl ApiFailure {
                     ),
                 ),
             ),
+            // The source answered, and its answer cannot be read as the
+            // documents this system exchanges with it: 502, like a refusal —
+            // our store is fine, and calling again unchanged gets the same
+            // unreadable answer. The detail names what could not be read.
+            AppError::SourceUnreadable {
+                ref origin,
+                ref detail,
+            } => Self::new(
+                StatusCode::BAD_GATEWAY,
+                ApiError::simple(
+                    error.code(),
+                    format!(
+                        "the answer from {origin} could not be read: {detail}; calling again \
+                         unchanged gets the same answer"
+                    ),
+                ),
+            ),
             // The broker answered, but its access cannot name one account:
             // nothing is wrong with the request, and a retry cannot help.
             // The remedy is the owner's binding, which the 409 names in

@@ -135,10 +135,11 @@ fn refuses_a_partial_operations_page() {
 #[test]
 fn parses_portfolio_into_cash_and_position_claims() -> Result<(), Box<dyn Error>> {
     let body = include_str!("../../../tests/fixtures/api/tinkoff-portfolio.json");
-    let claims = parse_portfolio(body)?;
+    let parsed = parse_portfolio(body)?;
 
-    assert_eq!(claims.len(), 2);
-    assert!(claims.iter().any(|claim| matches!(
+    assert!(parsed.refused.is_empty(), "{:?}", parsed.refused);
+    assert_eq!(parsed.claims.len(), 2);
+    assert!(parsed.claims.iter().any(|claim| matches!(
         claim,
         ControlClaim::CashBalance {
             currency: CurrencyCode::Rub,
@@ -146,7 +147,7 @@ fn parses_portfolio_into_cash_and_position_claims() -> Result<(), Box<dyn Error>
             at: BalancePoint::Closing,
         } if *amount == PostedMinor::new(19_972_973)
     )));
-    assert!(claims.iter().any(|claim| matches!(
+    assert!(parsed.claims.iter().any(|claim| matches!(
         claim,
         ControlClaim::PositionQuantity {
             quantity,
@@ -155,7 +156,8 @@ fn parses_portfolio_into_cash_and_position_claims() -> Result<(), Box<dyn Error>
         } if quantity.0.inner().to_string() == "1"
     )));
     assert_eq!(
-        claims
+        parsed
+            .claims
             .iter()
             .filter(|claim| matches!(claim, ControlClaim::PositionQuantity { .. }))
             .count(),
@@ -166,7 +168,7 @@ fn parses_portfolio_into_cash_and_position_claims() -> Result<(), Box<dyn Error>
 
 #[test]
 fn maps_each_currency_position_without_aggregate_totals() -> Result<(), Box<dyn Error>> {
-    let claims = parse_portfolio(
+    let parsed = parse_portfolio(
         r#"{
             "totalAmountCurrencies": {"currency": "usd", "units": "999", "nano": 0},
             "positions": [
@@ -184,25 +186,27 @@ fn maps_each_currency_position_without_aggregate_totals() -> Result<(), Box<dyn 
         }"#,
     )?;
 
-    assert_eq!(claims.len(), 2);
-    assert!(claims.iter().any(|claim| matches!(
+    assert!(parsed.refused.is_empty(), "{:?}", parsed.refused);
+    assert_eq!(parsed.claims.len(), 2);
+    assert!(parsed.claims.iter().any(|claim| matches!(
         claim,
         ControlClaim::CashBalance {
             currency: CurrencyCode::Rub,
             amount,
-            at: BalancePoint::Closing,
+            ..
         } if *amount == PostedMinor::new(19_972_973)
     )));
-    assert!(claims.iter().any(|claim| matches!(
+    assert!(parsed.claims.iter().any(|claim| matches!(
         claim,
         ControlClaim::CashBalance {
             currency: CurrencyCode::Usd,
             amount,
-            at: BalancePoint::Closing,
+            ..
         } if *amount == PostedMinor::new(1_050)
     )));
     assert!(
-        !claims
+        !parsed
+            .claims
             .iter()
             .any(|claim| matches!(claim, ControlClaim::PositionQuantity { .. }))
     );
@@ -241,18 +245,43 @@ fn refuses_money_that_cannot_be_represented_in_minor_units() -> Result<(), Box<d
     Ok(())
 }
 
+/// One position row the channel printed with identifiers that are not UUIDs
+/// is set aside with its reason instead of refusing the whole answer: the
+/// readable row still becomes a claim, and the unfit row reaches the owner
+/// with its reason and its original JSON (iaam-vg8te.1.2).
 #[test]
-fn refuses_a_position_without_uuid_identifiers() {
-    let result = parse_portfolio(
+fn a_position_without_uuid_identifiers_is_set_aside_and_the_rest_imports() {
+    let parsed = parse_portfolio(
         r#"{
-            "positions": [{
-                "quantity": {"units": "1", "nano": 0},
-                "positionUid": "not-a-uuid",
-                "instrumentUid": "also-not-a-uuid"
-            }]
+            "positions": [
+                {
+                    "quantity": {"units": "1", "nano": 0},
+                    "positionUid": "not-a-uuid",
+                    "instrumentUid": "also-not-a-uuid"
+                },
+                {
+                    "quantity": {"units": "2", "nano": 0},
+                    "positionUid": "f1a60ae6-3f1e-43c8-8d46-042df0fdc97a",
+                    "instrumentUid": "1c004240-d18d-46e1-8ac1-2aa05ebfdb38"
+                }
+            ]
         }"#,
+    )
+    .expect("the answer parses: the unfit row is set aside, not fatal");
+
+    assert_eq!(parsed.claims.len(), 1, "{:?}", parsed.claims);
+    assert_eq!(parsed.refused.len(), 1, "{:?}", parsed.refused);
+    assert!(matches!(
+        &parsed.refused[0].reason,
+        ParseError::InvalidIdentifier {
+            field: "instrumentUid",
+            ..
+        }
+    ));
+    assert_eq!(
+        parsed.refused[0].raw["instrumentUid"],
+        serde_json::Value::String("also-not-a-uuid".to_owned())
     );
-    assert!(matches!(result, Err(ParseError::InvalidIdentifier { .. })));
 }
 
 /// This is the defect `iaam-1u7b` exists to fix, using the report's own
@@ -283,8 +312,14 @@ fn a_blocked_quantity_reported_by_the_broker_is_not_discarded() -> Result<(), Bo
         }]
     }"#;
 
-    let positions = parse_portfolio_positions(body)?;
-    let position = positions
+    let parsed_positions = parse_portfolio_positions(body)?;
+    assert!(
+        parsed_positions.refused.is_empty(),
+        "{:?}",
+        parsed_positions.refused
+    );
+    let position = parsed_positions
+        .positions
         .first()
         .ok_or("sample does not contain the position")?;
 
@@ -305,7 +340,7 @@ fn a_blocked_quantity_reported_by_the_broker_is_not_discarded() -> Result<(), Bo
         Some("10".to_owned())
     );
     assert_eq!(position.class_code.as_deref(), Some("TQBR"));
-    assert_eq!(positions.len(), 1);
+    assert_eq!(parsed_positions.positions.len(), 1);
 
     // `ControlClaim::PositionQuantity` still cannot express the
     // encumbrance today: this is not this task's gap to close (a
@@ -313,8 +348,8 @@ fn a_blocked_quantity_reported_by_the_broker_is_not_discarded() -> Result<(), Bo
     // the boundary explicit rather than leaving it to be rediscovered. A
     // reader of the claim alone sees "ten held" with nothing to say four of
     // them are blocked.
-    let claims = parse_portfolio(body)?;
-    let claim_quantity = claims.iter().find_map(|claim| match claim {
+    let parsed = parse_portfolio(body)?;
+    let claim_quantity = parsed.claims.iter().find_map(|claim| match claim {
         ControlClaim::PositionQuantity { quantity, .. } => Some(quantity.0.inner().to_string()),
         _ => None,
     });
@@ -323,9 +358,12 @@ fn a_blocked_quantity_reported_by_the_broker_is_not_discarded() -> Result<(), Bo
     Ok(())
 }
 
+/// A row one of whose stated fields cannot be read is refused with that
+/// reason, never dropped silently: the caller sees exactly which row and
+/// which field the channel's answer lost (iaam-vg8te.1.2).
 #[test]
 fn refuses_an_unparsable_blocked_quantity_rather_than_dropping_it() {
-    let result = parse_portfolio_positions(
+    let parsed = parse_portfolio_positions(
         r#"{
             "positions": [{
                 "instrumentType": "share",
@@ -336,12 +374,16 @@ fn refuses_an_unparsable_blocked_quantity_rather_than_dropping_it() {
                 "blockedLots": {"nano": 0}
             }]
         }"#,
-    );
+    )
+    .expect("the answer parses: the unfit row is refused, not fatal");
+
+    assert!(parsed.positions.is_empty(), "{:?}", parsed.positions);
+    assert_eq!(parsed.refused.len(), 1, "{:?}", parsed.refused);
     assert!(matches!(
-        result,
-        Err(ParseError::MissingField {
+        &parsed.refused[0].reason,
+        ParseError::MissingField {
             field: "blockedLots",
-        })
+        }
     ));
 }
 
@@ -350,7 +392,7 @@ fn refuses_an_unparsable_blocked_quantity_rather_than_dropping_it() {
 /// there must not break parsing of the fields this system does read.
 #[test]
 fn a_non_empty_virtual_positions_array_does_not_break_parsing() -> Result<(), Box<dyn Error>> {
-    let claims = parse_portfolio(
+    let parsed = parse_portfolio(
         r#"{
             "positions": [{
                 "instrumentType": "share",
@@ -365,6 +407,6 @@ fn a_non_empty_virtual_positions_array_does_not_break_parsing() -> Result<(), Bo
             }]
         }"#,
     )?;
-    assert_eq!(claims.len(), 1);
+    assert_eq!(parsed.claims.len(), 1);
     Ok(())
 }

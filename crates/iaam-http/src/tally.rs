@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,12 +217,43 @@ impl EgressDirectory {
         self.0.path.join(TALLY_FILE)
     }
 
+    /// Opens the instance's egress directory, creating the place when it does
+    /// not exist yet.
+    ///
+    /// The place is a directory beside the database, created with mode 0700
+    /// (the owner bits survive every umask), so no step needs root. The fresh
+    /// empty tally record is created the way the documented
+    /// `install -m 0600 /dev/null` step created it: an empty pair is the
+    /// documented conservative recovery state, never truncating an existing
+    /// record. Every check of [`Self::open`] then applies to whatever was
+    /// found or created.
+    pub(crate) fn open_or_create(path: &Path) -> Result<Self, TallyError> {
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(TallyError::File {
+                    action: "create the egress directory beside the database",
+                    source,
+                });
+            }
+        }
+        let directory = Self::open(path)?;
+        let (record, _) = directory.open_child(
+            TALLY_FILE,
+            OFlags::RDWR | OFlags::CREATE,
+            "create the outbound tally record",
+        )?;
+        drop(record);
+        Ok(directory)
+    }
+
     fn verify(&self) -> Result<(), TallyError> {
         let named = statat(CWD, &self.0.path, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|source| file_error("verify the egress directory", source))?;
         if self.0.identity != FileIdentity::of(&named) {
             return Err(TallyError::InvalidPath(
-                "the egress directory was replaced; restore the mounted directory before retrying"
+                "the egress directory beside the database was replaced; restore it before retrying"
                     .to_owned(),
             ));
         }
@@ -1773,6 +1805,82 @@ mod tests {
             "{refused}"
         );
         std::fs::remove_dir_all(&moved).expect("moved directory removed");
+    }
+
+    #[test]
+    fn open_or_create_creates_the_place_beside_the_database() {
+        let outside = TempDir::new("create-outside");
+        let fresh = outside.0.join("fresh");
+        std::fs::create_dir(&fresh).expect("the database's directory exists");
+        let place = fresh.join("iaam.sqlite.egress");
+
+        let directory =
+            EgressDirectory::open_or_create(&place).expect("fresh place created and opened");
+
+        let mode =
+            std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&place).expect("place exists"));
+        assert_eq!(mode & 0o777, 0o700, "the place is private to its owner");
+        let record = std::fs::read(directory.tally_path()).expect("tally record exists");
+        assert!(record.is_empty(), "the fresh tally record is empty");
+    }
+
+    #[test]
+    fn open_or_create_never_truncates_an_existing_record() {
+        let outside = TempDir::new("create-existing");
+        let place = outside.0.join("iaam.sqlite.egress");
+        std::fs::create_dir(&place).expect("place created");
+        std::fs::write(
+            place.join(TALLY_FILE),
+            "iaam-outbound-tally-v4\ngeneration\t7\n",
+        )
+        .expect("existing tally written");
+
+        let directory = EgressDirectory::open_or_create(&place).expect("existing place opened");
+
+        let record = std::fs::read(directory.tally_path()).expect("tally record read");
+        assert!(
+            record.starts_with(b"iaam-outbound-tally-v4\ngeneration\t7"),
+            "an existing record must not be touched: {}",
+            String::from_utf8_lossy(&record)
+        );
+    }
+
+    #[test]
+    fn open_or_create_names_the_failed_creation_when_the_parent_is_missing() {
+        let outside = TempDir::new("create-orphan");
+        let place = outside.0.join("absent-parent").join("iaam.sqlite.egress");
+
+        let refused = EgressDirectory::open_or_create(&place)
+            .expect_err("a place whose parent is missing is not created");
+
+        // The refusal names the creation that failed, not a later open: the
+        // database's directory always exists by the time the gateway is
+        // built, so a missing parent is a real misconfiguration to report.
+        assert!(
+            matches!(
+                refused,
+                TallyError::File {
+                    action: "create the egress directory beside the database",
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn open_or_create_refuses_a_file_where_the_place_belongs() {
+        let outside = TempDir::new("create-file");
+        let place = outside.0.join("iaam.sqlite.egress");
+        std::fs::write(&place, "").expect("plain file written");
+
+        let refused = EgressDirectory::open_or_create(&place)
+            .expect_err("a file must not become the egress place");
+
+        // The refusal names the open that failed, whatever its shape: the
+        // place is unusable and nothing was created inside it.
+        let message = refused.to_string();
+        assert!(message.contains("egress directory"), "{refused}");
     }
 
     #[test]

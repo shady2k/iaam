@@ -35,10 +35,11 @@
 //! - no crate but this one depends on `reqwest` or any other HTTP client
 //!   crate, under its own name, under another (`package = "reqwest"`) or
 //!   through the workspace, and none builds a `reqwest` client by path;
-//! - `serve` builds one gateway with [`Gateway::production`] and shares it
+//! - `serve` builds one gateway with [`Gateway::production`], naming the
+//!   instance's database so the tally lives beside it, and shares it
 //!   throughout the server process. [`Gateway::new`] and
-//!   `Gateway::with_parts` stay public for tests, which build their own over a
-//!   fake transport and clock.
+//!   `Gateway::with_parts` stay public for non-broker tests, which build
+//!   their own over a fake transport and clock.
 //!
 //! In-process lanes, named waits and breakers do not survive a restart. The
 //! broker tally does and is shared by every process given its path. The
@@ -62,7 +63,7 @@ pub mod test_support;
 pub mod trust;
 
 pub use destination::Destination;
-pub use egress::{BrokerEgress, BrokerEgressConfigError, EGRESS_DIRECTORY};
+pub use egress::{BrokerEgress, BrokerEgressConfigError, egress_directory_for};
 pub use gateway::{Gateway, GatewayError, Outbound};
 pub use request::{AuthScheme, HttpMethod, HttpRequest, RequestAllowance, RequestBody, Secret};
 pub use response::{HttpError, HttpResponse};

@@ -450,7 +450,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // process for this gateway's lifetime; boot-clock budgets, spacing and the
     // rolling 24-hour ceiling persist in the configured outbound tally.
     let broker_egress = BrokerEgress::from_env()?;
-    let gateway = Arc::new(Gateway::production(broker_egress)?);
+    let gateway = Arc::new(Gateway::production(broker_egress, &config.database)?);
     let http = Arc::new(HttpOutbound::new(gateway.clone()));
 
     // Assembled once, here, because the catalogue belongs to the deployment.

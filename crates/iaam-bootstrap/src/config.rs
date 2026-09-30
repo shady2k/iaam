@@ -1,12 +1,13 @@
 //! Configuration from the environment.
 
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Eq, PartialEq, Error)]
 pub enum ConfigError {
     /// Neither the override variable nor a home directory the default place
     /// could hang off is set. The message names every variable that would
@@ -48,16 +49,23 @@ pub enum PlaceSource {
     Default,
 }
 
-/// The two places of one instance, and who chose each.
+/// The places of one instance, and who chose each.
 ///
 /// Everything that touches only the places — `iaam status`, and the key
 /// command's existence check — resolves this and nothing else, so an
 /// unrelated serve setting cannot stand between the owner and the answer
 /// to "where is my instance".
+///
+/// The database place always resolves: every command needs it, and without
+/// it there is no instance to talk about. The key place need not — a
+/// container that names no home directory and no key file has none — so it
+/// arrives as a result: the commands that need the key read it through
+/// [`Places::key_place`], `iaam status` prints the reason, and the
+/// commands that never touch the key never ask for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Places {
     pub database: Place,
-    pub broker_key: Place,
+    pub broker_key: Result<Place, ConfigError>,
 }
 
 /// The inputs that decide one place: the variable that overrides it, the
@@ -94,16 +102,21 @@ const BROKER_KEY_PLACE: PlaceSpec = PlaceSpec {
     allowed: "a path to the key file",
 };
 
-/// Resolves both places of the instance from one lookup. This is the one
+/// Resolves the places of the instance from one lookup. This is the one
 /// resolver: every command's places come from here, and no command
 /// resolves a path from the environment on its own.
+///
+/// The database place must resolve. The key place resolves when it can;
+/// when it cannot, the reason rides in `Places::broker_key` for the
+/// commands that need the key — and for `iaam status`, which prints it —
+/// while the commands that never touch the key go on without a key place.
 fn resolve_places<F>(get: &F) -> Result<Places, ConfigError>
 where
-    F: Fn(&str) -> Option<String>,
+    F: Fn(&str) -> Option<OsString>,
 {
     Ok(Places {
         database: resolve_place(&DATABASE_PLACE, get)?,
-        broker_key: resolve_place(&BROKER_KEY_PLACE, get)?,
+        broker_key: resolve_place(&BROKER_KEY_PLACE, get),
     })
 }
 
@@ -112,16 +125,17 @@ where
 /// XDG spec counts a relative value as unset, and the same rule applies to
 /// `HOME` — a place hanging off a relative path would move with the working
 /// directory. An override that is set but empty is invalid input and an
-/// error, never a silent default.
+/// error, never a silent default. A path is bytes: a value the operating
+/// system allows is a path here even when it is not UTF-8.
 fn resolve_place<F>(spec: &PlaceSpec, get: &F) -> Result<Place, ConfigError>
 where
-    F: Fn(&str) -> Option<String>,
+    F: Fn(&str) -> Option<OsString>,
 {
     if let Some(value) = get(spec.variable) {
         if value.is_empty() {
             return Err(ConfigError::Invalid {
                 name: spec.variable,
-                value,
+                value: value.to_string_lossy().into_owned(),
                 allowed: spec.allowed,
             });
         }
@@ -130,8 +144,8 @@ where
             source: PlaceSource::Variable,
         });
     }
-    let default = |base: String, tail: &'static str| Place {
-        path: Path::new(&base).join(tail),
+    let default = |base: OsString, tail: &'static str| Place {
+        path: PathBuf::from(base).join(tail),
         source: PlaceSource::Default,
     };
     if let Some(xdg) = absolute(get(spec.xdg_variable)) {
@@ -147,17 +161,46 @@ where
     })
 }
 
-/// A lookup result that is present and usable: non-empty and absolute.
-fn absolute(value: Option<String>) -> Option<String> {
+/// A lookup result that is present and usable as a place's base: non-empty
+/// and absolute. Absolute is decided on the bytes, so a home directory
+/// whose name is not UTF-8 still supplies the default place.
+fn absolute(value: Option<OsString>) -> Option<OsString> {
     value.filter(|value| !value.is_empty() && Path::new(value).is_absolute())
+}
+
+/// A setting that is text and not a path, as text: when the variable holds
+/// bytes that are not UTF-8, that is invalid input and refused naming the
+/// variable — never a silent default.
+fn text_setting(
+    name: &'static str,
+    value: Option<OsString>,
+    allowed: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    value
+        .map(|value| {
+            value.into_string().map_err(|bytes| ConfigError::Invalid {
+                name,
+                value: bytes.to_string_lossy().into_owned(),
+                allowed,
+            })
+        })
+        .transpose()
 }
 
 impl Places {
     pub(crate) fn from_lookup<F>(get: F) -> Result<Self, ConfigError>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<OsString>,
     {
         resolve_places(&get)
+    }
+
+    /// The key place, for the commands that need the key: `generate` writes
+    /// it, the access commands and `serve` read it. A command that does not
+    /// need the key never calls this, so a key place that does not exist
+    /// cannot stand between the owner and `iaam claim`.
+    pub(crate) fn key_place(&self) -> Result<&Place, ConfigError> {
+        self.broker_key.as_ref().map_err(|error| error.clone())
     }
 }
 
@@ -198,18 +241,27 @@ pub struct Config {
 
 impl Config {
     /// Read configuration from the environment through `from_lookup`, the
-    /// seam every caller here uses. Every place has a default now. What no
-    /// default ever does is create anything: only `iaam claim` creates the
-    /// database, and only `iaam broker key generate` creates the key.
+    /// seam every caller here uses. The full configuration belongs to the
+    /// commands whose work may need the key — `serve` and the broker-access
+    /// commands — so the key place must resolve here; the commands that
+    /// need the places alone read [`Places::from_lookup`], where it need
+    /// not. What no default ever does is create anything: only `iaam claim`
+    /// creates the database, and only `iaam broker key generate` creates
+    /// the key.
     pub(crate) fn from_lookup<F>(get: F) -> Result<Self, ConfigError>
     where
-        F: Fn(&str) -> Option<String>,
+        F: Fn(&str) -> Option<OsString>,
     {
         let Places {
             database,
             broker_key,
         } = resolve_places(&get)?;
-        let listen = get("IAAM_LISTEN").unwrap_or_else(|| "127.0.0.1:8080".into());
+        let listen = text_setting(
+            "IAAM_LISTEN",
+            get("IAAM_LISTEN"),
+            "socket address such as 127.0.0.1:8080",
+        )?
+        .unwrap_or_else(|| "127.0.0.1:8080".into());
         let listen = listen.parse().map_err(|_| ConfigError::Invalid {
             name: "IAAM_LISTEN",
             value: listen,
@@ -221,7 +273,7 @@ impl Config {
 
         Ok(Self {
             database,
-            broker_key,
+            broker_key: broker_key?,
             source_profiles: get("IAAM_SOURCE_PROFILES").map(PathBuf::from),
             listen,
             rate_limit,
@@ -232,9 +284,9 @@ impl Config {
 
 fn parse_u32<F>(name: &'static str, default: u32, get: &F) -> Result<u32, ConfigError>
 where
-    F: Fn(&str) -> Option<String>,
+    F: Fn(&str) -> Option<OsString>,
 {
-    match get(name) {
+    match text_setting(name, get(name), "integer from 0 to 4294967295")? {
         None => Ok(default),
         Some(value) => value.parse().map_err(|_| ConfigError::Invalid {
             name,
@@ -247,13 +299,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::{Config, ConfigError, PlaceSource, Places};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
 
-    fn values<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    fn values<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |name| {
             values
                 .iter()
                 .find(|(key, _)| *key == name)
-                .map(|(_, value)| (*value).to_owned())
+                .map(|(_, value)| OsString::from(*value))
+        }
+    }
+
+    /// The lookup as the operating system supplies it: values are bytes,
+    /// and a path variable may hold any of them.
+    fn raw_values<'a>(
+        values: &'a [(&'a str, &'a OsString)],
+    ) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |name| {
+            values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).clone())
         }
     }
 
@@ -361,14 +428,31 @@ mod tests {
 
     #[test]
     fn no_home_names_the_key_variables_when_the_key_has_no_override() {
-        let error =
-            Config::from_lookup(values(&[("IAAM_DATABASE", "/var/lib/iaam/iaam.db")])).unwrap_err();
+        // The database resolves; the key place comes back with the reason,
+        // which names every variable that would supply it.
+        let places =
+            Places::from_lookup(values(&[("IAAM_DATABASE", "/var/lib/iaam/iaam.db")])).unwrap();
+        let error = places.broker_key.unwrap_err();
 
         assert!(matches!(error, ConfigError::NoPlace { .. }));
         let text = error.to_string();
         assert!(text.contains("IAAM_BROKER_KEY_FILE"), "{text}");
         assert!(text.contains("XDG_CONFIG_HOME"), "{text}");
         assert!(text.contains("HOME"), "{text}");
+    }
+
+    #[test]
+    fn an_explicit_database_does_not_need_a_key_place() {
+        // The documented container invocation: an explicit database and no
+        // home directory. The places resolve; the key place is the only one
+        // that may come back with a reason instead of a path.
+        let places = Places::from_lookup(values(&[("IAAM_DATABASE", "/var/lib/iaam/iaam.db")]));
+        let places = places.unwrap();
+        assert_eq!(
+            places.database.path,
+            std::path::Path::new("/var/lib/iaam/iaam.db")
+        );
+        assert_eq!(places.database.source, PlaceSource::Variable);
     }
 
     #[test]
@@ -405,7 +489,7 @@ mod tests {
             std::path::Path::new("/home/dev/.local/share/iaam/iaam.db")
         );
         assert_eq!(
-            places.broker_key.path,
+            places.broker_key.unwrap().path,
             std::path::Path::new("/home/dev/.config/iaam/broker-key")
         );
     }
@@ -431,5 +515,53 @@ mod tests {
         assert!(text.contains("allowed values"));
         assert!(text.contains("socket address"));
         assert!(!text.contains("Invalid {"));
+    }
+
+    #[test]
+    fn a_non_utf8_database_variable_is_the_database_not_a_default_place() {
+        // `/` followed by one byte that is not UTF-8: a path the operating
+        // system allows and `std::env::var` cannot carry.
+        let raw = OsString::from_vec(vec![0x2f, 0xff]);
+        let places = Places::from_lookup(raw_values(&[
+            ("IAAM_DATABASE", &raw),
+            ("HOME", &OsString::from("/home/dev")),
+        ]))
+        .unwrap();
+
+        assert_eq!(places.database.path, std::path::PathBuf::from(raw));
+        assert_eq!(places.database.source, PlaceSource::Variable);
+    }
+
+    #[test]
+    fn a_non_utf8_home_still_supplies_the_default_place() {
+        let home = OsString::from_vec(vec![0x2f, 0xff]);
+        let places = Places::from_lookup(raw_values(&[("HOME", &home)])).unwrap();
+
+        assert_eq!(
+            places.database.path,
+            std::path::Path::new(&home).join(".local/share/iaam/iaam.db")
+        );
+        assert_eq!(places.database.source, PlaceSource::Default);
+    }
+
+    #[test]
+    fn a_non_utf8_serve_setting_is_refused_not_a_default() {
+        let raw = OsString::from_vec(vec![0xff]);
+        let error = Config::from_lookup(raw_values(&[
+            ("IAAM_LISTEN", &raw),
+            ("HOME", &OsString::from("/home/dev")),
+        ]))
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::Invalid {
+                    name: "IAAM_LISTEN",
+                    ..
+                }
+            ),
+            "{error}"
+        );
     }
 }

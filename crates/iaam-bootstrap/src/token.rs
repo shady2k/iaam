@@ -71,6 +71,31 @@ pub(crate) const fn scope_text(scope: Scope) -> &'static str {
 pub(crate) const SHOWN_ONCE: &str = "shown only now: put it in the owner's password manager or the agent's \
      configuration; it cannot be shown again";
 
+/// The label a claiming or issuing command accepts: free text without
+/// control characters. The list prints one label per line, so a control
+/// character in a stored label would forge a line there — the refusal says
+/// which characters are the problem.
+fn checked_label(label: String) -> Result<String, Box<dyn std::error::Error>> {
+    let mut controls: Vec<char> = label.chars().filter(|c| c.is_control()).collect();
+    controls.sort();
+    controls.dedup();
+    if controls.is_empty() {
+        return Ok(label);
+    }
+    let listed = controls
+        .iter()
+        .map(|c| format!("U+{:04X}", *c as u32))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "label {:?} is invalid: it contains the control character(s) {listed}; \
+         a label must not contain control characters, because `iaam token list` \
+         prints one label per line",
+        label
+    )
+    .into())
+}
+
 /// The instance's single owner, or the refusal that names the command which
 /// creates one.
 ///
@@ -102,7 +127,7 @@ pub(crate) async fn claim_owner(
     admin: &dyn TokenAdmin,
     label: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let label = label.unwrap_or_else(|| "owner".to_owned());
+    let label = checked_label(label.unwrap_or_else(|| "owner".to_owned()))?;
     let issued = admin.claim_owner(label).await?;
     Ok(issued.token)
 }
@@ -121,7 +146,7 @@ pub(crate) async fn issue_token(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let owner = sole_owner_or_refuse(admin).await?;
     let label = match label {
-        Some(label) => label,
+        Some(label) => checked_label(label)?,
         None => format!("{} {today}", scope_text(scope)),
     };
     let issued = admin.issue_token(owner, label, scope).await?;
@@ -157,7 +182,7 @@ fn render_listing(tokens: &[TokenView]) -> String {
         lines.push(format!(
             "{}  {}  {}  created {}  {}",
             token.id,
-            token.label,
+            shown_label(&token.label),
             scope_text(token.scope),
             token.created_at,
             state
@@ -170,29 +195,44 @@ fn render_listing(tokens: &[TokenView]) -> String {
     text
 }
 
+/// The label as the list prints it: control characters escaped, so a label
+/// that arrived over HTTP cannot forge a line here. Everything else is
+/// printed exactly as it is.
+fn shown_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Revoke one active token by label or by id, and print which one.
 ///
-/// A label naming several active tokens is refused with their ids: two
+/// A target that parses as a UUID is an id when some token carries it;
+/// when none does, it is looked up as a label, under the same rule —
+/// labels are the owner's free text and may look exactly like a UUID. A
+/// label naming several active tokens is refused with their ids: two
 /// tokens may share a label (the default label is the scope and the day),
-/// and revoking "whichever one" is not a decision the command makes for the
-/// owner. An unknown label or id is refused naming what was looked for. A
-/// revoked token stays revoked: revoking it again is refused, not idempotent
-/// silence, so the command's answer always says what happened.
+/// and revoking "whichever one" is not a decision the command makes for
+/// the owner. An unknown label or id is refused naming what was looked
+/// for. A revoked token stays revoked: revoking it again is refused, not
+/// idempotent silence, so the command's answer always says what happened.
 pub(crate) async fn revoke_token(
     admin: &dyn TokenAdmin,
     target: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let owner = sole_owner_or_refuse(admin).await?;
     let tokens = admin.list_tokens(owner).await?;
-    let id = match uuid::Uuid::parse_str(target) {
-        Ok(id) => id,
-        Err(_) => return revoke_by_label(admin, owner, &tokens, target).await,
-    };
-    let Some(token) = tokens.iter().find(|token| token.id == id) else {
-        return Err(format!(
-            "no token with id {target}: ids and labels come from `iaam token list`"
-        )
-        .into());
+    let id = uuid::Uuid::parse_str(target)
+        .ok()
+        .filter(|id| tokens.iter().any(|token| token.id == *id));
+    let Some(token) = id.and_then(|id| tokens.iter().find(|token| token.id == id)) else {
+        return revoke_by_label(admin, owner, &tokens, target).await;
     };
     if let Some(at) = &token.revoked_at {
         return Err(format!(
@@ -602,5 +642,108 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("iaam claim"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_label_with_a_control_character_is_refused_naming_it() {
+        let admin = adapter();
+        claim_owner(&admin, None).await.unwrap();
+
+        let error = issue_token(
+            &admin,
+            Scope::Agent,
+            Some("agent\n2".to_owned()),
+            "2026-09-30",
+        )
+        .await
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("invalid"), "{text}");
+        assert!(text.contains("U+000A"), "{text}");
+        assert!(text.contains("label"), "{text}");
+
+        // The refusal happened before the port was called: nothing issued.
+        let owner = sole_owner_or_refuse(&admin).await.unwrap();
+        assert_eq!(
+            admin.list_tokens(owner).await.unwrap().len(),
+            1,
+            "the refused label issued nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_label_with_a_control_character_is_refused_before_the_claim() {
+        let admin = adapter();
+
+        let error = claim_owner(&admin, Some("owner\u{1}".to_owned()))
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("U+0001"), "{text}");
+
+        // The instance is still unclaimed: the bad label claimed nothing.
+        let error = sole_owner_or_refuse(&admin).await.unwrap_err();
+        assert!(error.to_string().contains("iaam claim"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_listing_renders_stored_control_characters_harmlessly() {
+        let admin = adapter();
+        claim_owner(&admin, None).await.unwrap();
+        // A label issued over HTTP before the refusal existed: the port
+        // takes it, so the list must render it safely.
+        let owner = sole_owner_or_refuse(&admin).await.unwrap();
+        admin
+            .issue_token(owner, "a\u{1}b".to_owned(), Scope::Agent)
+            .await
+            .unwrap();
+
+        let listing = list_tokens(&admin).await.unwrap();
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(lines.len(), 2, "{listing}");
+        assert!(listing.contains("a\\u{1}b"), "{listing}");
+        assert!(!listing.contains('\u{1}'), "{listing}");
+    }
+
+    #[tokio::test]
+    async fn a_uuid_shaped_label_is_revoked_by_label() {
+        let admin = adapter();
+        claim_owner(&admin, None).await.unwrap();
+        let label = uuid::Uuid::new_v4().to_string();
+        issue_token(&admin, Scope::Agent, Some(label.clone()), "2026-09-30")
+            .await
+            .unwrap();
+
+        let report = revoke_token(&admin, &label).await.unwrap();
+        assert!(report.contains("agent"), "{report}");
+        assert!(report.contains(&label), "{report}");
+
+        // The token is revoked: revoking the same label again says so.
+        let error = revoke_token(&admin, &label).await.unwrap_err();
+        assert!(error.to_string().contains("already revoked"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_uuid_shaped_label_that_is_ambiguous_still_refuses_with_ids() {
+        let admin = adapter();
+        claim_owner(&admin, None).await.unwrap();
+        let label = uuid::Uuid::new_v4().to_string();
+        issue_token(&admin, Scope::Agent, Some(label.clone()), "2026-09-30")
+            .await
+            .unwrap();
+        issue_token(&admin, Scope::ReadOnly, Some(label.clone()), "2026-09-30")
+            .await
+            .unwrap();
+
+        let error = revoke_token(&admin, &label).await.unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("active tokens"), "{text}");
+
+        let owner = sole_owner_or_refuse(&admin).await.unwrap();
+        for token in admin.list_tokens(owner).await.unwrap() {
+            if token.label == label {
+                assert!(text.contains(&token.id.to_string()), "{text}");
+            }
+        }
     }
 }

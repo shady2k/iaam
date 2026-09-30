@@ -243,21 +243,25 @@ async fn main() -> std::process::ExitCode {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     reject_legacy_environment()?;
     let cli = Cli::parse();
-    execute(cli.command, |name| std::env::var(name).ok()).await
+    execute(cli.command, |name| std::env::var_os(name)).await
 }
 
 /// Runs one command against one resolved instance.
 ///
-/// The resolver decides both places for every command; `status` and `broker
-/// key generate` need the places alone, while the commands that open the
-/// instance's database resolve the whole configuration. No arm creates
-/// anything by accident: creation belongs to `claim` (the database, with
-/// its directory) and to `broker key generate` (the key, with its
-/// directory). Every command that finds no database refuses, naming the
-/// place it looked at, having created no file and no directory.
+/// The resolver decides the database place for every command; the key
+/// place is decided for the commands that need the key and asked about by
+/// nobody else, so a container that names no key place cannot stand
+/// between the owner and `claim`, `status`, the token commands or the
+/// bundle commands. `status` and `broker key generate` need the places
+/// alone, while the commands that open the instance's database resolve the
+/// whole configuration. No arm creates anything by accident: creation
+/// belongs to `claim` (the database, with its directory) and to `broker
+/// key generate` (the key, with its directory). Every command that finds
+/// no database refuses, naming the place it looked at, having created no
+/// file and no directory.
 async fn execute<F>(command: Command, get: F) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: Fn(&str) -> Option<String>,
+    F: Fn(&str) -> Option<std::ffi::OsString>,
 {
     match command {
         Command::Serve => serve(Config::from_lookup(&get)?).await,
@@ -296,8 +300,8 @@ where
         Command::Token {
             command: TokenCommand::Issue { scope, label },
         } => {
-            let config = Config::from_lookup(&get)?;
-            let store = open_database(&config.database)?;
+            let places = Places::from_lookup(&get)?;
+            let store = open_database(&places.database)?;
             let admin = SqliteAdapter::new(store);
             let token = issue_token(
                 &admin,
@@ -313,8 +317,8 @@ where
         Command::Token {
             command: TokenCommand::List,
         } => {
-            let config = Config::from_lookup(&get)?;
-            let store = open_database(&config.database)?;
+            let places = Places::from_lookup(&get)?;
+            let store = open_database(&places.database)?;
             let admin = SqliteAdapter::new(store);
             print!("{}", list_tokens(&admin).await?);
             Ok(())
@@ -322,8 +326,8 @@ where
         Command::Token {
             command: TokenCommand::Revoke { target },
         } => {
-            let config = Config::from_lookup(&get)?;
-            let store = open_database(&config.database)?;
+            let places = Places::from_lookup(&get)?;
+            let store = open_database(&places.database)?;
             let admin = SqliteAdapter::new(store);
             println!("{}", revoke_token(&admin, &target).await?);
             Ok(())
@@ -467,8 +471,8 @@ where
         Command::Bundle {
             command: BundleCommand::Export { output },
         } => {
-            let config = Config::from_lookup(&get)?;
-            let store = open_database(&config.database)?;
+            let places = Places::from_lookup(&get)?;
+            let store = open_database(&places.database)?;
             let summary = bundle::export_to_file(&store, &output)?;
             println!("{summary}");
             Ok(())
@@ -476,8 +480,8 @@ where
         Command::Bundle {
             command: BundleCommand::Import { input, merge },
         } => {
-            let config = Config::from_lookup(&get)?;
-            let mut store = open_database(&config.database)?;
+            let places = Places::from_lookup(&get)?;
+            let mut store = open_database(&places.database)?;
             let report = bundle::import_from_file(&mut store, &input, merge)?;
             println!("{report}");
             Ok(())
@@ -632,16 +636,26 @@ fn broker_key_for_serve(place: &Place) -> Result<Option<Key>, Box<dyn std::error
 /// when the database exists — the stored broker word: whether broker
 /// requests are on and which brokers are connected, names and environments
 /// only. No secret is read at all — this command exists to be safe to run
-/// before anything exists.
+/// before anything exists. A place counts as present only when a regular
+/// file is there: a directory in its way is reported as absent.
 fn status_report(places: &Places, broker_lines: Option<&str>) -> String {
+    // A key place that does not exist is not an error for `status`: the
+    // command still answers for the database, and the reason is the answer
+    // for the key.
+    let broker_key = match &places.broker_key {
+        Ok(place) => format!(
+            "broker key: {} ({}; {})",
+            place.path.display(),
+            place_source_text(place.source, "IAAM_BROKER_KEY_FILE"),
+            existence_text(place.path.is_file()),
+        ),
+        Err(reason) => format!("broker key: {reason}"),
+    };
     let mut report = format!(
-        "database: {} ({}; {})\nbroker key: {} ({}; {})\n",
+        "database: {} ({}; {})\n{broker_key}\n",
         places.database.path.display(),
         place_source_text(places.database.source, "IAAM_DATABASE"),
-        existence_text(places.database.path.exists()),
-        places.broker_key.path.display(),
-        place_source_text(places.broker_key.source, "IAAM_BROKER_KEY_FILE"),
-        existence_text(places.broker_key.path.exists()),
+        existence_text(places.database.path.is_file()),
     );
     match broker_lines {
         Some(lines) => report.push_str(lines),
@@ -657,9 +671,10 @@ fn status_report(places: &Places, broker_lines: Option<&str>) -> String {
 /// directory, not even the key's.
 async fn generate_key(places: &Places) -> Result<(), Box<dyn std::error::Error>> {
     open_database(&places.database)?;
-    ensure_private_directory(&places.broker_key.path, "the broker key file")?;
-    Key::create_at(&places.broker_key.path)?;
-    println!("key created: {}", places.broker_key.path.display());
+    let key_place = places.key_place()?;
+    ensure_private_directory(&key_place.path, "the broker key file")?;
+    Key::create_at(&key_place.path)?;
+    println!("key created: {}", key_place.path.display());
     Ok(())
 }
 
@@ -881,10 +896,10 @@ mod tests {
 
     /// A lookup closure over a private temporary home: it stands in for the
     /// environment, so the real home directory is never touched.
-    fn lookup_with(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let owned: Vec<(String, String)> = values
+    fn lookup_with(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        let owned: Vec<(String, std::ffi::OsString)> = values
             .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .map(|(key, value)| ((*key).to_owned(), std::ffi::OsString::from(*value)))
             .collect();
         move |name| {
             owned
@@ -1221,6 +1236,19 @@ mod tests {
         std::fs::remove_dir_all(&home).unwrap();
     }
 
+    #[test]
+    fn status_reports_a_directory_in_a_files_place_as_absent() {
+        let home = temp_home("status-directory");
+        std::fs::create_dir_all(home.join(".local/share/iaam/iaam.db")).unwrap();
+        std::fs::create_dir_all(home.join(".config/iaam/broker-key")).unwrap();
+
+        let report = status_report(&places_with(&[("HOME", home.to_str().unwrap())]), None);
+
+        assert!(!report.contains("present"), "{report}");
+        assert_eq!(report.matches("(default; absent)").count(), 2, "{report}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
     #[tokio::test]
     async fn status_reports_places_existence_and_source() {
         let home = temp_home("status");
@@ -1257,5 +1285,79 @@ mod tests {
         );
         assert!(report.contains("(IAAM_DATABASE; present)"), "{report}");
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// The documented container invocation: an explicit database and no
+    /// home directory. `claim` never needs the key, so the key place is
+    /// nobody's question here.
+    #[tokio::test]
+    async fn claim_with_an_explicit_database_and_no_key_place_claims() {
+        let database = std::env::temp_dir().join(format!(
+            "iaam-bootstrap-claim-no-key-place-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+
+        execute(
+            Command::Claim {
+                label: Some("Main".to_owned()),
+            },
+            lookup_with(&[("IAAM_DATABASE", database.to_str().unwrap())]),
+        )
+        .await
+        .unwrap();
+
+        assert!(database.is_file(), "claim created the database");
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_and_bundle_commands_do_not_ask_for_the_key_place() {
+        for command in [
+            Command::Token {
+                command: TokenCommand::List,
+            },
+            Command::Bundle {
+                command: BundleCommand::Export {
+                    output: std::env::temp_dir()
+                        .join(format!("iaam-export-{}.json", uuid::Uuid::new_v4())),
+                },
+            },
+        ] {
+            let database = std::env::temp_dir().join(format!(
+                "iaam-bootstrap-no-key-place-{}.sqlite",
+                uuid::Uuid::new_v4()
+            ));
+            let error = execute(
+                command,
+                lookup_with(&[("IAAM_DATABASE", database.to_str().unwrap())]),
+            )
+            .await
+            .unwrap_err();
+
+            let text = format_error_chain(error.as_ref());
+            assert!(text.contains("no database at"), "{text}");
+            assert!(
+                !text.contains("no place for the broker key file"),
+                "the command asked for the key place it never needs: {text}"
+            );
+            assert!(!database.exists());
+        }
+    }
+
+    #[test]
+    fn status_says_why_the_key_has_no_place() {
+        let places = places_with(&[("IAAM_DATABASE", "/var/lib/iaam/iaam.db")]);
+        let report = status_report(&places, None);
+
+        assert!(
+            report.contains("database: /var/lib/iaam/iaam.db (IAAM_DATABASE; absent)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("broker key: no place for the broker key file"),
+            "{report}"
+        );
+        assert!(report.contains("IAAM_BROKER_KEY_FILE"), "{report}");
+        assert!(report.contains("XDG_CONFIG_HOME"), "{report}");
     }
 }

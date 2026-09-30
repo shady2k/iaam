@@ -10,8 +10,9 @@
 //! [`Gateway::send`] is the only public way to send a request, and
 //! [`Outbound`] the one type a caller holds it by. Routing, retries and the
 //! circuit breaker live there. MOEX and CBR pacing uses an in-process host
-//! lane; broker budgets, host spacing and the UTC daily ceiling use a locked
-//! per-machine outbound tally. A caller that reached the transport directly
+//! lane; broker budgets, host spacing and the UTC daily ceiling use the
+//! instance's outbound tally, locked and persisted beside the database. A
+//! caller that reached the transport directly
 //! would skip those rules without a single error. So the production transport
 //! cannot be built outside this crate — [`Gateway::production`] is how a
 //! process gets it, already inside its gateway — and outside it neither of

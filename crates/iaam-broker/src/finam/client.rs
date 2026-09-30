@@ -990,8 +990,8 @@ mod tests {
         assert_eq!(
             received[2].url(),
             "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z\
+             ?interval.start_time=2024-01-01T00%3A00%3A00Z\
+             &interval.end_time=2024-02-02T00%3A00%3A00Z\
              &limit=1000"
         );
         for request in received.iter().skip(1) {
@@ -2002,14 +2002,14 @@ mod tests {
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 4, "one page per split, one exchange");
         let full = "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z&limit=2";
+             ?interval.start_time=2024-01-01T00%3A00%3A00Z\
+             &interval.end_time=2024-02-02T00%3A00%3A00Z&limit=2";
         let left = "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D01%2D17T00%3A00%3A00Z&limit=2";
+             ?interval.start_time=2024-01-01T00%3A00%3A00Z\
+             &interval.end_time=2024-01-17T00%3A00%3A00Z&limit=2";
         let right = "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D17T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z&limit=2";
+             ?interval.start_time=2024-01-17T00%3A00%3A00Z\
+             &interval.end_time=2024-02-02T00%3A00%3A00Z&limit=2";
         assert_eq!(received[1].url(), full, "the asked interval goes first");
         assert_eq!(
             received[2].url(),

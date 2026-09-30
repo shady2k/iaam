@@ -4,7 +4,17 @@
 //! without a network, which is why source crates need not know the transport
 //! at all. `HttpClient` handles sending.
 
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+/// Everything but RFC 3986's unreserved characters (§2.3: letters, digits,
+/// `-`, `.`, `_`, `~`), which are never encoded. Encoding them is legal but
+/// not equivalent everywhere: the live Finam API routed a query named
+/// `interval%2Estart%5Ftime` away from the API (iaam-xzz5.1).
+const QUERY: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use zeroize::Zeroizing;
@@ -329,8 +339,8 @@ impl HttpRequest {
                 .map(|(key, value)| {
                     format!(
                         "{}={}",
-                        utf8_percent_encode(key, NON_ALPHANUMERIC),
-                        utf8_percent_encode(value, NON_ALPHANUMERIC)
+                        utf8_percent_encode(key, QUERY),
+                        utf8_percent_encode(value, QUERY)
                     )
                 })
                 .collect();
@@ -413,6 +423,23 @@ mod tests {
         assert_eq!(
             request.url(),
             "https://api.finam.ru/v1/accounts/Main%20Account/transactions"
+        );
+    }
+
+    #[test]
+    fn a_query_keeps_the_unreserved_characters_as_they_are() {
+        // RFC 3986 §2.3: `-`, `.`, `_` and `~` are never encoded. The live
+        // Finam API routed `interval%2Estart%5Ftime` away from the API
+        // (iaam-xzz5.1); reserved characters are still encoded.
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts/Main/transactions")
+            .with_query("interval.start_time", "2026-09-01T00:00:00Z")
+            .with_query("a_b~c", "x y&z=1");
+
+        assert_eq!(
+            request.url(),
+            "https://api.finam.ru/v1/accounts/Main/transactions\
+             ?interval.start_time=2026-09-01T00%3A00%3A00Z\
+             &a_b~c=x%20y%26z%3D1"
         );
     }
 

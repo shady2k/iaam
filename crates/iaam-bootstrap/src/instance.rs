@@ -32,7 +32,7 @@ pub enum InstanceError {
     /// store only says that the place is empty.
     #[error(
         "no database at {path}: a database is created only by \
-         `iaam claim --label <label>`, no other command creates one"
+         `iaam claim`, no other command creates one"
     )]
     DatabaseMissing { path: String },
     #[error("cannot open the database {path}")]

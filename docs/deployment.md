@@ -243,8 +243,8 @@ rather than create:
 $ iaam status
 database: /home/dev/.local/share/iaam/iaam.db (default; absent)
 broker key: /home/dev/.config/iaam/broker-key (default; absent)
-$ iaam token issue --label console
-error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim --label <label>`, no other command creates one
+$ iaam token issue owner
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim`, no other command creates one
 $ iaam claim --label console
 1f0c…  (64 hexadecimal characters, on one line)
 $ iaam status
@@ -379,7 +379,7 @@ program refuses to start if one of them is set, and names its replacement.
 Check, on either route:
 
 ```console
-$ IAAM_DATABASE=/var/lib/iaam/iaam.db IAAM_ISSUE_OWNER_TOKEN=console iaam token issue --label console
+$ IAAM_DATABASE=/var/lib/iaam/iaam.db IAAM_ISSUE_OWNER_TOKEN=console iaam token issue owner
 error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue`
 $ echo $?
 1
@@ -1179,10 +1179,10 @@ supplies what is missing and with which command.
 | Message | Meaning | Fix |
 |---|---|---|
 | `error: no place for the instance's database: set IAAM_DATABASE, or XDG_DATA_HOME, or HOME; none of them is set` | no database path given and no home to hang the default place on — a bare container has no `HOME` | whoever writes the run command: add `--env IAAM_DATABASE=/var/lib/iaam/iaam.db` or `Environment=IAAM_DATABASE=…` |
-| ``error: no database at <path>: a database is created only by `iaam claim --label <label>`, no other command creates one`` | the resolved place holds no database, and the command created nothing there | the owner, at a console: `iaam claim --label console` (§2.1, §3.5, §4.4) |
+| ``error: no database at <path>: a database is created only by `iaam claim`, no other command creates one`` | the resolved place holds no database, and the command created nothing there | the owner, at a console: `iaam claim` (§2.1, §3.5, §4.4) |
 | `error: variable IAAM_LISTEN is invalid: 8080; allowed values: socket address such as 127.0.0.1:8080` | a port without a host | use `0.0.0.0:8080` in a container, `127.0.0.1:8080` on a host |
 | ``error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue` `` | a retired provisioning variable is set (§2.4) | remove it from the unit, profile or compose file and run the subcommand |
-| `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue --scope owner` (§7.3) |
+| `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue owner` (§7.3) |
 | ``error: instance has no owner: run `iaam claim --label <label>` first`` | `token issue`, or `bundle export`/`bundle import`, against an empty database | run `iaam claim --label console` (§3.5, §4.4) |
 | `error: multiple owners recorded in the database: …` | `bundle export`/`bundle import` against a database with more than one owner | inspect the database; this is corruption in a single-owner system, not something the command guesses past |
 | `error: this instance already holds journal facts; restoring would merge the archive into them …` | `bundle import` against a database that is not empty, without `--merge` | pass `--merge` if merging is what is wanted (§9); otherwise restore into an empty database |

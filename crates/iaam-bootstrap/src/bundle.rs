@@ -122,7 +122,7 @@ use iaam_store::bundle::{Bundle, ImportOutcome, TABLE_DISPOSITIONS, TableDisposi
 
 #[derive(Debug, thiserror::Error)]
 pub enum BundleCliError {
-    #[error("instance has no owner: run `iaam claim --label <label>` first")]
+    #[error("instance has no owner: run `iaam claim` first")]
     Unclaimed,
     #[error(
         "multiple owners recorded in the database: choosing which one a bundle \

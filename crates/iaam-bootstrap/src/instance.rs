@@ -169,4 +169,28 @@ mod tests {
         assert!(text.contains("cannot open the database"), "{text}");
         std::fs::remove_file(&path).unwrap();
     }
+
+    #[test]
+    fn a_place_that_cannot_be_created_is_refused_with_its_cause() {
+        let base = std::env::temp_dir().join(format!(
+            "iaam-bootstrap-instance-refused-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        // A dangling symlink in the directory's place: it does not exist
+        // (`exists` follows it), and creating through it fails.
+        let link = base.join("iaam");
+        std::os::unix::fs::symlink(base.join("nowhere"), &link).unwrap();
+        let database = link.join("iaam.db");
+
+        let error = match ensure_private_directory(&database, "test place") {
+            Ok(()) => panic!("a place behind a dangling symlink is not creatable"),
+            Err(error) => error,
+        };
+
+        let text = error.to_string();
+        assert!(text.contains("cannot create the directory"), "{text}");
+        assert!(text.contains("test place"), "{text}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }

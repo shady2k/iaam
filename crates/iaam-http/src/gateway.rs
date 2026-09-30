@@ -4307,4 +4307,275 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn every_refusal_names_its_kind_for_the_warn_log() {
+        let cases: Vec<(GatewayError, &str)> = vec![
+            (
+                GatewayError::Exhausted {
+                    destination: Destination::FinamApi,
+                    status: None,
+                    attempts: 1,
+                    retry_after: Duration::ZERO,
+                },
+                "exhausted",
+            ),
+            (
+                GatewayError::DeadlineReached {
+                    destination: Destination::FinamApi,
+                    status: None,
+                    attempts: 1,
+                    retry_after: Duration::ZERO,
+                },
+                "deadline",
+            ),
+            (
+                GatewayError::CircuitOpen {
+                    destination: Destination::FinamApi,
+                    attempts: 1,
+                    retry_after: Duration::ZERO,
+                },
+                "circuit open",
+            ),
+            (
+                GatewayError::Deferred {
+                    destination: Destination::FinamApi,
+                    status: None,
+                    attempts: 1,
+                    retry_after: Duration::ZERO,
+                },
+                "deferred",
+            ),
+            (
+                GatewayError::DailyCeiling {
+                    destination: Destination::FinamApi,
+                    ceiling: 1,
+                    resets_at: "tomorrow".to_owned(),
+                    retry_after: Duration::ZERO,
+                },
+                "daily ceiling",
+            ),
+            (
+                GatewayError::BrokerHostPaused {
+                    destination: Destination::FinamApi,
+                    host: "api.finam.ru",
+                    reopens_at: "soon".to_owned(),
+                    retry_after: Duration::ZERO,
+                    attempts: 1,
+                },
+                "broker host paused",
+            ),
+            (
+                GatewayError::BrokerHostClosed {
+                    destination: Destination::FinamApi,
+                    host: "api.finam.ru",
+                    reason: "repeated refusals",
+                    reopens_at: "soon".to_owned(),
+                    retry_after: Duration::ZERO,
+                    status: None,
+                    attempts: 1,
+                },
+                "broker host closed",
+            ),
+            (
+                GatewayError::MissingRequestAllowance {
+                    destination: Destination::FinamApi,
+                },
+                "missing request allowance",
+            ),
+            (
+                GatewayError::RequestCeiling {
+                    destination: Destination::FinamApi,
+                    ceiling: 1,
+                },
+                "request ceiling",
+            ),
+            (GatewayError::BrokerEgressOff, "broker egress off"),
+            (
+                GatewayError::EgressPlace {
+                    database: PathBuf::from("iaam.db"),
+                    reason: "unresolved".to_owned(),
+                },
+                "egress place",
+            ),
+            (
+                GatewayError::BrokerEgressWithoutDatabase,
+                "broker egress without database",
+            ),
+            (
+                GatewayError::TallyUnavailable {
+                    path: PathBuf::from("outbound-tally"),
+                    reason: "unavailable".to_owned(),
+                },
+                "tally unavailable",
+            ),
+            (
+                GatewayError::TallyCorrupt {
+                    path: PathBuf::from("outbound-tally"),
+                    reason: "corrupt".to_owned(),
+                },
+                "tally corrupt",
+            ),
+            (
+                GatewayError::BrokerEndpointOwned {
+                    destination: Destination::FinamApi,
+                    endpoint: "api.finam.ru",
+                },
+                "broker endpoint owned",
+            ),
+            (
+                GatewayError::UnknownBudget {
+                    destination: Destination::FinamApi,
+                    path: "/v1/sessions".to_owned(),
+                },
+                "unknown budget",
+            ),
+            (
+                GatewayError::InvalidBudgets("invented".to_owned()),
+                "invalid budgets",
+            ),
+            (GatewayError::SecondGateway, "second gateway"),
+            (
+                GatewayError::Rejected {
+                    destination: Destination::FinamApi,
+                    status: 500,
+                    attempts: 1,
+                    body: RejectedBody::without_secret(b"invented", None),
+                },
+                "rejected",
+            ),
+            (
+                GatewayError::Transport {
+                    destination: Destination::FinamApi,
+                    error: HttpError::Network,
+                    attempts: 1,
+                },
+                "transport",
+            ),
+        ];
+
+        for (refusal, kind) in &cases {
+            assert_eq!(refusal.kind(), *kind, "{refusal:?}");
+        }
+        // The log vocabulary is distinct: two refusals sharing a kind would
+        // make the warn log unreadable as a table.
+        let mut kinds = cases.iter().map(|(_, kind)| *kind).collect::<Vec<_>>();
+        kinds.sort_unstable();
+        let distinct = kinds.len();
+        kinds.dedup();
+        assert_eq!(kinds.len(), distinct, "every refusal names its own kind");
+    }
+
+    #[test]
+    fn the_database_anchored_constructors_name_a_database_that_does_not_resolve() {
+        let (directory, _database) = instance_database("ctor-unresolved");
+        let absent = directory.join("absent.sqlite");
+
+        let error =
+            initialize_fresh_tally(&absent, &SystemClock).expect_err("the place does not derive");
+        match &error {
+            GatewayError::EgressPlace { database, .. } => {
+                assert_eq!(database, &absent, "the refusal names the database");
+            }
+            other => panic!("an unresolvable database is an EgressPlace: {other:?}"),
+        }
+
+        let refused = match Gateway::with_parts_for_database(
+            HttpClient::new(),
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            BrokerEgress::On,
+            &absent,
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("the production constructor refuses the same database"),
+        };
+        assert!(
+            matches!(refused, GatewayError::EgressPlace { .. }),
+            "{refused:?}"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_obstructed_tally_record_is_named_by_the_constructors() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let (directory, database) = instance_database("ctor-obstructed");
+        let place = egress_directory_for(&database).expect("the place derives");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&place)
+            .expect("the place is made");
+        // The record's name is taken by a directory: opening it as a file
+        // fails before anything is read or written.
+        std::fs::create_dir(place.join(crate::tally::TALLY_FILE)).expect("the obstruction is made");
+
+        let error = initialize_fresh_tally(&database, &SystemClock)
+            .expect_err("an obstructed record is unavailable");
+        match &error {
+            GatewayError::TallyUnavailable { path, .. } => {
+                assert_eq!(path, &place.join(crate::tally::TALLY_FILE));
+            }
+            other => panic!("an obstructed record is TallyUnavailable: {other:?}"),
+        }
+
+        let refused = match Gateway::with_parts_for_database(
+            HttpClient::new(),
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            BrokerEgress::On,
+            &database,
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("the production constructor refuses the same obstruction"),
+        };
+        assert!(
+            matches!(refused, GatewayError::TallyUnavailable { .. }),
+            "{refused:?}"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_generation_record_that_cannot_be_opened_is_refused_before_any_call() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let (directory, database) = instance_database("ctor-generation");
+        let place = egress_directory_for(&database).expect("the place derives");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&place)
+            .expect("the place is made");
+        // The generation record's name is taken by a directory: the pair
+        // opens, the generation cannot, and the constructor stops before
+        // any broker call.
+        std::fs::create_dir(place.join(crate::tally::GENERATION_FILE))
+            .expect("the obstruction is made");
+
+        let refused = match Gateway::with_parts_for_database(
+            HttpClient::new(),
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            BrokerEgress::On,
+            &database,
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("a generation record that cannot be opened is refused"),
+        };
+        match &refused {
+            GatewayError::TallyUnavailable { path, reason } => {
+                assert_eq!(path, &place.join(crate::tally::TALLY_FILE));
+                assert!(
+                    reason.contains("open the outbound tally generation"),
+                    "{reason}"
+                );
+            }
+            other => panic!("an unopenable generation record is TallyUnavailable: {other:?}"),
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }

@@ -436,4 +436,87 @@ mod tests {
             assert!(open(&old_key, &sealed).is_err());
         }
     }
+
+    #[test]
+    fn an_empty_token_is_refused_before_any_store_write() {
+        let (mut store, owner) = store_with_owner();
+
+        let error = store_credential_and_enable_egress(
+            &mut store,
+            &key(),
+            "tinkoff",
+            Environment::Sandbox,
+            "   ",
+            false,
+        )
+        .expect_err("a whitespace paste is a missing input");
+
+        assert!(error.to_string().contains("token is empty"), "{error}");
+        assert!(
+            store.broker_access_history(owner).unwrap().is_empty(),
+            "nothing was written"
+        );
+        assert!(
+            !store.broker_egress().unwrap().enabled,
+            "the switch is untouched"
+        );
+    }
+
+    #[test]
+    fn a_store_with_no_owner_or_two_refuses_to_store_a_credential() {
+        let key = key();
+
+        let mut unclaimed = SqliteStore::open_in_memory().unwrap();
+        let error = store_credential_and_enable_egress(
+            &mut unclaimed,
+            &key,
+            "tinkoff",
+            Environment::Sandbox,
+            TOKEN,
+            false,
+        )
+        .expect_err("an unclaimed instance has nobody to store for");
+        assert!(
+            error.to_string().contains("run `iaam claim` first"),
+            "{error}"
+        );
+
+        let mut several = SqliteStore::open_in_memory().unwrap();
+        issue(&several, OwnerId::new_random(), "first");
+        issue(&several, OwnerId::new_random(), "second");
+        let error = store_credential_and_enable_egress(
+            &mut several,
+            &key,
+            "tinkoff",
+            Environment::Sandbox,
+            TOKEN,
+            false,
+        )
+        .expect_err("two owners are never chosen between");
+        assert!(error.to_string().contains("multiple owners"), "{error}");
+    }
+
+    #[test]
+    fn a_broker_this_build_does_not_connect_is_refused_by_name() {
+        let (mut store, _) = store_with_owner();
+
+        // `kraken` parses as a broker code — any non-empty name does — but
+        // no operation dictionary is known for it, so storing a credential
+        // would leave the access unusable.
+        let error = store_credential_and_enable_egress(
+            &mut store,
+            &key(),
+            "kraken",
+            Environment::Sandbox,
+            TOKEN,
+            false,
+        )
+        .expect_err("a broker without a dictionary is refused");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("kraken") && text.contains("operation-type dictionary"),
+            "{text}"
+        );
+    }
 }

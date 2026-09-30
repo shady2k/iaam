@@ -660,4 +660,27 @@ mod tests {
             "the first enabling is recorded"
         );
     }
+
+    #[test]
+    fn a_replace_of_an_unknown_access_is_refused_and_enables_nothing() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+
+        let refused = store
+            .store_broker_credential_and_enable_egress(BrokerCredentialWrite::Replace(
+                BrokerAccessCiphertext {
+                    id: Uuid::new_v4(),
+                    nonce: vec![9; 12],
+                    ciphertext: vec![9; 16],
+                },
+            ))
+            .expect_err("nothing is replaced under an unknown id");
+        match refused {
+            StoreError::NotFound { what, .. } => assert_eq!(what, "broker access"),
+            other => panic!("an unknown id is a NotFound: {other:?}"),
+        }
+        assert!(
+            !store.broker_egress().unwrap().enabled,
+            "the refused replace enables nothing"
+        );
+    }
 }

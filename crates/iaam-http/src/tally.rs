@@ -2312,4 +2312,49 @@ mod tests {
             "whatever the pair holds governs; the mint never restores an allowance"
         );
     }
+
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_named_before_anything_is_minted() {
+        let (temporary, directory, tally) = tally("mint-lock-obstructed");
+        // The lock file's name is taken by a directory: the mint cannot
+        // even take its lock, and nothing is read or written.
+        std::fs::create_dir(temporary.0.join(TALLY_LOCK_FILE)).expect("the obstruction is made");
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+
+        let refused = tally
+            .initialize_fresh_pair(&clock)
+            .expect_err("a lock that cannot be opened is a refusal");
+        let text = refused.to_string();
+        assert!(text.contains("open the tally lock file"), "{text}");
+
+        // The empty pair stands: no mint happened behind the failed lock.
+        let record = std::fs::read_to_string(directory.tally_path()).expect("the record reads");
+        assert!(record.is_empty(), "the pair was not minted: {record}");
+    }
+
+    #[test]
+    fn a_pair_that_fails_to_read_under_the_held_lock_is_reported_as_itself() {
+        let (temporary, directory, tally) = tally("mint-unreadable-pair");
+        // An empty tally beside a generation record is the documented
+        // corruption: the mint takes its lock, reads the pair, and refuses.
+        std::fs::write(
+            temporary.0.join(GENERATION_FILE),
+            "a generation record that is not a number\n",
+        )
+        .expect("the corrupt generation record is written");
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+
+        let refused = tally
+            .initialize_fresh_pair(&clock)
+            .expect_err("a pair that cannot be read under the lock is a refusal");
+        let text = refused.to_string();
+        assert!(
+            text.contains("emptied without its generation record"),
+            "{text}"
+        );
+
+        // The corrupt pair stands untouched: the mint never wrote.
+        let record = std::fs::read_to_string(directory.tally_path()).expect("the record reads");
+        assert!(record.is_empty(), "the pair was not minted: {record}");
+    }
 }

@@ -782,4 +782,42 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn every_scope_argument_maps_to_its_port_scope() {
+        assert!(matches!(TokenScopeArg::Owner.into(), Scope::Owner));
+        assert!(matches!(TokenScopeArg::Agent.into(), Scope::Agent));
+        assert!(matches!(TokenScopeArg::ReadOnly.into(), Scope::ReadOnly));
+    }
+
+    #[tokio::test]
+    async fn several_owners_are_refused_not_chosen_between() {
+        use iaam_core::ids::OwnerId;
+        use iaam_store::tokens::{TokenRecord, TokenScope};
+
+        let store = iaam_store::SqliteStore::open_in_memory().unwrap();
+        for (index, hash) in ["hash-invented-first", "hash-invented-second"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .insert_token(
+                    &TokenRecord {
+                        id: uuid::Uuid::new_v4(),
+                        owner: OwnerId::new_random(),
+                        label: format!("owner-{index}"),
+                        scope: TokenScope::Owner,
+                        revoked: false,
+                    },
+                    hash,
+                )
+                .unwrap();
+        }
+        let admin = SqliteAdapter::new(store);
+
+        let error = sole_owner_or_refuse(&admin).await.unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("multiple owners"), "{text}");
+        assert!(text.contains("corruption"), "{text}");
+    }
 }

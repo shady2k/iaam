@@ -640,7 +640,7 @@ fn read_broker_lines(store: &SqliteStore) -> Result<String, iaam_store::StoreErr
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use iaam_broker::credentials::Key;
@@ -649,10 +649,11 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::sync::PoisonError;
+    use std::time::Duration;
 
     use iaam_http::egress_directory_for;
     use iaam_http::gateway::Transport;
-    use iaam_http::{BrokerEgress, Gateway, HttpRequest, HttpResponse};
+    use iaam_http::{BrokerEgress, Destination, Gateway, HttpError, HttpRequest, HttpResponse};
     use iaam_store::SqliteStore;
     use iaam_store::tokens::{TokenRecord, TokenScope};
     use zeroize::Zeroizing;
@@ -673,6 +674,12 @@ mod tests {
 
     impl Instance {
         fn new(label: &str) -> Self {
+            Self::with_owners(label, 1)
+        }
+
+        /// A scratch instance with `owners` distinct owners: none is the
+        /// unclaimed instance, two are the corruption `connect` refuses.
+        fn with_owners(label: &str, owners: usize) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "iaam-connect-{label}-{}-{}",
                 std::process::id(),
@@ -680,7 +687,25 @@ mod tests {
             ));
             std::fs::create_dir_all(&root).expect("scratch root created");
             let database = root.join("iaam.db");
-            let (store, _owner) = seeded_store(&database);
+            let store = SqliteStore::open(&database).expect("the instance's store opens");
+            let mut seeded: Vec<OwnerId> = Vec::new();
+            for index in 0..owners {
+                let owner = OwnerId::new_random();
+                store
+                    .insert_token(
+                        &TokenRecord {
+                            id: uuid::Uuid::new_v4(),
+                            owner,
+                            label: "console".to_owned(),
+                            scope: TokenScope::Owner,
+                            revoked: false,
+                        },
+                        &format!("hash-invented-{index}"),
+                    )
+                    .expect("an owner is seeded");
+                seeded.push(owner);
+            }
+            let _owner = seeded.first().copied().unwrap_or_else(OwnerId::new_random);
             let place = egress_directory_for(&database).expect("the database resolves");
             std::fs::create_dir(&place).expect("the egress directory is created");
             // The empty pair the production gateway's `open_or_create` writes
@@ -703,24 +728,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
-    }
-
-    fn seeded_store(database: &Path) -> (SqliteStore, OwnerId) {
-        let store = SqliteStore::open(database).expect("the instance's store opens");
-        let owner = OwnerId::new_random();
-        store
-            .insert_token(
-                &TokenRecord {
-                    id: uuid::Uuid::new_v4(),
-                    owner,
-                    label: "console".to_owned(),
-                    scope: TokenScope::Owner,
-                    revoked: false,
-                },
-                "hash-invented",
-            )
-            .expect("the sole owner is seeded");
-        (store, owner)
     }
 
     /// A broker endpoint that answers from a script: no socket and no live
@@ -1195,5 +1202,613 @@ mod tests {
             broker_lines.contains("connected brokers: tinkoff (prod)"),
             "{broker_lines}"
         );
+    }
+    // --- the owners a connect acts on -------------------------------------
+
+    #[tokio::test]
+    async fn an_unclaimed_instance_refuses_connect_before_anything_is_sent() {
+        let mut instance = Instance::with_owners("no-owner", 0);
+        let key = instance.key();
+        let broker = broker_answering(vec![], &instance);
+
+        let error = run_connect(
+            &mut instance,
+            &key,
+            broker,
+            "tinkoff",
+            Environment::Prod,
+            false,
+        )
+        .await
+        .expect_err("an instance without an owner is refused");
+
+        let text = error.to_string();
+        assert!(text.contains("run `iaam claim` first"), "{text}");
+        assert!(
+            instance
+                .store
+                .broker_access_history(instance._owner)
+                .expect("the history reads")
+                .is_empty(),
+            "nothing is stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_with_two_owners_is_refused_as_corruption() {
+        let mut instance = Instance::with_owners("two-owners", 2);
+        let key = instance.key();
+        let broker = broker_answering(vec![], &instance);
+
+        let error = run_connect(
+            &mut instance,
+            &key,
+            broker,
+            "tinkoff",
+            Environment::Prod,
+            false,
+        )
+        .await
+        .expect_err("two owners are a refusal, never a choice");
+
+        assert!(error.to_string().contains("multiple owners"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_existing_sandbox_credential_names_the_sandbox_replace_command() {
+        let mut instance = Instance::new("sandbox-replace");
+        let key = instance.key();
+        provision::add_broker_access(
+            &mut instance.store,
+            &key,
+            "tinkoff",
+            Environment::Sandbox,
+            "the-old-invented-token",
+        )
+        .expect("the sandbox credential is seeded");
+        let broker = broker_answering(vec![], &instance);
+
+        let error = run_connect(
+            &mut instance,
+            &key,
+            broker,
+            "tinkoff",
+            Environment::Sandbox,
+            false,
+        )
+        .await
+        .expect_err("an existing sandbox credential refuses");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("`iaam broker connect tinkoff --sandbox --replace`"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replace_over_nothing_stored_checks_the_token_then_refuses_to_store() {
+        let mut instance = Instance::new("replace-empty");
+        let key = instance.key();
+        // The broker says yes: the check passes, and the replace still finds
+        // no stored credential to replace.
+        let broker = broker_answering(vec![body(200, &accounts_reply(1))], &instance);
+
+        let error = run_connect(
+            &mut instance,
+            &key,
+            broker,
+            "tinkoff",
+            Environment::Prod,
+            true,
+        )
+        .await
+        .expect_err("a replace with nothing stored is a refusal");
+
+        let text = error.to_string();
+        assert!(text.contains("the access was not stored"), "{text}");
+        assert!(
+            instance
+                .store
+                .broker_access_history(instance._owner)
+                .expect("the history reads")
+                .is_empty(),
+            "nothing was stored by the refused replace"
+        );
+        assert!(
+            !instance.store.broker_egress().unwrap().enabled,
+            "the switch stays as it was"
+        );
+    }
+
+    // --- the Finam check on the same scripted gateway ----------------------
+
+    #[tokio::test]
+    async fn a_finam_connection_checks_the_session_then_the_accounts() {
+        let mut instance = Instance::new("finam-yes");
+        let key = instance.key();
+        // Finam's order on the wire: the session exchange answers with the
+        // session token, then the accounts reading names what it sees.
+        let broker = broker_answering(
+            vec![
+                body(200, r#"{"token":"invited-session-token"}"#),
+                body(
+                    200,
+                    r#"{"account_ids":["invited-account-0","invited-account-1"]}"#,
+                ),
+            ],
+            &instance,
+        );
+
+        let message = run_connect(
+            &mut instance,
+            &key,
+            broker,
+            "finam",
+            Environment::Prod,
+            false,
+        )
+        .await
+        .expect("the Finam connection succeeds");
+
+        assert!(
+            message.contains("Finam connected: the token sees 2 accounts."),
+            "{message}"
+        );
+        let broker_code = BrokerCode::parse("finam").expect("the code parses");
+        assert!(
+            instance
+                .store
+                .find_broker_access(instance._owner, &broker_code, "prod")
+                .expect("the store reads")
+                .is_some(),
+            "the credential is stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finam_token_the_broker_refuses_stores_nothing() {
+        let mut instance = Instance::new("finam-refused");
+        instance
+            .store
+            .set_broker_egress_enabled(false)
+            .expect("the switch starts off");
+        let key = instance.key();
+        let broker = broker_answering(vec![body(401, r#"{"code":"unauthorized"}"#)], &instance);
+
+        let error = run_connect(
+            &mut instance,
+            &key,
+            broker,
+            "finam",
+            Environment::Prod,
+            false,
+        )
+        .await
+        .expect_err("a refused Finam token is a refusal");
+
+        let text = error.to_string();
+        assert!(text.contains("refused the token"), "{text}");
+        assert!(
+            !text.contains(TOKEN),
+            "the refusal never names the token: {text}"
+        );
+        assert!(
+            !instance.store.broker_egress().unwrap().enabled,
+            "the switch is as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_broker_name_is_refused_by_the_check_itself() {
+        let instance = Instance::new("check-unknown");
+        let no_broker = broker_answering(vec![], &instance);
+
+        let failure = check_access(
+            no_broker.gateway,
+            "kraken",
+            Environment::Prod,
+            &Zeroizing::new(TOKEN.to_owned()),
+        )
+        .await;
+
+        match failure {
+            Err(CheckFailure::Other(message)) => {
+                assert!(message.contains("unknown broker"), "{message}");
+                assert!(!message.contains(TOKEN), "{message}");
+            }
+            other => panic!("an unknown broker is an Other refusal: {other:?}"),
+        }
+    }
+
+    // --- the plain words of every check failure ----------------------------
+
+    #[test]
+    fn every_tinkoff_check_failure_maps_to_its_plain_words() {
+        use iaam_broker::tinkoff::TinkoffError as Error;
+
+        let wait = failure_from_tinkoff(Error::Unreachable {
+            status: None,
+            attempts: 3,
+            retry_after: Duration::from_secs(90),
+        });
+        assert!(
+            matches!(&wait, CheckFailure::Unreachable(text)
+                if text.contains("3 attempts") && text.contains("1 minute")),
+            "{wait:?}"
+        );
+
+        let through_the_gateway = failure_from_tinkoff(Error::Gateway(GatewayError::Exhausted {
+            destination: Destination::TinkoffProd,
+            status: None,
+            attempts: 2,
+            retry_after: Duration::from_secs(30),
+        }));
+        assert!(
+            matches!(&through_the_gateway, CheckFailure::Unreachable(text)
+                if text.contains("2 attempts")),
+            "{through_the_gateway:?}"
+        );
+
+        let transport = failure_from_tinkoff(Error::Transport(HttpError::Network));
+        assert!(
+            matches!(&transport, CheckFailure::Other(text)
+                if text.contains("the transport could not be built")),
+            "{transport:?}"
+        );
+
+        let answered = failure_from_tinkoff(Error::UnexpectedStatus {
+            status: 500,
+            body: "invented".to_owned(),
+        });
+        assert!(
+            matches!(&answered, CheckFailure::Other(text) if text.contains("status 500")),
+            "{answered:?}"
+        );
+
+        let malformed = failure_from_tinkoff(Error::MalformedResponse);
+        assert!(
+            matches!(&malformed, CheckFailure::Other(text)
+                if text.contains("was not the shape") && text.contains("environment")),
+            "{malformed:?}"
+        );
+
+        let ceiling = failure_from_tinkoff(Error::RequestCeiling { ceiling: 7 });
+        assert!(
+            matches!(&ceiling, CheckFailure::Other(text) if text.contains("ceiling of 7")),
+            "{ceiling:?}"
+        );
+
+        let built_fault = failure_from_tinkoff(Error::RequestSerialization);
+        assert!(
+            matches!(&built_fault, CheckFailure::Other(text)
+                if text.contains("fault of this build")),
+            "{built_fault:?}"
+        );
+
+        assert!(matches!(
+            failure_from_tinkoff(Error::InvalidToken),
+            CheckFailure::TokenRefused
+        ));
+    }
+
+    #[test]
+    fn every_finam_check_failure_maps_to_its_plain_words() {
+        use iaam_broker::finam::FinamError as Error;
+
+        assert!(matches!(
+            failure_from_finam(Error::InvalidToken),
+            CheckFailure::TokenRefused
+        ));
+
+        let unavailable = failure_from_finam(Error::Unavailable {
+            status: Some(503),
+            attempts: 2,
+            retry_after: Duration::from_secs(45 * 60),
+        });
+        assert!(
+            matches!(&unavailable, CheckFailure::Unreachable(text)
+                if text.contains("2 attempts") && text.contains("45 minutes")),
+            "{unavailable:?}"
+        );
+
+        let egress = failure_from_finam(Error::EgressRefused {
+            reason: "the instance's day is spent".to_owned(),
+            retry_after: None,
+        });
+        assert!(
+            matches!(&egress, CheckFailure::Ceiling(text)
+                if text.contains("the instance's day is spent")),
+            "{egress:?}"
+        );
+
+        let gateway = failure_from_finam(Error::Gateway {
+            reason: "the gateway refused".to_owned(),
+        });
+        assert!(
+            matches!(&gateway, CheckFailure::Other(text)
+                if text.contains("the gateway refused")),
+            "{gateway:?}"
+        );
+
+        let answered = failure_from_finam(Error::UnexpectedStatus {
+            status: 502,
+            body: "invented".to_owned(),
+        });
+        assert!(
+            matches!(&answered, CheckFailure::Other(text) if text.contains("status 502")),
+            "{answered:?}"
+        );
+
+        let malformed = failure_from_finam(Error::MalformedResponse);
+        assert!(
+            matches!(&malformed, CheckFailure::Other(text)
+                if text.contains("session answer was not the shape")),
+            "{malformed:?}"
+        );
+
+        let transport = failure_from_finam(Error::TransportNotBuilt {
+            reason: "no trust anchor".to_owned(),
+        });
+        assert!(
+            matches!(&transport, CheckFailure::Other(text)
+                if text.contains("the transport could not be built: no trust anchor")),
+            "{transport:?}"
+        );
+
+        let ceiling = failure_from_finam(Error::RequestCeiling { ceiling: 4 });
+        assert!(
+            matches!(&ceiling, CheckFailure::Other(text) if text.contains("ceiling of 4")),
+            "{ceiling:?}"
+        );
+
+        for built_fault in [Error::InvalidAccountId, Error::PartialResponse] {
+            let mapped = failure_from_finam(built_fault);
+            assert!(
+                matches!(&mapped, CheckFailure::Other(text)
+                    if text.contains("fault of this build")),
+                "{mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_gateway_refusal_maps_to_its_plain_words() {
+        let paused = failure_from_gateway(&GatewayError::BrokerHostPaused {
+            destination: Destination::FinamApi,
+            host: "api.finam.ru",
+            reopens_at: "soon".to_owned(),
+            retry_after: Duration::from_secs(120),
+            attempts: 3,
+        });
+        assert!(
+            matches!(&paused, CheckFailure::Deferred(text)
+                if text.contains("paused") && text.contains("reopens at soon")),
+            "{paused:?}"
+        );
+
+        let closed = failure_from_gateway(&GatewayError::BrokerHostClosed {
+            destination: Destination::FinamApi,
+            host: "api.finam.ru",
+            reason: "repeated refusals",
+            reopens_at: "later".to_owned(),
+            retry_after: Duration::from_secs(60),
+            status: None,
+            attempts: 4,
+        });
+        assert!(
+            matches!(&closed, CheckFailure::Deferred(text)
+                if text.contains("closed after repeated refusals")),
+            "{closed:?}"
+        );
+
+        let owned = failure_from_gateway(&GatewayError::BrokerEndpointOwned {
+            destination: Destination::FinamApi,
+            endpoint: "api.finam.ru",
+        });
+        assert!(
+            matches!(&owned, CheckFailure::Other(text)
+                if text.contains("another iaam process owns the api.finam.ru endpoint")),
+            "{owned:?}"
+        );
+
+        let breaker = failure_from_gateway(&GatewayError::CircuitOpen {
+            destination: Destination::FinamApi,
+            attempts: 2,
+            retry_after: Duration::from_secs(30),
+        });
+        assert!(
+            matches!(&breaker, CheckFailure::Deferred(text)
+                if text.contains("refused for under a minute after repeated failures")),
+            "{breaker:?}"
+        );
+
+        let exhausted = failure_from_gateway(&GatewayError::Exhausted {
+            destination: Destination::FinamApi,
+            status: None,
+            attempts: 5,
+            retry_after: Duration::from_secs(90),
+        });
+        assert!(
+            matches!(&exhausted, CheckFailure::Unreachable(text)
+                if text.contains("5 attempts") && text.contains("1 minute")),
+            "{exhausted:?}"
+        );
+
+        let ceiling = failure_from_gateway(&GatewayError::DailyCeiling {
+            destination: Destination::FinamApi,
+            ceiling: 500,
+            resets_at: "tomorrow".to_owned(),
+            retry_after: Duration::from_secs(3_600),
+        });
+        assert!(
+            matches!(&ceiling, CheckFailure::Ceiling(text)
+                if text.contains("rolling-day ceiling") && text.contains("resets at tomorrow")),
+            "{ceiling:?}"
+        );
+
+        let other = failure_from_gateway(&GatewayError::SecondGateway);
+        assert!(
+            matches!(&other, CheckFailure::Other(text) if text.contains("one gateway")),
+            "{other:?}"
+        );
+    }
+
+    #[test]
+    fn a_401_or_403_is_a_refused_token_and_any_other_status_is_named() {
+        for status in [401, 403] {
+            assert!(
+                matches!(unexpected_status(status), CheckFailure::TokenRefused),
+                "status {status} is a refused token"
+            );
+        }
+        let answered = unexpected_status(418);
+        assert!(
+            matches!(&answered, CheckFailure::Other(text)
+                if text.contains("status 418") && text.contains("environment")),
+            "{answered:?}"
+        );
+    }
+
+    #[test]
+    fn every_check_failure_explains_what_happened_to_the_stored_state() {
+        let refused = explain_check_failure(
+            "T-Invest",
+            "tinkoff",
+            Environment::Prod,
+            &CheckFailure::TokenRefused,
+        );
+        assert!(
+            refused.contains("refused the token")
+                && refused.contains("Nothing was stored")
+                && refused.contains("`iaam broker connect tinkoff` again"),
+            "{refused}"
+        );
+
+        let sandbox = explain_check_failure(
+            "T-Invest sandbox",
+            "tinkoff",
+            Environment::Sandbox,
+            &CheckFailure::TokenRefused,
+        );
+        assert!(
+            sandbox.contains("`iaam broker connect tinkoff --sandbox` again"),
+            "{sandbox}"
+        );
+
+        let unreachable_check = explain_check_failure(
+            "Finam",
+            "finam",
+            Environment::Prod,
+            &CheckFailure::Unreachable("it stayed away".to_owned()),
+        );
+        assert!(
+            unreachable_check.contains("could not be reached: it stayed away")
+                && unreachable_check.contains("Nothing was stored"),
+            "{unreachable_check}"
+        );
+
+        let deferred = explain_check_failure(
+            "Finam",
+            "finam",
+            Environment::Prod,
+            &CheckFailure::Deferred("it reopened late".to_owned()),
+        );
+        assert!(
+            deferred.contains("is not taking requests now: it reopened late")
+                && deferred.contains("Nothing was stored"),
+            "{deferred}"
+        );
+
+        let ceiling = explain_check_failure(
+            "Finam",
+            "finam",
+            Environment::Prod,
+            &CheckFailure::Ceiling("the day is spent".to_owned()),
+        );
+        assert!(
+            ceiling.contains("the instance's own broker allowance refused the check")
+                && ceiling.contains("nothing was sent"),
+            "{ceiling}"
+        );
+
+        let other = explain_check_failure(
+            "Finam",
+            "finam",
+            Environment::Prod,
+            &CheckFailure::Other("boom".to_owned()),
+        );
+        assert!(
+            other.contains("the connection check failed: boom. Nothing was stored."),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn a_wait_in_words_reads_as_moments_minutes_and_hours() {
+        assert_eq!(human(Duration::from_secs(30)), "under a minute");
+        assert_eq!(human(Duration::from_secs(60)), "1 minute");
+        assert_eq!(human(Duration::from_secs(150)), "2 minutes");
+        assert_eq!(human(Duration::from_secs(5_400)), "1 hour 30 minutes");
+    }
+
+    #[test]
+    fn the_connect_key_is_read_when_it_exists_and_created_when_it_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let instance = Instance::new("key-read");
+        let place = crate::config::Place {
+            path: instance.root.join("keys/broker.key"),
+            source: crate::config::PlaceSource::Default,
+        };
+
+        let created = key_for_connect(&place).expect("a missing key is created");
+        assert!(place.path.is_file(), "the key was written at the place");
+        assert_eq!(
+            place.path.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the key file is private"
+        );
+
+        // The second run reads the file the first wrote: what the created
+        // key sealed, the reread key opens — the key `serve` later reads is
+        // the one this connect used.
+        let reread = key_for_connect(&place).expect("an existing key is read");
+        let opened = open(&reread, &seal(&created, "round-trip"))
+            .expect("the reread key opens what the created key sealed");
+        assert_eq!(opened.expose(), "round-trip");
+    }
+
+    #[test]
+    fn an_unreadable_key_file_is_refused_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let instance = Instance::new("key-unreadable");
+        let place = crate::config::Place {
+            path: instance.root.join("broker.key"),
+            source: crate::config::PlaceSource::Default,
+        };
+        key_for_connect(&place).expect("the key is created for the test");
+        std::fs::set_permissions(&place.path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = key_for_connect(&place).expect_err("an unreadable key is refused");
+        let text = error.to_string();
+        assert!(text.contains("exists"), "{text}");
+
+        std::fs::set_permissions(&place.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // --- the pasted token read ---------------------------------------------
+
+    #[test]
+    fn a_piped_paste_reads_one_line_from_a_non_terminal_standard_input() {
+        // The suite runs with a non-terminal standard input (nextest, CI);
+        // a caller on a real terminal gets the hidden read, which no unit
+        // test can drive.
+        assert!(
+            !std::io::stdin().is_terminal(),
+            "this read needs a non-terminal stdin; \
+             run the suite under nextest or redirect standard input"
+        );
+        let token = read_token_hidden("T-Invest", Environment::Prod).expect("the pipe reads");
+        assert_eq!(token.as_str(), "", "an empty pipe is an empty paste");
     }
 }

@@ -722,8 +722,9 @@ async fn shutdown() {
 mod tests {
     use super::{
         BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, BrokerKeyCommand, BundleCommand,
-        Cli, Command, Config, Key, Places, SqliteAdapter, TokenCommand, claim_owner, execute,
-        format_error_chain, legacy_replacement, read_broker_key, serve, status_report,
+        Cli, Command, Config, Key, Place, PlaceSource, Places, SqliteAdapter, TokenCommand,
+        broker_key_for_serve, claim_owner, execute, format_error_chain, legacy_replacement,
+        read_broker_key, serve, status_report,
     };
     use crate::token::TokenScopeArg;
     use clap::Parser;
@@ -1468,5 +1469,187 @@ mod tests {
         );
         assert!(report.contains("IAAM_BROKER_KEY_FILE"), "{report}");
         assert!(report.contains("XDG_CONFIG_HOME"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn the_status_arm_answers_for_a_claimed_instance() {
+        let home = temp_home("status-arm");
+        let home_str = home.to_str().unwrap();
+
+        execute(
+            Command::Claim {
+                label: Some("Main".to_owned()),
+            },
+            lookup_with(&[("HOME", home_str)]),
+        )
+        .await
+        .expect("claim creates the instance");
+
+        execute(Command::Status, lookup_with(&[("HOME", home_str)]))
+            .await
+            .expect("status runs against the claimed instance");
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_token_arms_issue_list_and_revoke_end_to_end() {
+        use iaam_app::ports::{SoleOwner, TokenAdmin};
+
+        let home = temp_home("token-arms");
+        let home_str = home.to_str().unwrap();
+
+        execute(
+            Command::Claim {
+                label: Some("Main".to_owned()),
+            },
+            lookup_with(&[("HOME", home_str)]),
+        )
+        .await
+        .expect("claim creates the instance");
+        execute(
+            Command::Token {
+                command: TokenCommand::Issue {
+                    scope: TokenScopeArg::Agent,
+                    label: Some("ci-agent".to_owned()),
+                },
+            },
+            lookup_with(&[("HOME", home_str)]),
+        )
+        .await
+        .expect("issue runs for the sole owner");
+        execute(
+            Command::Token {
+                command: TokenCommand::List,
+            },
+            lookup_with(&[("HOME", home_str)]),
+        )
+        .await
+        .expect("list runs");
+        execute(
+            Command::Token {
+                command: TokenCommand::Revoke {
+                    target: "ci-agent".to_owned(),
+                },
+            },
+            lookup_with(&[("HOME", home_str)]),
+        )
+        .await
+        .expect("revoke by the issued label runs");
+
+        let admin = SqliteAdapter::new(
+            iaam_store::SqliteStore::open_existing(&home.join(".local/share/iaam/iaam.db"))
+                .unwrap(),
+        );
+        let owner = match admin.sole_owner().await.unwrap() {
+            SoleOwner::Single(owner) => owner,
+            other => panic!("a claimed instance has one owner: {other:?}"),
+        };
+        let issued = admin
+            .list_tokens(owner)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|token| token.label == "ci-agent")
+            .expect("the issued token is listed");
+        assert!(
+            issued.revoked_at.is_some(),
+            "the revoke arm revoked the token"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_bundle_import_arm_reads_what_export_wrote() {
+        let home = temp_home("bundle-arms");
+        let home_str = home.to_str().unwrap();
+        let archive = home.join("instance.bundle.json");
+
+        execute(
+            Command::Claim {
+                label: Some("Main".to_owned()),
+            },
+            lookup_with(&[("HOME", home_str)]),
+        )
+        .await
+        .expect("claim creates the instance");
+        execute(
+            Command::Bundle {
+                command: BundleCommand::Export {
+                    output: archive.clone(),
+                },
+            },
+            lookup_with(&[("HOME", home_str)]),
+        )
+        .await
+        .expect("export writes the archive");
+        assert!(archive.is_file(), "the archive was written");
+
+        // A second claimed instance takes the archive in: the arm opens its
+        // own database and imports there.
+        let other = temp_home("bundle-arms-target");
+        execute(
+            Command::Claim {
+                label: Some("Main".to_owned()),
+            },
+            lookup_with(&[("HOME", other.to_str().unwrap())]),
+        )
+        .await
+        .expect("claim creates the target instance");
+        execute(
+            Command::Bundle {
+                command: BundleCommand::Import {
+                    input: archive,
+                    merge: true,
+                },
+            },
+            lookup_with(&[("HOME", other.to_str().unwrap())]),
+        )
+        .await
+        .expect("import reads what export wrote");
+
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+    }
+
+    #[test]
+    fn serve_takes_the_key_only_where_a_place_promises_one() {
+        let home = temp_home("serve-key");
+        let existing = home.join("broker.key");
+        Key::create_at(&existing).unwrap();
+
+        let missing_at_default = broker_key_for_serve(&Place {
+            path: home.join("absent.key"),
+            source: PlaceSource::Default,
+        })
+        .unwrap();
+        assert!(
+            missing_at_default.is_none(),
+            "a default place may hold no key: serve starts without encryption"
+        );
+
+        let present_at_default = broker_key_for_serve(&Place {
+            path: existing.clone(),
+            source: PlaceSource::Default,
+        })
+        .unwrap();
+        assert!(present_at_default.is_some(), "a default key is read");
+
+        let named = broker_key_for_serve(&Place {
+            path: existing,
+            source: PlaceSource::Variable,
+        })
+        .unwrap();
+        assert!(named.is_some(), "a named key is read");
+
+        let error = broker_key_for_serve(&Place {
+            path: home.join("absent.key"),
+            source: PlaceSource::Variable,
+        })
+        .expect_err("a named key place is a promise, not a hope");
+        let text = format_error_chain(error.as_ref());
+        assert!(text.contains("absent.key"), "{text}");
+
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

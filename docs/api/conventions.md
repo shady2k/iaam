@@ -1159,3 +1159,22 @@ saying the total includes a number the owner stated rather than one the system
 derived. Both are closed the same way: `submit_operations`, because a real
 position synchronisation is what makes `positions.accounts_without_position_facts`
 stop naming the account and what makes `positions.stated` stop naming it too.
+
+## 9. The source error codes
+
+> **A failure on the source's side of the wall names the source and never the
+> store.** The three codes below are the closed vocabulary a broker or market
+> sync answers with when the call got out and the answer (or the lack of one)
+> is the problem. Nothing that reaches one of these codes was written to the
+> journal.
+
+| Code | Status | When | What the caller does |
+|---|---|---|---|
+| `source_unavailable` | 503 | The source is down, or the sync ran out of its deadline: transient. `Retry-After` rides along when the wait is known. | Call again after the wait. |
+| `source_refused` | 502 | The source understood the request and said no: a token it rejects, an access configured wrong. | Fix what the message names; a repeat unchanged gets the same answer. |
+| `source_unreadable` | 502 | The source answered, and its answer cannot be read as the documents this system exchanges with it (`iaam-vg8te.1.2`). The store is fine; the message names what could not be read. | Nothing here can repair the answer. Repeat unchanged gets the same answer until the source's changes; a whole answer that cannot be read leaves the journal untouched. |
+
+A row the source answered with and this system could not turn into a fact is
+**not** one of these: the sync completes and names the row in its answer
+(`recorded`, code `quarantined`), counts the rows set aside in `set_aside`,
+and stands a coverage gap in the journal until the dimension is confirmed.

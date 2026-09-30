@@ -167,6 +167,15 @@ pub enum AppError {
     /// help — what the request names or carries is what has to be fixed.
     #[error("{origin} rejected the request: {detail}")]
     SourceRefused { origin: String, detail: String },
+    /// An outside source answered, and its answer cannot be read as the
+    /// documents this system exchanges with it: not the JSON the channel
+    /// publishes, a whole answer missing its fields. Separate from
+    /// `SourceRefused` (the source understood the request and said no) and
+    /// from `Store` (our own side failed): the store is fine, and calling
+    /// again unchanged gets the same unreadable answer until the source's
+    /// answer changes.
+    #[error("the answer from {origin} could not be read: {detail}")]
+    SourceUnreadable { origin: String, detail: String },
 }
 
 /// A rejected request field, and everything the server can say about it.
@@ -362,6 +371,7 @@ impl AppError {
             Self::SourceUnreachable { .. } => "source_unavailable",
             Self::SyncRequestCeiling { .. } => "sync_request_ceiling",
             Self::SourceRefused { .. } => "source_refused",
+            Self::SourceUnreadable { .. } => "source_unreadable",
             Self::BrokerAccountUnseen { .. } => "broker_account_unseen",
             Self::BrokerAccountAmbiguous { .. } => "broker_account_ambiguous",
         }

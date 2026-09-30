@@ -9514,6 +9514,11 @@ pub struct SyncOutcomeDto {
     pub recorded: Vec<VerdictDto>,
     pub duplicates: usize,
     pub possible_duplicates: usize,
+    /// Rows this synchronisation set aside with a reason instead of
+    /// recording — a count over `recorded` (codes `rejected` and
+    /// `quarantined`), published for the caller that asks "how much did not
+    /// come through" before reading the rows.
+    pub set_aside: usize,
     pub assertions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assertions_withheld: Option<AssertionsWithheldDto>,
@@ -9539,6 +9544,7 @@ impl SyncOutcomeDto {
                 .collect(),
             duplicates: outcome.duplicates,
             possible_duplicates: outcome.possible_duplicates,
+            set_aside: outcome.set_aside,
             assertions: outcome.assertions,
             assertions_withheld: outcome.assertions_withheld.map(|withheld| match withheld {
                 iaam_app::sync::AssertionsWithheld::PortfolioDescribesAnotherDay { as_of } => {

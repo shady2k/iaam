@@ -4,6 +4,7 @@ use iaam_core::event::provenance::ParserVersion;
 // `finam::ChannelOperationKind` continue to mean the same type:
 // channel names remain familiar while the type behind them is shared.
 pub use crate::operation_kind::ChannelOperationKind;
+use iaam_core::ids::InstrumentId;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
@@ -30,6 +31,13 @@ pub enum ParseError {
     InvalidTimestamp { field: &'static str },
     #[error("field {field} is not a UUID: {value}")]
     InvalidIdentifier { field: &'static str, value: String },
+    /// The channel names the instrument by a symbol this parser cannot
+    /// resolve to an instrument. Finam prints symbols of the form
+    /// `TICKER@MIC`; the resolution through Finam's own asset endpoint is a
+    /// later task, so the row carrying such a symbol is set aside rather
+    /// than guessed into an instrument (iaam-vg8te.1.2).
+    #[error("symbol {value} is not resolved to an instrument")]
+    UnresolvedSymbol { value: String },
     #[error("unsupported Finam currency: {value}")]
     UnsupportedCurrency { value: String },
     #[error("field {field} cannot be represented in currency minor units {currency:?}")]
@@ -106,8 +114,41 @@ pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError>
         .collect())
 }
 
+/// A portfolio answer: the claims read from it, and the position rows that
+/// could not become claims.
+///
+/// `refused` carries each unfit row with its reason and its original JSON,
+/// exactly as [`parse_operations`] carries a rejected transaction: the
+/// readable rows still become claims, and the unfit rows reach the owner
+/// instead of stopping the sync (iaam-vg8te.1.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedPortfolio {
+    pub claims: Vec<ControlClaim>,
+    pub refused: Vec<RefusedPosition>,
+}
+
+/// One portfolio row the channel reported that could not become a claim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefusedPosition {
+    /// The row as the channel printed it, kept beside the reason so the
+    /// owner can read what was set aside.
+    pub raw: Value,
+    pub reason: ParseError,
+}
+
 /// Parse account cash and positions into source claims.
-pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
+///
+/// A cash entry that cannot be read refuses the whole answer: cash is the
+/// snapshot's money dimension, and a half-read list of currencies is no
+/// answer to assert. A position row that cannot become a claim is set aside
+/// instead — with its reason and its original JSON — because one
+/// instrument's unreadable row withholds an opinion about that instrument,
+/// not about the rest of the holdings (`iaam-vg8te.1.2`). A symbol the
+/// parser cannot resolve to an instrument is the standing case: Finam
+/// prints `TICKER@MIC`, and the resolution through Finam's own asset
+/// endpoint is a later task, so until it lands such rows are visible
+/// refusals, never guesses.
+pub fn parse_portfolio(body: &str) -> Result<ParsedPortfolio, ParseError> {
     let response: RawPortfolioResponse = parse_json(body)?;
     let mut claims = Vec::new();
     for cash in response.cash.unwrap_or_default() {
@@ -119,27 +160,46 @@ pub fn parse_portfolio(body: &str) -> Result<Vec<ControlClaim>, ParseError> {
         });
     }
 
-    let positions = response.positions.unwrap_or_default();
-    if positions.is_empty() {
-        return Ok(claims);
+    let mut refused = Vec::new();
+    for raw in response.positions.unwrap_or_default() {
+        let position = match serde_json::from_value::<RawPortfolioPosition>(raw.clone()) {
+            Ok(position) => position,
+            Err(error) => {
+                refused.push(RefusedPosition {
+                    raw,
+                    reason: ParseError::Json(error.to_string()),
+                });
+                continue;
+            }
+        };
+        match position_claim(&position) {
+            Ok(claim) => claims.push(claim),
+            Err(reason) => refused.push(RefusedPosition { raw, reason }),
+        }
     }
-    for position in positions {
-        let symbol = position
-            .symbol
-            .as_deref()
-            .ok_or(ParseError::MissingField { field: "symbol" })?;
-        let quantity = position
-            .quantity
-            .as_ref()
-            .ok_or(ParseError::MissingField { field: "quantity" })
-            .and_then(|value| parse_quantity(value, "quantity"))?;
-        claims.push(ControlClaim::PositionQuantity {
-            instrument: parse_identifier(symbol, "symbol")?,
-            quantity,
-            at: BalancePoint::Closing,
-        });
-    }
-    Ok(claims)
+    Ok(ParsedPortfolio { claims, refused })
+}
+
+/// One position row as the single claim this channel can state about it.
+fn position_claim(position: &RawPortfolioPosition) -> Result<ControlClaim, ParseError> {
+    let symbol = position
+        .symbol
+        .as_deref()
+        .ok_or(ParseError::MissingField { field: "symbol" })?;
+    let quantity = position
+        .quantity
+        .as_ref()
+        .ok_or(ParseError::MissingField { field: "quantity" })
+        .and_then(|value| parse_quantity(value, "quantity"))?;
+    let instrument: InstrumentId = serde_json::from_value(Value::String(symbol.to_owned()))
+        .map_err(|_| ParseError::UnresolvedSymbol {
+            value: symbol.to_owned(),
+        })?;
+    Ok(ControlClaim::PositionQuantity {
+        instrument,
+        quantity,
+        at: BalancePoint::Closing,
+    })
 }
 
 fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {
@@ -296,18 +356,6 @@ fn parse_currency(value: &str) -> Result<CurrencyCode, ParseError> {
     }
 }
 
-fn parse_identifier<T: DeserializeOwned>(
-    value: &str,
-    field: &'static str,
-) -> Result<T, ParseError> {
-    serde_json::from_value(Value::String(value.to_owned())).map_err(|_| {
-        ParseError::InvalidIdentifier {
-            field,
-            value: value.to_owned(),
-        }
-    })
-}
-
 fn date_or_reject(
     value: Option<String>,
     field: &'static str,
@@ -410,7 +458,7 @@ struct RawPortfolioResponse {
     #[allow(dead_code)]
     account_id: Option<String>,
     cash: Option<Vec<RawMoneyValue>>,
-    positions: Option<Vec<RawPortfolioPosition>>,
+    positions: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

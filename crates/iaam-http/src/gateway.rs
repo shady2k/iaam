@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 
 use crate::client::HttpClient;
 use crate::destination::Destination;
-use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, EGRESS_DIRECTORY};
+use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, egress_directory_for};
 use crate::request::{HttpRequest, Secret};
 use crate::resilience::{MAX_NAMED_WAIT, Outcome, Retry, RetryPolicy, is_transient};
 use crate::response::{HttpError, HttpResponse};
@@ -398,9 +398,22 @@ pub enum GatewayError {
     SecondGateway,
     /// The process explicitly disabled every broker destination.
     #[error(
-        "broker egress is disabled by {BROKER_EGRESS_ENV}; set it to `on` and mount {EGRESS_DIRECTORY} before sending broker requests"
+        "broker egress is disabled by {BROKER_EGRESS_ENV}; set it to `on` before sending broker requests, and the tally is found beside this instance's database"
     )]
     BrokerEgressOff,
+    /// The instance's database could not be resolved, so the egress directory
+    /// that holds the broker tally cannot be placed beside it.
+    #[error(
+        "the egress directory could not be placed beside the database {database}: {reason}",
+        database = .database.display()
+    )]
+    EgressPlace { database: PathBuf, reason: String },
+    /// A gateway built without the instance's database cannot open the broker
+    /// tally, which lives in a directory derived from that database.
+    #[error(
+        "broker egress is `on`, but the broker tally lives beside the instance's database and this constructor takes no database; build the gateway with `Gateway::production(broker_egress, database)` instead"
+    )]
+    BrokerEgressWithoutDatabase,
     /// The tally could not be opened, locked, read, written or persisted.
     #[error(
         "outbound tally {path} is unavailable: {reason}; restore access to that path before retrying",
@@ -555,6 +568,8 @@ impl GatewayError {
             Self::MissingRequestAllowance { .. } => "missing request allowance",
             Self::RequestCeiling { .. } => "request ceiling",
             Self::BrokerEgressOff => "broker egress off",
+            Self::EgressPlace { .. } => "egress place",
+            Self::BrokerEgressWithoutDatabase => "broker egress without database",
             Self::TallyUnavailable { .. } => "tally unavailable",
             Self::TallyCorrupt { .. } => "tally corrupt",
             Self::BrokerEndpointOwned { .. } => "broker endpoint owned",
@@ -579,6 +594,8 @@ impl GatewayError {
             | Self::BrokerHostPaused { retry_after, .. }
             | Self::BrokerHostClosed { retry_after, .. } => Some(*retry_after),
             Self::BrokerEgressOff
+            | Self::EgressPlace { .. }
+            | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
             | Self::BrokerEndpointOwned { .. }
@@ -603,6 +620,8 @@ impl GatewayError {
             Self::BrokerHostPaused { .. } => Some(429),
             Self::Rejected { status, .. } => Some(*status),
             Self::BrokerEgressOff
+            | Self::EgressPlace { .. }
+            | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
             | Self::BrokerEndpointOwned { .. }
@@ -630,6 +649,8 @@ impl GatewayError {
             | Self::Rejected { attempts, .. }
             | Self::Transport { attempts, .. } => *attempts,
             Self::BrokerEgressOff
+            | Self::EgressPlace { .. }
+            | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
             | Self::BrokerEndpointOwned { .. }
@@ -648,6 +669,8 @@ impl GatewayError {
         matches!(
             self,
             Self::BrokerEgressOff
+                | Self::EgressPlace { .. }
+                | Self::BrokerEgressWithoutDatabase
                 | Self::TallyUnavailable { .. }
                 | Self::TallyCorrupt { .. }
                 | Self::BrokerEndpointOwned { .. }
@@ -1004,7 +1027,8 @@ static PRODUCTION_BUILT: AtomicBool = AtomicBool::new(false);
 ///
 /// Built once per server process and shared: non-broker pacing, named waits
 /// and breakers are state of this value. Broker accounting and each endpoint's
-/// lifetime owner instead belong to the tally in [`EGRESS_DIRECTORY`].
+/// lifetime owner instead belong to the tally in the directory
+/// [`egress_directory_for`] derives from the instance's database.
 pub struct Gateway<T> {
     transport: Arc<T>,
     budgets: BudgetTable,
@@ -1025,20 +1049,23 @@ impl Gateway<HttpClient> {
     ///
     /// A second call in the same process is refused with
     /// `GatewayError::SecondGateway`: the breakers and named waits are state
-    /// of the value. Broker budgets live in the per-machine tally supplied by
-    /// `broker_egress`.
+    /// of the value. Broker budgets live in the instance's tally, in the
+    /// directory [`egress_directory_for`] derives from `database`: one
+    /// database is one tally, so one iaam instance is one tally.
     ///
     /// # Errors
     /// `GatewayError::SecondGateway` on every call after the first;
-    /// `GatewayError::InvalidBudgets` when the table in this module is wrong.
-    pub fn production(broker_egress: BrokerEgress) -> Result<Self, GatewayError> {
+    /// `GatewayError::InvalidBudgets` when the table in this module is wrong;
+    /// `GatewayError::EgressPlace` when the database cannot be resolved and
+    /// `GatewayError::TallyUnavailable` when the derived place is unusable.
+    pub fn production(broker_egress: BrokerEgress, database: &Path) -> Result<Self, GatewayError> {
         // Claimed before building: two threads racing here must not both
         // see the flag clear. A table that fails its checks fails the same
         // way on a second call, so nothing is lost by not releasing it.
         if PRODUCTION_BUILT.swap(true, Ordering::SeqCst) {
             return Err(GatewayError::SecondGateway);
         }
-        Self::new(HttpClient::new(), broker_egress)
+        Self::new_for_database(HttpClient::new(), broker_egress, database)
     }
 }
 
@@ -1046,16 +1073,23 @@ impl<T: Transport + 'static> Gateway<T> {
     /// A gateway with the documented budgets, system clock and tokio timer
     /// over `transport`.
     ///
+    /// This constructor takes no database, so it cannot open the broker tally
+    /// that lives beside one: it is for non-broker use, and broker egress
+    /// `on` is refused. To send broker requests, build the gateway with
+    /// [`Gateway::production`] or the `*_for_database`/`*_in_directory`
+    /// test seams, which take where the tally lives.
+    ///
     /// # Errors
-    /// `GatewayError::InvalidBudgets` when the table in this module is wrong.
+    /// `GatewayError::InvalidBudgets` when the table in this module is wrong;
+    /// `GatewayError::BrokerEgressWithoutDatabase` when `broker_egress` is
+    /// `BrokerEgress::On`.
     pub fn new(transport: T, broker_egress: BrokerEgress) -> Result<Self, GatewayError> {
-        Self::with_parts_in_directory(
+        Self::with_parts(
             transport,
             BUDGETS,
             Arc::new(SystemClock),
             Arc::new(TokioSleeper),
             broker_egress,
-            Path::new(EGRESS_DIRECTORY),
         )
     }
     /// Test seam for the documented budgets in an isolated egress directory.
@@ -1074,12 +1108,36 @@ impl<T: Transport + 'static> Gateway<T> {
             directory,
         )
     }
-
-    /// A gateway over explicit parts and the compiled egress directory.
+    /// Test seam for the documented budgets over an instance's database, the
+    /// way [`Gateway::production`] finds its tally.
     ///
     /// # Errors
-    /// `GatewayError::InvalidBudgets` when `budgets` fails its checks, or a
-    /// tally error when broker egress is enabled and its directory is unsafe.
+    /// As [`Self::with_parts_for_database`].
+    #[doc(hidden)]
+    pub fn new_for_database(
+        transport: T,
+        broker_egress: BrokerEgress,
+        database: &Path,
+    ) -> Result<Self, GatewayError> {
+        Self::with_parts_for_database(
+            transport,
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            broker_egress,
+            database,
+        )
+    }
+
+    /// A gateway over explicit parts. This constructor takes no database, so
+    /// it cannot open the broker tally that lives beside one: broker egress
+    /// `on` is refused, and broker use goes through
+    /// [`Self::with_parts_for_database`] or [`Self::with_parts_in_directory`].
+    ///
+    /// # Errors
+    /// `GatewayError::InvalidBudgets` when `budgets` fails its checks;
+    /// `GatewayError::BrokerEgressWithoutDatabase` when `broker_egress` is
+    /// `BrokerEgress::On`.
     pub fn with_parts(
         transport: T,
         budgets: &'static [Budget],
@@ -1087,17 +1145,59 @@ impl<T: Transport + 'static> Gateway<T> {
         sleeper: Arc<dyn Sleeper>,
         broker_egress: BrokerEgress,
     ) -> Result<Self, GatewayError> {
-        Self::with_parts_in_directory(
+        if broker_egress == BrokerEgress::On {
+            return Err(GatewayError::BrokerEgressWithoutDatabase);
+        }
+        Self::assemble(transport, budgets, clock, sleeper, broker_egress, None)
+    }
+
+    /// A gateway over explicit parts whose broker tally lives where
+    /// [`egress_directory_for`] places it: beside `database`, created when
+    /// missing. This is the production placement.
+    ///
+    /// # Errors
+    /// `GatewayError::InvalidBudgets` when `budgets` fails its checks;
+    /// `GatewayError::EgressPlace` when the database cannot be resolved;
+    /// `GatewayError::TallyUnavailable` when the derived place is unsafe.
+    pub fn with_parts_for_database(
+        transport: T,
+        budgets: &'static [Budget],
+        clock: Arc<dyn Clock>,
+        sleeper: Arc<dyn Sleeper>,
+        broker_egress: BrokerEgress,
+        database: &Path,
+    ) -> Result<Self, GatewayError> {
+        let egress_directory = if broker_egress == BrokerEgress::On {
+            let place =
+                egress_directory_for(database).map_err(|error| GatewayError::EgressPlace {
+                    database: database.to_owned(),
+                    reason: error.to_string(),
+                })?;
+            let directory = EgressDirectory::open_or_create(&place).map_err(|error| {
+                GatewayError::TallyUnavailable {
+                    path: place.join(crate::tally::TALLY_FILE),
+                    reason: error.to_string(),
+                }
+            })?;
+            OutboundTally::validate(&directory).map_err(|error| {
+                tally_gateway_error(Destination::FinamApi, &directory.tally_path(), error)
+            })?;
+            Some(directory)
+        } else {
+            None
+        };
+        Self::assemble(
             transport,
             budgets,
             clock,
             sleeper,
             broker_egress,
-            Path::new(EGRESS_DIRECTORY),
+            egress_directory,
         )
     }
 
-    /// Test seam for an isolated egress-directory mount.
+    /// Test seam for an isolated egress-directory mount: the directory must
+    /// exist already and is only opened, never created.
     #[doc(hidden)]
     pub fn with_parts_in_directory(
         transport: T,
@@ -1121,6 +1221,26 @@ impl<T: Transport + 'static> Gateway<T> {
         } else {
             None
         };
+        Self::assemble(
+            transport,
+            budgets,
+            clock,
+            sleeper,
+            broker_egress,
+            egress_directory,
+        )
+    }
+
+    /// The one constructor body: every placement above resolves the directory
+    /// (or none, when broker egress is off) and hands it here.
+    fn assemble(
+        transport: T,
+        budgets: &'static [Budget],
+        clock: Arc<dyn Clock>,
+        sleeper: Arc<dyn Sleeper>,
+        broker_egress: BrokerEgress,
+        egress_directory: Option<EgressDirectory>,
+    ) -> Result<Self, GatewayError> {
         Ok(Self {
             transport: Arc::new(transport),
             budgets: BudgetTable::new(budgets)?,
@@ -2124,6 +2244,21 @@ mod tests {
             body: Vec::new(),
             retry_after: None,
         }
+    }
+
+    /// An invented instance database in a fresh directory, the way a real
+    /// one exists before the gateway is built over it.
+    fn instance_database(label: &str) -> (PathBuf, PathBuf) {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "iaam-http-instance-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("instance directory created");
+        let database = directory.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+        (directory, database)
     }
 
     fn broker_egress_directory() -> PathBuf {
@@ -3946,8 +4081,9 @@ mod tests {
     // process is refused.
     #[test]
     fn a_process_builds_one_production_gateway() {
-        let first = Gateway::production(BrokerEgress::Off);
-        let second = Gateway::production(BrokerEgress::Off);
+        let (_directory, database) = instance_database("production");
+        let first = Gateway::production(BrokerEgress::Off, &database);
+        let second = Gateway::production(BrokerEgress::Off, &database);
 
         assert!(first.is_ok(), "the first gateway was refused");
         let Err(refused) = second else {
@@ -3961,6 +4097,62 @@ mod tests {
         let message = refused.to_string();
         assert!(message.contains("one gateway"), "{message}");
         assert!(message.contains("docs/deployment.md §1.1"), "{message}");
+    }
+
+    #[test]
+    fn a_gateway_without_a_database_refuses_broker_egress() {
+        let _kept = instance_database("without-database");
+
+        let refused = match Gateway::new(HttpClient::new(), BrokerEgress::On) {
+            Err(refused) => refused,
+            Ok(_) => panic!("a constructor without a database cannot open a tally"),
+        };
+        assert!(
+            matches!(refused, GatewayError::BrokerEgressWithoutDatabase),
+            "{refused:?}"
+        );
+        let message = refused.to_string();
+        assert!(message.contains("production"), "{message}");
+        let refused = match Gateway::with_parts(
+            HttpClient::new(),
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            BrokerEgress::On,
+        ) {
+            Err(refused) => refused,
+            Ok(_) => panic!("with_parts takes no database either"),
+        };
+        assert!(
+            matches!(refused, GatewayError::BrokerEgressWithoutDatabase),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_database_anchored_gateway_creates_its_place_beside_the_database() {
+        let (directory, database) = instance_database("for-database");
+        let time = FakeTime::new();
+
+        let gateway = Gateway::with_parts_for_database(
+            Scripted::answering(&time, 200),
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            &database,
+        )
+        .expect("the place beside the database is created");
+
+        let place = directory.join("iaam.sqlite.egress");
+        let mode = std::os::unix::fs::MetadataExt::mode(
+            &std::fs::metadata(&place).expect("the place exists"),
+        );
+        assert_eq!(mode & 0o777, 0o700, "the place is private to its owner");
+        let tally = std::fs::read(place.join(crate::tally::TALLY_FILE))
+            .expect("the fresh tally record exists");
+        assert!(tally.is_empty(), "a fresh record is empty, not pre-filled");
+        std::mem::forget(gateway);
     }
 
     #[test]

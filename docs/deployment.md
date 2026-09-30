@@ -73,8 +73,9 @@ breakers in the server process. They do not cross a restart.
 
 Broker traffic has a stronger rule: **one process owns each broker endpoint**.
 The first request to T-Invest production, T-Invest sandbox or Finam acquires
-`tinkoff-prod.owner`, `tinkoff-sandbox.owner` or `finam.owner` in the compiled
-egress directory, and holds that lock for the gateway's lifetime. A second
+`tinkoff-prod.owner`, `tinkoff-sandbox.owner` or `finam.owner` in the
+instance's egress directory — derived from the database path, see §2.1 — and
+holds that lock for the gateway's lifetime. A second
 process asking for that endpoint is refused before transport; the reason names
 the endpoint and tells the operator to use or stop the owning process. It may
 still own and use another endpoint.
@@ -111,8 +112,14 @@ for its stored duration; every closure restarts from its persisted reason
 unresolved attempt); old request histories restart from the new boot; and the
 first send to each endpoint waits 60 seconds.
 
-The gateway opens the compiled directory `/var/lib/iaam/egress` when broker
-egress is enabled and keeps that directory descriptor for its lifetime. Its
+The gateway places the instance's egress directory beside the instance's
+database (`iaam.sqlite` → `iaam.sqlite.egress`, canonicalized first: every
+alias of the same database reaches the same directory) and opens it when broker
+egress is enabled, keeping that directory descriptor for its lifetime. One
+database is one tally: this is the per-instance guarantee, and no separate
+setting exists that could split one instance's tally. When the directory is
+missing, the process creates it with mode 0700 and the two fresh tally records
+in it — no step needs root. The
 `outbound-tally`, `outbound-tally-generation`, lock, owner and temporary records
 are opened relative to the descriptor without following symlinks, then checked
 again by device and inode. The tally and its separate generation record advance
@@ -149,8 +156,12 @@ and transport handoff; boot identity changes; tally persistence across owner
 rebuilds; egress-off; path aliases; and two-process ownership. The process rows
 are reconstructed from the loopback receiver's actual wire-arrival records.
 The two child processes deliberately disagree in an irrelevant environment
-variable while receiving the same egress directory, proving that filesystem
-identity, not process-local environment, coordinates ownership.
+variable while receiving the same database path, proving that the tally beside
+the database, not process-local environment, coordinates ownership. A separate
+row builds gateways over aliases of one database — a symlink to the file, a
+symlink to its directory, a redundant `..`, a relative path — and shows they
+share one tally and one endpoint owner, while a second database keeps a second
+tally: two instances with two databases have two tallies.
 
 There is deliberately no fake wall-clock-step row. The production
 `Clock`/`SystemClock` used for persisted ceilings exposes only in-process
@@ -191,7 +202,7 @@ open breakers are still lost on restart.
 | `IAAM_DATABASE` | **required** | none — every subcommand refuses without it | every subcommand, including `serve` |
 | `IAAM_BROKER_KEY_FILE` | path to a secret | none | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
 | `IAAM_BROKER_EGRESS` | `off` or `on` | `off` | `serve`, broker examples, ignored live sandbox test |
-| `/var/lib/iaam/egress` | compiled persistent state directory, required when broker egress is `on` | fixed path | `serve`, broker examples, ignored live sandbox test |
+| the egress directory | directory beside the database (`<database>.egress`), created by the process when missing | derived from `IAAM_DATABASE` — no variable and no override | `serve`, broker examples, ignored live sandbox test |
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
 | `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
 | `IAAM_RATE_WINDOW_SECONDS` | optional | `60` | `serve` |
@@ -209,29 +220,25 @@ and answers `200` with or without the key (§6.2).
 
 `IAAM_BROKER_EGRESS` is a fail-closed deployment switch. Unset and `off` both
 refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
-or network is touched. `on` requires the compiled directory
-`/var/lib/iaam/egress`; there is no environment-variable path override.
+or network is touched. `on` derives the tally directory from the instance's
+database (§2.1, `IAAM_DATABASE`); there is no separate path override, so one
+instance cannot be given a second tally.
 
-Create the directory and its two existing tally records before startup:
+No preparation step exists: when the directory or the two fresh tally records
+are missing, the process creates them (mode 0700 on the directory) beside the
+database before opening them.
 
-```console
-$ install -d -m 0700 /var/lib/iaam/egress
-$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally
-$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally-generation
-$ export IAAM_BROKER_EGRESS=on
-```
-
-Every iaam process on the machine that may contact a broker must see that exact
-persistent mount and run as an OS user able to read, write and sync both tally
-records; create and lock its lock and three endpoint-owner records; create its
-temporary records; atomically rename within the directory; and sync the
-directory. A container must bind the same host directory at
-`/var/lib/iaam/egress`; a container-private directory or a different host path
-creates a separate owner and tally domain and is not safe. Processes on
+Every iaam process of one instance must reach the same database — and thereby
+the same egress directory — and run as an OS user able to read, write and sync
+both tally records; create and lock its lock and three endpoint-owner records;
+create its temporary records; atomically rename within the directory; and sync
+the directory. Two instances with two databases have two tallies, and that is
+the guarantee: an instance is one tally, not a machine. Processes on
 different machines do not share this coordination. Network filesystems and
 cross-machine tally sharing are outside the proof.
 
-Both tally records must already exist. A pair of empty records is accepted only
+A pair of empty records — including the fresh pair the process itself creates
+when the place is missing — is accepted only
 as a conservative recovery state: on first use iaam records 1,000 attempts at
 the current time for **each** broker endpoint, so every broker endpoint remains
 at its rolling-day ceiling for 24 hours. This is deliberate; an empty pair
@@ -256,7 +263,8 @@ its own acquisition time and closes that endpoint for a full hour from
 adoption. Other endpoint activity and the original handoff's age do not shorten
 that closure.
 
-Operational repair is a controlled stop: stop every process using the mount and
+Operational repair is a controlled stop: stop every process using the
+directory and
 repair both records as one matched pair. If no trustworthy matched pair exists,
 empty both records together, start one process, and expect the documented
 24-hour daily-ceiling refusal on every broker endpoint. After that interval,

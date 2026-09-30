@@ -91,7 +91,8 @@ async fn the_sandbox_accepts_the_provisioned_access() {
     // lifetime sandbox-endpoint ownership; requesting this test must not
     // bypass any of them.
     let egress = BrokerEgress::from_env().expect("broker egress configured");
-    let gateway = Gateway::production(egress).expect("broker gateway configured");
+    let database = required("IAAM_DATABASE");
+    let gateway = Gateway::production(egress, &database).expect("broker gateway configured");
     let result = gateway.send(&request, None).await;
 
     // Status and body length only, never the body: test output is kept in

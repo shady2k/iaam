@@ -1,16 +1,17 @@
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 pub const BROKER_EGRESS_ENV: &str = "IAAM_BROKER_EGRESS";
-pub const EGRESS_DIRECTORY: &str = "/var/lib/iaam/egress";
 
 /// Whether this process may send requests to a broker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerEgress {
     /// Broker destinations are refused before the tally or transport.
     Off,
-    /// Broker destinations use the fixed per-machine egress directory.
+    /// Broker destinations use the tally directory derived from the
+    /// instance's database path.
     On,
 }
 
@@ -26,9 +27,10 @@ pub enum BrokerEgressConfigError {
 impl BrokerEgress {
     /// Read the process's broker-egress switch.
     ///
-    /// The switch defaults to `off`. When it is `on`, the gateway opens the
-    /// compiled-in per-machine egress directory; no environment variable can
-    /// choose another tally or endpoint-owner identity.
+    /// The switch defaults to `off`. When it is `on`, the gateway derives the
+    /// instance's egress directory from its database path
+    /// ([`egress_directory_for`]); no environment variable can choose another
+    /// tally or endpoint-owner identity.
     ///
     /// # Errors
     /// An invalid switch value or a non-Unicode switch.
@@ -52,6 +54,60 @@ impl BrokerEgress {
             _ => Err(BrokerEgressConfigError::InvalidSwitch { value }),
         }
     }
+}
+
+/// The instance's database could not be resolved to place its egress directory.
+#[derive(Debug, Error)]
+pub enum EgressDirectoryError {
+    /// The database does not exist (or a path part is not a directory), so no
+    /// directory can be placed beside it.
+    #[error(
+        "the database {database} does not exist, so its egress directory cannot live beside it; \
+         the gateway is built after the store exists, so check which database this process was given",
+        database = .database.display()
+    )]
+    DatabaseUnresolved {
+        database: PathBuf,
+        source: std::io::Error,
+    },
+    /// The resolved database path has no file name to name the directory after.
+    #[error(
+        "the database path {database} has no file name, so its egress directory cannot be named after it",
+        database = .database.display()
+    )]
+    NoFileName { database: PathBuf },
+}
+
+/// Where one instance's broker tally lives: a directory beside its database,
+/// named after the database file (`iaam.sqlite` → `iaam.sqlite.egress`).
+///
+/// One database is one tally. Every alias of the same database — a relative
+/// path, a redundant `..`, a symlink to the file or to its directory — yields
+/// the same directory, because the database path is canonicalized first. Two
+/// different databases yield two directories: two instances with two databases
+/// have two tallies.
+///
+/// # Errors
+/// The database path does not resolve to an existing file
+/// ([`EgressDirectoryError::DatabaseUnresolved`]) or has no file name
+/// ([`EgressDirectoryError::NoFileName`]).
+pub fn egress_directory_for(database: &Path) -> Result<PathBuf, EgressDirectoryError> {
+    let resolved =
+        database
+            .canonicalize()
+            .map_err(|source| EgressDirectoryError::DatabaseUnresolved {
+                database: database.to_owned(),
+                source,
+            })?;
+    let name = resolved
+        .file_name()
+        .ok_or_else(|| EgressDirectoryError::NoFileName {
+            database: database.to_owned(),
+        })?
+        .to_owned();
+    let mut directory = resolved;
+    directory.pop();
+    Ok(directory.join(format!("{}.egress", name.to_string_lossy())))
 }
 
 #[cfg(test)]
@@ -99,5 +155,123 @@ mod tests {
         assert!(message.contains("yes"), "{message}");
         assert!(message.contains("on"), "{message}");
         assert!(message.contains("off"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod derivation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unique_directory(label: &str) -> PathBuf {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "iaam-http-egress-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("test directory created");
+        directory
+    }
+
+    #[test]
+    fn the_directory_is_named_after_the_database_file_beside_it() {
+        let directory = unique_directory("named-after");
+        let database = directory.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+
+        let derived = egress_directory_for(&database).expect("database resolves");
+
+        assert_eq!(derived, directory.join("iaam.sqlite.egress"));
+    }
+
+    #[test]
+    fn a_missing_database_is_refused_by_name() {
+        let directory = unique_directory("missing");
+        let database = directory.join("absent.sqlite");
+
+        let error = egress_directory_for(&database).expect_err("missing database refused");
+
+        assert!(error.to_string().contains("absent.sqlite"), "{error}");
+    }
+
+    #[test]
+    fn every_alias_of_one_database_yields_one_directory() {
+        let directory = unique_directory("aliases");
+        let real = directory.join("real");
+        std::fs::create_dir(&real).expect("real directory created");
+        let database = real.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+
+        let direct = egress_directory_for(&database).expect("direct path resolves");
+
+        // A symlink to the database file.
+        let file_link = directory.join("file-link.sqlite");
+        std::os::unix::fs::symlink(&database, &file_link).expect("database symlink created");
+        // A symlink to the database's directory.
+        let directory_link = directory.join("directory-link");
+        std::os::unix::fs::symlink(&real, &directory_link).expect("directory symlink created");
+        // A path carrying a redundant `..`.
+        let dotdot = directory
+            .join("directory-link")
+            .join("..")
+            .join("real")
+            .join("iaam.sqlite");
+
+        assert_eq!(
+            egress_directory_for(&file_link).expect("file symlink resolves"),
+            direct,
+            "a symlink to the file must reach the same tally"
+        );
+        assert_eq!(
+            egress_directory_for(&directory_link.join("iaam.sqlite"))
+                .expect("directory symlink resolves"),
+            direct,
+            "a symlink to the directory must reach the same tally"
+        );
+        assert_eq!(
+            egress_directory_for(&dotdot).expect("dot-dot path resolves"),
+            direct,
+            "a redundant `..` must reach the same tally"
+        );
+    }
+
+    #[test]
+    fn a_relative_path_yields_the_same_directory_as_the_absolute_one() {
+        let directory = unique_directory("relative");
+        let database = directory.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+        // A path relative to the current directory, without changing it:
+        // walk from the working directory down to the common ancestor, then
+        // back up to the database.
+        let current = std::env::current_dir().expect("working directory");
+        let mut relative = PathBuf::new();
+        let mut up = current.as_path();
+        while !database.starts_with(up) {
+            up = up.parent().expect("common ancestor");
+            relative.push("..");
+        }
+        relative.push(database.strip_prefix(up).expect("below the ancestor"));
+
+        let absolute = egress_directory_for(&database).expect("absolute path resolves");
+
+        assert_eq!(
+            egress_directory_for(&relative).expect("relative path resolves"),
+            absolute,
+        );
+    }
+
+    #[test]
+    fn two_databases_yield_two_directories() {
+        let directory = unique_directory("two");
+        let first = directory.join("first.sqlite");
+        let second = directory.join("second.sqlite");
+        std::fs::write(&first, "").expect("first database written");
+        std::fs::write(&second, "").expect("second database written");
+
+        let first_directory = egress_directory_for(&first).expect("first resolves");
+        let second_directory = egress_directory_for(&second).expect("second resolves");
+
+        assert_ne!(first_directory, second_directory);
     }
 }

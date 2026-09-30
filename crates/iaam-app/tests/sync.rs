@@ -2300,14 +2300,14 @@ async fn concurrent_account_syncs_own_separate_three_hundred_attempt_allowances(
         now: Mutex::new(Instant::now()),
         wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
     });
-    let directory = broker_egress_directory();
-    let gateway = Gateway::with_parts_in_directory(
+    let database = broker_egress_database();
+    let gateway = Gateway::with_parts_for_database(
         CountingTransport(Arc::clone(&sent)),
         BUDGETS,
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
         iaam_http::BrokerEgress::On,
-        &directory,
+        &database,
     );
     let Ok(gateway) = gateway else {
         panic!("the documented budget table was invalid");
@@ -2517,22 +2517,31 @@ impl Sleeper for PausedTime {
     }
 }
 
-fn broker_egress_directory() -> std::path::PathBuf {
+/// An invented instance database; the gateway's egress place is derived from
+/// it, created beside it, and initialized with the fixture tally.
+fn broker_egress_database() -> std::path::PathBuf {
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
         "iaam-app-sync-test-{}-{sequence}",
         std::process::id()
     ));
-    std::fs::create_dir(&directory).expect("egress directory created");
+    std::fs::create_dir(&directory).expect("instance directory created");
+    let database = directory.join("iaam.sqlite");
+    std::fs::write(&database, "").expect("database file written");
+    // The fixture tally is initialized in the place derived from the
+    // database, and records a boot of its own, so no test starts inside the
+    // conservative empty-pair state.
+    let place = iaam_http::egress_directory_for(&database).expect("place derived");
+    std::fs::create_dir(&place).expect("egress place created");
     std::fs::write(
-        directory.join("outbound-tally"),
+        place.join("outbound-tally"),
         "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
     )
     .expect("initialized tally created");
-    std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+    std::fs::write(place.join("outbound-tally-generation"), "0\n")
         .expect("initialized generation created");
-    directory
+    database
 }
 
 /// A T-Invest that answers every operations page, always with one more to
@@ -2570,8 +2579,8 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
     let time = Arc::new(PausedTime {
         start: tokio::time::Instant::now().into_std(),
     });
-    let directory = broker_egress_directory();
-    let gateway = Gateway::with_parts_in_directory(
+    let database = broker_egress_database();
+    let gateway = Gateway::with_parts_for_database(
         SlowTinvest {
             step: Duration::from_secs(4 * 60),
             asked: Arc::clone(&asked),
@@ -2580,7 +2589,7 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
         iaam_http::BrokerEgress::On,
-        &directory,
+        &database,
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);
@@ -2655,14 +2664,14 @@ fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
         now: Mutex::new(Instant::now()),
         wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
     });
-    let directory = broker_egress_directory();
-    let gateway = Gateway::with_parts_in_directory(
+    let database = broker_egress_database();
+    let gateway = Gateway::with_parts_for_database(
         transport,
         BUDGETS,
         Arc::clone(&time) as Arc<dyn GatewayClock>,
         time as Arc<dyn Sleeper>,
         iaam_http::BrokerEgress::On,
-        &directory,
+        &database,
     )
     .expect("the documented table is valid");
     let key = Key::from_bytes([5; 32]);

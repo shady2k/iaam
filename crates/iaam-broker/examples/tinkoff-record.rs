@@ -49,7 +49,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let interval_days = interval_days()?;
     let (from, to) = interval(interval_days)?;
 
-    let store = SqliteStore::open(&required_path("IAAM_DATABASE")?)?;
+    let database = required_path("IAAM_DATABASE")?;
+    let store = SqliteStore::open(&database)?;
     let key = Key::from_file(&required_path("IAAM_BROKER_KEY_FILE")?)?;
     let owner = match store.sole_token_owner()? {
         SoleOwner::Single(owner) => owner,
@@ -75,8 +76,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (nonce, ciphertext) = access.sealed_parts();
     let token = open(&key, &SealedToken::of(nonce.to_vec(), ciphertext.to_vec()))?;
     // The recorder must acquire the sandbox endpoint for its lifetime and
-    // records every send in the same canonical tally as the server and probes.
-    let gateway = Gateway::production(BrokerEgress::from_env()?)?;
+    // records every send in the instance's canonical tally, beside the same
+    // database the server uses.
+    let gateway = Gateway::production(BrokerEgress::from_env()?, &database)?;
 
     // Request only open accounts: a closed account is unsuitable for the
     // following calls and would make the sample set non-deterministic.

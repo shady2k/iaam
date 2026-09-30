@@ -693,22 +693,31 @@ mod tests {
             .expect("token round trip")
     }
 
-    fn broker_egress_directory() -> std::path::PathBuf {
+    /// An invented instance database; the gateway's egress place is derived
+    /// from it, created beside it, and initialized with the fixture tally.
+    fn broker_egress_database() -> std::path::PathBuf {
         static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
             "iaam-app-finam-test-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::create_dir(&directory).expect("instance directory created");
+        let database = directory.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+        // The fixture tally is initialized in the place derived from the
+        // database, and records a boot of its own, so no test starts inside
+        // the conservative empty-pair state.
+        let place = iaam_http::egress_directory_for(&database).expect("place derived");
+        std::fs::create_dir(&place).expect("egress place created");
         std::fs::write(
-            directory.join("outbound-tally"),
+            place.join("outbound-tally"),
             "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
         )
         .expect("initialized tally created");
-        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+        std::fs::write(place.join("outbound-tally-generation"), "0\n")
             .expect("initialized generation created");
-        directory
+        database
     }
 
     fn dictionary() -> OperationKindDictionary {
@@ -1470,9 +1479,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_request_still_running_at_the_deadline_is_dropped() {
-        let directory = broker_egress_directory();
+        let database = broker_egress_database();
         let gateway: Arc<dyn Outbound> = Arc::new(
-            Gateway::new_in_directory(Parked, BrokerEgress::On, &directory)
+            Gateway::new_for_database(Parked, BrokerEgress::On, &database)
                 .expect("the budget table is valid"),
         );
         let channel = channel(gateway);

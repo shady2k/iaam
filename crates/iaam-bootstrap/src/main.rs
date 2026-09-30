@@ -7,6 +7,7 @@ mod bundle;
 mod config;
 mod instance;
 mod provision;
+mod token;
 
 use std::sync::Arc;
 
@@ -16,8 +17,7 @@ use iaam_app::adapters::profile_ledger::StoreVersionLedger;
 use iaam_app::adapters::sqlite::SqliteAdapter;
 use iaam_app::ingest::profile::ProfileCatalogue;
 use iaam_app::ports::{
-    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Scope, SoleOwner, SystemClock,
-    TokenAdmin,
+    BrokerChannelFactory, BrokerVault, ClassificationRuleStore, Clock, SystemClock, TokenAdmin,
 };
 use iaam_broker::credentials::Key;
 use iaam_broker::environment::Environment;
@@ -29,6 +29,7 @@ use zeroize::Zeroizing;
 
 use crate::config::{Config, Place, PlaceSource, Places};
 use crate::instance::{ensure_private_directory, open_database};
+use crate::token::{SHOWN_ONCE, TokenCommand, claim_owner, issue_token, list_tokens, revoke_token};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -48,9 +49,10 @@ enum Command {
     ///
     /// The one command that creates a database: the file, and its
     /// directory with mode 0700, come into being here and nowhere else.
+    /// Without `--label` the token is named `owner`.
     Claim {
         #[arg(long)]
-        label: String,
+        label: Option<String>,
     },
     /// Manage API tokens.
     Token {
@@ -92,34 +94,6 @@ enum BundleCommand {
         #[arg(long)]
         merge: bool,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum TokenCommand {
-    /// Issue a token for the existing sole owner.
-    Issue {
-        #[arg(long)]
-        label: String,
-        #[arg(long, value_enum, default_value_t = TokenScopeArg::Owner)]
-        scope: TokenScopeArg,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum TokenScopeArg {
-    Owner,
-    Agent,
-    ReadOnly,
-}
-
-impl From<TokenScopeArg> for Scope {
-    fn from(scope: TokenScopeArg) -> Self {
-        match scope {
-            TokenScopeArg::Owner => Self::Owner,
-            TokenScopeArg::Agent => Self::Agent,
-            TokenScopeArg::ReadOnly => Self::ReadOnly,
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -293,18 +267,44 @@ where
             ensure_private_directory(&database.path, "the instance's database")?;
             let store = SqliteStore::open(&database.path)?;
             let admin = SqliteAdapter::new(store);
-            let token = claim_owner(&admin, &label).await?;
+            let token = claim_owner(&admin, label).await?;
             println!("{token}");
+            eprintln!("{SHOWN_ONCE}");
             Ok(())
         }
         Command::Token {
-            command: TokenCommand::Issue { label, scope },
+            command: TokenCommand::Issue { scope, label },
         } => {
             let config = Config::from_lookup(&get)?;
             let store = open_database(&config.database)?;
             let admin = SqliteAdapter::new(store);
-            let token = issue_token(&admin, &label, scope.into()).await?;
+            let token = issue_token(
+                &admin,
+                scope.into(),
+                label,
+                &SystemClock.today().to_string(),
+            )
+            .await?;
             println!("{token}");
+            eprintln!("{SHOWN_ONCE}");
+            Ok(())
+        }
+        Command::Token {
+            command: TokenCommand::List,
+        } => {
+            let config = Config::from_lookup(&get)?;
+            let store = open_database(&config.database)?;
+            let admin = SqliteAdapter::new(store);
+            print!("{}", list_tokens(&admin).await?);
+            Ok(())
+        }
+        Command::Token {
+            command: TokenCommand::Revoke { target },
+        } => {
+            let config = Config::from_lookup(&get)?;
+            let store = open_database(&config.database)?;
+            let admin = SqliteAdapter::new(store);
+            println!("{}", revoke_token(&admin, &target).await?);
             Ok(())
         }
         Command::Broker {
@@ -591,50 +591,6 @@ fn read_token() -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
     Ok(token)
 }
 
-/// Claim an instance and issue its first owner token.
-///
-/// Deciding that the instance is unclaimed and creating the token are one
-/// atomic operation, and it lives behind `TokenAdmin`: this command names it
-/// and prints its result, nothing more. Assembling a token record here as well
-/// would be a second implementation of credential issuance — and the one that
-/// mints the owner's token, so a change to issuance would pass it by in
-/// silence.
-///
-/// The token is printed once. It is nowhere else: not in a log, and not in the
-/// database, which keeps only its hash (§14).
-async fn claim_owner(
-    admin: &dyn TokenAdmin,
-    label: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let issued = admin.claim_owner(label.to_owned()).await?;
-    Ok(issued.token)
-}
-
-/// Issue a token for the existing sole owner. The token itself is printed
-/// once and never stored: only its hash is kept in the database.
-async fn issue_token(
-    admin: &dyn TokenAdmin,
-    label: &str,
-    scope: Scope,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let owner = match admin.sole_owner().await? {
-        SoleOwner::Single(owner) => owner,
-        SoleOwner::None => {
-            return Err("instance has no owner: run `iaam claim --label <label>` first".into());
-        }
-        SoleOwner::Several => {
-            return Err(
-                "multiple owners in database: choosing which one should receive \
-                        a token is impossible. These are signs of corruption in \
-                        a single-user system — inspect the database, not the command"
-                    .into(),
-            );
-        }
-    };
-    let issued = admin.issue_token(owner, label.to_owned(), scope).await?;
-    Ok(issued.token)
-}
-
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");
@@ -644,9 +600,10 @@ async fn shutdown() {
 mod tests {
     use super::{
         BrokerAccessCommand, BrokerCommand, BrokerEnvironmentArg, BrokerKeyCommand, BundleCommand,
-        Cli, Command, Config, Places, SqliteAdapter, TokenCommand, TokenScopeArg, claim_owner,
-        execute, format_error_chain, legacy_replacement, read_broker_key, serve, status_report,
+        Cli, Command, Config, Places, SqliteAdapter, TokenCommand, claim_owner, execute,
+        format_error_chain, legacy_replacement, read_broker_key, serve, status_report,
     };
+    use crate::token::TokenScopeArg;
     use clap::Parser;
 
     #[test]
@@ -689,30 +646,6 @@ mod tests {
         assert!(text.contains("do not create a new one over it"));
         assert!(!text.contains("IAAM_GENERATE_BROKER_KEY=1"));
         assert!(!text.contains("Invalid {"));
-    }
-
-    #[test]
-    fn cli_parses_nested_token_scope() {
-        let cli = Cli::try_parse_from([
-            "iaam",
-            "token",
-            "issue",
-            "--label",
-            "Main",
-            "--scope",
-            "read-only",
-        ])
-        .unwrap();
-
-        assert!(matches!(
-            cli.command,
-            Command::Token {
-                command: TokenCommand::Issue {
-                    scope: TokenScopeArg::ReadOnly,
-                    ..
-                }
-            }
-        ));
     }
 
     #[test]
@@ -825,7 +758,7 @@ mod tests {
                     .unwrap();
                 barrier.wait();
                 runtime
-                    .block_on(claim_owner(&adapter, label))
+                    .block_on(claim_owner(&adapter, Some(label.to_owned())))
                     .map_err(|error| error.to_string())
             })
         };
@@ -896,7 +829,7 @@ mod tests {
         let error = execute(
             Command::Token {
                 command: TokenCommand::Issue {
-                    label: "Main".to_owned(),
+                    label: None,
                     scope: TokenScopeArg::Owner,
                 },
             },
@@ -920,6 +853,59 @@ mod tests {
             !home.join(".local").exists(),
             "no directory may appear either"
         );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+    #[tokio::test]
+    async fn token_list_without_a_database_refuses_and_creates_nothing() {
+        let home = temp_home("token-list-refusal");
+        let database = home.join(".local/share/iaam/iaam.db");
+        let values = [("HOME", home.to_str().unwrap())];
+        let lookup = lookup_with(&values);
+
+        let error = execute(
+            Command::Token {
+                command: TokenCommand::List,
+            },
+            lookup,
+        )
+        .await
+        .unwrap_err();
+
+        let text = format_error_chain(error.as_ref());
+        assert!(text.contains("no database at"), "{text}");
+        assert!(
+            text.contains(database.display().to_string().as_str()),
+            "{text}"
+        );
+        assert!(!database.exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_revoke_without_a_database_refuses_and_creates_nothing() {
+        let home = temp_home("token-revoke-refusal");
+        let database = home.join(".local/share/iaam/iaam.db");
+        let values = [("HOME", home.to_str().unwrap())];
+        let lookup = lookup_with(&values);
+
+        let error = execute(
+            Command::Token {
+                command: TokenCommand::Revoke {
+                    target: "home agent".to_owned(),
+                },
+            },
+            lookup,
+        )
+        .await
+        .unwrap_err();
+
+        let text = format_error_chain(error.as_ref());
+        assert!(text.contains("no database at"), "{text}");
+        assert!(
+            text.contains(database.display().to_string().as_str()),
+            "{text}"
+        );
+        assert!(!database.exists());
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -1015,7 +1001,7 @@ mod tests {
 
         execute(
             Command::Claim {
-                label: "Main".to_owned(),
+                label: Some("Main".to_owned()),
             },
             lookup,
         )
@@ -1044,7 +1030,7 @@ mod tests {
 
         execute(
             Command::Claim {
-                label: "Main".to_owned(),
+                label: Some("Main".to_owned()),
             },
             lookup,
         )
@@ -1102,7 +1088,7 @@ mod tests {
         // generated for it.
         execute(
             Command::Claim {
-                label: "Main".to_owned(),
+                label: Some("Main".to_owned()),
             },
             lookup_with(&[("HOME", home.to_str().unwrap())]),
         )
@@ -1160,7 +1146,7 @@ mod tests {
         // and names a variable-set place by its variable.
         execute(
             Command::Claim {
-                label: "Main".to_owned(),
+                label: Some("Main".to_owned()),
             },
             lookup_with(&[("HOME", home.to_str().unwrap())]),
         )

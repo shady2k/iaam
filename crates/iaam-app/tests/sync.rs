@@ -2157,6 +2157,7 @@ impl Transport for CountingTransport {
             status: 200,
             body: Vec::new(),
             retry_after: None,
+            ..Default::default()
         })
     }
 }
@@ -2562,6 +2563,7 @@ impl Transport for SlowTinvest {
             status: 200,
             body: body.into_bytes(),
             retry_after: None,
+            ..Default::default()
         })
     }
 }
@@ -2655,6 +2657,7 @@ impl Transport for ThrottlingTinvest {
             status: 429,
             body: b"{}".to_vec(),
             retry_after: Some(self.wait),
+            ..Default::default()
         })
     }
 }

@@ -333,7 +333,7 @@ impl Transport for HttpClientHarness {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         self.client
             .send_to_base_observed(request, &self.base_url, self.timeout, handoff, observe)

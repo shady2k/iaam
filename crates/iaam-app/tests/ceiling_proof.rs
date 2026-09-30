@@ -776,7 +776,7 @@ impl Transport for ProofTransport {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         self.advance_before_handoff();
         let after = self.take_after_handoff();

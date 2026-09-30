@@ -1181,6 +1181,7 @@ pub(crate) mod fake {
                 retry_after: answer
                     .reset
                     .filter(|_| request.reset_header() == Some("x-ratelimit-reset")),
+                ..Default::default()
             })
         }
     }

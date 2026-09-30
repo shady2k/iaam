@@ -314,8 +314,9 @@ pub trait Transport: Send + Sync {
         request: &'a HttpRequest,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a;
 
-    /// Send while exposing the transport hand-off and response status before
-    /// the body is consumed.
+    /// Send while exposing the transport hand-off and the status line —
+    /// status, named wait and the headers an operator reads the call by —
+    /// before the body is consumed.
     ///
     /// Scripted transports get the safe default. `HttpClient` overrides it so
     /// the hand-off is acknowledged after request construction and immediately
@@ -325,12 +326,14 @@ pub trait Transport: Send + Sync {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         async move {
             handoff()?;
             let response = self.send(request).await?;
-            observe(response.status, response.retry_after);
+            let mut observed = response.clone();
+            observed.body = Vec::new();
+            observe(observed);
             Ok(response)
         }
     }
@@ -348,7 +351,7 @@ impl Transport for HttpClient {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         Self::send_observed(self, request, handoff, observe)
     }
@@ -380,8 +383,11 @@ impl<T: Transport + 'static> Outbound for Gateway<T> {
 
 /// Refusal from the gateway.
 ///
-/// Carries statuses, counts and delays only: never a header value and never
-/// the presented secret, so it can be logged as it is.
+/// Carries statuses, counts and delays, plus the three destination-authored
+/// response headers an operator reads a refusal by (`Rejected`'s `location`,
+/// `content_type` and `request_id`): the response body is boxed in
+/// `RejectedBody`, whose `Debug` prints its length only, and no field
+/// carries the presented secret, so it can be logged as it is.
 #[derive(Debug, Error)]
 pub enum GatewayError {
     #[error("no budget is recorded for path {path:?} at {destination:?}")]
@@ -538,6 +544,14 @@ pub enum GatewayError {
         status: u16,
         attempts: u32,
         body: RejectedBody,
+        /// Where a 3xx refusal points, as the destination sent it, cut of
+        /// the presented secret.
+        location: Option<String>,
+        /// The `Content-Type` the destination named for the refused body.
+        content_type: Option<String>,
+        /// The request id the destination answered with, cut of the
+        /// presented secret.
+        request_id: Option<String>,
     },
     /// The transport could not be set up; retrying would meet the same fault.
     #[error("{destination:?} could not be reached after {attempts} attempts: {error}")]
@@ -691,8 +705,48 @@ impl GatewayError {
 #[derive(Clone, PartialEq, Eq)]
 pub struct RejectedBody(Vec<u8>);
 
-/// What stands in a rejected body where the bearer secret was.
-const REDACTED: &[u8] = b"<redacted>";
+/// What stands in a rejected body or header where the bearer secret was.
+const REDACTED_TEXT: &str = "<redacted>";
+
+const REDACTED: &[u8] = REDACTED_TEXT.as_bytes();
+
+/// The response headers a refused line reads back: where a redirect
+/// points, the body's type, and the request id the destination named.
+///
+/// Each is cut of the request's bearer secret at capture: a destination
+/// that echoes the presented token back in a header would otherwise hand
+/// it to every reader of the log. Carries no body and no status: the
+/// rejection itself does.
+#[derive(Debug, Clone, Default)]
+struct RefusalHeaders {
+    location: Option<String>,
+    content_type: Option<String>,
+    request_id: Option<String>,
+}
+
+impl RefusalHeaders {
+    fn of(response: &HttpResponse, secret: Option<&Secret>) -> Self {
+        Self {
+            location: without_secret(response.location.as_deref(), secret),
+            content_type: without_secret(response.content_type.as_deref(), secret),
+            request_id: without_secret(response.request_id.as_deref(), secret),
+        }
+    }
+}
+
+/// `value` with every occurrence of the presented secret cut out, or
+/// `None` when the header is absent. No secret, or an empty one, leaves
+/// the value as it was.
+fn without_secret(value: Option<&str>, secret: Option<&Secret>) -> Option<String> {
+    let value = value?;
+    let Some(secret) = secret.map(Secret::expose) else {
+        return Some(value.to_owned());
+    };
+    if secret.is_empty() {
+        return Some(value.to_owned());
+    }
+    Some(value.replace(secret, REDACTED_TEXT))
+}
 
 impl RejectedBody {
     fn without_secret(body: &[u8], secret: Option<&Secret>) -> Self {
@@ -1311,15 +1365,24 @@ impl<T: Transport + 'static> Gateway<T> {
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
         let method = request.path();
-        let result = self.send_unlogged(request, deadline).await;
+        let started = self.clock.now();
+        let result = self.send_inner(request, deadline).await;
         if let Err(refusal) = &result {
+            // Every refused call says what was sent and what came back: the
+            // URL as it went out (the token never travels in it), the
+            // attempt, the wait, the status. The body stays out: it may
+            // carry the owner's data.
+            let elapsed_ms = millis(self.clock.now() - started);
             if let Some(wait) = refusal.retry_after() {
                 tracing::warn!(
                     destination = ?request.destination(),
                     method,
+                    url = %request.url(),
                     attempt = refusal.attempts(),
+                    elapsed_ms,
                     wait_ms = millis(wait),
                     status = refusal.status(),
+                    request_id = "-",
                     refusal = refusal.kind(),
                     "outbound call refused"
                 );
@@ -1327,17 +1390,25 @@ impl<T: Transport + 'static> Gateway<T> {
                 destination,
                 status,
                 attempts,
+                location,
+                content_type,
+                request_id,
                 ..
             } = refusal
             {
-                // The destination's own "no" (a 401 for a revoked token, a
-                // 404): the body stays out, it may carry the owner's data
-                // or an echoed secret.
+                // The destination's own "no" (a redirect, a 401 for a
+                // revoked token, a 404): where a redirect points, the
+                // body's type, and the request id its support asks for.
                 tracing::warn!(
                     destination = ?destination,
                     method,
+                    url = %request.url(),
                     attempt = attempts,
+                    elapsed_ms,
                     status,
+                    request_id = request_id.as_deref().unwrap_or("-"),
+                    location = location.as_deref().unwrap_or("-"),
+                    content_type = content_type.as_deref().unwrap_or("-"),
                     refusal = refusal.kind(),
                     "outbound call refused"
                 );
@@ -1346,11 +1417,15 @@ impl<T: Transport + 'static> Gateway<T> {
         result
     }
 
-    async fn send_unlogged(
+    /// The body of `send`: every rule, attempt and progress line, and the
+    /// answered line for a call that got its 2xx. `send` adds the refused
+    /// line, which reads the whole call.
+    async fn send_inner(
         &self,
         request: &HttpRequest,
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
+        let started = self.clock.now();
         let destination = request.destination();
         let method = request.path();
         let broker = is_broker_destination(destination);
@@ -1415,7 +1490,7 @@ impl<T: Transport + 'static> Gateway<T> {
             // decision-to-handoff bound is unnecessary: another process
             // cannot own this endpoint, and another local call cannot enter
             // until the status has been recorded.
-            let (decision, outcome, body) = {
+            let (decision, outcome, body, answered) = {
                 let asked = self.clock.now();
                 // A caller queued behind a long call or a named wait gives up
                 // at its deadline rather than when the lane frees; dropping
@@ -1733,22 +1808,19 @@ impl<T: Transport + 'static> Gateway<T> {
                             }
                         });
                         let observed = Arc::new(std::sync::Mutex::new(
-                            None::<(
-                                u16,
-                                Option<Duration>,
-                                Result<TallyResponseDecision, GatewayError>,
-                            )>,
+                            None::<(HttpResponse, Result<TallyResponseDecision, GatewayError>)>,
                         ));
                         let callback_observed = Arc::clone(&observed);
                         let callback_clock = Arc::clone(&clock);
                         let callback_tally = owner_tally.clone();
                         let callback_path = tally_path.clone();
-                        let observe = Box::new(move |status, retry_after: Option<Duration>| {
-                            let retry_after = retry_after.map(|delay| delay.min(TALLY_RETENTION));
+                        let observe = Box::new(move |observed: HttpResponse| {
+                            let retry_after =
+                                observed.retry_after.map(|delay| delay.min(TALLY_RETENTION));
                             let recorded = callback_tally
                                 .record_response(
                                     destination.base_url(),
-                                    status,
+                                    observed.status,
                                     retry_after,
                                     callback_clock.as_ref(),
                                 )
@@ -1758,7 +1830,7 @@ impl<T: Transport + 'static> Gateway<T> {
                             *callback_observed
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some((status, retry_after, recorded));
+                                Some((observed, recorded));
                         });
                         let answer = transport
                             .send_observed(&request, acknowledge, observe)
@@ -1806,13 +1878,13 @@ impl<T: Transport + 'static> Gateway<T> {
                         } else {
                             None
                         };
-                        if let Some((status, retry_after, Err(_))) = observed.as_ref() {
-                            lane.tally_latched = Some(if (200..300).contains(status) {
+                        if let Some((line, Err(_))) = observed.as_ref() {
+                            lane.tally_latched = Some(if (200..300).contains(&line.status) {
                                 TallyLatch::Unknown
                             } else {
                                 TallyLatch::Response {
-                                    status: *status,
-                                    retry_after: *retry_after,
+                                    status: line.status,
+                                    retry_after: line.retry_after,
                                 }
                             });
                         } else if handoff.as_ref().is_some_and(Result::is_err)
@@ -1872,7 +1944,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         response
                     })
                 });
-                if let Some((observed_status, observed_retry_after, recorded)) = observed {
+                if let Some((observed_line, recorded)) = observed {
                     match recorded {
                         Ok(TallyResponseDecision::Recorded) => {}
                         Ok(TallyResponseDecision::Paused { retry_after }) => {
@@ -1889,13 +1961,11 @@ impl<T: Transport + 'static> Gateway<T> {
                     // A status line is an endpoint answer even when its body
                     // later stalls or fails. Keep a 4xx/5xx from becoming a
                     // retryable transport error and losing the broker's stop
-                    // signal.
-                    if !(200..300).contains(&observed_status) && !matches!(answer, Some(Ok(_))) {
-                        answer = Some(Ok(HttpResponse {
-                            status: observed_status,
-                            body: Vec::new(),
-                            retry_after: observed_retry_after,
-                        }));
+                    // signal. The line carries the headers the refused log
+                    // reads by.
+                    if !(200..300).contains(&observed_line.status) && !matches!(answer, Some(Ok(_)))
+                    {
+                        answer = Some(Ok(observed_line));
                     }
                 } else if let Some(recorded) = unknown {
                     match recorded {
@@ -1931,7 +2001,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         retry.delay(attempts, &Outcome::Transport(HttpError::Timeout));
                     return Err(cut(attempts, status, retry_after));
                 };
-                let (outcome, body) = match answer {
+                let (outcome, body, answered) = match answer {
                     Ok(response) => {
                         if (200..300).contains(&response.status) {
                             if lane.record_success() {
@@ -1943,6 +2013,24 @@ impl<T: Transport + 'static> Gateway<T> {
                                     "breaker closed"
                                 );
                             }
+                            // Every outbound call to every destination
+                            // leaves an answered line: where it went, what
+                            // came back, and how long it took.
+                            tracing::info!(
+                                destination = ?destination,
+                                method,
+                                url = %request.url(),
+                                attempt = attempts,
+                                status = response.status,
+                                elapsed_ms = millis(self.clock.now() - started),
+                                request_id = without_secret(
+                                    response.request_id.as_deref(),
+                                    request.bearer(),
+                                )
+                                .as_deref()
+                                .unwrap_or("-"),
+                                "outbound call answered"
+                            );
                             return Ok(response);
                         }
                         status = Some(response.status);
@@ -1950,11 +2038,16 @@ impl<T: Transport + 'static> Gateway<T> {
                             Some(after) => Outcome::status_with_retry_after(response.status, after),
                             None => Outcome::status(response.status),
                         };
-                        (outcome, response.body)
+                        let answered = RefusalHeaders::of(&response, request.bearer());
+                        (outcome, response.body, answered)
                     }
                     Err(error) => {
                         status = None;
-                        (Outcome::Transport(error), Vec::new())
+                        (
+                            Outcome::Transport(error),
+                            Vec::new(),
+                            RefusalHeaders::default(),
+                        )
                     }
                 };
                 if let Some(named) = outcome.named_delay()
@@ -1985,7 +2078,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         "breaker opened"
                     );
                 }
-                (decision, outcome, body)
+                (decision, outcome, body, answered)
             };
             match decision {
                 // Waited at the top of the loop, under the lane, where every
@@ -2012,7 +2105,7 @@ impl<T: Transport + 'static> Gateway<T> {
                 }
                 Retry::GiveUp => {
                     let body = RejectedBody::without_secret(&body, request.bearer());
-                    return Err(self.refusal(destination, attempts, outcome, body));
+                    return Err(self.refusal(destination, attempts, outcome, body, answered));
                 }
             }
         }
@@ -2067,6 +2160,7 @@ impl<T: Transport + 'static> Gateway<T> {
         attempts: u32,
         outcome: Outcome,
         body: RejectedBody,
+        headers: RefusalHeaders,
     ) -> GatewayError {
         if is_transient(&outcome) {
             return GatewayError::Exhausted {
@@ -2089,6 +2183,9 @@ impl<T: Transport + 'static> Gateway<T> {
                 status,
                 attempts,
                 body,
+                location: headers.location,
+                content_type: headers.content_type,
+                request_id: headers.request_id,
             },
             Outcome::Transport(error) => GatewayError::Transport {
                 destination,
@@ -2278,6 +2375,7 @@ mod tests {
             status,
             body: Vec::new(),
             retry_after: None,
+            ..Default::default()
         }
     }
 
@@ -2317,7 +2415,7 @@ mod tests {
         directory
     }
 
-    fn gateway(time: &Arc<FakeTime>, transport: Scripted) -> Gateway<Scripted> {
+    fn gateway<T: Transport + 'static>(time: &Arc<FakeTime>, transport: T) -> Gateway<T> {
         let directory = broker_egress_directory();
         Gateway::with_parts_in_directory(
             transport,
@@ -4098,15 +4196,382 @@ mod tests {
                 ..status(401)
             })),
         );
-        let request = operations().with_bearer("t.invented-token");
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+            crate::RequestBody::Json(r#"{"session":"s.invented-session"}"#.to_owned()),
+        )
+        .with_bearer("t.invented-token")
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
+        .idempotent();
         let log = Log::capture();
 
         let _ = gateway.send(&request, None).await;
 
-        let text = log.text();
-        assert!(text.contains("refusal=\"rejected\""), "{text}");
-        assert!(!text.contains("invented-token"), "{text}");
-        assert!(!text.contains("balance"), "{text}");
+        let refused = log.text();
+        assert!(refused.contains("refusal=\"rejected\""), "{refused}");
+        assert!(!refused.contains("invented-token"), "{refused}");
+        assert!(!refused.contains("invented-session"), "{refused}");
+        assert!(!refused.contains("balance"), "{refused}");
+
+        // The success line names the wire URL: a secret that travelled in
+        // the query, the header or the body would reach it too.
+        let log = Log::capture();
+        gateway.send(&request, None).await.expect("answered");
+        let answered = log.text();
+        assert!(answered.contains("outbound call answered"), "{answered}");
+        assert!(!answered.contains("invented-token"), "{answered}");
+        assert!(!answered.contains("invented-session"), "{answered}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_destination_echoing_the_token_in_a_header_is_redacted_in_the_log() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let refusing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                location: Some(
+                    "https://invest-public-api.tbank.ru/again?t=t.invented-token".to_owned(),
+                ),
+                request_id: Some("t.invented-token".to_owned()),
+                content_type: Some("text/html".to_owned()),
+                ..status(308)
+            })),
+        );
+        let request = operations().with_bearer("t.invented-token");
+
+        let _ = refusing.send(&request, None).await;
+
+        let refused = log.text();
+        assert!(refused.contains("outbound call refused"), "{refused}");
+        assert!(!refused.contains("invented-token"), "{refused}");
+        assert!(
+            refused.contains("location=\"https://invest-public-api.tbank.ru/again?t=<redacted>\""),
+            "{refused}"
+        );
+        assert!(refused.contains("request_id=\"<redacted>\""), "{refused}");
+
+        // The answered line cuts the token out of the id the same way.
+        let log = Log::capture();
+        let answering = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some("t.invented-token".to_owned()),
+                ..status(200)
+            })),
+        );
+        answering.send(&request, None).await.expect("answered");
+        let answered = log.text();
+        assert!(answered.contains("outbound call answered"), "{answered}");
+        assert!(!answered.contains("invented-token"), "{answered}");
+    }
+
+    /// A transport that publishes a status line and then loses the body:
+    /// the shape a stalled or truncated body arrives in.
+    struct StatusLineThenBodyFailure {
+        status: HttpResponse,
+    }
+
+    impl Transport for StatusLineThenBodyFailure {
+        async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+            Err(HttpError::Timeout)
+        }
+
+        fn send_observed<'a>(
+            &'a self,
+            _request: &'a HttpRequest,
+            handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
+            observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
+        ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
+            let status = self.status.clone();
+            async move {
+                handoff()?;
+                observe(status);
+                Err(HttpError::Timeout)
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_two_hundred_status_line_whose_body_is_lost_is_not_a_success() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            StatusLineThenBodyFailure {
+                status: HttpResponse {
+                    request_id: Some("req-invented-3".to_owned()),
+                    ..status(200)
+                },
+            },
+        );
+
+        let refused = gateway.send(&operations(), None).await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::Exhausted {
+                    attempts: ATTEMPTS,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_status_line_survives_a_lost_body_with_its_headers() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            StatusLineThenBodyFailure {
+                status: HttpResponse {
+                    location: Some("/v1/moved".to_owned()),
+                    request_id: Some("req-invented-4".to_owned()),
+                    content_type: Some("text/html".to_owned()),
+                    ..status(308)
+                },
+            },
+        );
+
+        let refused = gateway.send(&operations(), None).await;
+
+        assert!(
+            matches!(&refused, Err(GatewayError::Rejected { status: 308, .. })),
+            "{refused:?}"
+        );
+        log.assert_line(
+            "WARN",
+            "refusal=\"rejected\"",
+            &[
+                "status=308",
+                "location=\"/v1/moved\"",
+                "content_type=\"text/html\"",
+                "request_id=\"req-invented-4\"",
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_redirect_refusal_is_logged_with_the_location_it_pointed_at() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                location: Some(
+                    "/v1/accounts/act/transactions?interval.start_time=2026-09-01".to_owned(),
+                ),
+                content_type: Some("text/html".to_owned()),
+                ..status(308)
+            })),
+        );
+
+        let _ = call(&gateway).await;
+
+        log.assert_line(
+            "WARN",
+            "refusal=\"rejected\"",
+            &[
+                "outbound call refused",
+                "url=https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+                "status=308",
+                "attempt=1",
+                "elapsed_ms=",
+                "request_id=\"-\"",
+                "location=\"/v1/accounts/act/transactions?interval.start_time=2026-09-01\"",
+                "content_type=\"text/html\"",
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_call_is_logged_at_info_with_its_wire_url_and_request_id() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some("req-invented-2".to_owned()),
+                ..status(200)
+            })),
+        );
+
+        call(&gateway).await.expect("answered");
+
+        log.assert_line(
+            "INFO",
+            "outbound call answered",
+            &[
+                "destination=TinkoffProd",
+                "method=\"/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor\"",
+                "url=https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+                "status=200",
+                "attempt=1",
+                "elapsed_ms=0",
+                "request_id=\"req-invented-2\"",
+            ],
+        );
+    }
+
+    /// One shared-scope row per destination: the walk's paths name no real
+    /// budget row, and a table of its own keeps the walk out of the
+    /// documented table's per-method keys.
+    static WALK_BUDGETS: &[Budget] = &[
+        Budget {
+            destination: Destination::TinkoffProd,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::TinkoffSandbox,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::FinamApi,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::MoexIss,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::CbrScripts,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::CbrDailyInfo,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::TinvestContract,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+    ];
+
+    fn walk_gateway(time: &Arc<FakeTime>, transport: Scripted) -> Gateway<Scripted> {
+        let directory = broker_egress_directory();
+        Gateway::with_parts_in_directory(
+            transport,
+            WALK_BUDGETS,
+            Arc::clone(time) as Arc<dyn Clock>,
+            Arc::clone(time) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            &directory,
+        )
+        .expect("the walk budget table is valid")
+    }
+
+    /// A GET the walk sends to every destination. Brokers carry the sync
+    /// allowance their lane demands; no other destination asks for one.
+    fn walk_request(destination: Destination) -> HttpRequest {
+        let request = HttpRequest::get(destination, "/log-walk");
+        if is_broker_destination(destination) {
+            request.with_request_allowance(RequestAllowance::new(u32::MAX))
+        } else {
+            request
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_destination_logs_its_success_and_its_refusal() {
+        for destination in Destination::ALL {
+            // Success: one line at info, naming where the call went.
+            let log = Log::capture();
+            let time = FakeTime::new();
+            let gateway = walk_gateway(
+                &time,
+                Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                    request_id: Some("req-walk-success".to_owned()),
+                    ..status(200)
+                })),
+            );
+            let request = walk_request(destination);
+            gateway
+                .send(&request, None)
+                .await
+                .unwrap_or_else(|error| panic!("{destination:?} success: {error}"));
+            let text = log.text();
+            let answered: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("outbound call answered"))
+                .collect();
+            assert_eq!(answered.len(), 1, "{destination:?}: {text}");
+            let line = answered[0];
+            for fragment in [
+                "INFO",
+                &format!("destination={destination:?}"),
+                "method=\"/log-walk\"",
+                &format!(
+                    "url={}/log-walk",
+                    destination.base_url().trim_end_matches('/')
+                ),
+                "status=200",
+                "attempt=1",
+                "elapsed_ms=",
+                "request_id=\"req-walk-success\"",
+            ] {
+                assert!(
+                    line.contains(fragment),
+                    "{destination:?}: no {fragment:?} in {line}"
+                );
+            }
+
+            // Refusal: one line at warn, the same fields with the status.
+            let log = Log::capture();
+            let time = FakeTime::new();
+            let gateway = walk_gateway(&time, Scripted::answering(&time, 404));
+            let refused = gateway.send(&request, None).await;
+            assert!(
+                matches!(refused, Err(GatewayError::Rejected { status: 404, .. })),
+                "{destination:?}: {refused:?}"
+            );
+            let text = log.text();
+            let rejected: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("outbound call refused"))
+                .collect();
+            assert_eq!(rejected.len(), 1, "{destination:?}: {text}");
+            let line = rejected[0];
+            for fragment in [
+                "WARN",
+                &format!("destination={destination:?}"),
+                &format!(
+                    "url={}/log-walk",
+                    destination.base_url().trim_end_matches('/')
+                ),
+                "status=404",
+                "attempt=1",
+                "refusal=\"rejected\"",
+            ] {
+                assert!(
+                    line.contains(fragment),
+                    "{destination:?}: no {fragment:?} in {line}"
+                );
+            }
+        }
     }
 
     // --- production parts -------------------------------------------------
@@ -4441,6 +4906,9 @@ mod tests {
                     status: 500,
                     attempts: 1,
                     body: RejectedBody::without_secret(b"invented", None),
+                    location: None,
+                    content_type: None,
+                    request_id: None,
                 },
                 "rejected",
             ),

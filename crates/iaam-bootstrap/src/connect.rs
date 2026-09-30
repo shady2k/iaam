@@ -751,6 +751,7 @@ mod tests {
                     status: 500,
                     body: b"unscripted request".to_vec(),
                     retry_after: None,
+                    ..Default::default()
                 });
             async move { Ok(next) }
         }
@@ -761,6 +762,7 @@ mod tests {
             status,
             body: body.as_bytes().to_vec(),
             retry_after: None,
+            ..Default::default()
         }
     }
 

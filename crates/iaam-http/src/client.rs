@@ -74,7 +74,7 @@ impl HttpClient {
     /// Private to this crate: outside it the only way to send is
     /// `Gateway::send`, which the `Transport` impl serves.
     pub(crate) async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
-        self.send_observed(request, Box::new(|| Ok(())), Box::new(|_, _| {}))
+        self.send_observed(request, Box::new(|| Ok(())), Box::new(|_| {}))
             .await
     }
 
@@ -84,7 +84,7 @@ impl HttpClient {
         &self,
         request: &HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + '_>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + '_>,
     ) -> Result<HttpResponse, HttpError> {
         self.send_to_url(request, request.url(), REQUEST_TIMEOUT, handoff, observe)
             .await
@@ -102,7 +102,7 @@ impl HttpClient {
             base_url,
             timeout,
             Box::new(|| Ok(())),
-            Box::new(|_, _| {}),
+            Box::new(|_| {}),
         )
         .await
     }
@@ -114,7 +114,7 @@ impl HttpClient {
         base_url: &str,
         timeout: Duration,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + '_>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + '_>,
     ) -> Result<HttpResponse, HttpError> {
         let request_url = request.url();
         let destination_base = request.destination().base_url().trim_end_matches('/');
@@ -132,7 +132,7 @@ impl HttpClient {
         url: String,
         timeout: Duration,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + '_>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + '_>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + '_>,
     ) -> Result<HttpResponse, HttpError> {
         let client = self.client_for(request.destination())?;
         let built = build_at(&client.0, request, &url, timeout)?;
@@ -144,12 +144,21 @@ impl HttpClient {
             .map_err(classify_transport_error)?;
         let status = response.status().as_u16();
         let successful = response.status().is_success();
-        let retry_after = named_delay(
-            response.headers(),
-            request.reset_header(),
-            SystemTime::now(),
-        );
-        observe(status, retry_after);
+        let headers = response.headers();
+        let retry_after = named_delay(headers, request.reset_header(), SystemTime::now());
+        let location = response_location(headers);
+        let content_type = response_content_type(headers);
+        let request_id = response_request_id(headers);
+        // The status line with its headers, before the body is read: what
+        // the answer said survives a body that stalls or fails.
+        observe(HttpResponse {
+            status,
+            body: Vec::new(),
+            retry_after,
+            location: location.clone(),
+            content_type: content_type.clone(),
+            request_id: request_id.clone(),
+        });
         // A status line that arrived is never lost: after a non-2xx status a
         // body that fails or stalls ends the read with what arrived.
         let mut body = Vec::new();
@@ -165,6 +174,9 @@ impl HttpClient {
             status,
             body,
             retry_after,
+            location,
+            content_type,
+            request_id,
         })
     }
 }
@@ -241,6 +253,43 @@ fn authorization_header(
         })?;
     value.set_sensitive(true);
     Ok(Some(value))
+}
+
+/// The `Location` header of the response: where a 3xx answer points, and
+/// the first fact a redirected call must name. A value that never was a
+/// valid header value cannot have arrived as one, so reading it as text
+/// cannot lose what the wire carried.
+fn response_location(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// The `Content-Type` the response names for its body, or `None`.
+fn response_content_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// The request-id names a destination's support asks for, in the order the
+/// names are commonly agreed on; the first present wins.
+const REQUEST_ID_HEADERS: [&str; 4] = [
+    "x-request-id",
+    "x-trace-id",
+    "traceparent",
+    "x-correlation-id",
+];
+
+fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    REQUEST_ID_HEADERS.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    })
 }
 
 fn classify_transport_error(error: reqwest::Error) -> HttpError {

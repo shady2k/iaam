@@ -595,6 +595,23 @@ verified to start and serve with all three.
 **On failure** — the container exits immediately and `docker logs iaam` holds
 the reason. Every message the program can print at start-up is in §11.
 
+Every outbound call the process makes — to any broker and to every other
+external source — leaves one line in the log: a call the destination answered
+logs `outbound call answered` at `info`, a call it refused logs
+`outbound call refused` at `warn`. Each line names the destination, the method
+path, the URL exactly as it was sent (path and full query; the access token
+travels in the `Authorization` header, never in the URL, so no line carries
+it), the status, the attempt, the elapsed milliseconds and, when the source
+answered with one, its request id — the first present of `x-request-id`,
+`x-trace-id`, `traceparent` and `x-correlation-id`, which the source's own
+support asks for when a call went wrong. A refused line also names, when the
+refusal carries them: where a redirect points (`location`), the type the
+source named for the body (`content_type`), and the refusal's kind. No line
+ever carries the token, the request body or the response body; the request id
+and the redirect target are cut of the token should a source echo it back.
+`RUST_LOG` (§2.1) controls the level: at the default `info` both lines appear;
+`RUST_LOG=warn` keeps only the refusals and the waits over a second.
+
 ### 3.7 Administration afterwards
 
 Every administrative command is the same image with a different argument list

@@ -572,6 +572,7 @@ impl iaam_http::gateway::Transport for FinamScript {
             status: 200,
             body: body.into_bytes(),
             retry_after: None,
+            ..Default::default()
         })
     }
 }

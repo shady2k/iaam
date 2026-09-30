@@ -868,6 +868,7 @@ mod tests {
             status,
             body: body.as_bytes().to_vec(),
             retry_after: None,
+            ..Default::default()
         }
     }
 

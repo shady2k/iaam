@@ -9,7 +9,7 @@ use thiserror::Error;
 /// The body is not parsed or re-encoded here: CBR responds in
 /// `windows-1251`, MOEX in UTF-8, and that knowledge belongs to the source
 /// crate, not the transport.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
@@ -18,6 +18,19 @@ pub struct HttpResponse {
     /// parsed (see `resilience::parse_retry_after`). `None` when it named
     /// none, or in a form that does not parse.
     pub retry_after: Option<Duration>,
+    /// Where a 3xx answer points: the `Location` header, as the source sent
+    /// it. A redirect is a refusal the gateway logs, and the first question
+    /// about one is where it pointed.
+    pub location: Option<String>,
+    /// The `Content-Type` the source named for the body, or `None`. Logged
+    /// with a refusal: an unexpected type explains a body that will not
+    /// parse before anyone opens it.
+    pub content_type: Option<String>,
+    /// The request id the source answered with: the first present of
+    /// `x-request-id`, `x-trace-id`, `traceparent`, `x-correlation-id`. It
+    /// is the handle a destination's own support asks for when a call went
+    /// wrong, so the gateway logs it with the answer.
+    pub request_id: Option<String>,
 }
 
 impl HttpResponse {
@@ -60,6 +73,7 @@ mod tests {
             status: 200,
             body: "response".as_bytes().to_vec(),
             retry_after: None,
+            ..Default::default()
         };
 
         assert_eq!(response.text_utf8(), Some("response"));
@@ -71,6 +85,7 @@ mod tests {
             status: 200,
             body: vec![0xff, 0xfe],
             retry_after: None,
+            ..Default::default()
         };
 
         assert_eq!(response.text_utf8(), None);

@@ -148,3 +148,73 @@ async fn reset_header_delay_is_clamped_to_one_day() {
     );
     assert_eq!(server.requests_received(), 1);
 }
+
+#[tokio::test]
+async fn a_response_carries_the_headers_the_log_reads_back() {
+    let server = LoopbackServer::start([LoopbackReply::redirect(
+        308,
+        "https://api.finam.ru/v1/moved?after=2026-09-01",
+    )
+    .with_header("content-type", "text/html")
+    .with_header("x-request-id", "req-invented-1")])
+    .expect("loopback server");
+    let client = HttpClientHarness::new(&server);
+    let request = HttpRequest::get(Destination::MoexIss, "/first");
+
+    let response = client.send(&request).await.expect("answered");
+
+    assert_eq!(response.status, 308);
+    assert_eq!(
+        response.location.as_deref(),
+        Some("https://api.finam.ru/v1/moved?after=2026-09-01")
+    );
+    assert_eq!(response.content_type.as_deref(), Some("text/html"));
+    assert_eq!(response.request_id.as_deref(), Some("req-invented-1"));
+}
+
+#[tokio::test]
+async fn the_request_id_is_the_first_present_of_the_common_names() {
+    let server = LoopbackServer::start([
+        LoopbackReply::complete(200, "")
+            .with_header("x-request-id", "from-request-id")
+            .with_header("x-trace-id", "from-trace-id"),
+        LoopbackReply::complete(200, "")
+            .with_header("x-trace-id", "from-trace-id")
+            .with_header("traceparent", "00-invented-trace-invented-span-01"),
+        LoopbackReply::complete(200, "")
+            .with_header("traceparent", "00-invented-trace-invented-span-01")
+            .with_header("x-correlation-id", "from-correlation-id"),
+        LoopbackReply::complete(200, "").with_header("x-correlation-id", "from-correlation-id"),
+    ])
+    .expect("loopback server");
+    let client = HttpClientHarness::new(&server);
+
+    for wanted in [
+        "from-request-id",
+        "from-trace-id",
+        "00-invented-trace-invented-span-01",
+        "from-correlation-id",
+    ] {
+        let response = client
+            .send(&HttpRequest::get(Destination::MoexIss, "/identified"))
+            .await
+            .expect("answered");
+        assert_eq!(response.request_id.as_deref(), Some(wanted));
+    }
+}
+
+#[tokio::test]
+async fn a_response_without_the_headers_reads_back_nothing() {
+    let server =
+        LoopbackServer::start([LoopbackReply::complete(200, "plain")]).expect("loopback server");
+    let client = HttpClientHarness::new(&server);
+
+    let response = client
+        .send(&HttpRequest::get(Destination::MoexIss, "/plain"))
+        .await
+        .expect("answered");
+
+    assert_eq!(response.location, None);
+    assert_eq!(response.content_type, None);
+    assert_eq!(response.request_id, None);
+}

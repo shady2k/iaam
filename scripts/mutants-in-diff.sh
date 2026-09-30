@@ -78,10 +78,25 @@ if grep -q '^+++ b/crates/iaam-core/' "$DIFF_FILE"; then
   )
 fi
 
-cargo mutants \
+# The report stays in this checkout's own target/ (a few files), so two
+# worktrees running at once do not overwrite each other's report; builds go
+# to the shared directory the dev shell chose, where a git worktree has no
+# target/ of its own, so the parent is created here (iaam-eoji9).
+REPORT_DIR="$REPO_ROOT/target/mutants-in-diff"
+mkdir -p "$REPO_ROOT/target"
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+# Mutant builds go to a directory of this run's own and are removed when the
+# run ends, pass or fail (iaam-eoji9): in the shared build directory they
+# were 20 GB of its growth, and two worktrees running this at once would
+# build into, and delete, each other's output. The next run rebuilds its
+# baseline in about a minute. The report is kept.
+MUTANT_BUILD_DIR="$TARGET_DIR/mutants-build-$$"
+trap 'rm -f "$DIFF_FILE"; rm -rf "$MUTANT_BUILD_DIR"' EXIT
+
+CARGO_TARGET_DIR="$MUTANT_BUILD_DIR" cargo mutants \
   --in-diff "$DIFF_FILE" \
   "${error_args[@]}" \
   --profile mutant \
   --jobs 1 \
-  --output target/mutants-in-diff \
+  --output "$REPORT_DIR" \
   "$@"

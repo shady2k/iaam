@@ -204,9 +204,11 @@ Linux. Its real-time spacing rows observe the host scheduler; longer accounting
 windows are advanced by the injected boot clock so the check remains bounded
 and deterministic.
 
-Administrative commands (`claim`, `token issue`, `broker key …`,
-`broker access …`, `bundle export`, `bundle import`) open the database and do
-not contact a source. The two broker examples and the ignored live sandbox
+Administrative commands (`claim`, `status`, `token …`, `broker key …`,
+`broker access …`, `broker off`, `bundle export`, `bundle import`) open the
+database and do not contact a source. `broker connect` is the one
+administrative command that does: it sends one read-only check to the broker,
+through the same gateway and tally as every broker request. The two broker examples and the ignored live sandbox
 test do contact brokers and consequently use the same egress switch, endpoint
 ownership and tally as `serve`.
 

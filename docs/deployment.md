@@ -139,7 +139,9 @@ first send to each endpoint waits 60 seconds.
 
 The gateway places the instance's egress directory beside the instance's
 database (`iaam.sqlite` → `iaam.sqlite.egress`, canonicalized first: every
-alias of the same database reaches the same directory) and opens it when broker
+symlink or relative alias of the same database reaches the same directory, and a
+database file with a second hard-linked name is refused, because each name would
+get its own tally) and opens it when broker
 egress is enabled, keeping that directory descriptor for its lifetime. One
 database is one tally: this is the per-instance guarantee, and no separate
 setting exists that could split one instance's tally. When the directory is

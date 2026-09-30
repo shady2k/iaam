@@ -57,7 +57,7 @@ pub enum FinamError {
     /// no row for Finam, which is a fault of this build, not of the request.
     #[error("the outbound gateway refused the Finam call: {reason}")]
     Gateway { reason: String },
-    /// The process-level egress switch or per-machine tally refused before
+    /// The process-level egress switch or the instance's tally refused before
     /// the transport. This is operational configuration, not an adapter bug.
     #[error("the Finam request cannot leave this machine: {reason}")]
     EgressRefused {

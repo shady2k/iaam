@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -96,6 +97,16 @@ pub enum EgressDirectoryError {
         database = .database.display()
     )]
     NoFileName { database: PathBuf },
+    /// The database file has more than one name (hard links). Each name would
+    /// derive its own egress directory, so two processes opening the same
+    /// database by two names would keep two tallies — and one could send
+    /// while the other holds a broker's pause.
+    #[error(
+        "the database {database} has {links} names (hard links); each name would get its own broker tally, \
+         so iaam refuses it: keep one name and remove the others (`find -samefile` lists them)",
+        database = .database.display()
+    )]
+    HardLinked { database: PathBuf, links: u64 },
 }
 
 /// Where one instance's broker tally lives: a directory beside its database,
@@ -103,7 +114,9 @@ pub enum EgressDirectoryError {
 ///
 /// One database is one tally. Every alias of the same database — a relative
 /// path, a redundant `..`, a symlink to the file or to its directory — yields
-/// the same directory, because the database path is canonicalized first. Two
+/// the same directory, because the database path is canonicalized first; a
+/// database with a second hard-linked name is refused, since canonicalizing
+/// cannot join two names of one file. Two
 /// different databases yield two directories: two instances with two databases
 /// have two tallies.
 ///
@@ -119,15 +132,28 @@ pub fn egress_directory_for(database: &Path) -> Result<PathBuf, EgressDirectoryE
                 database: database.to_owned(),
                 source,
             })?;
-    let name = resolved
+    let links = std::fs::metadata(&resolved)
+        .map_err(|source| EgressDirectoryError::DatabaseUnresolved {
+            database: database.to_owned(),
+            source,
+        })?
+        .nlink();
+    if links > 1 {
+        return Err(EgressDirectoryError::HardLinked {
+            database: resolved,
+            links,
+        });
+    }
+    let mut name = resolved
         .file_name()
         .ok_or_else(|| EgressDirectoryError::NoFileName {
             database: database.to_owned(),
         })?
         .to_owned();
+    name.push(".egress");
     let mut directory = resolved;
     directory.pop();
-    Ok(directory.join(format!("{}.egress", name.to_string_lossy())))
+    Ok(directory.join(name))
 }
 
 #[cfg(test)]
@@ -213,6 +239,25 @@ mod derivation_tests {
         let error = egress_directory_for(&database).expect_err("missing database refused");
 
         assert!(error.to_string().contains("absent.sqlite"), "{error}");
+    }
+
+    #[test]
+    fn a_hard_linked_database_is_refused_by_both_names() {
+        let directory = unique_directory("hard-link");
+        let database = directory.join("iaam.sqlite");
+        let second_name = directory.join("alias.sqlite");
+        std::fs::write(&database, "").unwrap();
+        std::fs::hard_link(&database, &second_name).unwrap();
+
+        for name in [&database, &second_name] {
+            let refused = egress_directory_for(name);
+            let Err(error) = refused else {
+                panic!("a hard-linked database must be refused, got {refused:?}");
+            };
+            let text = error.to_string();
+            assert!(text.contains("2 names"), "{text}");
+            assert!(text.contains("iaam.sqlite") || text.contains("alias.sqlite"), "{text}");
+        }
     }
 
     #[test]

@@ -138,9 +138,10 @@ are the repository's installation, and each person's plugin and hooks are theirs
 - **Static checks:** `make fmt lint arch privacy skill-doc`.
 - **Related tests:** `nix develop -c cargo nextest run -p <crate>` for each crate
   the change touches and each crate that depends on it.
-- **Full stage checks:** `make check` and `make diff-lint BASE=origin/main`
-  (inside `nix develop`). `make check` does NOT include the diff lint, which CI
-  runs: it refuses new `allow(...)`, `expect(...)`, `#[ignore]` and `todo!` in
+- **Full stage checks:** `make check`, `make diff-lint BASE=origin/main` and
+  `make diff-coverage BASE=origin/main` (inside `nix develop`). `make check`
+  includes neither of the other two, and CI runs both: diff coverage refuses a
+  branch whose added lines are less than 90% covered. The diff lint it refuses new `allow(...)`, `expect(...)`, `#[ignore]` and `todo!` in
   lines the branch adds, and any change to a quality-policy file (scripts/,
   .github/workflows, deny.toml, clippy.toml, flake.*, rustfmt.toml, root
   Cargo.toml, tests/fixtures) unless the PR is labelled `policy-change`, the

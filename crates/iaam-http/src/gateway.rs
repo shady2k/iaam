@@ -29,11 +29,12 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::cache::{CacheKey, ResponseCache};
 use crate::client::HttpClient;
 use crate::destination::Destination;
 use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, egress_directory_for};
@@ -222,6 +223,13 @@ impl BootTime {
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
     fn now_boot(&self) -> Result<BootTime, String>;
+    /// Wall-clock time for a record that must outlive the process. The
+    /// response cache stamps its entries with it, so an answer survives a
+    /// restart and expires an hour later whatever the boot was. The
+    /// system clock answers; a test clock moves it with its own offset.
+    fn now_unix(&self) -> SystemTime {
+        SystemTime::now()
+    }
 }
 
 /// Waits out a delay.
@@ -432,6 +440,13 @@ pub enum GatewayError {
         path = .path.display()
     )]
     TallyCorrupt { path: PathBuf, reason: String },
+    /// The instance's response cache could not be placed or created beside
+    /// the instance's database, so reads would be sent again every time.
+    #[error(
+        "the response cache for the database {database} could not be made: {reason}; the cache lives beside the database like its egress directory, and the process needs leave to create it",
+        database = .database.display()
+    )]
+    CacheUnavailable { database: PathBuf, reason: String },
     /// Another process owns this endpoint's lifetime lock.
     #[error(
         "broker endpoint {endpoint} is owned by another iaam process; use that process or stop it before retrying"
@@ -586,6 +601,7 @@ impl GatewayError {
             Self::BrokerEgressWithoutDatabase => "broker egress without database",
             Self::TallyUnavailable { .. } => "tally unavailable",
             Self::TallyCorrupt { .. } => "tally corrupt",
+            Self::CacheUnavailable { .. } => "cache unavailable",
             Self::BrokerEndpointOwned { .. } => "broker endpoint owned",
             Self::UnknownBudget { .. } => "unknown budget",
             Self::InvalidBudgets(_) => "invalid budgets",
@@ -612,6 +628,7 @@ impl GatewayError {
             | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::CacheUnavailable { .. }
             | Self::BrokerEndpointOwned { .. }
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
@@ -638,6 +655,7 @@ impl GatewayError {
             | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::CacheUnavailable { .. }
             | Self::BrokerEndpointOwned { .. }
             | Self::DailyCeiling { .. }
             | Self::UnknownBudget { .. }
@@ -667,6 +685,7 @@ impl GatewayError {
             | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::CacheUnavailable { .. }
             | Self::BrokerEndpointOwned { .. }
             | Self::DailyCeiling { .. }
             | Self::UnknownBudget { .. }
@@ -1092,6 +1111,10 @@ pub struct Gateway<T> {
     sleeper: Arc<dyn Sleeper>,
     broker_egress: BrokerEgress,
     egress_directory: Option<EgressDirectory>,
+    /// The response cache beside the instance's database: carried by the
+    /// production gateway alone, and by the test seam that builds what
+    /// production builds. A gateway built without a database has none.
+    cache: Option<ResponseCache>,
     /// Keyed by `Destination::base_url`, the host a request reaches.
     lanes: HashMap<&'static str, Arc<Mutex<Lane>>>,
 }
@@ -1107,11 +1130,17 @@ impl Gateway<HttpClient> {
     /// directory [`egress_directory_for`] derives from `database`: one
     /// database is one tally, so one iaam instance is one tally.
     ///
+    /// The response cache lives beside the database too, whatever the broker
+    /// egress switch says: a read this gateway answered within the hour is
+    /// answered from the cache instead of being sent again.
+    ///
     /// # Errors
     /// `GatewayError::SecondGateway` on every call after the first;
     /// `GatewayError::InvalidBudgets` when the table in this module is wrong;
-    /// `GatewayError::EgressPlace` when the database cannot be resolved and
-    /// `GatewayError::TallyUnavailable` when the derived place is unusable.
+    /// `GatewayError::EgressPlace` when the database cannot be resolved,
+    /// `GatewayError::TallyUnavailable` when the derived place is unusable,
+    /// and `GatewayError::CacheUnavailable` when the cache cannot be placed
+    /// or created beside the database.
     pub fn production(broker_egress: BrokerEgress, database: &Path) -> Result<Self, GatewayError> {
         // Claimed before building: two threads racing here must not both
         // see the flag clear. A table that fails its checks fails the same
@@ -1119,7 +1148,14 @@ impl Gateway<HttpClient> {
         if PRODUCTION_BUILT.swap(true, Ordering::SeqCst) {
             return Err(GatewayError::SecondGateway);
         }
-        Self::new_for_database(HttpClient::new(), broker_egress, database)
+        Self::with_parts_for_database_with_response_cache(
+            HttpClient::new(),
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            broker_egress,
+            database,
+        )
     }
 }
 
@@ -1242,7 +1278,10 @@ impl<T: Transport + 'static> Gateway<T> {
 
     /// A gateway over explicit parts whose broker tally lives where
     /// [`egress_directory_for`] places it: beside `database`, created when
-    /// missing. This is the production placement.
+    /// missing. This is the production placement. The response cache is not
+    /// carried here — stands that replay one request many times build this
+    /// constructor — and [`Self::with_parts_for_database_with_response_cache`]
+    /// is the seam that adds it.
     ///
     /// # Errors
     /// `GatewayError::InvalidBudgets` when `budgets` fails its checks;
@@ -1283,6 +1322,60 @@ impl<T: Transport + 'static> Gateway<T> {
             broker_egress,
             egress_directory,
         )
+    }
+
+    /// Test seam for everything [`Gateway::production`] builds — the
+    /// documented budgets, the broker tally beside the instance's database
+    /// and the response cache beside it — over the parts a test injects.
+    /// [`Gateway::production`] is this over the real transport and the
+    /// system clock; [`Self::with_parts_for_database`] stays cache-off for
+    /// stands that replay one request many times.
+    ///
+    /// # Errors
+    /// As [`Self::with_parts_for_database`], and
+    /// `GatewayError::CacheUnavailable` when the cache cannot be placed or
+    /// created beside the database.
+    #[doc(hidden)]
+    pub fn with_parts_for_database_with_response_cache(
+        transport: T,
+        budgets: &'static [Budget],
+        clock: Arc<dyn Clock>,
+        sleeper: Arc<dyn Sleeper>,
+        broker_egress: BrokerEgress,
+        database: &Path,
+    ) -> Result<Self, GatewayError> {
+        let gateway = Self::with_parts_for_database(
+            transport,
+            budgets,
+            clock,
+            sleeper,
+            broker_egress,
+            database,
+        )?;
+        gateway.with_response_cache_beside(database)
+    }
+
+    /// Carries the response cache derived from `database`, the way the
+    /// production gateway does.
+    ///
+    /// # Errors
+    /// `GatewayError::CacheUnavailable` when the cache place cannot be
+    /// derived from the database or the directory cannot be created there.
+    fn with_response_cache_beside(mut self, database: &Path) -> Result<Self, GatewayError> {
+        let place = crate::cache::cache_directory_for(database).map_err(|error| {
+            GatewayError::CacheUnavailable {
+                database: database.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let cache = ResponseCache::open(&place, Arc::clone(&self.clock)).map_err(|error| {
+            GatewayError::CacheUnavailable {
+                database: database.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        self.cache = Some(cache);
+        Ok(self)
     }
 
     /// Test seam for an isolated egress-directory mount: the directory must
@@ -1339,6 +1432,10 @@ impl<T: Transport + 'static> Gateway<T> {
             sleeper,
             broker_egress,
             egress_directory,
+            // The response cache is carried only where it is asked for:
+            // the production gateway and the seam that builds what the
+            // production gateway builds.
+            cache: None,
             lanes: Destination::ALL
                 .into_iter()
                 .map(|destination| {
@@ -1447,6 +1544,33 @@ impl<T: Transport + 'static> Gateway<T> {
         } else {
             None
         };
+        // The response cache, when this gateway carries one: a read the
+        // gateway answered within the hour is answered from the store
+        // beside the database. Nothing is sent, no ceiling allowance is
+        // spent and no retry is run; the lane is not even taken. The
+        // lookup comes after every check of the request itself, so a call
+        // refused here is refused exactly as before the cache existed.
+        let cache_key = self.cache.as_ref().and_then(|_cache| CacheKey::of(request));
+        if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+            if let Some(stored) = cache.lookup(key) {
+                tracing::info!(
+                    destination = ?destination,
+                    method,
+                    url = %request.url(),
+                    attempt = 0,
+                    status = stored.status,
+                    elapsed_ms = millis(self.clock.now() - started),
+                    request_id = without_secret(
+                        stored.request_id.as_deref(),
+                        request.bearer(),
+                    )
+                    .as_deref()
+                    .unwrap_or("-"),
+                    "outbound call answered from cache"
+                );
+                return Ok(stored);
+            }
+        }
         let lane_lock = &self.lanes[destination.base_url()];
         let mut attempts = 0_u32;
         let mut status = None;
@@ -2004,6 +2128,12 @@ impl<T: Transport + 'static> Gateway<T> {
                 let (outcome, body, answered) = match answer {
                     Ok(response) => {
                         if (200..300).contains(&response.status) {
+                            // The answer is kept under the request's key, so
+                            // the same read inside the hour is answered
+                            // from the store instead of being sent again.
+                            if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+                                cache.store(key, &response);
+                            }
                             if lane.record_success() {
                                 tracing::info!(
                                     destination = ?destination,
@@ -2274,6 +2404,10 @@ mod tests {
                 "test-boot",
                 self.now().saturating_duration_since(self.monotonic_origin),
             ))
+        }
+
+        fn now_unix(&self) -> SystemTime {
+            SystemTime::now() + *self.offset.lock().expect("clock")
         }
     }
 
@@ -5045,5 +5179,330 @@ mod tests {
             other => panic!("an unopenable generation record is TallyUnavailable: {other:?}"),
         }
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // --- response cache ---------------------------------------------------
+
+    /// An answer a scripted endpoint gave, with a body to tell answers
+    /// apart.
+    fn answered(status: u16, body: &[u8]) -> HttpResponse {
+        HttpResponse {
+            status,
+            body: body.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// The gateway a production process builds — documented budgets, the
+    /// tally beside the invented instance's database and the response
+    /// cache beside it — over the parts the test injects.
+    fn gateway_with_cache<T: Transport + 'static>(
+        time: &Arc<FakeTime>,
+        transport: T,
+        label: &str,
+    ) -> Gateway<T> {
+        let (_directory, database) = instance_database(label);
+        Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(time) as Arc<dyn Clock>,
+            Arc::clone(time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid")
+    }
+
+    /// The same over a broker destination, whose tally must be minted
+    /// fresh first: an invented instance's first enabling.
+    fn broker_gateway_with_cache<T: Transport + 'static>(
+        time: &Arc<FakeTime>,
+        transport: T,
+        label: &str,
+    ) -> Gateway<T> {
+        let (_directory, database) = instance_database(label);
+        initialize_fresh_tally(&database, time.as_ref()).expect("the fresh tally was minted");
+        Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(time) as Arc<dyn Clock>,
+            Arc::clone(time) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            &database,
+        )
+        .expect("the documented table is valid")
+    }
+
+    /// A Finam read: a GET the account's access token authorizes.
+    fn finam_read(bearer: &str) -> HttpRequest {
+        HttpRequest::get(Destination::FinamApi, "/v1/accounts/ACC123")
+            .with_bare_token(bearer)
+            .with_request_allowance(RequestAllowance::new(3))
+    }
+
+    /// Finam's session exchange: the secret rides the body alone, and the
+    /// method is marked safe to repeat because minting a session has no
+    /// effect on the account.
+    fn finam_exchange(secret: &str) -> HttpRequest {
+        HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            crate::RequestBody::Json(format!(r#"{{"secret":"{secret}"}}"#)),
+        )
+        .with_request_allowance(RequestAllowance::new(3))
+        .idempotent()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_answered_once_is_answered_from_the_cache_for_an_hour() {
+        let time = FakeTime::new();
+        let transport =
+            Scripted::answering(&time, 200).then(Ok(answered(200, b"<history>pages</history>")));
+        let gateway = gateway_with_cache(&time, transport, "read-hour");
+        let request = HttpRequest::get(
+            Destination::MoexIss,
+            "/iss/history/engines/stock/markets/bonds/boards/TQCB/securities/SU26238RMFS4.json",
+        )
+        .with_query("from", "2026-08-01");
+
+        let first = gateway.send(&request, None).await.expect("first sent");
+        let second = gateway.send(&request, None).await.expect("second answered");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            1,
+            "the second read was answered from the cache"
+        );
+        assert_eq!(second, first, "the cached answer is the answer given");
+
+        time.advance(crate::cache::CACHE_TTL + Duration::from_secs(1));
+        gateway
+            .send(&request, None)
+            .await
+            .expect("sent after the hour");
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "an hour later the read is sent again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_non_read_is_sent_every_time() {
+        let time = FakeTime::new();
+        let gateway = broker_gateway_with_cache(&time, Scripted::answering(&time, 200), "non-read");
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/accounts/ACC123/transactions",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_bare_token("test-bearer")
+        .with_request_allowance(RequestAllowance::new(3));
+
+        gateway.send(&request, None).await.expect("first sent");
+        gateway.send(&request, None).await.expect("second sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "a request that may act is sent again whatever the answer was"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_credential_exchange_is_never_cached() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200)
+            .then(Ok(answered(200, br#"{"token":"session-one"}"#)))
+            .then(Ok(answered(200, br#"{"token":"session-two"}"#)));
+        let gateway = broker_gateway_with_cache(&time, transport, "exchange");
+        let request = finam_exchange("test-finam-secret");
+
+        gateway
+            .send(&request, None)
+            .await
+            .expect("first exchange sent");
+        let second = gateway
+            .send(&request, None)
+            .await
+            .expect("second exchange sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "an exchange of a secret is sent every time"
+        );
+        assert_eq!(
+            second.body, br#"{"token":"session-two"}"#,
+            "the second exchange got its own answer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_access_credential_never_serves_another() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200)
+            .then(Ok(answered(200, b"first-access")))
+            .then(Ok(answered(200, b"second-access")));
+        let gateway = broker_gateway_with_cache(&time, transport, "isolation");
+
+        gateway
+            .send(&finam_read("test-bearer-one"), None)
+            .await
+            .expect("the first access was sent");
+        let second = gateway
+            .send(&finam_read("test-bearer-two"), None)
+            .await
+            .expect("the second access was sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "a new credential is a new send"
+        );
+        assert_eq!(
+            second.body, b"second-access",
+            "the first access's answer did not serve the second"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_answer_consumes_no_ceiling_allowance() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(answered(200, b"holdings")));
+        let gateway = broker_gateway_with_cache(&time, transport, "allowance");
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts/ACC123")
+            .with_bare_token("test-bearer")
+            .with_request_allowance(RequestAllowance::new(1));
+
+        let first = gateway
+            .send(&request, None)
+            .await
+            .expect("the first read went out");
+        let second = gateway
+            .send(&request, None)
+            .await
+            .expect("the second read was answered without spending the last attempt");
+
+        assert_eq!(first.body, second.body);
+        assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_answer_is_logged_like_an_answered_call() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(HttpResponse {
+            status: 200,
+            body: b"<history/>".to_vec(),
+            request_id: Some("moex-req-7".to_owned()),
+            ..Default::default()
+        }));
+        let gateway = gateway_with_cache(&time, transport, "log");
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        gateway.send(&request, None).await.expect("first sent");
+        gateway.send(&request, None).await.expect("second answered");
+
+        log.assert_line(
+            "INFO",
+            "outbound call answered from cache",
+            &[
+                "destination=MoexIss",
+                "method=\"/iss/history.json\"",
+                "url=https://iss.moex.com/iss/history.json",
+                "attempt=0",
+                "status=200",
+                "request_id=\"moex-req-7\"",
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cache_survives_a_restart() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(answered(200, b"<history/>")));
+        let (_directory, database) = instance_database("cache-restart");
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        let first = Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid");
+        first
+            .send(&request, None)
+            .await
+            .expect("sent by the first process");
+        drop(first);
+
+        // A restarted process: a fresh gateway over the same database, with
+        // a transport that has no answer scripted — whatever it returns,
+        // it must not have been sent.
+        let second = Gateway::with_parts_for_database_with_response_cache(
+            Scripted::answering(&time, 200),
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid");
+        second
+            .send(&request, None)
+            .await
+            .expect("answered after the restart");
+
+        assert_eq!(
+            second.transport.sent_count(),
+            0,
+            "the restarted gateway sent nothing for the read it had cached"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_without_a_database_does_not_cache() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        gateway.send(&request, None).await.expect("first sent");
+        gateway.send(&request, None).await.expect("second sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "without a database there is no cache"
+        );
+    }
+
+    #[test]
+    fn a_cache_beside_a_missing_database_is_refused_by_name() {
+        let time = FakeTime::new();
+        let missing =
+            std::env::temp_dir().join(format!("iaam-missing-cache-db-{}", std::process::id()));
+        let refused = Gateway::with_parts_for_database_with_response_cache(
+            Scripted::answering(&time, 200),
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &missing,
+        );
+
+        let Err(error) = refused else {
+            panic!("a gateway over a missing database was built");
+        };
+        assert!(
+            matches!(error, GatewayError::CacheUnavailable { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("response cache"), "{message}");
+        assert!(message.contains("does not exist"), "{message}");
     }
 }

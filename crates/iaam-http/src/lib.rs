@@ -51,6 +51,7 @@ compile_error!(
     "iaam-http feature `test-support` requires debug assertions and cannot be enabled in release builds"
 );
 
+mod cache;
 pub mod client;
 pub mod destination;
 mod egress;

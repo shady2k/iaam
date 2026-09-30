@@ -22,6 +22,9 @@ percent-encoding = "2"
 # Секрет зануляется при уничтожении: копия токена, оставшаяся
 # в освобождённой памяти, — это тот же токен.
 zeroize = { version = "1", features = ["alloc"] }
+# The response cache fingerprints the credential it keys a stored answer
+# by: a SHA-256 digest travels with the key, the credential never does.
+sha2 = "0.11"
 # A `Retry-After` may name an HTTP-date rather than seconds, and the gateway
 # obeys whichever form the source sends. RFC 9110's three date formats are a
 # parser of their own; this one is already in the tree beneath hyper.
@@ -43,7 +46,6 @@ rustix = { version = "1", features = ["fs", "time"] }
 # `test-util` pauses the tokio timer, so the production sleeper is checked
 # without a real wait.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-sha2 = "0.11"
 # Captures the gateway's events in a test, to prove what they carry.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 # Self dependency so integration tests compile the same feature-gated loopback

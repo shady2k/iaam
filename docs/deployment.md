@@ -157,6 +157,28 @@ of accepting truncation or rollback. A missing, unreadable, replaced,
 symlinked, hard-linked or corrupt record refuses broker operation; there is no
 in-memory allowance fallback.
 
+A gateway built with a database — `serve`'s is — also carries the instance's
+**response cache** in a directory beside the database
+(`iaam.sqlite` → `iaam.sqlite.cache`, derived exactly like the egress
+directory, so every alias of the database is one cache). What it holds: the
+answers of reads. A request counts as a read when the request itself says
+so — an HTTP `GET`, or a POST the source marked safe to repeat (T-Invest's
+`…Service/Get…` calls, CBR's SOAP queries). Such a read answered with a 2xx
+is stored, and the same question is answered from the store for one hour
+instead of being sent again. A credential exchange is never cached: Finam's
+`POST /v1/sessions` and `/v1/sessions/details`, and any request whose body
+names a credential, are sent every time. The key under which an answer sits
+covers the destination, the method, the wire URL, the request body and a
+SHA-256 fingerprint of the access token — one access's answer never serves
+another, and no file of the cache ever holds the token itself. A cached
+answer sends nothing on the wire, spends nothing from a sync's attempt
+allowance and touches no ceiling, and is logged at `info` like any other
+answer (§3.6). The directory is created 0700 and its files 0600; every access
+removes the entries older than the hour and the store holds at most 1024
+entries, so it never grows without bound. The cache **survives a restart** —
+it is ordinary files — and is cleared by deleting the directory; the next
+answer starts it again.
+
 Run the executable ceiling proof before enabling broker egress:
 
 ```console
@@ -611,6 +633,11 @@ ever carries the token, the request body or the response body; the request id
 and the redirect target are cut of the token should a source echo it back.
 `RUST_LOG` (§2.1) controls the level: at the default `info` both lines appear;
 `RUST_LOG=warn` keeps only the refusals and the waits over a second.
+
+A read answered from the cache instead of the wire (§2.1) logs
+`outbound call answered from cache` with the same fields: nothing was sent,
+no allowance was spent, and the line is the only trace that the answer came
+from the store beside the database.
 
 ### 3.7 Administration afterwards
 

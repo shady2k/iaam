@@ -214,3 +214,7 @@ entry in the same commit. Moved here from the tracker's memory store on
   cargo's lock; that is the price. A full disk still shows up as an opaque
   rustc exit 101: remove merged worktrees (`make sweep`) and, when
   `target/` itself has grown, `cargo clean` costs one full rebuild.
+- **`POLICY_CHANGE_APPROVED` goes back to `0` as soon as the pull request it
+  was set for is merged** (`gh variable set POLICY_CHANGE_APPROVED --body 0`).
+  While it is `1`, CI lets any branch change a quality-policy file; it was once
+  left at `1` for two days after a merge.

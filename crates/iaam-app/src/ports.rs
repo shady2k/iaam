@@ -2260,14 +2260,21 @@ pub trait BrokerChannel: Send + Sync {
     fn identity_scope(&self) -> IdentityScope;
     fn channel(&self) -> SourceChannel;
 }
-
-/// Channel factory that hides access storage and decryption from the use case.
+/// Broker channel creation: the factory opens one channel per call, so one
+/// channel instance is one synchronisation's scope (the sync routes open
+/// it, run `sync_broker` against it, and drop it).
 ///
-/// The secret crosses the boundary only within the adapter implementation and is never
-/// returned to the application or transport.
+/// `open` takes the factory by its `Arc` because a channel is handed the
+/// factory's own ports — the Finam channel resolves symbols against the
+/// instrument directory the adapter also serves — and an `Arc<dyn ...>`
+/// of the same value is the only way to share it.
 #[async_trait]
 pub trait BrokerChannelFactory: Send + Sync {
-    async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError>;
+    async fn open(
+        self: Arc<Self>,
+        owner: OwnerId,
+        broker: &str,
+    ) -> Result<Arc<dyn BrokerChannel>, AppError>;
 }
 
 /// Explicit stub for the composition point when no adapter is configured.
@@ -2276,7 +2283,7 @@ pub struct UnavailableBrokerChannelFactory;
 #[async_trait]
 impl BrokerChannelFactory for UnavailableBrokerChannelFactory {
     async fn open(
-        &self,
+        self: Arc<Self>,
         _owner: OwnerId,
         _broker: &str,
     ) -> Result<Arc<dyn BrokerChannel>, AppError> {

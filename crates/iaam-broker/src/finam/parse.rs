@@ -4,7 +4,6 @@ use iaam_core::event::provenance::ParserVersion;
 // `finam::ChannelOperationKind` continue to mean the same type:
 // channel names remain familiar while the type behind them is shared.
 pub use crate::operation_kind::ChannelOperationKind;
-use iaam_core::ids::InstrumentId;
 use iaam_core::money::{CurrencyCode, PostedMinor, Quantity};
 use iaam_core::numeric::decimal::Dec;
 use iaam_core::reconciliation::claim::{BalancePoint, ControlClaim};
@@ -31,13 +30,6 @@ pub enum ParseError {
     InvalidTimestamp { field: &'static str },
     #[error("field {field} is not a UUID: {value}")]
     InvalidIdentifier { field: &'static str, value: String },
-    /// The channel names the instrument by a symbol this parser cannot
-    /// resolve to an instrument. Finam prints symbols of the form
-    /// `TICKER@MIC`; the resolution through Finam's own asset endpoint is a
-    /// later task, so the row carrying such a symbol is set aside rather
-    /// than guessed into an instrument (iaam-vg8te.1.2).
-    #[error("symbol {value} is not resolved to an instrument")]
-    UnresolvedSymbol { value: String },
     #[error("unsupported Finam currency: {value}")]
     UnsupportedCurrency { value: String },
     #[error("field {field} cannot be represented in currency minor units {currency:?}")]
@@ -114,8 +106,8 @@ pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError>
         .collect())
 }
 
-/// A portfolio answer: the claims read from it, and the position rows that
-/// could not become claims.
+/// A portfolio answer: the claims read from it, the position rows kept for
+/// the symbol resolution, and the rows that could not become either.
 ///
 /// `refused` carries each unfit row with its reason and its original JSON,
 /// exactly as [`parse_operations`] carries a rejected transaction: the
@@ -124,7 +116,24 @@ pub fn parse_operations(body: &str) -> Result<Vec<ChannelOperation>, ParseError>
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedPortfolio {
     pub claims: Vec<ControlClaim>,
+    /// Every position row this parser could read whole. The resolution to
+    /// an iaam instrument runs through Finam's own asset description and
+    /// the instrument directory, which is the sync adapter's work; the
+    /// parser keeps the row's parts together so nothing is read twice and
+    /// nothing is guessed into an instrument here.
+    pub unresolved: Vec<UnresolvedPosition>,
     pub refused: Vec<RefusedPosition>,
+}
+
+/// One position row the parser could read whole, kept for the symbol
+/// resolution: the symbol as the channel printed it, the quantity beside
+/// it, and the row's original JSON for the refusal the sync writes when
+/// the resolution fails.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedPosition {
+    pub raw: Value,
+    pub symbol: String,
+    pub quantity: Quantity,
 }
 
 /// One portfolio row the channel reported that could not become a claim.
@@ -136,18 +145,17 @@ pub struct RefusedPosition {
     pub reason: ParseError,
 }
 
-/// Parse account cash and positions into source claims.
+/// Parse account cash and position rows.
 ///
 /// A cash entry that cannot be read refuses the whole answer: cash is the
 /// snapshot's money dimension, and a half-read list of currencies is no
-/// answer to assert. A position row that cannot become a claim is set aside
+/// answer to assert. A position row that cannot be read whole is set aside
 /// instead — with its reason and its original JSON — because one
 /// instrument's unreadable row withholds an opinion about that instrument,
-/// not about the rest of the holdings (`iaam-vg8te.1.2`). A symbol the
-/// parser cannot resolve to an instrument is the standing case: Finam
-/// prints `TICKER@MIC`, and the resolution through Finam's own asset
-/// endpoint is a later task, so until it lands such rows are visible
-/// refusals, never guesses.
+/// not about the rest of the holdings (`iaam-vg8te.1.2`). A row that reads
+/// whole travels in `unresolved` with its parts: the resolution of its
+/// symbol to an iaam instrument runs through Finam's own asset
+/// description, and never through a guess this parser would make.
 pub fn parse_portfolio(body: &str) -> Result<ParsedPortfolio, ParseError> {
     let response: RawPortfolioResponse = parse_json(body)?;
     let mut claims = Vec::new();
@@ -160,6 +168,7 @@ pub fn parse_portfolio(body: &str) -> Result<ParsedPortfolio, ParseError> {
         });
     }
 
+    let mut unresolved = Vec::new();
     let mut refused = Vec::new();
     for raw in response.positions.unwrap_or_default() {
         let position = match serde_json::from_value::<RawPortfolioPosition>(raw.clone()) {
@@ -172,16 +181,27 @@ pub fn parse_portfolio(body: &str) -> Result<ParsedPortfolio, ParseError> {
                 continue;
             }
         };
-        match position_claim(&position) {
-            Ok(claim) => claims.push(claim),
+        let read = read_position(&position);
+        match read {
+            Ok((symbol, quantity)) => unresolved.push(UnresolvedPosition {
+                raw,
+                symbol,
+                quantity,
+            }),
             Err(reason) => refused.push(RefusedPosition { raw, reason }),
         }
     }
-    Ok(ParsedPortfolio { claims, refused })
+    Ok(ParsedPortfolio {
+        claims,
+        unresolved,
+        refused,
+    })
 }
 
-/// One position row as the single claim this channel can state about it.
-fn position_claim(position: &RawPortfolioPosition) -> Result<ControlClaim, ParseError> {
+/// The parts of one position row this parser reads: the symbol as the
+/// channel printed it and the quantity beside it. A row missing either is
+/// refused with the field named, never defaulted.
+fn read_position(position: &RawPortfolioPosition) -> Result<(String, Quantity), ParseError> {
     let symbol = position
         .symbol
         .as_deref()
@@ -191,15 +211,22 @@ fn position_claim(position: &RawPortfolioPosition) -> Result<ControlClaim, Parse
         .as_ref()
         .ok_or(ParseError::MissingField { field: "quantity" })
         .and_then(|value| parse_quantity(value, "quantity"))?;
-    let instrument: InstrumentId = serde_json::from_value(Value::String(symbol.to_owned()))
-        .map_err(|_| ParseError::UnresolvedSymbol {
-            value: symbol.to_owned(),
-        })?;
-    Ok(ControlClaim::PositionQuantity {
-        instrument,
-        quantity,
-        at: BalancePoint::Closing,
-    })
+    Ok((symbol.to_owned(), quantity))
+}
+
+/// The part of Finam's asset description (`GET /v1/assets/{symbol}`) this
+/// channel reads: the ISIN the asset names, when it names one. An answer
+/// without an ISIN — the field absent, empty or blank — is a valid answer
+/// and reads as `None`: the standing refusal case one layer up, not a
+/// malformed answer. An answer that is not JSON at all is a parse error.
+pub fn parse_asset(body: &str) -> Result<Option<String>, ParseError> {
+    let value: Value = parse_json(body)?;
+    Ok(nonempty(
+        value
+            .get("isin")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    ))
 }
 
 fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {

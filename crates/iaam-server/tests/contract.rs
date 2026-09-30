@@ -210,7 +210,7 @@ struct FixedChannelFactory {
 #[async_trait::async_trait]
 impl BrokerChannelFactory for FixedChannelFactory {
     async fn open(
-        &self,
+        self: Arc<Self>,
         _owner: OwnerId,
         _broker: &str,
     ) -> Result<Arc<dyn BrokerChannel>, iaam_app::error::AppError> {
@@ -582,11 +582,14 @@ impl iaam_http::gateway::Transport for FinamScript {
 /// operation-kind dictionary, so `open` takes the registry's Finam row.
 async fn finam_sync_harness(script: Vec<String>) -> Harness {
     let store = SqliteStore::open_in_memory().expect("in-memory database");
-    // The instrument the Finam rows name must exist before the journal will
-    // accept an event that moves it.
+    // The instrument the Finam rows resolve to must exist before the
+    // journal will accept an event that moves it: the channel reads the
+    // invented asset description, takes its ISIN, and asks the store's own
+    // lookup which instrument carries that ISIN.
+    let instrument = InstrumentId::new_random();
     store
         .upsert_instrument(&InstrumentRecord {
-            id: InstrumentId(Uuid::parse_str(FINAM_SYMBOL).expect("invented UUID")),
+            id: instrument,
             kind: Some(InstrumentKind::Share),
             symbol: "IZPA".into(),
             title: "Invented issuer".into(),
@@ -594,6 +597,18 @@ async fn finam_sync_harness(script: Vec<String>) -> Harness {
             lineage: None,
         })
         .expect("invented instrument");
+    store
+        .record_alias(&iaam_store::reference::AliasRecord {
+            namespace: iaam_core::instrument::AliasNamespace::Isin,
+            value: FINAM_ISIN.to_owned(),
+            instrument,
+            interval: iaam_core::instrument::AliasInterval {
+                valid_from: time::macros::date!(2020 - 01 - 01),
+                valid_to: None,
+            },
+            source: iaam_core::ids::SourceId::new_random(),
+        })
+        .expect("invented ISIN alias");
     harness_with_everything(
         store,
         HarnessSetup {
@@ -6543,7 +6558,10 @@ async fn broker_sync_reports_unconfigured_access_as_503_and_rejects_read_only() 
 
 /// The instrument every invented Finam row names; registered by the harness
 /// before the sync runs.
-const FINAM_SYMBOL: &str = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+/// The channel's rows name the instrument `TICKER@MIC`; the invented
+/// asset description resolves it to the ISIN the harness records.
+const FINAM_SYMBOL: &str = "IZPA@MISX";
+const FINAM_ISIN: &str = "RU000AFIXTUR";
 
 /// An invented June 2025 Finam answer: a dividend and a purchase on one
 /// transactions page, then a portfolio of cash and one position. No real
@@ -6608,10 +6626,13 @@ fn finam_sessions_details() -> String {
 /// the portfolio.
 #[tokio::test]
 async fn the_finam_sync_route_records_operations_from_the_finam_channel() {
+    // One asset read for the one distinct symbol of the sync: the trade
+    // row resolves first, the portfolio row reuses the answer.
     let harness = finam_sync_harness(vec![
         finam_session_token(),
         finam_sessions_details(),
         finam_transactions_page(),
+        json!({ "isin": FINAM_ISIN }).to_string(),
         finam_portfolio(),
     ])
     .await;

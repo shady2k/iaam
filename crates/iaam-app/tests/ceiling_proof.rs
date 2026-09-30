@@ -1586,8 +1586,15 @@ async fn exercise_finam_sync() -> Scenario {
     );
     let scenario = Scenario::new_sync("finam-real-sync", Destination::FinamApi, replies);
     let client = FinamClient::new(token(), Arc::clone(&scenario.outbound));
-    let channel = FinamChannel::new(client, SourceId::new_random(), dictionary("finam"));
     let (services, principal, account) = services().await;
+    // The real instrument directory of the instance: this proof never
+    // reaches a symbol, so the directory is never asked.
+    let channel = FinamChannel::new(
+        client,
+        SourceId::new_random(),
+        dictionary("finam"),
+        Arc::clone(&services.directory),
+    );
     let result = iaam_app::sync::sync_broker(
         &services,
         &principal,

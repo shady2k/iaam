@@ -1718,9 +1718,12 @@ pub async fn sync_broker(
 ) -> Result<Json<SyncOutcomeDto>, ApiFailure> {
     require(&principal, OperationKey::SyncBroker)?;
     let code = broker_code(&broker)?;
+    // `open` takes the factory by its Arc: the channel shares the adapter's
+    // own instrument directory, so the handle is consumed by the call.
     let channel = state
         .services
         .channels
+        .clone()
         .open(principal.owner, &broker)
         .await?;
     let outcome = run_sync_broker(

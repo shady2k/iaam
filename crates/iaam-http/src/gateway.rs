@@ -149,6 +149,13 @@ pub const BUDGETS: &[Budget] = &[
         used: 100,
         window: MINUTE,
     },
+    Budget {
+        destination: Destination::FinamApi,
+        scope: MethodScope::Named("AssetsService.GetAsset"),
+        documented: Some(200),
+        used: 100,
+        window: MINUTE,
+    },
     // The exchange of the secret for a session JWT, which Finam calls next.
     Budget {
         destination: Destination::FinamApi,
@@ -895,6 +902,10 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
             }
             if matches!(path, "v1/sessions" | "v1/sessions/details") {
                 return Some("AuthService.Sessions");
+            }
+            if let Some(asset) = path.strip_prefix("v1/assets/") {
+                return (!asset.is_empty() && !asset.contains('/'))
+                    .then_some("AssetsService.GetAsset");
             }
             let account_path = path.strip_prefix("v1/accounts/")?;
             if let Some(account) = account_path.strip_suffix("/transactions") {
@@ -2779,6 +2790,7 @@ mod tests {
         for method in [
             "AccountsService.GetAccount",
             "AccountsService.Transactions",
+            "AssetsService.GetAsset",
             "AuthService.Sessions",
         ] {
             let row = BUDGETS
@@ -2789,6 +2801,41 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("{method} has no row"));
             assert_eq!((row.documented, row.used), (Some(200), 100), "{method}");
+        }
+    }
+
+    #[test]
+    fn a_finam_asset_path_is_budgeted_as_the_asset_read() {
+        assert_eq!(
+            broker_budget_key(Destination::FinamApi, "/v1/assets/SBER@MISX"),
+            Some("AssetsService.GetAsset")
+        );
+    }
+
+    #[test]
+    fn a_finam_asset_path_that_is_not_one_segment_is_refused_the_budget() {
+        let refused: &[&str] = &[
+            // Not an asset path at all, or a symbol missing.
+            "/v1/assets",
+            "/v1/assets/",
+            "/v1/invented",
+            // Dot segments, and a second segment.
+            "/v1/assets/.",
+            "/v1/assets/..",
+            "/v1/assets/SBER@MISX/extra",
+            // What a raw path may never carry.
+            "/v1/assets/SBER%40MISX",
+            "/v1/assets/SBER?MISX",
+            "/v1/assets/SBER#MISX",
+            "/v1/assets/SBER\\MISX",
+            "/v1/assets/SBER\nMISX",
+        ];
+        for path in refused {
+            assert_eq!(
+                broker_budget_key(Destination::FinamApi, path),
+                None,
+                "{path}"
+            );
         }
     }
 

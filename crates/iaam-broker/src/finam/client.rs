@@ -74,6 +74,11 @@ pub enum FinamError {
         "Finam account id cannot be used in the account endpoint path; use a non-empty id other than . or .. without /, \\, %, ?, or #"
     )]
     InvalidAccountId,
+    /// A symbol cannot be represented as one canonical API path segment.
+    #[error(
+        "Finam symbol cannot be used in the asset endpoint path; use a non-empty symbol other than . or .. without /, \\, %, ?, or #"
+    )]
+    InvalidSymbol,
     /// A single day's transactions answer reached the request's limit, and
     /// a single day cannot be split further: whether more transactions lie
     /// past the page cannot be proven from the wire, so the interval is
@@ -186,6 +191,33 @@ impl FinamClient {
             .transactions_interval(account_id, from, to, allowance)
             .await?;
         Ok(serde_json::json!({ "transactions": transactions }).to_string())
+    }
+
+    /// Return the raw body of the asset's description (`GET
+    /// /v1/assets/{symbol}`): the instrument as Finam itself names it, the
+    /// ISIN among the fields. The symbol is sent exactly one path segment,
+    /// `@` kept literal as RFC 3986 allows there; the optional
+    /// `?account_id` the contract names is not sent, because the answer
+    /// this channel reads — the ISIN — describes the instrument, not an
+    /// account, and one answer then serves every account of the access.
+    pub async fn get_asset(
+        &self,
+        symbol: &str,
+        allowance: &RequestAllowance,
+    ) -> Result<String, FinamError> {
+        validate_symbol(symbol)?;
+        let (body, _) = self
+            .authorized(allowance, |token| {
+                HttpRequest::get_with_symbol_path_segment(
+                    Destination::FinamApi,
+                    "/v1/assets/",
+                    symbol,
+                )
+                .with_bare_token(token)
+                .with_request_allowance(allowance.clone())
+            })
+            .await?;
+        Ok(body)
     }
 
     /// The transactions of one date interval, whole. The recursion is
@@ -501,6 +533,20 @@ fn validate_account_id(account_id: &str) -> Result<(), FinamError> {
         || account_id.contains(['/', '\\', '%', '?', '#'])
     {
         return Err(FinamError::InvalidAccountId);
+    }
+    Ok(())
+}
+
+/// The same one-segment rule the account ids keep, control characters
+/// included: the symbol becomes one path segment of the asset read, and
+/// the gateway's budget key refuses the same shapes on the raw path.
+fn validate_symbol(symbol: &str) -> Result<(), FinamError> {
+    if symbol.is_empty()
+        || matches!(symbol, "." | "..")
+        || symbol.contains(['/', '\\', '%', '?', '#'])
+        || symbol.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(FinamError::InvalidSymbol);
     }
     Ok(())
 }
@@ -1024,6 +1070,59 @@ mod tests {
             assert!(
                 endpoint.received.lock().expect("received").is_empty(),
                 "{account_id:?} reached transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_asset_read_names_the_symbol_with_the_at_literal_on_the_wire() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, r#"{"isin":"RU000AFIXTUR"}"#),
+        );
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        let body = client
+            .get_asset("SBER@MISX", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("asset read");
+
+        assert_eq!(body, r#"{"isin":"RU000AFIXTUR"}"#);
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].url(), "https://api.finam.ru/v1/sessions");
+        assert_eq!(
+            received[1].url(),
+            "https://api.finam.ru/v1/assets/SBER@MISX",
+            "RFC 3986 admits @ in a path segment; the symbol rides the wire as printed"
+        );
+        assert_eq!(
+            received[1]
+                .authorization()
+                .map(|value| value.expose().to_owned()),
+            Some(JWT_ONE.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_symbols_are_refused_before_the_session_or_asset_request() {
+        for symbol in ["", ".", "..", "/", "\\", "%40", "?", "#", "SBER\nMISX"] {
+            let endpoint = Arc::new(Scripted::answering(200));
+            let (client, _) = client_over(BUDGETS, &endpoint);
+
+            let error = client
+                .get_asset(symbol, &iaam_http::RequestAllowance::new(u32::MAX))
+                .await
+                .expect_err("unsafe symbol must be refused");
+
+            assert!(
+                error.to_string().contains("Finam symbol"),
+                "{symbol:?}: {error}"
+            );
+            assert!(
+                endpoint.received.lock().expect("received").is_empty(),
+                "{symbol:?} reached transport"
             );
         }
     }

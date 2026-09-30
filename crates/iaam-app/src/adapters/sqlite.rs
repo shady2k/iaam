@@ -1837,13 +1837,17 @@ impl crate::ports::BrokerDictionary for SqliteAdapter {
     }
 }
 /// The pieces the shared path gathered for one channel: the client's
-/// transport inputs plus the port data every channel carries.
+/// transport inputs plus the port data every channel carries. `instruments`
+/// is the adapter itself behind its own port — the one instrument directory
+/// this build serves — handed to the channels that resolve external codes
+/// against it.
 struct ChannelParts {
     environment: Environment,
     token: BrokerToken,
     gateway: Arc<dyn Outbound>,
     source: SourceId,
     dictionary: OperationKindDictionary,
+    instruments: Arc<dyn InstrumentDirectory>,
 }
 
 fn build_tinkoff_channel(parts: ChannelParts) -> Arc<dyn BrokerChannel> {
@@ -1859,6 +1863,7 @@ fn build_finam_channel(parts: ChannelParts) -> Arc<dyn BrokerChannel> {
         FinamClient::new(parts.token, parts.gateway),
         parts.source,
         parts.dictionary,
+        parts.instruments,
     ))
 }
 
@@ -1887,7 +1892,11 @@ pub fn supported_brokers() -> impl Iterator<Item = &'static str> {
 
 #[async_trait]
 impl BrokerChannelFactory for SqliteAdapter {
-    async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError> {
+    async fn open(
+        self: Arc<Self>,
+        owner: OwnerId,
+        broker: &str,
+    ) -> Result<Arc<dyn BrokerChannel>, AppError> {
         let code = BrokerCode::parse(broker).ok_or_else(|| AppError::Invalid {
             field: "broker".to_owned(),
             expected: "a supported broker code".to_owned(),
@@ -1982,12 +1991,16 @@ impl BrokerChannelFactory for SqliteAdapter {
                 actual: format!("{} -> {}", first.source_kind, first.kind),
             });
         }
+        // The same value behind its own port: the channel resolves external
+        // codes through the one directory this build serves.
+        let instruments: Arc<dyn InstrumentDirectory> = self;
         Ok(build(ChannelParts {
             environment,
             token,
             gateway,
             source: SourceId(access.id),
             dictionary,
+            instruments,
         }))
     }
 }
@@ -2680,7 +2693,12 @@ mod tests {
             )
             .await
             .expect("access is set up");
-        let first = adapter.open(owner, "tinkoff").await.expect("first channel");
+        let adapter = Arc::new(adapter);
+        let first = adapter
+            .clone()
+            .open(owner, "tinkoff")
+            .await
+            .expect("first channel");
         let second = adapter
             .open(owner, "tinkoff")
             .await
@@ -2761,7 +2779,7 @@ mod tests {
             .await
             .expect("access is set up");
 
-        let channel = adapter
+        let channel = Arc::new(adapter)
             .open(owner, "finam")
             .await
             .expect("the registry opens finam");
@@ -2801,7 +2819,7 @@ mod tests {
             gateway,
         );
 
-        let Err(error) = adapter.open(OwnerId::new_random(), "bcs").await else {
+        let Err(error) = Arc::new(adapter).open(OwnerId::new_random(), "bcs").await else {
             panic!("bcs has no registry row");
         };
 

@@ -15,6 +15,12 @@ const QUERY: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
+
+/// Path-segment encoding that keeps `@` literal: RFC 3986 (§3.3) admits
+/// `@` in a path segment, and Finam's asset symbols are of the form
+/// `TICKER@MIC` (iaam-vg8te.1.3). Everything else outside the unreserved
+/// set is encoded, exactly as [`QUERY`]'s account-path rule does.
+const SYMBOL_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'@');
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use zeroize::Zeroizing;
@@ -178,8 +184,33 @@ impl HttpRequest {
         segment: &str,
         suffix: &str,
     ) -> Self {
+        Self::get_with_encoded_segment(destination, prefix, segment, suffix, NON_ALPHANUMERIC)
+    }
+
+    /// Build a GET whose caller-supplied symbol segment is encoded on the
+    /// wire with `@` kept literal, while [`Self::path`] retains the raw
+    /// spelling for policy checks. RFC 3986 (§3.3) admits `@` in a path
+    /// segment, and Finam's asset symbols are of the form `TICKER@MIC`
+    /// (iaam-vg8te.1.3); everything else outside the unreserved set is
+    /// encoded exactly as [`Self::get_with_encoded_path_segment`] does.
+    #[must_use]
+    pub fn get_with_symbol_path_segment(
+        destination: Destination,
+        prefix: &str,
+        symbol: &str,
+    ) -> Self {
+        Self::get_with_encoded_segment(destination, prefix, symbol, "", SYMBOL_SEGMENT)
+    }
+
+    fn get_with_encoded_segment(
+        destination: Destination,
+        prefix: &str,
+        segment: &str,
+        suffix: &str,
+        set: &'static AsciiSet,
+    ) -> Self {
         let path = format!("{prefix}{segment}{suffix}");
-        let encoded = utf8_percent_encode(segment, NON_ALPHANUMERIC);
+        let encoded = utf8_percent_encode(segment, set);
         let wire_path = format!("{prefix}{encoded}{suffix}");
         let mut request = Self::get(destination, &path);
         request.wire_path = Some(wire_path);
@@ -423,6 +454,38 @@ mod tests {
         assert_eq!(
             request.url(),
             "https://api.finam.ru/v1/accounts/Main%20Account/transactions"
+        );
+    }
+
+    #[test]
+    fn a_symbol_path_segment_keeps_the_at_literal_on_the_wire() {
+        // RFC 3986 §3.3 admits `@` in a path segment, and Finam's asset
+        // symbols are of the form `TICKER@MIC` (iaam-vg8te.1.3): the wire
+        // URL spells the symbol exactly as the channel read it, while
+        // everything else outside the unreserved set is still encoded, as
+        // for the account paths.
+        let request = HttpRequest::get_with_symbol_path_segment(
+            Destination::FinamApi,
+            "/v1/assets/",
+            "SBER@MISX",
+        );
+
+        assert_eq!(request.path(), "/v1/assets/SBER@MISX");
+        assert_eq!(request.url(), "https://api.finam.ru/v1/assets/SBER@MISX");
+    }
+
+    #[test]
+    fn a_symbol_path_segment_still_encodes_what_the_wire_cannot_carry() {
+        let request = HttpRequest::get_with_symbol_path_segment(
+            Destination::FinamApi,
+            "/v1/assets/",
+            "Main Share@MISX",
+        );
+
+        assert_eq!(request.path(), "/v1/assets/Main Share@MISX");
+        assert_eq!(
+            request.url(),
+            "https://api.finam.ru/v1/assets/Main%20Share@MISX"
         );
     }
 

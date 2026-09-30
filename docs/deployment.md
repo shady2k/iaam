@@ -1102,6 +1102,27 @@ database holds. Deleting or emptying that pair after the first enabling
 spends the day (§2.1); the command then refuses with the ceiling it finds,
 and nothing restores the allowance.
 
+### 6.9 How Finam symbols become instruments
+
+Finam names an instrument `TICKER@MIC` (`SBER@MISX`); iaam identifies one by
+its own identifier and its external codes. A sync closes that gap through
+the broker's own asset description: for every distinct symbol of the sync —
+position rows and operations alike — the channel reads `GET
+/v1/assets/{symbol}` once, takes the ISIN the description names, and asks
+the instrument directory which instrument carries that ISIN. The position or
+operation then names that instrument. The asset read is budgeted like every
+Finam call (half of the documented 200 per minute), and the answer is cached
+beside the database like every read, so one symbol costs one wire request
+per hour however many rows and syncs name it.
+
+Two cases stay visible refusals instead of becoming guesses, and the sync's
+outcome lists them row by row with the original JSON: the asset description
+names **no ISIN** for the symbol, or the ISIN is carried by **no instrument
+recorded here**. Both are fixed the same way — record the instrument with
+the ISIN it actually carries (the refusal quotes the ISIN when there is
+one), and sync the same range again. Until then those rows assert nothing:
+the rest of the snapshot and the other operations import regardless.
+
 ---
 
 ## 7. Tokens

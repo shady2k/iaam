@@ -22,10 +22,19 @@ like a lost portfolio:
   key place, whether each file exists, and for each whether the place came
   from a variable or is the default.
 
-A relative `XDG_*` value counts as unset, as the XDG spec says; a variable
-set to an empty value counts as unset too. The image tag `iaam:0.1.0` and
-the container name `iaam` are still literal values that the commands below
-actually pass. A service or a container still passes explicit paths: inside
+A relative `XDG_*` value counts as unset, as the XDG spec says, and so does
+an empty or relative `HOME`. An override variable (`IAAM_DATABASE`,
+`IAAM_BROKER_KEY_FILE`) set to an empty value is refused, not treated as
+unset: a setting that was silently ignored looks exactly like one that was
+never read. The key place is asked for only by the commands that need the
+key (`iaam broker key …`, `iaam broker access …`, `iaam serve`), so `iaam
+claim` and `iaam status` work where only the database is named — `iaam
+status` reports the key place and, when it has no place at all, says why
+instead of failing.
+
+The image tag `iaam:0.1.0` and the container name `iaam` are still literal
+values that the commands below actually pass. A service or a container still
+passes explicit paths: inside
 a container there is no home directory worth a default, and a service names
 its paths so the unit file is the whole truth about where the data is. On
 the owner's own console no path is typed at all.

@@ -483,7 +483,28 @@ mod tests {
             text.contains(&path.display().to_string()),
             "names the path: {text}"
         );
+        assert!(
+            matches!(error, StoreError::DatabaseMissing { .. }),
+            "a missing file is missing, not unreachable: {text}"
+        );
         assert!(!path.exists(), "the refused open must not create the file");
+    }
+
+    #[test]
+    fn open_existing_reports_a_directory_in_the_databases_place_as_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-directory-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = SqliteStore::open_existing(&path);
+
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(
+            matches!(result, Err(StoreError::DatabaseMissing { .. })),
+            "a directory is not a database"
+        );
     }
 
     #[test]

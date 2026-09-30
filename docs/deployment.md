@@ -6,13 +6,40 @@ A step whose success cannot be observed by running something is not a step and
 is not in here. Where a step can fail, the failure names what is missing, who
 supplies it, and the command that supplies it.
 
-Nothing here is a "sensible location". `/var/lib/iaam/iaam.db`,
-`/etc/iaam/broker-key`, the image tag `iaam:0.1.0` and the container name `iaam`
-are literal values that the commands below actually pass, and you may replace
-them with other literal values — but nothing in the program, the image or this
-repository will guess them for you. There are no defaults for a path, and there
-will not be: a database in an unexpected place looks exactly like a lost
-portfolio.
+The instance has one default place for each of its two files, chosen by
+the XDG rules: the database at `$XDG_DATA_HOME/iaam/iaam.db`, else
+`$HOME/.local/share/iaam/iaam.db`; the broker key at
+`$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key` —
+apart from the data on purpose, so copying the data directory does not carry
+the key. Two rules keep a database in an expected place from ever looking
+like a lost portfolio:
+
+- **Only `iaam claim` creates a database.** Every other command that finds
+  no database at the place it resolved refuses, names the place it looked
+  at, and creates no file and no directory. An empty database never appears
+  silently anywhere.
+- **`iaam status` says where the instance is**: the database place and the
+  key place, whether each file exists, and for each whether the place came
+  from a variable or is the default.
+
+A relative `XDG_*` value counts as unset, as the XDG spec says, and so does
+an empty or relative `HOME`. An override variable (`IAAM_DATABASE`,
+`IAAM_BROKER_KEY_FILE`) set to an empty value is refused, not treated as
+unset: a setting that was silently ignored looks exactly like one that was
+never read. The key place is asked for only by the commands that need the
+key (`iaam broker key generate`, `iaam broker access …`, `iaam broker
+connect`, `iaam serve`), so `iaam claim`, `iaam status`, the token
+commands, `iaam broker off` and `iaam broker key rotate` (whose two keys
+are its own arguments) work where only the database is named. `iaam
+status` reports the key place and, when it has no place at all, says why
+instead of failing.
+
+The image tag `iaam:0.1.0` and the container name `iaam` are still literal
+values that the commands below actually pass. A service or a container still
+passes explicit paths: inside
+a container there is no home directory worth a default, and a service names
+its paths so the unit file is the whole truth about where the data is. On
+the owner's own console no path is typed at all.
 
 ---
 
@@ -24,7 +51,7 @@ and it has two roles.
 | Role | Command | Run by |
 |---|---|---|
 | HTTP service | `iaam serve` | a service manager, unattended |
-| local administration | `iaam claim`, `iaam token issue`, `iaam broker key …`, `iaam broker access …`, `iaam bundle export`, `iaam bundle import` | the owner, at a console |
+| local administration | `iaam status`, `iaam claim`, `iaam token issue`, `iaam token list`, `iaam token revoke`, `iaam broker key …`, `iaam broker access …`, `iaam broker connect`, `iaam broker off`, `iaam bundle export`, `iaam bundle import` | the owner, at a console |
 
 The second role is not a convenience wrapper. Under
 [ADR-0003](decisions/0003-the-owner-speaks-to-an-agent-and-a-cli-keeps-the-secrets.md)
@@ -73,8 +100,9 @@ breakers in the server process. They do not cross a restart.
 
 Broker traffic has a stronger rule: **one process owns each broker endpoint**.
 The first request to T-Invest production, T-Invest sandbox or Finam acquires
-`tinkoff-prod.owner`, `tinkoff-sandbox.owner` or `finam.owner` in the compiled
-egress directory, and holds that lock for the gateway's lifetime. A second
+`tinkoff-prod.owner`, `tinkoff-sandbox.owner` or `finam.owner` in the
+instance's egress directory — derived from the database path, see §2.1 — and
+holds that lock for the gateway's lifetime. A second
 process asking for that endpoint is refused before transport; the reason names
 the endpoint and tells the operator to use or stop the owning process. It may
 still own and use another endpoint.
@@ -111,8 +139,16 @@ for its stored duration; every closure restarts from its persisted reason
 unresolved attempt); old request histories restart from the new boot; and the
 first send to each endpoint waits 60 seconds.
 
-The gateway opens the compiled directory `/var/lib/iaam/egress` when broker
-egress is enabled and keeps that directory descriptor for its lifetime. Its
+The gateway places the instance's egress directory beside the instance's
+database (`iaam.sqlite` → `iaam.sqlite.egress`, canonicalized first: every
+symlink or relative alias of the same database reaches the same directory, and a
+database file with a second hard-linked name is refused, because each name would
+get its own tally) and opens it when broker
+egress is enabled, keeping that directory descriptor for its lifetime. One
+database is one tally: this is the per-instance guarantee, and no separate
+setting exists that could split one instance's tally. When the directory is
+missing, the process creates it with mode 0700 and the two fresh tally records
+in it — no step needs root. The
 `outbound-tally`, `outbound-tally-generation`, lock, owner and temporary records
 are opened relative to the descriptor without following symlinks, then checked
 again by device and inode. The tally and its separate generation record advance
@@ -149,8 +185,12 @@ and transport handoff; boot identity changes; tally persistence across owner
 rebuilds; egress-off; path aliases; and two-process ownership. The process rows
 are reconstructed from the loopback receiver's actual wire-arrival records.
 The two child processes deliberately disagree in an irrelevant environment
-variable while receiving the same egress directory, proving that filesystem
-identity, not process-local environment, coordinates ownership.
+variable while receiving the same database path, proving that the tally beside
+the database, not process-local environment, coordinates ownership. A separate
+row builds gateways over aliases of one database — a symlink to the file, a
+symlink to its directory, a redundant `..`, a relative path — and shows they
+share one tally and one endpoint owner, while a second database keeps a second
+tally: two instances with two databases have two tallies.
 
 There is deliberately no fake wall-clock-step row. The production
 `Clock`/`SystemClock` used for persisted ceilings exposes only in-process
@@ -164,9 +204,11 @@ Linux. Its real-time spacing rows observe the host scheduler; longer accounting
 windows are advanced by the injected boot clock so the check remains bounded
 and deterministic.
 
-Administrative commands (`claim`, `token issue`, `broker key …`,
-`broker access …`, `bundle export`, `bundle import`) open the database and do
-not contact a source. The two broker examples and the ignored live sandbox
+Administrative commands (`claim`, `status`, `token …`, `broker key …`,
+`broker access …`, `broker off`, `bundle export`, `bundle import`) open the
+database and do not contact a source. `broker connect` is the one
+administrative command that does: it sends one read-only check to the broker,
+through the same gateway and tally as every broker request. The two broker examples and the ignored live sandbox
 test do contact brokers and consequently use the same egress switch, endpoint
 ownership and tally as `serve`.
 
@@ -188,50 +230,104 @@ open breakers are still lost on restart.
 
 | Variable | Kind | Default | Read by |
 |---|---|---|---|
-| `IAAM_DATABASE` | **required** | none — every subcommand refuses without it | every subcommand, including `serve` |
-| `IAAM_BROKER_KEY_FILE` | path to a secret | none | `broker key generate`, `broker access add`, `broker access rotate`; optional for `serve` |
-| `IAAM_BROKER_EGRESS` | `off` or `on` | `off` | `serve`, broker examples, ignored live sandbox test |
-| `/var/lib/iaam/egress` | compiled persistent state directory, required when broker egress is `on` | fixed path | `serve`, broker examples, ignored live sandbox test |
+| `IAAM_DATABASE` | path to the database | `$XDG_DATA_HOME/iaam/iaam.db`, else `$HOME/.local/share/iaam/iaam.db` | every command, including `serve` |
+| `IAAM_BROKER_KEY_FILE` | path to a secret | `$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key` | `broker key generate`, `broker connect`, `broker access add`, `broker access rotate`; optional for `serve` |
+| `IAAM_BROKER_EGRESS` | `off` or `on` | the instance's stored switch (§6.8): on after `iaam broker connect`, off otherwise; `off` here still forces broker requests off | `serve` reads it over the stored switch; developer tools may set `on` |
+| the egress directory | directory beside the database (`<database>.egress`), created by the process when missing | derived from `IAAM_DATABASE` — no variable and no override | `serve`, broker examples, ignored live sandbox test |
 | `IAAM_LISTEN` | optional | `127.0.0.1:8080` | `serve` |
 | `IAAM_RATE_LIMIT` | optional | `120` | `serve` |
 | `IAAM_RATE_WINDOW_SECONDS` | optional | `60` | `serve` |
 | `IAAM_SOURCE_PROFILES` | path to a read-only directory | none | `serve` |
 | `RUST_LOG` | optional | `info` | `serve` |
 
+With no `HOME` and no override, a command refuses and names the variables
+that would supply the place:
+
+```console
+$ env -u HOME -u XDG_DATA_HOME -u XDG_CONFIG_HOME iaam status
+error: no place for the instance's database: set IAAM_DATABASE, or XDG_DATA_HOME, or HOME; none of them is set
+$ echo $?
+1
+```
+
+The short forms need no variable at all. `iaam status` first, then the one
+creating command, then the refusal that proves every other command refuses
+rather than create:
+
+```console
+$ iaam status
+database: /home/dev/.local/share/iaam/iaam.db (default; absent)
+broker key: /home/dev/.config/iaam/broker-key (default; absent)
+broker requests: off (no database yet, so nothing is stored anywhere)
+$ iaam token issue owner
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim`, no other command creates one
+$ iaam claim --label console
+1f0c…  (64 hexadecimal characters, on one line)
+shown only now: put it in the owner's password manager or the agent's configuration; it cannot be shown again
+$ iaam status
+database: /home/dev/.local/share/iaam/iaam.db (default; present)
+broker key: /home/dev/.config/iaam/broker-key (default; absent)
+broker requests: off
+connected brokers: none
+```
+
+`IAAM_DATABASE` and `IAAM_BROKER_KEY_FILE` still override the places when a
+deployment names them; every example below that passes them is a service or
+a container, which name their paths explicitly.
+
 `IAAM_BROKER_KEY_FILE` is optional for `serve` only in the sense that a service
-that never talks to a broker can run without it. If it is set and the file is
-absent, `serve` refuses to start rather than starting silently without
-encryption. Broker routes that **use** a credential — a sync, anything that
-decrypts — answer `{"code":"not_configured", …}` on a server started without it,
-and the fix is a restart with the key, not a different call.
+that never talks to a broker can run without it. `serve` reads the key from
+the resolved place when a file is there. When the place was named by the
+variable and the file is absent, `serve` refuses to start rather than
+starting silently without encryption; when only the default place is empty,
+it starts without encryption. Broker routes that **use** a credential — a
+sync, anything that decrypts — answer `{"code":"not_configured", …}` on a
+server started without a key, and the fix is a restart with the key, not a
+different call.
 `GET /v1/broker-access` is not one of them: it lists metadata, decrypts nothing,
 and answers `200` with or without the key (§6.2).
 
-`IAAM_BROKER_EGRESS` is a fail-closed deployment switch. Unset and `off` both
-refuse T-Invest production, T-Invest sandbox and Finam calls before the tally
-or network is touched. `on` requires the compiled directory
-`/var/lib/iaam/egress`; there is no environment-variable path override.
+The instance's broker requests are governed by **a stored switch**
+(migration `0008`, read with `iaam status`). `iaam broker connect` turns it
+on as part of connecting; `iaam broker off` turns it off. `serve` reads the
+stored switch at start. The `IAAM_BROKER_EGRESS` variable still overrides it:
+`off` forces a deployment that must not call a broker to stay silent, and
+`on` stays accepted as an override for developer tools. Unset, the stored
+word stands; an invalid value is refused, as before.
 
-Create the directory and its two existing tally records before startup:
+Broker requests still refuse — before the tally or the network is touched —
+whenever the effective switch is off, and the tally directory is still
+derived from the instance's database (§2.1, `IAAM_DATABASE`); there is no
+separate path override, so one instance cannot be given a second tally.
 
-```console
-$ install -d -m 0700 /var/lib/iaam/egress
-$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally
-$ install -m 0600 /dev/null /var/lib/iaam/egress/outbound-tally-generation
-$ export IAAM_BROKER_EGRESS=on
-```
+No preparation step exists: when the directory or the two fresh tally records
+are missing, the process creates them (mode 0700 on the directory) beside the
+database before opening them.
 
-Every iaam process on the machine that may contact a broker must see that exact
-persistent mount and run as an OS user able to read, write and sync both tally
-records; create and lock its lock and three endpoint-owner records; create its
-temporary records; atomically rename within the directory; and sync the
-directory. A container must bind the same host directory at
-`/var/lib/iaam/egress`; a container-private directory or a different host path
-creates a separate owner and tally domain and is not safe. Processes on
+**The first enabling mints a fresh zero tally.** On the instance's first
+`broker connect` — while the database records no first enabling — iaam
+writes the pair beside the database not as the empty pair below but as a
+fresh zero pair: current format, current boot, matched generation, no
+recorded attempt anywhere. Every ceiling still holds and nothing is spent,
+so the connect command's one checking call goes out at once instead of
+sitting out the conservative day. The database records that first enabling,
+and from then on the rule below applies exactly as before: a deleted or
+emptied egress directory restores nothing, because the database vouches only
+for the pair it watched being minted. Deleting the directory after the first
+enabling spends the day, exactly as emptying it always did.
+
+Every iaam process of one instance must reach the same database — and thereby
+the same egress directory — and run as an OS user able to read, write and sync
+both tally records; create and lock its lock and three endpoint-owner records;
+create its temporary records; atomically rename within the directory; and sync
+the directory. Two instances with two databases have two tallies, and that is
+the guarantee: an instance is one tally, not a machine. Processes on
 different machines do not share this coordination. Network filesystems and
 cross-machine tally sharing are outside the proof.
 
-Both tally records must already exist. A pair of empty records is accepted only
+A pair of empty records — including the fresh pair the process itself creates
+when the place is missing, and **excepting only the fresh zero pair the first
+enabling itself writes (above)** — is accepted only
 as a conservative recovery state: on first use iaam records 1,000 attempts at
 the current time for **each** broker endpoint, so every broker endpoint remains
 at its rolling-day ceiling for 24 hours. This is deliberate; an empty pair
@@ -256,7 +352,8 @@ its own acquisition time and closes that endpoint for a full hour from
 adoption. Other endpoint activity and the original handoff's age do not shorten
 that closure.
 
-Operational repair is a controlled stop: stop every process using the mount and
+Operational repair is a controlled stop: stop every process using the
+directory and
 repair both records as one matched pair. If no trustworthy matched pair exists,
 empty both records together, start one process, and expect the documented
 24-hour daily-ceiling refusal on every broker endpoint. After that interval,
@@ -293,7 +390,7 @@ conversation.
 
 | Secret | Where it lives | How it is created |
 |---|---|---|
-| broker encryption key | a file outside the database, mode `0600`, e.g. `/etc/iaam/broker-key` | `iaam broker key generate` (§6.1) |
+| broker encryption key | a file outside the database, mode `0600`, at `$XDG_CONFIG_HOME/iaam/broker-key`, else `$HOME/.config/iaam/broker-key`; `IAAM_BROKER_KEY_FILE` names a different place. The key lives apart from the data on purpose: copying the data directory does not carry the key | `iaam broker key generate` (§6.1) |
 | owner token | the operator's password manager; only its hash is in the database | `iaam claim` (§3.5, §4.4) |
 | agent / read-only tokens | the agent host's configuration | `POST /v1/tokens` (§7) |
 | the broker's own token | nowhere in configuration — it is pasted on standard input and stored only as ciphertext | `iaam broker access add` (§6.3) |
@@ -321,7 +418,7 @@ program refuses to start if one of them is set, and names its replacement.
 Check, on either route:
 
 ```console
-$ IAAM_DATABASE=/var/lib/iaam/iaam.db IAAM_ISSUE_OWNER_TOKEN=console iaam token issue --label console
+$ IAAM_DATABASE=/var/lib/iaam/iaam.db IAAM_ISSUE_OWNER_TOKEN=console iaam token issue owner
 error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue`
 $ echo $?
 1
@@ -394,9 +491,11 @@ Usage: iaam <COMMAND>
 
 Commands:
   serve   Run the iaam server
+  status  Show where the instance's database and broker key live
   claim   Claim a fresh instance and print its owner token once
   token   Manage API tokens
   broker  Manage broker credentials and access
+  bundle  Move an instance's transferable state in and out of a file (§14)
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -430,14 +529,16 @@ is skipped, the next step fails with `unable to open database file`.
 ### 3.5 Claim the instance
 
 This creates the owner and prints the owner token. It happens **once** in the
-life of a database.
+life of a database. `--label` names the token for `iaam token list`; without
+it the token is named `owner`.
 
 ```console
 $ docker run --rm \
     --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
     --env IAAM_DATABASE=/var/lib/iaam/iaam.db \
-    iaam:0.1.0 claim --label console
-1f0c…  (64 hexadecimal characters, on one line)
+    iaam:0.1.0 claim
+c35d72df…  (64 hexadecimal characters, on one line)
+shown only now: put it in the owner's password manager or the agent's configuration; it cannot be shown again
 ```
 
 Record it in the operator's password manager now. Then check that the claim took
@@ -445,7 +546,7 @@ effect, by making it a second time:
 
 ```console
 $ docker run --rm --mount type=bind,source=/var/lib/iaam,target=/var/lib/iaam \
-    --env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam:0.1.0 claim --label console
+    --env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam:0.1.0 claim
 error: instance is already claimed
 $ echo $?
 1
@@ -458,8 +559,10 @@ visit (§7.3), not the instance.
 
 **On failure** — `error: SQLite error: unable to open database file:
 /var/lib/iaam/iaam.db` is §3.4 not done: the directory exists but the container's
-uid cannot write to it. `error: variable IAAM_DATABASE is not set …` is a missing
-`--env`, supplied by whoever writes the run command.
+uid cannot write to it. `error: no place for the instance's database: set
+IAAM_DATABASE, …` is a missing `--env`: the image sets no `HOME`, so inside
+a container there is no default place. Supplied by whoever writes the run
+command.
 
 ### 3.6 Start the service
 
@@ -546,8 +649,8 @@ iaam iaam 700
 ### 4.4 Claim the instance
 
 ```console
-$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam claim --label console
-1f0c…  (64 hexadecimal characters, on one line)
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam claim
+c35d72df…  (64 hexadecimal characters, on one line)
 ```
 
 `sudo -u iaam` is the point of the step: the command must run as the identity
@@ -683,7 +786,12 @@ A broker token grants access to a real account, so the database holds only
 ciphertext and the key lives outside the database. `serve` reads the key; only
 the console writes credentials.
 
-### 6.1 Create the key
+§6.8 is the one command the owner runs to connect a broker. The rest of §6 is
+its anatomy, one step at a time: the key, the service's view of the key, the
+stored credential, its replacement, the key's rotation, and how the key is
+delivered in production.
+
+### 6.1 Generate the encryption key
 
 Container route:
 
@@ -867,6 +975,84 @@ to derive the key from a passphrase entered at every start, which costs
 unattended restarts and does not exist here. The damage is bounded by
 construction instead: the token has no trading rights.
 
+### 6.8 Connect a broker with one command
+
+`iaam broker connect` is the one command the owner remembers. It finds the
+instance by the default places, creates the encryption key when there is
+none, asks for the token on the terminal without echoing it, makes **one**
+read-only call through the gateway to check it — the same tally and ceilings
+as every broker request, with the fresh zero pair of §2.1 minted first on the
+instance's first enabling — and only after the broker answered does it store
+the credential (the §6.4 path) and turn the stored switch on. Finam has only
+production; T-Invest takes `--sandbox` for its sandbox:
+
+```console
+$ iaam broker connect finam
+paste the finam token for the prod environment and press Enter (it stays hidden):
+Finam connected: the token sees 2 accounts. Broker requests are on; turn them off with `iaam broker off`.
+```
+
+That success line is **described, not run**: running it calls the real
+broker, and no real broker is called for this document. The number is the
+count of accounts the token sees at the broker, read from the check call's
+own answer.
+
+Until the instance exists, the command refuses exactly as every command
+does, and creates nothing:
+
+```console
+$ iaam broker connect finam
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim`, no other command creates one
+$ iaam broker off
+error: no database at /home/dev/.local/share/iaam/iaam.db: a database is created only by `iaam claim`, no other command creates one
+```
+
+After `iaam claim`, an empty paste is refused before anything is sent, and
+`iaam status` carries the broker lines — whether requests are on and which
+brokers are connected, names and environments only, never secrets:
+
+```console
+$ iaam broker connect finam
+paste the finam token for the prod environment and press Enter (it stays hidden):
+error: the token is empty: paste the token from the broker's own token page and press Enter
+$ iaam broker off
+broker requests are off: `serve` will not send them; `iaam broker connect <broker>` turns them on again, and IAAM_BROKER_EGRESS=on still forces them on for developer tools.
+$ iaam status
+database: /home/dev/.local/share/iaam/iaam.db (default; present)
+broker key: /home/dev/.config/iaam/broker-key (default; present)
+broker requests: off
+connected brokers: none
+```
+
+The key line reads `present` because the refused connect had already
+created it — the command creates the key when there is none, before it
+asks for the token. The stored switch and the connected brokers still say
+what the database holds: nothing was stored, nothing was turned on.
+
+The broker's own refusals are the command's contract, and they are the lines
+**not run** here, for the same reason:
+
+- the broker refuses the token (a 401 or 403, or the broker's own token
+  error): `Finam refused the token. Nothing was stored and the switch is as
+  it was: check the token for this environment and run `iaam broker connect
+  finam` again.` — the token is never named and never printed;
+- the broker is paused or closed: the line names when the endpoint reopens
+  and nothing is stored;
+- the network is unreachable: the line says how many attempts were made and
+  nothing is stored.
+
+An active credential for the same broker and environment refuses the command
+until `--replace` is passed; `--replace` runs the same check and then
+replaces the credential in place (§6.4), so a bad new token cannot destroy a
+working one.
+
+The check goes out through the process's one gateway, so it spends the same
+allowance as every broker request — on the instance's first enabling from
+the fresh zero pair, and afterwards from whatever the pair beside the
+database holds. Deleting or emptying that pair after the first enabling
+spends the day (§2.1); the command then refuses with the ceiling it finds,
+and nothing restores the allowance.
+
 ---
 
 ## 7. Tokens
@@ -877,7 +1063,16 @@ from again.
 
 ### 7.1 Issue a token for an agent
 
-The owner token issues the rest over the API:
+From the console — the scope is the positional argument, `--label` is
+optional and defaults to the scope and the day (`agent 2026-09-30`):
+
+```console
+$ iaam token issue agent
+0252baae…  (64 hexadecimal characters, on one line)
+shown only now: put it in the owner's password manager or the agent's configuration; it cannot be shown again
+```
+
+Over the API, the owner token issues the rest:
 
 ```console
 $ curl -sS -X POST http://127.0.0.1:8080/v1/tokens \
@@ -910,6 +1105,34 @@ between the model's context and the host's configuration.
 
 ### 7.2 List and revoke
 
+From the console: one line per token — the id, the label, the scope, when it
+was created, and `active` or `revoked <time>` — active first, then the
+revoked ones. The secret and its hash are never in the list:
+
+```console
+$ iaam token list
+e8873921-246f-4724-b457-821f481d2669  owner  owner  created 2026-09-30T08:33:53.696868051Z  active
+de87122d-718e-4c70-8395-0778dab631f3  read-only 2026-09-30  read-only  created 2026-09-30T08:33:53.780679107Z  active
+4987c35e-576f-48e9-a5fa-0841c938ca81  agent 2026-09-30  agent  created 2026-09-30T08:33:53.751428155Z  revoked 2026-09-30T08:33:53.835333474Z
+
+$ iaam token revoke "agent 2026-09-30"
+revoked: agent 2026-09-30 (agent, id 4987c35e-576f-48e9-a5fa-0841c938ca81)
+```
+
+A label naming two active tokens (the default label is the scope and the
+day) is refused with their ids, and the owner revokes one by id:
+
+```console
+$ iaam token revoke "agent 2026-09-30"
+error: label "agent 2026-09-30" names 2 active tokens; revoke one by its id:
+  4cf1035d-d3fb-4800-9865-8a62de55a990  created 2026-09-30T08:34:04.545094219Z
+  796af525-d7af-4df2-9fa4-8566f6feedd9  created 2026-09-30T08:34:04.577454703Z
+$ iaam token revoke 4cf1035d-d3fb-4800-9865-8a62de55a990
+revoked: agent 2026-09-30 (agent, id 4cf1035d-d3fb-4800-9865-8a62de55a990)
+```
+
+The same two acts over the API:
+
 ```console
 $ curl -sS http://127.0.0.1:8080/v1/tokens -H "authorization: Bearer $OWNER"
 [{"id":"9520643a-…","label":"console","scope":"owner","created_at":"…","revoked_at":null}, …]
@@ -923,27 +1146,30 @@ Labels and scopes are listed; tokens and hashes are not, and cannot be — the
 hash is all an attacker would need. Revoked tokens stay in the list, because
 "when did this token stop working" is a question that needs an answer. A revoked
 token is then indistinguishable from an unknown one: both get `401`.
+Revoking from the console takes effect at once: the next request with the
+token is refused.
 
 ### 7.3 A lost owner token
 
 Recovery is by console, and only by console:
 
 ```console
-$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam token issue --label console --scope owner
+$ sudo -u iaam env IAAM_DATABASE=/var/lib/iaam/iaam.db iaam token issue owner
 1f0c…
 ```
 
 On the container route, the `docker run` form of §3.5 with
-`token issue --label console --scope owner` in place of `claim`. The command
+`token issue owner` in place of `claim`. The command
 takes the single existing owner from the database, prints a new owner token once
-and exits without starting a server. On an empty database it refuses:
+and exits without starting a server. On a database with no owner it refuses:
 
 ```console
-error: instance has no owner: run `iaam claim --label <label>` first
+error: instance has no owner: run `iaam claim` first
 ```
 
 The lost token is **not** revoked by this: revoke it with
-`DELETE /v1/tokens/{id}`, or it keeps working.
+`iaam token revoke <label-or-id>` (or `DELETE /v1/tokens/{id}` over the
+API), or it keeps working.
 
 ---
 
@@ -1074,11 +1300,12 @@ supplies what is missing and with which command.
 
 | Message | Meaning | Fix |
 |---|---|---|
-| `error: variable IAAM_DATABASE is not set; set it (allowed values: database file path)` | no database path given; there is no default | whoever writes the run command: add `--env IAAM_DATABASE=/var/lib/iaam/iaam.db` or `Environment=IAAM_DATABASE=…` |
+| `error: no place for the instance's database: set IAAM_DATABASE, or XDG_DATA_HOME, or HOME; none of them is set` | no database path given and no home to hang the default place on — a bare container has no `HOME` | whoever writes the run command: add `--env IAAM_DATABASE=/var/lib/iaam/iaam.db` or `Environment=IAAM_DATABASE=…` |
+| ``error: no database at <path>: a database is created only by `iaam claim`, no other command creates one`` | the resolved place holds no database, and the command created nothing there | the owner, at a console: `iaam claim` (§2.1, §3.5, §4.4) |
 | `error: variable IAAM_LISTEN is invalid: 8080; allowed values: socket address such as 127.0.0.1:8080` | a port without a host | use `0.0.0.0:8080` in a container, `127.0.0.1:8080` on a host |
 | ``error: environment variable IAAM_ISSUE_OWNER_TOKEN was replaced by `iaam token issue` `` | a retired provisioning variable is set (§2.4) | remove it from the unit, profile or compose file and run the subcommand |
-| `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue --scope owner` (§7.3) |
-| ``error: instance has no owner: run `iaam claim --label <label>` first`` | `token issue`, or `bundle export`/`bundle import`, against an empty database | run `iaam claim --label console` (§3.5, §4.4) |
+| `error: instance is already claimed` | the database already has an owner | expected on a second `claim`; for a new token use `iaam token issue owner` (§7.3) |
+| ``error: instance has no owner: run `iaam claim` first`` | `token issue`, or `bundle export`/`bundle import`, against an empty database | run `iaam claim` (§3.5, §4.4) |
 | `error: multiple owners recorded in the database: …` | `bundle export`/`bundle import` against a database with more than one owner | inspect the database; this is corruption in a single-owner system, not something the command guesses past |
 | `error: this instance already holds journal facts; restoring would merge the archive into them …` | `bundle import` against a database that is not empty, without `--merge` | pass `--merge` if merging is what is wanted (§9); otherwise restore into an empty database |
 | `error: … already exists: refusing to overwrite an existing archive` | `bundle export --output` names a file that is already there | choose a new path, or move the existing archive aside first |

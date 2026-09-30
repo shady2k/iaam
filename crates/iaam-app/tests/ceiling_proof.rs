@@ -22,10 +22,11 @@ use iaam_broker::tinkoff::TinkoffClient;
 use iaam_core::ids::{AccountId, OwnerId, SourceId};
 
 use iaam_http::gateway::{BUDGETS, Budget, Clock, MethodScope, Sleeper, Transport};
+use iaam_http::initialize_fresh_tally;
 use iaam_http::test_support::{HttpClientHarness, LoopbackReply, LoopbackServer};
 use iaam_http::{
     BrokerEgress, Destination, Gateway, GatewayError, HttpError, HttpRequest, HttpResponse,
-    Outbound, RequestAllowance, RequestBody,
+    Outbound, RequestAllowance, RequestBody, egress_directory_for,
 };
 
 use iaam_store::SqliteStore;
@@ -42,14 +43,28 @@ const DAILY_CEILING: usize = 1_000;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn initialize_tally(directory: &Path) {
+fn initialize_tally(place: &Path) {
+    std::fs::create_dir(place).unwrap_or_else(|error| panic!("create egress place: {error}"));
     std::fs::write(
-        directory.join("outbound-tally"),
+        place.join("outbound-tally"),
         "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
     )
     .unwrap_or_else(|error| panic!("create initialized tally: {error}"));
-    std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+    std::fs::write(place.join("outbound-tally-generation"), "0\n")
         .unwrap_or_else(|error| panic!("create initialized generation: {error}"));
+}
+
+/// An invented instance database, the egress place derived from it, and the
+/// fixture tally initialized in that place — the arrangement one running
+/// instance has. The database path is what every gateway of the instance is
+/// built over; two gateways over aliases of the same path share the tally.
+fn instance(label: &str) -> (TempDir, PathBuf, PathBuf) {
+    let directory = TempDir::new(label);
+    let database = directory.0.join("iaam.sqlite");
+    std::fs::write(&database, "").expect("database file written");
+    let place = egress_directory_for(&database).expect("place derived");
+    initialize_tally(&place);
+    (directory, database, place)
 }
 
 #[derive(Clone, Debug)]
@@ -794,6 +809,9 @@ struct Scenario {
     context: Arc<CallContext>,
     records: Arc<Mutex<Vec<SendRecord>>>,
     deadline_control: Arc<DeadlineControl>,
+    /// The egress place derived from the instance database: where the tally
+    /// records live.
+    place: PathBuf,
     _directory: TempDir,
 }
 
@@ -940,8 +958,11 @@ impl Scenario {
             short_deadline_calls,
         } = timing;
         let directory = TempDir::new(label);
+        let database = directory.0.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+        let place = egress_directory_for(&database).expect("place derived");
         if egress {
-            initialize_tally(&directory.0);
+            initialize_tally(&place);
         }
         let clock = FakeTime::new();
         clock.set_label(label);
@@ -964,7 +985,7 @@ impl Scenario {
                 .push(SendRecord {
                     logical_at: observed_clock.logical_now(),
                     wire_at: Instant::now().saturating_duration_since(wire_origin),
-                    host: host.clone(),
+                    host: host.to_owned(),
                     method,
                     sync: observed_context.active_sync.load(Ordering::SeqCst),
                     call: observed_context.active_call.load(Ordering::SeqCst),
@@ -1003,7 +1024,7 @@ impl Scenario {
             }),
             SleepMode::Logical => Arc::clone(&clock) as Arc<dyn Sleeper>,
         };
-        let gateway = Gateway::with_parts_in_directory(
+        let gateway = Gateway::with_parts_for_database(
             transport,
             BUDGETS,
             Arc::clone(&clock) as Arc<dyn Clock>,
@@ -1013,7 +1034,7 @@ impl Scenario {
             } else {
                 BrokerEgress::Off
             },
-            &directory.0,
+            &database,
         )
         .unwrap_or_else(|error| panic!("build proof gateway: {error}"));
         let outbound = Arc::new(ObservedOutbound {
@@ -1027,6 +1048,7 @@ impl Scenario {
             context,
             records,
             deadline_control,
+            place,
             _directory: directory,
         }
     }
@@ -1872,7 +1894,7 @@ async fn exercise_record_failure_latch() -> Scenario {
             .await
     });
     wait_for_arrivals(&scenario, 1).await;
-    let obstruction = scenario._directory.path("outbound-tally.tmp");
+    let obstruction = scenario.place.join("outbound-tally.tmp");
     std::fs::create_dir(&obstruction)
         .unwrap_or_else(|error| panic!("create tally obstruction: {error}"));
     scenario.server.release_one();
@@ -1939,7 +1961,7 @@ async fn exercise_lost_second_429() -> Scenario {
             .await
     });
     wait_for_arrivals(&scenario, 2).await;
-    let obstruction = scenario._directory.path("outbound-tally.tmp");
+    let obstruction = scenario.place.join("outbound-tally.tmp");
     std::fs::create_dir(&obstruction)
         .unwrap_or_else(|error| panic!("create second-429 obstruction: {error}"));
     scenario.server.release_one();
@@ -2138,7 +2160,7 @@ fn call_census(records: &[SendRecord]) -> String {
 }
 
 fn plant_pending_from_last_send(scenario: &Scenario, destination: Destination, budget_key: &str) {
-    let path = scenario._directory.path("outbound-tally");
+    let path = scenario.place.join("outbound-tally");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read post-handoff tally: {error}"));
     let host = destination.base_url();
@@ -2203,9 +2225,9 @@ async fn exercise_empty_pair_ceiling() -> Scenario {
     direct_send(&scenario, destination)
         .await
         .unwrap_or_else(|error| panic!("empty-pair initial send: {error}"));
-    std::fs::write(scenario._directory.path("outbound-tally"), "")
+    std::fs::write(scenario.place.join("outbound-tally"), "")
         .unwrap_or_else(|error| panic!("empty proof tally: {error}"));
-    std::fs::write(scenario._directory.path("outbound-tally-generation"), "")
+    std::fs::write(scenario.place.join("outbound-tally-generation"), "")
         .unwrap_or_else(|error| panic!("empty proof generation: {error}"));
 
     let refused = direct_send(&scenario, destination)
@@ -2264,7 +2286,7 @@ async fn exercise_tally_truncation() -> Scenario {
     direct_send(&scenario, destination)
         .await
         .unwrap_or_else(|error| panic!("tally-truncation initial send: {error}"));
-    std::fs::write(scenario._directory.path("outbound-tally"), "")
+    std::fs::write(scenario.place.join("outbound-tally"), "")
         .unwrap_or_else(|error| panic!("truncate proof tally: {error}"));
     let refused = direct_send(&scenario, destination)
         .await
@@ -2289,8 +2311,8 @@ async fn exercise_tally_rollback() -> Scenario {
     direct_send(&scenario, destination)
         .await
         .unwrap_or_else(|error| panic!("tally-rollback first send: {error}"));
-    let tally_path = scenario._directory.path("outbound-tally");
-    let generation_path = scenario._directory.path("outbound-tally-generation");
+    let tally_path = scenario.place.join("outbound-tally");
+    let generation_path = scenario.place.join("outbound-tally-generation");
     let older_tally = std::fs::read(&tally_path)
         .unwrap_or_else(|error| panic!("read older proof tally: {error}"));
     let older_generation = std::fs::read(&generation_path)
@@ -2405,6 +2427,103 @@ fn assert_path_aliases_refused() {
     assert_eq!(server.requests_received(), 0);
 }
 
+/// The per-instance guarantee, as a row: one database is one tally. The same
+/// database reached through an alias — a symlink to the file, a symlink to
+/// its directory, a redundant `..`, a relative path — is the same tally and
+/// the same endpoint owner; a second database is a second tally, so two
+/// instances with two databases have two tallies.
+async fn instance_tallies() {
+    let (root, database, _place) = instance("instance-tallies");
+    // Aliases of the same database.
+    let file_link = root.path("alias-file.sqlite");
+    std::os::unix::fs::symlink(&database, &file_link)
+        .unwrap_or_else(|error| panic!("file symlink: {error}"));
+    let directory_link = root.path("alias-directory");
+    std::os::unix::fs::symlink(&root.0, &directory_link)
+        .unwrap_or_else(|error| panic!("directory symlink: {error}"));
+    let through_directory = directory_link.join("iaam.sqlite");
+    // A redundant `..` over a real subdirectory of the database's directory.
+    let subdirectory = root.path("subdirectory");
+    std::fs::create_dir(&subdirectory).expect("subdirectory created");
+    let dotdot = subdirectory.join("..").join("iaam.sqlite");
+    // A path relative to the working directory, without changing it: walk
+    // from the working directory down to the common ancestor, then back up
+    // to the database.
+    let current = std::env::current_dir().expect("working directory");
+    let mut relative = PathBuf::new();
+    let mut up = current.as_path();
+    while !database.starts_with(up) {
+        up = up.parent().expect("common ancestor");
+        relative.push("..");
+    }
+    relative.push(database.strip_prefix(up).expect("below the ancestor"));
+
+    let server = LoopbackServer::start(std::iter::repeat_n(LoopbackReply::complete(200, "{}"), 4))
+        .unwrap_or_else(|error| panic!("instance-tallies loopback: {error}"));
+    let clock = FakeTime::new();
+    let build = |database: &Path| {
+        Gateway::with_parts_for_database(
+            HttpClientHarness::new(&server),
+            BUDGETS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::clone(&clock) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            database,
+        )
+    };
+    let request = direct_request(
+        Destination::TinkoffProd,
+        direct_path(Destination::TinkoffProd),
+    );
+
+    // The instance owns the T-Invest endpoint for its gateway's lifetime.
+    let first = build(&database).expect("instance gateway over the real path");
+    first
+        .send(&request, None)
+        .await
+        .expect("the instance sends over the real path");
+    assert_eq!(server.requests_received(), 1);
+
+    // The same database through every alias is the same tally and the same
+    // endpoint owner: an alias cannot become a second allowance.
+    for alias in [&file_link, &through_directory, &dotdot, &relative] {
+        let second =
+            build(alias).unwrap_or_else(|error| panic!("alias gateway {alias:?}: {error}"));
+        let owned = second.send(&request, None).await;
+        assert!(
+            matches!(owned, Err(GatewayError::BrokerEndpointOwned { .. })),
+            "an alias of the same database must share the tally and its endpoint owner, not open a second one: {alias:?}"
+        );
+    }
+    assert_eq!(
+        server.requests_received(),
+        1,
+        "no alias sent anything: the tally is shared"
+    );
+
+    // A second database is a second tally: the second instance owns the same
+    // endpoint without meeting the first. Two instances with two databases
+    // have two tallies. Its tally is initialized like any running instance's;
+    // a fresh empty tally would start at the documented conservative
+    // day-ceiling state, which the empty-pair row proves separately.
+    let second_database = root.path("second.sqlite");
+    std::fs::write(&second_database, "").expect("second database written");
+    initialize_tally(&egress_directory_for(&second_database).expect("second place derived"));
+    let second = build(&second_database).expect("second instance gateway");
+    second
+        .send(&request, None)
+        .await
+        .expect("a second database is a second tally and a second endpoint owner");
+    assert_eq!(
+        server.requests_received(),
+        2,
+        "the second tally sent on its own allowance"
+    );
+    println!(
+        "instance-tallies          one database is one tally: file-symlink, directory-symlink, `..` and relative aliases share one owner; a second database keeps a second tally"
+    );
+}
+
 fn wait_for_file(path: &Path, child: &mut Child, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
@@ -2479,9 +2598,9 @@ async fn process_child() {
     let Ok(role) = std::env::var("IAAM_CEILING_PROCESS_ROLE") else {
         return;
     };
-    let egress_directory = PathBuf::from(
-        std::env::var("IAAM_CEILING_PROCESS_TALLY")
-            .unwrap_or_else(|error| panic!("child egress directory: {error}")),
+    let database = PathBuf::from(
+        std::env::var("IAAM_CEILING_PROCESS_DATABASE")
+            .unwrap_or_else(|error| panic!("child instance database: {error}")),
     );
     let ready = PathBuf::from(
         std::env::var("IAAM_CEILING_PROCESS_READY")
@@ -2526,13 +2645,13 @@ async fn process_child() {
         },
     )
     .unwrap_or_else(|error| panic!("child loopback: {error}"));
-    let gateway = Gateway::with_parts_in_directory(
+    let gateway = Gateway::with_parts_for_database(
         HttpClientHarness::new(&server),
         BUDGETS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         Arc::clone(&clock) as Arc<dyn Sleeper>,
         BrokerEgress::On,
-        &egress_directory,
+        &database,
     )
     .unwrap_or_else(|error| panic!("child gateway: {error}"));
 
@@ -2604,18 +2723,17 @@ async fn process_child() {
 }
 
 fn process_measurements() -> (Measurements, Measurements) {
-    let directory = TempDir::new("processes");
+    let (directory, database, _place) = instance("processes");
     let ready = directory.path("ready");
     let done = directory.path("done");
     let owner_result = directory.path("owner-result");
     let contender_result = directory.path("contender-result");
-    initialize_tally(&directory.0);
     let executable = std::env::current_exe().unwrap_or_else(|error| panic!("test binary: {error}"));
     let child = |role: &str, result: &Path| {
         Command::new(&executable)
             .args(["--exact", "process_child", "--nocapture"])
             .env("IAAM_CEILING_PROCESS_ROLE", role)
-            .env("IAAM_CEILING_PROCESS_TALLY", &directory.0)
+            .env("IAAM_CEILING_PROCESS_DATABASE", &database)
             .env("IAAM_CEILING_PROCESS_READY", &ready)
             .env("IAAM_CEILING_PROCESS_DONE", &done)
             .env("IAAM_CEILING_PROCESS_RESULT", result)
@@ -2664,7 +2782,7 @@ fn process_measurements() -> (Measurements, Measurements) {
 
 #[tokio::test]
 async fn killed_process_child() {
-    let Some(directory) = std::env::var_os("IAAM_CEILING_KILLED_DIRECTORY") else {
+    let Some(database) = std::env::var_os("IAAM_CEILING_KILLED_DATABASE") else {
         return;
     };
     let record = PathBuf::from(
@@ -2677,7 +2795,7 @@ async fn killed_process_child() {
     ])
     .unwrap_or_else(|error| panic!("killed-process loopback: {error}"));
     let gateway = Arc::new(
-        Gateway::with_parts_in_directory(
+        Gateway::with_parts_for_database(
             ProofTransport::new(
                 HttpClientHarness::new(&server),
                 HttpClientHarness::new(&server),
@@ -2690,7 +2808,7 @@ async fn killed_process_child() {
             Arc::clone(&clock) as Arc<dyn Clock>,
             Arc::clone(&clock) as Arc<dyn Sleeper>,
             BrokerEgress::On,
-            Path::new(&directory),
+            Path::new(&database),
         )
         .unwrap_or_else(|error| panic!("killed-process gateway: {error}")),
     );
@@ -2716,7 +2834,9 @@ async fn killed_process_child() {
         );
         tokio::task::yield_now().await;
     }
-    let obstruction = PathBuf::from(&directory).join("outbound-tally.tmp");
+    let obstruction = egress_directory_for(Path::new(&database))
+        .expect("killed-process place derived")
+        .join("outbound-tally.tmp");
     std::fs::create_dir(&obstruction)
         .unwrap_or_else(|error| panic!("create killed-process tally obstruction: {error}"));
     server.release_one();
@@ -2737,13 +2857,12 @@ async fn killed_process_child() {
 }
 
 async fn process_death_measurement() -> Measurements {
-    let directory = TempDir::new("process-death");
-    initialize_tally(&directory.0);
+    let (directory, database, place) = instance("process-death");
     let record = directory.path("wire-record");
     let executable = std::env::current_exe().unwrap_or_else(|error| panic!("test binary: {error}"));
     let mut child = Command::new(executable)
         .args(["--exact", "killed_process_child", "--nocapture"])
-        .env("IAAM_CEILING_KILLED_DIRECTORY", &directory.0)
+        .env("IAAM_CEILING_KILLED_DATABASE", &database)
         .env("IAAM_CEILING_KILLED_RECORD", &record)
         .env(
             "IAAM_OUTBOUND_TALLY",
@@ -2758,20 +2877,20 @@ async fn process_death_measurement() -> Measurements {
     child
         .wait()
         .unwrap_or_else(|error| panic!("reap pending child: {error}"));
-    std::fs::remove_dir(directory.path("outbound-tally.tmp"))
+    std::fs::remove_dir(place.join("outbound-tally.tmp"))
         .unwrap_or_else(|error| panic!("remove killed-process obstruction: {error}"));
 
     let server = LoopbackServer::start([LoopbackReply::complete(200, "{}")])
         .unwrap_or_else(|error| panic!("replacement loopback: {error}"));
     let clock = FakeTime::new();
     clock.advance(Duration::from_secs(61));
-    let gateway = Gateway::with_parts_in_directory(
+    let gateway = Gateway::with_parts_for_database(
         HttpClientHarness::new(&server),
         BUDGETS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         Arc::clone(&clock) as Arc<dyn Sleeper>,
         BrokerEgress::On,
-        &directory.0,
+        &database,
     )
     .unwrap_or_else(|error| panic!("replacement gateway: {error}"));
     let refused = gateway
@@ -3007,6 +3126,7 @@ async fn executable_ceiling_proof() {
     egress_off.verify_and_print("egress-off", Destination::TinkoffProd, None);
 
     assert_path_aliases_refused();
+    instance_tallies().await;
 
     let (process_tinkoff, process_finam) = process_measurements();
     print_row(
@@ -3037,4 +3157,245 @@ fn documented_budget_table_keeps_half_the_published_limits() {
             assert_eq!(*used * 2, *published);
         }
     }
+}
+
+// --- The first enabling and the tally it vouches for (iaam-h0b8i.1.2). ---
+//
+// Row (a): on a fresh instance the first enabling mints the fresh zero pair
+// beside the database, and the checking call goes out at once — no
+// conservative day, no boot wait — and stays under every ceiling.
+// Row (b): after that first enabling, a deleted or emptied pair is the
+// conservative state exactly as documented: a restarted gateway sends
+// nothing and no allowance is restored.
+//
+// Each row is shown failing against its planted breach: the at-once bound
+// refuses a planted late arrival, and a gateway over a pair the mint never
+// upgraded is refused where the row's send must arrive.
+
+/// The at-once bound of row (a): the first arrival carries no wait, so its
+/// logical time sits inside the first second of the proof.
+fn sent_at_once_bound(records: &[SendRecord]) -> Result<(), String> {
+    let Some(first) = records.first() else {
+        return Err("no arrival was recorded".to_owned());
+    };
+    if first.logical_at >= Duration::from_secs(1) {
+        return Err(format!(
+            "the first send waited {:?} past the proof's start: a fresh pair \
+             must not carry the boot wait or the conservative day",
+            first.logical_at
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_enabling_sends_at_once_and_a_deleted_tally_restores_nothing() {
+    let directory = TempDir::new("first-enabling");
+    let database = directory.0.join("iaam.sqlite");
+    std::fs::write(&database, "").expect("database file written");
+    let place = egress_directory_for(&database).expect("place derived");
+    assert!(!place.exists(), "a fresh instance has no egress place yet");
+    let clock = FakeTime::new();
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicU64::new(0));
+    let observed_records = Arc::clone(&records);
+    let observed_clock = Arc::clone(&clock);
+    let observed_calls = Arc::clone(&calls);
+    let wire_origin = Instant::now();
+    let host = Destination::TinkoffProd.base_url();
+    let server = LoopbackServer::start_observed(
+        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), 5),
+        move |target, status| {
+            let method = method_for_target(target)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("unknown:{target}"));
+            observed_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(SendRecord {
+                    logical_at: observed_clock.logical_now(),
+                    wire_at: Instant::now().saturating_duration_since(wire_origin),
+                    host: host.to_owned(),
+                    method,
+                    sync: 1,
+                    call: observed_calls.load(Ordering::SeqCst),
+                    status,
+                    pause_for: None,
+                });
+        },
+    )
+    .unwrap_or_else(|error| panic!("first-enabling loopback: {error}"));
+
+    // (a) The mint is the real first-enabling code over this proof's clock.
+    let minted = initialize_fresh_tally(&database, &*clock)
+        .unwrap_or_else(|error| panic!("the first enabling mints the fresh pair: {error}"));
+    assert!(minted, "a missing pair is minted");
+
+    let build_gateway = || {
+        Gateway::with_parts_for_database(
+            HttpClientHarness::new(&server),
+            BUDGETS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::clone(&clock) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            &database,
+        )
+        .unwrap_or_else(|error| panic!("first-enabling gateway: {error}"))
+    };
+
+    // The checking call goes out on the first gateway, with no clock advance
+    // at all before it.
+    let gateway = build_gateway();
+    let request = direct_request(
+        Destination::TinkoffProd,
+        direct_path(Destination::TinkoffProd),
+    );
+    calls.fetch_add(1, Ordering::SeqCst);
+    gateway
+        .send(&request, None)
+        .await
+        .unwrap_or_else(|error| panic!("the checking call must go out at once: {error}"));
+    assert_eq!(
+        records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1
+    );
+    sent_at_once_bound(
+        &records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+
+    // A few more sends, still under every ceiling, then the printed row.
+    for _ in 0..4 {
+        calls.fetch_add(1, Ordering::SeqCst);
+        gateway
+            .send(&request, None)
+            .await
+            .unwrap_or_else(|error| panic!("a following send failed: {error}"));
+    }
+    let taken = records
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let measured = measure(&taken, 0, Some(1))
+        .unwrap_or_else(|error| panic!("measure first-enabling arrivals: {error}"));
+    assert_within_ceilings("first-enabling", &measured);
+    print_row(
+        "first-enabling",
+        Destination::TinkoffProd.base_url(),
+        &measured,
+    );
+
+    // (b) The documented controlled stop: the owning process stops (the
+    // gateway drops, releasing the endpoint), then both records are emptied
+    // together. A restarted gateway finds the empty pair and refuses before
+    // transport.
+    drop(gateway);
+    std::fs::write(place.join("outbound-tally"), "").expect("tally emptied");
+    std::fs::write(place.join("outbound-tally-generation"), "").expect("generation emptied");
+    let restarted = build_gateway();
+    let refused = restarted
+        .send(&request, None)
+        .await
+        .expect_err("an emptied pair is the conservative state");
+    assert!(
+        matches!(refused, GatewayError::DailyCeiling { .. }),
+        "the emptied pair spends the day: {refused:?}"
+    );
+    assert_eq!(
+        records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        5,
+        "the refusal came before the transport"
+    );
+
+    // Deleting the directory entirely is the same conservative state: the
+    // restarted process recreates the place with the empty pair in it.
+    std::fs::remove_dir_all(&place).expect("the egress directory is deleted");
+    let restarted = build_gateway();
+    let refused = restarted
+        .send(&request, None)
+        .await
+        .expect_err("a deleted pair is the conservative state");
+    assert!(
+        matches!(refused, GatewayError::DailyCeiling { .. }),
+        "the recreated empty pair spends the day: {refused:?}"
+    );
+    assert_eq!(
+        records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        5,
+        "still no wire arrival after the deletion"
+    );
+}
+
+#[test]
+fn the_first_enabling_row_fails_against_a_planted_late_arrival() {
+    let host = Destination::TinkoffProd.base_url();
+    let on_time = vec![planted_record(
+        Duration::from_millis(40),
+        host,
+        "UsersService",
+        1,
+        1,
+    )];
+    assert!(
+        sent_at_once_bound(&on_time).is_ok(),
+        "an arrival in the first second is the row's passing shape"
+    );
+
+    let planted = vec![planted_record(
+        Duration::from_secs(75),
+        host,
+        "UsersService",
+        1,
+        1,
+    )];
+    let error =
+        sent_at_once_bound(&planted).expect_err("a planted late arrival must fail the bound");
+    assert!(error.contains("waited"), "{error}");
+}
+
+#[tokio::test]
+async fn the_first_enabling_row_fails_when_the_pair_the_mint_leaves_is_empty() {
+    // The red shape of row (a): over a pair the mint never upgraded — here
+    // the plain empty pair a gateway creates when it finds the place
+    // missing — the checking call is refused where the row needs an arrival.
+    let directory = TempDir::new("first-enabling-red");
+    let database = directory.0.join("iaam.sqlite");
+    std::fs::write(&database, "").expect("database file written");
+    let clock = FakeTime::new();
+    let server = LoopbackServer::start(std::iter::empty())
+        .unwrap_or_else(|error| panic!("red loopback: {error}"));
+    let gateway = Gateway::with_parts_for_database(
+        HttpClientHarness::new(&server),
+        BUDGETS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&clock) as Arc<dyn Sleeper>,
+        BrokerEgress::On,
+        &database,
+    )
+    .unwrap_or_else(|error| panic!("red gateway: {error}"));
+    let refused = gateway
+        .send(
+            &direct_request(
+                Destination::TinkoffProd,
+                direct_path(Destination::TinkoffProd),
+            ),
+            None,
+        )
+        .await
+        .expect_err("without the mint the conservative day refuses the first send");
+    assert!(
+        matches!(refused, GatewayError::DailyCeiling { .. }),
+        "{refused:?}"
+    );
 }

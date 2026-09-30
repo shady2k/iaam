@@ -7,7 +7,9 @@
 use iaam_broker::credentials::{BrokerScope, Key, SealedToken, open, seal};
 use iaam_broker::environment::Environment;
 use iaam_store::SqliteStore;
-use iaam_store::broker_access::{BrokerAccessCiphertext, NewBrokerAccess, SoleOwner};
+use iaam_store::broker_access::{
+    BrokerAccessCiphertext, BrokerCredentialWrite, NewBrokerAccess, SoleOwner,
+};
 use iaam_store::broker_operation_kinds::BrokerOperationKind;
 use iaam_store::documents::BrokerCode;
 use thiserror::Error;
@@ -19,7 +21,7 @@ pub enum ProvisionError {
     BrokerNotNamed,
     #[error("token is empty")]
     TokenEmpty,
-    #[error("owner not found: run `iaam claim --label <label>` first")]
+    #[error("owner not found: run `iaam claim` first")]
     NoOwner,
     #[error("multiple owners: choosing which one should receive access is impossible")]
     SeveralOwners,
@@ -118,6 +120,85 @@ pub fn replace_broker_access(
         ciphertext: sealed.ciphertext().to_vec(),
     }])?;
     Ok(access.id)
+}
+
+/// The one store write of one `iaam broker connect`: the credential — first
+/// or replaced — and the enabling of the stored egress switch, committed as
+/// a single transaction in the store.
+///
+/// The broker has already accepted the token when this runs; a refusal
+/// never reaches here. What must not happen afterwards is a half commit: a
+/// credential stored beside a switch that is still off would make a retry
+/// a refusal "already exists", and would leave a replaced credential lost
+/// if the enabling alone failed. `broker access add` and `broker access
+/// rotate` keep [`add_broker_access`] and [`replace_broker_access`], whose
+/// single credential write leaves the switch as the owner left it.
+pub fn store_credential_and_enable_egress(
+    store: &mut SqliteStore,
+    key: &Key,
+    broker: &str,
+    environment: Environment,
+    token: &str,
+    replace: bool,
+) -> Result<Uuid, ProvisionError> {
+    let broker = BrokerCode::parse(broker).ok_or(ProvisionError::BrokerNotNamed)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(ProvisionError::TokenEmpty);
+    }
+    let owner = match store.sole_token_owner()? {
+        SoleOwner::Single(owner) => owner,
+        SoleOwner::None => return Err(ProvisionError::NoOwner),
+        SoleOwner::Several => return Err(ProvisionError::SeveralOwners),
+    };
+    if replace {
+        let access = store
+            .find_broker_access(owner, &broker, environment.code())?
+            .ok_or(ProvisionError::AccessNotFound)?;
+        let sealed = seal(key, token);
+        let id = access.id;
+        store.store_broker_credential_and_enable_egress(BrokerCredentialWrite::Replace(
+            BrokerAccessCiphertext {
+                id,
+                nonce: sealed.nonce().to_vec(),
+                ciphertext: sealed.ciphertext().to_vec(),
+            },
+        ))?;
+        Ok(id)
+    } else {
+        let (dictionary, seed) = iaam_broker::operation_kind::seed_for(broker.as_str())
+            .ok_or_else(|| ProvisionError::UnknownDictionary {
+                broker: broker.as_str().to_owned(),
+            })?;
+        let entries: Vec<BrokerOperationKind> = seed
+            .iter()
+            .map(|(source_kind, kind)| BrokerOperationKind {
+                source_kind: (*source_kind).to_owned(),
+                kind: (*kind).to_owned(),
+            })
+            .collect();
+        let sealed = seal(key, token);
+        let access = NewBrokerAccess {
+            id: Uuid::new_v4(),
+            owner,
+            broker,
+            // The environment is named at provisioning: tokens differ by
+            // environment, and no choice can be made for the user.
+            environment: environment.code().to_owned(),
+            // The permission scope is set here rather than accepted from the
+            // outside: trading permissions are never requested (§14).
+            scope: BrokerScope::ReadOnly.code().to_owned(),
+            nonce: sealed.nonce().to_vec(),
+            ciphertext: sealed.ciphertext().to_vec(),
+        };
+        let id = access.id;
+        store.store_broker_credential_and_enable_egress(BrokerCredentialWrite::Insert {
+            access,
+            dictionary: dictionary.to_owned(),
+            entries,
+        })?;
+        Ok(id)
+    }
 }
 
 /// Re-encrypt the entire access history in one storage transaction.
@@ -354,5 +435,88 @@ mod tests {
             assert_eq!(open(&new_key, &sealed).unwrap().expose(), TOKEN);
             assert!(open(&old_key, &sealed).is_err());
         }
+    }
+
+    #[test]
+    fn an_empty_token_is_refused_before_any_store_write() {
+        let (mut store, owner) = store_with_owner();
+
+        let error = store_credential_and_enable_egress(
+            &mut store,
+            &key(),
+            "tinkoff",
+            Environment::Sandbox,
+            "   ",
+            false,
+        )
+        .expect_err("a whitespace paste is a missing input");
+
+        assert!(error.to_string().contains("token is empty"), "{error}");
+        assert!(
+            store.broker_access_history(owner).unwrap().is_empty(),
+            "nothing was written"
+        );
+        assert!(
+            !store.broker_egress().unwrap().enabled,
+            "the switch is untouched"
+        );
+    }
+
+    #[test]
+    fn a_store_with_no_owner_or_two_refuses_to_store_a_credential() {
+        let key = key();
+
+        let mut unclaimed = SqliteStore::open_in_memory().unwrap();
+        let error = store_credential_and_enable_egress(
+            &mut unclaimed,
+            &key,
+            "tinkoff",
+            Environment::Sandbox,
+            TOKEN,
+            false,
+        )
+        .expect_err("an unclaimed instance has nobody to store for");
+        assert!(
+            error.to_string().contains("run `iaam claim` first"),
+            "{error}"
+        );
+
+        let mut several = SqliteStore::open_in_memory().unwrap();
+        issue(&several, OwnerId::new_random(), "first");
+        issue(&several, OwnerId::new_random(), "second");
+        let error = store_credential_and_enable_egress(
+            &mut several,
+            &key,
+            "tinkoff",
+            Environment::Sandbox,
+            TOKEN,
+            false,
+        )
+        .expect_err("two owners are never chosen between");
+        assert!(error.to_string().contains("multiple owners"), "{error}");
+    }
+
+    #[test]
+    fn a_broker_this_build_does_not_connect_is_refused_by_name() {
+        let (mut store, _) = store_with_owner();
+
+        // `kraken` parses as a broker code — any non-empty name does — but
+        // no operation dictionary is known for it, so storing a credential
+        // would leave the access unusable.
+        let error = store_credential_and_enable_egress(
+            &mut store,
+            &key(),
+            "kraken",
+            Environment::Sandbox,
+            TOKEN,
+            false,
+        )
+        .expect_err("a broker without a dictionary is refused");
+
+        let text = error.to_string();
+        assert!(
+            text.contains("kraken") && text.contains("operation-type dictionary"),
+            "{text}"
+        );
     }
 }

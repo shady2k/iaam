@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -216,12 +217,43 @@ impl EgressDirectory {
         self.0.path.join(TALLY_FILE)
     }
 
+    /// Opens the instance's egress directory, creating the place when it does
+    /// not exist yet.
+    ///
+    /// The place is a directory beside the database, created with mode 0700
+    /// (the owner bits survive every umask), so no step needs root. The fresh
+    /// empty tally record is created the way the documented
+    /// `install -m 0600 /dev/null` step created it: an empty pair is the
+    /// documented conservative recovery state, never truncating an existing
+    /// record. Every check of [`Self::open`] then applies to whatever was
+    /// found or created.
+    pub(crate) fn open_or_create(path: &Path) -> Result<Self, TallyError> {
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(TallyError::File {
+                    action: "create the egress directory beside the database",
+                    source,
+                });
+            }
+        }
+        let directory = Self::open(path)?;
+        let (record, _) = directory.open_child(
+            TALLY_FILE,
+            OFlags::RDWR | OFlags::CREATE,
+            "create the outbound tally record",
+        )?;
+        drop(record);
+        Ok(directory)
+    }
+
     fn verify(&self) -> Result<(), TallyError> {
         let named = statat(CWD, &self.0.path, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|source| file_error("verify the egress directory", source))?;
         if self.0.identity != FileIdentity::of(&named) {
             return Err(TallyError::InvalidPath(
-                "the egress directory was replaced; restore the mounted directory before retrying"
+                "the egress directory beside the database was replaced; restore it before retrying"
                     .to_owned(),
             ));
         }
@@ -387,7 +419,7 @@ impl OutboundTally {
         Ok(())
     }
 
-    fn new(directory: EgressDirectory) -> Result<Self, TallyError> {
+    pub(crate) fn new(directory: EgressDirectory) -> Result<Self, TallyError> {
         let (file, _) =
             directory.open_child(TALLY_FILE, OFlags::RDONLY, "open the outbound tally")?;
         drop(file);
@@ -398,6 +430,75 @@ impl OutboundTally {
         )?;
         drop(generation);
         Ok(Self { directory })
+    }
+
+    /// Mint the fresh zero tally of the instance's first broker enabling.
+    ///
+    /// A missing or empty pair is the conservative recovery state: on first
+    /// use iaam records a full day of attempts for every broker endpoint, so a
+    /// lost record restores no allowance. That is right for a *lost* record —
+    /// and wrong for the instance's first `connect`, which would spend its
+    /// first day refused. The first enabling therefore writes a pair that
+    /// proves its own freshness: the current format, the current boot, a
+    /// matched generation, and no recorded attempt anywhere — every ceiling
+    /// still holds, and nothing is spent.
+    ///
+    /// The mint never overwrites a non-empty pair and answers `false` then:
+    /// whatever the pair holds governs, exactly as for `serve`. The empty-pair
+    /// check runs under the tally lock, so a concurrent decision either
+    /// happened before the mint saw an empty file or after it saw a full one.
+    ///
+    /// # Errors
+    /// The pair could not be opened, read, written or persisted; or the
+    /// generation record carries content beside an empty tally.
+    pub(crate) fn initialize_fresh_pair(&self, clock: &dyn Clock) -> Result<bool, TallyError> {
+        let (lock, lock_identity) = self.directory.open_child(
+            TALLY_LOCK_FILE,
+            OFlags::RDWR | OFlags::CREATE,
+            "open the tally lock file",
+        )?;
+        FileExt::lock_exclusive(&lock).map_err(|source| TallyError::File {
+            action: "lock the tally lock file",
+            source,
+        })?;
+        self.directory
+            .verify_child(TALLY_LOCK_FILE, lock_identity)?;
+
+        let result = (|| {
+            let (mut state, tally_identity, generation_identity) = self.read_state()?;
+            if !state.pair_was_empty {
+                return Ok(false);
+            }
+            let boot = read_boot(clock)?;
+            state.generation = state.generation.checked_add(1).ok_or_else(|| {
+                TallyError::Corrupt("the tally generation is exhausted".to_owned())
+            })?;
+            state.boot_id = Some(boot.id().to_owned());
+            state.boot_high_water = Some(boot.elapsed().as_nanos());
+            // Every endpoint stands at zero: no send, no wait, no closure, no
+            // pause. The rows exist so the first decision on each finds its
+            // host already held at zero instead of inserting it at the
+            // boot-change wait, while a later boot change keeps the documented
+            // first-send wait.
+            for host in BROKER_HOSTS {
+                state.hosts.insert(host.to_owned(), HostState::default());
+            }
+            self.persist(&state, tally_identity, generation_identity)?;
+            self.directory
+                .0
+                .generation_high_water
+                .fetch_max(state.generation, Ordering::AcqRel);
+            Ok(true)
+        })();
+        let unlocked = FileExt::unlock(&lock).map_err(|source| TallyError::File {
+            action: "unlock the tally lock file",
+            source,
+        });
+        match (result, unlocked) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(minted), Ok(())) => Ok(minted),
+        }
     }
 
     pub(crate) fn decide_and_record(
@@ -1776,6 +1877,82 @@ mod tests {
     }
 
     #[test]
+    fn open_or_create_creates_the_place_beside_the_database() {
+        let outside = TempDir::new("create-outside");
+        let fresh = outside.0.join("fresh");
+        std::fs::create_dir(&fresh).expect("the database's directory exists");
+        let place = fresh.join("iaam.sqlite.egress");
+
+        let directory =
+            EgressDirectory::open_or_create(&place).expect("fresh place created and opened");
+
+        let mode =
+            std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(&place).expect("place exists"));
+        assert_eq!(mode & 0o777, 0o700, "the place is private to its owner");
+        let record = std::fs::read(directory.tally_path()).expect("tally record exists");
+        assert!(record.is_empty(), "the fresh tally record is empty");
+    }
+
+    #[test]
+    fn open_or_create_never_truncates_an_existing_record() {
+        let outside = TempDir::new("create-existing");
+        let place = outside.0.join("iaam.sqlite.egress");
+        std::fs::create_dir(&place).expect("place created");
+        std::fs::write(
+            place.join(TALLY_FILE),
+            "iaam-outbound-tally-v4\ngeneration\t7\n",
+        )
+        .expect("existing tally written");
+
+        let directory = EgressDirectory::open_or_create(&place).expect("existing place opened");
+
+        let record = std::fs::read(directory.tally_path()).expect("tally record read");
+        assert!(
+            record.starts_with(b"iaam-outbound-tally-v4\ngeneration\t7"),
+            "an existing record must not be touched: {}",
+            String::from_utf8_lossy(&record)
+        );
+    }
+
+    #[test]
+    fn open_or_create_names_the_failed_creation_when_the_parent_is_missing() {
+        let outside = TempDir::new("create-orphan");
+        let place = outside.0.join("absent-parent").join("iaam.sqlite.egress");
+
+        let refused = EgressDirectory::open_or_create(&place)
+            .expect_err("a place whose parent is missing is not created");
+
+        // The refusal names the creation that failed, not a later open: the
+        // database's directory always exists by the time the gateway is
+        // built, so a missing parent is a real misconfiguration to report.
+        assert!(
+            matches!(
+                refused,
+                TallyError::File {
+                    action: "create the egress directory beside the database",
+                    ..
+                }
+            ),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn open_or_create_refuses_a_file_where_the_place_belongs() {
+        let outside = TempDir::new("create-file");
+        let place = outside.0.join("iaam.sqlite.egress");
+        std::fs::write(&place, "").expect("plain file written");
+
+        let refused = EgressDirectory::open_or_create(&place)
+            .expect_err("a file must not become the egress place");
+
+        // The refusal names the open that failed, whatever its shape: the
+        // place is unusable and nothing was created inside it.
+        let message = refused.to_string();
+        assert!(message.contains("egress directory"), "{refused}");
+    }
+
+    #[test]
     fn replacing_a_held_child_record_is_refused() {
         let temporary = TempDir::new("replace-child");
         let directory = EgressDirectory::open(&temporary.0).expect("egress directory opened");
@@ -2039,5 +2216,145 @@ mod tests {
             panic!("matching pair rollback was not refused as corrupt");
         };
         assert!(reason.contains("process generation high-water"), "{reason}");
+    }
+
+    #[test]
+    fn the_first_enabling_wrapper_mints_beside_the_database_once() {
+        let outside = TempDir::new("wrapper-mint");
+        let database = outside.0.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+        let place = crate::egress_directory_for(&database).expect("place derived");
+        assert!(!place.exists(), "a fresh instance has no egress place");
+
+        let minted = super::super::initialize_fresh_tally(
+            &database,
+            &BootTime::new("wrapper-boot", Duration::from_secs(1_000)),
+        )
+        .expect("the first enabling wrapper mints");
+        assert!(minted, "a missing pair is minted");
+        let text = std::fs::read_to_string(place.join(TALLY_FILE)).expect("the pair reads");
+        assert!(!text.is_empty(), "the pair is no longer the empty pair");
+
+        let again = super::super::initialize_fresh_tally(
+            &database,
+            &BootTime::new("wrapper-boot", Duration::from_secs(1_000)),
+        )
+        .expect("the second call still reads the pair");
+        assert!(!again, "the wrapper never overwrites a pair that governs");
+    }
+
+    #[test]
+    fn the_first_enabling_mints_a_pair_that_holds_no_attempt() {
+        let (_temporary, directory, tally) = tally("fresh-mint");
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+
+        let minted = tally
+            .initialize_fresh_pair(&clock)
+            .expect("the first enabling mints the fresh pair");
+
+        assert!(minted, "an empty pair is minted");
+        let text =
+            std::fs::read_to_string(directory.tally_path()).expect("the minted tally record reads");
+        assert!(!text.is_empty(), "the pair is no longer empty");
+        let state = State::parse(&text).expect("the minted pair parses");
+        assert_eq!(state.boot_id.as_deref(), Some("boot-1"));
+        for host in BROKER_HOSTS {
+            let held = state
+                .hosts
+                .get(host)
+                .expect("every broker endpoint is held");
+            assert!(held.daily_sends.is_empty(), "{host} holds no attempt");
+            assert!(held.last_send.is_none());
+            assert!(held.boot_wait_until.is_none());
+            assert!(held.closed_until.is_none());
+            assert!(held.paused_until.is_none());
+        }
+    }
+
+    #[test]
+    fn a_minted_pair_sends_at_once_under_every_ceiling() {
+        let (_temporary, _directory, tally) = tally("fresh-sends");
+        let host = BROKER_HOSTS[0];
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+        tally
+            .initialize_fresh_pair(&clock)
+            .expect("the first enabling mints the fresh pair");
+
+        let decision = tally
+            .decide_and_record(host, "method", 100, Duration::from_secs(60), &clock)
+            .expect("the first decision decides");
+
+        assert!(
+            matches!(decision, TallyDecision::Send),
+            "the checking call goes out at once, not at the conservative ceiling"
+        );
+    }
+
+    #[test]
+    fn a_mint_never_overwrites_a_pair_that_governs() {
+        let (_temporary, _directory, tally) = tally("mint-keeps");
+        let host = BROKER_HOSTS[0];
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+        tally
+            .initialize_fresh_pair(&clock)
+            .expect("the first enabling mints the fresh pair");
+        assert!(matches!(
+            tally.decide_and_record(host, "method", 100, Duration::from_secs(60), &clock),
+            Ok(TallyDecision::Send)
+        ));
+
+        let minted = tally
+            .initialize_fresh_pair(&clock)
+            .expect("a later mint still reads the pair");
+
+        assert!(
+            !minted,
+            "whatever the pair holds governs; the mint never restores an allowance"
+        );
+    }
+
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_is_named_before_anything_is_minted() {
+        let (temporary, directory, tally) = tally("mint-lock-obstructed");
+        // The lock file's name is taken by a directory: the mint cannot
+        // even take its lock, and nothing is read or written.
+        std::fs::create_dir(temporary.0.join(TALLY_LOCK_FILE)).expect("the obstruction is made");
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+
+        let refused = tally
+            .initialize_fresh_pair(&clock)
+            .expect_err("a lock that cannot be opened is a refusal");
+        let text = refused.to_string();
+        assert!(text.contains("open the tally lock file"), "{text}");
+
+        // The empty pair stands: no mint happened behind the failed lock.
+        let record = std::fs::read_to_string(directory.tally_path()).expect("the record reads");
+        assert!(record.is_empty(), "the pair was not minted: {record}");
+    }
+
+    #[test]
+    fn a_pair_that_fails_to_read_under_the_held_lock_is_reported_as_itself() {
+        let (temporary, directory, tally) = tally("mint-unreadable-pair");
+        // An empty tally beside a generation record is the documented
+        // corruption: the mint takes its lock, reads the pair, and refuses.
+        std::fs::write(
+            temporary.0.join(GENERATION_FILE),
+            "a generation record that is not a number\n",
+        )
+        .expect("the corrupt generation record is written");
+        let clock = BootTime::new("boot-1", Duration::from_secs(5_000));
+
+        let refused = tally
+            .initialize_fresh_pair(&clock)
+            .expect_err("a pair that cannot be read under the lock is a refusal");
+        let text = refused.to_string();
+        assert!(
+            text.contains("emptied without its generation record"),
+            "{text}"
+        );
+
+        // The corrupt pair stands untouched: the mint never wrote.
+        let record = std::fs::read_to_string(directory.tally_path()).expect("the record reads");
+        assert!(record.is_empty(), "the pair was not minted: {record}");
     }
 }

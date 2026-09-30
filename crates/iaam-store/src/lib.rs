@@ -6,6 +6,7 @@
 //! stops the executor (§3.2).
 
 pub mod broker_access;
+pub mod broker_egress;
 pub mod broker_operation_kinds;
 pub mod market;
 pub mod market_source_codes;
@@ -28,7 +29,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -79,6 +80,23 @@ pub enum StoreError {
     SchemaGenerationMismatch { found: u32, current: u32 },
     #[error("record {what} {id} not found in database")]
     NotFound { what: &'static str, id: String },
+    /// No database file exists at the path this command resolved. Separate
+    /// from `Sqlite` so the message can say who may create the file: only
+    /// `iaam claim` does, and a command that opened with create-if-missing
+    /// would leave an empty database in the place a lost portfolio would
+    /// look exactly like.
+    #[error("no database at {path}")]
+    DatabaseMissing { path: String },
+    /// The database's place could not be examined (for example, permission
+    /// denied on a directory above it). Kept apart from `DatabaseMissing` so
+    /// an existing portfolio behind a permission error is never reported as
+    /// absent, which would send the owner to create a new one.
+    #[error("cannot reach the database at {path}: {source}")]
+    DatabaseInaccessible {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("active alias {namespace}:{value} not found for instrument {instrument}")]
     AliasNotFoundForInstrument {
         namespace: &'static str,
@@ -253,6 +271,49 @@ impl SqliteStore {
         Self::prepare(conn)
     }
 
+    /// Opens an existing database file and applies migrations, and never
+    /// creates one.
+    ///
+    /// SQLite's create-if-missing open ([`Self::open`]) would answer a
+    /// command whose database is simply somewhere else with a brand-new
+    /// empty database under the default path — a lost portfolio made of
+    /// silence. Only one command in the product may create a database;
+    /// every other caller opens with this and receives
+    /// [`StoreError::DatabaseMissing`], naming the place it looked at. The
+    /// flags say `READ_WRITE` without `CREATE` so that even a race with the
+    /// file's deletion cannot make SQLite manufacture an empty one. The
+    /// command-facing refusal lives with the commands, which know the
+    /// command that creates.
+    pub fn open_existing(path: &Path) -> Result<Self, StoreError> {
+        // `metadata`, not `is_file`: `is_file` answers `false` for a
+        // permission error too, and an existing portfolio behind one must
+        // not be reported as absent.
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(StoreError::DatabaseMissing {
+                    path: path.display().to_string(),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::DatabaseMissing {
+                    path: path.display().to_string(),
+                });
+            }
+            Err(source) => {
+                return Err(StoreError::DatabaseInaccessible {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        }
+        // One flag, not the default set: `READ_WRITE` without `CREATE` is
+        // the whole contract. The `URI` flag of a default open would parse
+        // `?` in an ordinary filename, and the store owns its connection
+        // exclusively, so the extra mutex mode buys nothing here.
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        Self::prepare(conn)
+    }
     /// In-memory database. Needed by tests: a file-based database leaves
     /// residue in the test and makes tests dependent on one another.
     pub fn open_in_memory() -> Result<Self, StoreError> {
@@ -374,5 +435,88 @@ mod tests {
             parsed.year() >= 2025,
             "timestamp is not from a previous century: {stamp}"
         );
+    }
+
+    #[test]
+    fn open_existing_keeps_the_cause_when_the_database_cannot_be_reached() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-blocked-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("iaam.sqlite");
+        drop(SqliteStore::open(&path).unwrap());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = SqliteStore::open_existing(&path);
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&parent).unwrap();
+        match result {
+            Err(StoreError::DatabaseInaccessible {
+                path: named,
+                source,
+            }) => {
+                assert!(named.contains("iaam.sqlite"), "{named}");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            Err(other) => panic!("the cause must be kept, got {other}"),
+            Ok(_) => panic!("an unreachable database must not open"),
+        }
+    }
+
+    #[test]
+    fn open_existing_refuses_a_missing_database_and_creates_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+
+        let error = match SqliteStore::open_existing(&path) {
+            Ok(_) => panic!("a missing database is refused, never created"),
+            Err(error) => error,
+        };
+
+        let text = error.to_string();
+        assert!(
+            text.contains(&path.display().to_string()),
+            "names the path: {text}"
+        );
+        assert!(
+            matches!(error, StoreError::DatabaseMissing { .. }),
+            "a missing file is missing, not unreachable: {text}"
+        );
+        assert!(!path.exists(), "the refused open must not create the file");
+    }
+
+    #[test]
+    fn open_existing_reports_a_directory_in_the_databases_place_as_missing() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-directory-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+
+        let result = SqliteStore::open_existing(&path);
+
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(
+            matches!(result, Err(StoreError::DatabaseMissing { .. })),
+            "a directory is not a database"
+        );
+    }
+
+    #[test]
+    fn open_existing_opens_a_database_open_created() {
+        let path = std::env::temp_dir().join(format!(
+            "iaam-store-open-existing-existing-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        drop(SqliteStore::open(&path).expect("creating open"));
+
+        SqliteStore::open_existing(&path).expect("existing database opens");
+
+        std::fs::remove_file(&path).expect("cleanup");
     }
 }

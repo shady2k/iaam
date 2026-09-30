@@ -1185,22 +1185,31 @@ pub(crate) mod fake {
         }
     }
 
-    fn broker_egress_directory() -> std::path::PathBuf {
+    /// An invented instance database; the gateway's egress place is derived
+    /// from it, created beside it, and initialized with the fixture tally.
+    fn broker_egress_database() -> std::path::PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
             "iaam-app-tinkoff-test-{}-{sequence}",
             std::process::id()
         ));
-        std::fs::create_dir(&directory).expect("egress directory created");
+        std::fs::create_dir(&directory).expect("instance directory created");
+        let database = directory.join("iaam.sqlite");
+        std::fs::write(&database, "").expect("database file written");
+        // The fixture tally is initialized in the place derived from the
+        // database, and records a boot of its own, so no test starts inside
+        // the conservative empty-pair state.
+        let place = iaam_http::egress_directory_for(&database).expect("place derived");
+        std::fs::create_dir(&place).expect("egress place created");
         std::fs::write(
-            directory.join("outbound-tally"),
+            place.join("outbound-tally"),
             "iaam-outbound-tally-v4\ngeneration\t0\nboot\tfixture-boot\nhigh-water\t0\n",
         )
         .expect("initialized tally created");
-        std::fs::write(directory.join("outbound-tally-generation"), "0\n")
+        std::fs::write(place.join("outbound-tally-generation"), "0\n")
             .expect("initialized generation created");
-        directory
+        database
     }
 
     /// A gateway over a fake T-Invest answering `script`, then `otherwise`.
@@ -1214,8 +1223,8 @@ pub(crate) mod fake {
             wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         });
         let log = Log::default();
-        let directory = broker_egress_directory();
-        let gateway = Gateway::with_parts_in_directory(
+        let database = broker_egress_database();
+        let gateway = Gateway::with_parts_for_database(
             FakeTinvest {
                 script: Mutex::new(script.into()),
                 otherwise,
@@ -1225,7 +1234,7 @@ pub(crate) mod fake {
             Arc::clone(&time) as Arc<dyn Clock>,
             Arc::clone(&time) as Arc<dyn Sleeper>,
             iaam_http::BrokerEgress::On,
-            &directory,
+            &database,
         )
         .expect("the documented table is valid");
         (Arc::new(gateway), log, time)

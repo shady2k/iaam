@@ -122,7 +122,7 @@ use iaam_store::bundle::{Bundle, ImportOutcome, TABLE_DISPOSITIONS, TableDisposi
 
 #[derive(Debug, thiserror::Error)]
 pub enum BundleCliError {
-    #[error("instance has no owner: run `iaam claim --label <label>` first")]
+    #[error("instance has no owner: run `iaam claim` first")]
     Unclaimed,
     #[error(
         "multiple owners recorded in the database: choosing which one a bundle \
@@ -340,6 +340,11 @@ fn disposition_reason(disposition: TableDisposition) -> String {
             "a credential; never copied into a portable file".to_owned()
         }
         TableDisposition::Pending(bead) => format!("not yet carried; tracked as {bead}"),
+        TableDisposition::InstanceLocal => {
+            "this instance's own word about this machine: it stays with the \
+             instance it was made on"
+                .to_owned()
+        }
     }
 }
 

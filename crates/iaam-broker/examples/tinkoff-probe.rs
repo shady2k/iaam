@@ -15,6 +15,8 @@
 
 use std::env;
 use std::fs;
+use std::io;
+use std::path::PathBuf;
 
 use iaam_http::{BrokerEgress, Destination, Gateway, GatewayError, HttpRequest, RequestBody};
 
@@ -23,12 +25,25 @@ use iaam_http::{BrokerEgress, Destination, Gateway, GatewayError, HttpRequest, R
 // complaint about the token rather than a complaint about the route.
 const METHOD: &str = "tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts";
 
+fn required_database() -> Result<PathBuf, io::Error> {
+    env::var_os("IAAM_DATABASE")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::other(
+                "environment variable IAAM_DATABASE is not set; set it to the instance's database, whose beside-directory holds the egress tally",
+            )
+        })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The tally lives beside the instance's database, so the probe anchors on
+    // the same setting as the server it probes.
+    let database = required_database()?;
     // The same process configuration as the server: broker egress is off
-    // unless the operator explicitly names the canonical tally, and this
-    // process must acquire the sandbox endpoint for its lifetime.
-    let gateway = Gateway::production(BrokerEgress::from_env()?)?;
+    // unless the operator explicitly enables it, and this process must
+    // acquire the sandbox endpoint for its lifetime.
+    let gateway = Gateway::production(BrokerEgress::from_env()?, &database)?;
     // GetAccounts only reads, so a second copy of it is harmless.
     let mut request = HttpRequest::post(
         Destination::TinkoffSandbox,

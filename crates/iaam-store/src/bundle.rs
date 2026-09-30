@@ -1240,6 +1240,13 @@ pub enum TableDisposition {
     /// the remaining work stays visible in code rather than only in a
     /// tracker.
     Pending(&'static str),
+    /// State of *this instance on this machine*: its broker-egress switch and
+    /// the first-enabling moment that vouches for the tally beside its
+    /// database. It describes where the instance stands, not what the owner
+    /// holds, so a bundle must not carry it — a restore would turn broker
+    /// requests on in the target instance without the owner having connected
+    /// anything there (iaam-h0b8i.1.2).
+    InstanceLocal,
 }
 
 /// Every table the schema declares, classified by [`TableDisposition`].
@@ -1360,6 +1367,11 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("snapshots", TableDisposition::Derived),
     ("schedule_snapshots", TableDisposition::Derived),
     ("schedule_completeness", TableDisposition::Derived),
+    // The instance's own operational word: its broker-egress switch and the
+    // first-enabling moment that vouches for the tally beside its database.
+    // See `TableDisposition::InstanceLocal` for why it stays behind when a
+    // bundle moves (iaam-h0b8i.1.2).
+    ("broker_egress", TableDisposition::InstanceLocal),
     // --- Credentials: must not travel in a file the owner copies between
     // machines (see the module doc above `Bundle`). ---
     ("api_tokens", TableDisposition::Credential),

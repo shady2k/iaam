@@ -203,7 +203,7 @@ is how you match a term in them to the code.
 | якорь доверия | trust anchor | |
 | узел | endpoint | an external HTTP destination |
 | шлюз | gateway | |
-| учёт исходящих запросов | outbound tally | one per-machine file whose locked records keep broker budgets, host spacing and the UTC daily ceiling shared across processes and restarts |
+| учёт исходящих запросов | outbound tally | one per-instance place beside the instance's database whose locked records keep broker budgets, host spacing and the UTC daily ceiling shared across processes and restarts; two instances with two databases have two tallies |
 | среда | environment | prod or sandbox |
 | перешифровка | re-encryption | |
 | ротация | rotation | |

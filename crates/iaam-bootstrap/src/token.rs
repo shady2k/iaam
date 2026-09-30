@@ -195,9 +195,9 @@ fn render_listing(tokens: &[TokenView]) -> String {
     text
 }
 
-/// The label as the list prints it: control characters escaped, so a label
-/// that arrived over HTTP cannot forge a line here. Everything else is
-/// printed exactly as it is.
+/// The label as the list and every revoke echo print it: control
+/// characters escaped, so a label that arrived over HTTP cannot forge a
+/// line here. Everything else is printed exactly as it is.
 fn shown_label(label: &str) -> String {
     label
         .chars()
@@ -237,7 +237,8 @@ pub(crate) async fn revoke_token(
     if let Some(at) = &token.revoked_at {
         return Err(format!(
             "token \"{}\" ({}) was already revoked at {at}; nothing to revoke",
-            token.label, token.id
+            shown_label(&token.label),
+            token.id
         )
         .into());
     }
@@ -269,7 +270,8 @@ async fn revoke_by_label(
                 .collect();
             if revoked.is_empty() {
                 Err(format!(
-                    "no token named \"{label}\": labels and ids come from `iaam token list`"
+                    "no token named \"{}\": labels and ids come from `iaam token list`",
+                    shown_label(label)
                 )
                 .into())
             } else {
@@ -285,8 +287,9 @@ async fn revoke_by_label(
                     .collect::<Vec<_>>()
                     .join("\n");
                 Err(format!(
-                    "no active token named \"{label}\": every token with this \
-                     label is already revoked:\n{listed}"
+                    "no active token named \"{}\": every token with this \
+                     label is already revoked:\n{listed}",
+                    shown_label(label)
                 )
                 .into())
             }
@@ -298,7 +301,8 @@ async fn revoke_by_label(
                 .collect::<Vec<_>>()
                 .join("\n");
             Err(format!(
-                "label \"{label}\" names {} active tokens; revoke one by its id:\n{listed}",
+                "label \"{}\" names {} active tokens; revoke one by its id:\n{listed}",
+                shown_label(label),
                 active.len()
             )
             .into())
@@ -306,8 +310,9 @@ async fn revoke_by_label(
     }
 }
 
-/// Revokes the token and names what was revoked: the label, the scope and
-/// the id, so the answer stays true when two tokens share a label.
+/// Revokes the token and names what was revoked: the label — escaped, as
+/// everywhere a label is echoed — the scope and the id, so the answer stays
+/// true when two tokens share a label.
 async fn revoke_and_report(
     admin: &dyn TokenAdmin,
     owner: OwnerId,
@@ -316,7 +321,7 @@ async fn revoke_and_report(
     admin.revoke_token(owner, token.id).await?;
     Ok(format!(
         "revoked: {} ({}, id {})",
-        token.label,
+        shown_label(&token.label),
         scope_text(token.scope),
         token.id
     ))
@@ -703,6 +708,37 @@ mod tests {
         assert_eq!(lines.len(), 2, "{listing}");
         assert!(listing.contains("a\\u{1}b"), "{listing}");
         assert!(!listing.contains('\u{1}'), "{listing}");
+    }
+
+    #[tokio::test]
+    async fn revoke_renders_a_stored_control_character_label_harmlessly() {
+        let admin = adapter();
+        claim_owner(&admin, None).await.unwrap();
+        let owner = sole_owner_or_refuse(&admin).await.unwrap();
+        // A label that arrived over HTTP before the refusal existed: the
+        // port takes it, so every echo — the report and the refusal — must
+        // render it as `token list` does.
+        admin
+            .issue_token(owner, "night\u{1}shift".to_owned(), Scope::Agent)
+            .await
+            .unwrap();
+        let tokens = admin.list_tokens(owner).await.unwrap();
+        let id = tokens
+            .iter()
+            .find(|token| token.label == "night\u{1}shift")
+            .unwrap()
+            .id;
+
+        let report = revoke_token(&admin, &id.to_string()).await.unwrap();
+        assert!(report.contains("night\\u{1}shift"), "{report}");
+        assert!(!report.contains('\u{1}'), "{report}");
+
+        // Revoking the revoked token again names it escaped too.
+        let error = revoke_token(&admin, &id.to_string()).await.unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("already revoked"), "{text}");
+        assert!(text.contains("night\\u{1}shift"), "{text}");
+        assert!(!text.contains('\u{1}'), "{text}");
     }
 
     #[tokio::test]

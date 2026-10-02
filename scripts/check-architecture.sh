@@ -252,7 +252,11 @@ done
 # The limit: the list names the clients known when it was written. A client
 # crate missing from it passes this guard and is left to review; nothing in
 # cargo metadata says that a crate speaks HTTP.
-HTTP_CLIENT_CRATES='^(reqwest|hyper|ureq|isahc|surf|curl|attohttpc|awc|minreq|http_req|ehttp)(-.*)?$'
+# Not only HTTP: any crate that opens a connection of its own is the same
+# second surface (the owner, 2026-09-30: only this module goes outside,
+# iaam-t4320) — HTTP/2 and HTTP/3 stacks, gRPC, WebSocket, mail, SSH, DNS
+# resolvers and raw socket wrappers.
+HTTP_CLIENT_CRATES='^(reqwest|hyper|ureq|isahc|surf|curl|attohttpc|awc|minreq|http_req|ehttp|h2|h3|quinn|tonic|grpcio|tungstenite|tokio-tungstenite|async-tungstenite|websocket|lettre|ssh2|russh|thrussh|hickory|trust-dns|socket2)(-.*)?$'
 http_client_deps() {
   jq -r --arg crates "$HTTP_CLIENT_CRATES" '
     .packages[] | select(.name != "iaam-http") | .name as $package
@@ -303,10 +307,11 @@ http_probe_meta='{"packages":[
   {"name":"inherited","dependencies":[{"name":"reqwest","rename":null,"kind":"dev"}]},
   {"name":"other","dependencies":[{"name":"ureq","rename":null,"kind":null},{"name":"hyper-util","rename":null,"kind":"build"}]},
   {"name":"small","dependencies":[{"name":"minreq","rename":null,"kind":null},{"name":"http_req","rename":null,"kind":null},{"name":"ehttp","rename":null,"kind":"dev"}]},
-  {"name":"clean","dependencies":[{"name":"serde","rename":null,"kind":null},{"name":"curlew","rename":null,"kind":null}]}
+  {"name":"net","dependencies":[{"name":"tonic","rename":null,"kind":null},{"name":"tokio-tungstenite","rename":null,"kind":null},{"name":"socket2","rename":null,"kind":"dev"}]},
+  {"name":"clean","dependencies":[{"name":"serde","rename":null,"kind":null},{"name":"curlew","rename":null,"kind":null},{"name":"tokio","rename":null,"kind":null}]}
 ]}'
 http_probe=$(printf '%s' "$http_probe_meta" | http_client_deps | tr '\n' '|')
-expected='plain depends on reqwest (normal)|renamed depends on reqwest renamed wire (normal)|inherited depends on reqwest (dev)|other depends on ureq (normal)|other depends on hyper-util (build)|small depends on minreq (normal)|small depends on http_req (normal)|small depends on ehttp (dev)|'
+expected='plain depends on reqwest (normal)|renamed depends on reqwest renamed wire (normal)|inherited depends on reqwest (dev)|other depends on ureq (normal)|other depends on hyper-util (build)|small depends on minreq (normal)|small depends on http_req (normal)|small depends on ehttp (dev)|net depends on tonic (normal)|net depends on tokio-tungstenite (normal)|net depends on socket2 (dev)|'
 if [ "$http_probe" != "$expected" ]; then
   err "the HTTP-client dependency guard misclassifies its probe: got '$http_probe'"
 fi
@@ -339,7 +344,7 @@ fi
 
 hits=$(meta | http_client_deps)
 if [ -n "$hits" ]; then
-  err "an HTTP client crate outside iaam-http: outgoing HTTP lives only in iaam-http (§3.1)"
+  err "a network client crate outside iaam-http: every outgoing connection lives only in iaam-http (§3.1, iaam-t4320)"
   echo "$hits" >&2
 fi
 hits=$(workspace_http_client_deps Cargo.toml)
@@ -476,6 +481,55 @@ for crate_dir in crates/*/; do
   hits=$(bypass_hits "$crate_dir")
   if [ -n "$hits" ]; then
     err "a request can be sent past the gateway in $crate_dir: outbound HTTP goes through Gateway::send (iaam-http module docs)"
+    echo "$hits" >&2
+  fi
+done
+
+# --- 11c. No connection of its own outside iaam-http ---
+# The owner, 2026-09-30: only this module goes outside (iaam-t4320). The
+# dependency guard above cannot see a socket from the standard library or
+# tokio, which every crate already has, nor a network program spawned as a
+# child process. Production sources outside iaam-http may therefore name no
+# outbound socket type (`TcpStream`, `UdpSocket`, `UnixStream` is local and
+# allowed) and spawn no network tool. `TcpListener` stays: serve binds it to
+# receive, and nothing goes out through it. Tests and examples may open
+# loopback sockets to fake a server; they reach nothing outside.
+socket_hits() {
+  rust_code $(find "$@" -name '*.rs' | sort) \
+    | grep -E ':[0-9]+:.*[^A-Za-z0-9_](TcpStream|UdpSocket)([^A-Za-z0-9_]|$)' \
+    || true
+}
+# Read from the raw source, not rust_code: the program's name is a string.
+spawn_hits() {
+  grep -nE 'Command::new[[:space:]]*\([[:space:]]*"(curl|wget|nc|ncat|netcat|ssh|scp|sftp|telnet|ftp|rsync|socat)"' \
+    $(find "$@" -name '*.rs' | sort) /dev/null || true
+}
+mkdir -p "$probe_dir/net"
+cat > "$probe_dir/net/allowed.rs" <<'PROBE'
+let listener = tokio::net::TcpListener::bind(config.listen).await?;
+// never a TcpStream here
+let message = "TcpStream is refused";
+let child = Command::new("git").arg("status");
+PROBE
+cat > "$probe_dir/net/refused.rs" <<'PROBE'
+use std::net::TcpStream;
+let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+let stream = TcpStream::connect(address)?;
+let child = Command::new("curl").arg(url);
+let other = Command::new( "ssh" ).arg(host);
+PROBE
+net_probe=$( { socket_hits "$probe_dir/net"; spawn_hits "$probe_dir/net"; } | sed 's|^.*/||' | cut -d: -f1,2 | sort -t: -k2n | tr '\n' ' ')
+if [ "$net_probe" != 'refused.rs:1 refused.rs:2 refused.rs:3 refused.rs:4 refused.rs:5 ' ]; then
+  err "the own-connection guard misclassifies its probe: got '$net_probe'"
+fi
+for crate_dir in crates/*/; do
+  case "$crate_dir" in
+    crates/iaam-http/) continue ;;
+  esac
+  [ -d "${crate_dir}src" ] || continue
+  hits=$( { socket_hits "${crate_dir}src"; spawn_hits "$crate_dir"; } )
+  if [ -n "$hits" ]; then
+    err "a connection of its own in $crate_dir: every outgoing connection goes through the gateway in iaam-http (iaam-t4320)"
     echo "$hits" >&2
   fi
 done

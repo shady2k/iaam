@@ -166,6 +166,7 @@ impl SqliteStore {
     /// Settle every open refusal of the channel that a later sync no longer
     /// lists, among those whose interval overlaps `[from, to]`. A row that
     /// this sync refused again stays open, however `row_keys` is ordered.
+    #[allow(clippy::too_many_arguments)] // the filter is one where, spelled out
     pub fn settle_sync_refusals_besides(
         &self,
         owner: OwnerId,

@@ -762,8 +762,10 @@ impl RefusalHeaders {
 
 /// `value` with every occurrence of the presented secret cut out, or
 /// `None` when the header is absent. No secret, or an empty one, leaves
-/// the value as it was.
-fn without_secret(value: Option<&str>, secret: Option<&Secret>) -> Option<String> {
+/// the value as it was. The cache uses the same redaction before it
+/// persists a header, so a source that echoes the token cannot hand it
+/// to a later reader of the cache file either.
+pub(crate) fn without_secret(value: Option<&str>, secret: Option<&Secret>) -> Option<String> {
     let value = value?;
     let Some(secret) = secret.map(Secret::expose) else {
         return Some(value.to_owned());
@@ -774,24 +776,34 @@ fn without_secret(value: Option<&str>, secret: Option<&Secret>) -> Option<String
     Some(value.replace(secret, REDACTED_TEXT))
 }
 
+/// `bytes` with every occurrence of the presented secret cut out, else
+/// the bytes as they were. No secret, or an empty one, leaves the bytes
+/// as they were. The one byte-level redaction of the crate: a refusal
+/// body kept for the source and a response body stored beside the
+/// database both pass through here, so a source that echoes the token
+/// back cannot hand it to a later reader of either.
+pub(crate) fn redacted_bytes(bytes: &[u8], secret: Option<&Secret>) -> Vec<u8> {
+    let secret = secret.map_or(&[][..], |secret| secret.expose().as_bytes());
+    if secret.is_empty() {
+        return bytes.to_vec();
+    }
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some((&first, tail)) = rest.split_first() {
+        if let Some(after) = rest.strip_prefix(secret) {
+            kept.extend_from_slice(REDACTED);
+            rest = after;
+        } else {
+            kept.push(first);
+            rest = tail;
+        }
+    }
+    kept
+}
+
 impl RejectedBody {
     fn without_secret(body: &[u8], secret: Option<&Secret>) -> Self {
-        let secret = secret.map_or(&[][..], |secret| secret.expose().as_bytes());
-        if secret.is_empty() {
-            return Self(body.to_vec());
-        }
-        let mut kept = Vec::with_capacity(body.len());
-        let mut rest = body;
-        while let Some((&first, tail)) = rest.split_first() {
-            if let Some(after) = rest.strip_prefix(secret) {
-                kept.extend_from_slice(REDACTED);
-                rest = after;
-            } else {
-                kept.push(first);
-                rest = tail;
-            }
-        }
-        Self(kept)
+        Self(redacted_bytes(body, secret))
     }
 
     #[must_use]
@@ -1562,23 +1574,29 @@ impl<T: Transport + 'static> Gateway<T> {
         // lookup comes after every check of the request itself, so a call
         // refused here is refused exactly as before the cache existed.
         let cache_key = self.cache.as_ref().and_then(|_cache| CacheKey::of(request));
-        if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
-            if let Some(stored) = cache.lookup(key) {
-                tracing::info!(
-                    destination = ?destination,
-                    method,
-                    url = %request.url(),
-                    attempt = 0,
-                    status = stored.status,
-                    elapsed_ms = millis(self.clock.now() - started),
-                    request_id = without_secret(
-                        stored.request_id.as_deref(),
-                        request.bearer(),
-                    )
+        // The stored answer under `key`, logged like an answered call, or
+        // `None` when the store holds none. Used twice: once before the
+        // lane is taken, and again once the lane is held, so a caller
+        // queued behind the very send that stored the answer serves it
+        // instead of spending its allowance and sending the same read.
+        let answer_from_cache = |cache: &ResponseCache, key: &CacheKey| -> Option<HttpResponse> {
+            let stored = cache.lookup(key)?;
+            tracing::info!(
+                destination = ?destination,
+                method,
+                url = %request.url(),
+                attempt = 0,
+                status = stored.status,
+                elapsed_ms = millis(self.clock.now() - started),
+                request_id = without_secret(stored.request_id.as_deref(), request.bearer())
                     .as_deref()
                     .unwrap_or("-"),
-                    "outbound call answered from cache"
-                );
+                "outbound call answered from cache"
+            );
+            Some(stored)
+        };
+        if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+            if let Some(stored) = answer_from_cache(cache, key) {
                 return Ok(stored);
             }
         }
@@ -1806,6 +1824,17 @@ impl<T: Transport + 'static> Gateway<T> {
                         .is_none()
                     {
                         return Err(cut(attempts, status, wait));
+                    }
+                }
+                // A caller that was queued behind the very send that stored
+                // its answer re-reads the store now that it holds the lane,
+                // before any allowance is spent or anything is sent: two
+                // concurrent identical reads must not both reach the wire
+                // within the hour. A caller that waited and then reacquired
+                // the lane reaches this same point again and re-reads too.
+                if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+                    if let Some(stored) = answer_from_cache(cache, key) {
+                        return Ok(stored);
                     }
                 }
                 if broker {
@@ -2137,13 +2166,31 @@ impl<T: Transport + 'static> Gateway<T> {
                     return Err(cut(attempts, status, retry_after));
                 };
                 let (outcome, body, answered) = match answer {
-                    Ok(response) => {
+                    Ok(mut response) => {
                         if (200..300).contains(&response.status) {
+                            // The moment this answer was observed: a live
+                            // send carries the stamp its transport gave it,
+                            // and a transport that does not stamp is dated
+                            // by the gateway's wall clock — the same clock
+                            // the store stamps entries with, so a caller can
+                            // date a live answer and a served one on one
+                            // scale.
+                            response
+                                .observed_at
+                                .get_or_insert_with(|| self.clock.now_unix());
                             // The answer is kept under the request's key, so
                             // the same read inside the hour is answered
                             // from the store instead of being sent again.
+                            // The presented credential and the cache
+                            // identity are cut out before anything is
+                            // persisted, so a cache file never holds one.
                             if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
-                                cache.store(key, &response);
+                                cache.store(
+                                    key,
+                                    &response,
+                                    request.bearer(),
+                                    request.cache_identity(),
+                                );
                             }
                             if lane.record_success() {
                                 tracing::info!(
@@ -3530,7 +3577,12 @@ mod tests {
             .await
             .expect("2xx is a success");
 
-        assert_eq!(response, answer);
+        // Everything the transport gave is returned as it came, with the
+        // one addition: the moment a caller dates the answer by.
+        let mut expected = answer;
+        expected.observed_at = response.observed_at;
+        assert_eq!(response, expected);
+        assert!(response.observed_at.is_some(), "a live answer is dated");
         assert_eq!(gateway.transport.sent_count(), 1);
     }
 
@@ -5320,7 +5372,23 @@ mod tests {
             1,
             "the second read was answered from the cache"
         );
-        assert_eq!(second, first, "the cached answer is the answer given");
+        assert_eq!(
+            second.status, first.status,
+            "the cached answer is the answer given"
+        );
+        assert_eq!(
+            second.body, first.body,
+            "the cached answer is the answer given"
+        );
+        // Both answers carry a moment, and the served one keeps the moment
+        // it was first fetched — between the first answer's and the serve's.
+        let observed = first.observed_at.expect("a live answer is dated");
+        let kept = second.observed_at.expect("a served answer keeps its date");
+        assert!(kept >= observed, "the kept moment is not before the fetch");
+        assert!(
+            kept <= time.now_unix(),
+            "the kept moment is the fetch's, not the serve's"
+        );
 
         time.advance(crate::cache::CACHE_TTL + Duration::from_secs(1));
         gateway
@@ -5433,6 +5501,91 @@ mod tests {
 
         assert_eq!(first.body, second.body);
         assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_concurrent_identical_reads_reach_the_wire_once() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(answered(200, b"<history/>")));
+        let gateway = broker_gateway_with_cache(&time, transport, "concurrent");
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts/ACC123")
+            .with_bare_token("test-bearer");
+        // One shared allowance of one: whatever the second caller does, it
+        // must be served from the store, not from a second send.
+        let allowance = RequestAllowance::new(1);
+        let first_call = request.clone().with_request_allowance(allowance.clone());
+        let second_call = request.with_request_allowance(allowance.clone());
+
+        let (first, second) = tokio::join!(
+            gateway.send(&first_call, None),
+            gateway.send(&second_call, None),
+        );
+
+        let first = first.expect("the first read was sent");
+        let second = second.expect("the second read was answered");
+        assert_eq!(
+            gateway.transport.sent_count(),
+            1,
+            "two concurrent identical reads both reached the wire"
+        );
+        assert_eq!(
+            first.body, b"<history/>",
+            "the wire answered the first call"
+        );
+        assert_eq!(
+            second.body, first.body,
+            "both callers received the same answer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_destination_echoing_the_token_is_not_stored_in_the_cache() {
+        let time = FakeTime::new();
+        let token = "test-bearer-token-Q1w2e3r4";
+        let identity = "test-cache-identity-Z9y8x7w6";
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json")
+            .with_bearer(token)
+            .with_cache_identity(identity);
+        let transport = Scripted::answering(&time, 200).then(Ok(HttpResponse {
+            status: 200,
+            body: format!(r#"{{ "history": ["{token}"] }}"#).into_bytes(),
+            request_id: Some(token.to_owned()),
+            ..Default::default()
+        }));
+        let (_directory, database) = instance_database("cache-echo");
+        let gateway = Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid");
+
+        gateway
+            .send(&request, None)
+            .await
+            .expect("the read was sent and answer stored");
+
+        let place = crate::cache::cache_directory_for(&database).expect("the cache place");
+        let mut files = 0;
+        for entry in std::fs::read_dir(&place).expect("cache read").flatten() {
+            files += 1;
+            let bytes = std::fs::read(entry.path()).expect("entry read");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains(token),
+                "the echoed token leaked into {:?}",
+                entry.path()
+            );
+            assert!(
+                !text.contains(identity),
+                "the cache identity leaked into {:?}",
+                entry.path()
+            );
+        }
+        assert!(files > 0, "the cache stored something to inspect");
     }
 
     #[tokio::test(start_paused = true)]

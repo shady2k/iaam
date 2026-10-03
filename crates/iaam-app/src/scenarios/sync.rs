@@ -4,6 +4,7 @@
 //! assertions, while reconciliation remains a pure `iaam-core` function.
 
 use crate::AppServices;
+use crate::actions::row_name_text;
 use crate::error::AppError;
 use crate::ports::{BrokerChannel, BrokerRequestContext, PortfolioAsOf, Principal, Recorded};
 use crate::scenarios::coverage_gap;
@@ -17,7 +18,7 @@ use iaam_core::reconciliation::{Dimension, claim::ControlClaim, evidence::Source
 use iaam_http::{HttpRequest, RequestAllowance};
 use iaam_ingest::dedup::{self, DedupDecision, DocumentContext, KnownRecord};
 use iaam_ingest::operation::NormalizationContext;
-use iaam_ingest::{Verdict, normalize};
+use iaam_ingest::{Rejection, Verdict, normalize};
 use iaam_market::cbr::key_rate::key_rate_request;
 use iaam_market::cbr::{daily_request, dynamic_request};
 use iaam_market::moex::{HistoryQuery, history_request};
@@ -28,12 +29,14 @@ use iaam_store::documents::BrokerCode;
 use iaam_store::market::{
     AccruedInterestRow, Coverage, FxRow, KeyRateRow, MarketStore, PriceRow, RunOutcome, SeriesKey,
 };
+use iaam_store::sync_refusals::SyncRefusalRecord;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use time::Date;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 /// Why no control assertion was recorded, when none was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,23 +278,42 @@ pub async fn sync_broker(
     // portfolio row the channel reported but nothing here could turn into a
     // claim is refused the same way — an operation and a position are set
     // aside alike (iaam-vg8te.1.2).
-    let mut refusals: Vec<RefusedRow> = parsed
-        .quarantined
-        .iter()
-        .chain(
-            snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.refused.as_slice())
-                .unwrap_or_default(),
-        )
-        .map(|row| RefusedRow {
-            key: SourceRowKey {
-                source: channel.source,
-                row: fingerprint_of(&row.raw),
-            },
-            dimensions: row.dimensions.clone(),
-        })
-        .collect();
+    // The same set-aside rows are built twice on purpose: the gap event keeps
+    // what the attempt was — keys and dimensions, nothing more — while the
+    // refusal records keep what the owner can act on — each row with its
+    // reason and original payload (iaam-vg8te.1.2). The record is written to
+    // the store only once every append has succeeded; see
+    // [`keep_refusal_questions`].
+    let mut refusals: Vec<RefusedRow> = Vec::new();
+    let mut refusal_records: Vec<SyncRefusalRecord> = Vec::new();
+    let quarantined = parsed.quarantined.iter().chain(
+        snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.refused.as_slice())
+            .unwrap_or_default(),
+    );
+    for row in quarantined {
+        let key = SourceRowKey {
+            source: channel.source,
+            row: fingerprint_of(&row.raw),
+        };
+        let dimensions = row.dimensions.clone();
+        refusals.push(RefusedRow {
+            key: key.clone(),
+            dimensions: dimensions.clone(),
+        });
+        refusal_records.push(refusal_record(
+            principal.owner,
+            account,
+            &channel,
+            from,
+            to,
+            &key,
+            &dimensions,
+            row.reason.clone(),
+            serde_json::to_string(&row.raw).unwrap_or_else(|_| row.raw.to_string()),
+        ));
+    }
 
     for operation in parsed.accepted {
         let context = DocumentContext {
@@ -317,7 +339,20 @@ pub async fn sync_broker(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
-                refusals.push(refused_row(&operation, channel.source));
+                let row = refused_row(&operation, channel.source);
+                refusals.push(row.clone());
+                refusal_records.push(refusal_record(
+                    principal.owner,
+                    account,
+                    &channel,
+                    from,
+                    to,
+                    &row.key,
+                    &row.dimensions,
+                    rejection_sentence(&rejection),
+                    serde_json::to_string(&operation)
+                        .unwrap_or_else(|_| format!("{:?}", operation.dates)),
+                ));
                 recorded.push(Verdict::Rejected { rejection });
                 continue;
             }
@@ -328,7 +363,20 @@ pub async fn sync_broker(
             .with_declared_by(PrincipalId(principal.token_id));
         if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
         {
-            refusals.push(refused_row(&operation, channel.source));
+            let row = refused_row(&operation, channel.source);
+            refusals.push(row.clone());
+            refusal_records.push(refusal_record(
+                principal.owner,
+                account,
+                &channel,
+                from,
+                to,
+                &row.key,
+                &row.dimensions,
+                rejection_sentence(&rejection),
+                serde_json::to_string(&operation)
+                    .unwrap_or_else(|_| format!("{:?}", operation.dates)),
+            ));
             recorded.push(Verdict::Rejected { rejection });
             continue;
         }
@@ -423,6 +471,20 @@ pub async fn sync_broker(
     // why no portfolio was fetched for it; refusals only add the coverage gap
     // above and do not suppress the portfolio answer.
     let Some(snapshot) = snapshot else {
+        // The refusals were discovered above; the appends they accompany
+        // succeeded, so the questions they raise stand. The portfolio was
+        // not asked for (an out-of-interval trade withholds it), so snapshot
+        // refusals cannot exist here by construction.
+        keep_refusal_questions(
+            services,
+            principal.owner,
+            account,
+            &channel,
+            from,
+            to,
+            &refusal_records,
+        )
+        .await?;
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -442,6 +504,19 @@ pub async fn sync_broker(
         }
     };
     if assertions_withheld.is_some() {
+        // As above: the operations and the gap were written, so the refused
+        // rows are questions the owner can act on; only the assertions were
+        // withheld. A sync that ended in an error would never reach here.
+        keep_refusal_questions(
+            services,
+            principal.owner,
+            account,
+            &channel,
+            from,
+            to,
+            &refusal_records,
+        )
+        .await?;
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -494,6 +569,19 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
+    // Every append this sync made has succeeded by here; the refused rows are
+    // now questions the owner can act on, and the rows this sync took no
+    // longer refuse the record they stood under.
+    keep_refusal_questions(
+        services,
+        principal.owner,
+        account,
+        &channel,
+        from,
+        to,
+        &refusal_records,
+    )
+    .await?;
     let set_aside = set_aside(&recorded);
     Ok(SyncOutcome {
         recorded,
@@ -596,6 +684,82 @@ fn refused_row(
         key: SourceRowKey { source, row },
         dimensions: coverage_gap::operation_dimensions(&operation.kind),
     }
+}
+
+/// The human sentence a rejection reads as, naming what is missing.
+fn rejection_sentence(rejection: &Rejection) -> String {
+    format!(
+        "{}: expected {}, received {}",
+        rejection.field, rejection.expected, rejection.actual
+    )
+}
+
+/// One refused row as the owner's question: the row's key, the interval the
+/// sync covered, the dimensions it withheld, the reason and the original
+/// payload. Everything the coverage-gap event deliberately does not carry
+/// (iaam-vg8te.1.2): the event keeps the attempt statement, this record keeps
+/// what the owner can act on.
+#[allow(clippy::too_many_arguments)]
+fn refusal_record(
+    owner: OwnerId,
+    account: AccountId,
+    channel: &SourceChannel,
+    from: Date,
+    to: Date,
+    key: &SourceRowKey,
+    dimensions: &BTreeSet<Dimension>,
+    reason: String,
+    payload: String,
+) -> SyncRefusalRecord {
+    SyncRefusalRecord {
+        id: Uuid::new_v4(),
+        owner,
+        account,
+        source: channel.source.inner().to_string(),
+        row_key: row_name_text(&key.row),
+        // ISO dates, inclusive ends: the same interval the gap event names,
+        // so the report's read (same source, overlapping interval) finds it.
+        range_from: from.to_string(),
+        range_to: to.to_string(),
+        dimensions: dimensions
+            .iter()
+            .map(|dimension| dimension.code())
+            .collect::<Vec<_>>()
+            .join("|"),
+        reason,
+        payload,
+        settled: false,
+    }
+}
+
+/// Answer the owner's questions this sync left standing: upsert every row it
+/// refused, and settle the rows it no longer refuses among those whose
+/// interval overlaps the sync's own. Only ever called once every append this
+/// sync made has succeeded — a sync that ends in an error records nothing, so
+/// a failed attempt cannot mint a question its failure should not
+/// (iaam-vg8te.1.2).
+#[allow(clippy::too_many_arguments)]
+async fn keep_refusal_questions(
+    services: &AppServices,
+    owner: OwnerId,
+    account: AccountId,
+    channel: &SourceChannel,
+    from: Date,
+    to: Date,
+    records: &[SyncRefusalRecord],
+) -> Result<(), AppError> {
+    let source = channel.source.inner().to_string();
+    for record in records {
+        services.store.upsert_sync_refusal(record.clone()).await?;
+    }
+    let row_keys: Vec<String> = records
+        .iter()
+        .map(|record| record.row_key.clone())
+        .collect();
+    services
+        .store
+        .settle_sync_refusals_besides(owner, account, &source, from, to, &row_keys)
+        .await
 }
 
 /// This channel's refusals, as the gap that says so.

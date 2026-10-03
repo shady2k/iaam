@@ -4,7 +4,7 @@ use crate::error::AppError;
 use crate::ports::{
     AccountActivityView, AccountScopeExclusionView, AccountTransferStatementView, AccountView,
     ClassificationRuleStore, ContourView, ControlAssertionView, ImportQuestionView,
-    ImportSessionState, ImportSessionSummaryView, Scope, Store, required_scope,
+    ImportSessionState, ImportSessionSummaryView, Scope, Store, SyncRefusalRecord, required_scope,
 };
 use crate::scenarios::classification::{matcher_request_json, outcome_json, rule_from_view};
 use crate::scenarios::import_session::{
@@ -2716,7 +2716,7 @@ pub fn ledger_diagnostics(
     ledger: &ReconciliationLedger,
     accounts: &[AccountView],
 ) -> Result<Vec<Action>, AppError> {
-    diagnostics(ledger, &AccountNames::new(accounts), None)
+    diagnostics(ledger, &AccountNames::new(accounts), None, &[])
 }
 
 /// The same facts, restricted to one account and the periods meeting one range.
@@ -2733,12 +2733,13 @@ pub fn ledger_diagnostics_for(
     ledger: &ReconciliationLedger,
     account: &AccountView,
     period: AssertionPeriod,
+    refusals: &[SyncRefusalRecord],
 ) -> Vec<Action> {
     // Infallible where the unscoped sibling is not: every item this call can
     // emit is about the one account the caller named and already holds, so the
     // name is in hand rather than looked up.
     let names = AccountNames::new(std::slice::from_ref(account));
-    diagnostics(ledger, &names, Some((account.id, period)))
+    diagnostics(ledger, &names, Some((account.id, period)), refusals)
         .expect("a scoped diagnostic names only the account it was scoped to")
 }
 
@@ -2757,6 +2758,7 @@ fn diagnostics(
     ledger: &ReconciliationLedger,
     names: &AccountNames<'_>,
     scope: Option<(AccountId, AssertionPeriod)>,
+    refusals: &[SyncRefusalRecord],
 ) -> Result<Vec<Action>, AppError> {
     let mut actions = Vec::new();
     for gap in ledger
@@ -2779,7 +2781,25 @@ fn diagnostics(
                     }
                 },
             );
-        actions.push(coverage_gap_action(names.get(gap.account)?, gap, category));
+        // This gap's channel's own refused rows, among the open records the
+        // caller loaded for the requested range: a record whose interval does
+        // not meet the gap's is a different attempt's question and must not
+        // answer under this gap. ISO dates compare correctly as strings.
+        let source = gap.source.inner().to_string();
+        let records = refusals
+            .iter()
+            .filter(|record| {
+                record.source == source
+                    && record.range_from <= gap.period.to.to_string()
+                    && record.range_to >= gap.period.from.to_string()
+            })
+            .collect::<Vec<_>>();
+        actions.push(coverage_gap_action(
+            names.get(gap.account)?,
+            gap,
+            category,
+            &records,
+        ));
     }
     for status in ledger
         .statuses()
@@ -2828,7 +2848,19 @@ fn diagnostics(
 /// where it is — `EventKind::ImportCoverageGap` is a statement about one attempt
 /// — and the `category` computed by the caller drops it to `Informational` once
 /// the period reaches independent confirmation in the gap's own dimensions.
-fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCategory) -> Action {
+///
+/// `records` are the open refusals the caller loaded for this gap's own
+/// channel and interval: each row the owner can act on, with its reason and
+/// its original payload, rendered into the reason because the item has no
+/// data fields of its own (iaam-vg8te.1.2). When no record survives — a
+/// legacy gap, or a settled question — the prose says so rather than
+/// pretending the rows were never refused.
+fn coverage_gap_action(
+    account: &AccountView,
+    gap: &Taint,
+    category: ActionCategory,
+    records: &[&SyncRefusalRecord],
+) -> Action {
     let rows = if gap.rows.is_empty() {
         "the legacy record cannot name the refused rows".to_owned()
     } else {
@@ -2839,6 +2871,23 @@ fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCateg
             .collect::<Vec<_>>()
             .join(", ");
         format!("refused rows: {names}")
+    };
+    let refused_detail = if records.is_empty() {
+        "The reasons of these rows were not retained with the attempt; re-import the interval \
+         through a channel that reads these rows to record them."
+            .to_owned()
+    } else {
+        let questions = records
+            .iter()
+            .map(|record| {
+                format!(
+                    "refused row {}: {}; the row: {}",
+                    record.row_key, record.reason, record.payload
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("Each refused row follows, with the reason and the row as it arrived: {questions}.")
     };
     blocked_action(
         format!(
@@ -2854,11 +2903,10 @@ fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCateg
         Some(ActionSubject::Account(AccountSubject::of(account))),
         format!(
             "Account {} ({}) has a coverage gap from {} through {} in dimensions {}; {} ({} rows \
-             refused). No operation in this API records a refused row, and the obvious route is \
-             not one: retracting the import withdraws the rows that did arrive and this record \
-             of the refusal with them. Import the interval again through a channel that reads \
-             these rows; this record stays, because it is a statement about one attempt and not \
-             about the interval.",
+             refused). {} The obvious route is not the repair: retracting the import withdraws \
+             the rows that did arrive and this record of the refusal with them. Import the \
+             interval again through a channel that reads these rows; this record stays, because \
+             it is a statement about one attempt and not about the interval.",
             gap.account.inner(),
             account.title,
             gap.period.from,
@@ -2869,7 +2917,8 @@ fn coverage_gap_action(account: &AccountView, gap: &Taint, category: ActionCateg
                 .collect::<Vec<_>>()
                 .join(", "),
             rows,
-            gap.refused
+            gap.refused,
+            refused_detail
         ),
     )
 }
@@ -3392,7 +3441,7 @@ fn claim_value_text(value: ClaimValue) -> String {
     }
 }
 
-fn row_name_text(name: &RowName) -> String {
+pub(crate) fn row_name_text(name: &RowName) -> String {
     match name {
         RowName::Given(name) => format!("given:{name}"),
         RowName::Fingerprint(name) => format!("fingerprint:{name}"),
@@ -10172,6 +10221,58 @@ mod tests {
         assert!(
             action.reason().contains("retracting the import"),
             "{}",
+            action.reason()
+        );
+    }
+
+    /// A refused row reaches the owner through the coverage-gap diagnostic
+    /// with its reason and its original payload beside its key: the question
+    /// the gap event's keys-only rows cannot carry, and the payload travels
+    /// in the sentence because this item has no data fields of its own
+    /// (iaam-vg8te.1.2).
+    #[test]
+    fn a_coverage_gap_diagnostic_names_the_refused_row_with_reason_and_payload() {
+        let account = AccountId::new_random();
+        let ledger = ReconciliationLedger::build(&[cash_gap_event(
+            account,
+            1,
+            vec![refused_row(SourceId::new_random(), "row-17")],
+        )])
+        .expect("gap ledger");
+        // The diagnostic matches a refusal to the gap by the channel the gap
+        // itself speaks for (its provenance source), the way a real sync's
+        // event and its store record share one source.
+        let source = ledger
+            .gaps()
+            .first()
+            .expect("one gap")
+            .source
+            .inner()
+            .to_string();
+        let record = SyncRefusalRecord {
+            id: uuid::Uuid::new_v4(),
+            owner: OwnerId::new_random(),
+            account,
+            source,
+            row_key: "given:row-17".to_owned(),
+            range_from: "2026-08-01".to_owned(),
+            range_to: "2026-08-31".to_owned(),
+            dimensions: "cash".to_owned(),
+            reason: "symbol UNKNOWN@MISX is not resolved to an instrument".to_owned(),
+            payload: r#"{"symbol":"UNKNOWN@MISX"}"#.to_owned(),
+            settled: false,
+        };
+        let action = ledger_diagnostics_for(&ledger, &with_id(account), august(), &[record])
+            .into_iter()
+            .find(|action| action.kind() == ActionKind::CoverageGapUnrepaired)
+            .expect("coverage gap diagnostic");
+
+        assert!(
+            action.reason().contains(
+                "refused row given:row-17: symbol UNKNOWN@MISX is not resolved to an \
+                 instrument; the row: {\"symbol\":\"UNKNOWN@MISX\"}"
+            ),
+            "the owner must read both the reason and the payload: {}",
             action.reason()
         );
     }

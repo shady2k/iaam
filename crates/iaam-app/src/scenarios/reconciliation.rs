@@ -15,10 +15,12 @@ use iaam_core::reconciliation::{ReconciliationLedger, ReconciliationStatus};
 use iaam_ingest::dedup::IdentityScope;
 use time::Date;
 
+use std::collections::BTreeSet;
+
 use crate::AppServices;
 use crate::actions::{Action, ledger_diagnostics_for};
 use crate::error::AppError;
-use crate::ports::{Principal, Recorded};
+use crate::ports::{Principal, Recorded, SyncRefusalRecord};
 
 /// Balance stated by the owner. Its composition is deliberately limited by §10.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,9 +83,33 @@ pub async fn report(
             what: "account",
             id: account.inner().to_string(),
         })?;
+    // The open refusals the account's own syncs left for this range, loaded
+    // per gap source: the coverage-gap event carries only keys and dimensions,
+    // so this read is what lets the diagnostics hand the owner each refused
+    // row with its reason and original payload (iaam-vg8te.1.2). Each
+    // diagnostic then keeps only the records of the gap's own channel and
+    // interval, so one report asking about several gaps cannot attach one
+    // attempt's question to another's.
+    let sources: BTreeSet<String> = ledger
+        .gaps()
+        .iter()
+        .filter(|gap| {
+            gap.account == account && gap.period.from <= period.to && period.from <= gap.period.to
+        })
+        .map(|gap| gap.source.inner().to_string())
+        .collect();
+    let mut refusals: Vec<SyncRefusalRecord> = Vec::new();
+    for source in sources {
+        refusals.extend(
+            services
+                .store
+                .list_open_sync_refusals(principal.owner, account, &source, from, to)
+                .await?,
+        );
+    }
     Ok(ReconciliationReport {
         statuses: statuses_for_account(&ledger, account, period),
-        actions: ledger_diagnostics_for(&ledger, named, period),
+        actions: ledger_diagnostics_for(&ledger, named, period, &refusals),
         gaps: ledger
             .gaps()
             .iter()

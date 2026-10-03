@@ -23,6 +23,7 @@ pub mod schedule;
 pub mod schema;
 pub mod snapshots;
 pub mod source_profiles;
+pub mod sync_refusals;
 pub mod tokens;
 
 use std::path::Path;

@@ -162,6 +162,11 @@ pub struct HttpRequest {
     reset_header: Option<&'static str>,
     idempotent: bool,
     allowance: Option<RequestAllowance>,
+    /// The stable access identity an authorized read is keyed on in the
+    /// response cache, when the caller binds one: the long-lived secret,
+    /// not the rotating session token. Never sent on the wire; only its
+    /// digest may enter a cache key.
+    cache_identity: Option<Secret>,
 }
 
 impl HttpRequest {
@@ -235,6 +240,7 @@ impl HttpRequest {
             soap_action: None,
             reset_header: None,
             allowance: None,
+            cache_identity: None,
             // A GET reads; any other method may act, and acting twice is
             // not undone by a later success.
             idempotent: matches!(method, HttpMethod::Get),
@@ -260,6 +266,19 @@ impl HttpRequest {
     pub fn with_bare_token(mut self, token: &str) -> Self {
         self.bearer = Some(Secret::new(token));
         self.auth_scheme = AuthScheme::Bare;
+        self
+    }
+
+    /// Bind the stable access identity the response cache keys this read
+    /// on. The identity is the caller-bound long-lived secret — the access
+    /// that owns the answer — not the rotating session token a read is
+    /// presented with: a renewed token must not re-send a read the cache
+    /// already holds for the same access. The identity never leaves the
+    /// request description; the cache digests it, and no cache file holds
+    /// it.
+    #[must_use]
+    pub fn with_cache_identity(mut self, identity: &str) -> Self {
+        self.cache_identity = Some(Secret::new(identity));
         self
     }
 
@@ -340,6 +359,13 @@ impl HttpRequest {
             AuthScheme::Bearer => Secret::new(&format!("Bearer {}", token.expose())),
             AuthScheme::Bare => Secret::new(token.expose()),
         })
+    }
+
+    /// The stable access identity bound to this request, or `None` when
+    /// the caller bound none and the presented credential keys the cache.
+    #[must_use]
+    pub fn cache_identity(&self) -> Option<&Secret> {
+        self.cache_identity.as_ref()
     }
 
     #[must_use]

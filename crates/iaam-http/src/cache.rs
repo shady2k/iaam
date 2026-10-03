@@ -21,10 +21,12 @@
 //! the send for [`CACHE_TTL`], one hour.
 //!
 //! **The key.** The SHA-256 of the destination, the method, the wire URL
-//! (path and full query), the request body and a SHA-256 fingerprint of the
-//! presented credential. One access's answer never serves another, and no
-//! file of the cache ever holds a credential: the fingerprint is a digest,
-//! and the key is a digest of everything, the fingerprint included.
+//! (path and full query), the request body and a SHA-256 fingerprint of
+//! the caller-bound stable access identity where one is set (Finam binds
+//! its long-lived broker secret to every authorized read), otherwise of
+//! the presented credential. One access's answer never serves another, and
+//! no file of the cache ever holds a credential: the fingerprint is a
+//! digest, and the key is a digest of everything, the fingerprint included.
 //!
 //! **The place and the bounds.** The cache is the directory
 //! `<database>.cache` beside the instance's database — the same
@@ -199,12 +201,19 @@ fn key_digest(request: &HttpRequest) -> [u8; 32] {
         }
         None => field(&mut material, b"-"),
     }
-    match request.authorization() {
-        // The credential itself never enters the key: its SHA-256
-        // fingerprint does, so one access's answer never serves another
-        // and no file of the cache ever holds a credential.
-        Some(credential) => {
-            let fingerprint = Sha256::digest(credential.expose().as_bytes());
+    // The identity the key names: the caller-bound stable access identity
+    // where the caller bound one (Finam binds its long-lived broker secret
+    // to every authorized read), else the presented credential — so a
+    // renewed session token does not re-send a read the same access
+    // already has cached. The identity or credential itself never enters
+    // the key: its SHA-256 fingerprint does, so one access's answer never
+    // serves another and no file of the cache ever holds a credential.
+    // The presented credential is materialized once, so its borrow lives
+    // through the match below.
+    let credential = request.authorization();
+    match request.cache_identity().or(credential.as_ref()) {
+        Some(identity) => {
+            let fingerprint = Sha256::digest(identity.expose().as_bytes());
             field(&mut material, &fingerprint);
         }
         None => field(&mut material, b"-"),
@@ -771,6 +780,43 @@ mod tests {
             with_body("{}"),
             with_body(r#"{"status":1}"#),
             "the body is in the key"
+        );
+    }
+
+    #[test]
+    fn the_key_prefers_the_bound_cache_identity_over_the_presented_credential() {
+        let key = |request: &HttpRequest| CacheKey::of(request).expect("a read has a key");
+        // Two reads with different presented tokens but the same stable
+        // access identity share one key: a renewed session token must not
+        // re-send a read the same access already has cached within the hour.
+        assert_eq!(
+            key(
+                &finam_read("session-token-one")
+                    .with_cache_identity("long-lived-access-secret")
+            ),
+            key(
+                &finam_read("session-token-two")
+                    .with_cache_identity("long-lived-access-secret")
+            ),
+            "the rotating token does not enter the key when the identity is set"
+        );
+        // A different access identity is a different access.
+        assert_ne!(
+            key(
+                &finam_read("session-token-one")
+                    .with_cache_identity("access-one")
+            ),
+            key(
+                &finam_read("session-token-one")
+                    .with_cache_identity("access-two")
+            ),
+            "one access's answer never serves another"
+        );
+        // Without an identity the key falls back to the presented credential.
+        assert_ne!(
+            key(&finam_read("test-token-one")),
+            key(&finam_read("test-token-two")),
+            "the presented credential still keys the cache when no identity is bound"
         );
     }
 

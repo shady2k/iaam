@@ -106,7 +106,9 @@ struct Session {
 /// the budget, the retries and the breaker; this client only describes the
 /// request and classifies what comes back. The owner's secret travels once,
 /// in the body of the exchange for a session token; every other call carries
-/// that token, and never the secret.
+/// that token, and never the secret on the wire — though each read also
+/// binds the secret as the access identity its response-cache key is made
+/// from, which the gateway digests and never sends.
 pub struct FinamClient {
     token: BrokerToken,
     gateway: Arc<dyn Outbound>,
@@ -366,17 +368,22 @@ impl FinamClient {
         .map(|(body, _)| body)
     }
 
-    /// Send an authorized call: the session token is the bearer. A 401 to
-    /// that token is answered with one shared renewal and one retry; the
-    /// second 401 is a refusal. Returns the body and the token that
-    /// finally carried it.
+    /// Send an authorized call: the session token is the bearer. The
+    /// request also binds the owner's stable access identity — the
+    /// long-lived broker secret — so the response cache keys the read on
+    /// the access, not on the rotating session token: a renewed token
+    /// does not re-send a read the same access already has cached. A 401
+    /// to the session token is answered with one shared renewal and one
+    /// retry; the second 401 is a refusal. Returns the body and the token
+    /// that finally carried it.
     async fn authorized(
         &self,
         allowance: &RequestAllowance,
         build: impl Fn(&str) -> HttpRequest,
     ) -> Result<(String, Secret), FinamError> {
         let session = self.session(allowance).await?;
-        let step = match self.raw(&build(session.token.expose())).await {
+        let request = build(session.token.expose()).with_cache_identity(self.token.expose());
+        let step = match self.raw(&request).await {
             Ok(body) => return Ok((body, session.token.clone())),
             Err(step) => step,
         };
@@ -384,7 +391,8 @@ impl FinamClient {
             return Err(step.into_error(self.token.expose(), Some(session.token.expose())));
         }
         let fresh = self.renewed(&session, allowance).await?;
-        match self.raw(&build(fresh.token.expose())).await {
+        let request = build(fresh.token.expose()).with_cache_identity(self.token.expose());
+        match self.raw(&request).await {
             Ok(body) => Ok((body, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
         }
@@ -1106,6 +1114,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_authorized_read_carries_the_access_identity_of_the_secret() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, "{}")
+                .then(200, r#"{"transactions":[]}"#),
+        );
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+        client
+            .get_asset("SBER@MISX", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("asset");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 3);
+        // The exchange is the one call that carries the secret itself and
+        // is never cached; it binds no cache identity.
+        assert_eq!(
+            received[0].cache_identity().map(|identity| identity.expose()),
+            None
+        );
+        for request in received.iter().skip(1) {
+            assert_eq!(
+                request.cache_identity().map(|identity| identity.expose()),
+                Some(SECRET),
+                "{} binds the broker secret as its cache identity",
+                request.url()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unsafe_symbols_are_refused_before_the_session_or_asset_request() {
         for symbol in ["", ".", "..", "/", "\\", "%40", "?", "#", "SBER\nMISX"] {
             let endpoint = Arc::new(Scripted::answering(200));
@@ -1426,6 +1471,17 @@ mod tests {
             received[3].bearer().map(|token| token.expose()),
             Some(JWT_TWO)
         );
+        // The retried read keeps the access identity of the first: the
+        // response cache key follows the stable secret, and the answer
+        // survives the renewal.
+        for data in [&received[1], &received[3]] {
+            assert_eq!(
+                data.cache_identity().map(|identity| identity.expose()),
+                Some(SECRET),
+                "{} carries the broker secret as its cache identity",
+                data.url()
+            );
+        }
     }
 
     #[tokio::test]

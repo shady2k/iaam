@@ -29,7 +29,7 @@ use iaam_core::reconciliation::evidence::SourceChannel;
 use iaam_ingest::SubmittedOperation;
 use iaam_ingest::dedup::IdentityScope;
 use iaam_ingest::operation::{OperationDates, OperationKind};
-use time::Date;
+use time::{Date, OffsetDateTime};
 
 use crate::error::AppError;
 use crate::ports::{
@@ -143,15 +143,21 @@ impl BrokerChannel for FinamChannel {
             allowance,
         } = context;
         let _ = account;
-        let body = bounded(
+        let (body, observed_at) = bounded(
             deadline,
             "the Finam portfolio request",
             self.client.get_portfolio(broker_account, allowance),
         )
         .await?;
+        // The answer's own moment becomes its observation date: the UTC day
+        // the transport first saw this answer, live or from the response
+        // cache. A `Current` portfolio fetched yesterday and served today
+        // stays dated yesterday (`iaam-vg8te.1.1`).
+        let observed_on = observed_at.map(|moment| OffsetDateTime::from(moment).date());
         adapt_portfolio(
             &body,
             at,
+            observed_on,
             &Symbols {
                 channel: self,
                 context,
@@ -467,6 +473,7 @@ async fn adapt_operations(
 async fn adapt_portfolio(
     body: &str,
     at: Date,
+    observed_on: Option<Date>,
     symbols: &Symbols<'_>,
 ) -> Result<PortfolioSnapshot, BrokerError> {
     let parsed = parse_portfolio(body).map_err(parse_error)?;
@@ -538,6 +545,7 @@ async fn adapt_portfolio(
         as_of: PortfolioAsOf::Current,
         claims,
         refused,
+        observed_on,
     })
 }
 

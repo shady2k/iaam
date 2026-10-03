@@ -499,7 +499,14 @@ pub async fn sync_broker(
     let assertions_withheld = match snapshot.as_of {
         PortfolioAsOf::Requested => None,
         PortfolioAsOf::Current => {
-            let as_of = services.clock.today();
+            // The portfolio is dated by the day its own answer was observed
+            // — a snapshot fetched yesterday and served from the cache
+            // today is still dated yesterday — and only when the transport
+            // gave no moment does the sync's own clock stand in
+            // (`iaam-vg8te.1.1`).
+            let as_of = snapshot
+                .observed_on
+                .unwrap_or_else(|| services.clock.today());
             (as_of != to).then_some(AssertionsWithheld::PortfolioDescribesAnotherDay { as_of })
         }
     };

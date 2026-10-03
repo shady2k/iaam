@@ -2214,6 +2214,14 @@ pub struct PortfolioSnapshot {
     pub as_of: PortfolioAsOf,
     pub claims: Vec<ControlClaim>,
     pub refused: Vec<Quarantined>,
+    /// The UTC date of the answer's own observation moment: the day the
+    /// transport first saw this answer, live or from the response cache.
+    /// A `Current` portfolio dated by it rather than by the sync's clock
+    /// keeps the date the answer truly carries, so a snapshot fetched
+    /// yesterday and served from the cache today is still dated yesterday
+    /// (`iaam-vg8te.1.1`). `None` when the transport gave no moment, and
+    /// the caller then keeps its own dating (`services.clock.today()`).
+    pub observed_on: Option<Date>,
 }
 
 /// Limits shared by every broker request made for one synchronization.

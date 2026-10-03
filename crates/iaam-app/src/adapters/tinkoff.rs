@@ -32,6 +32,8 @@ use iaam_ingest::operation::{OperationDates, OperationKind};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
+use time::{Date, OffsetDateTime};
+
 use crate::ports::{
     BrokerChannel, BrokerError, BrokerRequestContext, ParsedOperations, PortfolioAsOf,
     PortfolioSnapshot, Quarantined,
@@ -124,12 +126,17 @@ impl BrokerChannel for TinkoffChannel {
             allowance,
         } = context;
         let _ = account;
-        let body = self
+        let (body, observed_at) = self
             .client
             .get_portfolio(broker_account, deadline, allowance)
             .await
             .map_err(tinkoff_error)?;
-        adapt_portfolio(&body)
+        // The answer's own moment becomes its observation date: the UTC day
+        // the transport first saw this answer, live or from the response
+        // cache. A `Current` portfolio fetched yesterday and served today
+        // stays dated yesterday (`iaam-vg8te.1.1`).
+        let observed_on = observed_at.map(|moment| OffsetDateTime::from(moment).date());
+        adapt_portfolio(&body, observed_on)
     }
 
     fn channel(&self) -> SourceChannel {
@@ -161,7 +168,10 @@ impl BrokerChannel for TinkoffChannel {
 /// instrument there, drops every claim whose instrument has more than one
 /// row, and reports the dropped rows as `refused` instead of silently
 /// discarding an opinion the channel never gave.
-fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
+fn adapt_portfolio(
+    body: &str,
+    observed_on: Option<Date>,
+) -> Result<PortfolioSnapshot, BrokerError> {
     let parsed = parse_portfolio(body).map_err(parse_error)?;
     let positions = parse_portfolio_positions(body).map_err(parse_error)?;
 
@@ -215,6 +225,7 @@ fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
         as_of: PortfolioAsOf::Current,
         claims,
         refused,
+        observed_on,
     })
 }
 
@@ -2441,9 +2452,10 @@ mod tests {
     }
     #[test]
     fn t_invest_portfolio_answers_with_current_date_semantics() {
-        let snapshot = adapt_portfolio(include_str!(
-            "../../../../tests/fixtures/api/tinkoff-portfolio.json"
-        ))
+        let snapshot = adapt_portfolio(
+            include_str!("../../../../tests/fixtures/api/tinkoff-portfolio.json"),
+            None,
+        )
         .expect("portfolio adaptation");
 
         assert_eq!(snapshot.as_of, PortfolioAsOf::Current);
@@ -2482,7 +2494,7 @@ mod tests {
             ]
         }"#;
 
-        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+        let snapshot = adapt_portfolio(body, None).expect("portfolio adaptation");
 
         let disputed = InstrumentId(
             Uuid::parse_str("cccccccc-0000-0000-0000-000000000099").expect("instrument UID"),
@@ -2551,7 +2563,7 @@ mod tests {
             ]
         }"#;
 
-        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+        let snapshot = adapt_portfolio(body, None).expect("portfolio adaptation");
 
         assert_eq!(snapshot.claims.len(), 1, "{:?}", snapshot.claims);
         assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
@@ -2593,7 +2605,7 @@ mod tests {
             ]
         }"#;
 
-        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+        let snapshot = adapt_portfolio(body, None).expect("portfolio adaptation");
 
         assert_eq!(
             snapshot
@@ -2639,7 +2651,7 @@ mod tests {
             ]
         }"#;
 
-        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+        let snapshot = adapt_portfolio(body, None).expect("portfolio adaptation");
 
         assert_eq!(
             snapshot
@@ -2676,7 +2688,7 @@ mod tests {
             ]
         }"#;
 
-        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+        let snapshot = adapt_portfolio(body, None).expect("portfolio adaptation");
 
         assert!(snapshot.claims.is_empty(), "{:?}", snapshot.claims);
         assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);

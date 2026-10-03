@@ -39,7 +39,7 @@ use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, Verdict};
 use iaam_store::SqliteStore;
 use time::Date;
-use time::macros::date;
+use time::macros::{date, datetime};
 use tokio::sync::Notify;
 
 struct FixedClock(Date);
@@ -502,6 +502,7 @@ fn api_with_claims(
             as_of: PortfolioAsOf::Current,
             claims,
             refused: Vec::new(),
+            observed_on: None,
         }),
     }
 }
@@ -616,6 +617,7 @@ async fn a_position_with_no_trade_in_the_interval_registers_no_custody() {
                 at: BalancePoint::Closing,
             }],
             refused: Vec::new(),
+            observed_on: None,
         }),
     };
 
@@ -672,6 +674,7 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
             as_of: PortfolioAsOf::Current,
             claims: Vec::new(),
             refused: Vec::new(),
+            observed_on: None,
         }),
     };
 
@@ -940,6 +943,7 @@ async fn a_refused_position_reaches_the_owner_counted_and_gapped() {
             reason: "symbol SBER@MISX is not resolved to an instrument".to_owned(),
             dimensions: dimensions(&[Dimension::Positions]),
         }],
+        observed_on: None,
     });
 
     let outcome = sync_broker(
@@ -2419,6 +2423,7 @@ fn empty_portfolio() -> PortfolioSnapshot {
         as_of: PortfolioAsOf::Requested,
         claims: Vec::new(),
         refused: Vec::new(),
+        observed_on: None,
     }
 }
 
@@ -2900,6 +2905,17 @@ impl GatewayClock for FakeTime {
             .map_err(|error| error.to_string())?;
         Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
     }
+
+    fn now_unix(&self) -> SystemTime {
+        // The gateway dates a live answer and stamps the response cache
+        // with `now_unix`, and the channel turns that moment into the
+        // portfolio's observation date (`iaam-vg8te.1.1`). Letting the real
+        // wall clock answer here would date a faked answer with the real
+        // day, so the one-clock rule every other method keeps holds for
+        // the stamp too: `wall` is the fictional day the test's data lives
+        // on.
+        *self.wall.lock().expect("wall clock")
+    }
 }
 
 impl Sleeper for FakeTime {
@@ -3087,9 +3103,15 @@ fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
 /// speak for one channel identity — so the second can settle the first's
 /// refusals — build both channels with one `SourceId`.
 fn channel_over_with<T: Transport + 'static>(transport: T, source: SourceId) -> TinkoffChannel {
+    // The gateway's wall clock dates live answers and cache stamps, and the
+    // channel turns the moment into the portfolio's observation date. The
+    // tests this helper serves request 2026-03-31 intervals with same-day
+    // portfolios, so the wall sits on that day (noon UTC): the answer's own
+    // date equals the requested `to`, and the sync records the claims
+    // (`iaam-vg8te.1.1`).
     let time = Arc::new(FakeTime {
         now: Mutex::new(Instant::now()),
-        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_774_958_400)),
     });
     let database = broker_egress_database();
     let gateway = Gateway::with_parts_for_database(
@@ -3604,4 +3626,279 @@ async fn an_access_that_sees_no_account_refuses_the_sync() {
         "expected the unseen refusal, got {error:?}"
     );
     assert!(load_all(&services, owner).await.is_empty());
+}
+
+// --- iaam-vg8te.1.1: a served portfolio keeps the day it was answered ------
+
+/// A gateway clock whose `now_unix` — the reading the gateway dates live
+/// answers and response-cache stamps with — is a wall time the test moves
+/// by hand. A portfolio read can then be fetched on one UTC day and served
+/// from the cache on another, within the hour, and the answer keeps the day
+/// it was first seen (`iaam-vg8te.1.1`).
+struct WallTime {
+    now: Mutex<Instant>,
+    wall: Mutex<SystemTime>,
+}
+
+impl WallTime {
+    fn at(wall: SystemTime) -> Arc<Self> {
+        Arc::new(Self {
+            now: Mutex::new(Instant::now()),
+            wall: Mutex::new(wall),
+        })
+    }
+
+    fn set_wall(&self, wall: SystemTime) {
+        *self.wall.lock().expect("wall clock") = wall;
+    }
+}
+
+impl GatewayClock for WallTime {
+    fn now(&self) -> Instant {
+        *self.now.lock().expect("clock")
+    }
+
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        let elapsed = self
+            .wall
+            .lock()
+            .expect("wall clock")
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?;
+        Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
+    }
+
+    fn now_unix(&self) -> SystemTime {
+        *self.wall.lock().expect("wall clock")
+    }
+}
+
+impl Sleeper for WallTime {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        *self.now.lock().expect("clock") += delay;
+        *self.wall.lock().expect("wall clock") += delay;
+        Box::pin(async {})
+    }
+}
+
+/// A T-Invest that answers the reads of a portfolio sync: one empty
+/// operations page per operations cursor, and the portfolio body only to
+/// the first portfolio request. A second portfolio read inside the hour is
+/// served by the response cache, so the transport never sees it and counts
+/// only the one it answered.
+struct CachedPortfolioTinvest {
+    operations: String,
+    portfolio: String,
+    portfolio_asked: Arc<AtomicUsize>,
+}
+
+impl Transport for CachedPortfolioTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request.path().ends_with("/GetOperationsByCursor") {
+            return Ok(HttpResponse {
+                status: 200,
+                body: self.operations.as_bytes().to_vec(),
+                retry_after: None,
+                ..Default::default()
+            });
+        }
+        assert!(
+            request.path().ends_with("/GetPortfolio"),
+            "unexpected request: {}",
+            request.path()
+        );
+        self.portfolio_asked.fetch_add(1, Ordering::SeqCst);
+        Ok(HttpResponse {
+            status: 200,
+            body: self.portfolio.as_bytes().to_vec(),
+            retry_after: None,
+            ..Default::default()
+        })
+    }
+}
+
+/// The T-Invest channel over a gateway whose wall clock the test owns.
+/// The response cache is on, as it is on a production gateway: the whole
+/// point of these tests is a portfolio read answered the second time from
+/// the cache, dated by the moment it was first fetched
+/// (`iaam-vg8te.1.1`).
+fn tinkoff_channel_with_time<T: Transport + 'static>(
+    transport: T,
+    source: SourceId,
+    time: Arc<WallTime>,
+) -> TinkoffChannel {
+    let database = broker_egress_database();
+    let gateway = Gateway::with_parts_for_database_with_response_cache(
+        transport,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &database,
+    )
+    .expect("the documented table is valid");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-token")).expect("token opens");
+    let client = TinkoffClient::new(Environment::Prod, token, Arc::new(gateway));
+    let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
+    TinkoffChannel::new(client, source, dictionary)
+}
+
+/// A portfolio fetched on day D and served from the response cache on day
+/// D+1 — within the hour, so the cache serves it — is dated by its own
+/// observation moment, not by the sync's clock: the sync asked day D+1, the
+/// answer describes day D, and the assertions are withheld as describing
+/// another day. No claim of day D+1 is recorded, and the day-D portfolio
+/// was never asked for again (`iaam-vg8te.1.1`).
+#[tokio::test]
+async fn a_cached_portfolio_keeps_the_day_it_was_answered_and_withholds_on_the_next_day() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let day_d = services_with(date!(2026 - 04 - 01), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let day_d_plus_one = services_with(date!(2026 - 04 - 02), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let time = WallTime::at(SystemTime::from(datetime!(2026 - 04 - 01 23:20 UTC)));
+    let portfolio_asked = Arc::new(AtomicUsize::new(0));
+    let transport = CachedPortfolioTinvest {
+        operations: r#"{"hasNext":false,"items":[]}"#.to_owned(),
+        portfolio: format!(
+            r#"{{"positions":[{{"instrumentType":"share","quantity":{{"units":"1","nano":0}},"positionUid":"aaaaaaaa-0000-0000-0000-000000000001","instrumentUid":"{instrument_uid}","blocked":false}}]}}"#,
+            instrument_uid = instrument.inner(),
+        ),
+        portfolio_asked: Arc::clone(&portfolio_asked),
+    };
+    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+
+    // Day D, half past eleven at night: the live read is dated 23:20 UTC
+    // and stored in the cache. The sync asked [D, D], and the answer
+    // describes D, so its claim is recorded for day D.
+    let first = sync_broker(
+        &day_d,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 01),
+        date!(2026 - 04 - 01),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("day D sync: {error}"));
+    assert_eq!(first.assertions, 1, "{:?}", first.recorded);
+
+    // Day D+1, five minutes past midnight: within the hour, so the same
+    // read is served by the cache, still dated by the moment it was first
+    // fetched. The sync now asks [D+1, D+1], and the served answer still
+    // describes D: its assertions are withheld, naming the answer's own
+    // day, and no claim of day D+1 is recorded.
+    time.set_wall(SystemTime::from(datetime!(2026 - 04 - 02 00:05 UTC)));
+    let second = sync_broker(
+        &day_d_plus_one,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 02),
+        date!(2026 - 04 - 02),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("day D+1 sync: {error}"));
+
+    assert_eq!(second.assertions, 0, "{:?}", second.recorded);
+    assert_eq!(
+        second.assertions_withheld,
+        Some(AssertionsWithheld::PortfolioDescribesAnotherDay {
+            as_of: date!(2026 - 04 - 01)
+        }),
+        "the withheld portfolio is dated by the answer's own day, not the sync's clock"
+    );
+    assert_eq!(
+        portfolio_asked.load(Ordering::SeqCst),
+        1,
+        "the day-D+1 read was served by the cache, never re-sent"
+    );
+    let events = load_all(&day_d_plus_one, owner).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
+        "a portfolio describing day D must not become a claim of day D+1"
+    );
+}
+
+/// A portfolio fetched and served from the cache on one day — the serve
+/// still inside the hour — is dated by its own observation day, which IS
+/// the requested `to`: the same-day serve keeps recording the claims,
+/// exactly as before (`iaam-vg8te.1.1`).
+#[tokio::test]
+async fn a_same_day_served_cached_portfolio_still_records_its_claims() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let first = services_with(date!(2026 - 04 - 05), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let second = services_with(date!(2026 - 04 - 05), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let time = WallTime::at(SystemTime::from(datetime!(2026 - 04 - 05 10:00 UTC)));
+    let portfolio_asked = Arc::new(AtomicUsize::new(0));
+    let transport = CachedPortfolioTinvest {
+        operations: r#"{"hasNext":false,"items":[]}"#.to_owned(),
+        portfolio: format!(
+            r#"{{"positions":[{{"instrumentType":"share","quantity":{{"units":"1","nano":0}},"positionUid":"aaaaaaaa-0000-0000-0000-000000000001","instrumentUid":"{instrument_uid}","blocked":false}}]}}"#,
+            instrument_uid = instrument.inner(),
+        ),
+        portfolio_asked: Arc::clone(&portfolio_asked),
+    };
+    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+
+    // Day E at ten in the morning: the live read populates the cache.
+    let first_sync = sync_broker(
+        &first,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 05),
+        date!(2026 - 04 - 05),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first same-day sync: {error}"));
+    assert_eq!(first_sync.assertions, 1, "{:?}", first_sync.recorded);
+
+    // Day E, half past ten: served from the cache, still dated day E — the
+    // requested `to` — and the claim is recorded as before.
+    time.set_wall(SystemTime::from(datetime!(2026 - 04 - 05 10:30 UTC)));
+    let second_sync = sync_broker(
+        &second,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 05),
+        date!(2026 - 04 - 05),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second same-day sync: {error}"));
+
+    assert_eq!(second_sync.assertions, 1, "{:?}", second_sync.recorded);
+    assert_eq!(second_sync.assertions_withheld, None);
+    assert_eq!(
+        portfolio_asked.load(Ordering::SeqCst),
+        1,
+        "the second read was served by the cache"
+    );
+    let events = load_all(&second, owner).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
+        "a same-day portfolio is still recorded as a claim"
+    );
 }

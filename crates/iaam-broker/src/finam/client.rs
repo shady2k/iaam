@@ -1,6 +1,6 @@
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::credentials::BrokerToken;
 use iaam_http::gateway::{Clock, SystemClock};
@@ -154,12 +154,18 @@ impl FinamClient {
         }
     }
 
-    /// Return the raw body of the account's current portfolio.
+    /// Return the raw body of the account's current portfolio, beside the
+    /// moment the answer was observed: the transport's own stamp for a live
+    /// answer, and the stored stamp of the first fetch for one served from
+    /// the response cache. The moment lets a caller date the answer
+    /// truthfully — a `Current` portfolio fetched yesterday and served
+    /// today is still dated yesterday (`iaam-vg8te.1.1`). `None` when the
+    /// transport gave no moment.
     pub async fn get_portfolio(
         &self,
         account_id: &str,
         allowance: &RequestAllowance,
-    ) -> Result<String, FinamError> {
+    ) -> Result<(String, Option<SystemTime>), FinamError> {
         validate_account_id(account_id)?;
         self.get_account(account_id, "", &[], allowance).await
     }
@@ -208,7 +214,7 @@ impl FinamClient {
         allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
         validate_symbol(symbol)?;
-        let (body, _) = self
+        let (body, _, _) = self
             .authorized(allowance, |token| {
                 HttpRequest::get_with_symbol_path_segment(
                     Destination::FinamApi,
@@ -286,7 +292,7 @@ impl FinamClient {
             ("interval.end_time", rfc3339_midnight(end)),
             ("limit", self.transactions_limit.to_string()),
         ];
-        let body = self
+        let (body, _) = self
             .get_account(account_id, "/transactions", &query, allowance)
             .await?;
         let value: Value =
@@ -303,7 +309,7 @@ impl FinamClient {
         &self,
         allowance: &RequestAllowance,
     ) -> Result<Vec<String>, FinamError> {
-        let (body, token) = self
+        let (body, _, token) = self
             .authorized(allowance, |token| {
                 // The token rides the body only: the published contract gives
                 // this method no Authorization header, unlike the data
@@ -341,14 +347,15 @@ impl FinamClient {
         Ok(ids)
     }
 
-    /// Send a reading call over the session token.
+    /// Send a reading call over the session token: the body and the moment
+    /// the answer was observed, as the authorized plumbing surfaced them.
     async fn get_account(
         &self,
         account_id: &str,
         suffix: &str,
         query: &[(&str, String)],
         allowance: &RequestAllowance,
-    ) -> Result<String, FinamError> {
+    ) -> Result<(String, Option<SystemTime>), FinamError> {
         let query = query.to_vec();
         self.authorized(allowance, move |token| {
             let mut request = HttpRequest::get_with_encoded_path_segment(
@@ -365,7 +372,7 @@ impl FinamClient {
             request
         })
         .await
-        .map(|(body, _)| body)
+        .map(|(body, observed_at, _)| (body, observed_at))
     }
 
     /// Send an authorized call: the session token is the bearer. The
@@ -374,17 +381,18 @@ impl FinamClient {
     /// the access, not on the rotating session token: a renewed token
     /// does not re-send a read the same access already has cached. A 401
     /// to the session token is answered with one shared renewal and one
-    /// retry; the second 401 is a refusal. Returns the body and the token
-    /// that finally carried it.
+    /// retry; the second 401 is a refusal. Returns the body, the moment
+    /// the finally-carried answer was observed, and the token that
+    /// carried it.
     async fn authorized(
         &self,
         allowance: &RequestAllowance,
         build: impl Fn(&str) -> HttpRequest,
-    ) -> Result<(String, Secret), FinamError> {
+    ) -> Result<(String, Option<SystemTime>, Secret), FinamError> {
         let session = self.session(allowance).await?;
         let request = build(session.token.expose()).with_cache_identity(self.token.expose());
         let step = match self.raw(&request).await {
-            Ok(body) => return Ok((body, session.token.clone())),
+            Ok((body, observed_at)) => return Ok((body, observed_at, session.token.clone())),
             Err(step) => step,
         };
         if !step.is_unauthorized() {
@@ -393,7 +401,7 @@ impl FinamClient {
         let fresh = self.renewed(&session, allowance).await?;
         let request = build(fresh.token.expose()).with_cache_identity(self.token.expose());
         match self.raw(&request).await {
-            Ok(body) => Ok((body, fresh.token.clone())),
+            Ok((body, observed_at)) => Ok((body, observed_at, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
         }
     }
@@ -524,14 +532,19 @@ impl FinamClient {
         })
     }
 
-    /// Send the request through the gateway and return its body.
-    async fn raw(&self, request: &HttpRequest) -> Result<String, Step> {
+    /// Send the request through the gateway and return its body beside the
+    /// moment the answer was observed. The gateway stamps a live answer it
+    /// accepted and a served one with the stored moment of its first fetch;
+    /// the moment rides on here so a caller can date the answer by its own
+    /// observation time (`iaam-vg8te.1.1`).
+    async fn raw(&self, request: &HttpRequest) -> Result<(String, Option<SystemTime>), Step> {
         let response = self
             .gateway
             .send(request, None)
             .await
             .map_err(Step::Refused)?;
-        String::from_utf8(response.body).map_err(|_| Step::Malformed)
+        let body = String::from_utf8(response.body).map_err(|_| Step::Malformed)?;
+        Ok((body, response.observed_at))
     }
 }
 
@@ -902,6 +915,7 @@ mod tests {
                 client
                     .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                     .await
+                    .map(|(body, _)| body)
             })
         };
         let second = {
@@ -910,6 +924,7 @@ mod tests {
                 client
                     .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                     .await
+                    .map(|(body, _)| body)
             })
         };
         tokio::join!(async { first.await.expect("first task joins") }, async {
@@ -1446,6 +1461,31 @@ mod tests {
         assert_eq!(SESSION_LIFETIME, Duration::from_secs(15 * 60));
     }
 
+    /// The portfolio read surfaces the moment the answer was observed: the
+    /// gateway dates a live answer with its wall clock, and the read
+    /// carries it beside the body — the app cannot see the transport's
+    /// `HttpResponse`, so this is where the moment enters the channel
+    /// (`iaam-vg8te.1.1`).
+    #[tokio::test]
+    async fn a_portfolio_answer_surfaces_the_moment_it_was_observed() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, r#"{"positions":[]}"#),
+        );
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        let (_, observed_at) = client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+
+        assert!(
+            observed_at.is_some(),
+            "a live answer is dated by the gateway's clock"
+        );
+    }
+
     #[tokio::test]
     async fn a_401_on_a_data_call_is_answered_with_one_renewal_and_one_retry() {
         let endpoint = Arc::new(
@@ -1457,7 +1497,7 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        let body = client
+        let (body, _) = client
             .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");
@@ -1557,7 +1597,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
 
-        let body = client
+        let (body, _) = client
             .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");

@@ -1044,6 +1044,156 @@ async fn repeating_refused_sync_appends_one_coverage_gap() {
     );
 }
 
+/// A T-Invest that answers each RPC from the path in the request URL: the
+/// accounts listing, one empty operations page, and one portfolio answer.
+struct ScriptedTinvest {
+    accounts: &'static str,
+    operations: &'static str,
+    portfolio: String,
+}
+
+impl Transport for ScriptedTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let url = request.url();
+        let body = if url.ends_with("UsersService/GetAccounts") {
+            self.accounts
+        } else if url.ends_with("OperationsService/GetOperationsByCursor") {
+            self.operations
+        } else if url.ends_with("OperationsService/GetPortfolio") {
+            self.portfolio.as_str()
+        } else {
+            return Err(HttpError::Network);
+        };
+        Ok(HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            retry_after: None,
+            ..Default::default()
+        })
+    }
+}
+
+/// A refused T-Invest currency row is cash, never a position: the row whose
+/// quantity cannot be read stands in the journal as a coverage gap naming
+/// Cash only, the readable RUB row beside it still imports, and the
+/// reconciliation evidence from the same attempt does not confirm Cash —
+/// while the readable security row still lets positions reconcile
+/// (iaam-vg8te.1.2).
+#[tokio::test]
+async fn a_refused_t_invest_cash_row_gaps_cash_instead_of_positions() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    // Declared: this place backs a fact appended directly below, outside
+    // the sync under test, so the sync's own registration never reaches it.
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
+    // An independent report states the trade and both closing figures the
+    // readable rows will state too — cash spent ten thousand, the holding
+    // one share — so both dimensions would reconcile if every broker row
+    // had been readable.
+    let operation = trade(account, instrument, custody);
+    let report_source = SourceId::new_random();
+    services
+        .store
+        .append_events(
+            [
+                vec![
+                    report_trade_event(owner, &operation, report_source),
+                    report_cash_assertion(owner, account, report_source),
+                    report_position_assertion(owner, account, report_source, instrument),
+                ],
+                report_opening_assertions(owner, account, report_source, Some(instrument)),
+            ]
+            .concat(),
+            IdentityScope::Source,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed report: {error}"));
+
+    let portfolio = format!(
+        r#"{{"positions":[
+            {{
+                "instrumentType": "currency",
+                "quantity": {{"units": "-100", "nano": 0}},
+                "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c1",
+                "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c2",
+                "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}},
+                "averagePositionPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+            }},
+            {{
+                "instrumentType": "currency",
+                "quantity": {{"nano": 500000000}},
+                "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c4",
+                "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+            }},
+            {{
+                "instrumentType": "share",
+                "quantity": {{"units": "1", "nano": 0}},
+                "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c5",
+                "instrumentUid": "{instrument_uid}",
+                "blocked": false
+            }}
+        ]}}"#,
+        instrument_uid = instrument.inner(),
+    );
+    let channel = channel_over(ScriptedTinvest {
+        accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+        operations: r#"{"hasNext":false,"items":[]}"#,
+        portfolio,
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    // The set-aside currency row reaches the owner counted, the readable RUB
+    // and security rows import as assertions, and the journal gap names Cash.
+    assert_eq!(outcome.set_aside, 1, "{:?}", outcome.recorded);
+    assert_eq!(outcome.assertions, 2, "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    let gap = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ImportCoverageGap {
+                dimensions,
+                refused,
+                ..
+            } => Some((dimensions, refused)),
+            _ => None,
+        })
+        .expect("coverage gap");
+    assert_eq!(gap.0, &dimensions(&[Dimension::Cash]));
+    assert_eq!(*gap.1, 1);
+
+    // The readable security row still lets positions reconcile — the refusal
+    // was about cash all along — while the refused cash row withholds the
+    // confirmation the same attempt would otherwise have given Cash.
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::build(&events)
+        .unwrap_or_else(|error| panic!("ledger: {error}"));
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Positions),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent,
+    );
+    assert_ne!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent,
+    );
+}
+
 #[tokio::test]
 async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
     let owner = OwnerId::new_random();

@@ -226,6 +226,13 @@ pub struct RefusedPosition {
     /// owner can read what was set aside.
     pub raw: Value,
     pub reason: ParseError,
+    /// The instrument type the row named (`currency` for a cash position),
+    /// when the row was structured enough to say. The channel adapter uses
+    /// it to pick the reconciliation dimension the refusal taints: a
+    /// `currency` row is cash, a row with any other named type is a
+    /// position, and a row that never got typed taints the conservative
+    /// pair (`iaam-vg8te.1.2`).
+    pub instrument_type: Option<String>,
 }
 
 /// The portfolio positions with everything the response stated about them,
@@ -275,6 +282,7 @@ pub fn parse_portfolio(body: &str) -> Result<ParsedPortfolio, ParseError> {
             Err(reason) => refused.push(RefusedPosition {
                 raw: row.raw,
                 reason,
+                instrument_type: row.position.instrument_type.clone(),
             }),
         }
     }
@@ -306,6 +314,11 @@ fn read_position_rows(
             Err(error) => refused.push(RefusedPosition {
                 raw,
                 reason: ParseError::Json(error.to_string()),
+                // The row never became a typed position, so it never said
+                // whether it is a currency row or a security row. Leaving
+                // the type empty sends the reader to the conservative pair
+                // of dimensions. (`iaam-vg8te.1.2`)
+                instrument_type: None,
             }),
         }
     }
@@ -429,6 +442,7 @@ pub fn parse_portfolio_positions(body: &str) -> Result<ParsedPortfolioPositions,
             Err(reason) => refused.push(RefusedPosition {
                 raw: row.raw,
                 reason,
+                instrument_type: row.position.instrument_type.clone(),
             }),
         }
     }
@@ -1362,6 +1376,48 @@ mod tests {
             .pop()
             .expect("one operation");
         assert_eq!(operation.accrued_interest, None);
+    }
+
+    #[test]
+    fn refused_portfolio_rows_carry_the_instrument_type_they_named() {
+        let parsed = super::parse_portfolio(
+            r#"{
+                "positions": [
+                    {
+                        "instrumentType": "currency",
+                        "quantity": {"nano": 500000000},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c1",
+                        "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c2",
+                        "currentPrice": {"units": "1", "nano": 0, "currency": "rub"}
+                    },
+                    {
+                        "instrumentType": "share",
+                        "quantity": {"nano": 500000000},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                        "instrumentUid": "dddddddd-0000-0000-0000-000000000042"
+                    },
+                    {
+                        "quantity": "not-an-object",
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c4",
+                        "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c5"
+                    }
+                ]
+            }"#,
+        )
+        .expect("portfolio parses");
+
+        // The row that never deserialised is refused first, in the shared
+        // row pass, carrying no type; the rows that deserialised and then
+        // failed their claim follow, each naming the type it owned.
+        let types = parsed
+            .refused
+            .iter()
+            .map(|row| row.instrument_type.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [None, Some("currency".to_owned()), Some("share".to_owned()),]
+        );
     }
 
     #[test]

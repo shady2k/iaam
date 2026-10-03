@@ -187,7 +187,7 @@ fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
             // The same refusal shape the operations path prints: the named
             // variant for the machine, the sentence for the owner.
             reason: format!("{:?}: {}", row.reason, row.reason),
-            dimensions: [Dimension::Positions].into_iter().collect(),
+            dimensions: refusal_dimensions(row.instrument_type.as_deref()),
         })
         .collect();
     refused.extend(
@@ -216,6 +216,21 @@ fn adapt_portfolio(body: &str) -> Result<PortfolioSnapshot, BrokerError> {
         claims,
         refused,
     })
+}
+
+/// The dimension a set-aside row taints, from the instrument type the parser
+/// read off the row: a currency position is cash, a security is a position,
+/// and a row broken enough that its type never got read taints the
+/// conservative pair — neither dimension may be declared confirmed while one
+/// of its rows is invisible (`iaam-vg8te.1.2`).
+fn refusal_dimensions(instrument_type: Option<&str>) -> BTreeSet<Dimension> {
+    match instrument_type {
+        Some("currency") => [Dimension::Cash].into_iter().collect(),
+        Some(_) => [Dimension::Positions].into_iter().collect(),
+        None => [Dimension::Cash, Dimension::Positions]
+            .into_iter()
+            .collect(),
+    }
 }
 
 /// Two or more portfolio rows the channel reported for one instrument,
@@ -2528,6 +2543,7 @@ mod tests {
                     "blocked": false
                 },
                 {
+                    "instrumentType": "share",
                     "quantity": {"units": "1", "nano": 0},
                     "positionUid": "not-a-uuid",
                     "instrumentUid": "also-not-a-uuid"
@@ -2549,6 +2565,126 @@ mod tests {
         assert_eq!(
             refusal.dimensions,
             [Dimension::Positions].into_iter().collect()
+        );
+    }
+
+    /// A refused RUB currency row is cash, never a position: the row names
+    /// `instrumentType: currency`, so the refusal taints Cash — the readable
+    /// RUB row beside it still becomes a cash claim (iaam-vg8te.1.2).
+    #[test]
+    fn a_refused_rub_currency_row_taints_cash_not_positions() {
+        let body = r#"{
+            "positions": [
+                {
+                    "instrumentType": "currency",
+                    "quantity": {"units": "0", "nano": 0},
+                    "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c1",
+                    "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c2",
+                    "currentPrice": {"units": "1", "nano": 0, "currency": "rub"},
+                    "averagePositionPrice": {"units": "1", "nano": 0, "currency": "rub"}
+                },
+                {
+                    "instrumentType": "currency",
+                    "quantity": {"nano": 500000000},
+                    "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                    "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c4",
+                    "currentPrice": {"units": "1", "nano": 0, "currency": "rub"}
+                }
+            ]
+        }"#;
+
+        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+
+        assert_eq!(
+            snapshot
+                .claims
+                .iter()
+                .filter(|claim| { matches!(claim, ControlClaim::CashBalance { .. }) })
+                .count(),
+            1,
+            "{:?}",
+            snapshot.claims
+        );
+        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
+        let refusal = &snapshot.refused[0];
+        assert!(
+            refusal.reason.contains("units"),
+            "the refusal names the quantity field the row withheld: {}",
+            refusal.reason
+        );
+        assert_eq!(refusal.dimensions, [Dimension::Cash].into_iter().collect());
+    }
+
+    /// A refused security row is a position: the row names a real instrument
+    /// type, so the refusal taints Positions while the readable security
+    /// beside it still becomes a position claim (iaam-vg8te.1.2).
+    #[test]
+    fn a_refused_security_row_taints_positions() {
+        let body = r#"{
+            "positions": [
+                {
+                    "instrumentType": "share",
+                    "quantity": {"units": "0", "nano": 0},
+                    "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c5",
+                    "instrumentUid": "dddddddd-0000-0000-0000-000000000042",
+                    "blocked": false
+                },
+                {
+                    "instrumentType": "share",
+                    "quantity": {"nano": 500000000},
+                    "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c6",
+                    "instrumentUid": "dddddddd-0000-0000-0000-000000000098",
+                    "blocked": false
+                }
+            ]
+        }"#;
+
+        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+
+        assert_eq!(
+            snapshot
+                .claims
+                .iter()
+                .filter(|claim| { matches!(claim, ControlClaim::PositionQuantity { .. }) })
+                .count(),
+            1,
+            "{:?}",
+            snapshot.claims
+        );
+        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
+        let refusal = &snapshot.refused[0];
+        assert!(refusal.reason.contains("quantity"), "{}", refusal.reason);
+        assert_eq!(
+            refusal.dimensions,
+            [Dimension::Positions].into_iter().collect()
+        );
+    }
+
+    /// A row broken enough that the parser never typed it cannot say whether
+    /// it is cash or a holding: the refusal taints the conservative pair, so
+    /// neither dimension is declared confirmed while the row is invisible
+    /// (iaam-vg8te.1.2).
+    #[test]
+    fn a_row_too_broken_to_name_its_type_taints_the_conservative_pair() {
+        let body = r#"{
+            "positions": [
+                {
+                    "quantity": "not-an-object",
+                    "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c7",
+                    "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c8"
+                }
+            ]
+        }"#;
+
+        let snapshot = adapt_portfolio(body).expect("portfolio adaptation");
+
+        assert!(snapshot.claims.is_empty(), "{:?}", snapshot.claims);
+        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
+        assert_eq!(
+            snapshot.refused[0].dimensions,
+            [Dimension::Cash, Dimension::Positions]
+                .into_iter()
+                .collect()
         );
     }
 

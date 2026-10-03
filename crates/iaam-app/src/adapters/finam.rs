@@ -238,7 +238,30 @@ impl Symbols<'_> {
         match self.instrument(symbol, on).await {
             Ok(Resolution::Resolved(instrument)) => Ok(instrument),
             Ok(Resolution::Unresolved(reason)) => Err(row_unparsable(reason)),
-            Err(error) => Err(RowRefusal::Adapter(error.to_string())),
+            // An asset read that cannot name the symbol's ISIN is that row's
+            // problem, not the page's: the symbol is invalid in Finam's own
+            // path-segment rules, or the answer that names the ISIN cannot
+            // be read. The row is set aside with what is missing and who
+            // supplies it named; the rest of the page still imports.
+            Err(BrokerError::Unparsable { detail, .. }) => Err(row_unparsable(format!(
+                "symbol {symbol} is not resolved to an instrument: Finam's asset \
+                     description (GET /v1/assets/{symbol}) that names its ISIN cannot \
+                     be read — {detail} — record the instrument with the ISIN it \
+                     actually carries once the answer can be read, then sync this \
+                     range again"
+            ))),
+            // A genuine source-level failure of the asset read — the source
+            // is down, said no, or spent the sync's request budget — is the
+            // source's failure, not one row's: the sync stops with the
+            // original error's own classification.
+            Err(
+                error @ (BrokerError::Unreachable { .. }
+                | BrokerError::Refused { .. }
+                | BrokerError::RequestCeiling { .. }
+                | BrokerError::Adapter { .. }
+                | BrokerError::NoAccess { .. }
+                | BrokerError::ScopeNotReadOnly { .. }),
+            ) => Err(RowRefusal::Fatal(error)),
         }
     }
 
@@ -410,7 +433,14 @@ async fn adapt_operations(
                     dimensions,
                 });
             }
-            Err(error @ RowRefusal::Adapter(_)) => return Err(error.into_broker_error()),
+            // A row was only ever refused by the arm above; everything
+            // left here is a whole-sync failure — the original source
+            // error, or a bug this adapter's branching excluded.
+            Err(error) => {
+                return Err(error
+                    .into_original()
+                    .expect("a refused row is set aside by the arm above, never a stop"));
+            }
         }
     }
     Ok(ParsedOperations {
@@ -428,7 +458,12 @@ async fn adapt_operations(
 /// not reach travels in `refused` with its reason and its original JSON, the
 /// way a quarantined operation does: one instrument's unresolved row
 /// withholds an opinion about that instrument, not about the rest of the
-/// holdings (`iaam-vg8te.1.2`).
+/// holdings (`iaam-vg8te.1.2`). Nor does one row's own unreadable asset
+/// answer stop the sync: an invalid symbol or an answer that cannot be read
+/// sets that row aside with its reason and payload, and the other holdings
+/// still become claims. Only failures over the whole answer — an unparsable
+/// body, a source down or refusing, a directory that cannot be asked — fail
+/// the sync, each keeping its own classification (`iaam-vg8te.1.3`).
 async fn adapt_portfolio(
     body: &str,
     at: Date,
@@ -448,19 +483,55 @@ async fn adapt_portfolio(
         })
         .collect();
     for row in parsed.unresolved {
-        match symbols.instrument(&row.symbol, at).await? {
-            Resolution::Resolved(instrument) => {
+        // A row whose symbol cannot become an instrument is one position's
+        // problem, not the whole holdings': what cannot be read is that
+        // row's own asset answer, and one instrument's unresolved row
+        // withholds an opinion about that instrument rather than about the
+        // rest of the answer. Only failures over the whole answer — an
+        // unparsable body, a source down or refusing, a directory that
+        // cannot be asked — stop the sync, and each keeps its own
+        // classification.
+        match symbols.instrument(&row.symbol, at).await {
+            Ok(Resolution::Resolved(instrument)) => {
                 claims.push(ControlClaim::PositionQuantity {
                     instrument,
                     quantity: row.quantity,
                     at: BalancePoint::Closing,
                 });
             }
-            Resolution::Unresolved(reason) => refused.push(Quarantined {
+            Ok(Resolution::Unresolved(reason)) => refused.push(Quarantined {
                 raw: row.raw,
                 reason,
                 dimensions: [Dimension::Positions].into_iter().collect(),
             }),
+            // The symbol's own asset answer cannot be read — the symbol is
+            // invalid in Finam's path-segment rules, or the description
+            // that names the ISIN is unparsable: the row is set aside with
+            // its reason and its original JSON, and the rest of the answer
+            // still becomes claims.
+            Err(BrokerError::Unparsable { detail, .. }) => {
+                let reason = format!(
+                    "position {} is not resolved to an instrument: Finam's asset \
+                     description (GET /v1/assets/{}) that names its ISIN cannot \
+                     be read — {detail} — record the instrument with the ISIN it \
+                     actually carries once the answer can be read, then sync this \
+                     range again",
+                    row.symbol, row.symbol
+                );
+                refused.push(Quarantined {
+                    raw: row.raw,
+                    reason,
+                    dimensions: [Dimension::Positions].into_iter().collect(),
+                });
+            }
+            Err(
+                error @ (BrokerError::Unreachable { .. }
+                | BrokerError::Refused { .. }
+                | BrokerError::RequestCeiling { .. }
+                | BrokerError::Adapter { .. }
+                | BrokerError::NoAccess { .. }
+                | BrokerError::ScopeNotReadOnly { .. }),
+            ) => return Err(error),
         }
     }
     Ok(PortfolioSnapshot {
@@ -477,6 +548,11 @@ enum RowRefusal {
         reason: String,
         dimensions: BTreeSet<Dimension>,
     },
+    /// A genuine source-level failure behind one row's resolution — the
+    /// source was down, said no, or spent the request budget — carries the
+    /// original error whole, so the sync stops with the error's own
+    /// classification and never with ours.
+    Fatal(BrokerError),
     /// The adapter reached a state its own branching should have excluded.
     Adapter(String),
 }
@@ -485,17 +561,24 @@ impl RowRefusal {
     fn with_dimensions(self, dimensions: BTreeSet<Dimension>) -> Self {
         match self {
             Self::Row { reason, .. } => Self::Row { reason, dimensions },
+            Self::Fatal(error) => Self::Fatal(error),
             Self::Adapter(detail) => Self::Adapter(detail),
         }
     }
 
-    fn into_broker_error(self) -> BrokerError {
+    /// The broker error this refusal is, when the sync is to stop for it:
+    /// the fatal arm carries the original error with its classification
+    /// whole, and a genuine adapter bug becomes the adapter error that is
+    /// our side's failure. A refused row is set aside by the caller, never
+    /// a stop, so its reason comes back on the `Err` side.
+    fn into_original(self) -> Result<BrokerError, String> {
         match self {
-            Self::Row { reason, .. } => unparsable(reason),
-            Self::Adapter(detail) => BrokerError::Adapter {
+            Self::Fatal(error) => Ok(error),
+            Self::Adapter(detail) => Ok(BrokerError::Adapter {
                 broker: BROKER.to_owned(),
                 detail,
-            },
+            }),
+            Self::Row { reason, .. } => Err(reason),
         }
     }
 }
@@ -2058,5 +2141,328 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains(TOKEN), "{error}");
+    }
+
+    /// One position whose symbol Finam will not accept as a path segment
+    /// (it contains "/") is set aside, not an abort: the readable
+    /// positions of the same answer still become claims, the operations of
+    /// the same sync still import, and the bad row travels in `refused`
+    /// with its reason and its own JSON (iaam-vg8te.1.3).
+    #[tokio::test]
+    async fn a_position_with_an_invalid_symbol_is_set_aside_not_an_abort() {
+        const GOOD: &str = "GOOD@MISX";
+        const BAD: &str = "BAD/ROW";
+        const GOOD_ISIN: &str = "RU000AGOOD07";
+        let operations = json!({
+            "transactions": [
+                {
+                    "id": DIVIDEND_ID,
+                    "timestamp": "2025-06-10T10:00:00Z",
+                    "category": "DIVIDEND",
+                    "symbol": GOOD,
+                    "change": { "units": "12", "nanos": 500_000_000, "currencyCode": "rub" },
+                },
+            ],
+        })
+        .to_string();
+        let portfolio = json!({
+            "cash": [ { "units": "100", "nanos": 0, "currencyCode": "rub" } ],
+            "positions": [
+                { "symbol": GOOD, "quantity": { "value": "7" } },
+                { "symbol": BAD, "quantity": { "value": "3" } },
+            ],
+        })
+        .to_string();
+        let (instruments, expected) = directory(&[GOOD_ISIN]).await;
+        let channel = channel(
+            fake::gateway(
+                vec![
+                    session_answer(),
+                    page(&operations),
+                    Answer::status(200, format!(r#"{{"isin":"{GOOD_ISIN}"}}"#).as_str()),
+                    page(&portfolio),
+                ],
+                None,
+            )
+            .0,
+            instruments,
+        );
+        let context = broker_context(None);
+
+        // The operations of the same sync still import whole.
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                context,
+            )
+            .await
+            .expect("the operations are parsed");
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.accepted.len(), 1, "{:?}", parsed.accepted);
+        assert!(matches!(
+            &parsed.accepted[0].kind,
+            OperationKind::Income { instrument: Some(id), .. } if *id == expected[0]
+        ));
+
+        // The portfolio no longer stops on the invalid row: the readable
+        // position and the cash still become claims, the bad row is
+        // refused with its reason and its own JSON.
+        let snapshot = channel
+            .fetch_portfolio(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 30),
+                context,
+            )
+            .await
+            .expect("the portfolio is parsed");
+        assert_eq!(snapshot.claims.len(), 2, "{:?}", snapshot.claims);
+        assert!(snapshot
+            .claims
+            .iter()
+            .any(|claim| matches!(claim, ControlClaim::PositionQuantity { instrument, .. } if *instrument == expected[0])));
+        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
+        let refused = &snapshot.refused[0];
+        assert_eq!(refused.raw["symbol"], json!(BAD), "{refused:?}");
+        assert!(
+            refused.reason.contains(BAD)
+                && refused.reason.contains("not resolved to an instrument")
+                && refused.reason.contains("record the instrument"),
+            "{}",
+            refused.reason
+        );
+        assert_eq!(
+            refused.dimensions,
+            [Dimension::Positions].into_iter().collect(),
+            "{refused:?}"
+        );
+    }
+
+    /// An operation whose symbol Finam will not accept as a path segment is
+    /// quarantined beside the readable rows: one row's invalid symbol never
+    /// stops the page (iaam-vg8te.1.3).
+    #[tokio::test]
+    async fn an_operation_with_an_invalid_symbol_is_quarantined_not_an_abort() {
+        const GOOD: &str = "GOOD@MISX";
+        const BAD: &str = "BAD/ROW";
+        const GOOD_ISIN: &str = "RU000AGOOD07";
+        let operations = json!({
+            "transactions": [
+                {
+                    "id": DIVIDEND_ID,
+                    "timestamp": "2025-06-10T10:00:00Z",
+                    "category": "DIVIDEND",
+                    "symbol": GOOD,
+                    "change": { "units": "12", "nanos": 500_000_000, "currencyCode": "rub" },
+                },
+                {
+                    "id": BUY_ID,
+                    "timestamp": "2025-06-12T00:00:00Z",
+                    "category": "DIVIDEND",
+                    "symbol": BAD,
+                    "change": { "units": "7", "nanos": 0, "currencyCode": "rub" },
+                },
+            ],
+        })
+        .to_string();
+        let (instruments, expected) = directory(&[GOOD_ISIN]).await;
+        let channel = channel(
+            fake::gateway(
+                vec![
+                    session_answer(),
+                    page(&operations),
+                    Answer::status(200, format!(r#"{{"isin":"{GOOD_ISIN}"}}"#).as_str()),
+                ],
+                None,
+            )
+            .0,
+            instruments,
+        );
+
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("the operations are parsed");
+
+        assert_eq!(parsed.accepted.len(), 1, "{:?}", parsed.accepted);
+        assert!(matches!(
+            &parsed.accepted[0].kind,
+            OperationKind::Income { instrument: Some(id), .. } if *id == expected[0]
+        ));
+        assert_eq!(parsed.quarantined.len(), 1, "{:?}", parsed.quarantined);
+        let quarantined = &parsed.quarantined[0];
+        assert_eq!(quarantined.raw["symbol"], json!(BAD), "{quarantined:?}");
+        assert!(
+            quarantined.reason.contains(BAD)
+                && quarantined.reason.contains("not resolved to an instrument")
+                && quarantined.reason.contains("record the instrument"),
+            "{}",
+            quarantined.reason
+        );
+    }
+
+    /// The asset answer that should name a position's ISIN arrives
+    /// unreadable: the row is set aside with its reason and its original
+    /// JSON instead of stopping the sync, and the rest of the answer still
+    /// becomes claims — never a store failure (iaam-vg8te.1.3).
+    #[tokio::test]
+    async fn an_asset_answer_that_cannot_be_read_is_a_refused_row_not_an_abort() {
+        const GOOD: &str = "GOOD@MISX";
+        const UNREADABLE: &str = "UNRD@MISX";
+        const GOOD_ISIN: &str = "RU000AGOOD07";
+        let portfolio = json!({
+            "cash": [ { "units": "100", "nanos": 0, "currencyCode": "rub" } ],
+            "positions": [
+                { "symbol": GOOD, "quantity": { "value": "7" } },
+                { "symbol": UNREADABLE, "quantity": { "value": "3" } },
+            ],
+        })
+        .to_string();
+        let (instruments, expected) = directory(&[GOOD_ISIN]).await;
+        let channel = channel(
+            fake::gateway(
+                vec![
+                    session_answer(),
+                    page(&portfolio),
+                    Answer::status(200, format!(r#"{{"isin":"{GOOD_ISIN}"}}"#).as_str()),
+                    Answer::status(200, "not json at all"),
+                ],
+                None,
+            )
+            .0,
+            instruments,
+        );
+
+        let snapshot = channel
+            .fetch_portfolio(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("the portfolio is parsed: one row's asset answer never stops the sync");
+
+        assert_eq!(snapshot.claims.len(), 2, "{:?}", snapshot.claims);
+        assert!(snapshot
+            .claims
+            .iter()
+            .any(|claim| matches!(claim, ControlClaim::PositionQuantity { instrument, .. } if *instrument == expected[0])));
+        assert_eq!(snapshot.refused.len(), 1, "{:?}", snapshot.refused);
+        let refused = &snapshot.refused[0];
+        assert_eq!(refused.raw["symbol"], json!(UNREADABLE), "{refused:?}");
+        assert!(
+            refused.reason.contains(UNREADABLE) && refused.reason.contains("cannot be read"),
+            "{}",
+            refused.reason
+        );
+        assert_eq!(
+            refused.dimensions,
+            [Dimension::Positions].into_iter().collect(),
+            "{refused:?}"
+        );
+    }
+
+    /// A transactions or portfolio answer that is not JSON at all is the
+    /// source's answer failing to read (`parse_error` → `Unparsable`), the
+    /// classification the sync reports as source-unreadable, never our
+    /// store's failure: the whole answer failing is a whole-sync failure,
+    /// unlike one row's asset answer, and it keeps that classification
+    /// (iaam-vg8te.1.3).
+    #[tokio::test]
+    async fn a_whole_answer_that_cannot_be_read_is_the_sources_error() {
+        let portfolio_channel = channel(
+            fake::gateway(vec![session_answer(), page("not json at all")], None).0,
+            directory(&[]).await.0,
+        );
+        let error = portfolio_channel
+            .fetch_portfolio(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect_err("the whole portfolio answer is unreadable");
+        assert!(
+            matches!(&error, BrokerError::Unparsable { broker, .. } if broker == BROKER),
+            "{error}"
+        );
+
+        let operations_channel = channel(
+            fake::gateway(vec![session_answer(), page("not json at all")], None).0,
+            directory(&[]).await.0,
+        );
+        let error = operations_channel
+            .fetch_operations(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect_err("the whole transactions answer is unreadable");
+        assert!(
+            matches!(&error, BrokerError::Unparsable { broker, .. } if broker == BROKER),
+            "{error}"
+        );
+    }
+
+    /// The asset read behind one operation's symbol is refused by the
+    /// access (403), and the refused operation would need the ISIN it names:
+    /// the whole sync stops with the source's own refusal, never with our
+    /// store's failure (iaam-vg8te.1.3).
+    #[tokio::test]
+    async fn an_asset_read_the_source_refuses_keeps_the_refusal() {
+        let operations = json!({
+            "transactions": [
+                {
+                    "id": DIVIDEND_ID,
+                    "timestamp": "2025-06-10T10:00:00Z",
+                    "category": "DIVIDEND",
+                    "symbol": SYMBOL,
+                    "change": { "units": "12", "nanos": 500_000_000, "currencyCode": "rub" },
+                },
+            ],
+        })
+        .to_string();
+        let channel = channel(
+            fake::gateway(
+                vec![
+                    session_answer(),
+                    page(&operations),
+                    Answer::status(403, "forbidden"),
+                ],
+                None,
+            )
+            .0,
+            directory(&[]).await.0,
+        );
+
+        let error = channel
+            .fetch_operations(
+                account(),
+                account().inner().to_string().as_str(),
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect_err("the asset read is refused");
+
+        assert!(
+            matches!(&error, BrokerError::Refused { broker, .. } if broker == BROKER),
+            "{error}"
+        );
     }
 }

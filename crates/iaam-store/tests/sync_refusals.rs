@@ -6,6 +6,8 @@ use iaam_store::SqliteStore;
 use iaam_store::sync_refusals::SyncRefusalRecord;
 use uuid::Uuid;
 
+// Seven named fields read better than a struct-with-defaults dance in a test.
+#[allow(clippy::too_many_arguments)]
 fn refusal(
     owner: OwnerId,
     account: AccountId,

@@ -329,9 +329,11 @@ fn failure_from_finam(error: iaam_broker::finam::FinamError) -> CheckFailure {
         Error::RequestCeiling { ceiling } => CheckFailure::Other(format!(
             "the connection check spent its ceiling of {ceiling} attempts"
         )),
-        Error::InvalidAccountId | Error::PartialResponse => CheckFailure::Other(
-            "the check could not be sent as built; this is a fault of this build".to_owned(),
-        ),
+        Error::InvalidAccountId | Error::InvalidSymbol | Error::PartialResponse => {
+            CheckFailure::Other(
+                "the check could not be sent as built; this is a fault of this build".to_owned(),
+            )
+        }
     }
 }
 

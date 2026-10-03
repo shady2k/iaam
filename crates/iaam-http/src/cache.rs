@@ -790,26 +790,14 @@ mod tests {
         // access identity share one key: a renewed session token must not
         // re-send a read the same access already has cached within the hour.
         assert_eq!(
-            key(
-                &finam_read("session-token-one")
-                    .with_cache_identity("long-lived-access-secret")
-            ),
-            key(
-                &finam_read("session-token-two")
-                    .with_cache_identity("long-lived-access-secret")
-            ),
+            key(&finam_read("session-token-one").with_cache_identity("long-lived-access-secret")),
+            key(&finam_read("session-token-two").with_cache_identity("long-lived-access-secret")),
             "the rotating token does not enter the key when the identity is set"
         );
         // A different access identity is a different access.
         assert_ne!(
-            key(
-                &finam_read("session-token-one")
-                    .with_cache_identity("access-one")
-            ),
-            key(
-                &finam_read("session-token-one")
-                    .with_cache_identity("access-two")
-            ),
+            key(&finam_read("session-token-one").with_cache_identity("access-one")),
+            key(&finam_read("session-token-one").with_cache_identity("access-two")),
             "one access's answer never serves another"
         );
         // Without an identity the key falls back to the presented credential.

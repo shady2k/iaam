@@ -1137,7 +1137,9 @@ mod tests {
         // The exchange is the one call that carries the secret itself and
         // is never cached; it binds no cache identity.
         assert_eq!(
-            received[0].cache_identity().map(|identity| identity.expose()),
+            received[0]
+                .cache_identity()
+                .map(|identity| identity.expose()),
             None
         );
         for request in received.iter().skip(1) {

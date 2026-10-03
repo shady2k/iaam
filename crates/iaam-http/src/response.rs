@@ -1,6 +1,6 @@
 //! Transport response and refusals.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 
@@ -31,6 +31,14 @@ pub struct HttpResponse {
     /// is the handle a destination's own support asks for when a call went
     /// wrong, so the gateway logs it with the answer.
     pub request_id: Option<String>,
+    /// When this answer was observed, on the gateway's wall clock: the
+    /// moment a live answer arrived and was accepted, and for an answer
+    /// served from the response cache, the moment it was first fetched
+    /// and stored. Lets a caller date an answer truthfully: the same read
+    /// served an hour later still carries the hour-old moment it was
+    /// observed, not the moment that serve happened. `None` when no clock
+    /// stamped the answer.
+    pub observed_at: Option<SystemTime>,
 }
 
 impl HttpResponse {

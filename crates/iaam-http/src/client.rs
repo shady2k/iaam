@@ -145,7 +145,11 @@ impl HttpClient {
         let status = response.status().as_u16();
         let successful = response.status().is_success();
         let headers = response.headers();
-        let retry_after = named_delay(headers, request.reset_header(), SystemTime::now());
+        // The instant this answer was created: the response's real
+        // observation time, which a caller keeps when the gateway returns
+        // it and the store persists when the same answer is cached.
+        let observed_at = SystemTime::now();
+        let retry_after = named_delay(headers, request.reset_header(), observed_at);
         let location = response_location(headers);
         let content_type = response_content_type(headers);
         let request_id = response_request_id(headers);
@@ -158,6 +162,7 @@ impl HttpClient {
             location: location.clone(),
             content_type: content_type.clone(),
             request_id: request_id.clone(),
+            observed_at: Some(observed_at),
         });
         // A status line that arrived is never lost: after a non-2xx status a
         // body that fails or stalls ends the read with what arrived.
@@ -177,6 +182,7 @@ impl HttpClient {
             location,
             content_type,
             request_id,
+            observed_at: Some(observed_at),
         })
     }
 }

@@ -51,8 +51,8 @@ use thiserror::Error;
 
 use crate::destination::Destination;
 use crate::egress::{EgressDirectoryError, database_directory_for};
-use crate::gateway::Clock;
-use crate::request::{HttpMethod, HttpRequest};
+use crate::gateway::{Clock, redacted_bytes, without_secret};
+use crate::request::{HttpMethod, HttpRequest, Secret};
 use crate::response::HttpResponse;
 
 /// How long a stored answer stands in for a send: the owner's one hour.
@@ -304,7 +304,13 @@ impl ResponseCache {
                     let _ = std::fs::remove_file(&path);
                     None
                 } else {
-                    Some(entry.response)
+                    let mut response = entry.response;
+                    // The moment the answer was first fetched: the stamp the
+                    // entry was stored under, so a caller dates a served
+                    // answer by its real observation time, not by the serve.
+                    response.observed_at =
+                        Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(entry.stored));
+                    Some(response)
                 }
             }
             Err(()) => {
@@ -319,7 +325,19 @@ impl ResponseCache {
     /// Stores the answer under `key`, best effort: a store that cannot be
     /// made leaves the cache as it was, and the next call for the same read
     /// is sent again.
-    pub(crate) fn store(&self, key: &CacheKey, response: &HttpResponse) {
+    ///
+    /// `bearer` and `identity` are the presented credential and the cache
+    /// identity the read was keyed on: before anything is persisted, both
+    /// are cut out of the stored headers and body, the same redaction the
+    /// log gives a value a destination echoed the token into, so a cache
+    /// file never holds a credential.
+    pub(crate) fn store(
+        &self,
+        key: &CacheKey,
+        response: &HttpResponse,
+        bearer: Option<&Secret>,
+        identity: Option<&Secret>,
+    ) {
         if response.body.len() > MAX_STORED_BODY {
             return;
         }
@@ -327,7 +345,7 @@ impl ResponseCache {
         self.evict_over_the_cap();
         let name = key.hex();
         let temporary = self.directory.join(format!("{name}.tmp"));
-        let entry = Entry::of(response, self.stored_now());
+        let entry = Entry::of(response, self.stored_now(), bearer, identity);
         let stored = (|| -> std::io::Result<()> {
             let mut file = match std::fs::OpenOptions::new()
                 .write(true)
@@ -451,7 +469,12 @@ struct Entry {
 }
 
 impl Entry {
-    fn of(response: &HttpResponse, stored: u64) -> Vec<u8> {
+    fn of(
+        response: &HttpResponse,
+        stored: u64,
+        bearer: Option<&Secret>,
+        identity: Option<&Secret>,
+    ) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(192 + response.body.len());
         line(&mut bytes, ENTRY_VERSION);
         line(&mut bytes, &format!("stored {stored}"));
@@ -463,16 +486,35 @@ impl Entry {
                 None => "retry-after-ms -".to_owned(),
             },
         );
-        line(&mut bytes, &named("location", response.location.as_deref()));
         line(
             &mut bytes,
-            &named("content-type", response.content_type.as_deref()),
+            &named(
+                "location",
+                without_the_credentials(response.location.as_deref(), bearer, identity).as_deref(),
+            ),
         );
         line(
             &mut bytes,
-            &named("request-id", response.request_id.as_deref()),
+            &named(
+                "content-type",
+                without_the_credentials(response.content_type.as_deref(), bearer, identity)
+                    .as_deref(),
+            ),
         );
-        bytes.extend_from_slice(&response.body);
+        line(
+            &mut bytes,
+            &named(
+                "request-id",
+                without_the_credentials(response.request_id.as_deref(), bearer, identity)
+                    .as_deref(),
+            ),
+        );
+        // The body too: a destination that echoes the presented token into
+        // its answer must not hand it to the next reader of the cache file.
+        bytes.extend_from_slice(&redacted_bytes(
+            &redacted_bytes(&response.body, bearer),
+            identity,
+        ));
         bytes
     }
 
@@ -521,9 +563,24 @@ impl Entry {
             location: value(header[4], "location")?,
             content_type: value(header[5], "content-type")?,
             request_id: value(header[6], "request-id")?,
+            // The stamp is carried by the entry itself; `lookup` dates the
+            // served answer with it.
+            observed_at: None,
         };
         Ok(Self { stored, response })
     }
+}
+
+/// `value` with every occurrence of the presented credential and of the
+/// cache identity cut out — the same redaction the log applies to a value a
+/// destination echoed the token into — or `None` when the header is absent.
+/// A header with no occurrence is kept as it was.
+fn without_the_credentials(
+    value: Option<&str>,
+    bearer: Option<&Secret>,
+    identity: Option<&Secret>,
+) -> Option<String> {
+    without_secret(without_secret(value, bearer).as_deref(), identity)
 }
 
 fn line(bytes: &mut Vec<u8>, text: &str) {
@@ -811,7 +868,7 @@ mod tests {
     #[test]
     fn an_entry_round_trips_the_whole_answer() {
         let time = Shifted::new();
-        let (cache, _place) = cache("round-trip", &time);
+        let (cache, place) = cache("round-trip", &time);
         let key = CacheKey::of(&moex_read()).expect("a GET is cached");
         let response = HttpResponse {
             status: 200,
@@ -820,9 +877,32 @@ mod tests {
             location: Some("https://iss.moex.com/elsewhere".to_owned()),
             content_type: Some("application/json; charset=utf-8".to_owned()),
             request_id: Some("moex-req-7".to_owned()),
+            observed_at: None,
         };
-        cache.store(&key, &response);
-        assert_eq!(cache.lookup(&key), Some(response));
+        cache.store(&key, &response, None, None);
+        // The stored answer also carries the moment it was stored.
+        let stamped = stamp_of(&place.join(key.hex())).expect("the entry is stamped");
+        let mut stored = response;
+        stored.observed_at = Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(stamped));
+        assert_eq!(cache.lookup(&key), Some(stored));
+    }
+
+    #[test]
+    fn a_served_answer_keeps_the_moment_it_was_first_fetched() {
+        let time = Shifted::new();
+        let (cache, place) = cache("moment", &time);
+        let key = CacheKey::of(&moex_read()).expect("a GET is cached");
+        cache.store(&key, &answered(200, b"page"), None, None);
+        let fetched = stamp_of(&place.join(key.hex())).expect("the entry is stamped");
+
+        // Nearly the hour later the lookup is served.
+        time.advance(CACHE_TTL - Duration::from_secs(1));
+        let served = cache.lookup(&key).expect("the entry is served");
+        assert_eq!(
+            served.observed_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(fetched)),
+            "the served answer keeps the moment it was first fetched, not the moment it was served"
+        );
     }
 
     #[test]
@@ -830,7 +910,7 @@ mod tests {
         let time = Shifted::new();
         let (cache, place) = cache("expiry", &time);
         let key = CacheKey::of(&moex_read()).expect("a GET is cached");
-        cache.store(&key, &answered(200, b"page"));
+        cache.store(&key, &answered(200, b"page"), None, None);
 
         time.advance(CACHE_TTL - Duration::from_secs(1));
         assert!(
@@ -855,11 +935,11 @@ mod tests {
         let time = Shifted::new();
         let (cache, place) = cache("sweep", &time);
         let first = CacheKey::of(&moex_read()).expect("a GET is cached");
-        cache.store(&first, &answered(200, b"old"));
+        cache.store(&first, &answered(200, b"old"), None, None);
 
         time.advance(CACHE_TTL + Duration::from_secs(1));
         let second = CacheKey::of(&moex_read().with_query("start", "2")).expect("a read");
-        cache.store(&second, &answered(200, b"new"));
+        cache.store(&second, &answered(200, b"new"), None, None);
 
         assert!(
             !place.join(first.hex()).exists(),
@@ -893,7 +973,12 @@ mod tests {
             })
             .collect();
         for (index, key) in keys.iter().enumerate() {
-            cache.store(key, &answered(200, format!("page {index}").as_bytes()));
+            cache.store(
+                key,
+                &answered(200, format!("page {index}").as_bytes()),
+                None,
+                None,
+            );
         }
 
         let entries = std::fs::read_dir(&place)
@@ -921,7 +1006,7 @@ mod tests {
         let bearer = "test-bearer-token-Q1w2e3r4";
         let secret = "test-finam-secret-Z9y8x7w6";
         let key = CacheKey::of(&finam_read(bearer)).expect("a read");
-        cache.store(&key, &answered(200, b"holdings"));
+        cache.store(&key, &answered(200, b"holdings"), None, None);
         // The exchange is never cached; nothing of it may land anywhere.
         assert!(CacheKey::of(&finam_exchange(secret)).is_none());
 
@@ -954,7 +1039,7 @@ mod tests {
         let time = Shifted::new();
         let (cache, place) = cache("modes", &time);
         let key = CacheKey::of(&moex_read()).expect("a GET is cached");
-        cache.store(&key, &answered(200, b"x"));
+        cache.store(&key, &answered(200, b"x"), None, None);
 
         let directory_mode = std::fs::metadata(&place)
             .expect("place read")

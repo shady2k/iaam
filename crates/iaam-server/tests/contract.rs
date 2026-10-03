@@ -120,6 +120,7 @@ impl BrokerChannel for EmptyChannel {
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
+            observed_on: None,
             claims: Vec::new(),
             refused: Vec::new(),
         })
@@ -190,6 +191,7 @@ impl BrokerChannel for PopulatedChannel {
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
+            observed_on: None,
             claims: Vec::new(),
             refused: Vec::new(),
         })
@@ -12442,6 +12444,7 @@ impl BrokerChannel for TwinRowsChannel {
     ) -> Result<PortfolioSnapshot, BrokerError> {
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
+            observed_on: None,
             claims: Vec::new(),
             refused: Vec::new(),
         })
@@ -35789,6 +35792,7 @@ impl BrokerChannel for RecordingChannel {
             .push(broker_account.to_owned());
         Ok(PortfolioSnapshot {
             as_of: PortfolioAsOf::Current,
+            observed_on: None,
             claims: Vec::new(),
             refused: Vec::new(),
         })

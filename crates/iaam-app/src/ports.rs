@@ -36,6 +36,7 @@ pub use iaam_store::journal::RecordedEvent;
 // where rules live, and nothing may branch on it.
 pub use iaam_core::report::balances::NegativeBalanceExpectation;
 pub use iaam_store::reference::CashAssetClass;
+pub use iaam_store::sync_refusals::SyncRefusalRecord;
 use serde_json::Value;
 use std::sync::Arc;
 use time::Date;
@@ -1056,6 +1057,37 @@ pub trait Store: Send + Sync {
         account: AccountId,
         broker: &BrokerCode,
         broker_account: String,
+    ) -> Result<(), AppError>;
+
+    /// Record or refresh one refused row of a broker sync, so the owner can
+    /// act on it with the row and the reason in hand (iaam-vg8te.1.2). A
+    /// re-sync of the same owner row updates the record and reopens it; only
+    /// a later sync that no longer lists the row settles it.
+    async fn upsert_sync_refusal(&self, record: SyncRefusalRecord) -> Result<(), AppError>;
+
+    /// The open refusals of one owner account and channel whose interval
+    /// overlaps `[from, to]`, ordered by the row's key.
+    async fn list_open_sync_refusals(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        source: &str,
+        from: Date,
+        to: Date,
+    ) -> Result<Vec<SyncRefusalRecord>, AppError>;
+
+    /// Settle every open refusal of the channel that a later sync no longer
+    /// lists, among those whose interval overlaps `[from, to]`. A row that
+    /// the sync refused again stays open, however `row_keys` is ordered.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_sync_refusals_besides(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        source: &str,
+        from: Date,
+        to: Date,
+        row_keys: &[String],
     ) -> Result<(), AppError>;
 
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;

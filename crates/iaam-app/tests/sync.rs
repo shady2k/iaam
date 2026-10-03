@@ -1194,6 +1194,199 @@ async fn a_refused_t_invest_cash_row_gaps_cash_instead_of_positions() {
     );
 }
 
+/// A refused row of a real T-Invest channel over the scripted transport
+/// reaches the owner as a question he can act on: the reconciliation report
+/// carries the row with the reason it was set aside and the row as it
+/// arrived, and a later sync of the same range through the same channel that
+/// imports the row settles the question so its reason no longer appears
+/// (iaam-vg8te.1.2).
+#[tokio::test]
+async fn a_refused_row_reaches_the_owner_with_its_reason_and_payload_and_settles_once_imported() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    // One channel identity shared by both syncs below: the second may settle
+    // the first's refusal only because it speaks for the same source.
+    let source = SourceId::new_random();
+
+    // The first sync is handed a currency row whose quantity cannot be read
+    // (it states a nano without its units) beside a readable security row: the
+    // currency row is set aside with its reason and original JSON, the
+    // security row still imports.
+    let channel = channel_over_with(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio: format!(
+                r#"{{"positions":[
+                    {{
+                        "instrumentType": "currency",
+                        "quantity": {{"nano": 500000000}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                        "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c4",
+                        "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+                    }},
+                    {{
+                        "instrumentType": "share",
+                        "quantity": {{"units": "1", "nano": 0}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c5",
+                        "instrumentUid": "{instrument_uid}",
+                        "blocked": false
+                    }}
+                ]}}"#,
+                instrument_uid = instrument.inner(),
+            ),
+        },
+        source,
+    );
+
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    // One row refused, one row imported.
+    assert_eq!(first.set_aside, 1, "{:?}", first.recorded);
+
+    // The store now holds the row as the owner's question: key, reason and
+    // the original payload, under the channel's own source identity.
+    let source_text = source.inner().to_string();
+    let open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals: {error}"));
+    assert_eq!(open.len(), 1, "one set-aside row, one question");
+    assert!(!open[0].reason.is_empty(), "{:?}", open[0]);
+    let payload: serde_json::Value = serde_json::from_str(&open[0].payload)
+        .unwrap_or_else(|error| panic!("stored payload is JSON: {error}"));
+    assert_eq!(payload["instrumentType"], "currency");
+
+    // The owner-facing read — the reconciliation report for the period —
+    // carries the refusal with its reason and the row as it arrived.
+    let report = iaam_app::scenarios::reconciliation::report(
+        &services,
+        &principal(owner),
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("report: {error}"));
+    let action = report
+        .actions
+        .iter()
+        .find(|action| action.kind() == iaam_app::actions::ActionKind::CoverageGapUnrepaired)
+        .unwrap_or_else(|| panic!("no coverage gap action in {report:#?}"));
+    assert!(
+        action.reason().contains(&open[0].reason),
+        "the reason reaches the owner: {}",
+        action.reason()
+    );
+    assert!(
+        action.reason().contains(&open[0].payload),
+        "the payload reaches the owner: {}",
+        action.reason()
+    );
+
+    // The second sync reads the same row whole (its quantity now states its
+    // units): no row is set aside, the refusal is settled, and its reason no
+    // longer appears in the report.
+    let fixed = channel_over_with(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio: format!(
+                r#"{{"positions":[
+                    {{
+                        "instrumentType": "currency",
+                        "quantity": {{"units": "-100", "nano": 0}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                        "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c4",
+                        "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+                    }},
+                    {{
+                        "instrumentType": "share",
+                        "quantity": {{"units": "1", "nano": 0}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c5",
+                        "instrumentUid": "{instrument_uid}",
+                        "blocked": false
+                    }}
+                ]}}"#,
+                instrument_uid = instrument.inner(),
+            ),
+        },
+        source,
+    );
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &fixed,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second sync: {error}"));
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+
+    let still_open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals after the second sync: {error}"));
+    assert!(still_open.is_empty(), "{still_open:?}");
+
+    let after = iaam_app::scenarios::reconciliation::report(
+        &services,
+        &principal(owner),
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("report after the second sync: {error}"));
+    let action = after
+        .actions
+        .iter()
+        .find(|action| action.kind() == iaam_app::actions::ActionKind::CoverageGapUnrepaired);
+    // The coverage gap may still stand — it is a statement about the first
+    // attempt — but the settled row must not be asked about again.
+    if let Some(action) = action {
+        assert!(
+            !action.reason().contains(&open[0].reason),
+            "the settled refusal must not be asked again: {}",
+            action.reason()
+        );
+        assert!(
+            !action.reason().contains(&open[0].payload),
+            "the settled refusal must not be asked again: {}",
+            action.reason()
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
     let owner = OwnerId::new_random();
@@ -2887,6 +3080,13 @@ impl Transport for ThrottlingTinvest {
 }
 
 fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
+    channel_over_with(transport, SourceId::new_random())
+}
+
+/// The same channel over a source the caller chooses: two syncs that must
+/// speak for one channel identity — so the second can settle the first's
+/// refusals — build both channels with one `SourceId`.
+fn channel_over_with<T: Transport + 'static>(transport: T, source: SourceId) -> TinkoffChannel {
     let time = Arc::new(FakeTime {
         now: Mutex::new(Instant::now()),
         wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
@@ -2907,7 +3107,7 @@ fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    TinkoffChannel::new(client, SourceId::new_random(), dictionary)
+    TinkoffChannel::new(client, source, dictionary)
 }
 
 #[tokio::test]

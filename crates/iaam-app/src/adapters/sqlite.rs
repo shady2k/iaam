@@ -19,8 +19,8 @@ use crate::ports::{
     DeclinedAccountNameView, DocumentToKeep, ImportObservationView, ImportQuestionView,
     ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
     InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery,
-    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store, TokenAdmin,
-    TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
+    NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store,
+    SyncRefusalRecord, TokenAdmin, TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -300,6 +300,15 @@ fn import_session_error(error: iaam_store::StoreError) -> AppError {
         },
         other => store_error(other),
     }
+}
+
+/// One date in the ISO form the refusals table keeps its intervals in.
+fn iso(date: Date) -> String {
+    // `time::Date` prints exactly the `YYYY-MM-DD` the store and the store
+    // tests compare; formatting it here rather than at the call site keeps the
+    // two ports (the refused-row write and the report read) from ever
+    // disagreeing about the shape of an interval endpoint.
+    date.to_string()
 }
 
 fn store_error(error: iaam_store::StoreError) -> AppError {
@@ -821,6 +830,54 @@ impl Store for SqliteAdapter {
                     }
                     other => store_error(other),
                 })
+        })
+        .await
+    }
+
+    async fn upsert_sync_refusal(&self, record: SyncRefusalRecord) -> Result<(), AppError> {
+        self.blocking(move |store| store.upsert_sync_refusal(&record).map_err(store_error))
+            .await
+    }
+
+    async fn list_open_sync_refusals(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        source: &str,
+        from: Date,
+        to: Date,
+    ) -> Result<Vec<SyncRefusalRecord>, AppError> {
+        let source = source.to_owned();
+        self.blocking(move |store| {
+            store
+                .list_open_sync_refusals(owner, account, &source, &iso(from), &iso(to))
+                .map_err(store_error)
+        })
+        .await
+    }
+
+    async fn settle_sync_refusals_besides(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        source: &str,
+        from: Date,
+        to: Date,
+        row_keys: &[String],
+    ) -> Result<(), AppError> {
+        let source = source.to_owned();
+        let row_keys = row_keys.to_vec();
+        self.blocking(move |store| {
+            store
+                .settle_sync_refusals_besides(
+                    owner,
+                    account,
+                    &source,
+                    &iso(from),
+                    &iso(to),
+                    &row_keys,
+                )
+                .map_err(store_error)
         })
         .await
     }

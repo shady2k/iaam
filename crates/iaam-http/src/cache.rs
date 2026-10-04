@@ -20,6 +20,17 @@
 //! status, body and the headers [`HttpResponse`] carries — stands in for
 //! the send for [`CACHE_TTL`], one hour.
 //!
+//! **The moment a served answer dates.** The entry keeps the storage stamp
+//! the hour of validity is measured from and, when the stored answer
+//! already carried its own observation moment (the stamp the real client
+//! gave it at status-line time), that moment too. A served answer is
+//! dated by the moment it was observed, not by the moment the store wrote
+//! it: a response whose headers arrived just before midnight and whose
+//! body finished just after is observed on one day when served, whatever
+//! day the store was written on. The moment line is optional — an entry
+//! written before it existed still parses, and the served answer is then
+//! dated by its storage stamp as it always was.
+//!
 //! **The key.** The SHA-256 of the destination, the method, the wire URL
 //! (path and full query), the request body and a SHA-256 fingerprint of
 //! the caller-bound stable access identity where one is set (Finam binds
@@ -305,11 +316,16 @@ impl ResponseCache {
                     None
                 } else {
                     let mut response = entry.response;
-                    // The moment the answer was first fetched: the stamp the
-                    // entry was stored under, so a caller dates a served
-                    // answer by its real observation time, not by the serve.
-                    response.observed_at =
-                        Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(entry.stored));
+                    // The moment the answer was observed: the answer's own
+                    // stamp when the entry carries one, else the moment the
+                    // entry was stored — so a caller dates a served answer
+                    // by its real observation time, not by the serve, and a
+                    // response cached across midnight keeps the day it was
+                    // actually observed.
+                    response.observed_at = Some(match entry.observed_at {
+                        Some(at) => at,
+                        None => SystemTime::UNIX_EPOCH + Duration::from_nanos(entry.stored),
+                    });
                     Some(response)
                 }
             }
@@ -462,9 +478,12 @@ fn stamp_of(path: &Path) -> Option<u64> {
 }
 
 /// One stored answer: the header lines, then the body bytes as they were
-/// received.
+/// received. `stored` is the stamp the hour of validity is measured from;
+/// `observed_at` is the answer's own observation moment, when the stored
+/// answer carried one.
 struct Entry {
     stored: u64,
+    observed_at: Option<SystemTime>,
     response: HttpResponse,
 }
 
@@ -478,6 +497,12 @@ impl Entry {
         let mut bytes = Vec::with_capacity(192 + response.body.len());
         line(&mut bytes, ENTRY_VERSION);
         line(&mut bytes, &format!("stored {stored}"));
+        // The answer's own observation moment, kept beside the storage
+        // stamp when the answer carried one: a served answer dates the day
+        // it was observed, not the day the store wrote it.
+        if let Some(at) = response.observed_at {
+            line(&mut bytes, &format!("observed-at {}", unix_nanos(at)));
+        }
         line(&mut bytes, &format!("status {}", response.status));
         line(
             &mut bytes,
@@ -518,57 +543,89 @@ impl Entry {
         bytes
     }
 
-    /// The strict inverse of [`Self::of`]: seven header lines, then the
-    /// body. Anything else — another version, a short or repeated line, a
-    /// carriage return in a header — is not an answer.
+    /// The strict inverse of [`Self::of`]: the version line, the storage
+    /// stamp, an optional `observed-at` line when the stored answer
+    /// carried its own observation moment, then the five answer header
+    /// lines, then the body. Anything else — another version, a short or
+    /// repeated line, a carriage return in a header — is not an answer.
+    /// An entry written before the `observed-at` line existed (an earlier
+    /// build's entry) has none and still parses: the storage stamp is then
+    /// followed straight by the status line, and `lookup` dates the served
+    /// answer by the storage stamp as it always did.
     fn parse(bytes: &[u8]) -> Result<Self, ()> {
-        let mut header = [&[] as &[u8]; 7];
         let mut rest = bytes;
-        for slot in &mut header {
-            let newline = rest.iter().position(|byte| *byte == b'\n').ok_or(())?;
-            let (line, remainder) = rest.split_at(newline);
-            if line.contains(&b'\r') {
-                return Err(());
-            }
-            *slot = line;
-            rest = &remainder[1..];
-        }
-        if header[0] != ENTRY_VERSION.as_bytes() {
+        if line_of(&mut rest)? != ENTRY_VERSION.as_bytes() {
             return Err(());
         }
-        let stored = core::str::from_utf8(header[1])
-            .map_err(|_| ())?
-            .strip_prefix("stored ")
-            .ok_or(())?
+        let stored = header_field(line_of(&mut rest)?, "stored")?
             .parse()
             .map_err(|_| ())?;
-        let status = core::str::from_utf8(header[2])
-            .map_err(|_| ())?
-            .strip_prefix("status ")
-            .ok_or(())?
-            .parse()
-            .map_err(|_| ())?;
-        let retry_after = match core::str::from_utf8(header[3])
-            .map_err(|_| ())?
-            .strip_prefix("retry-after-ms ")
-            .ok_or(())?
+        // The answer's own observation moment, read only when the next
+        // line is its `observed-at`; an entry without the line proceeds
+        // straight to the status line.
+        let mut observed_at = None;
+        if let Some(line) = peek_line(rest)
+            && line.starts_with(b"observed-at ")
         {
+            let nanos = header_field(line_of(&mut rest)?, "observed-at")?
+                .parse()
+                .map_err(|_| ())?;
+            observed_at = Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos));
+        }
+        let status = header_field(line_of(&mut rest)?, "status")?
+            .parse()
+            .map_err(|_| ())?;
+        let retry_after = match header_field(line_of(&mut rest)?, "retry-after-ms")? {
             "-" => None,
             millis => Some(Duration::from_millis(millis.parse().map_err(|_| ())?)),
         };
+        let location = value(line_of(&mut rest)?, "location")?;
+        let content_type = value(line_of(&mut rest)?, "content-type")?;
+        let request_id = value(line_of(&mut rest)?, "request-id")?;
         let response = HttpResponse {
             status,
             body: rest.to_vec(),
             retry_after,
-            location: value(header[4], "location")?,
-            content_type: value(header[5], "content-type")?,
-            request_id: value(header[6], "request-id")?,
-            // The stamp is carried by the entry itself; `lookup` dates the
-            // served answer with it.
+            location,
+            content_type,
+            request_id,
+            // `lookup` dates the served answer: from the answer's own
+            // moment when the entry carries one, else from the storage
+            // stamp.
             observed_at: None,
         };
-        Ok(Self { stored, response })
+        Ok(Self {
+            stored,
+            observed_at,
+            response,
+        })
     }
+}
+
+/// The next line and the bytes after it, or `Err` when there is none or
+/// the line holds a carriage return.
+fn line_of<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8], ()> {
+    let newline = rest.iter().position(|byte| *byte == b'\n').ok_or(())?;
+    let (line, remainder) = rest.split_at(newline);
+    if line.contains(&b'\r') {
+        return Err(());
+    }
+    *rest = &remainder[1..];
+    Ok(line)
+}
+
+/// The next line, not consumed: what the parser reads to see whether the
+/// line after the storage stamp is the answer's own `observed-at` or the
+/// status line of an entry written before that line existed.
+fn peek_line(rest: &[u8]) -> Option<&[u8]> {
+    if rest.is_empty() {
+        return None;
+    }
+    let line = match rest.iter().position(|byte| *byte == b'\n') {
+        Some(newline) => &rest[..newline],
+        None => rest,
+    };
+    (!line.contains(&b'\r')).then_some(line)
 }
 
 /// `value` with every occurrence of the presented credential and of the
@@ -597,12 +654,19 @@ fn named(name: &str, value: Option<&str>) -> String {
 }
 
 fn value(line: &[u8], name: &str) -> Result<Option<String>, ()> {
-    let prefix = format!("{name} ");
-    let rest = line.strip_prefix(prefix.as_bytes()).ok_or(())?;
-    if rest == b"-" {
+    let rest = header_field(line, name)?;
+    if rest == "-" {
         return Ok(None);
     }
-    Ok(Some(String::from_utf8(rest.to_vec()).map_err(|_| ())?))
+    Ok(Some(rest.to_owned()))
+}
+
+/// The value after `name ` in a header line, or `Err` when the line is
+/// not the named one or is not UTF-8.
+fn header_field<'a>(line: &'a [u8], name: &str) -> Result<&'a str, ()> {
+    let prefix = format!("{name} ");
+    let rest = line.strip_prefix(prefix.as_bytes()).ok_or(())?;
+    core::str::from_utf8(rest).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -903,6 +967,52 @@ mod tests {
             Some(SystemTime::UNIX_EPOCH + Duration::from_nanos(fetched)),
             "the served answer keeps the moment it was first fetched, not the moment it was served"
         );
+    }
+
+    #[test]
+    fn a_served_answer_keeps_its_own_observed_moment() {
+        let time = Shifted::new();
+        let (cache, place) = cache("own-moment", &time);
+        let key = CacheKey::of(&moex_read()).expect("a GET is cached");
+        // A live answer's stamp, as the real transport gives it at
+        // status-line time.
+        let moment = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let response = HttpResponse {
+            status: 200,
+            body: b"page".to_vec(),
+            observed_at: Some(moment),
+            ..Default::default()
+        };
+        cache.store(&key, &response, None, None);
+
+        // The same store serves the next gateway the same read: the
+        // served answer keeps the moment it was originally observed,
+        // exactly — not the moment the store wrote it.
+        let second =
+            ResponseCache::open(&place, Arc::clone(&time) as Arc<dyn Clock>).expect("opened");
+        time.advance(CACHE_TTL - Duration::from_secs(1));
+        let served = second.lookup(&key).expect("the entry is served");
+        assert_eq!(
+            served.observed_at,
+            Some(moment),
+            "the served answer keeps its own observed moment, not the storage stamp"
+        );
+    }
+
+    #[test]
+    fn an_entry_written_without_the_observed_at_line_still_parses() {
+        // The exact layout an entry written before the observed-at line
+        // existed has: the storage stamp followed straight by the status.
+        let old = b"iaam-response-cache-v1\nstored 1000\nstatus 200\nretry-after-ms -\nlocation -\ncontent-type -\nrequest-id moex-req-7\npage";
+        let parsed =
+            Entry::parse(old).expect("an entry written without the observed-at line parses");
+        assert_eq!(parsed.stored, 1000);
+        assert_eq!(parsed.observed_at, None, "an old entry has no own moment");
+        assert_eq!(parsed.response.status, 200);
+        assert_eq!(parsed.response.retry_after, None);
+        assert_eq!(parsed.response.location, None);
+        assert_eq!(parsed.response.request_id.as_deref(), Some("moex-req-7"));
+        assert_eq!(parsed.response.body, b"page");
     }
 
     #[test]

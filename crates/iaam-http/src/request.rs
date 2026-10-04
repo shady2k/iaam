@@ -167,6 +167,12 @@ pub struct HttpRequest {
     /// not the rotating session token. Never sent on the wire; only its
     /// digest may enter a cache key.
     cache_identity: Option<Secret>,
+    /// Body-carried credentials the source names, which the gateway cuts
+    /// out of every logged header and body value. The Finam secret and
+    /// the session token ride the request body alone, so the gateway has
+    /// no `Authorization` header to scrub when a destination echoes them
+    /// back.
+    redaction_words: Vec<Secret>,
 }
 
 impl HttpRequest {
@@ -241,6 +247,7 @@ impl HttpRequest {
             reset_header: None,
             allowance: None,
             cache_identity: None,
+            redaction_words: Vec::new(),
             // A GET reads; any other method may act, and acting twice is
             // not undone by a later success.
             idempotent: matches!(method, HttpMethod::Get),
@@ -280,6 +287,27 @@ impl HttpRequest {
     pub fn with_cache_identity(mut self, identity: &str) -> Self {
         self.cache_identity = Some(Secret::new(identity));
         self
+    }
+
+    /// Name a body-carried credential the gateway must cut out of every
+    /// logged header and body value. A credential that travels only in the
+    /// request body — the Finam secret on `POST /v1/sessions`, the session
+    /// token on `/v1/sessions/details` — has no `Authorization` header of
+    /// its own to scrub: if the destination echoes the value back in a
+    /// response header or body, only a value named here stands between it
+    /// and the log. Call once per value.
+    #[must_use]
+    pub fn with_redaction_word(mut self, word: &str) -> Self {
+        self.redaction_words.push(Secret::new(word));
+        self
+    }
+
+    /// The body-carried credentials the request named, which the gateway
+    /// cuts out of every logged header and body value. A request that
+    /// named none leaves the existing behavior exactly as it was.
+    #[must_use]
+    pub fn redaction_words(&self) -> &[Secret] {
+        &self.redaction_words
     }
 
     /// `SOAPAction` header. Required by CBR: without it the service returns a
@@ -622,6 +650,46 @@ mod tests {
         assert_eq!(
             format!("{:?}", Secret::new("token-value")),
             "Secret(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn redaction_words_are_kept_for_the_log_scrubbers() {
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            RequestBody::Json(r#"{"secret":"the-finam-secret"}"#.to_owned()),
+        )
+        .with_redaction_word("the-finam-secret")
+        .with_redaction_word("the-session-token");
+
+        let words: Vec<&str> = request
+            .redaction_words()
+            .iter()
+            .map(Secret::expose)
+            .collect();
+        assert_eq!(words, ["the-finam-secret", "the-session-token"]);
+    }
+
+    #[test]
+    fn a_request_without_redaction_words_has_none() {
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        assert!(request.redaction_words().is_empty());
+    }
+
+    #[test]
+    fn a_redaction_word_never_appears_in_debug_output() {
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            RequestBody::Json("{}".to_owned()),
+        )
+        .with_redaction_word("the-super-secret-body-value");
+        let printed = format!("{request:?}");
+        assert!(
+            !printed.contains("the-super-secret-body-value"),
+            "secret leaked into Debug: {printed}"
         );
     }
 

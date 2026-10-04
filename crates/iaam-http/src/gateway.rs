@@ -725,9 +725,10 @@ impl GatewayError {
 ///
 /// Kept for the source, which alone knows what a broker's refusal body means
 /// (a T-Invest error code, say). `Debug` prints its length only: a refusal is
-/// logged, and a body may carry the owner's data. The request's bearer secret
-/// is cut out before the body is kept: a destination that echoes the token
-/// back would otherwise hand it to every reader of the error.
+/// logged, and a body may carry the owner's data. The request's presented
+/// credential, its bound cache identity and every body-carried redaction
+/// word are cut out before the body is kept: a destination that echoes one
+/// of them back would otherwise hand it to every reader of the error.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RejectedBody(Vec<u8>);
 
@@ -739,9 +740,10 @@ const REDACTED: &[u8] = REDACTED_TEXT.as_bytes();
 /// The response headers a refused line reads back: where a redirect
 /// points, the body's type, and the request id the destination named.
 ///
-/// Each is cut of the request's bearer secret at capture: a destination
-/// that echoes the presented token back in a header would otherwise hand
-/// it to every reader of the log. Carries no body and no status: the
+/// Each is cut of the request's presented credential, of its bound cache
+/// identity and of every body-carried redaction word at capture: a
+/// destination that echoes one of them back in a header would otherwise
+/// hand it to every reader of the log. Carries no body and no status: the
 /// rejection itself does.
 #[derive(Debug, Clone, Default)]
 struct RefusalHeaders {
@@ -751,13 +753,26 @@ struct RefusalHeaders {
 }
 
 impl RefusalHeaders {
-    fn of(response: &HttpResponse, secret: Option<&Secret>) -> Self {
+    fn of(response: &HttpResponse, request: &HttpRequest) -> Self {
         Self {
-            location: without_secret(response.location.as_deref(), secret),
-            content_type: without_secret(response.content_type.as_deref(), secret),
-            request_id: without_secret(response.request_id.as_deref(), secret),
+            location: without_secrets(response.location.as_deref(), redaction_of(request)),
+            content_type: without_secrets(response.content_type.as_deref(), redaction_of(request)),
+            request_id: without_secrets(response.request_id.as_deref(), redaction_of(request)),
         }
     }
+}
+
+/// Every secret a logged value must be cut of before it reaches the log:
+/// the presented credential, the bound cache identity, and each
+/// body-carried redaction word the request names — a Finam exchange names
+/// its own secret, which travels only in the body and so has no
+/// `Authorization` header of its own to scrub.
+fn redaction_of(request: &HttpRequest) -> impl Iterator<Item = &Secret> {
+    request
+        .bearer()
+        .into_iter()
+        .chain(request.cache_identity())
+        .chain(request.redaction_words().iter())
 }
 
 /// `value` with every occurrence of the presented secret cut out, or
@@ -766,24 +781,48 @@ impl RefusalHeaders {
 /// persists a header, so a source that echoes the token cannot hand it
 /// to a later reader of the cache file either.
 pub(crate) fn without_secret(value: Option<&str>, secret: Option<&Secret>) -> Option<String> {
-    let value = value?;
-    let Some(secret) = secret.map(Secret::expose) else {
-        return Some(value.to_owned());
-    };
-    if secret.is_empty() {
-        return Some(value.to_owned());
-    }
-    Some(value.replace(secret, REDACTED_TEXT))
+    without_secrets(value, secret)
 }
 
-/// `bytes` with every occurrence of the presented secret cut out, else
-/// the bytes as they were. No secret, or an empty one, leaves the bytes
-/// as they were. The one byte-level redaction of the crate: a refusal
-/// body kept for the source and a response body stored beside the
-/// database both pass through here, so a source that echoes the token
-/// back cannot hand it to a later reader of either.
-pub(crate) fn redacted_bytes(bytes: &[u8], secret: Option<&Secret>) -> Vec<u8> {
-    let secret = secret.map_or(&[][..], |secret| secret.expose().as_bytes());
+/// `value` with every occurrence of each secret cut out, or `None` when
+/// the header is absent. No secret, or an empty one, leaves the value as
+/// it was. The one place a logged value is cleared of everything a caller
+/// named secret — the presented credential, the bound cache identity, and
+/// every body-carried redaction word.
+pub(crate) fn without_secrets<'a, I>(value: Option<&str>, secrets: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a Secret>,
+{
+    let value = value?;
+    let mut kept = value.to_owned();
+    for secret in secrets {
+        let exposed = secret.expose();
+        if !exposed.is_empty() {
+            kept = kept.replace(exposed, REDACTED_TEXT);
+        }
+    }
+    Some(kept)
+}
+
+/// `bytes` with every occurrence of each secret cut out, else the bytes
+/// as they were. No secret, or an empty one, leaves the bytes as they
+/// were. The byte-level redaction of the crate: a refusal body kept for
+/// the source and a response body stored beside the database both pass
+/// through here, so a source that echoes a secret back cannot hand it to
+/// a later reader of either.
+pub(crate) fn redacted_bytes<'a, I>(bytes: &[u8], secrets: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = &'a Secret>,
+{
+    let mut kept = bytes.to_vec();
+    for secret in secrets {
+        kept = redact_secret_from(&kept, secret.expose().as_bytes());
+    }
+    kept
+}
+
+/// `bytes` with every occurrence of `secret` replaced by [`REDACTED`].
+fn redact_secret_from(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
     if secret.is_empty() {
         return bytes.to_vec();
     }
@@ -802,8 +841,11 @@ pub(crate) fn redacted_bytes(bytes: &[u8], secret: Option<&Secret>) -> Vec<u8> {
 }
 
 impl RejectedBody {
-    fn without_secret(body: &[u8], secret: Option<&Secret>) -> Self {
-        Self(redacted_bytes(body, secret))
+    fn without_secret<'a, I>(body: &[u8], redaction: I) -> Self
+    where
+        I: IntoIterator<Item = &'a Secret>,
+    {
+        Self(redacted_bytes(body, redaction))
     }
 
     #[must_use]
@@ -1588,7 +1630,7 @@ impl<T: Transport + 'static> Gateway<T> {
                 attempt = 0,
                 status = stored.status,
                 elapsed_ms = millis(self.clock.now() - started),
-                request_id = without_secret(stored.request_id.as_deref(), request.bearer())
+                request_id = without_secrets(stored.request_id.as_deref(), redaction_of(request))
                     .as_deref()
                     .unwrap_or("-"),
                 "outbound call answered from cache"
@@ -2211,9 +2253,9 @@ impl<T: Transport + 'static> Gateway<T> {
                                 attempt = attempts,
                                 status = response.status,
                                 elapsed_ms = millis(self.clock.now() - started),
-                                request_id = without_secret(
+                                request_id = without_secrets(
                                     response.request_id.as_deref(),
-                                    request.bearer(),
+                                    redaction_of(request),
                                 )
                                 .as_deref()
                                 .unwrap_or("-"),
@@ -2226,7 +2268,7 @@ impl<T: Transport + 'static> Gateway<T> {
                             Some(after) => Outcome::status_with_retry_after(response.status, after),
                             None => Outcome::status(response.status),
                         };
-                        let answered = RefusalHeaders::of(&response, request.bearer());
+                        let answered = RefusalHeaders::of(&response, request);
                         (outcome, response.body, answered)
                     }
                     Err(error) => {
@@ -2292,7 +2334,7 @@ impl<T: Transport + 'static> Gateway<T> {
                     }
                 }
                 Retry::GiveUp => {
-                    let body = RejectedBody::without_secret(&body, request.bearer());
+                    let body = RejectedBody::without_secret(&body, redaction_of(request));
                     return Err(self.refusal(destination, attempts, outcome, body, answered));
                 }
             }
@@ -4498,6 +4540,68 @@ mod tests {
         let answered = log.text();
         assert!(answered.contains("outbound call answered"), "{answered}");
         assert!(!answered.contains("invented-token"), "{answered}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_carried_secret_echoed_in_a_header_is_redacted_in_the_log() {
+        // The request that carries the long-lived secret only in its body:
+        // Finam's session exchange. The destination echoes the body value
+        // back in its response headers, and the gateway has no
+        // `Authorization` header to scrub — only the redaction word the
+        // request names.
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let secret = "the-body-carried-secret-Q1w2e3r4";
+        let refusing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                location: Some(format!("/v1/again?secret={secret}")),
+                request_id: Some(format!("echo-{secret}")),
+                content_type: Some("text/html".to_owned()),
+                ..status(401)
+            })),
+        );
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            crate::RequestBody::Json(format!(r#"{{"secret":"{secret}"}}"#)),
+        )
+        .with_redaction_word(secret)
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
+        .idempotent();
+
+        let _ = refusing.send(&request, None).await;
+
+        let refused = log.text();
+        assert!(refused.contains("outbound call refused"), "{refused}");
+        assert!(!refused.contains(secret), "{refused}");
+        assert!(
+            refused.contains("location=\"/v1/again?secret=<redacted>\""),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("request_id=\"echo-<redacted>\""),
+            "{refused}"
+        );
+
+        // The answered line cuts the body-carried secret out of the id the
+        // same way, though the request carried no Authorization header.
+        let log = Log::capture();
+        let answering = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some(format!("echo-{secret}")),
+                ..status(200)
+            })),
+        );
+        answering.send(&request, None).await.expect("answered");
+        let answered = log.text();
+        assert!(answered.contains("outbound call answered"), "{answered}");
+        assert!(!answered.contains(secret), "{answered}");
+        assert!(
+            answered.contains("request_id=\"echo-<redacted>\""),
+            "{answered}"
+        );
     }
 
     /// A transport that publishes a status line and then loses the body:

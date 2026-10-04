@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::cache::{CacheKey, ResponseCache};
+use crate::cache::{CacheKey, ResponseCache, is_credential_exchange};
 use crate::client::HttpClient;
 use crate::destination::Destination;
 use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, egress_directory_for};
@@ -760,6 +760,26 @@ impl RefusalHeaders {
             request_id: without_secrets(response.request_id.as_deref(), redaction_of(request)),
         }
     }
+}
+
+/// A successful reading answer is cut of every secret the request named
+/// before it reaches the caller: a response body that echoes a credential
+/// must not travel further — into a parser, into a kept row's payload, into
+/// a report. The one answer exempt is the credential exchange itself: its
+/// body IS the new token the caller must see whole, that request is never
+/// cached, and its answer is never parsed as data (iaam-vg8te.1.1).
+fn scrub_reading_answer(mut response: HttpResponse, request: &HttpRequest) -> HttpResponse {
+    if is_credential_exchange(request) {
+        return response;
+    }
+    let secrets: Vec<&Secret> = redaction_of(request).collect();
+    if secrets.is_empty() {
+        return response;
+    }
+    response.body = redacted_bytes(&response.body, secrets.iter().copied());
+    response.request_id = without_secrets(response.request_id.as_deref(), secrets.iter().copied());
+    response.location = without_secrets(response.location.as_deref(), secrets.iter().copied());
+    response
 }
 
 /// Every secret a logged value must be cut of before it reaches the log:
@@ -2261,7 +2281,7 @@ impl<T: Transport + 'static> Gateway<T> {
                                 .unwrap_or("-"),
                                 "outbound call answered"
                             );
-                            return Ok(response);
+                            return Ok(scrub_reading_answer(response, request));
                         }
                         status = Some(response.status);
                         let outcome = match response.retry_after {
@@ -4540,6 +4560,66 @@ mod tests {
         let answered = log.text();
         assert!(answered.contains("outbound call answered"), "{answered}");
         assert!(!answered.contains("invented-token"), "{answered}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_success_body_echoing_the_token_is_redacted_before_it_reaches_the_caller() {
+        // A reading answer echoes the presented credential in its body. The
+        // scrub must happen before the caller sees it: the body travels on
+        // into a parser and into a kept refusal's payload (iaam-vg8te.1.1).
+        let time = FakeTime::new();
+        let downgoing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some("req-7".to_owned()),
+                content_type: Some("application/json".to_owned()),
+                body: br#"{"symbol":"X","echo":"t.invented-token"}"#.to_vec(),
+                ..status(200)
+            })),
+        );
+        let request = HttpRequest::get(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+        )
+        .with_bearer("t.invented-token")
+        .with_request_allowance(RequestAllowance::new(u32::MAX));
+
+        let response = downgoing.send(&request, None).await.expect("answered");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(
+            !body.contains("t.invented-token"),
+            "the echoed token reached the caller: {body}"
+        );
+        assert!(
+            body.contains("<redacted>"),
+            "the body keeps its shape: {body}"
+        );
+
+        // The session exchange is the one answer that keeps its body whole: it
+        // IS the new token.
+        let secret = "the-exchange-secret-Q1w2e3r4";
+        let exch = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                content_type: Some("application/json".to_owned()),
+                body: br#"{"token":"the-exchange-secret-exchange-token"}"#.to_vec(),
+                ..status(200)
+            })),
+        );
+        let exchange = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            crate::request::RequestBody::Json(format!(r#"{{"secret":"{secret}"}}"#)),
+        )
+        .idempotent()
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
+        .with_redaction_word(secret);
+        let answer = exch.send(&exchange, None).await.expect("answered");
+        let body = String::from_utf8(answer.body).expect("utf8");
+        assert!(
+            body.contains("the-exchange-secret-exchange-token"),
+            "a credential exchange's answer is the credential and stays whole: {body}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -173,7 +173,7 @@ fn is_read(request: &HttpRequest) -> bool {
 /// and its details call by name — the published contract puts the secret
 /// and the token in their bodies — and so does any request whose body
 /// names a credential anywhere.
-fn is_credential_exchange(request: &HttpRequest) -> bool {
+pub(crate) fn is_credential_exchange(request: &HttpRequest) -> bool {
     if matches!(request.destination(), Destination::FinamApi)
         && matches!(request.path(), "/v1/sessions" | "/v1/sessions/details")
     {

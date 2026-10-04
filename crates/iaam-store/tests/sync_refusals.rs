@@ -326,3 +326,48 @@ fn a_later_sync_that_does_not_cover_the_records_interval_settles_nothing() {
         "a sync that covers the record's whole interval and refuses nothing settles it"
     );
 }
+
+#[test]
+fn a_settle_over_thousands_of_keys_stays_within_the_variable_limit() {
+    let store = SqliteStore::open_in_memory().expect("memory store");
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+
+    for row in ["row-0", "row-1", "row-2"] {
+        store
+            .upsert_sync_refusal(&refusal(
+                owner,
+                account,
+                row,
+                "2026-01-01",
+                "2026-01-31",
+                "a refused row",
+            ))
+            .expect("record");
+    }
+    // A refusal list larger than SQLite's variable limit: the settle must
+    // not fail (an unbounded NOT IN list would), and the rows whose keys
+    // are absent from it settle in memory (iaam-vg8te.1.1 acceptance).
+    let many: Vec<String> = (0..33_000)
+        .map(|index| format!("row-{index}"))
+        .filter(|key| key != "row-1" && key != "row-2")
+        .collect();
+    store
+        .settle_sync_refusals_besides(
+            &SyncRefusalFilter {
+                owner,
+                account,
+                source: "finam".to_owned(),
+                from: "2026-01-01".to_owned(),
+                to: "2026-01-31".to_owned(),
+            },
+            &many,
+        )
+        .expect("settle over thousands of keys");
+
+    let open = store
+        .list_open_sync_refusals(owner, account, "finam", "2026-01-01", "2026-01-31")
+        .expect("list");
+    assert_eq!(open.len(), 1, "the kept row stays open");
+    assert_eq!(open[0].row_key, "row-0");
+}

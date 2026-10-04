@@ -12,6 +12,8 @@
 //! dimensions, dates): interpreting them is the app's. Only the owner scope
 //! is typed, so nothing of one owner's refusals ever answers another's.
 
+use std::collections::BTreeSet;
+
 use iaam_core::ids::{AccountId, OwnerId};
 use rusqlite::params;
 use uuid::Uuid;
@@ -186,13 +188,19 @@ impl SqliteStore {
             from,
             to,
         } = filter;
-        // An empty list means the sync refused nothing: everything open whose
-        // interval the sync covers is settled.
-        if row_keys.is_empty() {
-            self.conn.execute(
-                "UPDATE sync_refusals SET settled = 1
-                 WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
-                   AND ?5 <= range_from AND range_to <= ?4",
+        // The covered open records are loaded, their keys compared in memory,
+        // and the absent ones settled one bounded statement each inside one
+        // transaction: an unbounded NOT IN list would trip SQLite's variable
+        // limit on a refusal set of more than ~32,761 rows (an exhaustive
+        // sync can refuse more), and chunking the list could settle a key
+        // present in another chunk (iaam-vg8te.1.1 acceptance review).
+        let mut statement = self.conn.prepare(
+            "SELECT row_key FROM sync_refusals
+             WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
+               AND ?5 <= range_from AND range_to <= ?4",
+        )?;
+        let covered: Vec<String> = statement
+            .query_map(
                 params![
                     owner.inner().to_string(),
                     account.inner().to_string(),
@@ -200,34 +208,41 @@ impl SqliteStore {
                     to,
                     from,
                 ],
-            )?;
-            return Ok(());
-        }
-        let mut sql = String::from(
-            "UPDATE sync_refusals SET settled = 1
-             WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
-               AND ?5 <= range_from AND range_to <= ?4
-               AND row_key NOT IN (",
-        );
-        let mut values: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::Text(owner.inner().to_string()),
-            rusqlite::types::Value::Text(account.inner().to_string()),
-            rusqlite::types::Value::Text(source.to_owned()),
-            rusqlite::types::Value::Text(to.to_owned()),
-            rusqlite::types::Value::Text(from.to_owned()),
-        ];
-        for (index, key) in row_keys.iter().enumerate() {
-            if index > 0 {
-                sql.push_str(", ");
+                |row| row.get(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let kept: BTreeSet<&str> = row_keys.iter().map(String::as_str).collect();
+        // The writes run under one explicit transaction: the type-level
+        // `Transaction` borrows the connection mutably and this method's
+        // receiver is `&self`, so the begin is spelled out, as `lib.rs` does
+        // for its own immediate transactions.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let outcome = (|| -> Result<(), StoreError> {
+            for key in &covered {
+                if kept.contains(key.as_str()) {
+                    continue;
+                }
+                self.conn.execute(
+                    "UPDATE sync_refusals SET settled = 1
+                     WHERE owner = ?1 AND account = ?2 AND source = ?3 AND row_key = ?4
+                       AND settled = 0",
+                    params![
+                        owner.inner().to_string(),
+                        account.inner().to_string(),
+                        source,
+                        key,
+                    ],
+                )?;
             }
-            sql.push('?');
-            sql.push_str(&(values.len() + 1).to_string());
-            values.push(rusqlite::types::Value::Text(key.clone()));
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => self.conn.execute_batch("COMMIT").map_err(Into::into),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        sql.push(')');
-        self.conn
-            .execute(&sql, rusqlite::params_from_iter(values))?;
-        Ok(())
     }
 }
 

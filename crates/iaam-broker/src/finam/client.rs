@@ -320,6 +320,7 @@ impl FinamClient {
                     RequestBody::Json(serde_json::json!({ "token": token }).to_string()),
                 )
                 .with_request_allowance(allowance.clone())
+                .with_redaction_word(token)
                 .idempotent()
             })
             .await?;
@@ -510,7 +511,8 @@ impl FinamClient {
             RequestBody::Json(serde_json::json!({ "secret": self.token.expose() }).to_string()),
         )
         .idempotent()
-        .with_request_allowance(allowance.clone());
+        .with_request_allowance(allowance.clone())
+        .with_redaction_word(self.token.expose());
         let response = self
             .gateway
             .send(&request, None)
@@ -1709,11 +1711,16 @@ mod tests {
             .await
             .expect_err("400 is refused");
 
+        // The gateway scrubs the access identity (the broker secret) from the
+        // rejected body before the client's own token redaction runs, so the
+        // finished message carries the gateway marker; the client's marker
+        // covers the session token itself. Whatever the label, the secret is
+        // hidden either way.
         assert_eq!(
             error,
             FinamError::UnexpectedStatus {
                 status: 400,
-                body: "bad <token hidden>".to_owned(),
+                body: "bad <redacted>".to_owned(),
             }
         );
         assert_no_secret(&error);

@@ -1391,6 +1391,111 @@ async fn a_refused_row_reaches_the_owner_with_its_reason_and_payload_and_settles
     }
 }
 
+/// A sync that never re-read the portfolio settles nothing, however wide its
+/// interval (iaam-vg8te.1.2).
+///
+/// The position refusal recorded by a full March 1–31 sync is a record whose
+/// whole interval a later March 1–31 sync covers — but that later sync had an
+/// out-of-interval trade, so its portfolio was never fetched, its assertions
+/// were withheld, and the refused row's absence from its refusal list proves
+/// nothing. Settling on such a sync would close the owner's question on
+/// silence.
+#[tokio::test]
+async fn a_partial_sync_never_settles_an_existing_refusal() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    // One channel identity for both syncs: only the same source could ever
+    // settle the first sync's question.
+    let source = SourceId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    // First sync: full, and one refused position. The row becomes the
+    // owner's question for the whole March interval.
+    let mut first_broker = api(account, source, trade_without_custody(account, instrument));
+    first_broker.operations = Ok(ParsedOperations {
+        accepted: Vec::new(),
+        quarantined: Vec::new(),
+    });
+    first_broker.portfolio = Ok(PortfolioSnapshot {
+        as_of: PortfolioAsOf::Current,
+        claims: vec![cash_opening_claim()],
+        refused: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::json!({ "symbol": "SBER@MISX", "quantity": { "value": "10" } }),
+            reason: "symbol SBER@MISX is not resolved to an instrument".to_owned(),
+            dimensions: dimensions(&[Dimension::Positions]),
+        }],
+        observed_on: None,
+    });
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &first_broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    assert_eq!(first.set_aside, 1, "{:?}", first.recorded);
+
+    let source_text = source.inner().to_string();
+    let open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals: {error}"));
+    assert_eq!(open.len(), 1, "one set-aside row, one question");
+
+    // Second sync: same channel, same interval — but an operation dated
+    // outside it, which withholds the portfolio (snapshot None) and the
+    // assertions. Nothing is refused, and the portfolio rows were never
+    // re-read, so the first sync's question must stay open.
+    let mut operation = trade_without_custody(account, instrument);
+    operation.dates.trade = Some(date!(2026 - 04 - 02));
+    let second_broker = api(account, source, operation);
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &second_broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second sync: {error}"));
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+    assert_eq!(second.assertions, 0);
+    assert_eq!(second.assertions_withheld, None);
+
+    let still_open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals after the partial sync: {error}"));
+    assert_eq!(
+        still_open.len(),
+        1,
+        "a sync that never re-read the portfolio must not settle the position question"
+    );
+    assert_eq!(still_open[0].row_key, open[0].row_key);
+}
+
 #[tokio::test]
 async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
     let owner = OwnerId::new_random();

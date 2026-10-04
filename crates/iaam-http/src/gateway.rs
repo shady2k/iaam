@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::cache::{CacheKey, ResponseCache, is_credential_exchange};
+use crate::cache::{CacheKey, ResponseCache};
 use crate::client::HttpClient;
 use crate::destination::Destination;
 use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, egress_directory_for};

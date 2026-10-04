@@ -127,6 +127,7 @@ impl BrokerChannel for FinamChannel {
         let symbols = Symbols {
             channel: self,
             context,
+            broker_account,
         };
         adapt_operations(account, operations, &self.dictionary, &symbols).await
     }
@@ -161,6 +162,7 @@ impl BrokerChannel for FinamChannel {
             &Symbols {
                 channel: self,
                 context,
+                broker_account,
             },
         )
         .await
@@ -219,6 +221,10 @@ fn deadline_refusal(request: &'static str) -> BrokerError {
 struct Symbols<'a> {
     channel: &'a FinamChannel,
     context: BrokerRequestContext<'a>,
+    /// The broker's own account the asset reads are scoped to: the live API
+    /// answers a bare asset read with `Invalid arguments: account_id`, so
+    /// the account scope travels with the request (iaam-vg8te.1.3).
+    broker_account: &'a str,
 }
 
 /// What one symbol became: an instrument, or the row's named refusal.
@@ -257,9 +263,14 @@ impl Symbols<'_> {
                      range again"
             ))),
             // A genuine source-level failure of the asset read — the source
-            // is down, said no, or spent the sync's request budget — is the
-            // source's failure, not one row's: the sync stops with the
-            // original error's own classification.
+            // is down or the sync spent its request budget — is the source's
+            // failure, not one row's: the sync stops with the original
+            // error's own classification. A per-symbol refusal is handled in
+            // `instrument`, which sets that row aside instead.
+            // `Refused` is listed defensively: `instrument` sets a per-symbol
+            // refusal aside, so this arm is unreachable in practice, and the
+            // exhaustive list keeps a new source-level variant from passing
+            // silently through the row path.
             Err(
                 error @ (BrokerError::Unreachable { .. }
                 | BrokerError::Refused { .. }
@@ -289,7 +300,40 @@ impl Symbols<'_> {
     /// are the standing refusals; a directory that cannot be asked at all
     /// fails the sync.
     async fn instrument(&self, symbol: &str, on: Date) -> Result<Resolution, BrokerError> {
-        let isin = self.channel.isin_of(symbol, self.context).await?;
+        let isin = match self
+            .channel
+            .isin_of(symbol, self.broker_account, self.context)
+            .await
+        {
+            Ok(isin) => isin,
+            // A symbol Finam itself cannot describe is that row's problem,
+            // not the sync's: the asset answer was refused or could not be
+            // read, and the reason says what the broker answered. The row is
+            // set aside and the rest of the sync still imports — the live
+            // walk saw Finam answer bare asset reads with 400
+            // `Invalid arguments: account_id`, and one such row must not
+            // stop the year sync (iaam-vg8te.1.3).
+            Err(BrokerError::Refused { detail, .. }) => {
+                return Ok(Resolution::Unresolved(format!(
+                    "symbol {symbol} is not resolved to an instrument: Finam refused its asset description: {detail} — record the instrument with the ISIN it actually carries, then sync this range again"
+                )));
+            }
+            Err(BrokerError::Unparsable { detail, .. }) => {
+                return Ok(Resolution::Unresolved(format!(
+                    "symbol {symbol} is not resolved to an instrument: Finam's asset description could not be read: {detail} — record the instrument with the ISIN it actually carries once the answer can be read, then sync this range again"
+                )));
+            }
+            // Genuine source-level failures keep their classification and
+            // stop the sync: the source is down, or the sync spent its
+            // request budget for the hour.
+            Err(
+                error @ (BrokerError::Unreachable { .. }
+                | BrokerError::RequestCeiling { .. }
+                | BrokerError::Adapter { .. }
+                | BrokerError::NoAccess { .. }
+                | BrokerError::ScopeNotReadOnly { .. }),
+            ) => return Err(error),
+        };
         let Some(isin) = isin else {
             return Ok(Resolution::Unresolved(unresolved_symbol_reason(
                 symbol, None,
@@ -342,6 +386,7 @@ impl FinamChannel {
     async fn isin_of(
         &self,
         symbol: &str,
+        broker_account: &str,
         context: BrokerRequestContext<'_>,
     ) -> Result<Option<String>, BrokerError> {
         if let Some(isin) = self.cached_isin(symbol) {
@@ -350,7 +395,8 @@ impl FinamChannel {
         let body = bounded(
             context.deadline,
             "the Finam asset request",
-            self.client.get_asset(symbol, context.allowance),
+            self.client
+                .get_asset(symbol, broker_account, context.allowance),
         )
         .await?;
         let isin = parse_asset(&body).map_err(parse_error)?;
@@ -2369,7 +2415,7 @@ mod tests {
         let refused = &snapshot.refused[0];
         assert_eq!(refused.raw["symbol"], json!(UNREADABLE), "{refused:?}");
         assert!(
-            refused.reason.contains(UNREADABLE) && refused.reason.contains("cannot be read"),
+            refused.reason.contains(UNREADABLE) && refused.reason.contains("could not be read"),
             "{}",
             refused.reason
         );
@@ -2426,12 +2472,13 @@ mod tests {
         );
     }
 
-    /// The asset read behind one operation's symbol is refused by the
-    /// access (403), and the refused operation would need the ISIN it names:
-    /// the whole sync stops with the source's own refusal, never with our
-    /// store's failure (iaam-vg8te.1.3).
     #[tokio::test]
-    async fn an_asset_read_the_source_refuses_keeps_the_refusal() {
+    async fn an_asset_read_the_source_refuses_sets_the_row_aside_not_the_sync() {
+        // Finam answered a live asset read with 400 (`Invalid arguments:
+        // account_id` until the account scope was added, and a real refusal
+        // for a symbol it cannot describe). A per-symbol refusal is the
+        // row's, not the sync's: the row is set aside with the broker's
+        // message and the other rows still import (iaam-vg8te.1.3).
         let operations = json!({
             "transactions": [
                 {
@@ -2457,7 +2504,7 @@ mod tests {
             directory(&[]).await.0,
         );
 
-        let error = channel
+        let outcome = channel
             .fetch_operations(
                 account(),
                 account().inner().to_string().as_str(),
@@ -2466,11 +2513,14 @@ mod tests {
                 broker_context(None),
             )
             .await
-            .expect_err("the asset read is refused");
-
-        assert!(
-            matches!(&error, BrokerError::Refused { broker, .. } if broker == BROKER),
-            "{error}"
+            .expect("the sync does not stop on a refused asset read");
+        assert_eq!(outcome.accepted.len(), 0, "{:?}", outcome.accepted);
+        assert_eq!(outcome.quarantined.len(), 1, "{:?}", outcome.quarantined);
+        assert_eq!(
+            outcome.quarantined[0].reason,
+            "symbol FIXT@MISX is not resolved to an instrument: Finam refused its asset \
+             description: Finam token is invalid — record the instrument with the ISIN \
+             it actually carries, then sync this range again"
         );
     }
 }

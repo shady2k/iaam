@@ -211,9 +211,11 @@ impl FinamClient {
     pub async fn get_asset(
         &self,
         symbol: &str,
+        account_id: &str,
         allowance: &RequestAllowance,
     ) -> Result<String, FinamError> {
         validate_symbol(symbol)?;
+        validate_account_id(account_id)?;
         let (body, _, _) = self
             .authorized(allowance, |token| {
                 HttpRequest::get_with_symbol_path_segment(
@@ -221,6 +223,11 @@ impl FinamClient {
                     "/v1/assets/",
                     symbol,
                 )
+                // The live API answered a bare asset read with
+                // `Invalid arguments: account_id`: the account scope is
+                // required in prod however the docs call it optional
+                // (found by the live walk, iaam-vg8te.1.3).
+                .with_query("account_id", account_id)
                 .with_bare_token(token)
                 .with_request_allowance(allowance.clone())
             })
@@ -1109,7 +1116,11 @@ mod tests {
         let (client, _) = client_over(BUDGETS, &endpoint);
 
         let body = client
-            .get_asset("SBER@MISX", &iaam_http::RequestAllowance::new(u32::MAX))
+            .get_asset(
+                "SBER@MISX",
+                "9999999",
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("asset read");
 
@@ -1119,8 +1130,8 @@ mod tests {
         assert_eq!(received[0].url(), "https://api.finam.ru/v1/sessions");
         assert_eq!(
             received[1].url(),
-            "https://api.finam.ru/v1/assets/SBER@MISX",
-            "RFC 3986 admits @ in a path segment; the symbol rides the wire as printed"
+            "https://api.finam.ru/v1/assets/SBER@MISX?account_id=9999999",
+            "RFC 3986 admits @ in a path segment, and the live API scopes the asset read to the account"
         );
         assert_eq!(
             received[1]
@@ -1145,7 +1156,11 @@ mod tests {
             .await
             .expect("portfolio");
         client
-            .get_asset("SBER@MISX", &iaam_http::RequestAllowance::new(u32::MAX))
+            .get_asset(
+                "SBER@MISX",
+                "9999999",
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
             .await
             .expect("asset");
 
@@ -1176,7 +1191,11 @@ mod tests {
             let (client, _) = client_over(BUDGETS, &endpoint);
 
             let error = client
-                .get_asset(symbol, &iaam_http::RequestAllowance::new(u32::MAX))
+                .get_asset(
+                    symbol,
+                    "9999999",
+                    &iaam_http::RequestAllowance::new(u32::MAX),
+                )
                 .await
                 .expect_err("unsafe symbol must be refused");
 

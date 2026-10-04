@@ -151,7 +151,7 @@ impl Transport for RecordingTransport {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> Result<HttpResponse, HttpError> {
         let answer = self
             .answers
@@ -168,7 +168,9 @@ impl Transport for RecordingTransport {
             .expect("sent requests")
             .push((request.destination(), self.time.wall()));
         if let Ok(response) = &answer {
-            observe(response.status, response.retry_after);
+            let mut line = response.clone();
+            line.body = Vec::new();
+            observe(line);
         }
         answer
     }
@@ -189,12 +191,16 @@ impl Transport for StatusThenBodyError {
         &'a self,
         _request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         self.sends.fetch_add(1, Ordering::SeqCst);
         async move {
             handoff()?;
-            observe(429, Some(Duration::MAX));
+            observe(HttpResponse {
+                status: 429,
+                retry_after: Some(Duration::MAX),
+                ..Default::default()
+            });
             Err(HttpError::Timeout)
         }
     }
@@ -235,7 +241,7 @@ impl Transport for DelayedPanickingTransport {
         &'a self,
         _request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        _observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        _observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> Result<HttpResponse, HttpError> {
         self.time.advance(self.delay);
         handoff()?;
@@ -258,11 +264,14 @@ impl Transport for ObservedPanickingTransport {
         &'a self,
         _request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> Result<HttpResponse, HttpError> {
         handoff()?;
         self.sent.fetch_add(1, Ordering::SeqCst);
-        observe(200, None);
+        observe(HttpResponse {
+            status: 200,
+            ..Default::default()
+        });
         panic!("invented transport panic after observing the status");
     }
 }
@@ -304,6 +313,7 @@ impl Transport for BreakTallyTransport {
             status: self.status,
             body: Vec::new(),
             retry_after: self.retry_after,
+            ..Default::default()
         })
     }
 }
@@ -324,6 +334,7 @@ fn status(status: u16) -> HttpResponse {
         status,
         body: Vec::new(),
         retry_after: None,
+        ..Default::default()
     }
 }
 
@@ -608,6 +619,7 @@ async fn retry_after_is_clamped_to_one_day_in_the_tally() {
             status: 429,
             body: Vec::new(),
             retry_after: Some(Duration::MAX),
+            ..Default::default()
         }));
     let gateway = gateway(transport, &time, &tally);
 
@@ -1164,6 +1176,7 @@ async fn a_successful_response_never_installs_its_named_delay() {
             status: 200,
             body: Vec::new(),
             retry_after: Some(Duration::from_secs(600)),
+            ..Default::default()
         }));
     let gateway = gateway(transport.clone(), &time, &tally);
 
@@ -1302,6 +1315,7 @@ async fn a_short_retry_after_still_persists_the_sixty_second_floor() {
             status: 429,
             body: Vec::new(),
             retry_after: Some(Duration::from_secs(5)),
+            ..Default::default()
         }));
     let gateway = gateway(transport, &time, &tally);
 

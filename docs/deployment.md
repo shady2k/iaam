@@ -157,6 +157,28 @@ of accepting truncation or rollback. A missing, unreadable, replaced,
 symlinked, hard-linked or corrupt record refuses broker operation; there is no
 in-memory allowance fallback.
 
+A gateway built with a database — `serve`'s is — also carries the instance's
+**response cache** in a directory beside the database
+(`iaam.sqlite` → `iaam.sqlite.cache`, derived exactly like the egress
+directory, so every alias of the database is one cache). What it holds: the
+answers of reads. A request counts as a read when the request itself says
+so — an HTTP `GET`, or a POST the source marked safe to repeat (T-Invest's
+`…Service/Get…` calls, CBR's SOAP queries). Such a read answered with a 2xx
+is stored, and the same question is answered from the store for one hour
+instead of being sent again. A credential exchange is never cached: Finam's
+`POST /v1/sessions` and `/v1/sessions/details`, and any request whose body
+names a credential, are sent every time. The key under which an answer sits
+covers the destination, the method, the wire URL, the request body and a
+SHA-256 fingerprint of the access token — one access's answer never serves
+another, and no file of the cache ever holds the token itself. A cached
+answer sends nothing on the wire, spends nothing from a sync's attempt
+allowance and touches no ceiling, and is logged at `info` like any other
+answer (§3.6). The directory is created 0700 and its files 0600; every access
+removes the entries older than the hour and the store holds at most 1024
+entries, so it never grows without bound. The cache **survives a restart** —
+it is ordinary files — and is cleared by deleting the directory; the next
+answer starts it again.
+
 Run the executable ceiling proof before enabling broker egress:
 
 ```console
@@ -594,6 +616,28 @@ verified to start and serve with all three.
 
 **On failure** — the container exits immediately and `docker logs iaam` holds
 the reason. Every message the program can print at start-up is in §11.
+
+Every outbound call the process makes — to any broker and to every other
+external source — leaves one line in the log: a call the destination answered
+logs `outbound call answered` at `info`, a call it refused logs
+`outbound call refused` at `warn`. Each line names the destination, the method
+path, the URL exactly as it was sent (path and full query; the access token
+travels in the `Authorization` header, never in the URL, so no line carries
+it), the status, the attempt, the elapsed milliseconds and, when the source
+answered with one, its request id — the first present of `x-request-id`,
+`x-trace-id`, `traceparent` and `x-correlation-id`, which the source's own
+support asks for when a call went wrong. A refused line also names, when the
+refusal carries them: where a redirect points (`location`), the type the
+source named for the body (`content_type`), and the refusal's kind. No line
+ever carries the token, the request body or the response body; the request id
+and the redirect target are cut of the token should a source echo it back.
+`RUST_LOG` (§2.1) controls the level: at the default `info` both lines appear;
+`RUST_LOG=warn` keeps only the refusals and the waits over a second.
+
+A read answered from the cache instead of the wire (§2.1) logs
+`outbound call answered from cache` with the same fields: nothing was sent,
+no allowance was spent, and the line is the only trace that the answer came
+from the store beside the database.
 
 ### 3.7 Administration afterwards
 
@@ -1057,6 +1101,31 @@ the fresh zero pair, and afterwards from whatever the pair beside the
 database holds. Deleting or emptying that pair after the first enabling
 spends the day (§2.1); the command then refuses with the ceiling it finds,
 and nothing restores the allowance.
+
+### 6.9 How Finam symbols become instruments
+
+Finam names an instrument `TICKER@MIC` (`SBER@MISX`); iaam identifies one by
+its own identifier and its external codes. A sync closes that gap through
+the broker's own asset description: for every distinct symbol of the sync —
+position rows and operations alike — the channel reads `GET
+/v1/assets/{symbol}?account_id=<the broker account>` once (the live API
+answers a bare asset read with 400 `Invalid arguments: account_id`, found
+by the walk on 2026-10-04), takes the ISIN the description names, and asks
+the instrument directory which instrument carries that ISIN. The position or
+operation then names that instrument. The asset read is budgeted like every
+Finam call (half of the documented 200 per minute), and the answer is cached
+beside the database like every read, so one symbol costs one wire request
+per hour however many rows and syncs name it. A symbol whose asset
+description Finam refuses or that cannot be read is that row's problem, not
+the sync's: the row is set aside with the broker's message as its reason.
+
+Two cases stay visible refusals instead of becoming guesses, and the sync's
+outcome lists them row by row with the original JSON: the asset description
+names **no ISIN** for the symbol, or the ISIN is carried by **no instrument
+recorded here**. Both are fixed the same way — record the instrument with
+the ISIN it actually carries (the refusal quotes the ISIN when there is
+one), and sync the same range again. Until then those rows assert nothing:
+the rest of the snapshot and the other operations import regardless.
 
 ---
 

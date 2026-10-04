@@ -1351,6 +1351,12 @@ pub const TABLE_DISPOSITIONS: &[(&str, TableDisposition)] = &[
     ("import_observations", TableDisposition::Carried),
     ("import_questions", TableDisposition::Carried),
     ("import_control_figures", TableDisposition::Carried),
+    // The broker sync's reading state, the way import questions are: the
+    // owner's open questions about refused rows (iaam-vg8te.1.2). Not yet
+    // carried — a restore loses the questions, and the next sync of the same
+    // range re-records them from the broker's answer — and named for the work
+    // that changes that.
+    ("sync_refusals", TableDisposition::Pending("iaam-s7ue2")),
     // These three are the one deliberate exclusion this task's own
     // acceptance criteria asked for: each has a real foreign key into
     // `schedule_snapshots.id`, and that table is `Derived` — recomputed by a

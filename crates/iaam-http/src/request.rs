@@ -4,7 +4,23 @@
 //! without a network, which is why source crates need not know the transport
 //! at all. `HttpClient` handles sending.
 
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+/// Everything but RFC 3986's unreserved characters (§2.3: letters, digits,
+/// `-`, `.`, `_`, `~`), which are never encoded. Encoding them is legal but
+/// not equivalent everywhere: the live Finam API routed a query named
+/// `interval%2Estart%5Ftime` away from the API (iaam-xzz5.1).
+const QUERY: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Path-segment encoding that keeps `@` literal: RFC 3986 (§3.3) admits
+/// `@` in a path segment, and Finam's asset symbols are of the form
+/// `TICKER@MIC` (iaam-vg8te.1.3). Everything else outside the unreserved
+/// set is encoded, exactly as [`QUERY`]'s account-path rule does.
+const SYMBOL_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'@');
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use zeroize::Zeroizing;
@@ -146,6 +162,17 @@ pub struct HttpRequest {
     reset_header: Option<&'static str>,
     idempotent: bool,
     allowance: Option<RequestAllowance>,
+    /// The stable access identity an authorized read is keyed on in the
+    /// response cache, when the caller binds one: the long-lived secret,
+    /// not the rotating session token. Never sent on the wire; only its
+    /// digest may enter a cache key.
+    cache_identity: Option<Secret>,
+    /// Body-carried credentials the source names, which the gateway cuts
+    /// out of every logged header and body value. The Finam secret and
+    /// the session token ride the request body alone, so the gateway has
+    /// no `Authorization` header to scrub when a destination echoes them
+    /// back.
+    redaction_words: Vec<Secret>,
 }
 
 impl HttpRequest {
@@ -168,8 +195,33 @@ impl HttpRequest {
         segment: &str,
         suffix: &str,
     ) -> Self {
+        Self::get_with_encoded_segment(destination, prefix, segment, suffix, NON_ALPHANUMERIC)
+    }
+
+    /// Build a GET whose caller-supplied symbol segment is encoded on the
+    /// wire with `@` kept literal, while [`Self::path`] retains the raw
+    /// spelling for policy checks. RFC 3986 (§3.3) admits `@` in a path
+    /// segment, and Finam's asset symbols are of the form `TICKER@MIC`
+    /// (iaam-vg8te.1.3); everything else outside the unreserved set is
+    /// encoded exactly as [`Self::get_with_encoded_path_segment`] does.
+    #[must_use]
+    pub fn get_with_symbol_path_segment(
+        destination: Destination,
+        prefix: &str,
+        symbol: &str,
+    ) -> Self {
+        Self::get_with_encoded_segment(destination, prefix, symbol, "", SYMBOL_SEGMENT)
+    }
+
+    fn get_with_encoded_segment(
+        destination: Destination,
+        prefix: &str,
+        segment: &str,
+        suffix: &str,
+        set: &'static AsciiSet,
+    ) -> Self {
         let path = format!("{prefix}{segment}{suffix}");
-        let encoded = utf8_percent_encode(segment, NON_ALPHANUMERIC);
+        let encoded = utf8_percent_encode(segment, set);
         let wire_path = format!("{prefix}{encoded}{suffix}");
         let mut request = Self::get(destination, &path);
         request.wire_path = Some(wire_path);
@@ -194,6 +246,8 @@ impl HttpRequest {
             soap_action: None,
             reset_header: None,
             allowance: None,
+            cache_identity: None,
+            redaction_words: Vec::new(),
             // A GET reads; any other method may act, and acting twice is
             // not undone by a later success.
             idempotent: matches!(method, HttpMethod::Get),
@@ -220,6 +274,40 @@ impl HttpRequest {
         self.bearer = Some(Secret::new(token));
         self.auth_scheme = AuthScheme::Bare;
         self
+    }
+
+    /// Bind the stable access identity the response cache keys this read
+    /// on. The identity is the caller-bound long-lived secret — the access
+    /// that owns the answer — not the rotating session token a read is
+    /// presented with: a renewed token must not re-send a read the cache
+    /// already holds for the same access. The identity never leaves the
+    /// request description; the cache digests it, and no cache file holds
+    /// it.
+    #[must_use]
+    pub fn with_cache_identity(mut self, identity: &str) -> Self {
+        self.cache_identity = Some(Secret::new(identity));
+        self
+    }
+
+    /// Name a body-carried credential the gateway must cut out of every
+    /// logged header and body value. A credential that travels only in the
+    /// request body — the Finam secret on `POST /v1/sessions`, the session
+    /// token on `/v1/sessions/details` — has no `Authorization` header of
+    /// its own to scrub: if the destination echoes the value back in a
+    /// response header or body, only a value named here stands between it
+    /// and the log. Call once per value.
+    #[must_use]
+    pub fn with_redaction_word(mut self, word: &str) -> Self {
+        self.redaction_words.push(Secret::new(word));
+        self
+    }
+
+    /// The body-carried credentials the request named, which the gateway
+    /// cuts out of every logged header and body value. A request that
+    /// named none leaves the existing behavior exactly as it was.
+    #[must_use]
+    pub fn redaction_words(&self) -> &[Secret] {
+        &self.redaction_words
     }
 
     /// `SOAPAction` header. Required by CBR: without it the service returns a
@@ -301,6 +389,13 @@ impl HttpRequest {
         })
     }
 
+    /// The stable access identity bound to this request, or `None` when
+    /// the caller bound none and the presented credential keys the cache.
+    #[must_use]
+    pub fn cache_identity(&self) -> Option<&Secret> {
+        self.cache_identity.as_ref()
+    }
+
     #[must_use]
     pub fn soap_action(&self) -> Option<&str> {
         self.soap_action.as_deref()
@@ -329,8 +424,8 @@ impl HttpRequest {
                 .map(|(key, value)| {
                     format!(
                         "{}={}",
-                        utf8_percent_encode(key, NON_ALPHANUMERIC),
-                        utf8_percent_encode(value, NON_ALPHANUMERIC)
+                        utf8_percent_encode(key, QUERY),
+                        utf8_percent_encode(value, QUERY)
                     )
                 })
                 .collect();
@@ -413,6 +508,55 @@ mod tests {
         assert_eq!(
             request.url(),
             "https://api.finam.ru/v1/accounts/Main%20Account/transactions"
+        );
+    }
+
+    #[test]
+    fn a_symbol_path_segment_keeps_the_at_literal_on_the_wire() {
+        // RFC 3986 §3.3 admits `@` in a path segment, and Finam's asset
+        // symbols are of the form `TICKER@MIC` (iaam-vg8te.1.3): the wire
+        // URL spells the symbol exactly as the channel read it, while
+        // everything else outside the unreserved set is still encoded, as
+        // for the account paths.
+        let request = HttpRequest::get_with_symbol_path_segment(
+            Destination::FinamApi,
+            "/v1/assets/",
+            "SBER@MISX",
+        );
+
+        assert_eq!(request.path(), "/v1/assets/SBER@MISX");
+        assert_eq!(request.url(), "https://api.finam.ru/v1/assets/SBER@MISX");
+    }
+
+    #[test]
+    fn a_symbol_path_segment_still_encodes_what_the_wire_cannot_carry() {
+        let request = HttpRequest::get_with_symbol_path_segment(
+            Destination::FinamApi,
+            "/v1/assets/",
+            "Main Share@MISX",
+        );
+
+        assert_eq!(request.path(), "/v1/assets/Main Share@MISX");
+        assert_eq!(
+            request.url(),
+            "https://api.finam.ru/v1/assets/Main%20Share@MISX"
+        );
+    }
+
+    #[test]
+    fn a_query_keeps_the_unreserved_characters_as_they_are() {
+        // RFC 3986 §2.3: `-`, `.`, `_` and `~` are never encoded. The live
+        // Finam API routed `interval%2Estart%5Ftime` away from the API
+        // (iaam-xzz5.1); reserved characters are still encoded.
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts/Main/transactions")
+            .with_query("interval.start_time", "2026-09-01T00:00:00Z")
+            .with_query("a_b~c", "x y&z=1");
+
+        assert_eq!(
+            request.url(),
+            "https://api.finam.ru/v1/accounts/Main/transactions\
+             ?interval.start_time=2026-09-01T00%3A00%3A00Z\
+             &a_b~c=x%20y%26z%3D1"
         );
     }
 
@@ -506,6 +650,46 @@ mod tests {
         assert_eq!(
             format!("{:?}", Secret::new("token-value")),
             "Secret(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn redaction_words_are_kept_for_the_log_scrubbers() {
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            RequestBody::Json(r#"{"secret":"the-finam-secret"}"#.to_owned()),
+        )
+        .with_redaction_word("the-finam-secret")
+        .with_redaction_word("the-session-token");
+
+        let words: Vec<&str> = request
+            .redaction_words()
+            .iter()
+            .map(Secret::expose)
+            .collect();
+        assert_eq!(words, ["the-finam-secret", "the-session-token"]);
+    }
+
+    #[test]
+    fn a_request_without_redaction_words_has_none() {
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        assert!(request.redaction_words().is_empty());
+    }
+
+    #[test]
+    fn a_redaction_word_never_appears_in_debug_output() {
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            RequestBody::Json("{}".to_owned()),
+        )
+        .with_redaction_word("the-super-secret-body-value");
+        let printed = format!("{request:?}");
+        assert!(
+            !printed.contains("the-super-secret-body-value"),
+            "secret leaked into Debug: {printed}"
         );
     }
 

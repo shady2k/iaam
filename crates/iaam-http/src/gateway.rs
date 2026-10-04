@@ -29,11 +29,12 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::cache::{CacheKey, ResponseCache};
 use crate::client::HttpClient;
 use crate::destination::Destination;
 use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, egress_directory_for};
@@ -148,6 +149,13 @@ pub const BUDGETS: &[Budget] = &[
         used: 100,
         window: MINUTE,
     },
+    Budget {
+        destination: Destination::FinamApi,
+        scope: MethodScope::Named("AssetsService.GetAsset"),
+        documented: Some(200),
+        used: 100,
+        window: MINUTE,
+    },
     // The exchange of the secret for a session JWT, which Finam calls next.
     Budget {
         destination: Destination::FinamApi,
@@ -222,6 +230,13 @@ impl BootTime {
 pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
     fn now_boot(&self) -> Result<BootTime, String>;
+    /// Wall-clock time for a record that must outlive the process. The
+    /// response cache stamps its entries with it, so an answer survives a
+    /// restart and expires an hour later whatever the boot was. The
+    /// system clock answers; a test clock moves it with its own offset.
+    fn now_unix(&self) -> SystemTime {
+        SystemTime::now()
+    }
 }
 
 /// Waits out a delay.
@@ -314,8 +329,9 @@ pub trait Transport: Send + Sync {
         request: &'a HttpRequest,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a;
 
-    /// Send while exposing the transport hand-off and response status before
-    /// the body is consumed.
+    /// Send while exposing the transport hand-off and the status line —
+    /// status, named wait and the headers an operator reads the call by —
+    /// before the body is consumed.
     ///
     /// Scripted transports get the safe default. `HttpClient` overrides it so
     /// the hand-off is acknowledged after request construction and immediately
@@ -325,12 +341,14 @@ pub trait Transport: Send + Sync {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         async move {
             handoff()?;
             let response = self.send(request).await?;
-            observe(response.status, response.retry_after);
+            let mut observed = response.clone();
+            observed.body = Vec::new();
+            observe(observed);
             Ok(response)
         }
     }
@@ -348,7 +366,7 @@ impl Transport for HttpClient {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         Self::send_observed(self, request, handoff, observe)
     }
@@ -380,8 +398,11 @@ impl<T: Transport + 'static> Outbound for Gateway<T> {
 
 /// Refusal from the gateway.
 ///
-/// Carries statuses, counts and delays only: never a header value and never
-/// the presented secret, so it can be logged as it is.
+/// Carries statuses, counts and delays, plus the three destination-authored
+/// response headers an operator reads a refusal by (`Rejected`'s `location`,
+/// `content_type` and `request_id`): the response body is boxed in
+/// `RejectedBody`, whose `Debug` prints its length only, and no field
+/// carries the presented secret, so it can be logged as it is.
 #[derive(Debug, Error)]
 pub enum GatewayError {
     #[error("no budget is recorded for path {path:?} at {destination:?}")]
@@ -426,6 +447,13 @@ pub enum GatewayError {
         path = .path.display()
     )]
     TallyCorrupt { path: PathBuf, reason: String },
+    /// The instance's response cache could not be placed or created beside
+    /// the instance's database, so reads would be sent again every time.
+    #[error(
+        "the response cache for the database {database} could not be made: {reason}; the cache lives beside the database like its egress directory, and the process needs leave to create it",
+        database = .database.display()
+    )]
+    CacheUnavailable { database: PathBuf, reason: String },
     /// Another process owns this endpoint's lifetime lock.
     #[error(
         "broker endpoint {endpoint} is owned by another iaam process; use that process or stop it before retrying"
@@ -538,6 +566,14 @@ pub enum GatewayError {
         status: u16,
         attempts: u32,
         body: RejectedBody,
+        /// Where a 3xx refusal points, as the destination sent it, cut of
+        /// the presented secret.
+        location: Option<String>,
+        /// The `Content-Type` the destination named for the refused body.
+        content_type: Option<String>,
+        /// The request id the destination answered with, cut of the
+        /// presented secret.
+        request_id: Option<String>,
     },
     /// The transport could not be set up; retrying would meet the same fault.
     #[error("{destination:?} could not be reached after {attempts} attempts: {error}")]
@@ -572,6 +608,7 @@ impl GatewayError {
             Self::BrokerEgressWithoutDatabase => "broker egress without database",
             Self::TallyUnavailable { .. } => "tally unavailable",
             Self::TallyCorrupt { .. } => "tally corrupt",
+            Self::CacheUnavailable { .. } => "cache unavailable",
             Self::BrokerEndpointOwned { .. } => "broker endpoint owned",
             Self::UnknownBudget { .. } => "unknown budget",
             Self::InvalidBudgets(_) => "invalid budgets",
@@ -598,6 +635,7 @@ impl GatewayError {
             | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::CacheUnavailable { .. }
             | Self::BrokerEndpointOwned { .. }
             | Self::UnknownBudget { .. }
             | Self::InvalidBudgets(_)
@@ -624,6 +662,7 @@ impl GatewayError {
             | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::CacheUnavailable { .. }
             | Self::BrokerEndpointOwned { .. }
             | Self::DailyCeiling { .. }
             | Self::UnknownBudget { .. }
@@ -653,6 +692,7 @@ impl GatewayError {
             | Self::BrokerEgressWithoutDatabase
             | Self::TallyUnavailable { .. }
             | Self::TallyCorrupt { .. }
+            | Self::CacheUnavailable { .. }
             | Self::BrokerEndpointOwned { .. }
             | Self::DailyCeiling { .. }
             | Self::UnknownBudget { .. }
@@ -685,33 +725,154 @@ impl GatewayError {
 ///
 /// Kept for the source, which alone knows what a broker's refusal body means
 /// (a T-Invest error code, say). `Debug` prints its length only: a refusal is
-/// logged, and a body may carry the owner's data. The request's bearer secret
-/// is cut out before the body is kept: a destination that echoes the token
-/// back would otherwise hand it to every reader of the error.
+/// logged, and a body may carry the owner's data. The request's presented
+/// credential, its bound cache identity and every body-carried redaction
+/// word are cut out before the body is kept: a destination that echoes one
+/// of them back would otherwise hand it to every reader of the error.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RejectedBody(Vec<u8>);
 
-/// What stands in a rejected body where the bearer secret was.
-const REDACTED: &[u8] = b"<redacted>";
+/// What stands in a rejected body or header where the bearer secret was.
+const REDACTED_TEXT: &str = "<redacted>";
+
+const REDACTED: &[u8] = REDACTED_TEXT.as_bytes();
+
+/// The response headers a refused line reads back: where a redirect
+/// points, the body's type, and the request id the destination named.
+///
+/// Each is cut of the request's presented credential, of its bound cache
+/// identity and of every body-carried redaction word at capture: a
+/// destination that echoes one of them back in a header would otherwise
+/// hand it to every reader of the log. Carries no body and no status: the
+/// rejection itself does.
+#[derive(Debug, Clone, Default)]
+struct RefusalHeaders {
+    location: Option<String>,
+    content_type: Option<String>,
+    request_id: Option<String>,
+}
+
+impl RefusalHeaders {
+    fn of(response: &HttpResponse, request: &HttpRequest) -> Self {
+        Self {
+            location: without_secrets(response.location.as_deref(), redaction_of(request)),
+            content_type: without_secrets(response.content_type.as_deref(), redaction_of(request)),
+            request_id: without_secrets(response.request_id.as_deref(), redaction_of(request)),
+        }
+    }
+}
+
+/// A successful reading answer is cut of every secret the request named
+/// before it reaches the caller: a response body that echoes a credential
+/// must not travel further — into a parser, into a kept row's payload, into
+/// a report. The one answer exempt is the credential exchange itself: its
+/// body IS the new token the caller must see whole, that request is never
+/// cached, and its answer is never parsed as data (iaam-vg8te.1.1).
+fn scrub_reading_answer(mut response: HttpResponse, request: &HttpRequest) -> HttpResponse {
+    // Only the call whose answer IS the credential is exempt: Finam's
+    // session mint (`POST /v1/sessions`) answers with the new token, which
+    // the caller must see whole. The cache's broad "never cache a body that
+    // mentions a credential" rule must not spare a reading answer here — an
+    // ordinary T-Invest operations read carries a cursor that can contain
+    // the word "token", and its answer is data, not a credential
+    // (iaam-vg8te.1.1 round 4).
+    if matches!(request.destination(), Destination::FinamApi) && request.path() == "/v1/sessions" {
+        return response;
+    }
+    let secrets: Vec<&Secret> = redaction_of(request).collect();
+    if secrets.is_empty() {
+        return response;
+    }
+    response.body = redacted_bytes(&response.body, secrets.iter().copied());
+    response.request_id = without_secrets(response.request_id.as_deref(), secrets.iter().copied());
+    response.location = without_secrets(response.location.as_deref(), secrets.iter().copied());
+    response
+}
+
+/// Every secret a logged value must be cut of before it reaches the log:
+/// the presented credential, the bound cache identity, and each
+/// body-carried redaction word the request names — a Finam exchange names
+/// its own secret, which travels only in the body and so has no
+/// `Authorization` header of its own to scrub.
+fn redaction_of(request: &HttpRequest) -> impl Iterator<Item = &Secret> {
+    request
+        .bearer()
+        .into_iter()
+        .chain(request.cache_identity())
+        .chain(request.redaction_words().iter())
+}
+
+/// `value` with every occurrence of the presented secret cut out, or
+/// `None` when the header is absent. No secret, or an empty one, leaves
+/// the value as it was. The cache uses the same redaction before it
+/// persists a header, so a source that echoes the token cannot hand it
+/// to a later reader of the cache file either.
+pub(crate) fn without_secret(value: Option<&str>, secret: Option<&Secret>) -> Option<String> {
+    without_secrets(value, secret)
+}
+
+/// `value` with every occurrence of each secret cut out, or `None` when
+/// the header is absent. No secret, or an empty one, leaves the value as
+/// it was. The one place a logged value is cleared of everything a caller
+/// named secret — the presented credential, the bound cache identity, and
+/// every body-carried redaction word.
+pub(crate) fn without_secrets<'a, I>(value: Option<&str>, secrets: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a Secret>,
+{
+    let value = value?;
+    let mut kept = value.to_owned();
+    for secret in secrets {
+        let exposed = secret.expose();
+        if !exposed.is_empty() {
+            kept = kept.replace(exposed, REDACTED_TEXT);
+        }
+    }
+    Some(kept)
+}
+
+/// `bytes` with every occurrence of each secret cut out, else the bytes
+/// as they were. No secret, or an empty one, leaves the bytes as they
+/// were. The byte-level redaction of the crate: a refusal body kept for
+/// the source and a response body stored beside the database both pass
+/// through here, so a source that echoes a secret back cannot hand it to
+/// a later reader of either.
+pub(crate) fn redacted_bytes<'a, I>(bytes: &[u8], secrets: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = &'a Secret>,
+{
+    let mut kept = bytes.to_vec();
+    for secret in secrets {
+        kept = redact_secret_from(&kept, secret.expose().as_bytes());
+    }
+    kept
+}
+
+/// `bytes` with every occurrence of `secret` replaced by [`REDACTED`].
+fn redact_secret_from(bytes: &[u8], secret: &[u8]) -> Vec<u8> {
+    if secret.is_empty() {
+        return bytes.to_vec();
+    }
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some((&first, tail)) = rest.split_first() {
+        if let Some(after) = rest.strip_prefix(secret) {
+            kept.extend_from_slice(REDACTED);
+            rest = after;
+        } else {
+            kept.push(first);
+            rest = tail;
+        }
+    }
+    kept
+}
 
 impl RejectedBody {
-    fn without_secret(body: &[u8], secret: Option<&Secret>) -> Self {
-        let secret = secret.map_or(&[][..], |secret| secret.expose().as_bytes());
-        if secret.is_empty() {
-            return Self(body.to_vec());
-        }
-        let mut kept = Vec::with_capacity(body.len());
-        let mut rest = body;
-        while let Some((&first, tail)) = rest.split_first() {
-            if let Some(after) = rest.strip_prefix(secret) {
-                kept.extend_from_slice(REDACTED);
-                rest = after;
-            } else {
-                kept.push(first);
-                rest = tail;
-            }
-        }
-        Self(kept)
+    fn without_secret<'a, I>(body: &[u8], redaction: I) -> Self
+    where
+        I: IntoIterator<Item = &'a Secret>,
+    {
+        Self(redacted_bytes(body, redaction))
     }
 
     #[must_use]
@@ -822,6 +983,10 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
             }
             if matches!(path, "v1/sessions" | "v1/sessions/details") {
                 return Some("AuthService.Sessions");
+            }
+            if let Some(asset) = path.strip_prefix("v1/assets/") {
+                return (!asset.is_empty() && !asset.contains('/'))
+                    .then_some("AssetsService.GetAsset");
             }
             let account_path = path.strip_prefix("v1/accounts/")?;
             if let Some(account) = account_path.strip_suffix("/transactions") {
@@ -1038,6 +1203,10 @@ pub struct Gateway<T> {
     sleeper: Arc<dyn Sleeper>,
     broker_egress: BrokerEgress,
     egress_directory: Option<EgressDirectory>,
+    /// The response cache beside the instance's database: carried by the
+    /// production gateway alone, and by the test seam that builds what
+    /// production builds. A gateway built without a database has none.
+    cache: Option<ResponseCache>,
     /// Keyed by `Destination::base_url`, the host a request reaches.
     lanes: HashMap<&'static str, Arc<Mutex<Lane>>>,
 }
@@ -1053,11 +1222,17 @@ impl Gateway<HttpClient> {
     /// directory [`egress_directory_for`] derives from `database`: one
     /// database is one tally, so one iaam instance is one tally.
     ///
+    /// The response cache lives beside the database too, whatever the broker
+    /// egress switch says: a read this gateway answered within the hour is
+    /// answered from the cache instead of being sent again.
+    ///
     /// # Errors
     /// `GatewayError::SecondGateway` on every call after the first;
     /// `GatewayError::InvalidBudgets` when the table in this module is wrong;
-    /// `GatewayError::EgressPlace` when the database cannot be resolved and
-    /// `GatewayError::TallyUnavailable` when the derived place is unusable.
+    /// `GatewayError::EgressPlace` when the database cannot be resolved,
+    /// `GatewayError::TallyUnavailable` when the derived place is unusable,
+    /// and `GatewayError::CacheUnavailable` when the cache cannot be placed
+    /// or created beside the database.
     pub fn production(broker_egress: BrokerEgress, database: &Path) -> Result<Self, GatewayError> {
         // Claimed before building: two threads racing here must not both
         // see the flag clear. A table that fails its checks fails the same
@@ -1065,7 +1240,14 @@ impl Gateway<HttpClient> {
         if PRODUCTION_BUILT.swap(true, Ordering::SeqCst) {
             return Err(GatewayError::SecondGateway);
         }
-        Self::new_for_database(HttpClient::new(), broker_egress, database)
+        Self::with_parts_for_database_with_response_cache(
+            HttpClient::new(),
+            BUDGETS,
+            Arc::new(SystemClock),
+            Arc::new(TokioSleeper),
+            broker_egress,
+            database,
+        )
     }
 }
 
@@ -1188,7 +1370,10 @@ impl<T: Transport + 'static> Gateway<T> {
 
     /// A gateway over explicit parts whose broker tally lives where
     /// [`egress_directory_for`] places it: beside `database`, created when
-    /// missing. This is the production placement.
+    /// missing. This is the production placement. The response cache is not
+    /// carried here — stands that replay one request many times build this
+    /// constructor — and [`Self::with_parts_for_database_with_response_cache`]
+    /// is the seam that adds it.
     ///
     /// # Errors
     /// `GatewayError::InvalidBudgets` when `budgets` fails its checks;
@@ -1229,6 +1414,60 @@ impl<T: Transport + 'static> Gateway<T> {
             broker_egress,
             egress_directory,
         )
+    }
+
+    /// Test seam for everything [`Gateway::production`] builds — the
+    /// documented budgets, the broker tally beside the instance's database
+    /// and the response cache beside it — over the parts a test injects.
+    /// [`Gateway::production`] is this over the real transport and the
+    /// system clock; [`Self::with_parts_for_database`] stays cache-off for
+    /// stands that replay one request many times.
+    ///
+    /// # Errors
+    /// As [`Self::with_parts_for_database`], and
+    /// `GatewayError::CacheUnavailable` when the cache cannot be placed or
+    /// created beside the database.
+    #[doc(hidden)]
+    pub fn with_parts_for_database_with_response_cache(
+        transport: T,
+        budgets: &'static [Budget],
+        clock: Arc<dyn Clock>,
+        sleeper: Arc<dyn Sleeper>,
+        broker_egress: BrokerEgress,
+        database: &Path,
+    ) -> Result<Self, GatewayError> {
+        let gateway = Self::with_parts_for_database(
+            transport,
+            budgets,
+            clock,
+            sleeper,
+            broker_egress,
+            database,
+        )?;
+        gateway.with_response_cache_beside(database)
+    }
+
+    /// Carries the response cache derived from `database`, the way the
+    /// production gateway does.
+    ///
+    /// # Errors
+    /// `GatewayError::CacheUnavailable` when the cache place cannot be
+    /// derived from the database or the directory cannot be created there.
+    fn with_response_cache_beside(mut self, database: &Path) -> Result<Self, GatewayError> {
+        let place = crate::cache::cache_directory_for(database).map_err(|error| {
+            GatewayError::CacheUnavailable {
+                database: database.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let cache = ResponseCache::open(&place, Arc::clone(&self.clock)).map_err(|error| {
+            GatewayError::CacheUnavailable {
+                database: database.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        self.cache = Some(cache);
+        Ok(self)
     }
 
     /// Test seam for an isolated egress-directory mount: the directory must
@@ -1285,6 +1524,10 @@ impl<T: Transport + 'static> Gateway<T> {
             sleeper,
             broker_egress,
             egress_directory,
+            // The response cache is carried only where it is asked for:
+            // the production gateway and the seam that builds what the
+            // production gateway builds.
+            cache: None,
             lanes: Destination::ALL
                 .into_iter()
                 .map(|destination| {
@@ -1311,15 +1554,24 @@ impl<T: Transport + 'static> Gateway<T> {
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
         let method = request.path();
-        let result = self.send_unlogged(request, deadline).await;
+        let started = self.clock.now();
+        let result = self.send_inner(request, deadline).await;
         if let Err(refusal) = &result {
+            // Every refused call says what was sent and what came back: the
+            // URL as it went out (the token never travels in it), the
+            // attempt, the wait, the status. The body stays out: it may
+            // carry the owner's data.
+            let elapsed_ms = millis(self.clock.now() - started);
             if let Some(wait) = refusal.retry_after() {
                 tracing::warn!(
                     destination = ?request.destination(),
                     method,
+                    url = %request.url(),
                     attempt = refusal.attempts(),
+                    elapsed_ms,
                     wait_ms = millis(wait),
                     status = refusal.status(),
+                    request_id = "-",
                     refusal = refusal.kind(),
                     "outbound call refused"
                 );
@@ -1327,17 +1579,25 @@ impl<T: Transport + 'static> Gateway<T> {
                 destination,
                 status,
                 attempts,
+                location,
+                content_type,
+                request_id,
                 ..
             } = refusal
             {
-                // The destination's own "no" (a 401 for a revoked token, a
-                // 404): the body stays out, it may carry the owner's data
-                // or an echoed secret.
+                // The destination's own "no" (a redirect, a 401 for a
+                // revoked token, a 404): where a redirect points, the
+                // body's type, and the request id its support asks for.
                 tracing::warn!(
                     destination = ?destination,
                     method,
+                    url = %request.url(),
                     attempt = attempts,
+                    elapsed_ms,
                     status,
+                    request_id = request_id.as_deref().unwrap_or("-"),
+                    location = location.as_deref().unwrap_or("-"),
+                    content_type = content_type.as_deref().unwrap_or("-"),
                     refusal = refusal.kind(),
                     "outbound call refused"
                 );
@@ -1346,11 +1606,15 @@ impl<T: Transport + 'static> Gateway<T> {
         result
     }
 
-    async fn send_unlogged(
+    /// The body of `send`: every rule, attempt and progress line, and the
+    /// answered line for a call that got its 2xx. `send` adds the refused
+    /// line, which reads the whole call.
+    async fn send_inner(
         &self,
         request: &HttpRequest,
         deadline: Option<Instant>,
     ) -> Result<HttpResponse, GatewayError> {
+        let started = self.clock.now();
         let destination = request.destination();
         let method = request.path();
         let broker = is_broker_destination(destination);
@@ -1372,6 +1636,39 @@ impl<T: Transport + 'static> Gateway<T> {
         } else {
             None
         };
+        // The response cache, when this gateway carries one: a read the
+        // gateway answered within the hour is answered from the store
+        // beside the database. Nothing is sent, no ceiling allowance is
+        // spent and no retry is run; the lane is not even taken. The
+        // lookup comes after every check of the request itself, so a call
+        // refused here is refused exactly as before the cache existed.
+        let cache_key = self.cache.as_ref().and_then(|_cache| CacheKey::of(request));
+        // The stored answer under `key`, logged like an answered call, or
+        // `None` when the store holds none. Used twice: once before the
+        // lane is taken, and again once the lane is held, so a caller
+        // queued behind the very send that stored the answer serves it
+        // instead of spending its allowance and sending the same read.
+        let answer_from_cache = |cache: &ResponseCache, key: &CacheKey| -> Option<HttpResponse> {
+            let stored = cache.lookup(key)?;
+            tracing::info!(
+                destination = ?destination,
+                method,
+                url = %request.url(),
+                attempt = 0,
+                status = stored.status,
+                elapsed_ms = millis(self.clock.now() - started),
+                request_id = without_secrets(stored.request_id.as_deref(), redaction_of(request))
+                    .as_deref()
+                    .unwrap_or("-"),
+                "outbound call answered from cache"
+            );
+            Some(stored)
+        };
+        if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+            if let Some(stored) = answer_from_cache(cache, key) {
+                return Ok(stored);
+            }
+        }
         let lane_lock = &self.lanes[destination.base_url()];
         let mut attempts = 0_u32;
         let mut status = None;
@@ -1415,7 +1712,7 @@ impl<T: Transport + 'static> Gateway<T> {
             // decision-to-handoff bound is unnecessary: another process
             // cannot own this endpoint, and another local call cannot enter
             // until the status has been recorded.
-            let (decision, outcome, body) = {
+            let (decision, outcome, body, answered) = {
                 let asked = self.clock.now();
                 // A caller queued behind a long call or a named wait gives up
                 // at its deadline rather than when the lane frees; dropping
@@ -1598,6 +1895,17 @@ impl<T: Transport + 'static> Gateway<T> {
                         return Err(cut(attempts, status, wait));
                     }
                 }
+                // A caller that was queued behind the very send that stored
+                // its answer re-reads the store now that it holds the lane,
+                // before any allowance is spent or anything is sent: two
+                // concurrent identical reads must not both reach the wire
+                // within the hour. A caller that waited and then reacquired
+                // the lane reaches this same point again and re-reads too.
+                if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+                    if let Some(stored) = answer_from_cache(cache, key) {
+                        return Ok(stored);
+                    }
+                }
                 if broker {
                     let directory = self
                         .egress_directory
@@ -1733,22 +2041,19 @@ impl<T: Transport + 'static> Gateway<T> {
                             }
                         });
                         let observed = Arc::new(std::sync::Mutex::new(
-                            None::<(
-                                u16,
-                                Option<Duration>,
-                                Result<TallyResponseDecision, GatewayError>,
-                            )>,
+                            None::<(HttpResponse, Result<TallyResponseDecision, GatewayError>)>,
                         ));
                         let callback_observed = Arc::clone(&observed);
                         let callback_clock = Arc::clone(&clock);
                         let callback_tally = owner_tally.clone();
                         let callback_path = tally_path.clone();
-                        let observe = Box::new(move |status, retry_after: Option<Duration>| {
-                            let retry_after = retry_after.map(|delay| delay.min(TALLY_RETENTION));
+                        let observe = Box::new(move |observed: HttpResponse| {
+                            let retry_after =
+                                observed.retry_after.map(|delay| delay.min(TALLY_RETENTION));
                             let recorded = callback_tally
                                 .record_response(
                                     destination.base_url(),
-                                    status,
+                                    observed.status,
                                     retry_after,
                                     callback_clock.as_ref(),
                                 )
@@ -1758,7 +2063,7 @@ impl<T: Transport + 'static> Gateway<T> {
                             *callback_observed
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some((status, retry_after, recorded));
+                                Some((observed, recorded));
                         });
                         let answer = transport
                             .send_observed(&request, acknowledge, observe)
@@ -1806,13 +2111,13 @@ impl<T: Transport + 'static> Gateway<T> {
                         } else {
                             None
                         };
-                        if let Some((status, retry_after, Err(_))) = observed.as_ref() {
-                            lane.tally_latched = Some(if (200..300).contains(status) {
+                        if let Some((line, Err(_))) = observed.as_ref() {
+                            lane.tally_latched = Some(if (200..300).contains(&line.status) {
                                 TallyLatch::Unknown
                             } else {
                                 TallyLatch::Response {
-                                    status: *status,
-                                    retry_after: *retry_after,
+                                    status: line.status,
+                                    retry_after: line.retry_after,
                                 }
                             });
                         } else if handoff.as_ref().is_some_and(Result::is_err)
@@ -1872,7 +2177,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         response
                     })
                 });
-                if let Some((observed_status, observed_retry_after, recorded)) = observed {
+                if let Some((observed_line, recorded)) = observed {
                     match recorded {
                         Ok(TallyResponseDecision::Recorded) => {}
                         Ok(TallyResponseDecision::Paused { retry_after }) => {
@@ -1889,13 +2194,11 @@ impl<T: Transport + 'static> Gateway<T> {
                     // A status line is an endpoint answer even when its body
                     // later stalls or fails. Keep a 4xx/5xx from becoming a
                     // retryable transport error and losing the broker's stop
-                    // signal.
-                    if !(200..300).contains(&observed_status) && !matches!(answer, Some(Ok(_))) {
-                        answer = Some(Ok(HttpResponse {
-                            status: observed_status,
-                            body: Vec::new(),
-                            retry_after: observed_retry_after,
-                        }));
+                    // signal. The line carries the headers the refused log
+                    // reads by.
+                    if !(200..300).contains(&observed_line.status) && !matches!(answer, Some(Ok(_)))
+                    {
+                        answer = Some(Ok(observed_line));
                     }
                 } else if let Some(recorded) = unknown {
                     match recorded {
@@ -1931,9 +2234,33 @@ impl<T: Transport + 'static> Gateway<T> {
                         retry.delay(attempts, &Outcome::Transport(HttpError::Timeout));
                     return Err(cut(attempts, status, retry_after));
                 };
-                let (outcome, body) = match answer {
-                    Ok(response) => {
+                let (outcome, body, answered) = match answer {
+                    Ok(mut response) => {
                         if (200..300).contains(&response.status) {
+                            // The moment this answer was observed: a live
+                            // send carries the stamp its transport gave it,
+                            // and a transport that does not stamp is dated
+                            // by the gateway's wall clock — the same clock
+                            // the store stamps entries with, so a caller can
+                            // date a live answer and a served one on one
+                            // scale.
+                            response
+                                .observed_at
+                                .get_or_insert_with(|| self.clock.now_unix());
+                            // The answer is kept under the request's key, so
+                            // the same read inside the hour is answered
+                            // from the store instead of being sent again.
+                            // The presented credential and the cache
+                            // identity are cut out before anything is
+                            // persisted, so a cache file never holds one.
+                            if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
+                                cache.store(
+                                    key,
+                                    &response,
+                                    request.bearer(),
+                                    request.cache_identity(),
+                                );
+                            }
                             if lane.record_success() {
                                 tracing::info!(
                                     destination = ?destination,
@@ -1943,18 +2270,41 @@ impl<T: Transport + 'static> Gateway<T> {
                                     "breaker closed"
                                 );
                             }
-                            return Ok(response);
+                            // Every outbound call to every destination
+                            // leaves an answered line: where it went, what
+                            // came back, and how long it took.
+                            tracing::info!(
+                                destination = ?destination,
+                                method,
+                                url = %request.url(),
+                                attempt = attempts,
+                                status = response.status,
+                                elapsed_ms = millis(self.clock.now() - started),
+                                request_id = without_secrets(
+                                    response.request_id.as_deref(),
+                                    redaction_of(request),
+                                )
+                                .as_deref()
+                                .unwrap_or("-"),
+                                "outbound call answered"
+                            );
+                            return Ok(scrub_reading_answer(response, request));
                         }
                         status = Some(response.status);
                         let outcome = match response.retry_after {
                             Some(after) => Outcome::status_with_retry_after(response.status, after),
                             None => Outcome::status(response.status),
                         };
-                        (outcome, response.body)
+                        let answered = RefusalHeaders::of(&response, request);
+                        (outcome, response.body, answered)
                     }
                     Err(error) => {
                         status = None;
-                        (Outcome::Transport(error), Vec::new())
+                        (
+                            Outcome::Transport(error),
+                            Vec::new(),
+                            RefusalHeaders::default(),
+                        )
                     }
                 };
                 if let Some(named) = outcome.named_delay()
@@ -1985,7 +2335,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         "breaker opened"
                     );
                 }
-                (decision, outcome, body)
+                (decision, outcome, body, answered)
             };
             match decision {
                 // Waited at the top of the loop, under the lane, where every
@@ -2011,8 +2361,8 @@ impl<T: Transport + 'static> Gateway<T> {
                     }
                 }
                 Retry::GiveUp => {
-                    let body = RejectedBody::without_secret(&body, request.bearer());
-                    return Err(self.refusal(destination, attempts, outcome, body));
+                    let body = RejectedBody::without_secret(&body, redaction_of(request));
+                    return Err(self.refusal(destination, attempts, outcome, body, answered));
                 }
             }
         }
@@ -2067,6 +2417,7 @@ impl<T: Transport + 'static> Gateway<T> {
         attempts: u32,
         outcome: Outcome,
         body: RejectedBody,
+        headers: RefusalHeaders,
     ) -> GatewayError {
         if is_transient(&outcome) {
             return GatewayError::Exhausted {
@@ -2089,6 +2440,9 @@ impl<T: Transport + 'static> Gateway<T> {
                 status,
                 attempts,
                 body,
+                location: headers.location,
+                content_type: headers.content_type,
+                request_id: headers.request_id,
             },
             Outcome::Transport(error) => GatewayError::Transport {
                 destination,
@@ -2177,6 +2531,10 @@ mod tests {
                 "test-boot",
                 self.now().saturating_duration_since(self.monotonic_origin),
             ))
+        }
+
+        fn now_unix(&self) -> SystemTime {
+            SystemTime::now() + *self.offset.lock().expect("clock")
         }
     }
 
@@ -2278,6 +2636,7 @@ mod tests {
             status,
             body: Vec::new(),
             retry_after: None,
+            ..Default::default()
         }
     }
 
@@ -2317,7 +2676,7 @@ mod tests {
         directory
     }
 
-    fn gateway(time: &Arc<FakeTime>, transport: Scripted) -> Gateway<Scripted> {
+    fn gateway<T: Transport + 'static>(time: &Arc<FakeTime>, transport: T) -> Gateway<T> {
         let directory = broker_egress_directory();
         Gateway::with_parts_in_directory(
             transport,
@@ -2547,6 +2906,7 @@ mod tests {
         for method in [
             "AccountsService.GetAccount",
             "AccountsService.Transactions",
+            "AssetsService.GetAsset",
             "AuthService.Sessions",
         ] {
             let row = BUDGETS
@@ -2557,6 +2917,41 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("{method} has no row"));
             assert_eq!((row.documented, row.used), (Some(200), 100), "{method}");
+        }
+    }
+
+    #[test]
+    fn a_finam_asset_path_is_budgeted_as_the_asset_read() {
+        assert_eq!(
+            broker_budget_key(Destination::FinamApi, "/v1/assets/SBER@MISX"),
+            Some("AssetsService.GetAsset")
+        );
+    }
+
+    #[test]
+    fn a_finam_asset_path_that_is_not_one_segment_is_refused_the_budget() {
+        let refused: &[&str] = &[
+            // Not an asset path at all, or a symbol missing.
+            "/v1/assets",
+            "/v1/assets/",
+            "/v1/invented",
+            // Dot segments, and a second segment.
+            "/v1/assets/.",
+            "/v1/assets/..",
+            "/v1/assets/SBER@MISX/extra",
+            // What a raw path may never carry.
+            "/v1/assets/SBER%40MISX",
+            "/v1/assets/SBER?MISX",
+            "/v1/assets/SBER#MISX",
+            "/v1/assets/SBER\\MISX",
+            "/v1/assets/SBER\nMISX",
+        ];
+        for path in refused {
+            assert_eq!(
+                broker_budget_key(Destination::FinamApi, path),
+                None,
+                "{path}"
+            );
         }
     }
 
@@ -3251,7 +3646,12 @@ mod tests {
             .await
             .expect("2xx is a success");
 
-        assert_eq!(response, answer);
+        // Everything the transport gave is returned as it came, with the
+        // one addition: the moment a caller dates the answer by.
+        let mut expected = answer;
+        expected.observed_at = response.observed_at;
+        assert_eq!(response, expected);
+        assert!(response.observed_at.is_some(), "a live answer is dated");
         assert_eq!(gateway.transport.sent_count(), 1);
     }
 
@@ -4098,15 +4498,570 @@ mod tests {
                 ..status(401)
             })),
         );
-        let request = operations().with_bearer("t.invented-token");
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+            crate::RequestBody::Json(r#"{"session":"s.invented-session"}"#.to_owned()),
+        )
+        .with_bearer("t.invented-token")
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
+        .idempotent();
         let log = Log::capture();
 
         let _ = gateway.send(&request, None).await;
 
-        let text = log.text();
-        assert!(text.contains("refusal=\"rejected\""), "{text}");
-        assert!(!text.contains("invented-token"), "{text}");
-        assert!(!text.contains("balance"), "{text}");
+        let refused = log.text();
+        assert!(refused.contains("refusal=\"rejected\""), "{refused}");
+        assert!(!refused.contains("invented-token"), "{refused}");
+        assert!(!refused.contains("invented-session"), "{refused}");
+        assert!(!refused.contains("balance"), "{refused}");
+
+        // The success line names the wire URL: a secret that travelled in
+        // the query, the header or the body would reach it too.
+        let log = Log::capture();
+        gateway.send(&request, None).await.expect("answered");
+        let answered = log.text();
+        assert!(answered.contains("outbound call answered"), "{answered}");
+        assert!(!answered.contains("invented-token"), "{answered}");
+        assert!(!answered.contains("invented-session"), "{answered}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_destination_echoing_the_token_in_a_header_is_redacted_in_the_log() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let refusing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                location: Some(
+                    "https://invest-public-api.tbank.ru/again?t=t.invented-token".to_owned(),
+                ),
+                request_id: Some("t.invented-token".to_owned()),
+                content_type: Some("text/html".to_owned()),
+                ..status(308)
+            })),
+        );
+        let request = operations().with_bearer("t.invented-token");
+
+        let _ = refusing.send(&request, None).await;
+
+        let refused = log.text();
+        assert!(refused.contains("outbound call refused"), "{refused}");
+        assert!(!refused.contains("invented-token"), "{refused}");
+        assert!(
+            refused.contains("location=\"https://invest-public-api.tbank.ru/again?t=<redacted>\""),
+            "{refused}"
+        );
+        assert!(refused.contains("request_id=\"<redacted>\""), "{refused}");
+
+        // The answered line cuts the token out of the id the same way.
+        let log = Log::capture();
+        let answering = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some("t.invented-token".to_owned()),
+                ..status(200)
+            })),
+        );
+        answering.send(&request, None).await.expect("answered");
+        let answered = log.text();
+        assert!(answered.contains("outbound call answered"), "{answered}");
+        assert!(!answered.contains("invented-token"), "{answered}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finam_reading_answer_is_scrubbed_not_only_the_mint() {
+        // The exemption is exactly the session mint: a reading on the Finam
+        // destination (an asset read, say) is data, and an answer that echoes
+        // the presented token must reach the caller cut of it. This pins the
+        // `&&`/`==` boundary of the exemption against the `||`/`!=` mutants.
+        let time = FakeTime::new();
+        let downgoing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                content_type: Some("application/json".to_owned()),
+                body: br#"{"isin":"RU000A0","echo":"t.invented-token"}"#.to_vec(),
+                ..status(200)
+            })),
+        );
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/assets/X")
+            .with_bearer("t.invented-token")
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
+
+        let response = downgoing.send(&request, None).await.expect("answered");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(
+            !body.contains("t.invented-token"),
+            "a Finam reading is scrubbed like any other: {body}"
+        );
+        assert!(
+            body.contains("RU000A0"),
+            "the answer's own content stays: {body}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reading_answer_is_scrubbed_even_when_its_body_mentions_token() {
+        // T-Invest reads carry a pagination cursor that can contain the word
+        // "token"; the cache's broad credential-body rule must not exempt
+        // such a reading from the scrub (iaam-vg8te.1.1 round 4).
+        let time = FakeTime::new();
+        let downgoing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                content_type: Some("application/json".to_owned()),
+                body: br#"{"row":"unfit","echo":"t.invented-token"}"#.to_vec(),
+                ..status(200)
+            })),
+        );
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+            crate::request::RequestBody::Json(r#"{"cursor":"page-token-2"}"#.to_owned()),
+        )
+        .idempotent()
+        .with_bearer("t.invented-token")
+        .with_request_allowance(RequestAllowance::new(u32::MAX));
+
+        let response = downgoing.send(&request, None).await.expect("answered");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(
+            !body.contains("t.invented-token"),
+            "the echoed token reached the caller: {body}"
+        );
+        assert!(
+            body.contains("unfit"),
+            "the rest of the answer stays: {body}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_success_body_echoing_the_token_is_redacted_before_it_reaches_the_caller() {
+        // A reading answer echoes the presented credential in its body. The
+        // scrub must happen before the caller sees it: the body travels on
+        // into a parser and into a kept refusal's payload (iaam-vg8te.1.1).
+        let time = FakeTime::new();
+        let downgoing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some("req-7".to_owned()),
+                content_type: Some("application/json".to_owned()),
+                body: br#"{"symbol":"X","echo":"t.invented-token"}"#.to_vec(),
+                ..status(200)
+            })),
+        );
+        let request = HttpRequest::get(
+            Destination::TinkoffProd,
+            "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+        )
+        .with_bearer("t.invented-token")
+        .with_request_allowance(RequestAllowance::new(u32::MAX));
+
+        let response = downgoing.send(&request, None).await.expect("answered");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(
+            !body.contains("t.invented-token"),
+            "the echoed token reached the caller: {body}"
+        );
+        assert!(
+            body.contains("<redacted>"),
+            "the body keeps its shape: {body}"
+        );
+
+        // The session exchange is the one answer that keeps its body whole: it
+        // IS the new token.
+        let secret = "the-exchange-secret-Q1w2e3r4";
+        let exch = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                content_type: Some("application/json".to_owned()),
+                body: br#"{"token":"the-exchange-secret-exchange-token"}"#.to_vec(),
+                ..status(200)
+            })),
+        );
+        let exchange = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            crate::request::RequestBody::Json(format!(r#"{{"secret":"{secret}"}}"#)),
+        )
+        .idempotent()
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
+        .with_redaction_word(secret);
+        let answer = exch.send(&exchange, None).await.expect("answered");
+        let body = String::from_utf8(answer.body).expect("utf8");
+        assert!(
+            body.contains("the-exchange-secret-exchange-token"),
+            "a credential exchange's answer is the credential and stays whole: {body}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_body_carried_secret_echoed_in_a_header_is_redacted_in_the_log() {
+        // The request that carries the long-lived secret only in its body:
+        // Finam's session exchange. The destination echoes the body value
+        // back in its response headers, and the gateway has no
+        // `Authorization` header to scrub — only the redaction word the
+        // request names.
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let secret = "the-body-carried-secret-Q1w2e3r4";
+        let refusing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                location: Some(format!("/v1/again?secret={secret}")),
+                request_id: Some(format!("echo-{secret}")),
+                content_type: Some("text/html".to_owned()),
+                ..status(401)
+            })),
+        );
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            crate::RequestBody::Json(format!(r#"{{"secret":"{secret}"}}"#)),
+        )
+        .with_redaction_word(secret)
+        .with_request_allowance(RequestAllowance::new(u32::MAX))
+        .idempotent();
+
+        let _ = refusing.send(&request, None).await;
+
+        let refused = log.text();
+        assert!(refused.contains("outbound call refused"), "{refused}");
+        assert!(!refused.contains(secret), "{refused}");
+        assert!(
+            refused.contains("location=\"/v1/again?secret=<redacted>\""),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("request_id=\"echo-<redacted>\""),
+            "{refused}"
+        );
+
+        // The answered line cuts the body-carried secret out of the id the
+        // same way, though the request carried no Authorization header.
+        let log = Log::capture();
+        let answering = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some(format!("echo-{secret}")),
+                ..status(200)
+            })),
+        );
+        answering.send(&request, None).await.expect("answered");
+        let answered = log.text();
+        assert!(answered.contains("outbound call answered"), "{answered}");
+        assert!(!answered.contains(secret), "{answered}");
+        assert!(
+            answered.contains("request_id=\"echo-<redacted>\""),
+            "{answered}"
+        );
+    }
+
+    /// A transport that publishes a status line and then loses the body:
+    /// the shape a stalled or truncated body arrives in.
+    struct StatusLineThenBodyFailure {
+        status: HttpResponse,
+    }
+
+    impl Transport for StatusLineThenBodyFailure {
+        async fn send(&self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+            Err(HttpError::Timeout)
+        }
+
+        fn send_observed<'a>(
+            &'a self,
+            _request: &'a HttpRequest,
+            handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
+            observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
+        ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
+            let status = self.status.clone();
+            async move {
+                handoff()?;
+                observe(status);
+                Err(HttpError::Timeout)
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_two_hundred_status_line_whose_body_is_lost_is_not_a_success() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            StatusLineThenBodyFailure {
+                status: HttpResponse {
+                    request_id: Some("req-invented-3".to_owned()),
+                    ..status(200)
+                },
+            },
+        );
+
+        let refused = gateway.send(&operations(), None).await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(GatewayError::Exhausted {
+                    attempts: ATTEMPTS,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_status_line_survives_a_lost_body_with_its_headers() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            StatusLineThenBodyFailure {
+                status: HttpResponse {
+                    location: Some("/v1/moved".to_owned()),
+                    request_id: Some("req-invented-4".to_owned()),
+                    content_type: Some("text/html".to_owned()),
+                    ..status(308)
+                },
+            },
+        );
+
+        let refused = gateway.send(&operations(), None).await;
+
+        assert!(
+            matches!(&refused, Err(GatewayError::Rejected { status: 308, .. })),
+            "{refused:?}"
+        );
+        log.assert_line(
+            "WARN",
+            "refusal=\"rejected\"",
+            &[
+                "status=308",
+                "location=\"/v1/moved\"",
+                "content_type=\"text/html\"",
+                "request_id=\"req-invented-4\"",
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_redirect_refusal_is_logged_with_the_location_it_pointed_at() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                location: Some(
+                    "/v1/accounts/act/transactions?interval.start_time=2026-09-01".to_owned(),
+                ),
+                content_type: Some("text/html".to_owned()),
+                ..status(308)
+            })),
+        );
+
+        let _ = call(&gateway).await;
+
+        log.assert_line(
+            "WARN",
+            "refusal=\"rejected\"",
+            &[
+                "outbound call refused",
+                "url=https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+                "status=308",
+                "attempt=1",
+                "elapsed_ms=",
+                "request_id=\"-\"",
+                "location=\"/v1/accounts/act/transactions?interval.start_time=2026-09-01\"",
+                "content_type=\"text/html\"",
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_call_is_logged_at_info_with_its_wire_url_and_request_id() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                request_id: Some("req-invented-2".to_owned()),
+                ..status(200)
+            })),
+        );
+
+        call(&gateway).await.expect("answered");
+
+        log.assert_line(
+            "INFO",
+            "outbound call answered",
+            &[
+                "destination=TinkoffProd",
+                "method=\"/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor\"",
+                "url=https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+                "status=200",
+                "attempt=1",
+                "elapsed_ms=0",
+                "request_id=\"req-invented-2\"",
+            ],
+        );
+    }
+
+    /// One shared-scope row per destination: the walk's paths name no real
+    /// budget row, and a table of its own keeps the walk out of the
+    /// documented table's per-method keys.
+    static WALK_BUDGETS: &[Budget] = &[
+        Budget {
+            destination: Destination::TinkoffProd,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::TinkoffSandbox,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::FinamApi,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::MoexIss,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::CbrScripts,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::CbrDailyInfo,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+        Budget {
+            destination: Destination::TinvestContract,
+            scope: MethodScope::Shared,
+            documented: None,
+            used: 1000,
+            window: MINUTE,
+        },
+    ];
+
+    fn walk_gateway(time: &Arc<FakeTime>, transport: Scripted) -> Gateway<Scripted> {
+        let directory = broker_egress_directory();
+        Gateway::with_parts_in_directory(
+            transport,
+            WALK_BUDGETS,
+            Arc::clone(time) as Arc<dyn Clock>,
+            Arc::clone(time) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            &directory,
+        )
+        .expect("the walk budget table is valid")
+    }
+
+    /// A GET the walk sends to every destination. Brokers carry the sync
+    /// allowance their lane demands; no other destination asks for one.
+    fn walk_request(destination: Destination) -> HttpRequest {
+        let request = HttpRequest::get(destination, "/log-walk");
+        if is_broker_destination(destination) {
+            request.with_request_allowance(RequestAllowance::new(u32::MAX))
+        } else {
+            request
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_destination_logs_its_success_and_its_refusal() {
+        for destination in Destination::ALL {
+            // Success: one line at info, naming where the call went.
+            let log = Log::capture();
+            let time = FakeTime::new();
+            let gateway = walk_gateway(
+                &time,
+                Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                    request_id: Some("req-walk-success".to_owned()),
+                    ..status(200)
+                })),
+            );
+            let request = walk_request(destination);
+            gateway
+                .send(&request, None)
+                .await
+                .unwrap_or_else(|error| panic!("{destination:?} success: {error}"));
+            let text = log.text();
+            let answered: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("outbound call answered"))
+                .collect();
+            assert_eq!(answered.len(), 1, "{destination:?}: {text}");
+            let line = answered[0];
+            for fragment in [
+                "INFO",
+                &format!("destination={destination:?}"),
+                "method=\"/log-walk\"",
+                &format!(
+                    "url={}/log-walk",
+                    destination.base_url().trim_end_matches('/')
+                ),
+                "status=200",
+                "attempt=1",
+                "elapsed_ms=",
+                "request_id=\"req-walk-success\"",
+            ] {
+                assert!(
+                    line.contains(fragment),
+                    "{destination:?}: no {fragment:?} in {line}"
+                );
+            }
+
+            // Refusal: one line at warn, the same fields with the status.
+            let log = Log::capture();
+            let time = FakeTime::new();
+            let gateway = walk_gateway(&time, Scripted::answering(&time, 404));
+            let refused = gateway.send(&request, None).await;
+            assert!(
+                matches!(refused, Err(GatewayError::Rejected { status: 404, .. })),
+                "{destination:?}: {refused:?}"
+            );
+            let text = log.text();
+            let rejected: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("outbound call refused"))
+                .collect();
+            assert_eq!(rejected.len(), 1, "{destination:?}: {text}");
+            let line = rejected[0];
+            for fragment in [
+                "WARN",
+                &format!("destination={destination:?}"),
+                &format!(
+                    "url={}/log-walk",
+                    destination.base_url().trim_end_matches('/')
+                ),
+                "status=404",
+                "attempt=1",
+                "refusal=\"rejected\"",
+            ] {
+                assert!(
+                    line.contains(fragment),
+                    "{destination:?}: no {fragment:?} in {line}"
+                );
+            }
+        }
     }
 
     // --- production parts -------------------------------------------------
@@ -4441,6 +5396,9 @@ mod tests {
                     status: 500,
                     attempts: 1,
                     body: RejectedBody::without_secret(b"invented", None),
+                    location: None,
+                    content_type: None,
+                    request_id: None,
                 },
                 "rejected",
             ),
@@ -4577,5 +5535,431 @@ mod tests {
             other => panic!("an unopenable generation record is TallyUnavailable: {other:?}"),
         }
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // --- response cache ---------------------------------------------------
+
+    /// An answer a scripted endpoint gave, with a body to tell answers
+    /// apart.
+    fn answered(status: u16, body: &[u8]) -> HttpResponse {
+        HttpResponse {
+            status,
+            body: body.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// The gateway a production process builds — documented budgets, the
+    /// tally beside the invented instance's database and the response
+    /// cache beside it — over the parts the test injects.
+    fn gateway_with_cache<T: Transport + 'static>(
+        time: &Arc<FakeTime>,
+        transport: T,
+        label: &str,
+    ) -> Gateway<T> {
+        let (_directory, database) = instance_database(label);
+        Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(time) as Arc<dyn Clock>,
+            Arc::clone(time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid")
+    }
+
+    /// The same over a broker destination, whose tally must be minted
+    /// fresh first: an invented instance's first enabling.
+    fn broker_gateway_with_cache<T: Transport + 'static>(
+        time: &Arc<FakeTime>,
+        transport: T,
+        label: &str,
+    ) -> Gateway<T> {
+        let (_directory, database) = instance_database(label);
+        initialize_fresh_tally(&database, time.as_ref()).expect("the fresh tally was minted");
+        Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(time) as Arc<dyn Clock>,
+            Arc::clone(time) as Arc<dyn Sleeper>,
+            BrokerEgress::On,
+            &database,
+        )
+        .expect("the documented table is valid")
+    }
+
+    /// A Finam read: a GET the account's access token authorizes.
+    fn finam_read(bearer: &str) -> HttpRequest {
+        HttpRequest::get(Destination::FinamApi, "/v1/accounts/ACC123")
+            .with_bare_token(bearer)
+            .with_request_allowance(RequestAllowance::new(3))
+    }
+
+    /// Finam's session exchange: the secret rides the body alone, and the
+    /// method is marked safe to repeat because minting a session has no
+    /// effect on the account.
+    fn finam_exchange(secret: &str) -> HttpRequest {
+        HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/sessions",
+            crate::RequestBody::Json(format!(r#"{{"secret":"{secret}"}}"#)),
+        )
+        .with_request_allowance(RequestAllowance::new(3))
+        .idempotent()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_answered_once_is_answered_from_the_cache_for_an_hour() {
+        let time = FakeTime::new();
+        let transport =
+            Scripted::answering(&time, 200).then(Ok(answered(200, b"<history>pages</history>")));
+        let gateway = gateway_with_cache(&time, transport, "read-hour");
+        let request = HttpRequest::get(
+            Destination::MoexIss,
+            "/iss/history/engines/stock/markets/bonds/boards/TQCB/securities/SU26238RMFS4.json",
+        )
+        .with_query("from", "2026-08-01");
+
+        let first = gateway.send(&request, None).await.expect("first sent");
+        let second = gateway.send(&request, None).await.expect("second answered");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            1,
+            "the second read was answered from the cache"
+        );
+        assert_eq!(
+            second.status, first.status,
+            "the cached answer is the answer given"
+        );
+        assert_eq!(
+            second.body, first.body,
+            "the cached answer is the answer given"
+        );
+        // Both answers carry a moment, and the served one keeps the moment
+        // it was first fetched — between the first answer's and the serve's.
+        let observed = first.observed_at.expect("a live answer is dated");
+        let kept = second.observed_at.expect("a served answer keeps its date");
+        assert!(kept >= observed, "the kept moment is not before the fetch");
+        assert!(
+            kept <= time.now_unix(),
+            "the kept moment is the fetch's, not the serve's"
+        );
+
+        time.advance(crate::cache::CACHE_TTL + Duration::from_secs(1));
+        gateway
+            .send(&request, None)
+            .await
+            .expect("sent after the hour");
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "an hour later the read is sent again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_non_read_is_sent_every_time() {
+        let time = FakeTime::new();
+        let gateway = broker_gateway_with_cache(&time, Scripted::answering(&time, 200), "non-read");
+        let request = HttpRequest::post(
+            Destination::FinamApi,
+            "/v1/accounts/ACC123/transactions",
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_bare_token("test-bearer")
+        .with_request_allowance(RequestAllowance::new(3));
+
+        gateway.send(&request, None).await.expect("first sent");
+        gateway.send(&request, None).await.expect("second sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "a request that may act is sent again whatever the answer was"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_credential_exchange_is_never_cached() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200)
+            .then(Ok(answered(200, br#"{"token":"session-one"}"#)))
+            .then(Ok(answered(200, br#"{"token":"session-two"}"#)));
+        let gateway = broker_gateway_with_cache(&time, transport, "exchange");
+        let request = finam_exchange("test-finam-secret");
+
+        gateway
+            .send(&request, None)
+            .await
+            .expect("first exchange sent");
+        let second = gateway
+            .send(&request, None)
+            .await
+            .expect("second exchange sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "an exchange of a secret is sent every time"
+        );
+        assert_eq!(
+            second.body, br#"{"token":"session-two"}"#,
+            "the second exchange got its own answer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_access_credential_never_serves_another() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200)
+            .then(Ok(answered(200, b"first-access")))
+            .then(Ok(answered(200, b"second-access")));
+        let gateway = broker_gateway_with_cache(&time, transport, "isolation");
+
+        gateway
+            .send(&finam_read("test-bearer-one"), None)
+            .await
+            .expect("the first access was sent");
+        let second = gateway
+            .send(&finam_read("test-bearer-two"), None)
+            .await
+            .expect("the second access was sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "a new credential is a new send"
+        );
+        assert_eq!(
+            second.body, b"second-access",
+            "the first access's answer did not serve the second"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_answer_consumes_no_ceiling_allowance() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(answered(200, b"holdings")));
+        let gateway = broker_gateway_with_cache(&time, transport, "allowance");
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts/ACC123")
+            .with_bare_token("test-bearer")
+            .with_request_allowance(RequestAllowance::new(1));
+
+        let first = gateway
+            .send(&request, None)
+            .await
+            .expect("the first read went out");
+        let second = gateway
+            .send(&request, None)
+            .await
+            .expect("the second read was answered without spending the last attempt");
+
+        assert_eq!(first.body, second.body);
+        assert_eq!(gateway.transport.sent_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_concurrent_identical_reads_reach_the_wire_once() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(answered(200, b"<history/>")));
+        let gateway = broker_gateway_with_cache(&time, transport, "concurrent");
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts/ACC123")
+            .with_bare_token("test-bearer");
+        // One shared allowance of one: whatever the second caller does, it
+        // must be served from the store, not from a second send.
+        let allowance = RequestAllowance::new(1);
+        let first_call = request.clone().with_request_allowance(allowance.clone());
+        let second_call = request.with_request_allowance(allowance.clone());
+
+        let (first, second) = tokio::join!(
+            gateway.send(&first_call, None),
+            gateway.send(&second_call, None),
+        );
+
+        let first = first.expect("the first read was sent");
+        let second = second.expect("the second read was answered");
+        assert_eq!(
+            gateway.transport.sent_count(),
+            1,
+            "two concurrent identical reads both reached the wire"
+        );
+        assert_eq!(
+            first.body, b"<history/>",
+            "the wire answered the first call"
+        );
+        assert_eq!(
+            second.body, first.body,
+            "both callers received the same answer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_destination_echoing_the_token_is_not_stored_in_the_cache() {
+        let time = FakeTime::new();
+        let token = "test-bearer-token-Q1w2e3r4";
+        let identity = "test-cache-identity-Z9y8x7w6";
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json")
+            .with_bearer(token)
+            .with_cache_identity(identity);
+        let transport = Scripted::answering(&time, 200).then(Ok(HttpResponse {
+            status: 200,
+            body: format!(r#"{{ "history": ["{token}"] }}"#).into_bytes(),
+            request_id: Some(token.to_owned()),
+            ..Default::default()
+        }));
+        let (_directory, database) = instance_database("cache-echo");
+        let gateway = Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid");
+
+        gateway
+            .send(&request, None)
+            .await
+            .expect("the read was sent and answer stored");
+
+        let place = crate::cache::cache_directory_for(&database).expect("the cache place");
+        let mut files = 0;
+        for entry in std::fs::read_dir(&place).expect("cache read").flatten() {
+            files += 1;
+            let bytes = std::fs::read(entry.path()).expect("entry read");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains(token),
+                "the echoed token leaked into {:?}",
+                entry.path()
+            );
+            assert!(
+                !text.contains(identity),
+                "the cache identity leaked into {:?}",
+                entry.path()
+            );
+        }
+        assert!(files > 0, "the cache stored something to inspect");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_answer_is_logged_like_an_answered_call() {
+        let log = Log::capture();
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(HttpResponse {
+            status: 200,
+            body: b"<history/>".to_vec(),
+            request_id: Some("moex-req-7".to_owned()),
+            ..Default::default()
+        }));
+        let gateway = gateway_with_cache(&time, transport, "log");
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        gateway.send(&request, None).await.expect("first sent");
+        gateway.send(&request, None).await.expect("second answered");
+
+        log.assert_line(
+            "INFO",
+            "outbound call answered from cache",
+            &[
+                "destination=MoexIss",
+                "method=\"/iss/history.json\"",
+                "url=https://iss.moex.com/iss/history.json",
+                "attempt=0",
+                "status=200",
+                "request_id=\"moex-req-7\"",
+            ],
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cache_survives_a_restart() {
+        let time = FakeTime::new();
+        let transport = Scripted::answering(&time, 200).then(Ok(answered(200, b"<history/>")));
+        let (_directory, database) = instance_database("cache-restart");
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        let first = Gateway::with_parts_for_database_with_response_cache(
+            transport,
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid");
+        first
+            .send(&request, None)
+            .await
+            .expect("sent by the first process");
+        drop(first);
+
+        // A restarted process: a fresh gateway over the same database, with
+        // a transport that has no answer scripted — whatever it returns,
+        // it must not have been sent.
+        let second = Gateway::with_parts_for_database_with_response_cache(
+            Scripted::answering(&time, 200),
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &database,
+        )
+        .expect("the documented table is valid");
+        second
+            .send(&request, None)
+            .await
+            .expect("answered after the restart");
+
+        assert_eq!(
+            second.transport.sent_count(),
+            0,
+            "the restarted gateway sent nothing for the read it had cached"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gateway_without_a_database_does_not_cache() {
+        let time = FakeTime::new();
+        let gateway = gateway(&time, Scripted::answering(&time, 200));
+        let request = HttpRequest::get(Destination::MoexIss, "/iss/history.json");
+
+        gateway.send(&request, None).await.expect("first sent");
+        gateway.send(&request, None).await.expect("second sent");
+
+        assert_eq!(
+            gateway.transport.sent_count(),
+            2,
+            "without a database there is no cache"
+        );
+    }
+
+    #[test]
+    fn a_cache_beside_a_missing_database_is_refused_by_name() {
+        let time = FakeTime::new();
+        let missing =
+            std::env::temp_dir().join(format!("iaam-missing-cache-db-{}", std::process::id()));
+        let refused = Gateway::with_parts_for_database_with_response_cache(
+            Scripted::answering(&time, 200),
+            BUDGETS,
+            Arc::clone(&time) as Arc<dyn Clock>,
+            Arc::clone(&time) as Arc<dyn Sleeper>,
+            BrokerEgress::Off,
+            &missing,
+        );
+
+        let Err(error) = refused else {
+            panic!("a gateway over a missing database was built");
+        };
+        assert!(
+            matches!(error, GatewayError::CacheUnavailable { .. }),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("response cache"), "{message}");
+        assert!(message.contains("does not exist"), "{message}");
     }
 }

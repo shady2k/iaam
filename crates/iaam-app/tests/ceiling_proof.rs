@@ -776,7 +776,7 @@ impl Transport for ProofTransport {
         &'a self,
         request: &'a HttpRequest,
         handoff: Box<dyn FnOnce() -> Result<(), HttpError> + Send + 'a>,
-        observe: Box<dyn FnOnce(u16, Option<Duration>) + Send + 'a>,
+        observe: Box<dyn FnOnce(HttpResponse) + Send + 'a>,
     ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send + 'a {
         self.advance_before_handoff();
         let after = self.take_after_handoff();
@@ -1586,8 +1586,15 @@ async fn exercise_finam_sync() -> Scenario {
     );
     let scenario = Scenario::new_sync("finam-real-sync", Destination::FinamApi, replies);
     let client = FinamClient::new(token(), Arc::clone(&scenario.outbound));
-    let channel = FinamChannel::new(client, SourceId::new_random(), dictionary("finam"));
     let (services, principal, account) = services().await;
+    // The real instrument directory of the instance: this proof never
+    // reaches a symbol, so the directory is never asked.
+    let channel = FinamChannel::new(
+        client,
+        SourceId::new_random(),
+        dictionary("finam"),
+        Arc::clone(&services.directory),
+    );
     let result = iaam_app::sync::sync_broker(
         &services,
         &principal,
@@ -3397,5 +3404,60 @@ async fn the_first_enabling_row_fails_when_the_pair_the_mint_leaves_is_empty() {
     assert!(
         matches!(refused, GatewayError::DailyCeiling { .. }),
         "{refused:?}"
+    );
+}
+
+// --- The response cache (iaam-vg8te.1.1). ---
+//
+// A read the production-built gateway has answered within the hour is
+// answered from the cache beside the database. The wire sees one departure,
+// and the answer served the second time is spent from no sync's allowance:
+// the second read below runs on a sync whose single attempt is already
+// spent, so anything but a cache answer could not answer it at all.
+
+#[tokio::test]
+async fn a_cached_answer_consumes_no_allowance() {
+    let directory = TempDir::new("cache-allowance");
+    let database = directory.0.join("iaam.sqlite");
+    std::fs::write(&database, "").expect("database file written");
+    let clock = FakeTime::new();
+    let minted = initialize_fresh_tally(&database, &*clock)
+        .unwrap_or_else(|error| panic!("the fresh pair was minted: {error}"));
+    assert!(minted, "a missing pair is minted");
+
+    // Exactly one scripted answer: the wire can serve the read once.
+    let server = LoopbackServer::start(std::iter::once(LoopbackReply::complete(
+        200,
+        r#"{"account_ids":["ACC123"]}"#,
+    )))
+    .unwrap_or_else(|error| panic!("cache-allowance loopback: {error}"));
+
+    let gateway = Gateway::with_parts_for_database_with_response_cache(
+        HttpClientHarness::new(&server),
+        BUDGETS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&clock) as Arc<dyn Sleeper>,
+        BrokerEgress::On,
+        &database,
+    )
+    .unwrap_or_else(|error| panic!("cache-allowance gateway: {error}"));
+
+    // One attempt is all this sync may spend.
+    let request = HttpRequest::get(Destination::FinamApi, "/v1/accounts/ACC123")
+        .with_bare_token("test-bearer-one")
+        .with_request_allowance(RequestAllowance::new(1));
+
+    let first = gateway
+        .send(&request, None)
+        .await
+        .unwrap_or_else(|error| panic!("the first read went out: {error}"));
+    let second = gateway.send(&request, None).await.unwrap_or_else(|error| {
+        panic!("the cached answer served the sync whose attempt was spent: {error}")
+    });
+
+    assert_eq!(first.status, 200);
+    assert_eq!(
+        first.body, second.body,
+        "the cached answer is the answer the gateway gave"
     );
 }

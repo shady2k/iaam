@@ -39,7 +39,7 @@ use iaam_ingest::operation::{OperationDates, OperationKind, PARSER_VERSION};
 use iaam_ingest::{SubmittedOperation, Verdict};
 use iaam_store::SqliteStore;
 use time::Date;
-use time::macros::date;
+use time::macros::{date, datetime};
 use tokio::sync::Notify;
 
 struct FixedClock(Date);
@@ -502,6 +502,7 @@ fn api_with_claims(
             as_of: PortfolioAsOf::Current,
             claims,
             refused: Vec::new(),
+            observed_on: None,
         }),
     }
 }
@@ -616,6 +617,7 @@ async fn a_position_with_no_trade_in_the_interval_registers_no_custody() {
                 at: BalancePoint::Closing,
             }],
             refused: Vec::new(),
+            observed_on: None,
         }),
     };
 
@@ -672,6 +674,7 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
             as_of: PortfolioAsOf::Current,
             claims: Vec::new(),
             refused: Vec::new(),
+            observed_on: None,
         }),
     };
 
@@ -911,6 +914,81 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
     );
 }
 
+/// A portfolio row the channel reported and this system could not turn into
+/// a claim is set aside like a quarantined operation: it reaches the owner
+/// in the sync's answer with its reason, the answer counts it, the readable
+/// claims still import, and the row stands in the journal as a coverage gap
+/// naming the positions dimension (iaam-vg8te.1.2).
+#[tokio::test]
+async fn a_refused_position_reaches_the_owner_counted_and_gapped() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    let operation = trade_without_custody(account, instrument);
+    let mut broker = api(account, SourceId::new_random(), operation);
+    broker.operations = Ok(ParsedOperations {
+        accepted: Vec::new(),
+        quarantined: Vec::new(),
+    });
+    broker.portfolio = Ok(PortfolioSnapshot {
+        as_of: PortfolioAsOf::Current,
+        claims: vec![cash_opening_claim()],
+        refused: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::json!({"symbol": "SBER@MISX", "quantity": {"value": "10"}}),
+            reason: "symbol SBER@MISX is not resolved to an instrument".to_owned(),
+            dimensions: dimensions(&[Dimension::Positions]),
+        }],
+        observed_on: None,
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    // The set-aside row reaches the owner in the sync's answer, with its
+    // reason.
+    assert!(
+        outcome.recorded.iter().any(|verdict| matches!(
+            verdict,
+            Verdict::Quarantined { reason }
+                if reason.contains("not resolved to an instrument")
+        )),
+        "{:?}",
+        outcome.recorded
+    );
+    // The answer counts every row set aside.
+    assert_eq!(outcome.set_aside, 1);
+    // The readable claim still imported.
+    assert_eq!(outcome.assertions, 1);
+    // And the row stands in the journal as a coverage gap naming positions.
+    let events = load_all(&services, owner).await;
+    let gap = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ImportCoverageGap {
+                dimensions,
+                refused,
+                ..
+            } => Some((dimensions, refused)),
+            _ => None,
+        })
+        .expect("coverage gap");
+    assert_eq!(gap.0, &dimensions(&[Dimension::Positions]));
+    assert_eq!(*gap.1, 1);
+}
+
 #[tokio::test]
 async fn repeating_refused_sync_appends_one_coverage_gap() {
     let owner = OwnerId::new_random();
@@ -968,6 +1046,454 @@ async fn repeating_refused_sync_appends_one_coverage_gap() {
             .count(),
         1
     );
+}
+
+/// A T-Invest that answers each RPC from the path in the request URL: the
+/// accounts listing, one empty operations page, and one portfolio answer.
+struct ScriptedTinvest {
+    accounts: &'static str,
+    operations: &'static str,
+    portfolio: String,
+}
+
+impl Transport for ScriptedTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let url = request.url();
+        let body = if url.ends_with("UsersService/GetAccounts") {
+            self.accounts
+        } else if url.ends_with("OperationsService/GetOperationsByCursor") {
+            self.operations
+        } else if url.ends_with("OperationsService/GetPortfolio") {
+            self.portfolio.as_str()
+        } else {
+            return Err(HttpError::Network);
+        };
+        Ok(HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            retry_after: None,
+            ..Default::default()
+        })
+    }
+}
+
+/// A refused T-Invest currency row is cash, never a position: the row whose
+/// quantity cannot be read stands in the journal as a coverage gap naming
+/// Cash only, the readable RUB row beside it still imports, and the
+/// reconciliation evidence from the same attempt does not confirm Cash —
+/// while the readable security row still lets positions reconcile
+/// (iaam-vg8te.1.2).
+#[tokio::test]
+async fn a_refused_t_invest_cash_row_gaps_cash_instead_of_positions() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let custody = CustodyId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    // Declared: this place backs a fact appended directly below, outside
+    // the sync under test, so the sync's own registration never reaches it.
+    seed_custody(&services, owner, custody, "Test Custody").await;
+
+    // An independent report states the trade and both closing figures the
+    // readable rows will state too — cash spent ten thousand, the holding
+    // one share — so both dimensions would reconcile if every broker row
+    // had been readable.
+    let operation = trade(account, instrument, custody);
+    let report_source = SourceId::new_random();
+    services
+        .store
+        .append_events(
+            [
+                vec![
+                    report_trade_event(owner, &operation, report_source),
+                    report_cash_assertion(owner, account, report_source),
+                    report_position_assertion(owner, account, report_source, instrument),
+                ],
+                report_opening_assertions(owner, account, report_source, Some(instrument)),
+            ]
+            .concat(),
+            IdentityScope::Source,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("seed report: {error}"));
+
+    let portfolio = format!(
+        r#"{{"positions":[
+            {{
+                "instrumentType": "currency",
+                "quantity": {{"units": "-100", "nano": 0}},
+                "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c1",
+                "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c2",
+                "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}},
+                "averagePositionPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+            }},
+            {{
+                "instrumentType": "currency",
+                "quantity": {{"nano": 500000000}},
+                "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c4",
+                "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+            }},
+            {{
+                "instrumentType": "share",
+                "quantity": {{"units": "1", "nano": 0}},
+                "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c5",
+                "instrumentUid": "{instrument_uid}",
+                "blocked": false
+            }}
+        ]}}"#,
+        instrument_uid = instrument.inner(),
+    );
+    let channel = channel_over(ScriptedTinvest {
+        accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+        operations: r#"{"hasNext":false,"items":[]}"#,
+        portfolio,
+    });
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("sync: {error}"));
+
+    // The set-aside currency row reaches the owner counted, the readable RUB
+    // and security rows import as assertions, and the journal gap names Cash.
+    assert_eq!(outcome.set_aside, 1, "{:?}", outcome.recorded);
+    assert_eq!(outcome.assertions, 2, "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    let gap = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ImportCoverageGap {
+                dimensions,
+                refused,
+                ..
+            } => Some((dimensions, refused)),
+            _ => None,
+        })
+        .expect("coverage gap");
+    assert_eq!(gap.0, &dimensions(&[Dimension::Cash]));
+    assert_eq!(*gap.1, 1);
+
+    // The readable security row still lets positions reconcile — the refusal
+    // was about cash all along — while the refused cash row withholds the
+    // confirmation the same attempt would otherwise have given Cash.
+    let ledger = iaam_core::reconciliation::ReconciliationLedger::build(&events)
+        .unwrap_or_else(|error| panic!("ledger: {error}"));
+    assert_eq!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Positions),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent,
+    );
+    assert_ne!(
+        ledger.status_for(account, date!(2026 - 03 - 15), Dimension::Cash),
+        iaam_core::reconciliation::DimensionStatus::AcceptedIndependent,
+    );
+}
+
+/// A refused row of a real T-Invest channel over the scripted transport
+/// reaches the owner as a question he can act on: the reconciliation report
+/// carries the row with the reason it was set aside and the row as it
+/// arrived, and a later sync of the same range through the same channel that
+/// imports the row settles the question so its reason no longer appears
+/// (iaam-vg8te.1.2).
+#[tokio::test]
+async fn a_refused_row_reaches_the_owner_with_its_reason_and_payload_and_settles_once_imported() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    // One channel identity shared by both syncs below: the second may settle
+    // the first's refusal only because it speaks for the same source.
+    let source = SourceId::new_random();
+
+    // The first sync is handed a currency row whose quantity cannot be read
+    // (it states a nano without its units) beside a readable security row: the
+    // currency row is set aside with its reason and original JSON, the
+    // security row still imports.
+    let channel = channel_over_with(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio: format!(
+                r#"{{"positions":[
+                    {{
+                        "instrumentType": "currency",
+                        "quantity": {{"nano": 500000000}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                        "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c4",
+                        "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+                    }},
+                    {{
+                        "instrumentType": "share",
+                        "quantity": {{"units": "1", "nano": 0}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c5",
+                        "instrumentUid": "{instrument_uid}",
+                        "blocked": false
+                    }}
+                ]}}"#,
+                instrument_uid = instrument.inner(),
+            ),
+        },
+        source,
+    );
+
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    // One row refused, one row imported.
+    assert_eq!(first.set_aside, 1, "{:?}", first.recorded);
+
+    // The store now holds the row as the owner's question: key, reason and
+    // the original payload, under the channel's own source identity.
+    let source_text = source.inner().to_string();
+    let open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals: {error}"));
+    assert_eq!(open.len(), 1, "one set-aside row, one question");
+    assert!(!open[0].reason.is_empty(), "{:?}", open[0]);
+    let payload: serde_json::Value = serde_json::from_str(&open[0].payload)
+        .unwrap_or_else(|error| panic!("stored payload is JSON: {error}"));
+    assert_eq!(payload["instrumentType"], "currency");
+
+    // The owner-facing read — the reconciliation report for the period —
+    // carries the refusal with its reason and the row as it arrived.
+    let report = iaam_app::scenarios::reconciliation::report(
+        &services,
+        &principal(owner),
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("report: {error}"));
+    let action = report
+        .actions
+        .iter()
+        .find(|action| action.kind() == iaam_app::actions::ActionKind::CoverageGapUnrepaired)
+        .unwrap_or_else(|| panic!("no coverage gap action in {report:#?}"));
+    assert!(
+        action.reason().contains(&open[0].reason),
+        "the reason reaches the owner: {}",
+        action.reason()
+    );
+    assert!(
+        action.reason().contains(&open[0].payload),
+        "the payload reaches the owner: {}",
+        action.reason()
+    );
+
+    // The second sync reads the same row whole (its quantity now states its
+    // units): no row is set aside, the refusal is settled, and its reason no
+    // longer appears in the report.
+    let fixed = channel_over_with(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio: format!(
+                r#"{{"positions":[
+                    {{
+                        "instrumentType": "currency",
+                        "quantity": {{"units": "-100", "nano": 0}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c3",
+                        "instrumentUid": "bbbbbbbb-0000-0000-0000-0000000000c4",
+                        "currentPrice": {{"units": "1", "nano": 0, "currency": "rub"}}
+                    }},
+                    {{
+                        "instrumentType": "share",
+                        "quantity": {{"units": "1", "nano": 0}},
+                        "positionUid": "aaaaaaaa-0000-0000-0000-0000000000c5",
+                        "instrumentUid": "{instrument_uid}",
+                        "blocked": false
+                    }}
+                ]}}"#,
+                instrument_uid = instrument.inner(),
+            ),
+        },
+        source,
+    );
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &fixed,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second sync: {error}"));
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+
+    let still_open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals after the second sync: {error}"));
+    assert!(still_open.is_empty(), "{still_open:?}");
+
+    let after = iaam_app::scenarios::reconciliation::report(
+        &services,
+        &principal(owner),
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("report after the second sync: {error}"));
+    let action = after
+        .actions
+        .iter()
+        .find(|action| action.kind() == iaam_app::actions::ActionKind::CoverageGapUnrepaired);
+    // The coverage gap may still stand — it is a statement about the first
+    // attempt — but the settled row must not be asked about again.
+    if let Some(action) = action {
+        assert!(
+            !action.reason().contains(&open[0].reason),
+            "the settled refusal must not be asked again: {}",
+            action.reason()
+        );
+        assert!(
+            !action.reason().contains(&open[0].payload),
+            "the settled refusal must not be asked again: {}",
+            action.reason()
+        );
+    }
+}
+
+/// A sync that never re-read the portfolio settles nothing, however wide its
+/// interval (iaam-vg8te.1.2).
+///
+/// The position refusal recorded by a full March 1–31 sync is a record whose
+/// whole interval a later March 1–31 sync covers — but that later sync had an
+/// out-of-interval trade, so its portfolio was never fetched, its assertions
+/// were withheld, and the refused row's absence from its refusal list proves
+/// nothing. Settling on such a sync would close the owner's question on
+/// silence.
+#[tokio::test]
+async fn a_partial_sync_never_settles_an_existing_refusal() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    // One channel identity for both syncs: only the same source could ever
+    // settle the first sync's question.
+    let source = SourceId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+
+    // First sync: full, and one refused position. The row becomes the
+    // owner's question for the whole March interval.
+    let mut first_broker = api(account, source, trade_without_custody(account, instrument));
+    first_broker.operations = Ok(ParsedOperations {
+        accepted: Vec::new(),
+        quarantined: Vec::new(),
+    });
+    first_broker.portfolio = Ok(PortfolioSnapshot {
+        as_of: PortfolioAsOf::Current,
+        claims: vec![cash_opening_claim()],
+        refused: vec![iaam_app::ports::Quarantined {
+            raw: serde_json::json!({ "symbol": "SBER@MISX", "quantity": { "value": "10" } }),
+            reason: "symbol SBER@MISX is not resolved to an instrument".to_owned(),
+            dimensions: dimensions(&[Dimension::Positions]),
+        }],
+        observed_on: None,
+    });
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &first_broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first sync: {error}"));
+    assert_eq!(first.set_aside, 1, "{:?}", first.recorded);
+
+    let source_text = source.inner().to_string();
+    let open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals: {error}"));
+    assert_eq!(open.len(), 1, "one set-aside row, one question");
+
+    // Second sync: same channel, same interval — but an operation dated
+    // outside it, which withholds the portfolio (snapshot None) and the
+    // assertions. Nothing is refused, and the portfolio rows were never
+    // re-read, so the first sync's question must stay open.
+    let mut operation = trade_without_custody(account, instrument);
+    operation.dates.trade = Some(date!(2026 - 04 - 02));
+    let second_broker = api(account, source, operation);
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &second_broker,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second sync: {error}"));
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+    assert_eq!(second.assertions, 0);
+    assert_eq!(second.assertions_withheld, None);
+
+    let still_open = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source_text,
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("list refusals after the partial sync: {error}"));
+    assert_eq!(
+        still_open.len(),
+        1,
+        "a sync that never re-read the portfolio must not settle the position question"
+    );
+    assert_eq!(still_open[0].row_key, open[0].row_key);
 }
 
 #[tokio::test]
@@ -2002,6 +2528,7 @@ fn empty_portfolio() -> PortfolioSnapshot {
         as_of: PortfolioAsOf::Requested,
         claims: Vec::new(),
         refused: Vec::new(),
+        observed_on: None,
     }
 }
 
@@ -2157,6 +2684,7 @@ impl Transport for CountingTransport {
             status: 200,
             body: Vec::new(),
             retry_after: None,
+            ..Default::default()
         })
     }
 }
@@ -2482,6 +3010,17 @@ impl GatewayClock for FakeTime {
             .map_err(|error| error.to_string())?;
         Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
     }
+
+    fn now_unix(&self) -> SystemTime {
+        // The gateway dates a live answer and stamps the response cache
+        // with `now_unix`, and the channel turns that moment into the
+        // portfolio's observation date (`iaam-vg8te.1.1`). Letting the real
+        // wall clock answer here would date a faked answer with the real
+        // day, so the one-clock rule every other method keeps holds for
+        // the stamp too: `wall` is the fictional day the test's data lives
+        // on.
+        *self.wall.lock().expect("wall clock")
+    }
 }
 
 impl Sleeper for FakeTime {
@@ -2562,6 +3101,7 @@ impl Transport for SlowTinvest {
             status: 200,
             body: body.into_bytes(),
             retry_after: None,
+            ..Default::default()
         })
     }
 }
@@ -2655,14 +3195,28 @@ impl Transport for ThrottlingTinvest {
             status: 429,
             body: b"{}".to_vec(),
             retry_after: Some(self.wait),
+            ..Default::default()
         })
     }
 }
 
 fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
+    channel_over_with(transport, SourceId::new_random())
+}
+
+/// The same channel over a source the caller chooses: two syncs that must
+/// speak for one channel identity — so the second can settle the first's
+/// refusals — build both channels with one `SourceId`.
+fn channel_over_with<T: Transport + 'static>(transport: T, source: SourceId) -> TinkoffChannel {
+    // The gateway's wall clock dates live answers and cache stamps, and the
+    // channel turns the moment into the portfolio's observation date. The
+    // tests this helper serves request 2026-03-31 intervals with same-day
+    // portfolios, so the wall sits on that day (noon UTC): the answer's own
+    // date equals the requested `to`, and the sync records the claims
+    // (`iaam-vg8te.1.1`).
     let time = Arc::new(FakeTime {
         now: Mutex::new(Instant::now()),
-        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_774_958_400)),
     });
     let database = broker_egress_database();
     let gateway = Gateway::with_parts_for_database(
@@ -2680,7 +3234,7 @@ fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    TinkoffChannel::new(client, SourceId::new_random(), dictionary)
+    TinkoffChannel::new(client, source, dictionary)
 }
 
 #[tokio::test]
@@ -2786,14 +3340,24 @@ async fn a_broker_refusal_is_not_a_store_failure() {
     }
 }
 
+/// An answer that cannot be read is the source's answer failing, not our
+/// store: the classification says whose side failed, and a repeat of the
+/// same call meets the same unreadable answer (iaam-vg8te.1.2).
 #[tokio::test]
-async fn an_unparsable_broker_answer_is_still_our_failure() {
+async fn an_unparsable_broker_answer_is_the_source_unreadable() {
     let error = sync_error(&failing_broker(BrokerError::Unparsable {
         broker: "test".to_owned(),
         detail: "not json".to_owned(),
     }))
     .await;
-    assert!(matches!(error, AppError::Store(_)), "{error:?}");
+    match &error {
+        AppError::SourceUnreadable { origin, detail } => {
+            assert_eq!(origin, "test");
+            assert_eq!(detail, "not json");
+            assert_eq!(error.code(), "source_unreadable");
+        }
+        other => panic!("expected a source-unreadable classification, got {other:?}"),
+    }
 }
 
 /// **Nothing is written until both of the broker's answers are in.** A sync
@@ -3167,4 +3731,279 @@ async fn an_access_that_sees_no_account_refuses_the_sync() {
         "expected the unseen refusal, got {error:?}"
     );
     assert!(load_all(&services, owner).await.is_empty());
+}
+
+// --- iaam-vg8te.1.1: a served portfolio keeps the day it was answered ------
+
+/// A gateway clock whose `now_unix` — the reading the gateway dates live
+/// answers and response-cache stamps with — is a wall time the test moves
+/// by hand. A portfolio read can then be fetched on one UTC day and served
+/// from the cache on another, within the hour, and the answer keeps the day
+/// it was first seen (`iaam-vg8te.1.1`).
+struct WallTime {
+    now: Mutex<Instant>,
+    wall: Mutex<SystemTime>,
+}
+
+impl WallTime {
+    fn at(wall: SystemTime) -> Arc<Self> {
+        Arc::new(Self {
+            now: Mutex::new(Instant::now()),
+            wall: Mutex::new(wall),
+        })
+    }
+
+    fn set_wall(&self, wall: SystemTime) {
+        *self.wall.lock().expect("wall clock") = wall;
+    }
+}
+
+impl GatewayClock for WallTime {
+    fn now(&self) -> Instant {
+        *self.now.lock().expect("clock")
+    }
+
+    fn now_boot(&self) -> Result<iaam_http::gateway::BootTime, String> {
+        let elapsed = self
+            .wall
+            .lock()
+            .expect("wall clock")
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?;
+        Ok(iaam_http::gateway::BootTime::new("test-boot", elapsed))
+    }
+
+    fn now_unix(&self) -> SystemTime {
+        *self.wall.lock().expect("wall clock")
+    }
+}
+
+impl Sleeper for WallTime {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        *self.now.lock().expect("clock") += delay;
+        *self.wall.lock().expect("wall clock") += delay;
+        Box::pin(async {})
+    }
+}
+
+/// A T-Invest that answers the reads of a portfolio sync: one empty
+/// operations page per operations cursor, and the portfolio body only to
+/// the first portfolio request. A second portfolio read inside the hour is
+/// served by the response cache, so the transport never sees it and counts
+/// only the one it answered.
+struct CachedPortfolioTinvest {
+    operations: String,
+    portfolio: String,
+    portfolio_asked: Arc<AtomicUsize>,
+}
+
+impl Transport for CachedPortfolioTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request.path().ends_with("/GetOperationsByCursor") {
+            return Ok(HttpResponse {
+                status: 200,
+                body: self.operations.as_bytes().to_vec(),
+                retry_after: None,
+                ..Default::default()
+            });
+        }
+        assert!(
+            request.path().ends_with("/GetPortfolio"),
+            "unexpected request: {}",
+            request.path()
+        );
+        self.portfolio_asked.fetch_add(1, Ordering::SeqCst);
+        Ok(HttpResponse {
+            status: 200,
+            body: self.portfolio.as_bytes().to_vec(),
+            retry_after: None,
+            ..Default::default()
+        })
+    }
+}
+
+/// The T-Invest channel over a gateway whose wall clock the test owns.
+/// The response cache is on, as it is on a production gateway: the whole
+/// point of these tests is a portfolio read answered the second time from
+/// the cache, dated by the moment it was first fetched
+/// (`iaam-vg8te.1.1`).
+fn tinkoff_channel_with_time<T: Transport + 'static>(
+    transport: T,
+    source: SourceId,
+    time: Arc<WallTime>,
+) -> TinkoffChannel {
+    let database = broker_egress_database();
+    let gateway = Gateway::with_parts_for_database_with_response_cache(
+        transport,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &database,
+    )
+    .expect("the documented table is valid");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-token")).expect("token opens");
+    let client = TinkoffClient::new(Environment::Prod, token, Arc::new(gateway));
+    let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
+    TinkoffChannel::new(client, source, dictionary)
+}
+
+/// A portfolio fetched on day D and served from the response cache on day
+/// D+1 — within the hour, so the cache serves it — is dated by its own
+/// observation moment, not by the sync's clock: the sync asked day D+1, the
+/// answer describes day D, and the assertions are withheld as describing
+/// another day. No claim of day D+1 is recorded, and the day-D portfolio
+/// was never asked for again (`iaam-vg8te.1.1`).
+#[tokio::test]
+async fn a_cached_portfolio_keeps_the_day_it_was_answered_and_withholds_on_the_next_day() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let day_d = services_with(date!(2026 - 04 - 01), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let day_d_plus_one = services_with(date!(2026 - 04 - 02), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let time = WallTime::at(SystemTime::from(datetime!(2026 - 04 - 01 23:20 UTC)));
+    let portfolio_asked = Arc::new(AtomicUsize::new(0));
+    let transport = CachedPortfolioTinvest {
+        operations: r#"{"hasNext":false,"items":[]}"#.to_owned(),
+        portfolio: format!(
+            r#"{{"positions":[{{"instrumentType":"share","quantity":{{"units":"1","nano":0}},"positionUid":"aaaaaaaa-0000-0000-0000-000000000001","instrumentUid":"{instrument_uid}","blocked":false}}]}}"#,
+            instrument_uid = instrument.inner(),
+        ),
+        portfolio_asked: Arc::clone(&portfolio_asked),
+    };
+    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+
+    // Day D, half past eleven at night: the live read is dated 23:20 UTC
+    // and stored in the cache. The sync asked [D, D], and the answer
+    // describes D, so its claim is recorded for day D.
+    let first = sync_broker(
+        &day_d,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 01),
+        date!(2026 - 04 - 01),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("day D sync: {error}"));
+    assert_eq!(first.assertions, 1, "{:?}", first.recorded);
+
+    // Day D+1, five minutes past midnight: within the hour, so the same
+    // read is served by the cache, still dated by the moment it was first
+    // fetched. The sync now asks [D+1, D+1], and the served answer still
+    // describes D: its assertions are withheld, naming the answer's own
+    // day, and no claim of day D+1 is recorded.
+    time.set_wall(SystemTime::from(datetime!(2026 - 04 - 02 00:05 UTC)));
+    let second = sync_broker(
+        &day_d_plus_one,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 02),
+        date!(2026 - 04 - 02),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("day D+1 sync: {error}"));
+
+    assert_eq!(second.assertions, 0, "{:?}", second.recorded);
+    assert_eq!(
+        second.assertions_withheld,
+        Some(AssertionsWithheld::PortfolioDescribesAnotherDay {
+            as_of: date!(2026 - 04 - 01)
+        }),
+        "the withheld portfolio is dated by the answer's own day, not the sync's clock"
+    );
+    assert_eq!(
+        portfolio_asked.load(Ordering::SeqCst),
+        1,
+        "the day-D+1 read was served by the cache, never re-sent"
+    );
+    let events = load_all(&day_d_plus_one, owner).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
+        "a portfolio describing day D must not become a claim of day D+1"
+    );
+}
+
+/// A portfolio fetched and served from the cache on one day — the serve
+/// still inside the hour — is dated by its own observation day, which IS
+/// the requested `to`: the same-day serve keeps recording the claims,
+/// exactly as before (`iaam-vg8te.1.1`).
+#[tokio::test]
+async fn a_same_day_served_cached_portfolio_still_records_its_claims() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let first = services_with(date!(2026 - 04 - 05), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let second = services_with(date!(2026 - 04 - 05), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "TESTSHARE");
+    });
+    let time = WallTime::at(SystemTime::from(datetime!(2026 - 04 - 05 10:00 UTC)));
+    let portfolio_asked = Arc::new(AtomicUsize::new(0));
+    let transport = CachedPortfolioTinvest {
+        operations: r#"{"hasNext":false,"items":[]}"#.to_owned(),
+        portfolio: format!(
+            r#"{{"positions":[{{"instrumentType":"share","quantity":{{"units":"1","nano":0}},"positionUid":"aaaaaaaa-0000-0000-0000-000000000001","instrumentUid":"{instrument_uid}","blocked":false}}]}}"#,
+            instrument_uid = instrument.inner(),
+        ),
+        portfolio_asked: Arc::clone(&portfolio_asked),
+    };
+    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+
+    // Day E at ten in the morning: the live read populates the cache.
+    let first_sync = sync_broker(
+        &first,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 05),
+        date!(2026 - 04 - 05),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("first same-day sync: {error}"));
+    assert_eq!(first_sync.assertions, 1, "{:?}", first_sync.recorded);
+
+    // Day E, half past ten: served from the cache, still dated day E — the
+    // requested `to` — and the claim is recorded as before.
+    time.set_wall(SystemTime::from(datetime!(2026 - 04 - 05 10:30 UTC)));
+    let second_sync = sync_broker(
+        &second,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 04 - 05),
+        date!(2026 - 04 - 05),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("second same-day sync: {error}"));
+
+    assert_eq!(second_sync.assertions, 1, "{:?}", second_sync.recorded);
+    assert_eq!(second_sync.assertions_withheld, None);
+    assert_eq!(
+        portfolio_asked.load(Ordering::SeqCst),
+        1,
+        "the second read was served by the cache"
+    );
+    let events = load_all(&second, owner).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
+        "a same-day portfolio is still recorded as a claim"
+    );
 }

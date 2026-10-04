@@ -1,6 +1,6 @@
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::credentials::BrokerToken;
 use iaam_http::gateway::{Clock, SystemClock};
@@ -74,6 +74,11 @@ pub enum FinamError {
         "Finam account id cannot be used in the account endpoint path; use a non-empty id other than . or .. without /, \\, %, ?, or #"
     )]
     InvalidAccountId,
+    /// A symbol cannot be represented as one canonical API path segment.
+    #[error(
+        "Finam symbol cannot be used in the asset endpoint path; use a non-empty symbol other than . or .. without /, \\, %, ?, or #"
+    )]
+    InvalidSymbol,
     /// A single day's transactions answer reached the request's limit, and
     /// a single day cannot be split further: whether more transactions lie
     /// past the page cannot be proven from the wire, so the interval is
@@ -101,7 +106,9 @@ struct Session {
 /// the budget, the retries and the breaker; this client only describes the
 /// request and classifies what comes back. The owner's secret travels once,
 /// in the body of the exchange for a session token; every other call carries
-/// that token, and never the secret.
+/// that token, and never the secret on the wire — though each read also
+/// binds the secret as the access identity its response-cache key is made
+/// from, which the gateway digests and never sends.
 pub struct FinamClient {
     token: BrokerToken,
     gateway: Arc<dyn Outbound>,
@@ -147,12 +154,18 @@ impl FinamClient {
         }
     }
 
-    /// Return the raw body of the account's current portfolio.
+    /// Return the raw body of the account's current portfolio, beside the
+    /// moment the answer was observed: the transport's own stamp for a live
+    /// answer, and the stored stamp of the first fetch for one served from
+    /// the response cache. The moment lets a caller date the answer
+    /// truthfully — a `Current` portfolio fetched yesterday and served
+    /// today is still dated yesterday (`iaam-vg8te.1.1`). `None` when the
+    /// transport gave no moment.
     pub async fn get_portfolio(
         &self,
         account_id: &str,
         allowance: &RequestAllowance,
-    ) -> Result<String, FinamError> {
+    ) -> Result<(String, Option<SystemTime>), FinamError> {
         validate_account_id(account_id)?;
         self.get_account(account_id, "", &[], allowance).await
     }
@@ -186,6 +199,40 @@ impl FinamClient {
             .transactions_interval(account_id, from, to, allowance)
             .await?;
         Ok(serde_json::json!({ "transactions": transactions }).to_string())
+    }
+
+    /// Return the raw body of the asset's description (`GET
+    /// /v1/assets/{symbol}`): the instrument as Finam itself names it, the
+    /// ISIN among the fields. The symbol is sent exactly one path segment,
+    /// `@` kept literal as RFC 3986 allows there; the optional
+    /// `?account_id` the contract names is not sent, because the answer
+    /// this channel reads — the ISIN — describes the instrument, not an
+    /// account, and one answer then serves every account of the access.
+    pub async fn get_asset(
+        &self,
+        symbol: &str,
+        account_id: &str,
+        allowance: &RequestAllowance,
+    ) -> Result<String, FinamError> {
+        validate_symbol(symbol)?;
+        validate_account_id(account_id)?;
+        let (body, _, _) = self
+            .authorized(allowance, |token| {
+                HttpRequest::get_with_symbol_path_segment(
+                    Destination::FinamApi,
+                    "/v1/assets/",
+                    symbol,
+                )
+                // The live API answered a bare asset read with
+                // `Invalid arguments: account_id`: the account scope is
+                // required in prod however the docs call it optional
+                // (found by the live walk, iaam-vg8te.1.3).
+                .with_query("account_id", account_id)
+                .with_bare_token(token)
+                .with_request_allowance(allowance.clone())
+            })
+            .await?;
+        Ok(body)
     }
 
     /// The transactions of one date interval, whole. The recursion is
@@ -252,7 +299,7 @@ impl FinamClient {
             ("interval.end_time", rfc3339_midnight(end)),
             ("limit", self.transactions_limit.to_string()),
         ];
-        let body = self
+        let (body, _) = self
             .get_account(account_id, "/transactions", &query, allowance)
             .await?;
         let value: Value =
@@ -269,7 +316,7 @@ impl FinamClient {
         &self,
         allowance: &RequestAllowance,
     ) -> Result<Vec<String>, FinamError> {
-        let (body, token) = self
+        let (body, _, token) = self
             .authorized(allowance, |token| {
                 // The token rides the body only: the published contract gives
                 // this method no Authorization header, unlike the data
@@ -280,6 +327,7 @@ impl FinamClient {
                     RequestBody::Json(serde_json::json!({ "token": token }).to_string()),
                 )
                 .with_request_allowance(allowance.clone())
+                .with_redaction_word(token)
                 .idempotent()
             })
             .await?;
@@ -307,14 +355,15 @@ impl FinamClient {
         Ok(ids)
     }
 
-    /// Send a reading call over the session token.
+    /// Send a reading call over the session token: the body and the moment
+    /// the answer was observed, as the authorized plumbing surfaced them.
     async fn get_account(
         &self,
         account_id: &str,
         suffix: &str,
         query: &[(&str, String)],
         allowance: &RequestAllowance,
-    ) -> Result<String, FinamError> {
+    ) -> Result<(String, Option<SystemTime>), FinamError> {
         let query = query.to_vec();
         self.authorized(allowance, move |token| {
             let mut request = HttpRequest::get_with_encoded_path_segment(
@@ -331,29 +380,36 @@ impl FinamClient {
             request
         })
         .await
-        .map(|(body, _)| body)
+        .map(|(body, observed_at, _)| (body, observed_at))
     }
 
-    /// Send an authorized call: the session token is the bearer. A 401 to
-    /// that token is answered with one shared renewal and one retry; the
-    /// second 401 is a refusal. Returns the body and the token that
-    /// finally carried it.
+    /// Send an authorized call: the session token is the bearer. The
+    /// request also binds the owner's stable access identity — the
+    /// long-lived broker secret — so the response cache keys the read on
+    /// the access, not on the rotating session token: a renewed token
+    /// does not re-send a read the same access already has cached. A 401
+    /// to the session token is answered with one shared renewal and one
+    /// retry; the second 401 is a refusal. Returns the body, the moment
+    /// the finally-carried answer was observed, and the token that
+    /// carried it.
     async fn authorized(
         &self,
         allowance: &RequestAllowance,
         build: impl Fn(&str) -> HttpRequest,
-    ) -> Result<(String, Secret), FinamError> {
+    ) -> Result<(String, Option<SystemTime>, Secret), FinamError> {
         let session = self.session(allowance).await?;
-        let step = match self.raw(&build(session.token.expose())).await {
-            Ok(body) => return Ok((body, session.token.clone())),
+        let request = build(session.token.expose()).with_cache_identity(self.token.expose());
+        let step = match self.raw(&request).await {
+            Ok((body, observed_at)) => return Ok((body, observed_at, session.token.clone())),
             Err(step) => step,
         };
         if !step.is_unauthorized() {
             return Err(step.into_error(self.token.expose(), Some(session.token.expose())));
         }
         let fresh = self.renewed(&session, allowance).await?;
-        match self.raw(&build(fresh.token.expose())).await {
-            Ok(body) => Ok((body, fresh.token.clone())),
+        let request = build(fresh.token.expose()).with_cache_identity(self.token.expose());
+        match self.raw(&request).await {
+            Ok((body, observed_at)) => Ok((body, observed_at, fresh.token.clone())),
             Err(step) => Err(step.into_error(self.token.expose(), Some(fresh.token.expose()))),
         }
     }
@@ -462,7 +518,8 @@ impl FinamClient {
             RequestBody::Json(serde_json::json!({ "secret": self.token.expose() }).to_string()),
         )
         .idempotent()
-        .with_request_allowance(allowance.clone());
+        .with_request_allowance(allowance.clone())
+        .with_redaction_word(self.token.expose());
         let response = self
             .gateway
             .send(&request, None)
@@ -484,14 +541,19 @@ impl FinamClient {
         })
     }
 
-    /// Send the request through the gateway and return its body.
-    async fn raw(&self, request: &HttpRequest) -> Result<String, Step> {
+    /// Send the request through the gateway and return its body beside the
+    /// moment the answer was observed. The gateway stamps a live answer it
+    /// accepted and a served one with the stored moment of its first fetch;
+    /// the moment rides on here so a caller can date the answer by its own
+    /// observation time (`iaam-vg8te.1.1`).
+    async fn raw(&self, request: &HttpRequest) -> Result<(String, Option<SystemTime>), Step> {
         let response = self
             .gateway
             .send(request, None)
             .await
             .map_err(Step::Refused)?;
-        String::from_utf8(response.body).map_err(|_| Step::Malformed)
+        let body = String::from_utf8(response.body).map_err(|_| Step::Malformed)?;
+        Ok((body, response.observed_at))
     }
 }
 
@@ -501,6 +563,20 @@ fn validate_account_id(account_id: &str) -> Result<(), FinamError> {
         || account_id.contains(['/', '\\', '%', '?', '#'])
     {
         return Err(FinamError::InvalidAccountId);
+    }
+    Ok(())
+}
+
+/// The same one-segment rule the account ids keep, control characters
+/// included: the symbol becomes one path segment of the asset read, and
+/// the gateway's budget key refuses the same shapes on the raw path.
+fn validate_symbol(symbol: &str) -> Result<(), FinamError> {
+    if symbol.is_empty()
+        || matches!(symbol, "." | "..")
+        || symbol.contains(['/', '\\', '%', '?', '#'])
+        || symbol.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(FinamError::InvalidSymbol);
     }
     Ok(())
 }
@@ -848,6 +924,7 @@ mod tests {
                 client
                     .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                     .await
+                    .map(|(body, _)| body)
             })
         };
         let second = {
@@ -856,6 +933,7 @@ mod tests {
                 client
                     .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
                     .await
+                    .map(|(body, _)| body)
             })
         };
         tokio::join!(async { first.await.expect("first task joins") }, async {
@@ -868,6 +946,7 @@ mod tests {
             status,
             body: body.as_bytes().to_vec(),
             retry_after: None,
+            ..Default::default()
         }
     }
 
@@ -990,8 +1069,8 @@ mod tests {
         assert_eq!(
             received[2].url(),
             "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z\
+             ?interval.start_time=2024-01-01T00%3A00%3A00Z\
+             &interval.end_time=2024-02-02T00%3A00%3A00Z\
              &limit=1000"
         );
         for request in received.iter().skip(1) {
@@ -1023,6 +1102,110 @@ mod tests {
             assert!(
                 endpoint.received.lock().expect("received").is_empty(),
                 "{account_id:?} reached transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_asset_read_names_the_symbol_with_the_at_literal_on_the_wire() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, r#"{"isin":"RU000AFIXTUR"}"#),
+        );
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        let body = client
+            .get_asset(
+                "SBER@MISX",
+                "9999999",
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
+            .await
+            .expect("asset read");
+
+        assert_eq!(body, r#"{"isin":"RU000AFIXTUR"}"#);
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].url(), "https://api.finam.ru/v1/sessions");
+        assert_eq!(
+            received[1].url(),
+            "https://api.finam.ru/v1/assets/SBER@MISX?account_id=9999999",
+            "RFC 3986 admits @ in a path segment, and the live API scopes the asset read to the account"
+        );
+        assert_eq!(
+            received[1]
+                .authorization()
+                .map(|value| value.expose().to_owned()),
+            Some(JWT_ONE.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn every_authorized_read_carries_the_access_identity_of_the_secret() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, "{}")
+                .then(200, r#"{"transactions":[]}"#),
+        );
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+        client
+            .get_asset(
+                "SBER@MISX",
+                "9999999",
+                &iaam_http::RequestAllowance::new(u32::MAX),
+            )
+            .await
+            .expect("asset");
+
+        let received = endpoint.received.lock().expect("received");
+        assert_eq!(received.len(), 3);
+        // The exchange is the one call that carries the secret itself and
+        // is never cached; it binds no cache identity.
+        assert_eq!(
+            received[0]
+                .cache_identity()
+                .map(|identity| identity.expose()),
+            None
+        );
+        for request in received.iter().skip(1) {
+            assert_eq!(
+                request.cache_identity().map(|identity| identity.expose()),
+                Some(SECRET),
+                "{} binds the broker secret as its cache identity",
+                request.url()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_symbols_are_refused_before_the_session_or_asset_request() {
+        for symbol in ["", ".", "..", "/", "\\", "%40", "?", "#", "SBER\nMISX"] {
+            let endpoint = Arc::new(Scripted::answering(200));
+            let (client, _) = client_over(BUDGETS, &endpoint);
+
+            let error = client
+                .get_asset(
+                    symbol,
+                    "9999999",
+                    &iaam_http::RequestAllowance::new(u32::MAX),
+                )
+                .await
+                .expect_err("unsafe symbol must be refused");
+
+            assert!(
+                error.to_string().contains("Finam symbol"),
+                "{symbol:?}: {error}"
+            );
+            assert!(
+                endpoint.received.lock().expect("received").is_empty(),
+                "{symbol:?} reached transport"
             );
         }
     }
@@ -1299,6 +1482,31 @@ mod tests {
         assert_eq!(SESSION_LIFETIME, Duration::from_secs(15 * 60));
     }
 
+    /// The portfolio read surfaces the moment the answer was observed: the
+    /// gateway dates a live answer with its wall clock, and the read
+    /// carries it beside the body — the app cannot see the transport's
+    /// `HttpResponse`, so this is where the moment enters the channel
+    /// (`iaam-vg8te.1.1`).
+    #[tokio::test]
+    async fn a_portfolio_answer_surfaces_the_moment_it_was_observed() {
+        let endpoint = Arc::new(
+            Scripted::answering(200)
+                .then(200, &session_answer(JWT_ONE))
+                .then(200, r#"{"positions":[]}"#),
+        );
+        let (client, _) = client_over(BUDGETS, &endpoint);
+
+        let (_, observed_at) = client
+            .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+
+        assert!(
+            observed_at.is_some(),
+            "a live answer is dated by the gateway's clock"
+        );
+    }
+
     #[tokio::test]
     async fn a_401_on_a_data_call_is_answered_with_one_renewal_and_one_retry() {
         let endpoint = Arc::new(
@@ -1310,7 +1518,7 @@ mod tests {
         );
         let (client, _) = client_over(BUDGETS, &endpoint);
 
-        let body = client
+        let (body, _) = client
             .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");
@@ -1326,6 +1534,17 @@ mod tests {
             received[3].bearer().map(|token| token.expose()),
             Some(JWT_TWO)
         );
+        // The retried read keeps the access identity of the first: the
+        // response cache key follows the stable secret, and the answer
+        // survives the renewal.
+        for data in [&received[1], &received[3]] {
+            assert_eq!(
+                data.cache_identity().map(|identity| identity.expose()),
+                Some(SECRET),
+                "{} carries the broker secret as its cache identity",
+                data.url()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1399,7 +1618,7 @@ mod tests {
         );
         let (client, time) = client_over(BUDGETS, &endpoint);
 
-        let body = client
+        let (body, _) = client
             .get_portfolio("Main", &iaam_http::RequestAllowance::new(u32::MAX))
             .await
             .expect("the retry succeeds");
@@ -1511,11 +1730,16 @@ mod tests {
             .await
             .expect_err("400 is refused");
 
+        // The gateway scrubs the access identity (the broker secret) from the
+        // rejected body before the client's own token redaction runs, so the
+        // finished message carries the gateway marker; the client's marker
+        // covers the session token itself. Whatever the label, the secret is
+        // hidden either way.
         assert_eq!(
             error,
             FinamError::UnexpectedStatus {
                 status: 400,
-                body: "bad <token hidden>".to_owned(),
+                body: "bad <redacted>".to_owned(),
             }
         );
         assert_no_secret(&error);
@@ -2002,14 +2226,14 @@ mod tests {
         let received = endpoint.received.lock().expect("received");
         assert_eq!(received.len(), 4, "one page per split, one exchange");
         let full = "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z&limit=2";
+             ?interval.start_time=2024-01-01T00%3A00%3A00Z\
+             &interval.end_time=2024-02-02T00%3A00%3A00Z&limit=2";
         let left = "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D01T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D01%2D17T00%3A00%3A00Z&limit=2";
+             ?interval.start_time=2024-01-01T00%3A00%3A00Z\
+             &interval.end_time=2024-01-17T00%3A00%3A00Z&limit=2";
         let right = "https://api.finam.ru/v1/accounts/Main/transactions\
-             ?interval%2Estart%5Ftime=2024%2D01%2D17T00%3A00%3A00Z\
-             &interval%2Eend%5Ftime=2024%2D02%2D02T00%3A00%3A00Z&limit=2";
+             ?interval.start_time=2024-01-17T00%3A00%3A00Z\
+             &interval.end_time=2024-02-02T00%3A00%3A00Z&limit=2";
         assert_eq!(received[1].url(), full, "the asked interval goes first");
         assert_eq!(
             received[2].url(),

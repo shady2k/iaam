@@ -1695,7 +1695,7 @@ pub async fn preview_category_rules_batch_route(
         (status = 200, description = "Synchronisation result", body = SyncOutcomeDto),
         (status = 403, description = "Insufficient permissions", body = ApiError),
         (status = 409, description = "A sync of this account is already running; nothing was sent to the broker", body = ApiError),
-        (status = 502, description = "The broker refused the request (code `source_refused`): a retry gets the same answer; check the broker access configured for this owner", body = ApiError),
+        (status = 502, description = "The broker refused the request (code `source_refused`): a retry gets the same answer; check the broker access configured for this owner. The broker's answer could also not be read as the documents this system exchanges with it (code `source_unreadable`): the same answer comes back until the broker's changes", body = ApiError),
         (
             status = 503,
             description = "Either the broker channel or access is not configured (code `not_configured`), or the broker stayed unreachable through every retry or the sync ran out of its deadline (code `source_unavailable`); nothing was written: call again after the seconds in Retry-After, which is sent when the wait is known",
@@ -1718,9 +1718,12 @@ pub async fn sync_broker(
 ) -> Result<Json<SyncOutcomeDto>, ApiFailure> {
     require(&principal, OperationKey::SyncBroker)?;
     let code = broker_code(&broker)?;
+    // `open` takes the factory by its Arc: the channel shares the adapter's
+    // own instrument directory, so the handle is consumed by the call.
     let channel = state
         .services
         .channels
+        .clone()
         .open(principal.owner, &broker)
         .await?;
     let outcome = run_sync_broker(

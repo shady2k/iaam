@@ -195,6 +195,7 @@ enum OperationType {
                     status: 200,
                     body: b"enum OperationType { OPERATION_TYPE_INPUT = 1; }".to_vec(),
                     retry_after: None,
+                    ..Default::default()
                 })
             }
         }

@@ -52,7 +52,7 @@ mod tests {
 
         assert_eq!(
             request.url(),
-            "https://www.cbr.ru/scripts/XML_daily.asp?date%5Freq=04%2F08%2F2026"
+            "https://www.cbr.ru/scripts/XML_daily.asp?date_req=04%2F08%2F2026"
         );
     }
 }

@@ -137,8 +137,8 @@ mod tests {
             start: 0,
         });
         let url = request.url();
-        assert!(url.contains("from=2026%2D08%2D03"), "{url}");
-        assert!(url.contains("till=2026%2D08%2D21"), "{url}");
+        assert!(url.contains("from=2026-08-03"), "{url}");
+        assert!(url.contains("till=2026-08-21"), "{url}");
     }
 
     #[test]

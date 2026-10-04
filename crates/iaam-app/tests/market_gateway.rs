@@ -96,6 +96,7 @@ fn status(status: u16) -> HttpResponse {
         status,
         body: Vec::new(),
         retry_after: None,
+        ..Default::default()
     }
 }
 

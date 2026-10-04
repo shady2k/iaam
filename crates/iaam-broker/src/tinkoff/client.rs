@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::credentials::BrokerToken;
 use crate::environment::{Environment, Method};
@@ -163,10 +163,18 @@ impl TinkoffClient {
 
     /// Return the raw response body from `UsersService/GetAccounts`.
     pub async fn get_accounts(&self, allowance: &RequestAllowance) -> Result<String, TinkoffError> {
-        self.post(ACCOUNTS, json!({}), None, allowance).await
+        self.post(ACCOUNTS, json!({}), None, allowance)
+            .await
+            .map(|(body, _)| body)
     }
 
-    /// Return the raw response body from `OperationsService/GetPortfolio`.
+    /// Return the raw portfolio body from `OperationsService/GetPortfolio`,
+    /// beside the moment the answer was observed: the transport's own stamp
+    /// for a live answer, and the stored stamp of the first fetch for one
+    /// served from the response cache. The moment lets a caller date the
+    /// answer truthfully — a `Current` portfolio fetched yesterday and
+    /// served today is still dated yesterday (`iaam-vg8te.1.1`). `None`
+    /// when the transport gave no moment.
     ///
     /// No attempt starts, and no wait for one runs, past `deadline`.
     pub async fn get_portfolio(
@@ -174,7 +182,7 @@ impl TinkoffClient {
         account_id: &str,
         deadline: Option<Instant>,
         allowance: &RequestAllowance,
-    ) -> Result<String, TinkoffError> {
+    ) -> Result<(String, Option<SystemTime>), TinkoffError> {
         self.post(
             PORTFOLIO,
             json!({ "accountId": account_id }),
@@ -193,7 +201,7 @@ impl TinkoffClient {
         deadline: Option<Instant>,
         allowance: &RequestAllowance,
     ) -> Result<String, TinkoffError> {
-        let body = self
+        let (body, _) = self
             .post(
                 OPERATIONS,
                 serde_json::to_value(request).map_err(|_| TinkoffError::RequestSerialization)?,
@@ -206,13 +214,18 @@ impl TinkoffClient {
     }
 
     /// The request path identifies the service budget at the gateway.
+    /// Returns the body beside the moment the answer was observed: the
+    /// gateway stamps a live answer it accepted and a served one with the
+    /// stored moment of its first fetch, and the moment rides on here so a
+    /// caller can date the answer by its own observation time
+    /// (`iaam-vg8te.1.1`).
     async fn post(
         &self,
         call: ReadCall,
         body: Value,
         deadline: Option<Instant>,
         allowance: &RequestAllowance,
-    ) -> Result<String, TinkoffError> {
+    ) -> Result<(String, Option<SystemTime>), TinkoffError> {
         ensure_method_available(self.environment, call.method)?;
         let body = serde_json::to_string(&body).map_err(|_| TinkoffError::RequestSerialization)?;
         let path = format!("{PACKAGE}.{}", call.path);
@@ -228,7 +241,8 @@ impl TinkoffClient {
             .send(&request, deadline)
             .await
             .map_err(|error| gateway_error(error, self.token.expose()))?;
-        String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)
+        let body = String::from_utf8(response.body).map_err(|_| TinkoffError::MalformedResponse)?;
+        Ok((body, response.observed_at))
     }
 
     // The environment supplies the base through `Environment`, not
@@ -457,6 +471,7 @@ mod tests {
             status,
             body: body.as_bytes().to_vec(),
             retry_after: None,
+            ..Default::default()
         })
     }
 
@@ -581,6 +596,27 @@ mod tests {
             .expect("the second attempt passes");
 
         assert_eq!(sent(&gateway), 2);
+    }
+
+    /// The portfolio read surfaces the moment the answer was observed: the
+    /// gateway dates a live answer with its wall clock, and the read
+    /// carries it beside the body — the app cannot see the transport's
+    /// `HttpResponse`, so this is where the moment enters the channel
+    /// (`iaam-vg8te.1.1`).
+    #[tokio::test]
+    async fn a_portfolio_answer_surfaces_the_moment_it_was_observed() {
+        let (client, gateway, _) = client(vec![answer(200, r#"{"positions":[]}"#)]);
+
+        let (_, observed_at) = client
+            .get_portfolio("account", None, &iaam_http::RequestAllowance::new(u32::MAX))
+            .await
+            .expect("portfolio");
+
+        assert_eq!(sent(&gateway), 1);
+        assert!(
+            observed_at.is_some(),
+            "a live answer is dated by the gateway's clock"
+        );
     }
 
     #[tokio::test]

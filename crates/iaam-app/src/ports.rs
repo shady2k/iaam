@@ -36,6 +36,7 @@ pub use iaam_store::journal::RecordedEvent;
 // where rules live, and nothing may branch on it.
 pub use iaam_core::report::balances::NegativeBalanceExpectation;
 pub use iaam_store::reference::CashAssetClass;
+pub use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use serde_json::Value;
 use std::sync::Arc;
 use time::Date;
@@ -1056,6 +1057,33 @@ pub trait Store: Send + Sync {
         account: AccountId,
         broker: &BrokerCode,
         broker_account: String,
+    ) -> Result<(), AppError>;
+
+    /// Record or refresh one refused row of a broker sync, so the owner can
+    /// act on it with the row and the reason in hand (iaam-vg8te.1.2). A
+    /// re-sync of the same owner row updates the record and reopens it; only
+    /// a later sync that no longer lists the row settles it.
+    async fn upsert_sync_refusal(&self, record: SyncRefusalRecord) -> Result<(), AppError>;
+
+    /// The open refusals of one owner account and channel whose interval
+    /// overlaps `[from, to]`, ordered by the row's key.
+    async fn list_open_sync_refusals(
+        &self,
+        owner: OwnerId,
+        account: AccountId,
+        source: &str,
+        from: Date,
+        to: Date,
+    ) -> Result<Vec<SyncRefusalRecord>, AppError>;
+
+    /// Settle every open refusal of the channel that a later sync no longer
+    /// lists, among those whose interval the later sync demonstrably covers
+    /// (the filter's `from`..`to` is the sync's own). A row that the sync
+    /// refused again stays open, however `row_keys` is ordered.
+    async fn settle_sync_refusals_besides(
+        &self,
+        filter: SyncRefusalFilter,
+        row_keys: &[String],
     ) -> Result<(), AppError>;
 
     async fn list_accounts(&self, owner: OwnerId) -> Result<Vec<AccountView>, AppError>;
@@ -2182,6 +2210,14 @@ pub struct PortfolioSnapshot {
     pub as_of: PortfolioAsOf,
     pub claims: Vec<ControlClaim>,
     pub refused: Vec<Quarantined>,
+    /// The UTC date of the answer's own observation moment: the day the
+    /// transport first saw this answer, live or from the response cache.
+    /// A `Current` portfolio dated by it rather than by the sync's clock
+    /// keeps the date the answer truly carries, so a snapshot fetched
+    /// yesterday and served from the cache today is still dated yesterday
+    /// (`iaam-vg8te.1.1`). `None` when the transport gave no moment, and
+    /// the caller then keeps its own dating (`services.clock.today()`).
+    pub observed_on: Option<Date>,
 }
 
 /// Limits shared by every broker request made for one synchronization.
@@ -2260,14 +2296,21 @@ pub trait BrokerChannel: Send + Sync {
     fn identity_scope(&self) -> IdentityScope;
     fn channel(&self) -> SourceChannel;
 }
-
-/// Channel factory that hides access storage and decryption from the use case.
+/// Broker channel creation: the factory opens one channel per call, so one
+/// channel instance is one synchronisation's scope (the sync routes open
+/// it, run `sync_broker` against it, and drop it).
 ///
-/// The secret crosses the boundary only within the adapter implementation and is never
-/// returned to the application or transport.
+/// `open` takes the factory by its `Arc` because a channel is handed the
+/// factory's own ports — the Finam channel resolves symbols against the
+/// instrument directory the adapter also serves — and an `Arc<dyn ...>`
+/// of the same value is the only way to share it.
 #[async_trait]
 pub trait BrokerChannelFactory: Send + Sync {
-    async fn open(&self, owner: OwnerId, broker: &str) -> Result<Arc<dyn BrokerChannel>, AppError>;
+    async fn open(
+        self: Arc<Self>,
+        owner: OwnerId,
+        broker: &str,
+    ) -> Result<Arc<dyn BrokerChannel>, AppError>;
 }
 
 /// Explicit stub for the composition point when no adapter is configured.
@@ -2276,7 +2319,7 @@ pub struct UnavailableBrokerChannelFactory;
 #[async_trait]
 impl BrokerChannelFactory for UnavailableBrokerChannelFactory {
     async fn open(
-        &self,
+        self: Arc<Self>,
         _owner: OwnerId,
         _broker: &str,
     ) -> Result<Arc<dyn BrokerChannel>, AppError> {

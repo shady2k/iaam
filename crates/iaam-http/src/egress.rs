@@ -125,6 +125,22 @@ pub enum EgressDirectoryError {
 /// ([`EgressDirectoryError::DatabaseUnresolved`]) or has no file name
 /// ([`EgressDirectoryError::NoFileName`]).
 pub fn egress_directory_for(database: &Path) -> Result<PathBuf, EgressDirectoryError> {
+    database_directory_for(database, ".egress")
+}
+
+/// The directory named after the database file with `suffix`, derived the
+/// way [`egress_directory_for`] derives the egress place: canonicalize the
+/// database path so every alias lands on one directory, refuse a
+/// hard-linked database (two names would keep two places), and name the
+/// directory after the file. The response cache derives its
+/// `<database>.cache` place through this too.
+///
+/// # Errors
+/// The same three as [`egress_directory_for`].
+pub(crate) fn database_directory_for(
+    database: &Path,
+    suffix: &str,
+) -> Result<PathBuf, EgressDirectoryError> {
     let resolved =
         database
             .canonicalize()
@@ -150,7 +166,7 @@ pub fn egress_directory_for(database: &Path) -> Result<PathBuf, EgressDirectoryE
             database: database.to_owned(),
         })?
         .to_owned();
-    name.push(".egress");
+    name.push(suffix);
     let mut directory = resolved;
     directory.pop();
     Ok(directory.join(name))

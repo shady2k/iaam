@@ -4599,8 +4599,8 @@ mod tests {
             "the echoed token reached the caller: {body}"
         );
         assert!(
-            body.contains("page-token-2"),
-            "the cursor itself stays: {body}"
+            body.contains("unfit"),
+            "the rest of the answer stays: {body}"
         );
     }
 

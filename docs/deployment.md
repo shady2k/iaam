@@ -1108,12 +1108,16 @@ Finam names an instrument `TICKER@MIC` (`SBER@MISX`); iaam identifies one by
 its own identifier and its external codes. A sync closes that gap through
 the broker's own asset description: for every distinct symbol of the sync —
 position rows and operations alike — the channel reads `GET
-/v1/assets/{symbol}` once, takes the ISIN the description names, and asks
+/v1/assets/{symbol}?account_id=<the broker account>` once (the live API
+answers a bare asset read with 400 `Invalid arguments: account_id`, found
+by the walk on 2026-10-04), takes the ISIN the description names, and asks
 the instrument directory which instrument carries that ISIN. The position or
 operation then names that instrument. The asset read is budgeted like every
 Finam call (half of the documented 200 per minute), and the answer is cached
 beside the database like every read, so one symbol costs one wire request
-per hour however many rows and syncs name it.
+per hour however many rows and syncs name it. A symbol whose asset
+description Finam refuses or that cannot be read is that row's problem, not
+the sync's: the row is set aside with the broker's message as its reason.
 
 Two cases stay visible refusals instead of becoming guesses, and the sync's
 outcome lists them row by row with the original JSON: the asset description

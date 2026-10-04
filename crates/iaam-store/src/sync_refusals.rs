@@ -174,16 +174,18 @@ impl SqliteStore {
     /// sync that covers the whole record has re-read the row and can say it
     /// is no longer refused. A row that this sync refused again stays open,
     /// however `row_keys` is ordered.
-    #[allow(clippy::too_many_arguments)] // the filter is one where, spelled out
     pub fn settle_sync_refusals_besides(
         &self,
-        owner: OwnerId,
-        account: AccountId,
-        source: &str,
-        from: &str,
-        to: &str,
+        filter: &SyncRefusalFilter,
         row_keys: &[String],
     ) -> Result<(), StoreError> {
+        let SyncRefusalFilter {
+            owner,
+            account,
+            source,
+            from,
+            to,
+        } = filter;
         // An empty list means the sync refused nothing: everything open whose
         // interval the sync covers is settled.
         if row_keys.is_empty() {
@@ -227,6 +229,20 @@ impl SqliteStore {
             .execute(&sql, rusqlite::params_from_iter(values))?;
         Ok(())
     }
+}
+
+/// Whose refusals, and over which interval: the filter a settle applies.
+///
+/// Folded from six positional parameters so no lint allow is needed
+/// (`iaam-pygg`): the owner, account and channel name the records, the
+/// interval is the sync's own (ISO dates, inclusive ends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRefusalFilter {
+    pub owner: OwnerId,
+    pub account: AccountId,
+    pub source: String,
+    pub from: String,
+    pub to: String,
 }
 
 fn decode_error(what: &'static str, id: &str) -> StoreError {

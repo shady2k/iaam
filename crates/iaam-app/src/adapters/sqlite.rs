@@ -20,7 +20,8 @@ use crate::ports::{
     ImportSessionState, ImportSessionSummaryView, ImportSessionView, InstrumentDirectory,
     InstrumentUpsert, InstrumentView, IssuedToken, JournalQuery, JournalSourceCategoryQuery,
     NewImportQuestion, Principal, Recorded, RecordedEvent, Scope, SoleOwner, Store,
-    SyncRefusalRecord, TokenAdmin, TokenView, UnresolvedAccountSourceView, UnresolvedAccountView,
+    SyncRefusalFilter, SyncRefusalRecord, TokenAdmin, TokenView, UnresolvedAccountSourceView,
+    UnresolvedAccountView,
 };
 use crate::tokens::{hash_token, secret_hex};
 use async_trait::async_trait;
@@ -858,25 +859,13 @@ impl Store for SqliteAdapter {
 
     async fn settle_sync_refusals_besides(
         &self,
-        owner: OwnerId,
-        account: AccountId,
-        source: &str,
-        from: Date,
-        to: Date,
+        filter: SyncRefusalFilter,
         row_keys: &[String],
     ) -> Result<(), AppError> {
-        let source = source.to_owned();
         let row_keys = row_keys.to_vec();
         self.blocking(move |store| {
             store
-                .settle_sync_refusals_besides(
-                    owner,
-                    account,
-                    &source,
-                    &iso(from),
-                    &iso(to),
-                    &row_keys,
-                )
+                .settle_sync_refusals_besides(&filter, &row_keys)
                 .map_err(store_error)
         })
         .await

@@ -6,7 +6,9 @@
 use crate::AppServices;
 use crate::actions::row_name_text;
 use crate::error::AppError;
-use crate::ports::{BrokerChannel, BrokerRequestContext, PortfolioAsOf, Principal, Recorded};
+use crate::ports::{
+    BrokerChannel, BrokerRequestContext, PortfolioAsOf, Principal, Recorded, SyncRefusalFilter,
+};
 use crate::scenarios::coverage_gap;
 use iaam_core::dates::{CashPostedDate, EffectiveOrder, EventDates};
 use iaam_core::event::provenance::{ParserVersion, Provenance, RawHash};
@@ -284,6 +286,13 @@ pub async fn sync_broker(
     // reason and original payload (iaam-vg8te.1.2). The record is written to
     // the store only once every append has succeeded; see
     // [`keep_refusal_questions`].
+    let refusal_context = RefusalContext {
+        owner: principal.owner,
+        account,
+        channel: &channel,
+        from,
+        to,
+    };
     let mut refusals: Vec<RefusedRow> = Vec::new();
     let mut refusal_records: Vec<SyncRefusalRecord> = Vec::new();
     let quarantined = parsed.quarantined.iter().chain(
@@ -303,11 +312,7 @@ pub async fn sync_broker(
             dimensions: dimensions.clone(),
         });
         refusal_records.push(refusal_record(
-            principal.owner,
-            account,
-            &channel,
-            from,
-            to,
+            &refusal_context,
             &key,
             &dimensions,
             row.reason.clone(),
@@ -342,11 +347,7 @@ pub async fn sync_broker(
                 let row = refused_row(&operation, channel.source);
                 refusals.push(row.clone());
                 refusal_records.push(refusal_record(
-                    principal.owner,
-                    account,
-                    &channel,
-                    from,
-                    to,
+                    &refusal_context,
                     &row.key,
                     &row.dimensions,
                     rejection_sentence(&rejection),
@@ -366,11 +367,7 @@ pub async fn sync_broker(
             let row = refused_row(&operation, channel.source);
             refusals.push(row.clone());
             refusal_records.push(refusal_record(
-                principal.owner,
-                account,
-                &channel,
-                from,
-                to,
+                &refusal_context,
                 &row.key,
                 &row.dimensions,
                 rejection_sentence(&rejection),
@@ -478,17 +475,7 @@ pub async fn sync_broker(
         // The questions this sync raised stand, but nothing settles: the
         // portfolio was never fetched, so the rows that are not in this
         // sync's refusal list are merely the rows it never re-read.
-        keep_refusal_questions(
-            services,
-            principal.owner,
-            account,
-            &channel,
-            from,
-            to,
-            &refusal_records,
-            false,
-        )
-        .await?;
+        keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -521,17 +508,7 @@ pub async fn sync_broker(
         // portfolio was read but not affirmed, so position refusals absent
         // from this sync's list were not demonstrably re-read whole. A sync
         // that ended in an error would never reach here.
-        keep_refusal_questions(
-            services,
-            principal.owner,
-            account,
-            &channel,
-            from,
-            to,
-            &refusal_records,
-            false,
-        )
-        .await?;
+        keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -589,17 +566,7 @@ pub async fn sync_broker(
     // portfolio was fetched and the assertions were not withheld, so a row
     // absent from this sync's refusal list was re-read whole and is no
     // longer refused.
-    keep_refusal_questions(
-        services,
-        principal.owner,
-        account,
-        &channel,
-        from,
-        to,
-        &refusal_records,
-        true,
-    )
-    .await?;
+    keep_refusal_questions(services, &refusal_context, &refusal_records, true).await?;
     let set_aside = set_aside(&recorded);
     Ok(SyncOutcome {
         recorded,
@@ -712,18 +679,24 @@ fn rejection_sentence(rejection: &Rejection) -> String {
     )
 }
 
+/// The one sync-shaped identity every refusal record and the settle share:
+/// whose rows, over which interval, on which channel. Folded together so the
+/// record builder and the settle take few parameters (iaam-vg8te.1.2).
+struct RefusalContext<'a> {
+    owner: OwnerId,
+    account: AccountId,
+    channel: &'a SourceChannel,
+    from: Date,
+    to: Date,
+}
+
 /// One refused row as the owner's question: the row's key, the interval the
 /// sync covered, the dimensions it withheld, the reason and the original
 /// payload. Everything the coverage-gap event deliberately does not carry
 /// (iaam-vg8te.1.2): the event keeps the attempt statement, this record keeps
 /// what the owner can act on.
-#[allow(clippy::too_many_arguments)]
 fn refusal_record(
-    owner: OwnerId,
-    account: AccountId,
-    channel: &SourceChannel,
-    from: Date,
-    to: Date,
+    context: &RefusalContext<'_>,
     key: &SourceRowKey,
     dimensions: &BTreeSet<Dimension>,
     reason: String,
@@ -731,14 +704,14 @@ fn refusal_record(
 ) -> SyncRefusalRecord {
     SyncRefusalRecord {
         id: Uuid::new_v4(),
-        owner,
-        account,
-        source: channel.source.inner().to_string(),
+        owner: context.owner,
+        account: context.account,
+        source: context.channel.source.inner().to_string(),
         row_key: row_name_text(&key.row),
         // ISO dates, inclusive ends: the same interval the gap event names,
         // so the report's read (same source, overlapping interval) finds it.
-        range_from: from.to_string(),
-        range_to: to.to_string(),
+        range_from: context.from.to_string(),
+        range_to: context.to.to_string(),
         dimensions: dimensions
             .iter()
             .map(|dimension| dimension.code())
@@ -763,18 +736,12 @@ fn refusal_record(
 /// sync has no answer about the rows it never re-read, so their absence from
 /// its refusal list proves nothing, and settling them would close the owner's
 /// question on silence (iaam-vg8te.1.2).
-#[allow(clippy::too_many_arguments)]
 async fn keep_refusal_questions(
     services: &AppServices,
-    owner: OwnerId,
-    account: AccountId,
-    channel: &SourceChannel,
-    from: Date,
-    to: Date,
+    context: &RefusalContext<'_>,
     records: &[SyncRefusalRecord],
     settle: bool,
 ) -> Result<(), AppError> {
-    let source = channel.source.inner().to_string();
     for record in records {
         services.store.upsert_sync_refusal(record.clone()).await?;
     }
@@ -787,7 +754,16 @@ async fn keep_refusal_questions(
         .collect();
     services
         .store
-        .settle_sync_refusals_besides(owner, account, &source, from, to, &row_keys)
+        .settle_sync_refusals_besides(
+            SyncRefusalFilter {
+                owner: context.owner,
+                account: context.account,
+                source: context.channel.source.inner().to_string(),
+                from: context.from.to_string(),
+                to: context.to.to_string(),
+            },
+            &row_keys,
+        )
         .await
 }
 

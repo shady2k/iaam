@@ -36,7 +36,7 @@ pub use iaam_store::journal::RecordedEvent;
 // where rules live, and nothing may branch on it.
 pub use iaam_core::report::balances::NegativeBalanceExpectation;
 pub use iaam_store::reference::CashAssetClass;
-pub use iaam_store::sync_refusals::SyncRefusalRecord;
+pub use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use serde_json::Value;
 use std::sync::Arc;
 use time::Date;
@@ -1077,16 +1077,12 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<SyncRefusalRecord>, AppError>;
 
     /// Settle every open refusal of the channel that a later sync no longer
-    /// lists, among those whose interval overlaps `[from, to]`. A row that
-    /// the sync refused again stays open, however `row_keys` is ordered.
-    #[allow(clippy::too_many_arguments)]
+    /// lists, among those whose interval the later sync demonstrably covers
+    /// (the filter's `from`..`to` is the sync's own). A row that the sync
+    /// refused again stays open, however `row_keys` is ordered.
     async fn settle_sync_refusals_besides(
         &self,
-        owner: OwnerId,
-        account: AccountId,
-        source: &str,
-        from: Date,
-        to: Date,
+        filter: SyncRefusalFilter,
         row_keys: &[String],
     ) -> Result<(), AppError>;
 

@@ -17,7 +17,7 @@
 use iaam_core::ids::{AccountId, OwnerId};
 use iaam_store::SqliteStore;
 use iaam_store::schema::{SCHEMA_VERSION, migrate};
-use iaam_store::sync_refusals::SyncRefusalRecord;
+use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
 fn user_version(store: &SqliteStore) -> u32 {
@@ -346,7 +346,16 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
     assert_eq!(listed[0].reason, "no instrument carries ISIN RU000AFIXTUR");
 
     store
-        .settle_sync_refusals_besides(owner, account, "finam", "2026-03-01", "2026-03-31", &[])
+        .settle_sync_refusals_besides(
+            &SyncRefusalFilter {
+                owner,
+                account,
+                source: "finam".to_owned(),
+                from: "2026-03-01".to_owned(),
+                to: "2026-03-31".to_owned(),
+            },
+            &[],
+        )
         .expect("the migrated table settles covered refusals");
     assert!(
         store

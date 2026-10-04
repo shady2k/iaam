@@ -4,11 +4,9 @@
 
 use iaam_core::ids::{AccountId, OwnerId};
 use iaam_store::SqliteStore;
-use iaam_store::sync_refusals::SyncRefusalRecord;
+use iaam_store::sync_refusals::{SyncRefusalFilter, SyncRefusalRecord};
 use uuid::Uuid;
 
-// Seven named fields read better than a struct-with-defaults dance in a test.
-#[allow(clippy::too_many_arguments)]
 fn refusal(
     owner: OwnerId,
     account: AccountId,
@@ -16,7 +14,6 @@ fn refusal(
     from: &str,
     to: &str,
     reason: &str,
-    payload: &str,
 ) -> SyncRefusalRecord {
     SyncRefusalRecord {
         id: Uuid::new_v4(),
@@ -28,7 +25,9 @@ fn refusal(
         range_to: to.to_owned(),
         dimensions: "positions".to_owned(),
         reason: reason.to_owned(),
-        payload: payload.to_owned(),
+        // The payload is set where a test needs one; the empty object is the
+        // honest default for the rest.
+        payload: r#"{}"#.to_owned(),
         settled: false,
     }
 }
@@ -40,16 +39,17 @@ fn a_sync_refusal_round_trips_and_stays_owner_scoped() {
     let other = OwnerId::new_random();
     let account = AccountId::new_random();
 
+    let mut first = refusal(
+        owner,
+        account,
+        "row-1",
+        "2026-01-01",
+        "2026-01-31",
+        "no instrument carries ISIN RU000AFIXTUR",
+    );
+    first.payload = r#"{"symbol":"FIXT@MISX"}"#.to_owned();
     store
-        .upsert_sync_refusal(&refusal(
-            owner,
-            account,
-            "row-1",
-            "2026-01-01",
-            "2026-01-31",
-            "no instrument carries ISIN RU000AFIXTUR",
-            r#"{"symbol":"FIXT@MISX"}"#,
-        ))
+        .upsert_sync_refusal(&first)
         .expect("record refuses row-1");
     store
         .upsert_sync_refusal(&refusal(
@@ -59,7 +59,6 @@ fn a_sync_refusal_round_trips_and_stays_owner_scoped() {
             "2026-01-01",
             "2026-01-31",
             "someone else's row",
-            r#"{"symbol":"OTHER@MISX"}"#,
         ))
         .expect("record refuses the other owner's row-1");
 
@@ -94,20 +93,18 @@ fn a_re_sync_of_the_same_row_updates_and_never_duplicates() {
             "2026-01-01",
             "2026-01-31",
             "old reason",
-            r#"{"symbol":"FIXT@MISX"}"#,
         ))
         .expect("first record");
-    store
-        .upsert_sync_refusal(&refusal(
-            owner,
-            account,
-            "row-1",
-            "2026-01-01",
-            "2026-01-31",
-            "new reason after the owner recorded a wrong ISIN",
-            r#"{"symbol":"FIXT@MISX","quantity":2}"#,
-        ))
-        .expect("second record");
+    let mut refresh = refusal(
+        owner,
+        account,
+        "row-1",
+        "2026-01-01",
+        "2026-01-31",
+        "new reason after the owner recorded a wrong ISIN",
+    );
+    refresh.payload = r#"{"symbol":"FIXT@MISX","quantity":2}"#.to_owned();
+    store.upsert_sync_refusal(&refresh).expect("second record");
 
     let listed = store
         .list_open_sync_refusals(owner, account, "finam", "2026-01-01", "2026-01-31")
@@ -138,7 +135,6 @@ fn an_open_refusal_is_listed_only_when_the_interval_overlaps() {
             "2026-03-01",
             "2026-03-31",
             "reasons",
-            r#"{}"#,
         ))
         .expect("record");
 
@@ -173,7 +169,6 @@ fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_covered_rang
             "2026-01-01",
             "2026-01-31",
             "a",
-            r#"{}"#,
         ))
         .expect("row-a");
     store
@@ -184,7 +179,6 @@ fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_covered_rang
             "2026-01-01",
             "2026-01-31",
             "b",
-            r#"{}"#,
         ))
         .expect("row-b");
     store
@@ -195,7 +189,6 @@ fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_covered_rang
             "2025-11-01",
             "2025-11-30",
             "old",
-            r#"{}"#,
         ))
         .expect("row-old");
 
@@ -204,11 +197,13 @@ fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_covered_rang
     // and stays open, row-a stays open.
     store
         .settle_sync_refusals_besides(
-            owner,
-            account,
-            "finam",
-            "2026-01-01",
-            "2026-01-31",
+            &SyncRefusalFilter {
+                owner,
+                account,
+                source: "finam".to_owned(),
+                from: "2026-01-01".to_owned(),
+                to: "2026-01-31".to_owned(),
+            },
             &["row-a".to_owned()],
         )
         .expect("settle");
@@ -220,7 +215,6 @@ fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_covered_rang
             "2026-01-01",
             "2026-01-31",
             "a again",
-            r#"{}"#,
         ))
         .expect("row-a refreshed");
 
@@ -262,14 +256,22 @@ fn a_later_sync_that_does_not_cover_the_records_interval_settles_nothing() {
             "2026-03-01",
             "2026-03-31",
             "reasons",
-            r#"{}"#,
         ))
         .expect("record");
 
     // March 31 only: neither an empty refusal list nor a list of other keys
     // may settle a record the sync did not read whole.
     store
-        .settle_sync_refusals_besides(owner, account, "finam", "2026-03-31", "2026-03-31", &[])
+        .settle_sync_refusals_besides(
+            &SyncRefusalFilter {
+                owner,
+                account,
+                source: "finam".to_owned(),
+                from: "2026-03-31".to_owned(),
+                to: "2026-03-31".to_owned(),
+            },
+            &[],
+        )
         .expect("settle with an empty list");
     assert_eq!(
         store
@@ -282,11 +284,13 @@ fn a_later_sync_that_does_not_cover_the_records_interval_settles_nothing() {
 
     store
         .settle_sync_refusals_besides(
-            owner,
-            account,
-            "finam",
-            "2026-03-31",
-            "2026-03-31",
+            &SyncRefusalFilter {
+                owner,
+                account,
+                source: "finam".to_owned(),
+                from: "2026-03-31".to_owned(),
+                to: "2026-03-31".to_owned(),
+            },
             &["row-other".to_owned()],
         )
         .expect("settle with a list of other keys");
@@ -303,7 +307,16 @@ fn a_later_sync_that_does_not_cover_the_records_interval_settles_nothing() {
     // nothing settles it: the re-read is complete, the row is not in its
     // refusal list, and the question is answered.
     store
-        .settle_sync_refusals_besides(owner, account, "finam", "2026-03-01", "2026-03-31", &[])
+        .settle_sync_refusals_besides(
+            &SyncRefusalFilter {
+                owner,
+                account,
+                source: "finam".to_owned(),
+                from: "2026-03-01".to_owned(),
+                to: "2026-03-31".to_owned(),
+            },
+            &[],
+        )
         .expect("settle over the full range");
     assert!(
         store

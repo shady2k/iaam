@@ -8,7 +8,7 @@
   "ideaLabels": ["idea"],
   "ideaTitlePrefixes": ["Brainstorming:"],
   "findingLabels": ["findings"],
-  "findingBudget": 24,
+  "findingBudget": 25,
   "staleDays": 14,
   "holdDays": 2,
   "bulkCluster": 20,

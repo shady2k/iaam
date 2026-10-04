@@ -188,36 +188,35 @@ impl SqliteStore {
             from,
             to,
         } = filter;
-        // The covered open records are loaded, their keys compared in memory,
-        // and the absent ones settled one bounded statement each inside one
-        // transaction: an unbounded NOT IN list would trip SQLite's variable
-        // limit on a refusal set of more than ~32,761 rows (an exhaustive
-        // sync can refuse more), and chunking the list could settle a key
-        // present in another chunk (iaam-vg8te.1.1 acceptance review).
-        let mut statement = self.conn.prepare(
-            "SELECT row_key FROM sync_refusals
-             WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
-               AND ?5 <= range_from AND range_to <= ?4",
-        )?;
-        let covered: Vec<String> = statement
-            .query_map(
-                params![
-                    owner.inner().to_string(),
-                    account.inner().to_string(),
-                    source,
-                    to,
-                    from,
-                ],
-                |row| row.get(0),
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        let kept: BTreeSet<&str> = row_keys.iter().map(String::as_str).collect();
-        // The writes run under one explicit transaction: the type-level
-        // `Transaction` borrows the connection mutably and this method's
-        // receiver is `&self`, so the begin is spelled out, as `lib.rs` does
-        // for its own immediate transactions.
+        // The covered records are selected, their keys compared in memory,
+        // and the absent ones settled one bounded statement each — all inside
+        // one immediate transaction. An unbounded NOT IN list would trip
+        // SQLite's variable limit on a refusal set of more than ~32,761 rows,
+        // and chunking the list could settle a key present in another chunk.
+        // Selecting BEFORE the begin would let a concurrent upsert widen a
+        // record's interval between the selection and the settle, and this
+        // sync does not cover the widened record — so the begin comes first
+        // and the selection lives under the write lock with the updates.
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let outcome = (|| -> Result<(), StoreError> {
+            let mut statement = self.conn.prepare(
+                "SELECT row_key FROM sync_refusals
+                 WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
+                   AND ?5 <= range_from AND range_to <= ?4",
+            )?;
+            let covered: Vec<String> = statement
+                .query_map(
+                    params![
+                        owner.inner().to_string(),
+                        account.inner().to_string(),
+                        source,
+                        to,
+                        from,
+                    ],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            let kept: BTreeSet<&str> = row_keys.iter().map(String::as_str).collect();
             for key in &covered {
                 if kept.contains(key.as_str()) {
                     continue;

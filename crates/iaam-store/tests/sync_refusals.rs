@@ -371,3 +371,52 @@ fn a_settle_over_thousands_of_keys_stays_within_the_variable_limit() {
     assert_eq!(open.len(), 1, "the kept row stays open");
     assert_eq!(open[0].row_key, "row-0");
 }
+
+#[test]
+fn a_concurrent_interval_widen_cannot_be_settled_from_a_stale_selection() {
+    // Two connections to one database: a settle on A must never close a
+    // question that a concurrent upsert on B widens past A's coverage. With
+    // the selection inside A's immediate transaction, either B wins before
+    // the begin (A then sees the widened interval and leaves the record
+    // alone) or B waits for A's commit (its upsert reopens the record it
+    // settled) (iaam-vg8te.1.1 round 4).
+    let path = std::env::temp_dir().join(format!("iaam-sync-refusals-{}.db", Uuid::new_v4()));
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let a = SqliteStore::open(&path).expect("connection A");
+    let b = SqliteStore::open(&path).expect("connection B");
+
+    // B widens the refusals interval to February–March; A's settle covers
+    // only March — the widened record is outside it and must stay open.
+    b.upsert_sync_refusal(&refusal(
+        owner,
+        account,
+        "row-1",
+        "2026-02-01",
+        "2026-03-31",
+        "widened by B",
+    ))
+    .expect("B records");
+
+    a.settle_sync_refusals_besides(
+        &SyncRefusalFilter {
+            owner,
+            account,
+            source: "finam".to_owned(),
+            from: "2026-03-01".to_owned(),
+            to: "2026-03-31".to_owned(),
+        },
+        &[],
+    )
+    .expect("A settles its March range");
+
+    let open = a
+        .list_open_sync_refusals(owner, account, "finam", "2026-02-01", "2026-03-31")
+        .expect("list");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        open.iter().map(|r| r.row_key.as_str()).collect::<Vec<_>>(),
+        vec!["row-1"],
+        "the widened question survives A's March-only settle"
+    );
+}

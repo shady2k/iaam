@@ -769,7 +769,14 @@ impl RefusalHeaders {
 /// body IS the new token the caller must see whole, that request is never
 /// cached, and its answer is never parsed as data (iaam-vg8te.1.1).
 fn scrub_reading_answer(mut response: HttpResponse, request: &HttpRequest) -> HttpResponse {
-    if is_credential_exchange(request) {
+    // Only the call whose answer IS the credential is exempt: Finam's
+    // session mint (`POST /v1/sessions`) answers with the new token, which
+    // the caller must see whole. The cache's broad "never cache a body that
+    // mentions a credential" rule must not spare a reading answer here — an
+    // ordinary T-Invest operations read carries a cursor that can contain
+    // the word "token", and its answer is data, not a credential
+    // (iaam-vg8te.1.1 round 4).
+    if matches!(request.destination(), Destination::FinamApi) && request.path() == "/v1/sessions" {
         return response;
     }
     let secrets: Vec<&Secret> = redaction_of(request).collect();
@@ -4595,6 +4602,40 @@ mod tests {
             "the body keeps its shape: {body}"
         );
 
+        #[tokio::test(start_paused = true)]
+        async fn a_reading_answer_is_scrubbed_even_when_its_body_mentions_token() {
+            // T-Invest reads carry a pagination cursor that can contain the word
+            // "token"; the cache's broad credential-body rule must not exempt
+            // such a reading from the scrub (iaam-vg8te.1.1 round 4).
+            let time = FakeTime::new();
+            let downgoing = gateway(
+                &time,
+                Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                    content_type: Some("application/json".to_owned()),
+                    body: br#"{"row":"unfit","echo":"t.invented-token"}"#.to_vec(),
+                    ..status(200)
+                })),
+            );
+            let request = HttpRequest::post(
+                Destination::TinkoffProd,
+                "/tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor",
+                crate::request::RequestBody::Json(r#"{"cursor":"page-token-2"}"#.to_owned()),
+            )
+            .idempotent()
+            .with_bearer("t.invented-token")
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
+
+            let response = downgoing.send(&request, None).await.expect("answered");
+            let body = String::from_utf8(response.body).expect("utf8");
+            assert!(
+                !body.contains("t.invented-token"),
+                "the echoed token reached the caller: {body}"
+            );
+            assert!(
+                body.contains("page-token-2"),
+                "the cursor itself stays: {body}"
+            );
+        }
         // The session exchange is the one answer that keeps its body whole: it
         // IS the new token.
         let secret = "the-exchange-secret-Q1w2e3r4";

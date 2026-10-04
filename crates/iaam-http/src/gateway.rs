@@ -4570,6 +4570,37 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_finam_reading_answer_is_scrubbed_not_only_the_mint() {
+        // The exemption is exactly the session mint: a reading on the Finam
+        // destination (an asset read, say) is data, and an answer that echoes
+        // the presented token must reach the caller cut of it. This pins the
+        // `&&`/`==` boundary of the exemption against the `||`/`!=` mutants.
+        let time = FakeTime::new();
+        let downgoing = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                content_type: Some("application/json".to_owned()),
+                body: br#"{"isin":"RU000A0","echo":"t.invented-token"}"#.to_vec(),
+                ..status(200)
+            })),
+        );
+        let request = HttpRequest::get(Destination::FinamApi, "/v1/assets/X")
+            .with_bearer("t.invented-token")
+            .with_request_allowance(RequestAllowance::new(u32::MAX));
+
+        let response = downgoing.send(&request, None).await.expect("answered");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(
+            !body.contains("t.invented-token"),
+            "a Finam reading is scrubbed like any other: {body}"
+        );
+        assert!(
+            body.contains("RU000A0"),
+            "the answer's own content stays: {body}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_reading_answer_is_scrubbed_even_when_its_body_mentions_token() {
         // T-Invest reads carry a pagination cursor that can contain the word
         // "token"; the cache's broad credential-body rule must not exempt

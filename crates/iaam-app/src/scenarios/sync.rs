@@ -475,6 +475,9 @@ pub async fn sync_broker(
         // succeeded, so the questions they raise stand. The portfolio was
         // not asked for (an out-of-interval trade withholds it), so snapshot
         // refusals cannot exist here by construction.
+        // The questions this sync raised stand, but nothing settles: the
+        // portfolio was never fetched, so the rows that are not in this
+        // sync's refusal list are merely the rows it never re-read.
         keep_refusal_questions(
             services,
             principal.owner,
@@ -483,6 +486,7 @@ pub async fn sync_broker(
             from,
             to,
             &refusal_records,
+            false,
         )
         .await?;
         let set_aside = set_aside(&recorded);
@@ -513,7 +517,10 @@ pub async fn sync_broker(
     if assertions_withheld.is_some() {
         // As above: the operations and the gap were written, so the refused
         // rows are questions the owner can act on; only the assertions were
-        // withheld. A sync that ended in an error would never reach here.
+        // withheld. The withholding is exactly why nothing settles: the
+        // portfolio was read but not affirmed, so position refusals absent
+        // from this sync's list were not demonstrably re-read whole. A sync
+        // that ended in an error would never reach here.
         keep_refusal_questions(
             services,
             principal.owner,
@@ -522,6 +529,7 @@ pub async fn sync_broker(
             from,
             to,
             &refusal_records,
+            false,
         )
         .await?;
         let set_aside = set_aside(&recorded);
@@ -577,8 +585,10 @@ pub async fn sync_broker(
     }
 
     // Every append this sync made has succeeded by here; the refused rows are
-    // now questions the owner can act on, and the rows this sync took no
-    // longer refuse the record they stood under.
+    // now questions the owner can act on. Only this full path settles: the
+    // portfolio was fetched and the assertions were not withheld, so a row
+    // absent from this sync's refusal list was re-read whole and is no
+    // longer refused.
     keep_refusal_questions(
         services,
         principal.owner,
@@ -587,6 +597,7 @@ pub async fn sync_broker(
         from,
         to,
         &refusal_records,
+        true,
     )
     .await?;
     let set_aside = set_aside(&recorded);
@@ -740,11 +751,18 @@ fn refusal_record(
 }
 
 /// Answer the owner's questions this sync left standing: upsert every row it
-/// refused, and settle the rows it no longer refuses among those whose
-/// interval overlaps the sync's own. Only ever called once every append this
-/// sync made has succeeded — a sync that ends in an error records nothing, so
-/// a failed attempt cannot mint a question its failure should not
-/// (iaam-vg8te.1.2).
+/// refused, and — only when `settle` is true — settle the rows it no longer
+/// refuses among those whose interval the sync's own covers. Only ever called
+/// once every append this sync made has succeeded — a sync that ends in an
+/// error records nothing, so a failed attempt cannot mint a question its
+/// failure should not (iaam-vg8te.1.2).
+///
+/// The upsert half runs for every successful sync: the rows this sync did
+/// refuse are questions that stand even when the rest of the sync was
+/// partial. The settle half is exactly as guarded as its flag: an incomplete
+/// sync has no answer about the rows it never re-read, so their absence from
+/// its refusal list proves nothing, and settling them would close the owner's
+/// question on silence (iaam-vg8te.1.2).
 #[allow(clippy::too_many_arguments)]
 async fn keep_refusal_questions(
     services: &AppServices,
@@ -754,10 +772,14 @@ async fn keep_refusal_questions(
     from: Date,
     to: Date,
     records: &[SyncRefusalRecord],
+    settle: bool,
 ) -> Result<(), AppError> {
     let source = channel.source.inner().to_string();
     for record in records {
         services.store.upsert_sync_refusal(record.clone()).await?;
+    }
+    if !settle {
+        return Ok(());
     }
     let row_keys: Vec<String> = records
         .iter()

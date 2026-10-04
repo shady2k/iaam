@@ -164,8 +164,16 @@ impl SqliteStore {
     }
 
     /// Settle every open refusal of the channel that a later sync no longer
-    /// lists, among those whose interval overlaps `[from, to]`. A row that
-    /// this sync refused again stays open, however `row_keys` is ordered.
+    /// lists, among those whose interval the later sync demonstrably covers.
+    ///
+    /// Overlap is not enough: a refusal recorded for a March 1–31 sync (a
+    /// March 5 operation refused) must not be settled by a later sync of
+    /// March 31 only — that sync's silence about the row proves nothing
+    /// about March 5. A record settles only when the new sync's own interval
+    /// contains the record's (`from <= range_from AND range_to <= to`); a
+    /// sync that covers the whole record has re-read the row and can say it
+    /// is no longer refused. A row that this sync refused again stays open,
+    /// however `row_keys` is ordered.
     #[allow(clippy::too_many_arguments)] // the filter is one where, spelled out
     pub fn settle_sync_refusals_besides(
         &self,
@@ -176,13 +184,13 @@ impl SqliteStore {
         to: &str,
         row_keys: &[String],
     ) -> Result<(), StoreError> {
-        // An empty list means the sync refused nothing: everything open and
-        // overlapping is settled.
+        // An empty list means the sync refused nothing: everything open whose
+        // interval the sync covers is settled.
         if row_keys.is_empty() {
             self.conn.execute(
                 "UPDATE sync_refusals SET settled = 1
                  WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
-                   AND range_from <= ?4 AND range_to >= ?5",
+                   AND ?5 <= range_from AND range_to <= ?4",
                 params![
                     owner.inner().to_string(),
                     account.inner().to_string(),
@@ -196,7 +204,7 @@ impl SqliteStore {
         let mut sql = String::from(
             "UPDATE sync_refusals SET settled = 1
              WHERE settled = 0 AND owner = ?1 AND account = ?2 AND source = ?3
-               AND range_from <= ?4 AND range_to >= ?5
+               AND ?5 <= range_from AND range_to <= ?4
                AND row_key NOT IN (",
         );
         let mut values: Vec<rusqlite::types::Value> = vec![

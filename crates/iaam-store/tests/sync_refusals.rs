@@ -1,5 +1,6 @@
 //! A sync refusal record round-trips owner-scoped, deduplicates per row and
-//! settles when a later sync no longer lists it (iaam-vg8te.1.2).
+//! settles when a later sync that covers its whole interval no longer lists
+//! it (iaam-vg8te.1.2).
 
 use iaam_core::ids::{AccountId, OwnerId};
 use iaam_store::SqliteStore;
@@ -159,7 +160,7 @@ fn an_open_refusal_is_listed_only_when_the_interval_overlaps() {
 }
 
 #[test]
-fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_overlap() {
+fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_covered_range() {
     let store = SqliteStore::open_in_memory().expect("memory store");
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
@@ -199,8 +200,8 @@ fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_overlap() {
         .expect("row-old");
 
     // A later sync of the same range refused only row-a again: row-b is
-    // settled (the row now imports), row-old lies outside the overlap and
-    // stays open, row-a stays open.
+    // settled (the row now imports), row-old lies outside the covered range
+    // and stays open, row-a stays open.
     store
         .settle_sync_refusals_besides(
             owner,
@@ -241,4 +242,74 @@ fn settling_keeps_the_row_refused_again_and_settles_the_rest_of_the_overlap() {
         .expect("list");
     assert_eq!(settled.len(), 1);
     assert_eq!(settled[0].row_key, "row-a");
+}
+
+#[test]
+fn a_later_sync_that_does_not_cover_the_records_interval_settles_nothing() {
+    let store = SqliteStore::open_in_memory().expect("memory store");
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+
+    // A March 1–31 sync refused one row. A later sync of March 31 only
+    // refuses nothing: its silence about the row proves nothing about March
+    // 1–30, so the record settles only when the later sync covers its own
+    // interval (iaam-vg8te.1.2).
+    store
+        .upsert_sync_refusal(&refusal(
+            owner,
+            account,
+            "row-1",
+            "2026-03-01",
+            "2026-03-31",
+            "reasons",
+            r#"{}"#,
+        ))
+        .expect("record");
+
+    // March 31 only: neither an empty refusal list nor a list of other keys
+    // may settle a record the sync did not read whole.
+    store
+        .settle_sync_refusals_besides(owner, account, "finam", "2026-03-31", "2026-03-31", &[])
+        .expect("settle with an empty list");
+    assert_eq!(
+        store
+            .list_open_sync_refusals(owner, account, "finam", "2026-03-01", "2026-03-31")
+            .expect("list")
+            .len(),
+        1,
+        "a sync of March 31 only must not settle a March 1–31 refusal"
+    );
+
+    store
+        .settle_sync_refusals_besides(
+            owner,
+            account,
+            "finam",
+            "2026-03-31",
+            "2026-03-31",
+            &["row-other".to_owned()],
+        )
+        .expect("settle with a list of other keys");
+    assert_eq!(
+        store
+            .list_open_sync_refusals(owner, account, "finam", "2026-03-01", "2026-03-31")
+            .expect("list")
+            .len(),
+        1,
+        "nor must an absent row key by itself prove anything"
+    );
+
+    // A later sync that does cover the whole record's interval and refuses
+    // nothing settles it: the re-read is complete, the row is not in its
+    // refusal list, and the question is answered.
+    store
+        .settle_sync_refusals_besides(owner, account, "finam", "2026-03-01", "2026-03-31", &[])
+        .expect("settle over the full range");
+    assert!(
+        store
+            .list_open_sync_refusals(owner, account, "finam", "2026-03-01", "2026-03-31")
+            .expect("list")
+            .is_empty(),
+        "a sync that covers the record's whole interval and refuses nothing settles it"
+    );
 }

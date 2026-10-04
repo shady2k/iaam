@@ -14,8 +14,11 @@
 //! dropped, the table `0003_event_stated_securities_value.sql` adds removed,
 //! and the version wound back — the shape a version-1 database actually has.
 
+use iaam_core::ids::{AccountId, OwnerId};
 use iaam_store::SqliteStore;
 use iaam_store::schema::{SCHEMA_VERSION, migrate};
+use iaam_store::sync_refusals::SyncRefusalRecord;
+use uuid::Uuid;
 
 fn user_version(store: &SqliteStore) -> u32 {
     store
@@ -73,6 +76,13 @@ fn has_broker_egress_table(store: &SqliteStore) -> bool {
         .is_ok()
 }
 
+fn has_sync_refusals_table(store: &SqliteStore) -> bool {
+    store
+        .connection()
+        .prepare("SELECT row_key FROM sync_refusals LIMIT 0")
+        .is_ok()
+}
+
 #[test]
 fn a_database_left_at_version_one_gains_the_counterparty_column() {
     let store = SqliteStore::open_in_memory().expect("open");
@@ -92,6 +102,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
              DROP TABLE contour_report_defaults; \
              DROP TABLE broker_account_bindings; \
              DROP TABLE broker_egress; \
+             DROP TABLE sync_refusals; \
              PRAGMA user_version = 1;",
         )
         .expect("winding the database back to version 1");
@@ -122,6 +133,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         !has_broker_egress_table(&store),
         "and this table too, or migration 0008 is not actually being exercised"
+    );
+    assert!(
+        !has_sync_refusals_table(&store),
+        "and this table too, or migration 0009 is not actually being exercised"
     );
 
     migrate(store.connection()).expect("migrating the wound-back database");
@@ -155,6 +170,10 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
     assert!(
         has_broker_egress_table(&store),
         "and the table 0008 adds, for the same reason"
+    );
+    assert!(
+        has_sync_refusals_table(&store),
+        "and the table 0009 adds, for the same reason"
     );
     assert_eq!(
         user_version(&store),
@@ -203,11 +222,11 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
     // Back to the version before the rebuild, so `migrate` performs it again —
     // this time over a journal that is not empty. `accounts.declared_by`,
     // `account_retractions`, `contour_report_defaults`,
-    // `broker_account_bindings` and `broker_egress` are dropped too:
-    // `migrate` still catches this database up to the current `SCHEMA_VERSION`
-    // afterwards, and migrations 0004 to 0008 would otherwise find the column
-    // and the tables already there from the initial `open_in_memory` and fail
-    // on a name that already exists.
+    // `broker_account_bindings`, `broker_egress` and `sync_refusals` are
+    // dropped too: `migrate` still catches this database up to the current
+    // `SCHEMA_VERSION` afterwards, and migrations 0004 to 0009 would otherwise
+    // find the column and the tables already there from the initial
+    // `open_in_memory` and fail on a name that already exists.
     connection
         .execute_batch(
             "DROP TABLE event_stated_securities_value; \
@@ -216,9 +235,14 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
              DROP TABLE contour_report_defaults; \
              DROP TABLE broker_account_bindings; \
              DROP TABLE broker_egress; \
+             DROP TABLE sync_refusals; \
              PRAGMA user_version = 2;",
         )
         .expect("winding the database back to version 2");
+    assert!(
+        !has_sync_refusals_table(&store),
+        "the sync_refusals table must be gone too, or migration 0009 is not actually being exercised"
+    );
 
     migrate(connection).expect("migrating a populated database");
 
@@ -241,5 +265,94 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
         orphans, 0,
         "a rebuild run with the foreign-key guard off must leave nothing pointing at a \
          parent that is not there"
+    );
+}
+
+/// A database built at version 8 — before `sync_refusals` existed — gains the
+/// table and its methods work on it.
+///
+/// The sync-refusals table was first appended to `0001_schema.sql`, which
+/// every database already at version 1 skips: an existing instance would
+/// never re-apply it, and the first `settle_sync_refusals_besides` would
+/// fail with "no such table" even when nothing was refused
+/// (iaam-vg8te.1.2). A database that build never sees again is produced the
+/// way every migration test here produces one: current database, the new
+/// migration's table dropped, the version wound back to where that build
+/// left it.
+#[test]
+fn a_version_eight_database_gains_the_sync_refusals_table() {
+    let store = SqliteStore::open_in_memory().expect("open");
+    assert!(
+        has_sync_refusals_table(&store),
+        "a database this build creates has the table, or the test is not about a fresh one"
+    );
+
+    // The shape a version-8 build actually leaves behind: everything of
+    // migrations 1 to 8, nothing of 0009, and the version number it wrote.
+    store
+        .connection()
+        .execute_batch(
+            "DROP TABLE sync_refusals; \
+             PRAGMA user_version = 8;",
+        )
+        .expect("winding the database back to version 8");
+    assert!(
+        !has_sync_refusals_table(&store),
+        "the table must be gone, or the upgrade is not actually being exercised"
+    );
+    assert_eq!(
+        user_version(&store),
+        8,
+        "the wound-back database must claim exactly the version of the last migration it has"
+    );
+
+    migrate(store.connection()).expect("migrating the version-8 database");
+
+    assert!(
+        has_sync_refusals_table(&store),
+        "an existing database must gain the table, not be expected to have had it all along"
+    );
+    assert_eq!(
+        user_version(&store),
+        SCHEMA_VERSION,
+        "it must be left at this build's version, so the next migration is not reapplied"
+    );
+
+    // The store's own methods work over the migrated table: a refusal is
+    // recorded, listed as the owner's question, and settled again by a later
+    // sync that covers its whole interval and does not list it.
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let record = SyncRefusalRecord {
+        id: Uuid::new_v4(),
+        owner,
+        account,
+        source: "finam".to_owned(),
+        row_key: "row-1".to_owned(),
+        range_from: "2026-03-01".to_owned(),
+        range_to: "2026-03-31".to_owned(),
+        dimensions: "positions".to_owned(),
+        reason: "no instrument carries ISIN RU000AFIXTUR".to_owned(),
+        payload: r#"{"symbol":"FIXT@MISX"}"#.to_owned(),
+        settled: false,
+    };
+    store
+        .upsert_sync_refusal(&record)
+        .expect("the migrated table records a refusal");
+    let listed = store
+        .list_open_sync_refusals(owner, account, "finam", "2026-03-01", "2026-03-31")
+        .expect("the migrated table lists open refusals");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].reason, "no instrument carries ISIN RU000AFIXTUR");
+
+    store
+        .settle_sync_refusals_besides(owner, account, "finam", "2026-03-01", "2026-03-31", &[])
+        .expect("the migrated table settles covered refusals");
+    assert!(
+        store
+            .list_open_sync_refusals(owner, account, "finam", "2026-03-01", "2026-03-31")
+            .expect("list after settling")
+            .is_empty(),
+        "the refusal settled through the migrated table"
     );
 }

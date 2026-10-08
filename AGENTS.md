@@ -57,9 +57,8 @@ and keeps the edge. `br ready` alone does not know that case: the integration's
 **TodoWrite, TaskCreate and markdown TODO lists are forbidden.** `br` is the
 tracker for all work, including your own checklists.
 
-**Recall is `deja`, not the tracker.** `br` has no memory store. A lesson every
-agent must follow goes into **Lessons** below, through a commit someone reads;
-what you personally worked out is found again through `deja`.
+A lesson every agent must follow goes into **Lessons** below, through a commit
+someone reads; what you personally worked out stays in your own session notes.
 
 ## Session completion
 

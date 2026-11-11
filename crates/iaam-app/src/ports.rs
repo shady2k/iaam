@@ -2183,6 +2183,18 @@ pub struct Quarantined {
     pub dimensions: std::collections::BTreeSet<Dimension>,
 }
 
+/// A full repayment whose source reports zero units, not a position size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingFullRedemption {
+    pub account: AccountId,
+    pub instrument: InstrumentId,
+    pub compensation: iaam_core::money::Money,
+    pub effective_date: Date,
+    pub idempotency_key: String,
+    pub source_operation_id: String,
+    pub raw: String,
+}
+
 /// Result of retrieving a page of broker-channel operations.
 ///
 /// Rejected rows are not lost: they are separated from accepted operations, but
@@ -2191,6 +2203,7 @@ pub struct Quarantined {
 pub struct ParsedOperations {
     pub accepted: Vec<SubmittedOperation>,
     pub journal: Vec<iaam_ingest::SubmittedJournalEvent>,
+    pub pending_redemptions: Vec<PendingFullRedemption>,
     pub quarantined: Vec<Quarantined>,
 }
 

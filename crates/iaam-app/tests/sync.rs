@@ -527,6 +527,7 @@ fn api_with_claims(
         identity_scope: IdentityScope::Source,
         operations: Ok(ParsedOperations {
             journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: vec![operation],
             quarantined: Vec::new(),
         }),
@@ -639,6 +640,7 @@ async fn a_position_with_no_trade_in_the_interval_registers_no_custody() {
         identity_scope: IdentityScope::Source,
         operations: Ok(ParsedOperations {
             journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: Vec::new(),
             quarantined: Vec::new(),
         }),
@@ -701,6 +703,7 @@ async fn account_scope_sync_records_same_source_identifier_for_two_accounts() {
         identity_scope: IdentityScope::Account,
         operations: Ok(ParsedOperations {
             journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: vec![operation],
             quarantined: Vec::new(),
         }),
@@ -891,6 +894,7 @@ async fn a_refused_commission_records_a_cash_gap_but_preserves_position_evidence
     );
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -968,6 +972,7 @@ async fn a_refused_position_reaches_the_owner_counted_and_gapped() {
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: Vec::new(),
         quarantined: Vec::new(),
     });
@@ -1039,6 +1044,7 @@ async fn repeating_refused_sync_appends_one_coverage_gap() {
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -1464,6 +1470,7 @@ async fn a_partial_sync_never_settles_an_existing_refusal() {
     let mut first_broker = api(account, source, trade_without_custody(account, instrument));
     first_broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: Vec::new(),
         quarantined: Vec::new(),
     });
@@ -1597,6 +1604,7 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
     );
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -1630,6 +1638,7 @@ async fn a_later_refusal_widens_the_existing_gap_for_reconciliation() {
 
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -1821,6 +1830,7 @@ async fn mixed_sync_counts_possible_duplicates_separately_from_duplicates() {
     let mut broker = api(account, SourceId::new_random(), possible.clone());
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![possible, duplicate, fresh],
         quarantined: Vec::new(),
     });
@@ -1963,6 +1973,7 @@ async fn partial_operations_record_control_assertion_and_coverage_gap() {
     let mut broker = api(account, SourceId::new_random(), operation);
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: broker
             .operations
             .as_ref()
@@ -2009,6 +2020,7 @@ async fn a_transfer_refusal_becomes_a_quarantined_verdict_without_losing_other_r
     let mut broker = api(account, SourceId::new_random(), first);
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![
             broker.operations.as_ref().expect("operations").accepted[0].clone(),
             second,
@@ -2060,6 +2072,7 @@ async fn bond_amortisation_and_unknown_rows_become_quarantined_verdicts() {
         let mut broker = api(account, SourceId::new_random(), broker_operation);
         broker.operations = Ok(ParsedOperations {
             journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: broker
                 .operations
                 .as_ref()
@@ -2112,6 +2125,7 @@ async fn a_normalisation_rejection_stops_one_row_and_records_the_other_rows() {
     let mut broker = api(account, SourceId::new_random(), valid.clone());
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![valid, invalid],
         quarantined: Vec::new(),
     });
@@ -2168,6 +2182,7 @@ async fn a_structural_rejection_stops_one_operation_and_records_its_dimensions()
     );
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: vec![invalid],
         quarantined: Vec::new(),
     });
@@ -2751,6 +2766,291 @@ async fn a_full_bond_repayment_persists_principal_and_removes_quantity_only_once
     assert_eq!(redemptions_after, vec![redemption]);
 }
 
+fn zero_quantity_repayment_channel(services: &AppServices) -> TinkoffChannel {
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").expect("invented bond UID"),
+    );
+    channel_over(
+        CatalogueTinvest {
+            descriptions_asked: Arc::new(AtomicUsize::new(0)),
+            description: serde_json::json!({"instrument": {
+                "isin":invented_isin(instrument), "ticker":"INVENTEDBOND",
+                "name":"Invented redeemed bond", "instrumentType":"bond",
+                "currency":"rub", "classCode":"TQOB", "lot":1
+            }})
+            .to_string(),
+            inner: ScriptedTinvest {
+                accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+                operations: r#"{"hasNext":false,"items":[{
+                    "cursor":"zero-redemption-cursor", "brokerAccountId":"solo",
+                    "id":"invented-zero-full-repayment", "date":"2026-03-15T10:00:00Z",
+                    "type":"OPERATION_TYPE_BOND_REPAYMENT_FULL",
+                    "state":"OPERATION_STATE_EXECUTED",
+                    "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000005",
+                    "positionUid":"aaaaaaaa-0000-0000-0000-000000000005",
+                    "quantity":"0", "quantityDone":"0", "quantityRest":"0",
+                    "payment":{"units":"2000","nano":0,"currency":"rub"}
+                }]}"#,
+                portfolio: r#"{"positions":[]}"#.to_owned(),
+            },
+        },
+        services,
+    )
+}
+
+async fn seed_redemption_history(
+    services: &AppServices,
+    owner: OwnerId,
+    account: AccountId,
+    instrument: InstrumentId,
+    history: &[(Date, i64)],
+) {
+    let source = SourceId::new_random();
+    let events = history
+        .iter()
+        .enumerate()
+        .map(|(index, &(at, quantity))| {
+            let quantity_value = Dec::new(rust_decimal::Decimal::from(quantity.abs()));
+            let mut operation = trade_without_custody(account, instrument);
+            operation.kind = if quantity > 0 {
+                OperationKind::Buy {
+                    instrument,
+                    custody: None,
+                    quantity: quantity_value,
+                    gross_minor: quantity.abs() * 100_000,
+                    fee_minor: None,
+                    basis_fee: None,
+                    accrued_interest_minor: None,
+                    currency: CurrencyCode::Rub,
+                }
+            } else {
+                OperationKind::Sell {
+                    instrument,
+                    custody: None,
+                    quantity: quantity_value,
+                    gross_minor: quantity.abs() * 100_000,
+                    fee_minor: None,
+                    basis_fee: None,
+                    accrued_interest_minor: None,
+                    currency: CurrencyCode::Rub,
+                }
+            };
+            operation.dates = OperationDates {
+                trade: Some(at),
+                settled: Some(at),
+                cash_posted: Some(at),
+                paid: None,
+            };
+            operation.source_operation_id = Some(format!("invented-bond-trade-{index}"));
+            iaam_ingest::normalize(
+                &operation,
+                &iaam_ingest::operation::NormalizationContext {
+                    owner,
+                    source,
+                    parser_version: ParserVersion(PARSER_VERSION.to_owned()),
+                },
+            )
+            .expect("invented bond trade")
+            .event
+        })
+        .collect();
+    services
+        .store
+        .append_events(events, IdentityScope::Source)
+        .await
+        .expect("seed journal position history");
+}
+
+#[tokio::test]
+async fn a_zero_quantity_full_repayment_retires_the_position_at_its_date_only_once() {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::event::leg::LegKind;
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").expect("invented bond UID"),
+    );
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBOND");
+    });
+    seed_redemption_history(
+        &services,
+        owner,
+        account,
+        instrument,
+        &[
+            (date!(2026 - 03 - 01), 3),
+            (date!(2026 - 03 - 10), -1),
+            (date!(2026 - 03 - 20), 5),
+        ],
+    )
+    .await;
+    let channel = zero_quantity_repayment_channel(&services);
+    let first = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("zero quantity repayment sync");
+    assert_eq!(first.set_aside, 0, "{:?}", first.recorded);
+    let events = load_all(&services, owner).await;
+    let redemptions: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::Redemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(redemptions.len(), 1, "{events:?}");
+    let redemption = redemptions[0];
+    match &redemption.kind {
+        EventKind::CorporateAction {
+            action:
+                CorporateAction::Redemption {
+                    quantity,
+                    compensation,
+                    principal_returned_per_unit,
+                    effective_date,
+                    ..
+                },
+        } => {
+            assert_eq!(quantity.0, Dec::new(rust_decimal::Decimal::from(2)));
+            assert_eq!(compensation.amount().raw(), 200_000);
+            assert_eq!(compensation.currency(), CurrencyCode::Rub);
+            assert_eq!(
+                principal_returned_per_unit.value(),
+                Dec::new(rust_decimal::Decimal::from(1000))
+            );
+            assert_eq!(*effective_date, date!(2026 - 03 - 15));
+        }
+        other => panic!("expected redemption, got {other:?}"),
+    }
+    let security = redemption
+        .legs
+        .iter()
+        .find(|leg| leg.kind == LegKind::SecurityQuantity)
+        .expect("retired position leg");
+    assert_eq!(security.account, account);
+    assert_eq!(security.instrument, Some(instrument));
+    assert_eq!(
+        security.quantity.map(|quantity| quantity.0),
+        Some(Dec::new(rust_decimal::Decimal::from(-2)))
+    );
+    let cash = redemption
+        .legs
+        .iter()
+        .find(|leg| leg.kind == LegKind::Principal)
+        .expect("principal payment leg");
+    assert_eq!(
+        cash.cash_effect().expect("principal inflow").amount().raw(),
+        200_000
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event.kind,
+        EventKind::Income { .. } | EventKind::CashIn { .. }
+    )));
+
+    let second = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("repeat zero quantity repayment sync");
+    assert_eq!(second.set_aside, 0, "{:?}", second.recorded);
+    assert_eq!(second.duplicates, 1, "{:?}", second.recorded);
+    assert!(second.recorded.iter().any(|verdict| matches!(verdict,
+        Verdict::Duplicate { existing } if *existing == redemption.id
+    )));
+    let after = load_all(&services, owner).await;
+    let redemptions_after: Vec<_> = after
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::CorporateAction {
+                    action: CorporateAction::Redemption { .. }
+                }
+            )
+        })
+        .collect();
+    assert_eq!(redemptions_after, vec![redemption]);
+}
+
+#[tokio::test]
+async fn a_zero_quantity_full_repayment_without_journal_history_is_set_aside() {
+    zero_quantity_repayment_without_position(false).await;
+}
+
+#[tokio::test]
+async fn a_future_position_does_not_supply_a_zero_quantity_full_repayment() {
+    zero_quantity_repayment_without_position(true).await;
+}
+
+async fn zero_quantity_repayment_without_position(future_position: bool) {
+    use iaam_core::event::corporate_action::CorporateAction;
+
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000005").expect("invented bond UID"),
+    );
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDBOND");
+    });
+    if future_position {
+        seed_redemption_history(
+            &services,
+            owner,
+            account,
+            instrument,
+            &[(date!(2026 - 03 - 20), 5)],
+        )
+        .await;
+    }
+    let channel = zero_quantity_repayment_channel(&services);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("unproven repayment sync");
+    assert_eq!(outcome.set_aside, 1, "{:?}", outcome.recorded);
+    assert!(outcome.recorded.iter().any(|verdict| matches!(verdict,
+        Verdict::Quarantined { reason }
+            if reason.to_lowercase().contains("journal") && reason.to_lowercase().contains("position")
+    )), "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.kind,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption { .. }
+            } | EventKind::Income { .. }
+                | EventKind::CashIn { .. }
+        )),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_fractional_unit_price_is_multiplied_before_the_journal_gross_is_posted() {
     let owner = OwnerId::new_random();
@@ -2845,6 +3145,7 @@ async fn existing_quarantine_reasons_reach_the_owner_as_row_verdicts() {
     );
     broker.operations = Ok(ParsedOperations {
         journal: Vec::new(),
+            pending_redemptions: Vec::new(),
             accepted: broker
             .operations
             .as_ref()
@@ -3142,6 +3443,7 @@ async fn a_requested_portfolio_is_recorded_for_its_requested_interval() {
 fn empty_operations() -> ParsedOperations {
     ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted: Vec::new(),
         quarantined: Vec::new(),
     }

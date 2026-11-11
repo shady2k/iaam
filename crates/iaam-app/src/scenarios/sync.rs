@@ -246,7 +246,7 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "fetch_operations",
         status = "complete",
-        accepted = parsed.accepted.len() + parsed.journal.len(),
+        accepted = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
         quarantined = parsed.quarantined.len(),
         "broker sync phase complete"
     );
@@ -318,7 +318,7 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "map",
         status = "start",
-        accepted = parsed.accepted.len() + parsed.journal.len(),
+        accepted = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
         "broker sync phase start"
     );
     let mut known = known_records(&bounded_events);
@@ -382,7 +382,7 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "write",
         status = "start",
-        rows = parsed.accepted.len() + parsed.journal.len(),
+        rows = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
         "broker sync phase start"
     );
     for (row_index, operation) in parsed.accepted.into_iter().enumerate() {
@@ -494,7 +494,80 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
-    for (row_index, submitted) in parsed.journal.into_iter().enumerate() {
+    // Resolve repayments in date order, after this sync's position movements
+    // have entered the journal. Each lookup is bounded to the repayment date.
+    let mut journal: Vec<_> = parsed
+        .journal
+        .into_iter()
+        .map(|submitted| {
+            let date = match &submitted.fact {
+                iaam_ingest::JournalFact::CorporateAction(action) => action.effective_date(),
+                iaam_ingest::JournalFact::OfferExercise { day, .. } => *day,
+            };
+            (date, Ok(submitted))
+        })
+        .chain(
+            parsed
+                .pending_redemptions
+                .into_iter()
+                .map(|pending| (pending.effective_date, Err(pending))),
+        )
+        .collect();
+    journal.sort_by_key(|(date, _)| *date);
+    for (row_index, (_, submission)) in journal.into_iter().enumerate() {
+        let submitted = match submission {
+            Ok(submitted) => submitted,
+            Err(pending) => {
+                let context = DocumentContext {
+                    account: pending.account,
+                    document: None,
+                    sheet: None,
+                    row: None,
+                    identity_scope: broker.identity_scope(),
+                };
+                // Identity is checked before looking up holdings: on a repeat
+                // sync the previously recorded redemption has already retired them.
+                let key = dedup::DedupKey::SourceOperationId(pending.source_operation_id.clone());
+                let digest = Sha256::digest(pending.raw.as_bytes());
+                let fingerprint = RawHash::parse(
+                    &digest
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                )
+                .expect("fingerprint is SHA-256");
+                if let DedupDecision::Duplicate { existing, .. } =
+                    dedup::assess(Some(&key), &fingerprint, &context, &known)
+                {
+                    duplicates += 1;
+                    recorded.push(Verdict::Duplicate { existing });
+                    continue;
+                }
+                match resolve_full_redemption(services, principal.owner, &pending).await? {
+                    Ok(submitted) => submitted,
+                    Err(reason) => {
+                        tracing::debug!(phase = "map", row_index, reason = %reason, "broker full redemption set aside");
+                        let key = SourceRowKey {
+                            source: channel.source,
+                            row: RowName::Given(pending.source_operation_id),
+                        };
+                        let dimensions = [Dimension::Cash, Dimension::Positions]
+                            .into_iter()
+                            .collect();
+                        refusal_records.push(refusal_record(
+                            &refusal_context,
+                            &key,
+                            &dimensions,
+                            reason.clone(),
+                            pending.raw,
+                        ));
+                        refusals.push(RefusedRow { key, dimensions });
+                        recorded.push(Verdict::Quarantined { reason });
+                        continue;
+                    }
+                }
+            }
+        };
         let context = DocumentContext {
             account: submitted.account,
             document: None,
@@ -1095,6 +1168,59 @@ fn coverage_gap_event(
         Provenance::new(channel.source, raw_hash, channel.parser_version.clone()),
         identity,
     )
+}
+
+async fn resolve_full_redemption(
+    services: &AppServices,
+    owner: OwnerId,
+    pending: &crate::ports::PendingFullRedemption,
+) -> Result<Result<iaam_ingest::SubmittedJournalEvent, String>, AppError> {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::projection::balances::{Balances, PositionKey};
+    let events = services
+        .store
+        .load_events_through(owner, pending.effective_date)
+        .await?;
+    let effective = iaam_core::event::correction::resolve(&events).map_err(AppError::Correction)?;
+    let mut balances = Balances::new();
+    for event in effective {
+        balances
+            .apply(event)
+            .map_err(iaam_core::projection::ProjectionError::from)
+            .map_err(AppError::from_projection)?;
+    }
+    let Some(quantity) = balances
+        .position(&PositionKey {
+            account: pending.account,
+            instrument: pending.instrument,
+        })
+        .filter(|quantity| quantity.0.is_positive())
+    else {
+        return Ok(Err(format!(
+            "bond redemption reports zero quantity and the journal holds no positive position of this instrument on this account at {}; history may start after the holding",
+            pending.effective_date
+        )));
+    };
+    let principal_returned_per_unit =
+        match iaam_core::money::returned_principal_per_unit(pending.compensation, quantity) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(format!("bond redemption principal per unit: {error}"))),
+        };
+    Ok(Ok(iaam_ingest::SubmittedJournalEvent {
+        account: pending.account,
+        fact: iaam_ingest::JournalFact::CorporateAction(CorporateAction::Redemption {
+            instrument: pending.instrument,
+            custody: None,
+            quantity,
+            principal_returned_per_unit,
+            compensation: pending.compensation,
+            effective_date: pending.effective_date,
+            record_date: None,
+            grounds: None,
+        }),
+        idempotency_key: Some(pending.idempotency_key.clone()),
+        source_operation_id: Some(pending.source_operation_id.clone()),
+    }))
 }
 
 fn known_records(events: &[Event]) -> Vec<KnownRecord> {

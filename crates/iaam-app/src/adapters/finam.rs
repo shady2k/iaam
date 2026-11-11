@@ -542,6 +542,7 @@ async fn adapt_operations(
     }
     Ok(ParsedOperations {
         journal: Vec::new(),
+        pending_redemptions: Vec::new(),
         accepted,
         quarantined,
     })

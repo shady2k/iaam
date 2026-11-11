@@ -672,6 +672,7 @@ fn adapt_operations(
     }
     let mut accepted = Vec::new();
     let mut journal = Vec::new();
+    let mut pending_redemptions = Vec::new();
     let mut quarantined = Vec::new();
     for mut operation in operations {
         // Take the payload before moving the operation into conversion; no later stage reads it.
@@ -715,6 +716,20 @@ fn adapt_operations(
             continue;
         }
         if matches!(kind, ChannelOperationKind::BondRedemption) {
+            if operation
+                .quantity
+                .is_some_and(|quantity| quantity == iaam_core::money::Quantity::zero())
+            {
+                match pending_redemption(account, &operation, raw.to_string()) {
+                    Ok(pending) => pending_redemptions.push(pending),
+                    Err(error) => quarantined.push(Quarantined {
+                        raw,
+                        reason: error.to_string(),
+                        dimensions: cash_positions(),
+                    }),
+                }
+                continue;
+            }
             match redemption_to_journal(account, operation) {
                 Ok(event) => journal.push(event),
                 Err(RowRefusal::Row { reason, .. }) => quarantined.push(Quarantined {
@@ -769,6 +784,7 @@ fn adapt_operations(
     Ok(ParsedOperations {
         accepted,
         journal,
+        pending_redemptions,
         quarantined,
     })
 }
@@ -841,6 +857,32 @@ fn order_state_reason(kind: &ChannelOperationKind, state: &ChannelOrderState) ->
     };
     Some(format!("order state {state_name}: {evidence}"))
 }
+fn pending_redemption(
+    account: AccountId,
+    operation: &ChannelOperation,
+    raw: String,
+) -> Result<crate::ports::PendingFullRedemption, BrokerError> {
+    let instrument = optional_instrument(operation)
+        .map_err(RowRefusal::into_broker_error)?
+        .ok_or_else(|| unparsable("bond redemption does not contain instrumentUid"))?;
+    let effective_date = operation
+        .date
+        .ok_or_else(|| unparsable("bond redemption does not contain date"))?;
+    let payment = operation
+        .payment
+        .filter(|payment| payment.amount.raw() > 0)
+        .ok_or_else(|| unparsable("bond redemption requires positive payment"))?;
+    Ok(crate::ports::PendingFullRedemption {
+        account,
+        instrument,
+        effective_date,
+        compensation: iaam_core::money::Money::new(payment.amount, payment.currency),
+        idempotency_key: operation.deduplication_key.clone(),
+        source_operation_id: operation.operation_id.clone(),
+        raw,
+    })
+}
+
 fn redemption_to_journal(
     account: AccountId,
     operation: ChannelOperation,
@@ -4068,7 +4110,7 @@ mod full_redemption_tests {
     }
 
     #[test]
-    fn full_repayment_refuses_missing_or_nonpositive_principal_and_quantity() {
+    fn full_repayment_refuses_missing_or_nonpositive_principal_and_invalid_quantity() {
         for (field, value, reason) in [
             ("payment", serde_json::Value::Null, "positive payment"),
             (
@@ -4082,7 +4124,6 @@ mod full_redemption_tests {
                 "positive payment",
             ),
             ("quantity", serde_json::Value::Null, "positive quantity"),
-            ("quantity", serde_json::json!("0"), "positive quantity"),
             ("quantity", serde_json::json!("-1"), "positive quantity"),
             ("instrumentUid", serde_json::Value::Null, "instrumentUid"),
             (
@@ -4106,6 +4147,26 @@ mod full_redemption_tests {
             assert_eq!(refusal.dimensions, cash_positions());
             assert_eq!(refusal.raw, row);
         }
+    }
+
+    #[test]
+    fn zero_quantity_full_repayment_waits_for_journal_holdings() {
+        let mut row = full_repayment_row();
+        row["quantity"] = serde_json::json!("0");
+        row["price"] = serde_json::json!({"units": "0", "nano": 0, "currency": "rub"});
+        let parsed = adapt_row(row.clone());
+        assert!(parsed.accepted.is_empty());
+        assert!(parsed.journal.is_empty());
+        assert!(parsed.quarantined.is_empty());
+        assert_eq!(parsed.pending_redemptions.len(), 1);
+        assert_eq!(
+            parsed.pending_redemptions[0].compensation.amount().raw(),
+            240_000
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&parsed.pending_redemptions[0].raw).unwrap(),
+            row
+        );
     }
 
     #[test]

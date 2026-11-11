@@ -300,6 +300,32 @@ impl Symbols<'_> {
     /// are the standing refusals; a directory that cannot be asked at all
     /// fails the sync.
     async fn instrument(&self, symbol: &str, on: Date) -> Result<Resolution, BrokerError> {
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "start",
+            strategy = "isin_directory",
+            requested = 1,
+            "broker sync phase"
+        );
+        let result = self.resolve_instrument(symbol, on).await;
+        let (resolved, unresolved, failed) = match &result {
+            Ok(Resolution::Resolved(_)) => (1, 0, 0),
+            Ok(Resolution::Unresolved(_)) => (0, 1, 0),
+            Err(_) => (0, 0, 1),
+        };
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "complete",
+            strategy = "isin_directory",
+            resolved,
+            unresolved,
+            failed,
+            "broker sync phase complete"
+        );
+        result
+    }
+
+    async fn resolve_instrument(&self, symbol: &str, on: Date) -> Result<Resolution, BrokerError> {
         let isin = match self
             .channel
             .isin_of(symbol, self.broker_account, self.context)

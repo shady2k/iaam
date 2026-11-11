@@ -38,6 +38,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use time::Date;
 use time::OffsetDateTime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Why no control assertion was recorded, when none was.
@@ -157,6 +158,17 @@ pub struct BrokerSyncRequest {
 }
 
 /// Retrieves the broker's operations and portfolio and records new facts.
+#[tracing::instrument(
+    name = "broker_sync",
+    skip_all,
+    fields(
+        broker = %request.broker_code.as_str(),
+        account = %request.account.inner(),
+        from = %request.from,
+        to = %request.to,
+        broker_account = tracing::field::Empty
+    )
+)]
 pub async fn sync_broker(
     services: &AppServices,
     principal: &Principal,
@@ -177,8 +189,6 @@ pub async fn sync_broker(
         });
     }
 
-    let span = tracing::info_span!("broker_sync", broker = %broker_code.as_str(), account = %account.inner(), from = %from, to = %to, broker_account = tracing::field::Empty);
-    let _entered = span.enter();
     tracing::info!(phase = "start", "broker sync started");
     let _claim = services.running_syncs.claim(principal.owner, account)?;
     let deadline = Some(Instant::now() + SYNC_DEADLINE);
@@ -223,7 +233,7 @@ pub async fn sync_broker(
         }
     };
 
-    span.record("broker_account", broker_account.as_str());
+    tracing::Span::current().record("broker_account", broker_account.as_str());
     tracing::info!(
         phase = "fetch_operations",
         status = "start",
@@ -235,6 +245,7 @@ pub async fn sync_broker(
         .map_err(broker_error)?;
     tracing::info!(
         phase = "fetch_operations",
+        status = "complete",
         accepted = parsed.accepted.len(),
         quarantined = parsed.quarantined.len(),
         "broker sync phase complete"
@@ -258,20 +269,29 @@ pub async fn sync_broker(
     // after the operations were recorded would leave a journal the refusal
     // claims is unchanged. An out-of-interval trade withholds every
     // assertion, so its portfolio is not asked for at all.
+    tracing::info!(
+        phase = "fetch_portfolio",
+        status = "start",
+        "broker sync phase"
+    );
     let snapshot = if has_out_of_interval_trade {
-        None
-    } else {
         tracing::info!(
             phase = "fetch_portfolio",
-            status = "start",
-            "broker sync phase"
+            status = "skipped",
+            reason = "out_of_interval_trade",
+            claims = 0,
+            refused = 0,
+            "broker sync phase complete"
         );
+        None
+    } else {
         let snapshot = broker
             .fetch_portfolio(account, &broker_account, to, broker_context)
             .await
             .map_err(broker_error)?;
         tracing::info!(
             phase = "fetch_portfolio",
+            status = "complete",
             claims = snapshot.claims.len(),
             refused = snapshot.refused.len(),
             "broker sync phase complete"
@@ -297,11 +317,25 @@ pub async fn sync_broker(
     };
     tracing::info!(
         phase = "resolve_instruments",
-        instruments = 0,
-        "broker sync phase complete"
+        status = "start",
+        strategy = "broker_identity",
+        "using instrument identities supplied by the broker channel"
+    );
+    let operation_rows = parsed.accepted.len();
+    let portfolio_claims = snapshot
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.claims.len());
+    tracing::info!(
+        phase = "resolve_instruments",
+        status = "complete",
+        strategy = "broker_identity",
+        operation_rows,
+        portfolio_claims,
+        "broker channel instrument identities ready"
     );
     tracing::info!(
         phase = "map",
+        status = "start",
         accepted = parsed.accepted.len(),
         "broker sync phase start"
     );
@@ -337,7 +371,13 @@ pub async fn sync_broker(
             .unwrap_or_default(),
     );
     for (row_index, row) in quarantined.enumerate() {
-        tracing::debug!(phase = "map", row_index, operation_type = "quarantined", reason = %row.reason, "broker sync row set aside");
+        tracing::debug!(
+            phase = "map",
+            row_index,
+            operation_type = quarantined_operation_type(&row.raw),
+            reason = %row.reason,
+            "broker sync row quarantined"
+        );
         let key = SourceRowKey {
             source: channel.source,
             row: fingerprint_of(&row.raw),
@@ -356,14 +396,14 @@ pub async fn sync_broker(
         ));
     }
 
-    tracing::info!(phase = "map", status = "complete", "broker sync phase");
+    // Mapping and appending share the loop so deduplication sees prior writes.
     tracing::info!(
         phase = "write",
+        status = "start",
         rows = parsed.accepted.len(),
         "broker sync phase start"
     );
     for (row_index, operation) in parsed.accepted.into_iter().enumerate() {
-        tracing::debug!(phase = "map", row_index, operation_type = ?operation.kind, reason = "normalization/write candidate", "broker sync row mapped");
         let context = DocumentContext {
             account: operation.account,
             document: None,
@@ -387,6 +427,14 @@ pub async fn sync_broker(
         ) {
             Ok(normalized) => normalized,
             Err(rejection) => {
+                tracing::debug!(
+                    phase = "map",
+                    row_index,
+                    operation_type = operation_kind_name(&operation.kind),
+                    reason = "normalization_rejected",
+                    field = %rejection.field,
+                    "broker sync row rejected"
+                );
                 let row = refused_row(&operation, channel.source);
                 refusals.push(row.clone());
                 refusal_records.push(refusal_record(
@@ -407,6 +455,14 @@ pub async fn sync_broker(
             .with_declared_by(PrincipalId(principal.token_id));
         if let Some(rejection) = crate::scenarios::ingest::structural_rejection(&event, "operation")
         {
+            tracing::debug!(
+                phase = "map",
+                row_index,
+                operation_type = operation_kind_name(&operation.kind),
+                reason = "structure_rejected",
+                field = %rejection.field,
+                "broker sync row rejected"
+            );
             let row = refused_row(&operation, channel.source);
             refusals.push(row.clone());
             refusal_records.push(refusal_record(
@@ -436,6 +492,11 @@ pub async fn sync_broker(
             vec![event.clone()],
             broker.identity_scope(),
         )
+        .instrument(tracing::info_span!(
+            "broker_sync_row",
+            row_index,
+            operation_type = operation_kind_name(&operation.kind)
+        ))
         .await?;
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         let verdict = match (possible_duplicate, event_id_from_verdict(&verdict)) {
@@ -450,6 +511,17 @@ pub async fn sync_broker(
         }
         recorded.push(verdict);
     }
+
+    tracing::info!(
+        phase = "map",
+        status = "complete",
+        rows = recorded.len(),
+        rejected = set_aside(&recorded),
+        quarantined = refusal_records.len() - set_aside(&recorded),
+        duplicates,
+        possible_duplicates,
+        "broker sync phase complete"
+    );
 
     // A refused row is reported whatever else happens to this response: its
     // reason names what is missing, and it reaches the owner nowhere else. A
@@ -507,6 +579,24 @@ pub async fn sync_broker(
             recorded.push(verdict);
         }
     }
+    tracing::info!(
+        phase = "write",
+        status = "complete",
+        rows = recorded.len(),
+        duplicates,
+        possible_duplicates,
+        set_aside = set_aside(&recorded),
+        binding_recorded,
+        "broker sync phase complete"
+    );
+    tracing::info!(
+        phase = "assertions",
+        status = "start",
+        claims = snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.claims.len()),
+        "broker sync phase"
+    );
     // An out-of-interval trade remains its own early-return condition, which is
     // why no portfolio was fetched for it; refusals only add the coverage gap
     // above and do not suppress the portfolio answer.
@@ -519,6 +609,13 @@ pub async fn sync_broker(
         // portfolio was never fetched, so the rows that are not in this
         // sync's refusal list are merely the rows it never re-read.
         keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
+        tracing::info!(
+            phase = "assertions",
+            status = "skipped",
+            reason = "out_of_interval_trade",
+            assertions = 0,
+            "broker sync phase complete"
+        );
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -530,11 +627,6 @@ pub async fn sync_broker(
             binding_recorded,
         });
     };
-    tracing::info!(
-        phase = "write",
-        rows = recorded.len(),
-        "broker sync phase complete"
-    );
     let assertions_withheld = match snapshot.as_of {
         PortfolioAsOf::Requested => None,
         PortfolioAsOf::Current => {
@@ -557,6 +649,13 @@ pub async fn sync_broker(
         // from this sync's list were not demonstrably re-read whole. A sync
         // that ended in an error would never reach here.
         keep_refusal_questions(services, &refusal_context, &refusal_records, false).await?;
+        tracing::info!(
+            phase = "assertions",
+            status = "skipped",
+            reason = "portfolio_describes_another_day",
+            assertions = 0,
+            "broker sync phase complete"
+        );
         let set_aside = set_aside(&recorded);
         return Ok(SyncOutcome {
             recorded,
@@ -569,11 +668,8 @@ pub async fn sync_broker(
         });
     }
 
-    tracing::info!(
-        phase = "assertions",
-        claims = snapshot.claims.len(),
-        "broker sync phase start"
-    );
+    let assertion_claims = snapshot.claims.len();
+    let assertion_duplicates_before = duplicates;
     let mut assertions = 0;
     for (index, claim) in snapshot.claims.into_iter().enumerate() {
         let mut event = assertion_event(
@@ -620,6 +716,14 @@ pub async fn sync_broker(
     // absent from this sync's refusal list was re-read whole and is no
     // longer refused.
     keep_refusal_questions(services, &refusal_context, &refusal_records, true).await?;
+    tracing::info!(
+        phase = "assertions",
+        status = "complete",
+        claims = assertion_claims,
+        assertions,
+        duplicates = duplicates - assertion_duplicates_before,
+        "broker sync phase complete"
+    );
     let set_aside = set_aside(&recorded);
     Ok(SyncOutcome {
         recorded,
@@ -630,6 +734,42 @@ pub async fn sync_broker(
         assertions_withheld: None,
         binding_recorded,
     })
+}
+
+/// Only a named type field, never the raw row or a structured kind payload.
+fn quarantined_operation_type(raw: &serde_json::Value) -> &str {
+    [
+        "operation_type",
+        "operationType",
+        "transaction_type",
+        "transactionType",
+        "type",
+        "kind",
+    ]
+    .into_iter()
+    .find_map(|key| raw.get(key).and_then(serde_json::Value::as_str))
+    .unwrap_or("unparsed")
+}
+
+/// The operation variant only: its Debug representation also contains amounts.
+fn operation_kind_name(kind: &iaam_ingest::operation::OperationKind) -> &'static str {
+    use iaam_ingest::operation::OperationKind;
+    match kind {
+        OperationKind::Deposit { .. } => "Deposit",
+        OperationKind::Withdrawal { .. } => "Withdrawal",
+        OperationKind::Refund { .. } => "Refund",
+        OperationKind::Transfer { .. } => "Transfer",
+        OperationKind::OwnAccountMovement { .. } => "OwnAccountMovement",
+        OperationKind::Buy { .. } => "Buy",
+        OperationKind::Sell { .. } => "Sell",
+        OperationKind::Income { .. } => "Income",
+        OperationKind::Fee { .. } => "Fee",
+        OperationKind::Tax { .. } => "Tax",
+        OperationKind::OpeningCash { .. } => "OpeningCash",
+        OperationKind::StatedSecuritiesValue { .. } => "StatedSecuritiesValue",
+        OperationKind::OpeningPosition { .. } => "OpeningPosition",
+        OperationKind::Valuation { .. } => "Valuation",
+    }
 }
 
 /// A broker that is down or says no is not our store failing: each is told

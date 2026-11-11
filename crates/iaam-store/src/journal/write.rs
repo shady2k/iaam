@@ -41,6 +41,23 @@ use super::rows::{
 };
 use crate::StoreError;
 
+// Log only explicitly selected identifiers, never a row or SQL parameters.
+macro_rules! write_result {
+    ($result:expr, $write:literal, $table:literal $(, $name:ident = $id:expr)* $(,)?) => {
+        $result.map_err(|error| {
+            let sqlite_extended_code = match &error {
+                rusqlite::Error::SqliteFailure(code, _) => Some(code.extended_code),
+                _ => None,
+            };
+            tracing::error!(write = $write, table = $table, $($name = ?$id,)*
+                sqlite_extended_code = ?sqlite_extended_code, error = %error,
+                "journal write failed");
+            error
+        })
+    };
+}
+pub(super) use write_result;
+
 /// Every `(table, column)` pair in `0001_schema.sql` where a table whose
 /// name starts with `event` declares `REFERENCES custody_places`.
 ///
@@ -168,8 +185,9 @@ fn ensure_owned(
 }
 
 fn insert_header(tx: &Transaction<'_>, header: &EventRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO events (
+    write_result!(
+        tx.execute(
+            "INSERT INTO events (
             id, owner, account, kind, effective_date, source_time, sequence, confidence,
             relation_kind, relation_target, idempotency_key, recorded_at,
             date_trade, date_settled, date_cash_posted, date_entitlement, date_paid,
@@ -186,66 +204,88 @@ fn insert_header(tx: &Transaction<'_>, header: &EventRow) -> Result<(), StoreErr
             ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36,
             ?37, ?38
         )",
-        params![
-            header.id,
-            header.owner,
-            header.account,
-            header.kind,
-            header.effective_date,
-            header.source_time,
-            header.sequence,
-            header.confidence,
-            header.relation_kind,
-            header.relation_target,
-            header.idempotency_key,
-            header.recorded_at,
-            header.date_trade,
-            header.date_settled,
-            header.date_cash_posted,
-            header.date_entitlement,
-            header.date_paid,
-            header.tax_period_override,
-            header.source,
-            header.raw_hash,
-            header.parser_version,
-            header.source_operation_id,
-            header.source_category,
-            header.source_kind,
-            header.owner_category,
-            header.source_code,
-            header.source_description,
-            header.import,
-            header.import_session,
-            header.declared_by,
-            header.rule_settlement,
-            header.settled_by_rule,
-            header.settled_by_rule_version,
-            header.row_document,
-            header.row_sheet,
-            header.row_number,
-            header.source_position_id,
-            header.source_counterparty,
-        ],
+            params![
+                header.id,
+                header.owner,
+                header.account,
+                header.kind,
+                header.effective_date,
+                header.source_time,
+                header.sequence,
+                header.confidence,
+                header.relation_kind,
+                header.relation_target,
+                header.idempotency_key,
+                header.recorded_at,
+                header.date_trade,
+                header.date_settled,
+                header.date_cash_posted,
+                header.date_entitlement,
+                header.date_paid,
+                header.tax_period_override,
+                header.source,
+                header.raw_hash,
+                header.parser_version,
+                header.source_operation_id,
+                header.source_category,
+                header.source_kind,
+                header.owner_category,
+                header.source_code,
+                header.source_description,
+                header.import,
+                header.import_session,
+                header.declared_by,
+                header.rule_settlement,
+                header.settled_by_rule,
+                header.settled_by_rule_version,
+                header.row_document,
+                header.row_sheet,
+                header.row_number,
+                header.source_position_id,
+                header.source_counterparty,
+            ],
+        ),
+        "insert_event_header",
+        "events",
+        event_id = header.id,
+        owner_id = header.owner,
+        account_id = header.account,
+        relation_target = header.relation_target,
+        source = header.source,
+        owner_category = header.owner_category,
+        import = header.import,
+        import_session = header.import_session,
+        declared_by = header.declared_by,
+        row_document = header.row_document
     )?;
     Ok(())
 }
 
 fn insert_leg(tx: &Transaction<'_>, leg: &LegRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_legs
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_legs
              (event, ordinal, kind, account, custody, instrument, amount, currency, quantity)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            leg.event,
-            leg.ordinal,
-            leg.kind,
-            leg.account,
-            leg.custody,
-            leg.instrument,
-            leg.amount,
-            leg.currency,
-            leg.quantity,
-        ],
+            params![
+                leg.event,
+                leg.ordinal,
+                leg.kind,
+                leg.account,
+                leg.custody,
+                leg.instrument,
+                leg.amount,
+                leg.currency,
+                leg.quantity,
+            ],
+        ),
+        "insert_event_leg",
+        "event_legs",
+        event_id = leg.event,
+        ordinal = leg.ordinal,
+        account_id = leg.account,
+        custody = leg.custody,
+        instrument_id = leg.instrument
     )?;
     Ok(())
 }
@@ -270,38 +310,52 @@ fn insert_detail(tx: &Transaction<'_>, detail: &DetailRows) -> Result<(), StoreE
 }
 
 fn insert_trade(tx: &Transaction<'_>, row: &TradeRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_trade (
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_trade (
             event, side, instrument, quantity, gross_amount, gross_currency,
             fee_amount, fee_currency, basis_fee_amount, basis_fee_currency,
             basis_fee_exact_value, basis_fee_exact_currency,
             accrued_interest_amount, accrued_interest_currency
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        params![
-            row.event,
-            row.side,
-            row.instrument,
-            row.quantity,
-            row.gross_amount,
-            row.gross_currency,
-            row.fee_amount,
-            row.fee_currency,
-            row.basis_fee_amount,
-            row.basis_fee_currency,
-            row.basis_fee_exact_value,
-            row.basis_fee_exact_currency,
-            row.accrued_interest_amount,
-            row.accrued_interest_currency,
-        ],
+            params![
+                row.event,
+                row.side,
+                row.instrument,
+                row.quantity,
+                row.gross_amount,
+                row.gross_currency,
+                row.fee_amount,
+                row.fee_currency,
+                row.basis_fee_amount,
+                row.basis_fee_currency,
+                row.basis_fee_exact_value,
+                row.basis_fee_exact_currency,
+                row.accrued_interest_amount,
+                row.accrued_interest_currency,
+            ],
+        ),
+        "insert_trade_detail",
+        "event_trade",
+        event_id = row.event,
+        instrument_id = row.instrument
     )?;
     Ok(())
 }
 
 fn insert_cash_transfer(tx: &Transaction<'_>, row: &CashTransferRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_cash_transfer (event, transfer_id, from_account, to_account)
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_cash_transfer (event, transfer_id, from_account, to_account)
          VALUES (?1,?2,?3,?4)",
-        params![row.event, row.transfer_id, row.from_account, row.to_account],
+            params![row.event, row.transfer_id, row.from_account, row.to_account],
+        ),
+        "insert_cash_transfer_detail",
+        "event_cash_transfer",
+        event_id = row.event,
+        transfer_id = row.transfer_id,
+        from_account = row.from_account,
+        to_account = row.to_account
     )?;
     Ok(())
 }
@@ -310,33 +364,54 @@ fn insert_unresolved_movement(
     tx: &Transaction<'_>,
     row: &UnresolvedMovementRow,
 ) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_unresolved_movement (event, amount, currency) VALUES (?1,?2,?3)",
-        params![row.event, row.amount, row.currency],
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_unresolved_movement (event, amount, currency) VALUES (?1,?2,?3)",
+            params![row.event, row.amount, row.currency],
+        ),
+        "insert_unresolved_movement_detail",
+        "event_unresolved_movement",
+        event_id = row.event
     )?;
     Ok(())
 }
 
 fn insert_income(tx: &Transaction<'_>, row: &IncomeRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_income (event, instrument, income_kind) VALUES (?1,?2,?3)",
-        params![row.event, row.instrument, row.income_kind],
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_income (event, instrument, income_kind) VALUES (?1,?2,?3)",
+            params![row.event, row.instrument, row.income_kind],
+        ),
+        "insert_income_detail",
+        "event_income",
+        event_id = row.event,
+        instrument_id = row.instrument
     )?;
     Ok(())
 }
 
 fn insert_fee(tx: &Transaction<'_>, row: &FeeRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_fee (event, origin) VALUES (?1,?2)",
-        params![row.event, row.origin],
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_fee (event, origin) VALUES (?1,?2)",
+            params![row.event, row.origin],
+        ),
+        "insert_fee_detail",
+        "event_fee",
+        event_id = row.event
     )?;
     Ok(())
 }
 
 fn insert_tax(tx: &Transaction<'_>, row: &TaxRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_tax (event, origin) VALUES (?1,?2)",
-        params![row.event, row.origin],
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_tax (event, origin) VALUES (?1,?2)",
+            params![row.event, row.origin],
+        ),
+        "insert_tax_detail",
+        "event_tax",
+        event_id = row.event
     )?;
     Ok(())
 }
@@ -345,29 +420,35 @@ fn insert_opening_position(
     tx: &Transaction<'_>,
     row: &OpeningPositionRow,
 ) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_opening_position (
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_opening_position (
             event, instrument, quantity, cost_basis_amount, cost_basis_currency,
             quantity_certainty, acquisition_date, acquisition_date_certainty,
             tax_basis_certainty, basis_currency, basis_rate, fees_included,
             ldv_eligibility, prior_corporate_actions
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        params![
-            row.event,
-            row.instrument,
-            row.quantity,
-            row.cost_basis_amount,
-            row.cost_basis_currency,
-            row.quantity_certainty,
-            row.acquisition_date,
-            row.acquisition_date_certainty,
-            row.tax_basis_certainty,
-            row.basis_currency,
-            row.basis_rate,
-            row.fees_included,
-            row.ldv_eligibility,
-            row.prior_corporate_actions,
-        ],
+            params![
+                row.event,
+                row.instrument,
+                row.quantity,
+                row.cost_basis_amount,
+                row.cost_basis_currency,
+                row.quantity_certainty,
+                row.acquisition_date,
+                row.acquisition_date_certainty,
+                row.tax_basis_certainty,
+                row.basis_currency,
+                row.basis_rate,
+                row.fees_included,
+                row.ldv_eligibility,
+                row.prior_corporate_actions,
+            ],
+        ),
+        "insert_opening_position_detail",
+        "event_opening_position",
+        event_id = row.event,
+        instrument_id = row.instrument
     )?;
     Ok(())
 }
@@ -376,25 +457,36 @@ fn insert_stated_securities_value(
     tx: &Transaction<'_>,
     row: &StatedSecuritiesValueRow,
 ) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_stated_securities_value (event, amount, currency)
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_stated_securities_value (event, amount, currency)
          VALUES (?1,?2,?3)",
-        params![row.event, row.amount, row.currency],
+            params![row.event, row.amount, row.currency],
+        ),
+        "insert_stated_securities_value_detail",
+        "event_stated_securities_value",
+        event_id = row.event
     )?;
     Ok(())
 }
 
 fn insert_valuation(tx: &Transaction<'_>, row: &ValuationRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_valuation (event, instrument, price, currency, quality)
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_valuation (event, instrument, price, currency, quality)
          VALUES (?1,?2,?3,?4,?5)",
-        params![
-            row.event,
-            row.instrument,
-            row.price,
-            row.currency,
-            row.quality
-        ],
+            params![
+                row.event,
+                row.instrument,
+                row.price,
+                row.currency,
+                row.quality
+            ],
+        ),
+        "insert_valuation_detail",
+        "event_valuation",
+        event_id = row.event,
+        instrument_id = row.instrument
     )?;
     Ok(())
 }
@@ -403,56 +495,80 @@ fn insert_control_assertion(
     tx: &Transaction<'_>,
     row: &ControlAssertionRow,
 ) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_control_assertion (
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_control_assertion (
             event, period_from, period_to, claim_kind, balance_point, currency,
             amount, instrument, quantity, debit, credit
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-        params![
-            row.event,
-            row.period_from,
-            row.period_to,
-            row.claim_kind,
-            row.balance_point,
-            row.currency,
-            row.amount,
-            row.instrument,
-            row.quantity,
-            row.debit,
-            row.credit,
-        ],
+            params![
+                row.event,
+                row.period_from,
+                row.period_to,
+                row.claim_kind,
+                row.balance_point,
+                row.currency,
+                row.amount,
+                row.instrument,
+                row.quantity,
+                row.debit,
+                row.credit,
+            ],
+        ),
+        "insert_control_assertion_detail",
+        "event_control_assertion",
+        event_id = row.event,
+        instrument_id = row.instrument
     )?;
     Ok(())
 }
 
 fn insert_coverage_gap(tx: &Transaction<'_>, detail: &CoverageGapDetail) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_coverage_gap (event, period_from, period_to) VALUES (?1,?2,?3)",
-        params![
-            detail.header.event,
-            detail.header.period_from,
-            detail.header.period_to
-        ],
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_coverage_gap (event, period_from, period_to) VALUES (?1,?2,?3)",
+            params![
+                detail.header.event,
+                detail.header.period_from,
+                detail.header.period_to
+            ],
+        ),
+        "insert_coverage_gap_detail",
+        "event_coverage_gap",
+        event_id = detail.header.event
     )?;
     for row in &detail.sources {
-        tx.execute(
-            "INSERT INTO event_coverage_gap_rows
+        write_result!(
+            tx.execute(
+                "INSERT INTO event_coverage_gap_rows
                  (event, ordinal, source, row_name_kind, row_name_value)
              VALUES (?1,?2,?3,?4,?5)",
-            params![
-                row.event,
-                row.ordinal,
-                row.source,
-                row.row_name_kind,
-                row.row_name_value,
-            ],
+                params![
+                    row.event,
+                    row.ordinal,
+                    row.source,
+                    row.row_name_kind,
+                    row.row_name_value,
+                ],
+            ),
+            "insert_coverage_gap_rows_detail",
+            "event_coverage_gap_rows",
+            event_id = row.event,
+            ordinal = row.ordinal,
+            source = row.source
         )?;
     }
     for row in &detail.dimensions {
-        tx.execute(
-            "INSERT INTO event_coverage_gap_row_dimensions (event, ordinal, dimension)
+        write_result!(
+            tx.execute(
+                "INSERT INTO event_coverage_gap_row_dimensions (event, ordinal, dimension)
              VALUES (?1,?2,?3)",
-            params![row.event, row.ordinal, row.dimension],
+                params![row.event, row.ordinal, row.dimension],
+            ),
+            "insert_coverage_gap_row_dimensions_detail",
+            "event_coverage_gap_row_dimensions",
+            event_id = row.event,
+            ordinal = row.ordinal
         )?;
     }
     Ok(())
@@ -462,7 +578,7 @@ fn insert_corporate_action(
     tx: &Transaction<'_>,
     row: &CorporateActionRow,
 ) -> Result<(), StoreError> {
-    tx.execute(
+    write_result!(tx.execute(
         "INSERT INTO event_corporate_action (
             event, action_kind, instrument, predecessor, successor, custody,
             quantity, quantity_in, quantity_out, ratio,
@@ -496,32 +612,41 @@ fn insert_corporate_action(
             row.allocation_known_as_of,
             row.allocation_algorithm,
         ],
-    )?;
+    ), "insert_corporate_action_detail", "event_corporate_action", event_id = row.event, instrument_id = row.instrument, predecessor = row.predecessor, successor = row.successor, custody = row.custody)?;
     Ok(())
 }
 
 fn insert_offer_exercise(tx: &Transaction<'_>, row: &OfferExerciseRow) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO event_offer_exercise (
+    write_result!(
+        tx.execute(
+            "INSERT INTO event_offer_exercise (
             event, action_kind, submission, window, instrument, custody, quantity,
             gross_amount, gross_currency, fee_amount, fee_currency,
             accrued_interest_amount, accrued_interest_currency
         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-        params![
-            row.event,
-            row.action_kind,
-            row.submission,
-            row.window,
-            row.instrument,
-            row.custody,
-            row.quantity,
-            row.gross_amount,
-            row.gross_currency,
-            row.fee_amount,
-            row.fee_currency,
-            row.accrued_interest_amount,
-            row.accrued_interest_currency,
-        ],
+            params![
+                row.event,
+                row.action_kind,
+                row.submission,
+                row.window,
+                row.instrument,
+                row.custody,
+                row.quantity,
+                row.gross_amount,
+                row.gross_currency,
+                row.fee_amount,
+                row.fee_currency,
+                row.accrued_interest_amount,
+                row.accrued_interest_currency,
+            ],
+        ),
+        "insert_offer_exercise_detail",
+        "event_offer_exercise",
+        event_id = row.event,
+        submission = row.submission,
+        window = row.window,
+        instrument_id = row.instrument,
+        custody = row.custody
     )?;
     Ok(())
 }

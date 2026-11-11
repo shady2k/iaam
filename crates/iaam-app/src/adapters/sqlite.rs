@@ -70,7 +70,6 @@ use iaam_store::reference::{
     Declared as StoredDeclared, InstrumentRecord,
 };
 use iaam_store::tokens::{TokenRecord, TokenScope};
-use rusqlite;
 use time::Date;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -141,7 +140,11 @@ impl SqliteAdapter {
         F: FnOnce(&mut SqliteStore) -> Result<T, AppError> + Send + 'static,
     {
         let store = Arc::clone(&self.store);
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
+            let _dispatch = tracing::dispatcher::set_default(&dispatch);
+            let _entered = span.enter();
             let mut guard = match store.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -426,14 +429,16 @@ impl Store for SqliteAdapter {
         self.blocking(move |store| {
             let mut recorded = Vec::with_capacity(events.len());
             for (row_index, event) in events.iter().enumerate() {
-                let outcome = store.append_event_in_order(event, identity_scope).map_err(|error| {
-                    let (code, message) = match &error {
-                        iaam_store::StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => (Some(code.extended_code), error.to_string()),
-                        _ => (None, error.to_string()),
-                    };
-                    tracing::error!(scenario = "broker_sync", write = "append_event_in_order", table = "events/event detail", row_index, event_id = %event.id.inner().to_string(), account_id = %event.account.inner().to_string(), sqlite_extended_code = ?code, error = %message, "broker sync store write failed");
-                    AppError::Store(format!("broker sync write append_event_in_order row {row_index} event {} account {} failed: {message}", event.id.inner(), event.account.inner()))
-                })?;
+                let span = tracing::info_span!("journal_append", row_index,
+                    event_id = %event.id.inner(), account_id = %event.account.inner());
+                let _entered = span.enter();
+                let outcome =
+                    store
+                        .append_event_in_order(event, identity_scope)
+                        .map_err(|error| {
+                            tracing::error!(error = %error, "journal append failed");
+                            store_error(error)
+                        })?;
                 recorded.push(match outcome {
                     Appended::Inserted { id } => Recorded::Inserted { id },
                     Appended::Duplicate { existing } => Recorded::Duplicate { existing },

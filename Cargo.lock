@@ -1020,7 +1020,6 @@ dependencies = [
  "iaam-market",
  "iaam-store",
  "rand 0.10.2",
- "rusqlite",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -1200,6 +1199,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "time",
+ "tracing",
  "uuid",
 ]
 

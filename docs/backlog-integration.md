@@ -202,7 +202,7 @@ are the repository's installation, and each person's plugin and hooks are theirs
   `jev.mjs status --config .backlog/config.json` from the set's skill directory.
 - **Owner pushes:** the run script's `notify` reads the owner's channel from
   `~/.config/shady2k-skills/notify.json` (Bark, this machine's); the config's
-  `notifyPushes` says whether this project sends to it.
+  `notifyPushes` is on: the owner confirmed a test push on 2026-11-11.
 - **Bulk-edit age correction:** `gate.mjs` passes `--ages-from` and
   `--ages-through` from the two `.git/shady2k/` snapshots when the clone has them.
 - **Static checks:** `make fmt lint arch privacy skill-doc`.

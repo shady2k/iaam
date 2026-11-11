@@ -85,7 +85,7 @@
     "sure": 0.9,
     "model": "jev-1.13"
   },
-  "notifyPushes": false,
+  "notifyPushes": true,
   "scope": "personal",
   "artifactLanguage": "en",
   "openQuestions": "one-at-a-time",

@@ -9,7 +9,7 @@ rust-version.workspace = true
 iaam-core = { path = "../iaam-core", version = "0.1.0" }
 # Чтение XLS и XLSX брокерских отчётов. Одна библиотека читает оба
 # формата: второй читатель означал бы второй способ прочитать число.
-calamine = "0.36"
+calamine = "0.38"
 csv = "1"
 # Windows-1251 is one of the encodings a source profile may name, and a bank
 # export written in it is not text until something decodes it. One library,

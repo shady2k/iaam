@@ -18,6 +18,14 @@ pub struct HttpResponse {
     /// parsed (see `resilience::parse_retry_after`). `None` when it named
     /// none, or in a form that does not parse.
     pub retry_after: Option<Duration>,
+    /// Numeric `x-ratelimit-limit` reported by the broker, never a local budget.
+    pub rate_limit: Option<u64>,
+    /// Numeric `x-ratelimit-remaining` reported by the broker.
+    pub rate_remaining: Option<u64>,
+    /// `x-ratelimit-reset`: seconds until the broker window resets.
+    /// T-Invest documents this in `investAPI/src/docs/grpc.md` on its
+    /// official RussianInvestments GitHub repository.
+    pub rate_reset: Option<u64>,
     /// Where a 3xx answer points: the `Location` header, as the source sent
     /// it. A redirect is a refusal the gateway logs, and the first question
     /// about one is where it pointed.

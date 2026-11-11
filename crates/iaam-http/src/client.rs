@@ -153,6 +153,9 @@ impl HttpClient {
         let location = response_location(headers);
         let content_type = response_content_type(headers);
         let request_id = response_request_id(headers);
+        let rate_limit = numeric_header(headers, "x-ratelimit-limit");
+        let rate_remaining = numeric_header(headers, "x-ratelimit-remaining");
+        let rate_reset = numeric_header(headers, "x-ratelimit-reset");
         // The status line with its headers, before the body is read: what
         // the answer said survives a body that stalls or fails.
         observe(HttpResponse {
@@ -162,6 +165,9 @@ impl HttpClient {
             location: location.clone(),
             content_type: content_type.clone(),
             request_id: request_id.clone(),
+            rate_limit,
+            rate_remaining,
+            rate_reset,
             observed_at: Some(observed_at),
         });
         // A status line that arrived is never lost: after a non-2xx status a
@@ -182,6 +188,9 @@ impl HttpClient {
             location,
             content_type,
             request_id,
+            rate_limit,
+            rate_remaining,
+            rate_reset,
             observed_at: Some(observed_at),
         })
     }
@@ -298,6 +307,15 @@ fn response_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
     })
 }
 
+// Only unsigned decimal counts leave the transport, never arbitrary headers.
+fn numeric_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    let value = headers.get(name)?.to_str().ok()?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn classify_transport_error(error: reqwest::Error) -> HttpError {
     if error.is_timeout() {
         HttpError::Timeout
@@ -355,6 +373,28 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn rate_headers_accept_only_unsigned_decimal_counts() {
+        let fields = headers(&[
+            ("x-ratelimit-limit", "200"),
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "17"),
+            ("authorization", "Bearer private"),
+        ]);
+        assert_eq!(numeric_header(&fields, "x-ratelimit-limit"), Some(200));
+        assert_eq!(numeric_header(&fields, "x-ratelimit-remaining"), Some(0));
+        assert_eq!(numeric_header(&fields, "x-ratelimit-reset"), Some(17));
+        for invalid in ["-1", "+1", "1.5", "private", "18446744073709551616", ""] {
+            assert_eq!(
+                numeric_header(
+                    &headers(&[("x-ratelimit-reset", invalid)]),
+                    "x-ratelimit-reset"
+                ),
+                None
+            );
+        }
     }
 
     #[test]

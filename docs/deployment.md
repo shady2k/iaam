@@ -1135,7 +1135,26 @@ T-Invest InstrumentsService has a documented limit of 200 requests per minute;
 iaam uses 100 per minute on each environment, half that limit, without raising
 any existing budget. See the broker's
 [request limits](https://developer.tbank.ru/invest/intro/intro/limits).
+These are hard ceilings, not a promise of the broker's current allowance:
+T-Invest can apply dynamic limits shared by the owner's accounts and tools.
 Description requests also consume the sync's existing hard request allowance.
+
+Every broker status line logs the numeric `x-ratelimit-limit`,
+`x-ratelimit-remaining` and `x-ratelimit-reset` fields at `info`, including
+`429` answers and answers whose body subsequently fails. Missing or malformed
+fields carry no numeric value; no arbitrary response header or body is logged.
+When remaining is zero, the next call sharing that budget waits the reset
+seconds from the status-line observation. T-Invest's
+[header documentation](https://github.com/RussianInvestments/investAPI/blob/main/src/docs/grpc.md)
+defines reset as seconds until the counter resets. The wait is per service for
+T-Invest and per method for Finam. The same selected headers are read when
+Finam supplies them; no undocumented Finam-specific header is assumed.
+A wait beyond the call's deadline refuses the call before sending. As with
+other server-named waits, waits over fifteen minutes are refused for later
+retry, not shortened. Header pacing is in-process; the existing host-wide `429` pauses remain durable in
+the outbound tally. Cached responses do not restart a header wait. Headers
+can delay a call, never raise a budget, shorten another pause, or bypass the
+one-second spacing, request allowance or rolling-day ceiling.
 
 A description that names no ISIN, is refused, or cannot be read still sets
 aside the affected rows with their original payload and a reason, including

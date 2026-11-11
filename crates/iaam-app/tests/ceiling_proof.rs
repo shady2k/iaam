@@ -1462,11 +1462,22 @@ async fn exercise_redirects() -> (Scenario, Scenario) {
     (same, cross)
 }
 
+// Invented spare server allowance cannot replenish any local ceiling.
+fn spare_server_allowance(reply: LoopbackReply) -> LoopbackReply {
+    reply
+        .with_header("x-ratelimit-limit", "1000000")
+        .with_header("x-ratelimit-remaining", "999999")
+        .with_header("x-ratelimit-reset", "1")
+}
+
 async fn exercise_daily_ceiling() -> Scenario {
     let scenario = Scenario::new(
         "rolling-day",
         Destination::TinkoffSandbox,
-        std::iter::repeat_n(LoopbackReply::complete(200, "{}"), DAILY_CEILING + 1),
+        std::iter::repeat_n(
+            spare_server_allowance(LoopbackReply::complete(200, "{}")),
+            DAILY_CEILING + 1,
+        ),
         Duration::from_secs(2),
         true,
     );
@@ -2236,7 +2247,7 @@ async fn exercise_empty_pair_ceiling() -> Scenario {
     let scenario = Scenario::new(
         "empty-pair",
         destination,
-        [LoopbackReply::complete(200, "{}")],
+        [spare_server_allowance(LoopbackReply::complete(200, "{}"))],
         Duration::from_secs(5),
         true,
     );
@@ -2297,7 +2308,7 @@ async fn exercise_tally_truncation() -> Scenario {
     let scenario = Scenario::new(
         "tally-truncation",
         destination,
-        [LoopbackReply::complete(200, "{}")],
+        [spare_server_allowance(LoopbackReply::complete(200, "{}"))],
         Duration::from_secs(5),
         true,
     );
@@ -2388,7 +2399,10 @@ async fn exercise_boot_change() -> Scenario {
     let scenario = Scenario::new(
         "boot-change",
         Destination::TinkoffProd,
-        std::iter::repeat_n(LoopbackReply::complete(400, "refused"), 4),
+        std::iter::repeat_n(
+            spare_server_allowance(LoopbackReply::complete(400, "refused")),
+            4,
+        ),
         Duration::from_secs(2),
         true,
     );
@@ -3471,6 +3485,83 @@ async fn a_cached_answer_consumes_no_allowance() {
         first.body, second.body,
         "the cached answer is the answer the gateway gave"
     );
+}
+
+#[tokio::test]
+async fn exhausted_server_allowance_only_delays_wire_departures() {
+    let reset = Duration::from_secs(120);
+    for destination in [
+        Destination::TinkoffProd,
+        Destination::TinkoffSandbox,
+        Destination::FinamApi,
+    ] {
+        let scenario = Scenario::new(
+            "server-headers-exhausted",
+            destination,
+            [
+                LoopbackReply::complete(200, "{}")
+                    .with_header("x-ratelimit-limit", "1")
+                    .with_header("x-ratelimit-remaining", "0")
+                    .with_header("x-ratelimit-reset", "120"),
+                spare_server_allowance(LoopbackReply::complete(200, "{}")),
+            ],
+            Duration::from_secs(2),
+            true,
+        );
+        direct_send(&scenario, destination)
+            .await
+            .expect("successful response reports exhausted server allowance");
+        direct_send(&scenario, destination)
+            .await
+            .expect("the next request waits for the server reset");
+        let records = scenario.records();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records[1].logical_at.saturating_sub(records[0].logical_at) >= reset,
+            "the receiver saw a departure before the reported reset"
+        );
+        scenario.verify_and_print("server-headers-exhausted", destination, None);
+    }
+}
+
+#[tokio::test]
+async fn spare_server_allowance_cannot_raise_static_or_sync_ceilings() {
+    for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+        let scenario = Scenario::new_sync(
+            "server-headers-static-sync",
+            destination,
+            std::iter::repeat_n(
+                spare_server_allowance(LoopbackReply::complete(200, "{}")),
+                BROKER_SYNC_REQUEST_CEILING as usize,
+            ),
+        );
+        let request = direct_request(
+            destination,
+            "/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts",
+        );
+        for _ in 0..BROKER_SYNC_REQUEST_CEILING {
+            scenario
+                .outbound
+                .send(&request, None)
+                .await
+                .expect("server spare allowance stays inside the local budgets");
+        }
+        scenario
+            .outbound
+            .send(&request, None)
+            .await
+            .expect_err("server spare allowance cannot replenish a spent sync allowance");
+        let measured = scenario.verify_and_print("server-headers-static-sync", destination, None);
+        assert_eq!(
+            scenario.server.requests_received(),
+            BROKER_SYNC_REQUEST_CEILING as usize
+        );
+        assert_eq!(measured.max_sync, BROKER_SYNC_REQUEST_CEILING as usize);
+        assert_eq!(measured.locally_refused, 1);
+        assert_eq!(measured.pairs.len(), 1);
+        assert_eq!(measured.pairs[0].method, "UsersService");
+        assert_eq!(measured.pairs[0].reached, measured.pairs[0].ceiling);
+    }
 }
 
 #[tokio::test]

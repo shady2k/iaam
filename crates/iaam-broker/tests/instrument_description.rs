@@ -51,3 +51,57 @@ fn incomplete_reference_data_and_invalid_metadata_are_refused() {
         .is_err()
     );
 }
+
+#[test]
+fn finam_fund_description_accepts_a_decimal_wrapped_integral_lot() {
+    let description = finam::parse_asset_description(
+        r#"{
+        "board":"TEST","id":"31415","ticker":"FUNDX","mic":"XTEST",
+        "isin":"XX0000000042","type":"FUNDS","name":"Invented fund",
+        "lot_size":{"value":"10.000"},"decimals":0,"min_step":"0.25",
+        "quote_currency":"RUB"
+    }"#,
+    )
+    .unwrap();
+    assert_eq!(description.kind, Some(InstrumentKind::MutualFund));
+    assert_eq!(description.lot, Some(10));
+    assert_eq!(description.price_decimals, Some(0));
+    assert_eq!(description.board.as_deref(), Some("TEST"));
+}
+
+#[test]
+fn finam_native_asset_types_are_not_guessed_into_shares() {
+    for (source, expected) in [
+        ("EQUITIES", Some(InstrumentKind::Share)),
+        ("BONDS", Some(InstrumentKind::Bond)),
+        ("CURRENCIES", Some(InstrumentKind::Currency)),
+        ("FUTURES", None),
+    ] {
+        let body = serde_json::json!({"ticker":"TEST","name":"Invented instrument", "quote_currency":"RUB","type":source,"lot_size":{"value":"1.0"}});
+        assert_eq!(
+            finam::parse_asset_description(&body.to_string())
+                .unwrap()
+                .kind,
+            expected
+        );
+    }
+}
+
+#[test]
+fn finam_price_step_accepts_plain_and_wrapped_decimals() {
+    for step in [
+        serde_json::json!("0.05"),
+        serde_json::json!({"value":"0.05"}),
+    ] {
+        let body = serde_json::json!({"ticker":"TEST","name":"Invented bond","quote_currency":"RUB","min_step":step});
+        assert!(finam::parse_asset_description(&body.to_string()).is_ok());
+    }
+    let body = r#"{"ticker":"TEST","name":"Invented bond","quote_currency":"RUB","min_step":{"value":"invalid"}}"#;
+    assert!(matches!(
+        finam::parse_asset_description(body),
+        Err(finam::ParseError::InvalidField {
+            field: "min_step",
+            ..
+        })
+    ));
+}

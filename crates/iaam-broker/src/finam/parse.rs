@@ -255,19 +255,19 @@ pub fn parse_asset_description(
         .map(str::to_ascii_uppercase)
         .as_deref()
     {
-        Some("STOCK" | "SHARE") => Some(InstrumentKind::Share),
-        Some("BOND") => Some(InstrumentKind::Bond),
+        Some("STOCK" | "SHARE" | "EQUITIES") => Some(InstrumentKind::Share),
+        Some("BOND" | "BONDS") => Some(InstrumentKind::Bond),
         Some("ETF") => Some(InstrumentKind::Etf),
-        Some("CURRENCY") => Some(InstrumentKind::Currency),
+        Some("FUNDS") => Some(InstrumentKind::MutualFund),
+        Some("CURRENCY" | "CURRENCIES") => Some(InstrumentKind::Currency),
         _ => None,
     };
     let lot = asset
         .get("lot_size")
         .map(|value| {
-            value
-                .get("value")
-                .and_then(Value::as_str)
-                .and_then(|s| s.parse::<u32>().ok())
+            asset_decimal(value, "lot_size")
+                .ok()
+                .and_then(|value| value.inner().normalize().to_string().parse::<u32>().ok())
                 .filter(|n| *n > 0)
                 .ok_or_else(|| ParseError::InvalidField {
                     field: "lot_size",
@@ -275,6 +275,11 @@ pub fn parse_asset_description(
                 })
         })
         .transpose()?;
+    // The catalogue has no price-step field. Read the source decimal without
+    // confusing its precision with the separate `decimals` field.
+    if let Some(step) = asset.get("min_step") {
+        asset_decimal(step, "min_step")?;
+    }
     let price_decimals = asset
         .get("decimals")
         .map(|value| {
@@ -298,6 +303,17 @@ pub fn parse_asset_description(
         lot,
         price_decimals,
     })
+}
+
+fn asset_decimal(value: &Value, field: &'static str) -> Result<Dec, ParseError> {
+    let text = value
+        .as_str()
+        .or_else(|| value.get("value").and_then(Value::as_str));
+    text.and_then(|text| serde_json::from_value(Value::String(text.to_owned())).ok())
+        .ok_or_else(|| ParseError::InvalidField {
+            field,
+            value: value.to_string(),
+        })
 }
 
 fn parse_operation(item: RawTransaction, raw: Value) -> ChannelOperation {

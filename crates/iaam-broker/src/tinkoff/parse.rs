@@ -179,6 +179,61 @@ pub struct OperationsPage {
     pub next_cursor: Option<String>,
 }
 
+/// Parse the reference data returned by `InstrumentsService/GetInstrumentBy`.
+pub fn parse_instrument(body: &str) -> Result<crate::BrokerInstrumentDescription, ParseError> {
+    use iaam_core::instrument::InstrumentKind;
+    let response: Value = parse_json(body)?;
+    let instrument = response.get("instrument").ok_or(ParseError::MissingField {
+        field: "instrument",
+    })?;
+    let required = |field: &'static str| -> Result<String, ParseError> {
+        instrument
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(ParseError::MissingField { field })
+    };
+    let optional = |field: &str| {
+        instrument
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let kind = match optional("instrumentType").as_deref() {
+        Some("share") => Some(InstrumentKind::Share),
+        Some("bond") => Some(InstrumentKind::Bond),
+        Some("etf") => Some(InstrumentKind::Etf),
+        Some("currency") => Some(InstrumentKind::Currency),
+        _ => None,
+    };
+    let lot = instrument
+        .get("lot")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| ParseError::InvalidField {
+                    field: "lot",
+                    value: value.to_string(),
+                })
+        })
+        .transpose()?;
+    Ok(crate::BrokerInstrumentDescription {
+        isin: optional("isin"),
+        ticker: required("ticker")?,
+        name: required("name")?,
+        kind,
+        currency: parse_currency(&required("currency")?)?,
+        mic: None,
+        board: optional("classCode"),
+        lot,
+        price_decimals: None,
+    })
+}
+
 /// Parse one `GetOperationsByCursor` response page without network access.
 pub fn parse_operations(body: &str) -> Result<OperationsPage, ParseError> {
     let response: RawOperationsResponse = parse_json(body)?;

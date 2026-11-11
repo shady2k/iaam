@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use iaam_broker::BrokerInstrumentDescription;
 use iaam_broker::operation_kind::OperationKindDictionary;
 use iaam_broker::tinkoff::{
     ChannelMoney, ChannelOperation, ChannelOperationKind, ChannelOrderState,
-    ChannelPortfolioPosition, GetOperationsByCursorRequest, ParseError, TINKOFF_PARSER_VERSION,
-    TinkoffClient, TinkoffError, parse_account_ids, parse_operations, parse_portfolio,
-    parse_portfolio_positions,
+    ChannelPortfolioPosition, GetOperationsByCursorRequest, InstrumentIdType, ParseError,
+    TINKOFF_PARSER_VERSION, TinkoffClient, TinkoffError, parse_account_ids, parse_operations,
+    parse_portfolio, parse_portfolio_positions,
 };
 use iaam_core::event::kind::{FeeOrigin, IncomeKind};
 use iaam_core::event::provenance::ParserVersion;
@@ -43,6 +44,8 @@ use crate::ports::{
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
+type CachedDescription = (Instant, Result<BrokerInstrumentDescription, String>);
+
 /// Broker channel implementation for T-Invest.
 pub struct TinkoffChannel {
     client: TinkoffClient,
@@ -53,6 +56,7 @@ pub struct TinkoffChannel {
     /// for SQLite.
     dictionary: OperationKindDictionary,
     instruments: Arc<dyn InstrumentDirectory>,
+    descriptions: tokio::sync::Mutex<HashMap<String, CachedDescription>>,
 }
 
 impl TinkoffChannel {
@@ -70,37 +74,98 @@ impl TinkoffChannel {
             source,
             dictionary,
             instruments,
+            descriptions: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
-    async fn known_instruments(&self) -> Result<HashSet<InstrumentId>, BrokerError> {
-        let instruments =
-            self.instruments
-                .list_instruments()
+    async fn resolve_instrument(
+        &self,
+        uid: Option<&str>,
+        raw: &serde_json::Value,
+        on: Date,
+        context: BrokerRequestContext<'_>,
+    ) -> Result<Result<InstrumentId, String>, BrokerError> {
+        let (id, id_type) = match uid.filter(|value| !value.is_empty()) {
+            Some(uid) => (uid, InstrumentIdType::Uid),
+            None => match raw.get("figi").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()) {
+                Some(figi) => (figi, InstrumentIdType::Figi),
+                None => return Ok(Err("instrument description cannot be requested: the row supplies neither instrument UID nor FIGI".to_owned())),
+            },
+        };
+        let key = match id_type {
+            InstrumentIdType::Uid => format!(
+                "uid:{}",
+                Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string())
+            ),
+            InstrumentIdType::Figi => format!("figi:{id}"),
+        };
+        let mut descriptions = self.descriptions.lock().await;
+        if descriptions
+            .get(&key)
+            .is_none_or(|(read_at, _)| read_at.elapsed() >= std::time::Duration::from_secs(3600))
+        {
+            tracing::info!(
+                phase = "describe_instruments",
+                status = "start",
+                instruments = 1,
+                "reading broker instrument description"
+            );
+            let description = match self
+                .client
+                .get_instrument(id, id_type, context.deadline, context.allowance)
                 .await
-                .map_err(|error| BrokerError::Adapter {
-                    broker: BROKER.to_owned(),
-                    detail: format!("cannot check the instance instrument directory: {error}"),
-                })?;
-        Ok(instruments
-            .into_iter()
-            .map(|instrument| instrument.id)
-            .collect())
-    }
-}
-
-fn unknown_instrument_reason(uid: &str, raw: &serde_json::Value) -> String {
-    let identities = ["figi", "ticker", "isin"]
-        .into_iter()
-        .filter_map(|key| {
-            raw.get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(|value| format!("{key} {value}"))
+                .map_err(tinkoff_error)
+            {
+                Ok(body) => {
+                    iaam_broker::tinkoff::parse_instrument(&body).map_err(|error| error.to_string())
+                }
+                Err(
+                    BrokerError::Refused { detail, .. } | BrokerError::Unparsable { detail, .. },
+                ) => Err(detail),
+                Err(error) => return Err(error),
+            };
+            tracing::info!(
+                phase = "describe_instruments",
+                status = "complete",
+                instruments = 1,
+                described = usize::from(description.is_ok()),
+                "broker instrument description read"
+            );
+            descriptions.insert(key.clone(), (Instant::now(), description));
+        }
+        let description = descriptions
+            .get(&key)
+            .expect("description inserted")
+            .1
+            .clone();
+        drop(descriptions);
+        let description = match description {
+            Ok(description) => description,
+            Err(reason) => {
+                return Ok(Err(format!(
+                    "instrument {id} description refused or unreadable: {reason}"
+                )));
+            }
+        };
+        if description
+            .isin
+            .as_deref()
+            .is_none_or(|isin| isin.trim().is_empty())
+        {
+            return Ok(Err(format!("instrument {id} description names no ISIN")));
+        }
+        super::catalogue::resolve_or_record(
+            self.instruments.as_ref(),
+            &description,
+            self.source,
+            on,
+        )
+        .await
+        .map(Ok)
+        .map_err(|error| BrokerError::Adapter {
+            broker: BROKER.to_owned(),
+            detail: error.to_string(),
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "instrumentUid {uid} ({identities}) is not recorded in this instance; record the instrument with this UID using POST /v1/instruments before syncing again"
-    )
+    }
 }
 
 #[async_trait]
@@ -148,37 +213,49 @@ impl BrokerChannel for TinkoffChannel {
             phase = "resolve_instruments",
             status = "start",
             rows = operations.len(),
-            strategy = "instance_uid",
+            strategy = "broker_description_isin",
             "broker sync phase"
         );
-        let known = self.known_instruments().await?;
         let mut checked = Vec::new();
         let mut refused = Vec::new();
-        for operation in operations {
-            let unknown = match operation.instrument_uid.as_deref() {
-                Some(uid) => {
-                    Uuid::parse_str(uid).is_ok_and(|id| !known.contains(&InstrumentId(id)))
-                }
-                None => ["figi", "ticker", "isin"].into_iter().any(|key| {
+        for mut operation in operations {
+            let has_identity = operation.instrument_uid.is_some()
+                || ["figi", "ticker", "isin"].into_iter().any(|key| {
                     operation
                         .raw
                         .get(key)
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|value| !value.is_empty())
-                }),
-            };
-            if unknown {
-                refused.push(Quarantined {
-                    reason: unknown_instrument_reason(
-                        operation.instrument_uid.as_deref().unwrap_or("absent"),
-                        &operation.raw,
-                    ),
-                    dimensions: dimensions_for_kind(
-                        &self.dictionary.kind_of(&operation.source_kind),
-                    ),
-                    raw: operation.raw,
                 });
-                continue;
+            if has_identity && operation.rejection.is_none() {
+                match self
+                    .resolve_instrument(
+                        operation.instrument_uid.as_deref(),
+                        &operation.raw,
+                        operation.date.unwrap_or(from),
+                        context,
+                    )
+                    .await?
+                {
+                    Ok(instrument) => {
+                        operation.instrument_uid = Some(instrument.inner().to_string())
+                    }
+                    Err(reason) => {
+                        tracing::debug!(
+                            phase = "resolve_instruments",
+                            reason,
+                            "operation set aside"
+                        );
+                        refused.push(Quarantined {
+                            reason,
+                            dimensions: dimensions_for_kind(
+                                &self.dictionary.kind_of(&operation.source_kind),
+                            ),
+                            raw: operation.raw,
+                        });
+                        continue;
+                    }
+                }
             }
             checked.push(operation);
         }
@@ -187,7 +264,7 @@ impl BrokerChannel for TinkoffChannel {
             status = "complete",
             accepted = checked.len(),
             quarantined = refused.len(),
-            strategy = "instance_uid",
+            strategy = "broker_description_isin",
             "broker sync phase complete"
         );
         let mut parsed = adapt_operations(account, checked, &self.dictionary)?;
@@ -217,60 +294,97 @@ impl BrokerChannel for TinkoffChannel {
         // cache. A `Current` portfolio fetched yesterday and served today
         // stays dated yesterday (`iaam-vg8te.1.1`).
         let observed_on = observed_at.map(|moment| OffsetDateTime::from(moment).date());
-        let mut snapshot = adapt_portfolio(&body, observed_on)?;
-        tracing::info!(
-            phase = "resolve_instruments",
-            status = "start",
-            claims = snapshot.claims.len(),
-            strategy = "instance_uid",
-            "broker sync phase"
-        );
-        let refused_before = snapshot.refused.len();
-        let known = self.known_instruments().await?;
-        let raw: serde_json::Value =
+        let mut raw: serde_json::Value =
             serde_json::from_str(&body).map_err(|error| unparsable(error.to_string()))?;
-        snapshot.claims.retain(|claim| {
-            let ControlClaim::PositionQuantity { instrument, .. } = claim else {
-                return true;
-            };
-            if known.contains(instrument) {
-                return true;
-            }
-            let uid = instrument.inner().to_string();
-            let row = raw
-                .get("positions")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|positions| {
-                    positions.iter().find(|position| {
-                        position
-                            .get("instrumentUid")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|value| Uuid::parse_str(value).ok())
-                            == Some(instrument.inner())
-                    })
-                })
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({"instrumentUid": uid}));
-            snapshot.refused.push(Quarantined {
-                reason: unknown_instrument_reason(
-                    row.get("instrumentUid")
+        let mut refused = Vec::new();
+        let mut accepted_positions = Vec::new();
+        let mut originals: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        let positions = raw
+            .get_mut("positions")
+            .and_then(serde_json::Value::as_array_mut);
+        if let Some(positions) = positions {
+            tracing::info!(
+                phase = "resolve_instruments",
+                status = "start",
+                rows = positions.len(),
+                strategy = "broker_description_isin",
+                "resolving portfolio instruments"
+            );
+            for mut position in std::mem::take(positions) {
+                if position
+                    .get("instrumentType")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("currency")
+                {
+                    let uid = position
+                        .get("instrumentUid")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or(&uid),
-                    &row,
-                ),
-                raw: row,
-                dimensions: [Dimension::Positions].into_iter().collect(),
-            });
-            false
-        });
-        tracing::info!(
-            phase = "resolve_instruments",
-            status = "complete",
-            claims = snapshot.claims.len(),
-            quarantined = snapshot.refused.len() - refused_before,
-            strategy = "instance_uid",
-            "broker sync phase complete"
-        );
+                        .map(str::to_owned);
+                    match self
+                        .resolve_instrument(uid.as_deref(), &position, _at, context)
+                        .await?
+                    {
+                        Ok(instrument) => {
+                            originals
+                                .entry(instrument.inner().to_string())
+                                .or_default()
+                                .push(position.clone());
+                            position["instrumentUid"] =
+                                serde_json::json!(instrument.inner().to_string());
+                        }
+                        Err(reason) => {
+                            tracing::debug!(
+                                phase = "resolve_instruments",
+                                reason,
+                                "portfolio row set aside"
+                            );
+                            let dimensions = refusal_dimensions(
+                                position
+                                    .get("instrumentType")
+                                    .and_then(serde_json::Value::as_str),
+                            );
+                            refused.push(Quarantined {
+                                reason,
+                                raw: position,
+                                dimensions,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                accepted_positions.push(position);
+            }
+            tracing::info!(
+                phase = "resolve_instruments",
+                status = "complete",
+                accepted = accepted_positions.len(),
+                quarantined = refused.len(),
+                "portfolio instruments resolved"
+            );
+            *positions = accepted_positions;
+        }
+        let mut snapshot = adapt_portfolio(&raw.to_string(), observed_on)?;
+        for refusal in &mut snapshot.refused {
+            if let Some(uid) = refusal
+                .raw
+                .get("instrumentUid")
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some(rows) = originals.get(uid) {
+                    refusal.raw = if rows.len() == 1 {
+                        rows[0].clone()
+                    } else {
+                        serde_json::json!({"positions": rows})
+                    };
+                }
+            }
+            tracing::debug!(
+                phase = "map_portfolio",
+                reason = refusal.reason,
+                "portfolio row set aside"
+            );
+        }
+        snapshot.refused.extend(refused);
         Ok(snapshot)
     }
 
@@ -1350,6 +1464,18 @@ pub(crate) mod fake {
                 Some(iaam_http::RequestBody::Json(body)) => body.clone(),
                 _ => String::new(),
             };
+            if request
+                .path()
+                .ends_with("InstrumentsService/GetInstrumentBy")
+            {
+                let value: serde_json::Value =
+                    serde_json::from_str(&body).expect("instrument request");
+                let id = value["id"].as_str().expect("instrument ID");
+                return Ok(HttpResponse { status: 200, body: serde_json::json!({"instrument": {
+                    "isin": if id == "eeeeeeee-0000-0000-0000-000000000001" { None } else { Some(format!("TEST-{id}")) }, "ticker": "TEST", "name": "Invented instrument",
+                    "instrumentType": "share", "currency": "rub", "uid": id
+                }}).to_string().into_bytes(), ..Default::default() });
+            }
             self.log.lock().expect("log").push(body);
             let scripted = self.script.lock().expect("script").pop_front();
             let answer = scripted
@@ -3393,8 +3519,21 @@ mod tests {
                         iaam_core::money::CurrencyCode::Rub,
                     ),
                     lineage: None,
+                    metadata: None,
                 })
                 .expect("seed instrument");
+            store
+                .record_alias(&iaam_store::reference::AliasRecord {
+                    namespace: iaam_core::instrument::AliasNamespace::Isin,
+                    value: format!("TEST-{uid}"),
+                    instrument: InstrumentId(Uuid::parse_str(uid).expect("invented UID")),
+                    interval: iaam_core::instrument::AliasInterval {
+                        valid_from: time::macros::date!(0001 - 01 - 01),
+                        valid_to: None,
+                    },
+                    source: SourceId(Uuid::from_u128(9)),
+                })
+                .expect("seed ISIN");
         }
         super::TinkoffChannel::new(
             TinkoffClient::new(Environment::Prod, token, gateway),
@@ -3419,7 +3558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_instruments_are_refused_before_any_operation_kind_is_mapped() {
+    async fn descriptions_without_isin_are_refused_before_any_operation_kind_is_mapped() {
         let missing = "eeeeeeee-0000-0000-0000-000000000001";
         for kind in [
             "OPERATION_TYPE_BUY",
@@ -3439,7 +3578,7 @@ mod tests {
             assert_eq!(parsed.quarantined.len(), 1);
             let reason = &parsed.quarantined[0].reason;
             assert!(reason.contains(missing), "{reason}");
-            assert!(reason.contains("POST /v1/instruments"), "{reason}");
+            assert!(reason.contains("names no ISIN"), "{reason}");
         }
     }
 

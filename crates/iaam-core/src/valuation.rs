@@ -138,7 +138,6 @@ impl PriceBoard {
 
     /// All observations for an instrument no later than the valuation date,
     /// newest first.
-    #[must_use]
     pub fn observations_at_or_before(
         &self,
         instrument: InstrumentId,

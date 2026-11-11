@@ -666,6 +666,14 @@ pub async fn create_instrument(
             title: request.title,
             currencies,
             lineage: None,
+            metadata: request
+                .metadata
+                .map(|metadata| iaam_core::instrument::InstrumentMetadata {
+                    mic: metadata.mic,
+                    board: metadata.board,
+                    lot: metadata.lot,
+                    price_decimals: metadata.price_decimals,
+                }),
         })
         .await?;
     let instrument = state
@@ -6828,6 +6836,14 @@ fn instrument_dto(instrument: iaam_app::ports::InstrumentView) -> InstrumentDto 
         denomination_currency: instrument.denomination_currency,
         settlement_currency: instrument.settlement_currency,
         quote_currency: instrument.quote_currency,
+        metadata: instrument
+            .metadata
+            .map(|metadata| crate::dto::InstrumentMetadataDto {
+                mic: metadata.mic,
+                board: metadata.board,
+                lot: metadata.lot,
+                price_decimals: metadata.price_decimals,
+            }),
     }
 }
 

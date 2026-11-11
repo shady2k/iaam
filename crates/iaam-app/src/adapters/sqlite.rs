@@ -376,6 +376,7 @@ fn instrument_view(record: iaam_store::reference::InstrumentRecord) -> Instrumen
         denomination_currency: record.currencies.denomination.code().to_owned(),
         settlement_currency: record.currencies.settlement.code().to_owned(),
         quote_currency: record.currencies.quote.code().to_owned(),
+        metadata: record.metadata,
     }
 }
 
@@ -1601,6 +1602,7 @@ impl InstrumentDirectory for SqliteAdapter {
             title,
             currencies,
             lineage,
+            metadata,
         } = record;
         self.blocking(move |store| {
             store
@@ -1611,9 +1613,38 @@ impl InstrumentDirectory for SqliteAdapter {
                     title,
                     currencies,
                     lineage,
+                    metadata,
                 })
                 .map_err(store_error)?;
             Ok(id)
+        })
+        .await
+    }
+
+    async fn register_instrument_with_isin(
+        &self,
+        record: InstrumentUpsert,
+        isin: String,
+        source: iaam_core::ids::SourceId,
+        on: Date,
+    ) -> Result<InstrumentId, AppError> {
+        self.blocking(move |store| {
+            store
+                .register_instrument_with_isin(
+                    &InstrumentRecord {
+                        id: record.id,
+                        kind: record.kind,
+                        symbol: record.symbol,
+                        title: record.title,
+                        currencies: record.currencies,
+                        lineage: record.lineage,
+                        metadata: record.metadata,
+                    },
+                    &isin,
+                    source,
+                    on,
+                )
+                .map_err(resolve_error)
         })
         .await
     }

@@ -266,6 +266,7 @@ fn seed_instrument_id(path: &std::path::Path, id: InstrumentId, symbol: &str) {
             title: format!("Instrument {symbol}"),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("journal instrument");
 }
@@ -597,6 +598,7 @@ async fn finam_sync_harness(script: Vec<String>) -> Harness {
             title: "Invented issuer".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("invented instrument");
     store
@@ -827,6 +829,7 @@ async fn seed_market(harness: &Harness) {
             title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("market instrument");
 
@@ -981,6 +984,7 @@ async fn seed_bond_market(harness: &Harness) {
             title: "Test bond".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("bond market instrument");
     store
@@ -1771,6 +1775,32 @@ async fn the_stage_one_question_is_answered_end_to_end() {
 }
 
 #[tokio::test]
+async fn instrument_post_retains_broker_metadata_in_its_get_view() {
+    let harness = harness().await;
+    let metadata = json!({"mic": "XTEST", "board": "TEST", "lot": 10, "price_decimals": 4});
+    let (status, created) = call(
+        &harness.router,
+        post("/v1/instruments", &harness.owner_token, &json!({
+            "kind": "share", "symbol": "TEST", "title": "Invented instrument",
+            "denomination_currency": "RUB", "settlement_currency": "RUB", "quote_currency": "RUB",
+            "metadata": metadata
+        })),
+    ).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["metadata"], metadata);
+    let (status, loaded) = call(
+        &harness.router,
+        get(
+            &format!("/v1/instruments/{}", created["id"].as_str().expect("id")),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loaded["metadata"], metadata);
+}
+
+#[tokio::test]
 async fn returns_report_serializes_bond_metrics_and_all_nested_dto_branches() {
     let (harness, path) = harness_on_disk().await;
     let (status, instrument_response) = call(
@@ -1981,6 +2011,7 @@ async fn seed_share_quote(harness: &Harness) {
             title: "Share One".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("market instrument");
 
@@ -6634,7 +6665,14 @@ async fn the_finam_sync_route_records_operations_from_the_finam_channel() {
         finam_session_token(),
         finam_sessions_details(),
         finam_transactions_page(),
-        json!({ "isin": FINAM_ISIN }).to_string(),
+        json!({
+            "isin": FINAM_ISIN,
+            "ticker": "IZPA",
+            "name": "Invented contract share",
+            "type": "COMMON_STOCK",
+            "quote_currency": "RUB"
+        })
+        .to_string(),
         finam_portfolio(),
     ])
     .await;
@@ -6878,6 +6916,7 @@ fn seed_directory(store: &SqliteStore) -> InstrumentId {
             title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument");
     store
@@ -7007,6 +7046,7 @@ async fn a_two_word_namespace_resolves_under_the_spelling_the_contract_publishes
             title: "Sberbank".into(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument");
     store
@@ -34833,6 +34873,7 @@ async fn the_journal_currency_filter_selects_the_whole_event_on_both_routes() {
             title: "Test Share".to_owned(),
             currencies: CurrencyRoles::uniform(usd),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument");
     SqliteAdapter::new(SqliteStore::open(&path).expect("custody connection"))

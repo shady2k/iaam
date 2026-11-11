@@ -1566,6 +1566,7 @@ mod market_tests {
                 title: "Sberbank".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .expect("instrument");
         let body = include_bytes!("../../../../tests/fixtures/market/moex-iss-history-sber.json");

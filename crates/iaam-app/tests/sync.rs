@@ -249,8 +249,39 @@ fn seed_instrument(store: &SqliteStore, instrument: InstrumentId, symbol: &str) 
             title: symbol.to_owned(),
             currencies: iaam_core::instrument::CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .unwrap_or_else(|error| panic!("seed instrument: {error}"));
+    store
+        .record_alias(&iaam_store::reference::AliasRecord {
+            namespace: iaam_core::instrument::AliasNamespace::Isin,
+            value: invented_isin(instrument),
+            instrument,
+            interval: iaam_core::instrument::AliasInterval {
+                valid_from: date!(2026 - 01 - 01),
+                valid_to: None,
+            },
+            source: SourceId::new_random(),
+        })
+        .unwrap_or_else(|error| panic!("seed instrument ISIN: {error}"));
+}
+
+fn invented_isin(instrument: InstrumentId) -> String {
+    format!("XX{:010X}", instrument.inner().as_u128() & 0xff_ffff_ffff)
+}
+
+fn invented_description(request: &HttpRequest) -> String {
+    let body: serde_json::Value =
+        serde_json::from_str(request.body().expect("description request body").payload())
+            .expect("description request JSON");
+    let uid = body["id"].as_str().expect("instrument handle");
+    let instrument = InstrumentId(uuid::Uuid::parse_str(uid).expect("invented UID"));
+    serde_json::json!({"instrument":{
+        "isin": invented_isin(instrument), "ticker":"TESTSHARE",
+        "name":"Invented security", "instrumentType":"share",
+        "currency":"rub", "classCode":"TQBR", "lot":1
+    }})
+    .to_string()
 }
 
 fn trade(account: AccountId, instrument: InstrumentId, custody: CustodyId) -> SubmittedOperation {
@@ -1059,7 +1090,11 @@ struct ScriptedTinvest {
 impl Transport for ScriptedTinvest {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let url = request.url();
-        let body = if url.ends_with("UsersService/GetAccounts") {
+        let description;
+        let body = if url.ends_with("InstrumentsService/GetInstrumentBy") {
+            description = invented_description(request);
+            description.as_str()
+        } else if url.ends_with("UsersService/GetAccounts") {
             self.accounts
         } else if url.ends_with("OperationsService/GetOperationsByCursor") {
             self.operations
@@ -2211,21 +2246,147 @@ async fn append_checked_rejects_a_batch_before_any_event_is_written() {
     assert!(load_all(&services, owner).await.is_empty());
 }
 
-/// Missing reference data must refuse only the affected rows, not roll back
-/// a readable cash deposit from the same broker response (iaam-xzz5.4.1).
+struct CatalogueFinam;
+
+impl Transport for CatalogueFinam {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let body = if request.path().ends_with("/v1/sessions") {
+            r#"{"token":"invented-finam-session"}"#
+        } else if request.path().contains("/transactions") {
+            r#"{"transactions":[{"id":"cccccccc-0000-0000-0000-000000000001",
+                "timestamp":"2026-03-15T10:00:00Z", "category":"DIVIDEND",
+                "symbol":"INVENTED@MISX",
+                "change":{"units":"25","nanos":0,"currencyCode":"rub"}}]}"#
+        } else if request.path().contains("/assets/") {
+            r#"{"isin":"XX0000000001","ticker":"INVENTEDBOND","name":"Invented bond",
+                "type":"BOND","quote_currency":"RUB"}"#
+        } else {
+            panic!("unexpected Finam catalogue request: {}", request.path());
+        };
+        Ok(HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+}
+
+async fn record_finam_description(services: &AppServices, account: AccountId) -> InstrumentId {
+    let time = Arc::new(FakeTime {
+        now: Mutex::new(Instant::now()),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_774_958_400)),
+    });
+    let gateway = Gateway::with_parts_for_database(
+        CatalogueFinam,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &broker_egress_database(),
+    )
+    .expect("gateway");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-finam-token")).expect("token");
+    let (_, seed) = seed_for("finam").expect("Finam dictionary");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty());
+    let channel = iaam_app::adapters::finam::FinamChannel::new(
+        iaam_broker::finam::FinamClient::new(token, Arc::new(gateway)),
+        SourceId::new_random(),
+        dictionary,
+        Arc::clone(&services.directory),
+    );
+    let operations = channel
+        .fetch_operations(
+            account,
+            "invented-account",
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+            BrokerRequestContext {
+                deadline: None,
+                allowance: &RequestAllowance::new(20),
+            },
+        )
+        .await
+        .expect("Finam describes the security");
+    assert!(
+        operations.quarantined.is_empty(),
+        "{:?}",
+        operations.quarantined
+    );
+    assert_eq!(operations.accepted.len(), 1);
+    services
+        .directory
+        .resolve("isin", "XX0000000001", date!(2026 - 03 - 15))
+        .await
+        .expect("Finam registered ISIN")
+}
+
+struct CatalogueTinvest {
+    inner: ScriptedTinvest,
+    description: String,
+    descriptions_asked: Arc<AtomicUsize>,
+}
+
+impl Transport for CatalogueTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            self.descriptions_asked.fetch_add(1, Ordering::SeqCst);
+            return Ok(HttpResponse {
+                status: 200,
+                body: self.description.as_bytes().to_vec(),
+                ..Default::default()
+            });
+        }
+        self.inner.send(request).await
+    }
+}
+
 #[tokio::test]
-async fn an_unrecorded_coupon_instrument_is_quarantined_while_a_deposit_is_recorded() {
+async fn an_unrecorded_coupon_instrument_is_described_and_recorded_once_across_both_fetches() {
+    coupon_catalogue_sync(true, false).await;
+}
+
+#[tokio::test]
+async fn a_description_without_isin_refuses_the_security_but_records_the_deposit() {
+    coupon_catalogue_sync(false, false).await;
+}
+
+#[tokio::test]
+async fn finam_and_tinkoff_descriptions_of_one_isin_share_one_instrument() {
+    coupon_catalogue_sync(true, true).await;
+}
+
+async fn coupon_catalogue_sync(with_isin: bool, finam_first: bool) {
     let owner = OwnerId::new_random();
     let account = AccountId::new_random();
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
     });
+    let finam_instrument = if finam_first {
+        Some(record_finam_description(&services, account).await)
+    } else {
+        None
+    };
     let source = SourceId::new_random();
     let uid = "bbbbbbbb-0000-0000-0000-000000000001";
+    let descriptions_asked = Arc::new(AtomicUsize::new(0));
+    let description = serde_json::json!({"instrument": {
+        "isin": if with_isin { "XX0000000001" } else { "" },
+        "ticker":"INVENTEDBOND", "name":"Invented bond", "instrumentType":"bond",
+        "currency":"rub", "classCode":"TQOB", "lot":1
+    }})
+    .to_string();
     let channel = channel_over_with(
-        ScriptedTinvest {
-            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
-            operations: r#"{"hasNext":false,"items":[
+        CatalogueTinvest {
+            descriptions_asked: Arc::clone(&descriptions_asked),
+            description,
+            inner: ScriptedTinvest {
+                accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+                operations: r#"{"hasNext":false,"items":[
                 {
                     "cursor":"coupon-cursor", "brokerAccountId":"solo",
                     "id":"invented-coupon", "date":"2026-03-15T10:00:00Z",
@@ -2241,14 +2402,15 @@ async fn an_unrecorded_coupon_instrument_is_quarantined_while_a_deposit_is_recor
                     "payment":{"units":"100","nano":0,"currency":"rub"}
                 }
             ]}"#,
-            portfolio: format!(
-                r#"{{"positions":[{{
+                portfolio: format!(
+                    r#"{{"positions":[{{
                     "instrumentType":"bond", "quantity":{{"units":"1","nano":0}},
                     "positionUid":"aaaaaaaa-0000-0000-0000-000000000001",
                     "instrumentUid":"{portfolio_uid}", "figi":"BBG_INVENTED_BOND", "blocked":false
                 }}]}}"#,
-                portfolio_uid = uid.to_uppercase()
-            ),
+                    portfolio_uid = uid.to_uppercase()
+                ),
+            },
         },
         source,
         &services,
@@ -2265,19 +2427,12 @@ async fn an_unrecorded_coupon_instrument_is_quarantined_while_a_deposit_is_recor
     .await
     .expect("missing reference data must not abort the sync");
 
-    assert_eq!(outcome.set_aside, 2, "{:?}", outcome.recorded);
-    assert_eq!(outcome.assertions, 0, "{:?}", outcome.recorded);
-    let reason = outcome
-        .recorded
-        .iter()
-        .find_map(|verdict| match verdict {
-            Verdict::Quarantined { reason } => Some(reason),
-            _ => None,
-        })
-        .expect("coupon quarantine reaches the owner");
-    for detail in [uid, "BBG_INVENTED_BOND", "POST /v1/instruments"] {
-        assert!(reason.contains(detail), "missing {detail}: {reason}");
-    }
+    assert_eq!(descriptions_asked.load(Ordering::SeqCst), 1);
+    let instruments = services
+        .directory
+        .list_instruments()
+        .await
+        .expect("catalogue");
     let events = load_all(&services, owner).await;
     let deposits: Vec<_> = events
         .iter()
@@ -2288,12 +2443,6 @@ async fn an_unrecorded_coupon_instrument_is_quarantined_while_a_deposit_is_recor
         .collect();
     assert_eq!(deposits.len(), 1, "{events:?}");
     assert_eq!(deposits[0].amount().raw(), 10_000);
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
-    );
-
     let refusals = services
         .store
         .list_open_sync_refusals(
@@ -2305,19 +2454,118 @@ async fn an_unrecorded_coupon_instrument_is_quarantined_while_a_deposit_is_recor
         )
         .await
         .expect("stored refusals");
-    assert_eq!(refusals.len(), 2);
-    assert!(
-        refusals
-            .iter()
-            .any(|refusal| refusal.payload.contains(&uid.to_uppercase())
-                && refusal.reason.contains("BBG_INVENTED_BOND"))
-    );
+    if with_isin {
+        assert_eq!(outcome.set_aside, 0, "{:?}", outcome.recorded);
+        assert_eq!(outcome.assertions, 1, "{:?}", outcome.recorded);
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(instruments[0].title, "Invented bond");
+        if let Some(finam_instrument) = finam_instrument {
+            assert_eq!(instruments[0].id, finam_instrument);
+        }
+        let canonical = services
+            .directory
+            .resolve("isin", "XX0000000001", date!(2026 - 03 - 15))
+            .await
+            .expect("registered ISIN");
+        assert_eq!(canonical, instruments[0].id);
+        assert_ne!(canonical.inner().to_string(), uid);
+        assert!(events.iter().any(|event| matches!(event.kind,
+            EventKind::Income { instrument: Some(id), .. } if id == canonical)));
+        assert!(refusals.is_empty(), "{refusals:?}");
+    } else {
+        assert_eq!(outcome.set_aside, 2, "{:?}", outcome.recorded);
+        assert_eq!(outcome.assertions, 0, "{:?}", outcome.recorded);
+        assert!(instruments.is_empty());
+        assert_eq!(refusals.len(), 2);
+        for refusal in &refusals {
+            assert!(
+                refusal.reason.to_lowercase().contains("isin"),
+                "{}",
+                refusal.reason
+            );
+        }
+        assert!(
+            refusals
+                .iter()
+                .any(|refusal| refusal.payload.contains("invented-coupon"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
+        );
+    }
+}
 
-    let coupon = refusals
-        .iter()
-        .find(|refusal| refusal.payload.contains("invented-coupon"))
-        .expect("coupon raw payload retained");
-    assert_eq!(&coupon.reason, reason);
+#[tokio::test]
+async fn a_refused_portfolio_quantity_keeps_the_brokers_uid_after_catalogue_resolution() {
+    refused_portfolio_keeps_original_rows(false).await;
+}
+
+#[tokio::test]
+async fn duplicate_portfolio_positions_keep_both_original_rows_after_catalogue_resolution() {
+    refused_portfolio_keeps_original_rows(true).await;
+}
+
+async fn refused_portfolio_keeps_original_rows(duplicate: bool) {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let uid = "bbbbbbbb-0000-0000-0000-000000000003";
+    let original = serde_json::json!({
+        "instrumentType":"share", "quantity":{"units": if duplicate { "1" } else { "not-a-number" },"nano":0},
+        "positionUid":"aaaaaaaa-0000-0000-0000-000000000003",
+        "instrumentUid":uid, "blocked":false
+    });
+    let mut rows = vec![original.clone()];
+    if duplicate {
+        let mut second = original.clone();
+        second["instrumentUid"] = serde_json::json!(uid.to_uppercase());
+        second["positionUid"] = serde_json::json!("aaaaaaaa-0000-0000-0000-000000000004");
+        second["blocked"] = serde_json::json!(true);
+        rows.push(second);
+    }
+    let channel = channel_over(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio: serde_json::json!({"positions":rows.clone()}).to_string(),
+        },
+        &services,
+    );
+    let snapshot = channel
+        .fetch_portfolio(
+            account,
+            "solo",
+            date!(2026 - 03 - 31),
+            BrokerRequestContext {
+                deadline: None,
+                allowance: &RequestAllowance::new(20),
+            },
+        )
+        .await
+        .expect("portfolio with one refused quantity");
+    let instruments = services
+        .directory
+        .list_instruments()
+        .await
+        .expect("catalogue");
+    assert_eq!(
+        instruments.len(),
+        1,
+        "description was successfully registered"
+    );
+    assert_ne!(instruments[0].id.inner().to_string(), uid);
+    assert!(snapshot.claims.is_empty());
+    assert_eq!(snapshot.refused.len(), 1);
+    let expected = if duplicate {
+        serde_json::json!({"positions": rows})
+    } else {
+        original
+    };
+    assert_eq!(snapshot.refused[0].raw, expected);
 }
 
 #[tokio::test]
@@ -4002,6 +4250,16 @@ struct CachedPortfolioTinvest {
 
 impl Transport for CachedPortfolioTinvest {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            return Ok(HttpResponse {
+                status: 200,
+                body: invented_description(request).into_bytes(),
+                ..Default::default()
+            });
+        }
         if request.path().ends_with("/GetOperationsByCursor") {
             return Ok(HttpResponse {
                 status: 200,

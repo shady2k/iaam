@@ -19,6 +19,7 @@ fn store_with_one_bond() -> (SqliteStore, InstrumentId) {
             title: "OFZ 26207".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("instrument created");
     (store, instrument)
@@ -203,6 +204,7 @@ fn renaming_with_a_foreign_instrument_is_rejected_without_closing_the_old_code()
             title: "Foreign issue".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .expect("foreign instrument created");
     store
@@ -313,6 +315,7 @@ fn instrument_returns_the_stored_record_and_none_for_an_unknown_id() {
         title: "Test issue".to_owned(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
+        metadata: None,
     };
     store
         .upsert_instrument(&expected)
@@ -340,6 +343,7 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         title: "Later issue".to_owned(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
+        metadata: None,
     };
     let earlier = InstrumentRecord {
         id: InstrumentId::new_random(),
@@ -348,6 +352,7 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
         title: "Earlier issue".to_owned(),
         currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
         lineage: None,
+        metadata: None,
     };
     store
         .upsert_instrument(&later)
@@ -359,6 +364,80 @@ fn list_instruments_returns_all_stored_records_in_symbol_order() {
     assert_eq!(
         store.list_instruments().expect("instrument list"),
         vec![earlier, later]
+    );
+}
+
+#[test]
+fn isin_registration_resolves_existing_and_rolls_back_a_failed_alias() {
+    let (mut store, id) = store_with_one_bond();
+    let instrument = store.instrument(id).expect("read").expect("instrument");
+    let source = SourceId::new_random();
+    let on = date!(2026 - 01 - 01);
+    assert_eq!(
+        store
+            .register_instrument_with_isin(&instrument, "TEST00000001", source, on)
+            .expect("register"),
+        id
+    );
+    let mut candidate = instrument.clone();
+    candidate.id = InstrumentId::new_random();
+    candidate.title = "Must not replace existing metadata".to_owned();
+    assert_eq!(
+        store
+            .register_instrument_with_isin(&candidate, "TEST00000001", source, on)
+            .expect("resolve"),
+        id
+    );
+    assert!(store.instrument(candidate.id).expect("read").is_none());
+    assert_eq!(store.instrument(id).expect("read"), Some(instrument));
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER refuse_test_alias BEFORE INSERT ON instrument_aliases
+         BEGIN SELECT RAISE(ABORT, 'invented alias failure'); END;",
+        )
+        .expect("invented failure");
+    assert!(
+        store
+            .register_instrument_with_isin(&candidate, "TEST00000002", source, on)
+            .is_err()
+    );
+    assert!(store.instrument(candidate.id).expect("read").is_none());
+}
+
+#[test]
+fn broker_metadata_round_trips_and_absent_metadata_preserves_it() {
+    let (store, id) = store_with_one_bond();
+    let mut instrument = store.instrument(id).expect("read").expect("instrument");
+    let metadata = iaam_core::instrument::InstrumentMetadata {
+        mic: Some("XTEST".to_owned()),
+        board: Some("TEST".to_owned()),
+        lot: Some(10),
+        price_decimals: Some(4),
+    };
+    instrument.metadata = Some(metadata.clone());
+    store
+        .upsert_instrument(&instrument)
+        .expect("metadata recorded");
+    assert_eq!(
+        store.instrument(id).expect("read"),
+        Some(instrument.clone())
+    );
+    assert_eq!(
+        store.list_instruments().expect("list"),
+        vec![instrument.clone()]
+    );
+    instrument.metadata = None;
+    store
+        .upsert_instrument(&instrument)
+        .expect("ordinary update");
+    assert_eq!(
+        store
+            .instrument(id)
+            .expect("read")
+            .expect("instrument")
+            .metadata,
+        Some(metadata)
     );
 }
 

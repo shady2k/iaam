@@ -1102,30 +1102,46 @@ database holds. Deleting or emptying that pair after the first enabling
 spends the day (§2.1); the command then refuses with the ceiling it finds,
 and nothing restores the allowance.
 
-### 6.9 How Finam symbols become instruments
+### 6.9 How broker descriptions fill the instrument catalogue
 
-Finam names an instrument `TICKER@MIC` (`SBER@MISX`); iaam identifies one by
-its own identifier and its external codes. A sync closes that gap through
-the broker's own asset description: for every distinct symbol of the sync —
-position rows and operations alike — the channel reads `GET
-/v1/assets/{symbol}?account_id=<the broker account>` once (the live API
-answers a bare asset read with 400 `Invalid arguments: account_id`, found
-by the walk on 2026-10-04), takes the ISIN the description names, and asks
-the instrument directory which instrument carries that ISIN. The position or
-operation then names that instrument. The asset read is budgeted like every
-Finam call (half of the documented 200 per minute), and the answer is cached
-beside the database like every read, so one symbol costs one wire request
-per hour however many rows and syncs name it. A symbol whose asset
-description Finam refuses or that cannot be read is that row's problem, not
-the sync's: the row is set aside with the broker's message as its reason.
+Both brokers resolve securities by **ISIN**, not by a broker's private
+instrument identifier. For each distinct security named by operations or
+portfolio positions, the sync reads the broker's instrument description,
+looks up its ISIN in the instance catalogue, and records the instrument when
+that ISIN is missing. It uses the same instrument-directory write path as
+`POST /v1/instruments`, then records the ISIN alias and uses the resulting
+iaam instrument identifier in journal rows. The same ISIN through Finam and
+T-Invest therefore names one instrument. Registration and the ISIN alias are written in one transaction, so repeated
+or concurrent rows do not create duplicate instruments or partial records.
 
-Two cases stay visible refusals instead of becoming guesses, and the sync's
-outcome lists them row by row with the original JSON: the asset description
-names **no ISIN** for the symbol, or the ISIN is carried by **no instrument
-recorded here**. Both are fixed the same way — record the instrument with
-the ISIN it actually carries (the refusal quotes the ISIN when there is
-one), and sync the same range again. Until then those rows assert nothing:
-the rest of the snapshot and the other operations import regardless.
+Finam describes `TICKER@MIC` symbols through
+`GET /v1/assets/{symbol}?account_id=<the broker account>`. T-Invest describes
+UIDs or FIGIs through
+`POST /rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy`
+on the client's selected production or sandbox host. The broker UID is only
+a lookup key; it is never used as an iaam instrument identifier.
+
+New records retain the description's ISIN, ticker, name, supported instrument
+kind and currency, plus MIC, board, lot and price decimals where supplied.
+Existing instruments are reused rather than overwritten. Broker descriptions
+supply no historical start date for an ISIN, so new ISIN aliases have an
+open-ended interval starting at 0001-01-01; this avoids
+creating a second instrument when an earlier range is synced later.
+
+Every description read uses the outbound gateway and its one-hour response
+cache. Repeated rows in one sync share the description, including operations
+and portfolio positions. Finam retains its existing half-limit budget.
+T-Invest InstrumentsService has a documented limit of 200 requests per minute;
+iaam uses 100 per minute on each environment, half that limit, without raising
+any existing budget. See the broker's
+[request limits](https://developer.tbank.ru/invest/intro/intro/limits).
+Description requests also consume the sync's existing hard request allowance.
+
+A description that names no ISIN, is refused, or cannot be read still sets
+aside the affected rows with their original payload and a reason, including
+the broker's refusal message. Other rows continue. New catalogue steps log
+counts at `info`; each set-aside row logs its reason at `debug`. These logs
+contain neither monetary amounts nor tokens.
 
 ---
 

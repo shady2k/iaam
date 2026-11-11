@@ -136,6 +136,8 @@ fn method_for_target(target: &str) -> Option<&'static str> {
         Some("UsersService")
     } else if target.contains("OperationsService/") {
         Some("OperationsService")
+    } else if target.contains("InstrumentsService/") {
+        Some("InstrumentsService")
     } else if target.ends_with("/v1/sessions") || target.ends_with("/v1/sessions/details") {
         Some("AuthService.Sessions")
     } else if target.contains("/transactions") {
@@ -556,6 +558,10 @@ impl FakeTime {
 }
 
 impl Clock for FakeTime {
+    fn now_unix(&self) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000) + self.logical_now()
+    }
+
     fn now(&self) -> Instant {
         *self
             .monotonic
@@ -3465,4 +3471,99 @@ async fn a_cached_answer_consumes_no_allowance() {
         first.body, second.body,
         "the cached answer is the answer the gateway gave"
     );
+}
+
+#[tokio::test]
+async fn instrument_lookup_obeys_the_existing_sync_and_host_ceilings() {
+    for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+        let scenario = Scenario::new_sync(
+            "instrument-ceilings",
+            destination,
+            (0..BROKER_SYNC_REQUEST_CEILING).map(|_| LoopbackReply::complete(200, "{}")),
+        );
+        let request = direct_request(
+            destination,
+            "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
+        );
+        for _ in 0..BROKER_SYNC_REQUEST_CEILING {
+            scenario
+                .outbound
+                .send(&request, None)
+                .await
+                .expect("lookup within allowance");
+        }
+        assert!(scenario.outbound.send(&request, None).await.is_err());
+        let measured = scenario.verify_and_print("instrument-ceilings", destination, None);
+        assert_eq!(measured.max_sync, BROKER_SYNC_REQUEST_CEILING as usize);
+        assert_eq!(measured.locally_refused, 1);
+        assert_eq!(measured.pairs.len(), 1);
+        assert_eq!(measured.pairs[0].method, "InstrumentsService");
+        assert_eq!(measured.pairs[0].ceiling, 100);
+
+        let planted: Vec<_> = (0..101)
+            .map(|index| {
+                planted_record(
+                    Duration::from_millis(index * 500),
+                    destination.base_url(),
+                    "InstrumentsService",
+                    index + 1,
+                    index + 1,
+                )
+            })
+            .collect();
+        let measured = measure(&planted, 0, None).expect("known instrument budget");
+        assert!(
+            violations(&measured)
+                .iter()
+                .any(|name| name.contains("minute budget"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn instrument_lookup_cache_lasts_one_hour_without_spending_another_attempt() {
+    let (_directory, database, _) = instance("instrument-cache");
+    let clock = FakeTime::new();
+    let server = LoopbackServer::start([
+        LoopbackReply::complete(200, r#"{"instrument":{"uid":"invented-instrument-a"}}"#),
+        LoopbackReply::complete(200, r#"{"instrument":{"uid":"invented-instrument-b"}}"#),
+    ])
+    .expect("instrument cache loopback");
+    let gateway = Gateway::with_parts_for_database_with_response_cache(
+        HttpClientHarness::new(&server),
+        BUDGETS,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Arc::clone(&clock) as Arc<dyn Sleeper>,
+        BrokerEgress::On,
+        &database,
+    )
+    .expect("instrument cache gateway");
+    let allowance = RequestAllowance::new(1);
+    let request = HttpRequest::post(
+        Destination::TinkoffProd,
+        "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
+        RequestBody::Json(
+            r#"{"id":"invented-instrument-a","idType":"INSTRUMENT_ID_TYPE_UID"}"#.to_owned(),
+        ),
+    )
+    .idempotent()
+    .with_request_allowance(allowance);
+    let first = gateway.send(&request, None).await.expect("first lookup");
+    clock.advance(Duration::from_secs(3599));
+    let cached = gateway
+        .send(&request, None)
+        .await
+        .expect("cached lookup with spent allowance");
+    assert_eq!(cached.body, first.body);
+    clock.advance(Duration::from_secs(1));
+    assert!(
+        gateway.send(&request, None).await.is_err(),
+        "expired cache must not bypass allowance"
+    );
+    let renewed = request.with_request_allowance(RequestAllowance::new(1));
+    let fresh = gateway
+        .send(&renewed, None)
+        .await
+        .expect("lookup after expiry");
+    assert_ne!(fresh.body, first.body);
 }

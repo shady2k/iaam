@@ -468,6 +468,7 @@ impl BondReferenceData {
                 title: "Test Bond".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .unwrap();
         store
@@ -478,6 +479,7 @@ impl BondReferenceData {
                 title: "Test Bond, Successor".to_owned(),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .unwrap();
         store
@@ -743,6 +745,7 @@ fn a_restore_does_not_overwrite_an_instrument_already_in_the_target() {
             title: "Already Known Title".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .unwrap();
 
@@ -802,6 +805,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
             title: "Grandparent Bond".to_owned(),
             currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
             lineage: None,
+            metadata: None,
         })
         .unwrap();
     store
@@ -815,6 +819,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 parent: grandparent,
                 reason: LineageReason::Replacement,
             }),
+            metadata: None,
         })
         .unwrap();
     store
@@ -828,6 +833,7 @@ fn a_lineage_chain_two_deep_imports_regardless_of_the_sections_own_order() {
                 parent,
                 reason: LineageReason::Replacement,
             }),
+            metadata: None,
         })
         .unwrap();
 
@@ -2140,6 +2146,7 @@ fn measure_the_size_of_a_realistic_export() {
                 title: format!("Synthetic Bond {index}"),
                 currencies: CurrencyRoles::uniform(CurrencyCode::Rub),
                 lineage: None,
+                metadata: None,
             })
             .unwrap();
         store

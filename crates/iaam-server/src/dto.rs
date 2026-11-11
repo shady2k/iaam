@@ -9601,6 +9601,16 @@ pub struct InstrumentDto {
     /// A quotation read as though it stood in either sibling states the
     /// position in money nobody quoted it in.
     pub quote_currency: String,
+    pub metadata: Option<InstrumentMetadataDto>,
+}
+
+/// Broker trading details, with missing values left unknown.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct InstrumentMetadataDto {
+    pub mic: Option<String>,
+    pub board: Option<String>,
+    pub lot: Option<u32>,
+    pub price_decimals: Option<u8>,
 }
 
 /// The instrument catalogue response.
@@ -9631,6 +9641,7 @@ pub struct CreateInstrumentRequest {
     pub denomination_currency: String,
     pub settlement_currency: String,
     pub quote_currency: String,
+    pub metadata: Option<InstrumentMetadataDto>,
 }
 
 /// Transport namespace of an external instrument code. A separate type because

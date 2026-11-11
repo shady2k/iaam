@@ -118,6 +118,16 @@ pub const BUDGETS: &[Budget] = &[
         used: 25,
         window: MINUTE,
     },
+    // T-Invest InstrumentsService, including GetInstrumentBy: 200/min;
+    // use half. Source: https://developer.tbank.ru/invest/intro/intro/limits
+    // (unary methods table, Instruments service REST/gRPC; 2026-11-11).
+    Budget {
+        destination: Destination::TinkoffProd,
+        scope: MethodScope::Named("InstrumentsService"),
+        documented: Some(200),
+        used: 100,
+        window: MINUTE,
+    },
     // The sandbox is a separate host with the same published limits.
     Budget {
         destination: Destination::TinkoffSandbox,
@@ -131,6 +141,13 @@ pub const BUDGETS: &[Budget] = &[
         scope: MethodScope::Named("UsersService"),
         documented: Some(50),
         used: 25,
+        window: MINUTE,
+    },
+    Budget {
+        destination: Destination::TinkoffSandbox,
+        scope: MethodScope::Named("InstrumentsService"),
+        documented: Some(200),
+        used: 100,
         window: MINUTE,
     },
     // Finam states its limit per method, 200/min each; use 100/min. One row
@@ -970,6 +987,8 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
                 | "tinkoff.public.invest.api.contract.v1.OperationsService/GetOperationsByCursor"
                 | "OperationsService/GetPortfolio"
                 | "OperationsService/GetOperationsByCursor" => Some("OperationsService"),
+                "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
+                | "InstrumentsService/GetInstrumentBy" => Some("InstrumentsService"),
                 _ => None,
             }
         }
@@ -2899,6 +2918,33 @@ mod tests {
             Some(&(start + Duration::from_secs(50))),
             "the users method waited for the operations method's budget"
         );
+    }
+
+    #[test]
+    fn instrument_lookup_paths_share_the_documented_service_budget() {
+        for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+            let row = BUDGETS
+                .iter()
+                .find(|row| {
+                    row.destination == destination
+                        && row.scope == MethodScope::Named("InstrumentsService")
+                })
+                .expect("instrument service budget");
+            assert_eq!((row.documented, row.used), (Some(200), 100));
+            for path in [
+                "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
+                "/InstrumentsService/GetInstrumentBy",
+            ] {
+                assert_eq!(
+                    broker_budget_key(destination, path),
+                    Some("InstrumentsService")
+                );
+            }
+            assert_eq!(
+                broker_budget_key(destination, "/InstrumentsService/Invented"),
+                None
+            );
+        }
     }
 
     #[test]

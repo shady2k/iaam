@@ -103,6 +103,7 @@ fn a_database_left_at_version_one_gains_the_counterparty_column() {
              DROP TABLE broker_account_bindings; \
              DROP TABLE broker_egress; \
              DROP TABLE sync_refusals; \
+             ALTER TABLE instruments DROP COLUMN metadata; \
              PRAGMA user_version = 1;",
         )
         .expect("winding the database back to version 1");
@@ -236,6 +237,7 @@ fn the_events_rebuild_carries_a_populated_journal_and_its_children() {
              DROP TABLE broker_account_bindings; \
              DROP TABLE broker_egress; \
              DROP TABLE sync_refusals; \
+             ALTER TABLE instruments DROP COLUMN metadata; \
              PRAGMA user_version = 2;",
         )
         .expect("winding the database back to version 2");
@@ -293,6 +295,7 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
         .connection()
         .execute_batch(
             "DROP TABLE sync_refusals; \
+             ALTER TABLE instruments DROP COLUMN metadata; \
              PRAGMA user_version = 8;",
         )
         .expect("winding the database back to version 8");

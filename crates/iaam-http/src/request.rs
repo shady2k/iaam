@@ -134,12 +134,19 @@ impl RequestAllowance {
     }
 
     pub(crate) fn take(&self) -> bool {
-        self.state
-            .remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
+        let mut remaining = self.state.remaining.load(Ordering::SeqCst);
+        while let Some(next) = remaining.checked_sub(1) {
+            match self.state.remaining.compare_exchange_weak(
+                remaining,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => remaining = actual,
+            }
+        }
+        false
     }
 
     pub(crate) fn give_back(&self) {

@@ -671,6 +671,7 @@ fn adapt_operations(
         ));
     }
     let mut accepted = Vec::new();
+    let mut journal = Vec::new();
     let mut quarantined = Vec::new();
     for mut operation in operations {
         // Take the payload before moving the operation into conversion; no later stage reads it.
@@ -713,7 +714,19 @@ fn adapt_operations(
             });
             continue;
         }
-        if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
+        if matches!(kind, ChannelOperationKind::BondRedemption) {
+            match redemption_to_journal(account, operation) {
+                Ok(event) => journal.push(event),
+                Err(RowRefusal::Row { reason, .. }) => quarantined.push(Quarantined {
+                    raw,
+                    reason,
+                    dimensions: cash_positions(),
+                }),
+                Err(error @ RowRefusal::Adapter(_)) => {
+                    return Err(error.into_broker_error());
+                }
+            }
+        } else if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
             if let Some(reason) = trade_row_reason(&operation, &kind) {
                 quarantined.push(Quarantined {
                     raw,
@@ -755,6 +768,7 @@ fn adapt_operations(
     }
     Ok(ParsedOperations {
         accepted,
+        journal,
         quarantined,
     })
 }
@@ -827,6 +841,47 @@ fn order_state_reason(kind: &ChannelOperationKind, state: &ChannelOrderState) ->
     };
     Some(format!("order state {state_name}: {evidence}"))
 }
+fn redemption_to_journal(
+    account: AccountId,
+    operation: ChannelOperation,
+) -> Result<iaam_ingest::journal_event::SubmittedJournalEvent, RowRefusal> {
+    use iaam_core::event::corporate_action::CorporateAction;
+    use iaam_core::money::{Money, returned_principal_per_unit};
+    use iaam_ingest::journal_event::{JournalFact, SubmittedJournalEvent};
+
+    let instrument = optional_instrument(&operation)?
+        .ok_or_else(|| row_unparsable("bond redemption does not contain instrumentUid"))?;
+    let effective_date = operation
+        .date
+        .ok_or_else(|| row_unparsable("bond redemption does not contain date"))?;
+    let quantity = operation
+        .quantity
+        .filter(|quantity| quantity.0 > Dec::zero())
+        .ok_or_else(|| row_unparsable("bond redemption requires positive quantity"))?;
+    let payment = operation
+        .payment
+        .filter(|payment| payment.amount.raw() > 0)
+        .ok_or_else(|| row_unparsable("bond redemption requires positive payment"))?;
+    let compensation = Money::new(payment.amount, payment.currency);
+    let principal_returned_per_unit = returned_principal_per_unit(compensation, quantity)
+        .map_err(|error| row_unparsable(format!("bond redemption principal per unit: {error}")))?;
+    Ok(SubmittedJournalEvent {
+        account,
+        fact: JournalFact::CorporateAction(CorporateAction::Redemption {
+            instrument,
+            custody: None,
+            quantity,
+            principal_returned_per_unit,
+            compensation,
+            effective_date,
+            record_date: None,
+            grounds: None,
+        }),
+        idempotency_key: Some(operation.deduplication_key),
+        source_operation_id: Some(operation.operation_id),
+    })
+}
+
 fn operation_to_submitted(
     account: AccountId,
     operation: ChannelOperation,
@@ -902,13 +957,8 @@ fn operation_to_submitted(
                 dimensions: BTreeSet::new(),
             });
         }
-        // Amortisation and redemption are corporate actions, not
-        // owner operations: they have their own representation and endpoint
-        // (POST /v1/ingest/journal-events). The rejection here identifies
-        // WHAT IS MISSING, rather than «unknown kind»: the channel reports the
-        // payment amount, but not the returned face value per unit or the custody
-        // location; without them the fact cannot be constructed, and substituting
-        // a guess would record something that never happened in the append-only journal.
+        // Partial repayment still needs its own journal mapping. Final
+        // redemption is routed to the journal before this conversion.
         ChannelOperationKind::BondAmortisation => {
             return Err(row_unparsable(
                 "bond amortisation: the channel does not report the returned face value per unit \
@@ -916,9 +966,8 @@ fn operation_to_submitted(
             ));
         }
         ChannelOperationKind::BondRedemption => {
-            return Err(row_unparsable(
-                "bond redemption: the channel does not report the returned face value per unit \
-                 or custody location — the fact is entered via the journal endpoint",
+            return Err(RowRefusal::Adapter(
+                "bond redemption must be submitted through the journal path".to_owned(),
             ));
         }
         ChannelOperationKind::Other(kind) => {
@@ -1699,60 +1748,55 @@ mod tests {
         )
     }
 
-    /// Amortisation and redemption are corporate actions, and the channel
-    /// does not provide the data they require. The rejection must identify WHAT IS MISSING:
+    /// Partial repayment remains refused until its journal mapping exists. The rejection must identify WHAT IS MISSING:
     /// «unsupported kind» would send the owner looking for support
     /// for a kind that is supported, rather than for the data that is missing.
     #[test]
-    fn a_bond_repayment_is_refused_by_naming_what_the_channel_does_not_report() {
+    fn a_partial_bond_repayment_is_refused_by_naming_what_the_channel_does_not_report() {
         use iaam_broker::operation_kind::ChannelOperationKind;
         use iaam_broker::tinkoff::ChannelOperation;
 
-        for kind in [
-            ChannelOperationKind::BondAmortisation,
-            ChannelOperationKind::BondRedemption,
-        ] {
-            let operation = ChannelOperation {
-                date: None,
-                source_time: None,
-                broker_account_id: "account".to_owned(),
-                operation_id: "1".to_owned(),
-                parent_operation_id: None,
-                cursor: "c".to_owned(),
-                source_kind: "irrelevant: the kind is passed separately".to_owned(),
-                state: ChannelOrderState::Executed,
-                position_uid: None,
-                instrument_uid: None,
-                figi: None,
-                quantity: None,
-                trades: Vec::new(),
-                quantity_done: iaam_core::money::Quantity::zero(),
-                quantity_rest: iaam_core::money::Quantity::zero(),
-                cancel_reason: None,
-                accrued_interest: None,
-                payment: None,
-                price: None,
-                commission: None,
-                deduplication_key: "k".to_owned(),
-                parser_version: iaam_core::event::provenance::ParserVersion("test".to_owned()),
-                raw: serde_json::Value::Null,
-                rejection: None,
-            };
-            let account = AccountId(Uuid::from_u128(1));
-            let error = operation_to_submitted(account, operation, kind.clone())
-                .expect_err("a corporate action cannot be constructed through the channel");
-            let RowRefusal::Row { reason, .. } = error else {
-                panic!("corporate action should be a row refusal");
-            };
-            assert!(
-                reason.contains("returned face value per unit"),
-                "error does not identify what is missing: {reason}"
-            );
-            assert!(
-                reason.contains("journal endpoint"),
-                "error does not identify where the fact is entered: {reason}"
-            );
-        }
+        let kind = ChannelOperationKind::BondAmortisation;
+        let operation = ChannelOperation {
+            date: None,
+            source_time: None,
+            broker_account_id: "account".to_owned(),
+            operation_id: "1".to_owned(),
+            parent_operation_id: None,
+            cursor: "c".to_owned(),
+            source_kind: "irrelevant: the kind is passed separately".to_owned(),
+            state: ChannelOrderState::Executed,
+            position_uid: None,
+            instrument_uid: None,
+            figi: None,
+            quantity: None,
+            trades: Vec::new(),
+            quantity_done: iaam_core::money::Quantity::zero(),
+            quantity_rest: iaam_core::money::Quantity::zero(),
+            cancel_reason: None,
+            accrued_interest: None,
+            payment: None,
+            price: None,
+            commission: None,
+            deduplication_key: "k".to_owned(),
+            parser_version: iaam_core::event::provenance::ParserVersion("test".to_owned()),
+            raw: serde_json::Value::Null,
+            rejection: None,
+        };
+        let account = AccountId(Uuid::from_u128(1));
+        let error = operation_to_submitted(account, operation, kind.clone())
+            .expect_err("a corporate action cannot be constructed through the channel");
+        let RowRefusal::Row { reason, .. } = error else {
+            panic!("corporate action should be a row refusal");
+        };
+        assert!(
+            reason.contains("returned face value per unit"),
+            "error does not identify what is missing: {reason}"
+        );
+        assert!(
+            reason.contains("journal endpoint"),
+            "error does not identify where the fact is entered: {reason}"
+        );
     }
 
     /// The channel dictionary is defined explicitly in tests: classification is data,
@@ -3873,6 +3917,208 @@ mod tests {
         ] {
             let error = super::tinkoff_error(super::TinkoffError::Transport(fault));
             assert!(matches!(error, BrokerError::Adapter { .. }), "{error:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod full_redemption_tests {
+    use super::*;
+
+    // Invented end to end, including the zero execution counters that belong
+    // to the channel's non-trading repayment rows.
+    fn full_repayment_row() -> serde_json::Value {
+        serde_json::json!({
+            "cursor": "invented-redemption-cursor",
+            "brokerAccountId": "invented-broker-account",
+            "id": "invented-redemption",
+            "parentOperationId": "",
+            "date": "2026-08-20T10:11:12Z",
+            "type": "OPERATION_TYPE_BOND_REPAYMENT_FULL",
+            "state": "OPERATION_STATE_EXECUTED",
+            "instrumentUid": "01234567-89ab-cdef-0123-456789abcdef",
+            "positionUid": "11234567-89ab-cdef-0123-456789abcdef",
+            "figi": "TESTBOND0001",
+            "instrumentType": "bond",
+            "instrumentKind": "INSTRUMENT_TYPE_BOND",
+            "ticker": "TESTBOND",
+            "classCode": "TQCB",
+            "name": "Invented bond",
+            "description": "Full repayment of an invented bond",
+            "quantity": "3",
+            "quantityRest": "0",
+            "quantityDone": "0",
+            "payment": {"units": "2400", "nano": 0, "currency": "rub"},
+            "price": {"units": "800", "nano": 0, "currency": "rub"},
+            "commission": {"units": "0", "nano": 0, "currency": ""},
+            "accruedInt": {"units": "0", "nano": 0, "currency": ""},
+            "cancelReason": "",
+            "tradesInfo": {"trades": []},
+            "childOperations": []
+        })
+    }
+
+    fn adapt_row(row: serde_json::Value) -> ParsedOperations {
+        let body = serde_json::json!({"hasNext": false, "items": [row]}).to_string();
+        let operations = parse_operations(&body)
+            .expect("invented repayment parses")
+            .operations;
+        let (dictionary, unreadable) = OperationKindDictionary::build(
+            iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                .iter()
+                .copied(),
+        );
+        assert!(unreadable.is_empty());
+        adapt_operations(AccountId(Uuid::from_u128(1)), operations, &dictionary)
+            .expect("row mapping")
+    }
+
+    #[test]
+    fn full_repayment_becomes_principal_return_and_retires_the_reported_quantity() {
+        use iaam_core::event::corporate_action::CorporateAction;
+        use iaam_ingest::journal_event::JournalFact;
+
+        let mut row = full_repayment_row();
+        // Principal comes from the payment, not a quote or execution counter.
+        row["price"]["units"] = serde_json::json!("999");
+        let parsed = adapt_row(row);
+        assert!(
+            parsed.accepted.is_empty(),
+            "redemption is not income or a sale"
+        );
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.journal.len(), 1);
+        let submitted = &parsed.journal[0];
+        assert_eq!(submitted.account, AccountId(Uuid::from_u128(1)));
+        assert_eq!(
+            submitted.source_operation_id.as_deref(),
+            Some("invented-redemption")
+        );
+        assert_eq!(
+            submitted.idempotency_key.as_deref(),
+            Some("invented-broker-account/invented-redemption")
+        );
+        let JournalFact::CorporateAction(CorporateAction::Redemption {
+            instrument,
+            custody,
+            quantity,
+            principal_returned_per_unit,
+            compensation,
+            effective_date,
+            record_date,
+            grounds,
+        }) = &submitted.fact
+        else {
+            panic!("full repayment must be a journal redemption");
+        };
+        assert_eq!(
+            *instrument,
+            InstrumentId(
+                Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("invented UID")
+            )
+        );
+        assert_eq!(*custody, None, "positionUid is not a custody place");
+        assert_eq!(quantity.0.inner().to_string(), "3");
+        assert_eq!(
+            principal_returned_per_unit.value(),
+            Dec::new(Decimal::from(800))
+        );
+        assert_eq!(principal_returned_per_unit.currency(), CurrencyCode::Rub);
+        assert_eq!(compensation.amount().raw(), 240_000);
+        assert_eq!(compensation.currency(), CurrencyCode::Rub);
+        assert_eq!(*effective_date, time::macros::date!(2026 - 08 - 20));
+        assert_eq!(*record_date, None);
+        assert_eq!(*grounds, None);
+        let normalized = iaam_ingest::journal_event::normalize_journal_event(
+            submitted,
+            &iaam_ingest::journal_event::JournalEventEnrichment::default(),
+            &iaam_ingest::operation::NormalizationContext {
+                owner: iaam_core::ids::OwnerId(Uuid::from_u128(2)),
+                source: SourceId(Uuid::from_u128(3)),
+                parser_version: ParserVersion(TINKOFF_PARSER_VERSION.to_owned()),
+            },
+        )
+        .expect("redemption normalizes into journal legs");
+        normalized
+            .event
+            .validate_structure()
+            .expect("valid redemption");
+        assert_eq!(normalized.event.legs.len(), 2);
+        let principal = normalized
+            .event
+            .legs
+            .iter()
+            .find(|leg| leg.kind == iaam_core::event::leg::LegKind::Principal)
+            .expect("principal cash return");
+        assert_eq!(
+            principal.cash_effect().expect("cash").amount().raw(),
+            240_000
+        );
+        let security = normalized
+            .event
+            .legs
+            .iter()
+            .find(|leg| leg.kind == iaam_core::event::leg::LegKind::SecurityQuantity)
+            .expect("retired quantity");
+        assert_eq!(
+            security.quantity.expect("quantity").0.inner().to_string(),
+            "-3"
+        );
+        assert_eq!(security.custody, None);
+    }
+
+    #[test]
+    fn full_repayment_refuses_missing_or_nonpositive_principal_and_quantity() {
+        for (field, value, reason) in [
+            ("payment", serde_json::Value::Null, "positive payment"),
+            (
+                "payment",
+                serde_json::json!({"units": "0", "nano": 0, "currency": "rub"}),
+                "positive payment",
+            ),
+            (
+                "payment",
+                serde_json::json!({"units": "-1", "nano": 0, "currency": "rub"}),
+                "positive payment",
+            ),
+            ("quantity", serde_json::Value::Null, "positive quantity"),
+            ("quantity", serde_json::json!("0"), "positive quantity"),
+            ("quantity", serde_json::json!("-1"), "positive quantity"),
+            ("instrumentUid", serde_json::Value::Null, "instrumentUid"),
+            (
+                "instrumentUid",
+                serde_json::json!("not-a-uuid"),
+                "instrumentUid",
+            ),
+        ] {
+            let mut row = full_repayment_row();
+            row[field] = value;
+            let parsed = adapt_row(row.clone());
+            assert!(parsed.accepted.is_empty());
+            assert!(parsed.journal.is_empty());
+            assert_eq!(parsed.quarantined.len(), 1);
+            let refusal = &parsed.quarantined[0];
+            assert!(
+                refusal.reason.contains(reason),
+                "{field}: {}",
+                refusal.reason
+            );
+            assert_eq!(refusal.dimensions, cash_positions());
+            assert_eq!(refusal.raw, row);
+        }
+    }
+
+    #[test]
+    fn unexecuted_full_repayment_does_not_create_a_journal_fact() {
+        for state in ["OPERATION_STATE_CANCELED", "OPERATION_STATE_PROGRESS"] {
+            let mut row = full_repayment_row();
+            row["state"] = serde_json::json!(state);
+            let parsed = adapt_row(row);
+            assert!(parsed.accepted.is_empty());
+            assert!(parsed.journal.is_empty());
+            assert_eq!(parsed.quarantined.len(), 1);
+            assert!(parsed.quarantined[0].reason.contains(state));
+            assert_eq!(parsed.quarantined[0].dimensions, cash_positions());
         }
     }
 }

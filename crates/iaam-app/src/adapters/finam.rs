@@ -541,6 +541,7 @@ async fn adapt_operations(
         }
     }
     Ok(ParsedOperations {
+        journal: Vec::new(),
         accepted,
         quarantined,
     })
@@ -550,12 +551,12 @@ async fn adapt_operations(
 fn income_kind(operation: &ChannelOperation) -> Result<ChannelOperationKind, String> {
     match operation.transaction_name.as_deref() {
         Some("Купонный доход") => Ok(ChannelOperationKind::Coupon),
-        Some("Доход по предоставлениям займа") => Err(
-            concat!("unsupported Finam INCOME transaction_name: Доход по предоставлениям займа — ",
-                "core IncomeKind has no loan-provision income kind; DepositInterest describes ",
-                "deposit interest, and an absent kind would discard the source's stated meaning")
-                .to_owned(),
-        ),
+        Some("Доход по предоставлениям займа") => Err(concat!(
+            "unsupported Finam INCOME transaction_name: Доход по предоставлениям займа — ",
+            "core IncomeKind has no loan-provision income kind; DepositInterest describes ",
+            "deposit interest, and an absent kind would discard the source's stated meaning"
+        )
+        .to_owned()),
         Some(name) => Err(format!("unsupported Finam INCOME transaction_name: {name}")),
         None => Err("Finam INCOME does not contain transaction_name".to_owned()),
     }

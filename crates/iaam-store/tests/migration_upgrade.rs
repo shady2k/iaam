@@ -368,3 +368,49 @@ fn a_version_eight_database_gains_the_sync_refusals_table() {
         "the refusal settled through the migrated table"
     );
 }
+
+#[test]
+fn version_ten_redemption_rows_survive_optional_custody_migration() {
+    let store = SqliteStore::open_in_memory().expect("open");
+    let conn = store.connection();
+    let legacy = include_str!("../migrations/0001_schema.sql");
+    let start = legacy
+        .find("CREATE TABLE event_corporate_action (")
+        .unwrap();
+    let end = start + legacy[start..].find(") STRICT;").unwrap() + ") STRICT;".len();
+    conn.execute_batch("DROP TABLE event_corporate_action;")
+        .unwrap();
+    conn.execute_batch(&legacy[start..end]).unwrap();
+    conn.execute_batch(
+        "INSERT INTO accounts (id, owner, title, created_at) VALUES ('a', 'o', 'Account', '2026-01-01T00:00:00Z');
+         INSERT INTO instruments (id, kind, symbol, title, denomination_currency, settlement_currency, quote_currency, created_at) VALUES ('i', 'bond', 'BOND', 'Bond', 'RUB', 'RUB', 'RUB', '2026-01-01T00:00:00Z');
+         INSERT INTO custody_places (id, owner, title, origin, created_at) VALUES ('c', 'o', 'Custody', 'declared', '2026-01-01T00:00:00Z');
+         INSERT INTO events (id, owner, account, kind, effective_date, sequence, confidence, relation_kind, recorded_at, source, raw_hash, parser_version)
+         VALUES ('e', 'o', 'a', 'corporate_action', '2026-01-02', 1, 'known', 'none', '2026-01-02T00:00:00Z', 'file', 'hash', 'v1');
+         INSERT INTO event_corporate_action (event, action_kind, instrument, custody, quantity, principal_returned_per_unit_value, principal_returned_per_unit_currency, effective_date)
+         VALUES ('e', 'redemption', 'i', 'c', '10', '1000', 'RUB', '2026-01-02');
+         PRAGMA user_version = 10;"
+    ).unwrap();
+    migrate(conn).expect("migrate populated version ten");
+    let custody: Option<String> = conn
+        .query_row(
+            "SELECT custody FROM event_corporate_action WHERE event = 'e'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(custody.as_deref(), Some("c"));
+    conn.execute(
+        "UPDATE event_corporate_action SET custody = NULL WHERE event = 'e'",
+        [],
+    )
+    .expect("redemption accepts no custody");
+    assert!(
+        conn.execute(
+            "UPDATE event_corporate_action SET action_kind = 'conversion' WHERE event = 'e'",
+            []
+        )
+        .is_err()
+    );
+    assert_eq!(user_version(&store), SCHEMA_VERSION);
+}

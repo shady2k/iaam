@@ -2190,6 +2190,7 @@ pub struct Quarantined {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedOperations {
     pub accepted: Vec<SubmittedOperation>,
+    pub journal: Vec<iaam_ingest::SubmittedJournalEvent>,
     pub quarantined: Vec<Quarantined>,
 }
 

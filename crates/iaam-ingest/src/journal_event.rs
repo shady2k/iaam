@@ -227,7 +227,10 @@ fn corporate_action_legs(
             ..
         } => Ok(vec![
             Leg::principal(account, *instrument, *compensation),
-            Leg::security(account, *custody, *instrument, retired(*quantity)?),
+            match custody {
+                Some(custody) => Leg::security(account, *custody, *instrument, retired(*quantity)?),
+                None => Leg::security_without_custody(account, *instrument, retired(*quantity)?),
+            },
         ]),
         CorporateAction::Conversion {
             predecessor,
@@ -435,7 +438,7 @@ mod tests {
         let event =
             normalized_and_valid(JournalFact::CorporateAction(CorporateAction::Redemption {
                 instrument: InstrumentId::new_random(),
-                custody: CustodyId::new_random(),
+                custody: Some(CustodyId::new_random()),
                 quantity: qty("10"),
                 principal_returned_per_unit: PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
                 compensation: rub(1_000_000),
@@ -444,6 +447,25 @@ mod tests {
                 grounds: None,
             }));
         assert_eq!(event.legs.len(), 2, "{:?}", event.legs);
+    }
+
+    #[test]
+    fn redemption_without_custody_retires_the_position_without_inventing_a_place() {
+        let event =
+            normalized_and_valid(JournalFact::CorporateAction(CorporateAction::Redemption {
+                instrument: InstrumentId::new_random(),
+                custody: None,
+                quantity: qty("10"),
+                principal_returned_per_unit: PerUnitAmount::new(dec("1000"), CurrencyCode::Rub),
+                compensation: rub(1_000_000),
+                effective_date: date!(2026 - 06 - 01),
+                record_date: None,
+                grounds: None,
+            }));
+        assert_eq!(event.legs.len(), 2);
+        assert!(event.legs.iter().all(|leg| leg.custody.is_none()));
+        assert_eq!(event.legs[1].quantity, Some(qty("-10")));
+        assert!(event.validate_structure().is_ok());
     }
 
     #[test]

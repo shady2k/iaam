@@ -536,7 +536,7 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
             EventKind::CorporateAction {
                 action: CorporateAction::Redemption {
                     instrument,
-                    custody,
+                    custody: Some(custody),
                     quantity: qty("10"),
                     principal_returned_per_unit: per_unit("800"),
                     compensation: money(800_000),
@@ -631,6 +631,27 @@ fn every_new_fact(owner: OwnerId, account: AccountId, refs: &BondReferenceData) 
                 kind: Some(IncomeKind::Coupon),
             },
             vec![Leg::cash(account, money(70_000))],
+        ),
+        bond_event(
+            owner,
+            account,
+            17,
+            EventKind::CorporateAction {
+                action: CorporateAction::Redemption {
+                    instrument,
+                    custody: None,
+                    quantity: qty("10"),
+                    principal_returned_per_unit: per_unit("800"),
+                    compensation: money(800_000),
+                    effective_date: date!(2026 - 06 - 15),
+                    record_date: None,
+                    grounds: None,
+                },
+            },
+            vec![
+                Leg::principal(account, instrument, money(800_000)),
+                Leg::security_without_custody(account, instrument, qty("-10")),
+            ],
         ),
     ]
 }

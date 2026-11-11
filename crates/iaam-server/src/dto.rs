@@ -6871,10 +6871,30 @@ mod tests {
     }
 
     #[test]
+    fn redemption_without_custody_is_not_given_an_invented_place() {
+        let dto = CorporateActionDto::Redemption {
+            instrument: Uuid::new_v4(),
+            custody: None,
+            quantity: "10".into(),
+            principal_returned_per_unit: amount("1000"),
+            compensation: amount("10000.00"),
+            effective_date: time::macros::date!(2026 - 06 - 01),
+            record_date: None,
+            grounds: None,
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        let restored: CorporateActionDto = serde_json::from_value(json).unwrap();
+        let CorporateAction::Redemption { custody, .. } = restored.to_domain().unwrap() else {
+            panic!("expected redemption");
+        };
+        assert_eq!(custody, None);
+    }
+
+    #[test]
     fn every_corporate_action_member_names_itself_in_json() {
         let redemption_fields = || CorporateActionDto::Redemption {
             instrument: Uuid::new_v4(),
-            custody: Uuid::new_v4(),
+            custody: Some(Uuid::new_v4()),
             quantity: "10".into(),
             principal_returned_per_unit: amount("1000"),
             compensation: amount("10000.00"),
@@ -9918,7 +9938,8 @@ pub enum CorporateActionDto {
     /// is disposed of.
     Redemption {
         instrument: Uuid,
-        custody: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custody: Option<Uuid>,
         quantity: String,
         principal_returned_per_unit: AmountDto,
         compensation: AmountDto,
@@ -9999,7 +10020,7 @@ impl CorporateActionDto {
                 grounds,
             } => CorporateAction::Redemption {
                 instrument: InstrumentId(*instrument),
-                custody: CustodyId(*custody),
+                custody: custody.map(CustodyId),
                 quantity: Quantity(Dec::new(decimal(quantity, "quantity")?)),
                 principal_returned_per_unit: principal_returned_per_unit
                     .to_per_unit("principal_returned_per_unit")?,

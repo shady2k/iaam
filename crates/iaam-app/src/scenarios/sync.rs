@@ -246,7 +246,7 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "fetch_operations",
         status = "complete",
-        accepted = parsed.accepted.len(),
+        accepted = parsed.accepted.len() + parsed.journal.len(),
         quarantined = parsed.quarantined.len(),
         "broker sync phase complete"
     );
@@ -318,7 +318,7 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "map",
         status = "start",
-        accepted = parsed.accepted.len(),
+        accepted = parsed.accepted.len() + parsed.journal.len(),
         "broker sync phase start"
     );
     let mut known = known_records(&bounded_events);
@@ -382,7 +382,7 @@ pub async fn sync_broker(
     tracing::info!(
         phase = "write",
         status = "start",
-        rows = parsed.accepted.len(),
+        rows = parsed.accepted.len() + parsed.journal.len(),
         "broker sync phase start"
     );
     for (row_index, operation) in parsed.accepted.into_iter().enumerate() {
@@ -483,6 +483,104 @@ pub async fn sync_broker(
         let verdict = verdict_from_recorded(&result, &mut duplicates);
         let verdict = match (possible_duplicate, event_id_from_verdict(&verdict)) {
             (Some((of, level)), Some(event)) => {
+                possible_duplicates += 1;
+                Verdict::PossibleDuplicate { event, of, level }
+            }
+            _ => verdict,
+        };
+        if let Some(event_id) = event_id_from_verdict(&verdict) {
+            known.push(known_record(&event, event_id));
+        }
+        recorded.push(verdict);
+    }
+
+    for (row_index, submitted) in parsed.journal.into_iter().enumerate() {
+        let context = DocumentContext {
+            account: submitted.account,
+            document: None,
+            sheet: None,
+            row: None,
+            identity_scope: broker.identity_scope(),
+        };
+        let key = submitted
+            .source_operation_id
+            .clone()
+            .map(dedup::DedupKey::SourceOperationId)
+            .or_else(|| {
+                submitted
+                    .idempotency_key
+                    .clone()
+                    .map(dedup::DedupKey::IdempotencyKey)
+            });
+        let normalized = iaam_ingest::normalize_journal_event(
+            &submitted,
+            &iaam_ingest::JournalEventEnrichment::default(),
+            &NormalizationContext {
+                owner: principal.owner,
+                source: channel.source,
+                parser_version: channel.parser_version.clone(),
+            },
+        )
+        .and_then(|normalized| {
+            if let Some(rejection) =
+                crate::scenarios::ingest::structural_rejection(&normalized.event, "journal")
+            {
+                Err(rejection)
+            } else {
+                Ok(normalized)
+            }
+        });
+        let mut event = match normalized {
+            Ok(normalized) => normalized.event,
+            Err(rejection) => {
+                tracing::debug!(phase = "map", row_index, reason = %rejection_sentence(&rejection), "broker journal row rejected");
+                let row = RefusedRow {
+                    key: SourceRowKey {
+                        source: channel.source,
+                        row: submitted
+                            .source_operation_id
+                            .clone()
+                            .map(RowName::Given)
+                            .unwrap_or_else(|| {
+                                fingerprint_of(
+                                    &serde_json::to_value(&submitted).expect("journal serializes"),
+                                )
+                            }),
+                    },
+                    dimensions: [Dimension::Cash, Dimension::Positions]
+                        .into_iter()
+                        .collect(),
+                };
+                refusal_records.push(refusal_record(
+                    &refusal_context,
+                    &row.key,
+                    &row.dimensions,
+                    rejection_sentence(&rejection),
+                    serde_json::to_string(&submitted).expect("journal serializes"),
+                ));
+                refusals.push(row);
+                recorded.push(Verdict::Rejected { rejection });
+                continue;
+            }
+        };
+        event.provenance = event
+            .provenance
+            .with_declared_by(PrincipalId(principal.token_id));
+        let decision = dedup::assess(key.as_ref(), event.provenance.raw_hash(), &context, &known);
+        if let DedupDecision::Duplicate { existing, .. } = decision {
+            duplicates += 1;
+            recorded.push(Verdict::Duplicate { existing });
+            continue;
+        }
+        let result = crate::scenarios::ingest::append_checked(
+            services,
+            vec![event.clone()],
+            broker.identity_scope(),
+        )
+        .await?;
+        let verdict = verdict_from_recorded(&result, &mut duplicates);
+        let verdict = match (decision, event_id_from_verdict(&verdict)) {
+            (DedupDecision::PossibleDuplicate { of, level }, Some(event)) => {
                 possible_duplicates += 1;
                 Verdict::PossibleDuplicate { event, of, level }
             }

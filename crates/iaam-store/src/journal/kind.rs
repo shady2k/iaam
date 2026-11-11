@@ -447,7 +447,7 @@ fn corporate_action_to_row(
         instrument: None,
         predecessor: None,
         successor: None,
-        custody: String::new(),
+        custody: None,
         quantity: None,
         quantity_in: None,
         quantity_out: None,
@@ -490,7 +490,7 @@ fn corporate_action_to_row(
             Ok(CorporateActionRow {
                 action_kind: "partial_redemption".to_owned(),
                 instrument: Some(instrument.inner().to_string()),
-                custody: custody.inner().to_string(),
+                custody: Some(custody.inner().to_string()),
                 quantity: Some(dec_to_text(quantity.0)),
                 principal_returned_per_unit_value: Some(dec_to_text(
                     principal_returned_per_unit.value(),
@@ -523,7 +523,7 @@ fn corporate_action_to_row(
         } => Ok(CorporateActionRow {
             action_kind: "redemption".to_owned(),
             instrument: Some(instrument.inner().to_string()),
-            custody: custody.inner().to_string(),
+            custody: custody.map(|id| id.inner().to_string()),
             quantity: Some(dec_to_text(quantity.0)),
             principal_returned_per_unit_value: Some(dec_to_text(
                 principal_returned_per_unit.value(),
@@ -554,7 +554,7 @@ fn corporate_action_to_row(
             action_kind: "conversion".to_owned(),
             predecessor: Some(predecessor.inner().to_string()),
             successor: Some(successor.inner().to_string()),
-            custody: custody.inner().to_string(),
+            custody: Some(custody.inner().to_string()),
             quantity_in: Some(dec_to_text(quantity_in.0)),
             quantity_out: Some(dec_to_text(quantity_out.0)),
             ratio: Some(dec_to_text(*ratio)),
@@ -1048,7 +1048,11 @@ fn corporate_action_from_row(
     legs: &[Leg],
 ) -> Result<EventKind, StoreError> {
     let field = "event_corporate_action";
-    let custody = CustodyId(parse_uuid(field, &row.custody)?);
+    let custody = row
+        .custody
+        .as_deref()
+        .map(|id| parse_uuid(field, id).map(CustodyId))
+        .transpose()?;
     let effective_date = date_from_text(field, &row.effective_date)?;
     let record_date = row
         .record_date
@@ -1061,7 +1065,10 @@ fn corporate_action_from_row(
                 field,
                 &require_str(field, row.instrument.as_deref())?,
             )?),
-            custody,
+            custody: CustodyId(parse_uuid(
+                field,
+                &require_str(field, row.custody.as_deref())?,
+            )?),
             quantity: Quantity(dec_from_text(
                 field,
                 &require_str(field, row.quantity.as_deref())?,
@@ -1123,7 +1130,10 @@ fn corporate_action_from_row(
                 field,
                 &require_str(field, row.successor.as_deref())?,
             )?),
-            custody,
+            custody: CustodyId(parse_uuid(
+                field,
+                &require_str(field, row.custody.as_deref())?,
+            )?),
             ratio: dec_from_text(field, &require_str(field, row.ratio.as_deref())?)?,
             quantity_in: Quantity(dec_from_text(
                 field,
@@ -2474,7 +2484,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::Redemption {
                     instrument: f.instrument,
-                    custody: f.custody,
+                    custody: Some(f.custody),
                     quantity: qty("10"),
                     principal_returned_per_unit: per_unit("800"),
                     compensation: rub(i64::MIN),
@@ -2488,6 +2498,18 @@ mod tests {
                 Leg::security(f.account, f.custody, f.instrument, qty("-10")),
             ],
         ));
+
+        let mut without_custody = events.last().unwrap().clone();
+        if let EventKind::CorporateAction {
+            action: CorporateAction::Redemption { custody, .. },
+        } = &mut without_custody.kind
+        {
+            *custody = None;
+        }
+        for leg in &mut without_custody.legs {
+            leg.custody = None;
+        }
+        events.push(without_custody);
 
         // --- CorporateAction: Conversion, with and without compensation ------
         let successor = InstrumentId::new_random();

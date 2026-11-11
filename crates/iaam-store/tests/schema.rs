@@ -243,7 +243,7 @@ fn every_corporate_action() -> Vec<CorporateAction> {
         },
         CorporateAction::Redemption {
             instrument: InstrumentId::new_random(),
-            custody: CustodyId::new_random(),
+            custody: Some(CustodyId::new_random()),
             quantity: qty("100"),
             principal_returned_per_unit: PerUnitAmount::new(dec("800"), CurrencyCode::Rub),
             compensation: rub(8_000_000),

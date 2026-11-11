@@ -2066,7 +2066,33 @@ impl BrokerChannelFactory for SqliteAdapter {
         // them — using the same approach already used for SQLite.
         let code = code.clone();
         let rows = self
-            .blocking(move |store| store.broker_operation_kinds(&code).map_err(store_error))
+            .blocking(move |store| {
+                if code.as_str() == "tinkoff" {
+                    let outcome = store
+                        .extend_broker_operation_kinds(
+                            &code,
+                            "embedded T-Invest full redemption",
+                            &iaam_broker::tinkoff::dictionary_seed::TINKOFF_OPERATION_KINDS
+                                .iter()
+                                .filter(|(source, _)| {
+                                    *source == "OPERATION_TYPE_BOND_REPAYMENT_FULL"
+                                })
+                                .map(|(source, kind)| BrokerOperationKind {
+                                    source_kind: (*source).to_owned(),
+                                    kind: (*kind).to_owned(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(store_error)?;
+                    tracing::info!(
+                        phase = "extend_operation_dictionary",
+                        added = outcome.added,
+                        already_known = outcome.already_known,
+                        "broker dictionary updated"
+                    );
+                }
+                store.broker_operation_kinds(&code).map_err(store_error)
+            })
             .await?;
         let (dictionary, unreadable) = OperationKindDictionary::build(rows);
         // A dictionary row not understood by this build means that the
@@ -2697,6 +2723,68 @@ mod tests {
             deadline,
             allowance: &ALLOWANCE,
         }
+    }
+
+    #[tokio::test]
+    async fn opening_existing_tinkoff_access_adds_redemption_without_overwriting_decisions() {
+        use crate::adapters::tinkoff::fake;
+        use crate::ports::BrokerDictionary;
+        use crate::ports::{BrokerEnvironment, BrokerVault};
+        let (gateway, _, _) = fake::gateway(Vec::new(), None);
+        let adapter = Arc::new(SqliteAdapter::with_broker_key(
+            SqliteStore::open_in_memory().unwrap(),
+            Some(Key::from_bytes([7; 32])),
+            gateway,
+        ));
+        let owner = OwnerId::new_random();
+        adapter
+            .add_access(
+                owner,
+                "tinkoff".to_owned(),
+                BrokerEnvironment::Prod,
+                zeroize::Zeroizing::new("invented-token".to_owned()),
+            )
+            .await
+            .unwrap();
+        adapter.blocking(|store| {
+            store.connection().execute("DELETE FROM broker_operation_kinds WHERE source_kind = 'OPERATION_TYPE_BOND_REPAYMENT_FULL'", []).map_err(|error| store_error(error.into()))?;
+            Ok(())
+        }).await.unwrap();
+        adapter.clone().open(owner, "tinkoff").await.unwrap();
+        let broker = BrokerCode::parse("tinkoff").unwrap();
+        assert_eq!(
+            adapter
+                .operation_kinds(&broker)
+                .await
+                .unwrap()
+                .get("OPERATION_TYPE_BOND_REPAYMENT_FULL")
+                .map(String::as_str),
+            Some("bond_redemption")
+        );
+        adapter
+            .blocking(|store| {
+                store
+                    .set_broker_operation_kind(
+                        &BrokerCode::parse("tinkoff").unwrap(),
+                        &BrokerOperationKind {
+                            source_kind: "OPERATION_TYPE_BOND_REPAYMENT_FULL".to_owned(),
+                            kind: "coupon".to_owned(),
+                        },
+                    )
+                    .map_err(store_error)
+            })
+            .await
+            .unwrap();
+        adapter.clone().open(owner, "tinkoff").await.unwrap();
+        assert_eq!(
+            adapter
+                .operation_kinds(&broker)
+                .await
+                .unwrap()
+                .get("OPERATION_TYPE_BOND_REPAYMENT_FULL")
+                .map(String::as_str),
+            Some("coupon")
+        );
     }
 
     #[test]

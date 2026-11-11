@@ -106,6 +106,7 @@ impl BrokerChannel for EmptyChannel {
         _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
+            journal: Vec::new(),
             accepted: Vec::new(),
             quarantined: Vec::new(),
         })
@@ -157,6 +158,7 @@ impl BrokerChannel for PopulatedChannel {
         _context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError> {
         Ok(ParsedOperations {
+            journal: Vec::new(),
             accepted: vec![SubmittedOperation {
                 account,
                 kind: OperationKind::Deposit {
@@ -12470,6 +12472,7 @@ impl BrokerChannel for TwinRowsChannel {
             counterparty: None,
         };
         Ok(ParsedOperations {
+            journal: Vec::new(),
             accepted: vec![row("twin-a"), row("twin-b")],
             quarantined: Vec::new(),
         })
@@ -35795,6 +35798,7 @@ impl BrokerChannel for RecordingChannel {
             .unwrap_or_else(|error| error.into_inner())
             .push(broker_account.to_owned());
         Ok(ParsedOperations {
+            journal: Vec::new(),
             accepted: vec![SubmittedOperation {
                 account,
                 kind: OperationKind::Deposit {

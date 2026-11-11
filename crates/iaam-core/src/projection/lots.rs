@@ -1681,7 +1681,7 @@ mod tests {
             EventKind::CorporateAction {
                 action: CorporateAction::Redemption {
                     instrument: bond.instrument,
-                    custody: bond.custody,
+                    custody: Some(bond.custody),
                     quantity: qty(10),
                     principal_returned_per_unit: per_unit("800"),
                     compensation: rub(800_000),

@@ -177,6 +177,9 @@ pub async fn sync_broker(
         });
     }
 
+    let span = tracing::info_span!("broker_sync", broker = %broker_code.as_str(), account = %account.inner(), from = %from, to = %to, broker_account = tracing::field::Empty);
+    let _entered = span.enter();
+    tracing::info!(phase = "start", "broker sync started");
     let _claim = services.running_syncs.claim(principal.owner, account)?;
     let deadline = Some(Instant::now() + SYNC_DEADLINE);
     let allowance = RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING);
@@ -220,10 +223,22 @@ pub async fn sync_broker(
         }
     };
 
+    span.record("broker_account", broker_account.as_str());
+    tracing::info!(
+        phase = "fetch_operations",
+        status = "start",
+        "broker sync phase"
+    );
     let parsed = broker
         .fetch_operations(account, &broker_account, from, to, broker_context)
         .await
         .map_err(broker_error)?;
+    tracing::info!(
+        phase = "fetch_operations",
+        accepted = parsed.accepted.len(),
+        quarantined = parsed.quarantined.len(),
+        "broker sync phase complete"
+    );
     let channel = broker.channel();
     // Deduplication belongs to the requested interval; it must not treat later facts
     // as part of this sync.
@@ -246,12 +261,22 @@ pub async fn sync_broker(
     let snapshot = if has_out_of_interval_trade {
         None
     } else {
-        Some(
-            broker
-                .fetch_portfolio(account, &broker_account, to, broker_context)
-                .await
-                .map_err(broker_error)?,
-        )
+        tracing::info!(
+            phase = "fetch_portfolio",
+            status = "start",
+            "broker sync phase"
+        );
+        let snapshot = broker
+            .fetch_portfolio(account, &broker_account, to, broker_context)
+            .await
+            .map_err(broker_error)?;
+        tracing::info!(
+            phase = "fetch_portfolio",
+            claims = snapshot.claims.len(),
+            refused = snapshot.refused.len(),
+            "broker sync phase complete"
+        );
+        Some(snapshot)
     };
     // The sync's fetches have succeeded — both answers, wherever the
     // portfolio is asked for at all: an out-of-interval trade withholds

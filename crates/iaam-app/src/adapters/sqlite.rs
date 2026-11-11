@@ -70,6 +70,7 @@ use iaam_store::reference::{
     Declared as StoredDeclared, InstrumentRecord,
 };
 use iaam_store::tokens::{TokenRecord, TokenScope};
+use rusqlite;
 use time::Date;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -424,10 +425,15 @@ impl Store for SqliteAdapter {
     ) -> Result<Vec<Recorded>, AppError> {
         self.blocking(move |store| {
             let mut recorded = Vec::with_capacity(events.len());
-            for event in &events {
-                let outcome = store
-                    .append_event_in_order(event, identity_scope)
-                    .map_err(store_error)?;
+            for (row_index, event) in events.iter().enumerate() {
+                let outcome = store.append_event_in_order(event, identity_scope).map_err(|error| {
+                    let (code, message) = match &error {
+                        iaam_store::StoreError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => (Some(code.extended_code), error.to_string()),
+                        _ => (None, error.to_string()),
+                    };
+                    tracing::error!(scenario = "broker_sync", write = "append_event_in_order", table = "events/event detail", row_index, event_id = %event.id.inner().to_string(), account_id = %event.account.inner().to_string(), sqlite_extended_code = ?code, error = %message, "broker sync store write failed");
+                    AppError::Store(format!("broker sync write append_event_in_order row {row_index} event {} account {} failed: {message}", event.id.inner(), event.account.inner()))
+                })?;
                 recorded.push(match outcome {
                     Appended::Inserted { id } => Recorded::Inserted { id },
                     Appended::Duplicate { existing } => Recorded::Duplicate { existing },

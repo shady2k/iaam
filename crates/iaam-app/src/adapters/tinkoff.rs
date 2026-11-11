@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -35,8 +36,8 @@ use uuid::Uuid;
 use time::{Date, OffsetDateTime};
 
 use crate::ports::{
-    BrokerChannel, BrokerError, BrokerRequestContext, ParsedOperations, PortfolioAsOf,
-    PortfolioSnapshot, Quarantined,
+    BrokerChannel, BrokerError, BrokerRequestContext, InstrumentDirectory, ParsedOperations,
+    PortfolioAsOf, PortfolioSnapshot, Quarantined,
 };
 
 const BROKER: &str = "tinkoff";
@@ -51,6 +52,7 @@ pub struct TinkoffChannel {
     /// this adapter binds them — using the same approach already used
     /// for SQLite.
     dictionary: OperationKindDictionary,
+    instruments: Arc<dyn InstrumentDirectory>,
 }
 
 impl TinkoffChannel {
@@ -61,13 +63,44 @@ impl TinkoffChannel {
         client: TinkoffClient,
         source: SourceId,
         dictionary: OperationKindDictionary,
+        instruments: Arc<dyn InstrumentDirectory>,
     ) -> Self {
         Self {
             client,
             source,
             dictionary,
+            instruments,
         }
     }
+    async fn known_instruments(&self) -> Result<HashSet<InstrumentId>, BrokerError> {
+        let instruments =
+            self.instruments
+                .list_instruments()
+                .await
+                .map_err(|error| BrokerError::Adapter {
+                    broker: BROKER.to_owned(),
+                    detail: format!("cannot check the instance instrument directory: {error}"),
+                })?;
+        Ok(instruments
+            .into_iter()
+            .map(|instrument| instrument.id)
+            .collect())
+    }
+}
+
+fn unknown_instrument_reason(uid: &str, raw: &serde_json::Value) -> String {
+    let identities = ["figi", "ticker", "isin"]
+        .into_iter()
+        .filter_map(|key| {
+            raw.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(|value| format!("{key} {value}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "instrumentUid {uid} ({identities}) is not recorded in this instance; record the instrument with this UID using POST /v1/instruments before syncing again"
+    )
 }
 
 #[async_trait]
@@ -111,7 +144,55 @@ impl BrokerChannel for TinkoffChannel {
                 .await
         })
         .await?;
-        adapt_operations(account, operations, &self.dictionary)
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "start",
+            rows = operations.len(),
+            strategy = "instance_uid",
+            "broker sync phase"
+        );
+        let known = self.known_instruments().await?;
+        let mut checked = Vec::new();
+        let mut refused = Vec::new();
+        for operation in operations {
+            let unknown = match operation.instrument_uid.as_deref() {
+                Some(uid) => {
+                    Uuid::parse_str(uid).is_ok_and(|id| !known.contains(&InstrumentId(id)))
+                }
+                None => ["figi", "ticker", "isin"].into_iter().any(|key| {
+                    operation
+                        .raw
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                }),
+            };
+            if unknown {
+                refused.push(Quarantined {
+                    reason: unknown_instrument_reason(
+                        operation.instrument_uid.as_deref().unwrap_or("absent"),
+                        &operation.raw,
+                    ),
+                    dimensions: dimensions_for_kind(
+                        &self.dictionary.kind_of(&operation.source_kind),
+                    ),
+                    raw: operation.raw,
+                });
+                continue;
+            }
+            checked.push(operation);
+        }
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "complete",
+            accepted = checked.len(),
+            quarantined = refused.len(),
+            strategy = "instance_uid",
+            "broker sync phase complete"
+        );
+        let mut parsed = adapt_operations(account, checked, &self.dictionary)?;
+        parsed.quarantined.extend(refused);
+        Ok(parsed)
     }
 
     async fn fetch_portfolio(
@@ -136,7 +217,61 @@ impl BrokerChannel for TinkoffChannel {
         // cache. A `Current` portfolio fetched yesterday and served today
         // stays dated yesterday (`iaam-vg8te.1.1`).
         let observed_on = observed_at.map(|moment| OffsetDateTime::from(moment).date());
-        adapt_portfolio(&body, observed_on)
+        let mut snapshot = adapt_portfolio(&body, observed_on)?;
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "start",
+            claims = snapshot.claims.len(),
+            strategy = "instance_uid",
+            "broker sync phase"
+        );
+        let refused_before = snapshot.refused.len();
+        let known = self.known_instruments().await?;
+        let raw: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| unparsable(error.to_string()))?;
+        snapshot.claims.retain(|claim| {
+            let ControlClaim::PositionQuantity { instrument, .. } = claim else {
+                return true;
+            };
+            if known.contains(instrument) {
+                return true;
+            }
+            let uid = instrument.inner().to_string();
+            let row = raw
+                .get("positions")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|positions| {
+                    positions.iter().find(|position| {
+                        position
+                            .get("instrumentUid")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|value| Uuid::parse_str(value).ok())
+                            == Some(instrument.inner())
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"instrumentUid": uid}));
+            snapshot.refused.push(Quarantined {
+                reason: unknown_instrument_reason(
+                    row.get("instrumentUid")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(&uid),
+                    &row,
+                ),
+                raw: row,
+                dimensions: [Dimension::Positions].into_iter().collect(),
+            });
+            false
+        });
+        tracing::info!(
+            phase = "resolve_instruments",
+            status = "complete",
+            claims = snapshot.claims.len(),
+            quarantined = snapshot.refused.len() - refused_before,
+            strategy = "instance_uid",
+            "broker sync phase complete"
+        );
+        Ok(snapshot)
     }
 
     fn channel(&self) -> SourceChannel {
@@ -3238,10 +3373,34 @@ mod tests {
     fn channel(gateway: Arc<dyn Outbound>) -> super::TinkoffChannel {
         let key = Key::from_bytes([5; 32]);
         let token = open(&key, &seal(&key, TOKEN)).expect("token opens");
+        let store = iaam_store::SqliteStore::open_in_memory().expect("instrument directory");
+        for uid in [
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "cccccccc-0000-0000-0000-000000000099",
+            "dddddddd-0000-0000-0000-000000000042",
+            "bbbbbbbb-0000-0000-0000-0000000000c2",
+            "bbbbbbbb-0000-0000-0000-0000000000c4",
+            "dddddddd-0000-0000-0000-000000000098",
+            "bbbbbbbb-0000-0000-0000-0000000000c8",
+        ] {
+            store
+                .upsert_instrument(&iaam_store::reference::InstrumentRecord {
+                    id: InstrumentId(Uuid::parse_str(uid).expect("invented UID")),
+                    kind: None,
+                    symbol: "TEST".to_owned(),
+                    title: "Invented instrument".to_owned(),
+                    currencies: iaam_core::instrument::CurrencyRoles::uniform(
+                        iaam_core::money::CurrencyCode::Rub,
+                    ),
+                    lineage: None,
+                })
+                .expect("seed instrument");
+        }
         super::TinkoffChannel::new(
             TinkoffClient::new(Environment::Prod, token, gateway),
             SourceId(Uuid::from_u128(9)),
             dictionary(),
+            Arc::new(crate::adapters::sqlite::SqliteAdapter::new(store)),
         )
     }
 
@@ -3257,6 +3416,31 @@ mod tests {
                 broker_context(None),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn unknown_instruments_are_refused_before_any_operation_kind_is_mapped() {
+        let missing = "eeeeeeee-0000-0000-0000-000000000001";
+        for kind in [
+            "OPERATION_TYPE_BUY",
+            "OPERATION_TYPE_SELL",
+            "OPERATION_TYPE_COUPON",
+            "OPERATION_TYPE_DIVIDEND",
+            "OPERATION_TYPE_BOND_REPAYMENT_FULL",
+            "OPERATION_TYPE_BOND_REPAYMENT",
+        ] {
+            let body =
+                income_operation(kind).replace("01234567-89ab-cdef-0123-456789abcdef", missing);
+            let (gateway, _, _) = fake::gateway(vec![Answer::status(200, &body)], None);
+            let parsed = fetch(&channel(gateway))
+                .await
+                .expect("unknown instrument is a row refusal");
+            assert!(parsed.accepted.is_empty());
+            assert_eq!(parsed.quarantined.len(), 1);
+            let reason = &parsed.quarantined[0].reason;
+            assert!(reason.contains(missing), "{reason}");
+            assert!(reason.contains("POST /v1/instruments"), "{reason}");
+        }
     }
 
     #[tokio::test]

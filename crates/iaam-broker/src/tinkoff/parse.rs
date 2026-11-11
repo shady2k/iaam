@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime, Time, UtcOffset};
 
 /// T-Invest response parser version, independent of the XLSX parser.
-pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/3";
+pub const TINKOFF_PARSER_VERSION: &str = "tinkoff-api/4";
 
 /// Error while parsing a T-Invest channel response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -143,8 +143,8 @@ pub struct ChannelOperation {
     pub accrued_interest: Option<ChannelMoney>,
     /// Monetary effect of the operation.
     pub payment: Option<ChannelMoney>,
-    /// Price of one unit.
-    pub price: Option<ChannelMoney>,
+    /// Exact price of one unit, without rounding to currency minor units.
+    pub price: Option<CalcMoney>,
     /// Operation commission.
     pub commission: Option<CalcMoney>,
     /// Stable key for the first deduplication stage.
@@ -587,7 +587,7 @@ fn parse_operation(item: RawOperation, raw: Value) -> ChannelOperation {
         &mut rejection,
     );
     let price = keep_or_reject(
-        parse_optional_money(item.price.as_ref(), "price"),
+        parse_optional_calc_money(item.price.as_ref(), "price"),
         &mut rejection,
     );
     let commission = keep_or_reject(

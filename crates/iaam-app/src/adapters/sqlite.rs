@@ -1912,6 +1912,7 @@ fn build_tinkoff_channel(parts: ChannelParts) -> Arc<dyn BrokerChannel> {
         TinkoffClient::new(parts.environment, parts.token, parts.gateway),
         parts.source,
         parts.dictionary,
+        parts.instruments,
     ))
 }
 

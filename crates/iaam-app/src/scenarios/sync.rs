@@ -316,24 +316,6 @@ pub async fn sync_broker(
         None => false,
     };
     tracing::info!(
-        phase = "resolve_instruments",
-        status = "start",
-        strategy = "broker_identity",
-        "using instrument identities supplied by the broker channel"
-    );
-    let operation_rows = parsed.accepted.len();
-    let portfolio_claims = snapshot
-        .as_ref()
-        .map_or(0, |snapshot| snapshot.claims.len());
-    tracing::info!(
-        phase = "resolve_instruments",
-        status = "complete",
-        strategy = "broker_identity",
-        operation_rows,
-        portfolio_claims,
-        "broker channel instrument identities ready"
-    );
-    tracing::info!(
         phase = "map",
         status = "start",
         accepted = parsed.accepted.len(),

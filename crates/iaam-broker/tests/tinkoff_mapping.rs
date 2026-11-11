@@ -45,8 +45,8 @@ fn tinkoff_commission_is_exact_and_does_not_reject_the_trade() -> Result<(), Box
         Some(PostedMinor::new(-27_013))
     );
     assert_eq!(
-        operation.price.as_ref().map(|money| money.amount),
-        Some(PostedMinor::new(27_013))
+        operation.price,
+        Some(CalcMoney::new(dec("270.13"), CurrencyCode::Rub))
     );
     assert_eq!(
         operation.commission,
@@ -78,6 +78,51 @@ fn tinkoff_commission_is_exact_and_does_not_reject_the_trade() -> Result<(), Box
     assert_eq!(
         rejected.raw["payment"]["units"],
         serde_json::Value::String("0".to_owned())
+    );
+    Ok(())
+}
+
+#[test]
+fn keeps_a_sub_minor_unit_price_exact_without_rejecting_the_order() -> Result<(), Box<dyn Error>> {
+    let operations = parse_operations(
+        r#"{
+            "hasNext": false,
+            "items": [{
+                "cursor": "cursor-price",
+                "brokerAccountId": "invented-account",
+                "id": "invented-order",
+                "date": "2026-08-20T10:11:12Z",
+                "type": "OPERATION_TYPE_BUY",
+                "state": "OPERATION_STATE_EXECUTED",
+                "quantityDone": "2",
+                "payment": {"units": "-197", "nano": -530000000, "currency": "rub"},
+                "price": {"units": "98", "nano": 765000000, "currency": "rub"},
+                "tradesInfo": {"trades": [{
+                    "num": "invented-fill",
+                    "date": "2026-08-20T10:11:12Z",
+                    "quantity": "2",
+                    "price": {"units": "98", "nano": 765000000, "currency": "rub"}
+                }]}
+            }]
+        }"#,
+    )?;
+    let operation = &operations[0];
+    assert_eq!(operation.rejection, None);
+    assert_eq!(
+        operation.price,
+        Some(CalcMoney::new(dec("98.765"), CurrencyCode::Rub))
+    );
+    assert_eq!(
+        operation.trades[0].price,
+        operation.price.expect("order price")
+    );
+    let gross =
+        iaam_core::money::gross_for_fill(operation.trades[0].price, operation.trades[0].quantity)?;
+    assert_eq!(gross, CalcMoney::new(dec("197.53"), CurrencyCode::Rub));
+    assert_eq!(gross.rounded_minor()?, PostedMinor::new(19_753));
+    assert_eq!(
+        operation.payment.expect("payment").amount,
+        PostedMinor::new(-19_753)
     );
     Ok(())
 }

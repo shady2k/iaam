@@ -1147,11 +1147,14 @@ async fn a_refused_t_invest_cash_row_gaps_cash_instead_of_positions() {
         ]}}"#,
         instrument_uid = instrument.inner(),
     );
-    let channel = channel_over(ScriptedTinvest {
-        accounts: r#"{"accounts":[{"id":"solo"}]}"#,
-        operations: r#"{"hasNext":false,"items":[]}"#,
-        portfolio,
-    });
+    let channel = channel_over(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[]}"#,
+            portfolio,
+        },
+        &services,
+    );
 
     let outcome = sync_broker(
         &services,
@@ -1246,6 +1249,7 @@ async fn a_refused_row_reaches_the_owner_with_its_reason_and_payload_and_settles
             ),
         },
         source,
+        &services,
     );
 
     let first = sync_broker(
@@ -1336,6 +1340,7 @@ async fn a_refused_row_reaches_the_owner_with_its_reason_and_payload_and_settles
             ),
         },
         source,
+        &services,
     );
     let second = sync_broker(
         &services,
@@ -2204,6 +2209,192 @@ async fn append_checked_rejects_a_batch_before_any_event_is_written() {
             && actual.contains("quantity")
     ));
     assert!(load_all(&services, owner).await.is_empty());
+}
+
+/// Missing reference data must refuse only the affected rows, not roll back
+/// a readable cash deposit from the same broker response (iaam-xzz5.4.1).
+#[tokio::test]
+async fn an_unrecorded_coupon_instrument_is_quarantined_while_a_deposit_is_recorded() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let source = SourceId::new_random();
+    let uid = "bbbbbbbb-0000-0000-0000-000000000001";
+    let channel = channel_over_with(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[
+                {
+                    "cursor":"coupon-cursor", "brokerAccountId":"solo",
+                    "id":"invented-coupon", "date":"2026-03-15T10:00:00Z",
+                    "type":"OPERATION_TYPE_COUPON", "state":"OPERATION_STATE_EXECUTED",
+                    "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000001",
+                    "figi":"BBG_INVENTED_BOND",
+                    "payment":{"units":"25","nano":0,"currency":"rub"}
+                },
+                {
+                    "cursor":"deposit-cursor", "brokerAccountId":"solo",
+                    "id":"invented-deposit", "date":"2026-03-15T11:00:00Z",
+                    "type":"OPERATION_TYPE_INPUT", "state":"OPERATION_STATE_EXECUTED",
+                    "payment":{"units":"100","nano":0,"currency":"rub"}
+                }
+            ]}"#,
+            portfolio: format!(
+                r#"{{"positions":[{{
+                    "instrumentType":"bond", "quantity":{{"units":"1","nano":0}},
+                    "positionUid":"aaaaaaaa-0000-0000-0000-000000000001",
+                    "instrumentUid":"{portfolio_uid}", "figi":"BBG_INVENTED_BOND", "blocked":false
+                }}]}}"#,
+                portfolio_uid = uid.to_uppercase()
+            ),
+        },
+        source,
+        &services,
+    );
+
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("missing reference data must not abort the sync");
+
+    assert_eq!(outcome.set_aside, 2, "{:?}", outcome.recorded);
+    assert_eq!(outcome.assertions, 0, "{:?}", outcome.recorded);
+    let reason = outcome
+        .recorded
+        .iter()
+        .find_map(|verdict| match verdict {
+            Verdict::Quarantined { reason } => Some(reason),
+            _ => None,
+        })
+        .expect("coupon quarantine reaches the owner");
+    for detail in [uid, "BBG_INVENTED_BOND", "POST /v1/instruments"] {
+        assert!(reason.contains(detail), "missing {detail}: {reason}");
+    }
+    let events = load_all(&services, owner).await;
+    let deposits: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::CashIn { amount } => Some(amount),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deposits.len(), 1, "{events:?}");
+    assert_eq!(deposits[0].amount().raw(), 10_000);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. }))
+    );
+
+    let refusals = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source.inner().to_string(),
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .expect("stored refusals");
+    assert_eq!(refusals.len(), 2);
+    assert!(
+        refusals
+            .iter()
+            .any(|refusal| refusal.payload.contains(&uid.to_uppercase())
+                && refusal.reason.contains("BBG_INVENTED_BOND"))
+    );
+
+    let coupon = refusals
+        .iter()
+        .find(|refusal| refusal.payload.contains("invented-coupon"))
+        .expect("coupon raw payload retained");
+    assert_eq!(&coupon.reason, reason);
+}
+
+#[tokio::test]
+async fn a_fractional_unit_price_is_multiplied_before_the_journal_gross_is_posted() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let instrument = InstrumentId(
+        uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-000000000002")
+            .expect("invented instrument UID"),
+    );
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+        seed_instrument(store, instrument, "INVENTEDSHARE");
+    });
+    let channel = channel_over(
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[{
+                "cursor":"trade-cursor", "brokerAccountId":"solo",
+                "id":"invented-priced-buy", "date":"2026-03-15T10:00:00Z",
+                "type":"OPERATION_TYPE_BUY", "state":"OPERATION_STATE_EXECUTED",
+                "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000002",
+                "positionUid":"aaaaaaaa-0000-0000-0000-000000000002",
+                "quantity":"2", "quantityDone":"2", "quantityRest":"0",
+                "price":{"units":"98","nano":765000000,"currency":"rub"},
+                "payment":{"units":"-197","nano":-530000000,"currency":"rub"},
+                "tradesInfo":{"trades":[{
+                    "num":"invented-execution", "date":"2026-03-15T10:00:00Z",
+                    "quantity":"2",
+                    "price":{"units":"98","nano":765000000,"currency":"rub"}
+                }]}
+            }]}"#,
+            portfolio: r#"{"positions":[]}"#.to_owned(),
+        },
+        &services,
+    );
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("priced trade sync");
+    assert_eq!(outcome.set_aside, 0, "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    let trades: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Trade {
+                instrument,
+                quantity,
+                gross,
+                ..
+            } => Some((instrument, quantity, gross)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(trades.len(), 1, "{events:?}");
+    assert_eq!(*trades[0].0, instrument);
+    assert_eq!(
+        *trades[0].1,
+        iaam_core::money::Quantity(Dec::new(rust_decimal::Decimal::from(2)))
+    );
+    assert_eq!(trades[0].2.amount().raw(), 19_753);
+    let trade = events
+        .iter()
+        .find(|event| matches!(event.kind, EventKind::Trade { .. }))
+        .expect("trade");
+    let cash = trade
+        .legs
+        .iter()
+        .find(|leg| leg.kind == iaam_core::event::leg::LegKind::Cash)
+        .expect("cash leg");
+    assert_eq!(cash.money.expect("posted cash").amount().raw(), -19_753);
 }
 
 #[tokio::test]
@@ -3138,7 +3329,12 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    let channel = TinkoffChannel::new(client, SourceId::new_random(), dictionary);
+    let channel = TinkoffChannel::new(
+        client,
+        SourceId::new_random(),
+        dictionary,
+        Arc::clone(&services.directory),
+    );
     let before = load_all(&services, owner).await;
     let started = tokio::time::Instant::now();
 
@@ -3200,14 +3396,18 @@ impl Transport for ThrottlingTinvest {
     }
 }
 
-fn channel_over<T: Transport + 'static>(transport: T) -> TinkoffChannel {
-    channel_over_with(transport, SourceId::new_random())
+fn channel_over<T: Transport + 'static>(transport: T, services: &AppServices) -> TinkoffChannel {
+    channel_over_with(transport, SourceId::new_random(), services)
 }
 
 /// The same channel over a source the caller chooses: two syncs that must
 /// speak for one channel identity — so the second can settle the first's
 /// refusals — build both channels with one `SourceId`.
-fn channel_over_with<T: Transport + 'static>(transport: T, source: SourceId) -> TinkoffChannel {
+fn channel_over_with<T: Transport + 'static>(
+    transport: T,
+    source: SourceId,
+    services: &AppServices,
+) -> TinkoffChannel {
     // The gateway's wall clock dates live answers and cache stamps, and the
     // channel turns the moment into the portfolio's observation date. The
     // tests this helper serves request 2026-03-31 intervals with same-day
@@ -3234,7 +3434,7 @@ fn channel_over_with<T: Transport + 'static>(transport: T, source: SourceId) -> 
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    TinkoffChannel::new(client, source, dictionary)
+    TinkoffChannel::new(client, source, dictionary, Arc::clone(&services.directory))
 }
 
 #[tokio::test]
@@ -3244,9 +3444,12 @@ async fn a_broker_that_stays_throttled_is_unreachable_for_the_minimum_pause() {
     let services = services_with(date!(2026 - 03 - 31), |store| {
         seed_account(store, owner, account, "Main");
     });
-    let channel = channel_over(ThrottlingTinvest {
-        wait: Duration::from_secs(7),
-    });
+    let channel = channel_over(
+        ThrottlingTinvest {
+            wait: Duration::from_secs(7),
+        },
+        &services,
+    );
 
     let refused = sync_broker(
         &services,
@@ -3831,6 +4034,7 @@ fn tinkoff_channel_with_time<T: Transport + 'static>(
     transport: T,
     source: SourceId,
     time: Arc<WallTime>,
+    services: &AppServices,
 ) -> TinkoffChannel {
     let database = broker_egress_database();
     let gateway = Gateway::with_parts_for_database_with_response_cache(
@@ -3848,7 +4052,7 @@ fn tinkoff_channel_with_time<T: Transport + 'static>(
     let (seed_name, seed) = seed_for("tinkoff").expect("a T-Invest seed");
     let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
     assert!(unreadable.is_empty(), "{seed_name}: {unreadable:?}");
-    TinkoffChannel::new(client, source, dictionary)
+    TinkoffChannel::new(client, source, dictionary, Arc::clone(&services.directory))
 }
 
 /// A portfolio fetched on day D and served from the response cache on day
@@ -3880,7 +4084,8 @@ async fn a_cached_portfolio_keeps_the_day_it_was_answered_and_withholds_on_the_n
         ),
         portfolio_asked: Arc::clone(&portfolio_asked),
     };
-    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+    let channel =
+        tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time), &day_d);
 
     // Day D, half past eleven at night: the live read is dated 23:20 UTC
     // and stored in the cache. The sync asked [D, D], and the answer
@@ -3963,7 +4168,8 @@ async fn a_same_day_served_cached_portfolio_still_records_its_claims() {
         ),
         portfolio_asked: Arc::clone(&portfolio_asked),
     };
-    let channel = tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time));
+    let channel =
+        tinkoff_channel_with_time(transport, SourceId::new_random(), Arc::clone(&time), &first);
 
     // Day E at ten in the morning: the live read populates the cache.
     let first_sync = sync_broker(

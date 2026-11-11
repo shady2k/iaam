@@ -1516,8 +1516,13 @@ async fn exercise_tinkoff_sync() -> Scenario {
     }
     let scenario = Scenario::new_sync("tinkoff-real-sync", Destination::TinkoffProd, replies);
     let client = TinkoffClient::new(Environment::Prod, token(), Arc::clone(&scenario.outbound));
-    let channel = TinkoffChannel::new(client, SourceId::new_random(), dictionary("tinkoff"));
     let (services, principal, account) = services().await;
+    let channel = TinkoffChannel::new(
+        client,
+        SourceId::new_random(),
+        dictionary("tinkoff"),
+        Arc::clone(&services.directory),
+    );
     let result = iaam_app::sync::sync_broker(
         &services,
         &principal,

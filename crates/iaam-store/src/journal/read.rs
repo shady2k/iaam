@@ -1204,21 +1204,24 @@ mod tests {
     /// prepared statement actually run, so this counts statements, not
     /// rows, and is oblivious to how large `ids` is.
     fn hydrate_and_count(store: &mut SqliteStore, ids: &[EventId]) -> (usize, usize) {
-        if let Err(e) = store
+        let armed = store
             .connection_mut()
-            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement))
-        {
-            panic!("the statement tracer could not be set: {e}");
-        }
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement));
+        assert!(
+            armed.is_ok(),
+            "the statement tracer could not be set: {armed:?}"
+        );
         TRACE_COUNT.store(0, Ordering::SeqCst);
         let events = hydrate(store.connection(), ids).expect("hydrate");
         let statements = TRACE_COUNT.load(Ordering::SeqCst);
-        if let Err(e) = store.connection_mut().trace_v2(
+        let disarmed = store.connection_mut().trace_v2(
             TraceEventCodes::SQLITE_TRACE_STMT,
             None::<fn(TraceEvent<'_>)>,
-        ) {
-            panic!("the statement tracer could not be set: {e}");
-        }
+        );
+        assert!(
+            disarmed.is_ok(),
+            "the statement tracer could not be cleared: {disarmed:?}"
+        );
         (statements, events.len())
     }
 

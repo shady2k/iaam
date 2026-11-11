@@ -47,6 +47,7 @@ iaam-store = { path = "../iaam-store", version = "0.1.0", features = ["test-supp
 # Reuses iaam-http's loopback server and real-client wrapper in acceptance
 # tests; the production dependency above does not enable the seam.
 iaam-http = { path = "../iaam-http", version = "0.1.0", features = ["test-support"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [lints]
 workspace = true

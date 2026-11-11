@@ -295,6 +295,16 @@ pub async fn sync_broker(
         }
         None => false,
     };
+    tracing::info!(
+        phase = "resolve_instruments",
+        instruments = 0,
+        "broker sync phase complete"
+    );
+    tracing::info!(
+        phase = "map",
+        accepted = parsed.accepted.len(),
+        "broker sync phase start"
+    );
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -326,7 +336,8 @@ pub async fn sync_broker(
             .map(|snapshot| snapshot.refused.as_slice())
             .unwrap_or_default(),
     );
-    for row in quarantined {
+    for (row_index, row) in quarantined.enumerate() {
+        tracing::debug!(phase = "map", row_index, operation_type = "quarantined", reason = %row.reason, "broker sync row set aside");
         let key = SourceRowKey {
             source: channel.source,
             row: fingerprint_of(&row.raw),
@@ -345,7 +356,14 @@ pub async fn sync_broker(
         ));
     }
 
-    for operation in parsed.accepted {
+    tracing::info!(phase = "map", status = "complete", "broker sync phase");
+    tracing::info!(
+        phase = "write",
+        rows = parsed.accepted.len(),
+        "broker sync phase start"
+    );
+    for (row_index, operation) in parsed.accepted.into_iter().enumerate() {
+        tracing::debug!(phase = "map", row_index, operation_type = ?operation.kind, reason = "normalization/write candidate", "broker sync row mapped");
         let context = DocumentContext {
             account: operation.account,
             document: None,
@@ -512,6 +530,11 @@ pub async fn sync_broker(
             binding_recorded,
         });
     };
+    tracing::info!(
+        phase = "write",
+        rows = recorded.len(),
+        "broker sync phase complete"
+    );
     let assertions_withheld = match snapshot.as_of {
         PortfolioAsOf::Requested => None,
         PortfolioAsOf::Current => {
@@ -546,6 +569,11 @@ pub async fn sync_broker(
         });
     }
 
+    tracing::info!(
+        phase = "assertions",
+        claims = snapshot.claims.len(),
+        "broker sync phase start"
+    );
     let mut assertions = 0;
     for (index, claim) in snapshot.claims.into_iter().enumerate() {
         let mut event = assertion_event(

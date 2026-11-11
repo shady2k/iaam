@@ -484,6 +484,19 @@ pub async fn sync_broker(
         let verdict = match (possible_duplicate, event_id_from_verdict(&verdict)) {
             (Some((of, level)), Some(event)) => {
                 possible_duplicates += 1;
+                tracing::debug!(
+                    phase = "map",
+                    row_index,
+                    operation_type = operation_kind_name(&operation.kind),
+                    verdict = "possible_duplicate",
+                    source_operation_id = ?operation.source_operation_id,
+                    dedup_level = level.number(),
+                    match_basis = "canonical_fingerprint",
+                    matched_fields = ?dedup::fingerprint_fields(&operation),
+                    event = %event.inner(),
+                    existing_event = %of.inner(),
+                    "broker sync possible duplicate (present fields covered by equal fingerprints)"
+                );
                 Verdict::PossibleDuplicate { event, of, level }
             }
             _ => verdict,
@@ -655,6 +668,18 @@ pub async fn sync_broker(
         let verdict = match (decision, event_id_from_verdict(&verdict)) {
             (DedupDecision::PossibleDuplicate { of, level }, Some(event)) => {
                 possible_duplicates += 1;
+                tracing::debug!(
+                    phase = "map",
+                    row_index,
+                    verdict = "possible_duplicate",
+                    source_operation_id = ?submitted.source_operation_id,
+                    dedup_level = level.number(),
+                    match_basis = "canonical_fingerprint",
+                    matched_fields = ?dedup::journal_fingerprint_fields(&submitted),
+                    event = %event.inner(),
+                    existing_event = %of.inner(),
+                    "broker sync possible duplicate (present fields covered by equal fingerprints)"
+                );
                 Verdict::PossibleDuplicate { event, of, level }
             }
             _ => verdict,

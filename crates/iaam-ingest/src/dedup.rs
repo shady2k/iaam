@@ -294,6 +294,52 @@ pub fn canonical_form(operation: &SubmittedOperation) -> String {
     serde_json::to_string(&canonical).unwrap_or_else(|_| unrepresentable_operation())
 }
 
+/// Present canonical field names covered by an operation fingerprint.
+///
+/// Diagnostic evidence for a level-five hint: equality is checked on the whole
+/// fingerprint, not independently on these fields. Null/absent fields and the
+/// internal format version are omitted. Only names are returned, never values.
+#[must_use]
+pub fn fingerprint_fields(operation: &SubmittedOperation) -> Vec<String> {
+    canonical_field_names(&canonical_form(operation))
+}
+
+/// Present canonical field names covered by a journal-fact fingerprint.
+///
+/// Uses the same diagnostic convention as [`fingerprint_fields`].
+#[must_use]
+pub fn journal_fingerprint_fields(submitted: &SubmittedJournalEvent) -> Vec<String> {
+    canonical_field_names(&canonical_journal_form(submitted))
+}
+
+fn canonical_field_names(canonical: &str) -> Vec<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(canonical).expect("canonical form is serialized JSON");
+    let mut fields = Vec::new();
+    if let serde_json::Value::Object(object) = value {
+        for (name, value) in object {
+            if name != "v" {
+                collect_field_names(&name, &value, &mut fields);
+            }
+        }
+    }
+    fields
+}
+
+fn collect_field_names(path: &str, value: &serde_json::Value, fields: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Object(object) => {
+            for (name, value) in object {
+                collect_field_names(&format!("{path}.{name}"), value, fields);
+            }
+        }
+        // An array is one field (including dates in journal facts), not a list
+        // of value-dependent index names.
+        _ => fields.push(path.to_owned()),
+    }
+}
+
 /// Fingerprint of a normalized record (§10.6, level three).
 #[must_use]
 pub fn fingerprint(operation: &SubmittedOperation) -> RawHash {

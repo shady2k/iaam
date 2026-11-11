@@ -1177,6 +1177,28 @@ the broker's refusal message. Other rows continue. New catalogue steps log
 counts at `info`; each set-aside row logs its reason at `debug`. These logs
 contain neither monetary amounts nor tokens.
 
+T-Invest operation fetching also reports the number of pages and source items
+received. Its final accounting separates accepted **source rows**, quarantined
+source rows and reductions by reason. These counts balance as
+`received = source_rows_accepted + quarantined + reduced`. The number of
+emitted operations is separate: an order with several execution fills can
+emit several operations from one source row.
+
+The current adapter does not merge parent orders or fold child operations,
+and it does not discard non-executed rows as a filter. Unusable states are
+quarantined. A trade with no execution fills can emit no operations; this
+existing reduction is logged as `no_execution_trades`. No mapping or
+filtering rule is changed by the accounting logs. Each reduced row logs its
+source operation id, source type and fixed reason code at `debug`; quarantine
+counts are also broken down by reason.
+
+Possible-duplicate diagnostics name the deduplication level (`5` for the
+probabilistic hint) and the present canonical fingerprint fields that matched. This is fingerprint equality, not an
+independent field-by-field match, and it does not discard the operation.
+The diagnostics contain field names, never their values or the fingerprint.
+Enable the relevant application's `debug` logging to inspect individual rows;
+aggregate operation counts are available at `info`.
+
 ---
 
 ## 7. Tokens

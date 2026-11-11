@@ -1768,6 +1768,23 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
         existing.provenance.source_operation_id()
     );
 
+    let amount_values = match &operation.kind {
+        OperationKind::Buy {
+            gross_minor,
+            fee_minor,
+            ..
+        } => [Some(*gross_minor), *fee_minor],
+        _ => panic!("fixture must be a trade"),
+    };
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
     let broker = api(account, SourceId::new_random(), operation);
     let outcome = sync_broker(
         &services,
@@ -1797,6 +1814,40 @@ async fn a_renumbered_operation_is_recorded_as_a_possible_duplicate() {
             .any(|record| record.id == *event),
         "possible duplicate event must be recorded"
     );
+
+    let logs = String::from_utf8(captured.0.lock().expect("duplicate log buffer").clone())
+        .expect("UTF-8 logs");
+    let line = logs
+        .lines()
+        .find(|line| line.contains("verdict=\"possible_duplicate\""))
+        .unwrap_or_else(|| panic!("missing possible duplicate diagnostic: {logs}"));
+    for field in [
+        "dedup_level=5",
+        "match_basis=\"canonical_fingerprint\"",
+        "REN_NUMBERED-2",
+        "matched_fields=",
+        "account",
+        "dates.trade",
+        "kind.Buy.instrument",
+        "kind.Buy.gross_minor",
+        "kind.Buy.currency",
+    ] {
+        assert!(line.contains(field), "missing {field}: {line}");
+    }
+    assert!(
+        !line.contains("dates.paid"),
+        "absent date must not be claimed: {line}"
+    );
+    assert!(
+        !line.contains("kind.Buy.basis_fee"),
+        "absent fee must not be claimed: {line}"
+    );
+    for amount in amount_values.into_iter().flatten() {
+        assert!(
+            !line.contains(&amount.to_string()),
+            "amount value leaked: {line}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5208,4 +5259,233 @@ async fn a_same_day_served_cached_portfolio_still_records_its_claims() {
             .any(|event| matches!(event.kind, EventKind::ControlAssertion { .. })),
         "a same-day portfolio is still recorded as a claim"
     );
+}
+
+struct AccountingPagesTinvest {
+    pages: Vec<String>,
+    asked: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl Transport for AccountingPagesTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            return Ok(HttpResponse {
+                status: 200,
+                body: invented_description(request).into_bytes(),
+                ..Default::default()
+            });
+        }
+        assert!(request.path().ends_with("/GetOperationsByCursor"));
+        let body: serde_json::Value =
+            serde_json::from_str(request.body().expect("operations request body").payload())
+                .expect("operations request JSON");
+        let mut asked = self.asked.lock().expect("requested cursors");
+        let page = self
+            .pages
+            .get(asked.len())
+            .expect("only two pages requested");
+        asked.push(body["cursor"].as_str().map(str::to_owned));
+        Ok(HttpResponse {
+            status: 200,
+            body: page.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct AccountingLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for AccountingLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("accounting log buffer")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn operation_pages_account_for_source_rows_without_counting_trade_fills_as_rows() {
+    let account = AccountId::new_random();
+    let instrument = InstrumentId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_instrument(store, instrument, "ACCOUNTING");
+    });
+    let row = |id: &str, kind: &str, state: &str| {
+        serde_json::json!({
+            "id": id, "cursor": id, "brokerAccountId": "invented-account",
+            "date": "2026-03-15T10:00:00Z", "type": kind, "state": state,
+            "quantityDone": "0"
+        })
+    };
+    let no_buy = row(
+        "no-buy-fills",
+        "OPERATION_TYPE_BUY",
+        "OPERATION_STATE_PROGRESS",
+    );
+    let no_sell = row(
+        "no-sell-fills",
+        "OPERATION_TYPE_SELL",
+        "OPERATION_STATE_CANCELED",
+    );
+    let mut deposit = row(
+        "deposit",
+        "OPERATION_TYPE_INPUT",
+        "OPERATION_STATE_EXECUTED",
+    );
+    deposit["payment"] = serde_json::json!({"units":"10", "nano":0, "currency":"rub"});
+    let mut cancelled = deposit.clone();
+    cancelled["id"] = "cancelled-deposit".into();
+    cancelled["state"] = "OPERATION_STATE_CANCELED".into();
+    let mut malformed = deposit.clone();
+    malformed["id"] = "sub-minor-payment".into();
+    malformed["payment"]["nano"] = 1.into();
+    let mut trade = row(
+        "two-fills",
+        "OPERATION_TYPE_BUY",
+        "OPERATION_STATE_EXECUTED",
+    );
+    trade["instrumentUid"] = instrument.inner().to_string().into();
+    trade["positionUid"] = "invented-position".into();
+    trade["quantityDone"] = "2".into();
+    trade["payment"] = serde_json::json!({"units":"-20", "nano":0, "currency":"rub"});
+    trade["tradesInfo"] = serde_json::json!({"trades":[
+        {"num":"fill-one", "date":"2026-03-15T10:00:00Z", "quantity":"1",
+         "price":{"units":"10", "nano":0, "currency":"rub"}},
+        {"num":"fill-two", "date":"2026-03-15T10:01:00Z", "quantity":"1",
+         "price":{"units":"10", "nano":0, "currency":"rub"}}
+    ]});
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let channel = channel_over(
+        AccountingPagesTinvest {
+            pages: vec![
+                serde_json::json!({"hasNext":true, "nextCursor":"page-two",
+                "items":[no_buy, deposit, cancelled]})
+                .to_string(),
+                serde_json::json!({"hasNext":false, "items":[no_sell, malformed, trade]})
+                    .to_string(),
+            ],
+            asked: Arc::clone(&asked),
+        },
+        &services,
+    );
+    let writer = AccountingLogWriter::default();
+    let captured = writer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let result = channel
+        .fetch_operations(
+            account,
+            "invented-account",
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+            BrokerRequestContext {
+                deadline: None,
+                allowance: &RequestAllowance::new(20),
+            },
+        )
+        .await
+        .expect("read both invented operation pages");
+    assert_eq!(
+        *asked.lock().expect("requested cursors"),
+        vec![None, Some("page-two".to_owned())]
+    );
+    assert_eq!(result.accepted.len(), 3, "deposit and two execution fills");
+    assert!(result.journal.is_empty());
+    assert!(result.pending_redemptions.is_empty());
+    assert_eq!(result.quarantined.len(), 2);
+    assert!(
+        result
+            .quarantined
+            .iter()
+            .any(|row| row.raw["id"] == "cancelled-deposit")
+    );
+    assert!(
+        result
+            .quarantined
+            .iter()
+            .any(|row| row.raw["id"] == "sub-minor-payment")
+    );
+    let logs = String::from_utf8(captured.0.lock().expect("accounting log buffer").clone())
+        .expect("UTF-8 logs");
+    // The source-row equation is 6 = 2 accepted + 2 quarantined + 2 reduced.
+    // Three emitted operations must not be substituted for the two accepted rows.
+    let summary = logs
+        .lines()
+        .find(|line| {
+            line.contains("phase=\"fetch_operations\"") && line.contains("status=\"complete\"")
+        })
+        .unwrap_or_else(|| panic!("missing source-row summary: {logs}"));
+    for field in [
+        "received=6",
+        "source_rows_accepted=2",
+        "quarantined=2",
+        "reduced_no_execution_trades=2",
+        "emitted_operations=3",
+        "quarantined_parse=1",
+        "quarantined_order_state=1",
+        "quarantined_instrument_resolution=0",
+        "quarantined_securities_transfer=0",
+        "quarantined_trade=0",
+        "quarantined_conversion=0",
+    ] {
+        assert!(summary.contains(field), "missing {field}: {summary}");
+    }
+    let pages = logs
+        .lines()
+        .find(|line| {
+            line.contains("phase=\"fetch_operation_pages\"") && line.contains("status=\"complete\"")
+        })
+        .unwrap_or_else(|| panic!("missing page summary: {logs}"));
+    assert!(pages.contains("pages_fetched=2"), "{pages}");
+    assert!(pages.contains("received=6"), "{pages}");
+    let page_logs = logs
+        .lines()
+        .filter(|line| line.contains("DEBUG") && line.contains("phase=\"fetch_operation_pages\""))
+        .collect::<Vec<_>>();
+    assert_eq!(page_logs.len(), 2, "{logs}");
+    for (index, line) in page_logs.iter().enumerate() {
+        assert!(line.contains(&format!("page={}", index + 1)), "{line}");
+        assert!(line.contains("received=3"), "{line}");
+    }
+    for (id, kind) in [
+        ("no-buy-fills", "OPERATION_TYPE_BUY"),
+        ("no-sell-fills", "OPERATION_TYPE_SELL"),
+    ] {
+        let line = logs
+            .lines()
+            .find(|line| {
+                line.contains("DEBUG") && line.contains(id) && line.contains("no_execution_trades")
+            })
+            .unwrap_or_else(|| panic!("missing reduction diagnostic for {id}: {logs}"));
+        assert!(line.contains(kind), "missing source operation type: {line}");
+    }
+    for (id, reason) in [
+        ("sub-minor-payment", "parse"),
+        ("cancelled-deposit", "order_state"),
+    ] {
+        let line = logs
+            .lines()
+            .find(|line| line.contains("DEBUG") && line.contains(&format!("operation_id=\"{id}\"")))
+            .unwrap_or_else(|| panic!("missing quarantine diagnostic for {id}: {logs}"));
+        assert!(
+            line.contains("source_kind=\"OPERATION_TYPE_INPUT\""),
+            "{line}"
+        );
+        assert!(line.contains(&format!("reason=\"{reason}\"")), "{line}");
+    }
 }

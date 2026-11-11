@@ -78,6 +78,85 @@ fn recorded(operation: &SubmittedOperation, context: &DocumentContext) -> KnownR
 }
 
 #[test]
+fn fingerprint_diagnostics_name_present_fields_without_exposing_values() {
+    let mut operation = deposit(AccountId::new_random(), 987_654_321);
+    operation.source_operation_id = Some("private-source-id".to_owned());
+    operation.idempotency_key = Some("private-client-key".to_owned());
+    let before = fingerprint(&operation);
+
+    assert_eq!(
+        iaam_ingest::dedup::fingerprint_fields(&operation),
+        [
+            "account",
+            "dates.cash_posted",
+            "kind.Deposit.amount_minor",
+            "kind.Deposit.currency",
+        ]
+    );
+    assert_eq!(fingerprint(&operation), before);
+
+    operation.kind = OperationKind::Income {
+        instrument: None,
+        gross_minor: 123_456,
+        currency: CurrencyCode::Rub,
+        kind: None,
+    };
+    assert_eq!(
+        iaam_ingest::dedup::fingerprint_fields(&operation),
+        [
+            "account",
+            "dates.cash_posted",
+            "kind.Income.currency",
+            "kind.Income.gross_minor",
+        ]
+    );
+    operation.kind = OperationKind::Income {
+        instrument: Some(InstrumentId::new_random()),
+        gross_minor: 123_456,
+        currency: CurrencyCode::Rub,
+        kind: None,
+    };
+    assert!(
+        iaam_ingest::dedup::fingerprint_fields(&operation)
+            .contains(&"kind.Income.instrument".to_owned())
+    );
+}
+
+#[test]
+fn journal_fingerprint_diagnostics_follow_the_fact_schema() {
+    use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId};
+    use iaam_core::money::Quantity;
+    use iaam_ingest::journal_event::{JournalFact, SubmittedJournalEvent};
+
+    let submitted = SubmittedJournalEvent {
+        account: AccountId::new_random(),
+        fact: JournalFact::OfferExercise {
+            action: OfferExerciseAction::Cancelled {
+                submission: OfferSubmissionId::new_random(),
+                quantity: Quantity::zero(),
+            },
+            day: date!(2026 - 04 - 01),
+        },
+        idempotency_key: Some("private-client-key".to_owned()),
+        source_operation_id: Some("private-source-id".to_owned()),
+    };
+    let before = iaam_ingest::dedup::fingerprint_journal_event(&submitted);
+    assert_eq!(
+        iaam_ingest::dedup::journal_fingerprint_fields(&submitted),
+        [
+            "account",
+            "fact.OfferExercise.action.Cancelled.quantity",
+            "fact.OfferExercise.action.Cancelled.submission",
+            "fact.OfferExercise.day",
+        ]
+    );
+    assert_eq!(
+        iaam_ingest::dedup::fingerprint_journal_event(&submitted),
+        before
+    );
+}
+
+#[test]
 fn the_strongest_available_key_wins() {
     // Hierarchy from strongest to weakest: a stable source identifier
     // is stronger than a client key, and a client key is stronger than a file location.

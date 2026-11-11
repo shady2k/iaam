@@ -209,6 +209,7 @@ impl BrokerChannel for TinkoffChannel {
                 .await
         })
         .await?;
+        let received = operations.len();
         tracing::info!(
             phase = "resolve_instruments",
             status = "start",
@@ -241,6 +242,11 @@ impl BrokerChannel for TinkoffChannel {
                         operation.instrument_uid = Some(instrument.inner().to_string())
                     }
                     Err(reason) => {
+                        trace_quarantined_operation(
+                            &operation.operation_id,
+                            &operation.source_kind,
+                            "instrument_resolution",
+                        );
                         tracing::debug!(
                             phase = "resolve_instruments",
                             reason,
@@ -267,8 +273,27 @@ impl BrokerChannel for TinkoffChannel {
             strategy = "broker_description_isin",
             "broker sync phase complete"
         );
-        let mut parsed = adapt_operations(account, checked, &self.dictionary)?;
+        let (mut parsed, accounting) =
+            adapt_operations_accounted(account, checked, &self.dictionary)?;
+        let quarantined_instrument_resolution = refused.len();
         parsed.quarantined.extend(refused);
+        tracing::info!(
+            phase = "fetch_operations",
+            status = "complete",
+            received,
+            source_rows_accepted = accounting.source_rows_accepted,
+            quarantined = parsed.quarantined.len(),
+            quarantined_instrument_resolution,
+            quarantined_parse = accounting.quarantined_parse,
+            quarantined_securities_transfer = accounting.quarantined_securities_transfer,
+            quarantined_order_state = accounting.quarantined_order_state,
+            quarantined_trade = accounting.quarantined_trade,
+            quarantined_conversion = accounting.quarantined_conversion,
+            reduced_no_execution_trades = accounting.reduced_no_execution_trades,
+            emitted_operations =
+                parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
+            "T-Invest operations accounted"
+        );
         Ok(parsed)
     }
 
@@ -592,8 +617,21 @@ where
             .map_err(|error| after_pages(tinkoff_error(error), fetched))?;
         fetched += 1;
         let page = parse_operations(&body).map_err(parse_error)?;
+        tracing::debug!(
+            phase = "fetch_operation_pages",
+            page = fetched,
+            received = page.operations.len(),
+            "T-Invest operation page received"
+        );
         operations.extend(page.operations);
         if !page.has_next {
+            tracing::info!(
+                phase = "fetch_operation_pages",
+                status = "complete",
+                pages_fetched = fetched,
+                received = operations.len(),
+                "T-Invest operation pages fetched"
+            );
             return Ok(operations);
         }
         let Some(cursor) = page.next_cursor else {
@@ -657,11 +695,31 @@ impl RowRefusal {
     }
 }
 
+#[derive(Debug, Default)]
+struct OperationAccounting {
+    source_rows_accepted: usize,
+    reduced_no_execution_trades: usize,
+    quarantined_parse: usize,
+    quarantined_securities_transfer: usize,
+    quarantined_order_state: usize,
+    quarantined_trade: usize,
+    quarantined_conversion: usize,
+}
+
+#[cfg(test)]
 fn adapt_operations(
     account: AccountId,
     operations: Vec<ChannelOperation>,
     dictionary: &OperationKindDictionary,
 ) -> Result<ParsedOperations, BrokerError> {
+    adapt_operations_accounted(account, operations, dictionary).map(|(parsed, _)| parsed)
+}
+
+fn adapt_operations_accounted(
+    account: AccountId,
+    operations: Vec<ChannelOperation>,
+    dictionary: &OperationKindDictionary,
+) -> Result<(ParsedOperations, OperationAccounting), BrokerError> {
     // An empty dictionary means an unconfigured channel, not an unknown broker.
     // Without this check, the owner would receive a rejection for every code
     // separately and investigate the broker instead of the configuration.
@@ -674,11 +732,35 @@ fn adapt_operations(
     let mut journal = Vec::new();
     let mut pending_redemptions = Vec::new();
     let mut quarantined = Vec::new();
+    let mut accounting = OperationAccounting::default();
+    let source_rows = operations.len();
     for mut operation in operations {
+        let operation_id = if operation.operation_id.is_empty() {
+            operation
+                .raw
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            operation.operation_id.clone()
+        };
+        let source_kind = if operation.source_kind.is_empty() {
+            operation
+                .raw
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        } else {
+            operation.source_kind.clone()
+        };
         // Take the payload before moving the operation into conversion; no later stage reads it.
         let raw = std::mem::take(&mut operation.raw);
         let kind = dictionary.kind_of(&operation.source_kind);
         if let Some(rejection) = operation.rejection.as_ref() {
+            accounting.quarantined_parse += 1;
+            trace_quarantined_operation(&operation_id, &source_kind, "parse");
             let dimensions = if operation.source_kind.is_empty() {
                 all_dimensions()
             } else {
@@ -693,6 +775,8 @@ fn adapt_operations(
         }
 
         if let Some(reason) = securities_transfer_reason(&kind) {
+            accounting.quarantined_securities_transfer += 1;
+            trace_quarantined_operation(&operation_id, &source_kind, "securities_transfer");
             quarantined.push(Quarantined {
                 raw,
                 reason: reason.to_owned(),
@@ -701,6 +785,8 @@ fn adapt_operations(
             continue;
         }
         if let Some(reason) = order_state_reason(&kind, &operation.state) {
+            accounting.quarantined_order_state += 1;
+            trace_quarantined_operation(&operation_id, &source_kind, "order_state");
             quarantined.push(Quarantined {
                 raw,
                 reason,
@@ -722,27 +808,35 @@ fn adapt_operations(
             {
                 match pending_redemption(account, &operation, raw.to_string()) {
                     Ok(pending) => pending_redemptions.push(pending),
-                    Err(error) => quarantined.push(Quarantined {
-                        raw,
-                        reason: error.to_string(),
-                        dimensions: cash_positions(),
-                    }),
+                    Err(error) => {
+                        trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                        quarantined.push(Quarantined {
+                            raw,
+                            reason: error.to_string(),
+                            dimensions: cash_positions(),
+                        });
+                    }
                 }
                 continue;
             }
             match redemption_to_journal(account, operation) {
                 Ok(event) => journal.push(event),
-                Err(RowRefusal::Row { reason, .. }) => quarantined.push(Quarantined {
-                    raw,
-                    reason,
-                    dimensions: cash_positions(),
-                }),
+                Err(RowRefusal::Row { reason, .. }) => {
+                    trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions: cash_positions(),
+                    });
+                }
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
             }
         } else if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
             if let Some(reason) = trade_row_reason(&operation, &kind) {
+                accounting.quarantined_trade += 1;
+                trace_quarantined_operation(&operation_id, &source_kind, "trade");
                 quarantined.push(Quarantined {
                     raw,
                     reason,
@@ -754,12 +848,27 @@ fn adapt_operations(
             match trade_operations(account, operation, kind)
                 .map_err(|error| error.with_dimensions(dimensions))
             {
-                Ok(operations) => accepted.extend(operations),
-                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
-                    raw,
-                    reason,
-                    dimensions,
-                }),
+                Ok(operations) => {
+                    if operations.is_empty() {
+                        accounting.reduced_no_execution_trades += 1;
+                        tracing::debug!(
+                            phase = "map_operations",
+                            operation_id,
+                            source_kind,
+                            reason = "no_execution_trades",
+                            "T-Invest operation reduced"
+                        );
+                    }
+                    accepted.extend(operations);
+                }
+                Err(RowRefusal::Row { reason, dimensions }) => {
+                    trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions,
+                    });
+                }
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
@@ -770,23 +879,46 @@ fn adapt_operations(
                 .map_err(|error| error.with_dimensions(dimensions))
             {
                 Ok(operation) => accepted.push(operation),
-                Err(RowRefusal::Row { reason, dimensions }) => quarantined.push(Quarantined {
-                    raw,
-                    reason,
-                    dimensions,
-                }),
+                Err(RowRefusal::Row { reason, dimensions }) => {
+                    trace_quarantined_operation(&operation_id, &source_kind, "conversion");
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions,
+                    });
+                }
                 Err(error @ RowRefusal::Adapter(_)) => {
                     return Err(error.into_broker_error());
                 }
             }
         }
     }
-    Ok(ParsedOperations {
-        accepted,
-        journal,
-        pending_redemptions,
-        quarantined,
-    })
+    accounting.source_rows_accepted =
+        source_rows - quarantined.len() - accounting.reduced_no_execution_trades;
+    accounting.quarantined_conversion = quarantined.len()
+        - accounting.quarantined_parse
+        - accounting.quarantined_securities_transfer
+        - accounting.quarantined_order_state
+        - accounting.quarantined_trade;
+    Ok((
+        ParsedOperations {
+            accepted,
+            journal,
+            pending_redemptions,
+            quarantined,
+        },
+        accounting,
+    ))
+}
+
+fn trace_quarantined_operation(operation_id: &str, source_kind: &str, reason: &'static str) {
+    tracing::debug!(
+        phase = "map_operations",
+        operation_id,
+        source_kind,
+        reason,
+        "T-Invest operation quarantined"
+    );
 }
 
 fn all_dimensions() -> BTreeSet<Dimension> {

@@ -1,44 +1,100 @@
 {
   "strength": "block-new",
   "currentMilestone": "m-broker-api",
-  "milestoneLabels": ["m-broker-api"],
-  "areaLabels": ["area-broker", "area-journal", "area-reports", "area-process"],
+  "milestoneLabels": [
+    "m-broker-api"
+  ],
+  "areaLabels": [
+    "area-broker",
+    "area-journal",
+    "area-reports",
+    "area-process"
+  ],
   "roadmapLabels": [],
-  "triageLabels": ["agent-field-report", "agent-report", "import-field-report", "api-contract", "design", "human"],
-  "ideaLabels": ["idea"],
-  "ideaTitlePrefixes": ["Brainstorming:"],
-  "findingLabels": ["findings"],
+  "triageLabels": [
+    "agent-field-report",
+    "agent-report",
+    "import-field-report",
+    "api-contract",
+    "design",
+    "human"
+  ],
+  "ideaLabels": [
+    "idea"
+  ],
+  "ideaTitlePrefixes": [
+    "Brainstorming:"
+  ],
+  "findingLabels": [
+    "findings"
+  ],
   "findingBudget": 27,
   "staleDays": 14,
   "holdDays": 2,
   "bulkCluster": 20,
   "timeRecordsExempt": [],
-  "presentDocuments": ["AGENTS.md", "CLAUDE.md", "README.md", "docs/glossary-ru-en.md", "docs/backlog-integration.md", "docs/api/conventions.md", "docs/import-boundary.md", "docs/irreversible-core.md", "docs/deployment.md", "docs/agent-skill/SKILL.md"],
-  "presentAreas": ["crates"],
-  "presentIgnores": ["skills/"],
+  "agreementExempt": [
+    "iaam-xzz5"
+  ],
+  "codePaths": [],
+  "presentDocuments": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "docs/glossary-ru-en.md",
+    "docs/backlog-integration.md",
+    "docs/api/conventions.md",
+    "docs/import-boundary.md",
+    "docs/irreversible-core.md",
+    "docs/deployment.md",
+    "docs/agent-skill/SKILL.md"
+  ],
+  "presentAreas": [
+    "crates"
+  ],
+  "presentIgnores": [
+    "skills/"
+  ],
   "presentChurnCommits": 20,
   "execution": {
     "development": "tdd",
     "runMode": "worker-sessions",
     "maxBranchDays": 2,
-    "landing": "push",
+    "landing": "pull-request",
     "maxWorkers": 3,
     "mutationBudgetMinutes": 10,
     "mutationFallback": "escalate",
     "reviewPreference": "different-model",
-    "reviewFallback": "same-model independent reviewer"
+    "reviewFallback": "same-model independent reviewer",
+    "wayOfWorking": "github-flow"
   },
   "jev": {
     "consent": true,
     "route": "openrouter",
     "idPattern": "\\biaam-(?!(?:app|bootstrap|broker|core|http|ingest|market|oracle|server|store)\\b)[a-z0-9]{3,5}(?:\\.[0-9]+)*\\b",
     "maskPatterns": [
-      {"name": "card", "pattern": "\\b\\d{4}(?:[ -]?\\d{4}){3}\\b"},
-      {"name": "account", "pattern": "\\b\\d{12,20}\\b"}
-    ]
+      {
+        "name": "card",
+        "pattern": "\\b\\d{4}(?:[ -]?\\d{4}){3}\\b"
+      },
+      {
+        "name": "account",
+        "pattern": "\\b\\d{12,20}\\b"
+      }
+    ],
+    "sure": 0.9,
+    "model": "jev-1.13"
   },
+  "notifyPushes": false,
   "scope": "personal",
   "artifactLanguage": "en",
-  "projectWords": ["iaam", "IAAM"],
-  "trackerWords": ["beads", "br "]
+  "openQuestions": "one-at-a-time",
+  "projectWords": [
+    "iaam",
+    "IAAM"
+  ],
+  "trackerWords": [
+    "beads",
+    "br "
+  ]
 }

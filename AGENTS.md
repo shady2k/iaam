@@ -10,49 +10,51 @@ before writes. When a skill reports the installation is out of date, run
 
 ## The tracker: `br`
 
-The backlog lives in **`br`** (beads_rust): one SQLite database per machine plus
-the tracked export `.beads/issues.jsonl`. Filing, taking and closing work go
-through the skills above; the commands below are how the tracker works, not a
-way around them. `bd` (beads with Dolt) was this project's tracker until
-2026-09-27 and is not used any more.
+The backlog lives in **`br`** (beads_rust), and **off every branch**: one store
+per machine on the ref `refs/tracker/state`, which no branch contains. Every
+checkout and worktree reaches it through its `.beads` link, and a background
+service, `iaam-tracker-sync` (systemd, user), publishes each change to GitHub
+within seconds and takes the other machines' changes every 10 seconds. No commit
+carries the tracker, and no branch may: the pre-commit hook refuses anything
+staged under `.beads`. Filing, taking and closing work go through the skills
+above; the commands below are how the tracker works, not a way around them.
+`bd` (beads with Dolt) was this project's tracker until 2026-09-27; until
+2026-11-11 the export was committed on `main`.
 
 ```bash
 br ready --json                              # what can start (see ready.mjs below)
 br show <id>                                 # one item, with comments
-br update <id> --claim --actor "<agent>"     # atomic, exclusive claim
+node .backlog/rules/tracker-sync.mjs claim --item <id> --holder "<agent>" \
+  --recipe .backlog/rules/trackers/br.mjs    # a claim: counts once it is on the remote
+br update <id> --status in_progress          # then mark it started
 br close <id> --reason "..."                 # after stage acceptance only
-br sync --flush-only                         # db -> .beads/issues.jsonl
+node .backlog/rules/tracker-sync.mjs status --recipe .backlog/rules/trackers/br.mjs
 ```
 
-**`br` never runs git.** Nothing commits, pushes or pulls the backlog for you.
-The export is committed **on `main` only**, in `chore(beads): ...` commits: the
-pre-commit hook refuses `.beads/issues.jsonl` staged on any other branch, so a
-feature branch carries what it delivers and never the tracker. `br` resolves
-the database of the **main checkout** even from a worktree, so every worktree
-sees one tracker. A `git pull` that brings a newer export is imported by the
-next `br` command on its own.
+**A claim goes through the sync, never `br update --claim`.** It fetches,
+merges, writes and pushes; where another session's claim reached the remote
+first it exits 3 and says so, and you read the queue again and take other
+work. The holder is the agent's full name
+(`<harness>-<role>:<person>@<machine>:<branch>#<session>`), never the person.
+Exclusive claims (`claim_exclusive`) and the statuses below travel with the
+store, in its `config.yaml` and `policy.yaml`.
 
-**Publish every backlog write promptly** — on `main`: `br sync --flush-only`,
-commit `.beads/issues.jsonl`, push. An unpublished item exists for nobody else.
+**Every other write is plain `br`**, and the sync publishes it. Do not commit,
+push or export the tracker yourself, and **never run `br sync`** in any form:
+the sync owns the import and the export, and `br sync --merge` tombstones every
+issue the export lacks.
 
-**Never run `br sync --merge` to catch up.** It tombstones every issue the
-database holds and the export does not — measured in a sibling project on
-2026-09-11: 70 records killed by one run after a fast-forward. For a database
-that is merely ahead, `br sync --reconcile-additive` adds without deleting. A
-tombstone is not undone by `br update`; the repair is to rebuild the lines from
-`git show`, `br delete --hard` the ids, and `br sync --import-only`.
+**A same-stage dependant of an `implemented` prerequisite** is still blocked to
+`br ready`; the integration's `node .backlog/ready.mjs --stage <id>` knows the
+case, and the claim above takes it with the edge kept.
 
-**Always claim with `--actor`**, the agent's full name
-(`<harness>-<role>:<person>@<machine>:<branch>#<session>`); without it `br`
-records the person. `claim_exclusive` refuses a claim while another actor holds
-the item. A same-stage dependant of an `implemented` prerequisite is still
-blocked to `br`: claim it with `--claim --force --actor ...`, which stays atomic
-and keeps the edge. `br ready` alone does not know that case: the integration's
-`node .backlog/ready.mjs --stage <id>` does.
-
-**`submitted` and `implemented` are statuses of this project**
-(`.beads/policy.yaml`), set with the evidence bound to the transition:
+**`submitted` and `implemented` are statuses of this project** (the store's
+`policy.yaml`), set with the evidence bound to the transition:
 `br update <id> --status implemented --transition-comment "implemented: <rev> -- <checks>"`.
+
+**When the sync is down** (`systemctl --user status iaam-tracker-sync`), writes
+stay in this machine's store and are published within seconds of its return;
+`make backlog-connect` starts it again and says what is missing.
 
 **TodoWrite, TaskCreate and markdown TODO lists are forbidden.** `br` is the
 tracker for all work, including your own checklists.
@@ -65,8 +67,9 @@ someone reads; what you personally worked out stays in your own session notes.
 1. File what remains through `to-backlog`.
 2. Run the quality gates if code changed.
 3. Update item status: close accepted work, release what you hold and did not finish.
-4. On `main`: `br sync --flush-only`, commit `.beads/issues.jsonl`, `git push`
-   (this repository opts in to committing and pushing; see `CLAUDE.md`).
+4. Push your branch (this repository opts in to committing and pushing; see
+   `CLAUDE.md`). The tracker needs no step: the sync has published it; check
+   with `node .backlog/rules/tracker-sync.mjs status --recipe .backlog/rules/trackers/br.mjs`.
 5. Hand off: changes, validation, item status, and any blocked step with its exact error.
 
 ## Non-Interactive Shell Commands

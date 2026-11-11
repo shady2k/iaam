@@ -2,25 +2,45 @@
 // br (beads_rust) -> the normalized backlog the shipped rules read (.backlog/rules/,
 // model.md of shady2k-skills). The rules know no tracker; everything br-specific is here.
 //
-//   adapter.mjs                 the live tracker: br's own JSONL export, flushed first
-//   adapter.mjs --jsonl <file>  a beads-format JSONL export, e.g. an earlier revision
-//   adapter.mjs --at <rev>      .beads/issues.jsonl as committed at <rev>
+//   adapter.mjs [--offline]       the live tracker: the machine's store on refs/tracker/state,
+//                                 synced with the remote first (--offline: this store only)
+//   adapter.mjs --at <rev>        the tracker as the store recorded it when <rev> was cut or
+//                                 landed; a revision from before the move reads the export
+//                                 that revision committed, which was that layout's record
+//   adapter.mjs --jsonl <file>    a beads-format JSONL export, e.g. a snapshot
 //
-// The JSONL format is the one bd wrote before 2026-09-27 (iaam-r1v7), so --at reads
-// revisions from either tracker; only the way a state is stored differs, below.
+// THE LAYOUT (iaam-ima7z): the tracker lives off the branches, one store per machine,
+// published to the ref refs/tracker/state by the background sync
+// (.backlog/rules/tracker-sync.mjs with the recipe .backlog/rules/trackers/br.mjs).
+// No code branch carries a tracker record. The tracker at a code revision is the
+// recording the store made under that revision's own name, never a code tree and
+// never a later snapshot. Until 2026-11-11 the export was committed on main
+// (.beads/issues.jsonl), so a revision from then is read from its own tree: that
+// file was what that layout recorded for it.
+//
+// The export also carries `landed`: the commits on the main line at the revision
+// judged, parsed by the commit-link convention (commits.mjs), so the gate reports
+// an open leaf whose change already landed.
 //
 // Exit 2, with the reason, when the tracker cannot be read: an unreadable
 // backlog is never an empty one.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+export const MECHANISM = join(HERE, 'rules', 'tracker-sync.mjs');
+export const RECIPE = join(HERE, 'rules', 'trackers', 'br.mjs');
+const ISSUES = '.beads/issues.jsonl';
+const git = (...a) => execFileSync('git', a, { encoding: 'utf8', maxBuffer: 1 << 30, stdio: ['ignore', 'pipe', 'pipe'] });
 
 const TYPES = { epic: 'epic', task: 'task', bug: 'bug', chore: 'chore' };
 
-// `submitted` and `implemented` are br statuses of this project (.beads/policy.yaml),
-// and the transition that sets one carries its revision and evidence as a comment:
-// `submitted: <rev> -- <evidence>`. Before the move to br, bd stored the same thing
-// as metadata on an open issue; that is still read, for revisions committed then.
+// `submitted` and `implemented` are br statuses of this project (policy.yaml in the
+// store), and the transition that sets one carries its revision and evidence as a
+// comment: `submitted: <rev> -- <evidence>`. Before the move to br, bd stored the
+// same thing as metadata on an open issue; that is still read, for old revisions.
 const STATES = ['submitted', 'implemented'];
 const KNOWN = new Set(['open', 'in_progress', 'blocked', 'deferred', 'closed', 'tombstone', ...STATES]);
 
@@ -58,7 +78,18 @@ function body(r) {
   return parts.join('\n\n');
 }
 
-export function normalize(rows, source) {
+// The set's records go out raw and whole, damaged or not, with br's own comment
+// id: work records (`[shady2k-time`) and the command runner's journal of
+// durations (`<!-- shady2k-exec v1 -->`). The gate judges them and the run
+// scripts read them, so a record dropped here is time lost with nothing to say so.
+const RECORD = /^(\[shady2k-time|<!-- shady2k-exec v1 -->)/;
+function records(r) {
+  return (r.comments || [])
+    .filter((c) => RECORD.test(c.text || ''))
+    .map((c) => ({ id: String(c.id), at: c.created_at, author: c.author, body: c.text }));
+}
+
+export function normalize(rows, source, landed) {
   const issues = rows
     // A tombstone is br's deleted issue: gone from the tracker, not a state of work.
     .filter((r) => (r._type || 'issue') === 'issue' && r.status !== 'tombstone')
@@ -87,37 +118,98 @@ export function normalize(rows, source) {
       if (s === 'implemented') out.integration = evidence(r, s, meta);
       return out;
     });
-  return { generatedAt: new Date().toISOString(), source, issues };
-}
-
-// The set's work records (claims, receipts, stops) are comments whose text
-// starts with `[shady2k-time`. They go out raw and whole, damaged or not, with
-// beads' own comment id: the gate judges them and the run script reads them, so
-// a record dropped here is time lost with nothing to say so.
-function records(r) {
-  return (r.comments || [])
-    .filter((c) => (c.text || '').startsWith('[shady2k-time'))
-    .map((c) => ({ id: String(c.id), at: c.created_at, author: c.author, body: c.text }));
+  const out = { generatedAt: new Date().toISOString(), source, issues };
+  if (landed) out.landed = landed;
+  return out;
 }
 
 function parseJsonl(text) {
   return text.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
 }
 
+// The mechanism prints the store's state files as `=== <path>` sections.
+function issuesSection(text, what) {
+  const head = `=== ${ISSUES}\n`;
+  const at = text.indexOf(head);
+  if (at < 0) throw new Error(`${what} carries no ${ISSUES}`);
+  const rest = text.slice(at + head.length);
+  const next = rest.search(/^=== \.beads\//m);
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
+function mechanism(args) {
+  const r = spawnSync(process.execPath, [MECHANISM, ...args, '--recipe', RECIPE], { encoding: 'utf8', maxBuffer: 1 << 30 });
+  if (r.error) throw r.error;
+  return r;
+}
+
+// The commit-link convention, shared with commits.mjs: ids inside parentheses.
+export function taskIds(message) {
+  const text = message.split('\n').filter((l) => !l.startsWith('#')).join('\n');
+  const ids = [];
+  for (const group of text.matchAll(/\(([^()]*)\)/g))
+    for (const m of group[1].matchAll(/\biaam-[a-z0-9]+(?:\.[0-9]+)*\b/g)) ids.push(m[0]);
+  return [...new Set(ids)];
+}
+
+// A commit of the layout before the move that changed nothing but the tracker's
+// export (and, for a finding budget, the config beside it) recorded what
+// happened to the items it names; it delivered none of them, so it is not a
+// landing of their work. Since the move no branch carries such a commit.
+const RECORD_PATH = (p) => p.startsWith('.beads/') || p === '.backlog/config.json';
+export function recordsOnly(paths) {
+  return paths.length > 0 && paths.some((p) => p.startsWith('.beads/')) && paths.every(RECORD_PATH);
+}
+
+// The main line at a code revision: every commit both on `main` and in that
+// revision's history, less the records-only commits above. Local history only,
+// never the network.
+export function landedAt(rev) {
+  let main = null;
+  for (const ref of ['refs/heads/main', 'refs/remotes/origin/main']) {
+    try { git('rev-parse', '--verify', '--quiet', ref); main = ref; break; } catch { /* try the next */ }
+  }
+  if (!main) throw new Error('no main line here: neither main nor origin/main resolves');
+  const tip = git('merge-base', main, rev).trim();
+  return git('log', '--diff-merges=first-parent', '--name-only', '--format=%x02%H%x01%B%x03', tip).split('\x02').filter(Boolean).flatMap((s) => {
+    const [id, rest] = s.split('\x01');
+    const [msg, files] = (rest || '').split('\x03');
+    if (recordsOnly((files || '').split('\n').map((f) => f.trim()).filter(Boolean))) return [];
+    return [{ id: id.trim(), taskIds: taskIds(msg || '') }];
+  });
+}
+
+function revisionOf(rev) {
+  return git('rev-parse', '--verify', `${rev}^{commit}`).trim();
+}
+
 export function read(argv) {
   const at = argv.indexOf('--at');
   const file = argv.indexOf('--jsonl');
-  if (at >= 0) {
-    const rev = argv[at + 1];
-    const text = execFileSync('git', ['show', `${rev}:.beads/issues.jsonl`], { encoding: 'utf8', maxBuffer: 1 << 30 });
-    return normalize(parseJsonl(text), `beads .beads/issues.jsonl @ ${rev}`);
-  }
   if (file >= 0) return normalize(parseJsonl(readFileSync(argv[file + 1], 'utf8')), `beads jsonl ${argv[file + 1]}`);
-  // br keeps its export current after every write (sync.auto_flush); the flush makes
-  // sure of it. `br where` names the main checkout's .beads even from a worktree.
-  execFileSync('br', ['sync', '--flush-only', '--quiet'], { stdio: ['ignore', 'ignore', 'pipe'] });
-  const where = execFileSync('br', ['where'], { encoding: 'utf8' }).split('\n')[0].trim();
-  return normalize(parseJsonl(readFileSync(join(where, 'issues.jsonl'), 'utf8')), 'br live export');
+  if (at >= 0) {
+    const rev = revisionOf(argv[at + 1]);
+    const r = mechanism(['export', '--at', rev]);
+    if (r.status === 0)
+      return normalize(parseJsonl(issuesSection(r.stdout, `the recording of ${rev}`)), `br refs/tracker/state recording @ ${rev}`, landedAt(rev));
+    // Before the move the layout's record of a revision was the export it committed.
+    let text = null;
+    try { text = git('show', `${rev}:${ISSUES}`); } catch { /* not a pre-move revision */ }
+    if (text !== null) return normalize(parseJsonl(text), `beads ${ISSUES} committed (layout before 2026-11-11) @ ${rev}`, landedAt(rev));
+    throw new Error((r.stderr || r.stdout || `tracker-sync export --at ${rev} failed`).trim().replace(/^tracker-sync: /, ''));
+  }
+  let where = 'live store';
+  let r = mechanism(argv.includes('--offline') ? ['export', '--offline'] : ['export']);
+  // A hook asks with --or-offline: an unreachable remote (exit 4) does not stop a
+  // commit, but the read says it is this machine's store only, never the whole state.
+  if (r.status === 4 && argv.includes('--or-offline')) {
+    console.error('backlog adapter: the remote is unreachable, so this reads this machine\'s store only; other machines\' changes are not in it');
+    r = mechanism(['export', '--offline']);
+    where = 'this machine\'s store only (remote unreachable)';
+  }
+  if (r.status !== 0) throw new Error((r.stderr || r.stdout || 'tracker-sync export failed').trim().replace(/^tracker-sync: /, ''));
+  const head = revisionOf('HEAD');
+  return normalize(parseJsonl(issuesSection(r.stdout, 'the store')), `br refs/tracker/state ${where} @ ${head}`, landedAt(head));
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -1,0 +1,674 @@
+#!/usr/bin/env node
+/**
+ * The product-documents check: is every product document in its form, and does
+ * every id a document names exist?
+ *
+ * The forms are the protocol's (references/product.md): a vision, sources,
+ * hypotheses, user stories, use cases, product requirements, open questions,
+ * prototypes and their results, each a Markdown file under docs/ whose first
+ * line is its id and title, then its fields, then its sections. A practice
+ * record (references/keeping.md) is not a product document and takes no part
+ * in the chain, but one file per practice stands under docs/practices/ and is
+ * checked here too, for lack of a second reader. A repository with no product
+ * document and no practice has nothing to check here and passes.
+ *
+ * IT KNOWS NO PROJECT AND NO WIKI. It reads files and says what is wrong with
+ * them, file and line, in words a contributor who never heard of the set can
+ * act on. A product wiki that accepts changes runs this same check.
+ *
+ * WHAT IT REFUSES:
+ *
+ *   document-form       the identity line, a field or a section is missing,
+ *                       unknown, repeated or of the wrong shape
+ *   unfinished-content  a placeholder (TODO, TBD, angle brackets,
+ *                       [NEEDS CLARIFICATION]): an unknown is a question
+ *   duplicate-id        two documents claim one id
+ *   dangling-reference  a document the set writes names an id no document
+ *                       holds, prose it does not write links to a document that
+ *                       is not there, or a prototype's code folder that does not
+ *                       exist
+ *   wrong-link          a link field names a kind it may not grow from
+ *   unknown-step        a use case's extension names no step of its scenario
+ *   written-status      a Status: field: status is computed from the links
+ *   system-part-in-requirement
+ *                       a product requirement names code: it says what a user
+ *                       observes, and the capability requirement says how
+ *   unverified-quote    a quote is not at the place it names in a kept source
+ *
+ * WHAT IT ONLY REPORTS:
+ *
+ *   outside-quote       a quote from a source kept outside the repository,
+ *                       which nothing here can read
+ *
+ * WHAT IT CANNOT SEE: whether a requirement is true, small or wanted. A
+ * requirement can name no code and still describe a database; that is found
+ * by reading. Ids are found as written (a prefix, a dash, three digits or
+ * more), outside code blocks, code spans and HTML comments.
+ *
+ * WHERE IT LOOKS FOR A REFERENCE. In a document the set writes, every id it
+ * names is a reference, because the set's own forms put ids there and mean
+ * them. In prose it does not write — a decision record, a guide, a note — a
+ * word that merely looks like an id is a word, and a reference is only what is
+ * written as a link to a document's file. A document the set writes is one
+ * that opens with one of the set's identity forms (a document's identity line,
+ * a spec's `Capability:` field, a change record's `Change:` field) or stands
+ * where its kind collects, the place the product's registry names.
+ */
+
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, posix, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { ValueNeeded, valueOf } from './argv.mjs';
+import { notRegularFileSaid } from './regular-file.mjs';
+
+export const RULES_VERSION = '0.68.0';
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+class Misuse extends Error {}
+
+const WHY = {
+  'document-form': 'a product document is its identity line "# <ID> — <title>", its fields as "Name: value", then its own sections; see the protocol\'s product documents',
+  'unfinished-content': 'a placeholder is not content: write what is known, and make what is not an open question (Q-…) with who can answer it',
+  'duplicate-id': 'each id belongs to one document and is never reused: give one of them the next free number',
+  'dangling-reference': 'the document or folder named here does not exist: write it, or correct the reference. A word that only looks like an id is marked as code, in backticks (`AB-12`); in prose the set does not write — a decision record, a guide — a reference is a link to the document\'s own file, [the shape](../system/capabilities/<name>.md)',
+  'wrong-link': 'this field links only the kinds a document of this kind grows from',
+  'unknown-step': 'an extension names the step of the main success scenario it alters, as 3a for step 3',
+  'written-status': 'status is computed from the links and the checks: remove the Status: field',
+  'system-part-in-requirement': 'a product requirement says what a user can observe and names no part of the system; how the system does it is a capability requirement that serves this one',
+  'unverified-quote': 'the quote must stand, as written, at the lines or times the citation names in that source: correct the place or the quote',
+  'wrong-folder': 'a practice record stands under docs/practices/, one file per practice: that folder is what the agent doc and the retrospective look in',
+  'outside-quote': 'the source is kept outside the repository, so this quote cannot be verified here',
+  'irregular-registry': 'the registry at docs/kinds.yaml must be a regular file: a named pipe, a socket or a directory there cannot be read, and reading it could wait for ever',
+};
+const NOTES = new Set(['outside-quote']);
+
+// PRA is the practice kind, outside the product chain; it is listed first so
+// that PRA-001 is never read as a P-… id with something after it.
+const PRACTICE = 'PRA';
+const PREFIXES = ['PRA', 'S', 'H', 'US', 'UC', 'FR', 'Q', 'P', 'R'];
+const ID = /^(PRA|S|H|US|UC|FR|Q|P|R)-\d{3,}$/;
+const MENTION = /(?<![\w-])(?:PRA|S|H|US|UC|FR|Q|P|R)-\d{3,}(?![\w-])/g;
+const PLACEHOLDER = /\b(TODO|TBD|TKTK)\b|\[NEEDS CLARIFICATION|<[^>\n]+>/i;
+
+const list = (...values) => ({ list: values });
+const links = (...kinds) => ({ links: kinds });
+const date = { date: true };
+const text = { text: true };
+
+// Each kind: its fields (required unless marked) and its sections.
+const KINDS = {
+  S: {
+    name: 'source',
+    fields: { Kind: list('conversation', 'interview', 'transcript', 'document', 'outside'), Date: date, With: text,
+      Reference: { ...text, optional: true }, Redacted: { ...text, optional: true } },
+    sections: { Record: { optional: true } },
+  },
+  H: {
+    name: 'hypothesis',
+    fields: { 'Grew from': links('VISION', 'S', 'Q') },
+    sections: { Belief: {}, Test: {}, Metric: {}, Threshold: {}, Result: { optional: true }, Sources: { optional: true, sources: true } },
+  },
+  US: {
+    name: 'user story',
+    fields: { 'Grew from': links('VISION', 'H') },
+    sections: { Story: { story: true }, Acceptance: { items: true }, Sources: { optional: true, sources: true } },
+  },
+  UC: {
+    name: 'use case',
+    fields: { Serves: links('US'), Level: list('summary', 'user goal', 'subfunction'), 'Primary actor': text, Scope: text,
+      Scenario: { ...text, optional: true }, Trigger: { ...text, optional: true } },
+    sections: { Preconditions: {}, 'Success end condition': {}, 'Failed end condition': {}, 'Main success scenario': { steps: true },
+      Extensions: { optional: true, extensions: true }, 'Open issues': { optional: true, items: true },
+      'Stakeholders and interests': { optional: true }, 'Minimal guarantee': { optional: true }, Sources: { optional: true, sources: true } },
+  },
+  FR: {
+    name: 'product requirement',
+    fields: { Serves: links('UC', 'US'), 'Verified by': list('test', 'demonstration', 'inspection', 'analysis') },
+    sections: { Requirement: { noCode: true }, Rationale: { optional: true }, Sources: { optional: true, sources: true } },
+  },
+  Q: {
+    name: 'open question',
+    fields: { Concerns: links('VISION', ...PREFIXES), 'Who can answer': text },
+    sections: { Question: {}, 'What settles it': {}, Answer: { optional: true, mayBeEmpty: true } },
+  },
+  P: {
+    name: 'prototype',
+    fields: { Tests: links('H'), Code: { path: true } },
+    sections: { 'What it tries': {}, 'How to run': {} },
+  },
+  R: {
+    name: 'result',
+    fields: { Of: links('P'), Date: date },
+    sections: { Prediction: {}, Observed: {}, Verdict: { verdict: true } },
+  },
+};
+const COMMON = { Supersedes: { supersedes: true, optional: true } };
+
+// A practice: not a product document, so not in KINDS, and its Status is
+// written, not computed -- it is the one field the rule below lets through.
+const PRACTICES = {
+  name: 'practice',
+  fields: { Status: list('active', 'retired'), Since: date, Evidence: text },
+  sections: { Class: {}, Mechanism: {}, Practice: {}, 'How we will know': {} },
+};
+const kindFor = (prefix) => KINDS[prefix] ?? (prefix === PRACTICE ? PRACTICES : null);
+
+// ---- where the files come from -------------------------------------------
+
+// A repository read three ways: its working tree, its staged files (what a
+// commit hook checks) or a revision (what CI checks). Paths are POSIX,
+// relative to the root.
+function tree(root, { staged = false, rev = null } = {}) {
+  if (!staged && !rev) {
+    const all = [];
+    const irregular = [];
+    const walk = (dir) => {
+      for (const entry of readdirSync(dir)) {
+        if (entry === '.git' || entry === 'node_modules') continue;
+        const path = join(dir, entry);
+        let st;
+        try { st = statSync(path); } catch { continue; }
+        // Only a regular file is ever listed, and only a regular file is ever
+        // read: open() on a named pipe with no writer blocks for ever, so the
+        // walk names what else stands there and nothing opens it.
+        if (st.isDirectory()) walk(path);
+        else if (st.isFile()) all.push(relative(root, path).split(sep).join('/'));
+        else irregular.push(relative(root, path).split(sep).join('/'));
+      }
+    };
+    if (!existsSync(root)) throw new Misuse(`no such folder: ${root}`);
+    walk(root);
+    // The walk lists regular files, so a path the check treats as a file can be
+    // missing from it while something else stands there: the registry is asked
+    // about directly rather than inferred from the listing.
+    const stat = (p) => { try { return statSync(join(root, p)); } catch { return null; } };
+    return { files: all, irregular, abs: (p) => join(root, p), stat, read: (p) => readFileSync(join(root, p), 'utf8') };
+  }
+  const git = (...args) => {
+    const r = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 1 << 28 });
+    if (r.status !== 0) throw new Misuse(`git ${args.join(' ')} failed: ${r.stderr.trim()}`);
+    return r.stdout;
+  };
+  const files = (staged ? git('ls-files', '-z', '--cached') : git('ls-tree', '-r', '-z', '--name-only', rev)).split('\0').filter(Boolean);
+  return { files, read: (p) => git('show', staged ? `:${p}` : `${rev}:${p}`) };
+}
+
+// ---- reading one document -------------------------------------------------
+
+// The lines of a Markdown text, with what is example rather than content
+// (fenced code, HTML comments) marked so nothing is read from it.
+function lines(textOf) {
+  const out = [];
+  let fence = null, comment = false;
+  textOf.replace(/\r\n/g, '\n').split('\n').forEach((raw, i) => {
+    const mark = raw.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+    let structural = true;
+    if (fence) {
+      structural = false;
+      if (mark && mark[1][0] === fence[0] && mark[1].length >= fence.length && !mark[2].trim()) fence = null;
+    } else if (mark) { fence = mark[1]; structural = false; }
+    else if (comment || raw.trimStart().startsWith('<!--')) {
+      structural = false;
+      comment = !raw.includes('-->');
+    }
+    out.push({ raw, line: i + 1, structural });
+  });
+  return out;
+}
+
+// The ids a line names, outside code spans.
+const mentions = (raw) => [...raw.replace(/`[^`]*`/g, '').matchAll(MENTION)].map((m) => m[0]);
+
+// The vision is the one document the set writes that carries no id of its own:
+// the check knows it by its path, the way the protocol names it.
+const VISION = 'docs/vision.md';
+
+// ---- which documents the set writes ----------------------------------------
+
+// The forms the set's own templates open with, read once per file: the identity
+// line of a document of a kind, the identity field a spec or a change record
+// carries under its title, and the vision, the one document the set names by
+// path because it carries no id of its own. Both the parser and the reference
+// rule ask this one question, so a file is the set's or it is not by one answer:
+// what the set writes keeps every id it names checked, and prose it does not
+// write is never searched for ids.
+const IDENTITY_FIELD = /^(?:Capability|Change):\s*\S/;
+// The kinds the set writes documents of, and so the kinds whose every id is a
+// reference: the chain's kinds and the practice record's (the forms this file
+// reads), the spec's and the change record's (the forms the set's own templates
+// write, `Capability:` and `Change:`). A decision record, an exploration, a
+// roadmap or a milestone charter is prose the set does not write, even where the
+// set ships a template for its shape: what a person writes there is their own.
+const WRITTEN = new Set([...PREFIXES, 'CAP', 'CHG', 'DES']);
+// A product that holds no registry yet gets the set's own places for these
+// kinds, which are the defaults the registry would carry.
+const DEFAULT_FOLDERS = ['docs/vision.md', 'docs/sources', 'docs/hypotheses', 'docs/stories', 'docs/use-cases',
+  'docs/requirements', 'docs/questions', 'docs/prototypes', 'docs/results', 'docs/practices',
+  'docs/system/capabilities', 'docs/changes'];
+// Where those kinds' documents collect is the product's own data, never a list
+// here: the registry at `docs/kinds.yaml` says it, in the words the wiki reads.
+// A document that lost its identity line still stands where its kind collects,
+// so losing the line cannot turn an id into prose.
+function kindFolders(source, finding) {
+  const registry = 'docs/kinds.yaml';
+  // Ask before anything opens the registry: open() on a named pipe with no
+  // writer never returns, so the check refuses it the way it refuses a
+  // registry it cannot read, and reads nothing.
+  const st = source.stat ? source.stat(registry) : null;
+  if (source.irregular?.includes(registry) || (st && !st.isFile())) {
+    const said = (source.abs && notRegularFileSaid(source.abs(registry)))
+      || `${registry} is not a regular file, so nothing is read from it`;
+    finding('irregular-registry', registry, 1, said);
+    return [];
+  }
+  if (!source.files.includes(registry)) return DEFAULT_FOLDERS;
+  let text;
+  try { text = source.read(registry); } catch { return []; }
+  const folders = [];
+  let prefix = null;
+  for (const line of text.replace(/\r\n/g, '\n').split('\n')) {
+    const p = line.match(/^\s*-?\s*prefix:\s*(\S+)\s*$/);
+    if (p) prefix = p[1];
+    const f = line.match(/^\s*folder:\s*(\S+)\s*$/);
+    if (f && prefix && WRITTEN.has(prefix)) folders.push(f[1].replace(/^\.\//, ''));
+  }
+  return folders;
+}
+const inFolders = (path, folders) => folders.some((f) => (f.endsWith('.md') ? path === f : path.startsWith(`${f.replace(/\/+$/, '')}/`)));
+
+function ownership(path, all, folders) {
+  // The first line that is content: a comment above the title is not the title.
+  const first = all.find((l) => l.structural && l.raw.trim());
+  let identity = null;
+  if (first) {
+    const head = first.raw.match(/^# (\S+) — (.+)$/);
+    const near = first.raw.match(/^#\s*((?:PRA|S|H|US|UC|FR|Q|P|R)-\d{3,})(?![\w-])/);
+    if (head && ID.test(head[1])) identity = { line: first, head };
+    else if (near) identity = { line: first, near };
+  }
+  let field = false;
+  for (const l of all) {
+    if (!l.structural) continue;
+    if (/^## /.test(l.raw)) break;
+    if (IDENTITY_FIELD.test(l.raw)) { field = true; break; }
+  }
+  return { identity, written: path === VISION || Boolean(identity) || field || inFolders(path, folders) };
+}
+
+// The documents a line links to: a Markdown link's target — written inline or as
+// a reference definition — resolved against the file that holds it, when it
+// names a Markdown file under docs/. This is how a reference is written in prose
+// the set does not write, and a link to a document that is not there is refused
+// wherever it stands. A link inside an HTML comment or a code span is an example.
+const INLINE_LINK = /\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+["'(][^)]*)?\)/g;
+const LINK_DEFINITION = /^\s{0,3}\[[^\]]+\]:\s*<?([^\s>]+)>?/;
+function linkTargets(raw, path) {
+  const text = raw.replace(/`[^`]*`/g, '').replace(/<!--[\s\S]*?-->/g, '');
+  const found = [...text.matchAll(INLINE_LINK)].map((m) => m[1]);
+  const definition = text.match(LINK_DEFINITION);
+  if (definition) found.push(definition[1]);
+  const out = [];
+  for (const target of found) {
+    if (/^[a-z][a-z0-9+.-]*:/i.test(target) || target.startsWith('#') || target.startsWith('/')) continue;
+    const bare = target.replace(/[?#].*$/, '');
+    if (!bare) continue;
+    let decoded = bare;
+    try { decoded = decodeURIComponent(bare); } catch { /* a target that is not a URI stays as it is */ }
+    const resolved = posix.normalize(posix.join(posix.dirname(path), decoded));
+    if (resolved.startsWith('docs/') && resolved.endsWith('.md')) out.push(resolved);
+  }
+  return out;
+}
+
+function parse(path, body, finding, folders) {
+  const all = lines(body);
+  const identity = ownership(path, all, folders).identity;
+  const head = identity?.head;
+  if (!head) {
+    // A first line that starts with an id is a product document out of form.
+    if (identity) finding('document-form', path, identity.line.line, `the identity line is "# ${identity.near[1]} — <title>", with a dash between the id and the title`);
+    return identity ? { broken: identity.line.line } : null;
+  }
+  const first = identity.line;
+  const id = head[1];
+  const prefix = id.split('-')[0];
+  const kind = kindFor(prefix);
+  const doc = { id, prefix, kind, path, line: first.line, title: head[2].trim(), fields: {}, sections: {}, lines: all };
+  const at = (line, rule, what) => finding(rule, path, line, what);
+  if (PLACEHOLDER.test(doc.title)) at(first.line, 'unfinished-content', 'the title is a placeholder');
+  let section = null;
+  for (const l of all.slice(all.indexOf(first) + 1)) {
+    if (!l.structural) { if (section) section.lines.push(l); continue; }
+    const h2 = l.raw.match(/^## (.+)$/);
+    if (h2) {
+      const name = h2[1].trim();
+      if (!Object.hasOwn(kind.sections, name)) at(l.line, 'document-form', `a ${kind.name} has no section "${name}"; its sections are ${Object.keys(kind.sections).join(', ')}`);
+      else if (doc.sections[name]) at(l.line, 'document-form', `the section "${name}" is repeated`);
+      section = { name, line: l.line, lines: [] };
+      if (Object.hasOwn(kind.sections, name) && !doc.sections[name]) doc.sections[name] = section;
+      continue;
+    }
+    if (/^#{1,6}\s/.test(l.raw) && !section) { at(l.line, 'document-form', 'a heading before the first section'); continue; }
+    if (section) { section.lines.push(l); continue; }
+    if (!l.raw.trim()) continue;
+    const f = l.raw.match(/^([A-Z][A-Za-z ]*?):\s*(.*)$/);
+    if (!f) { at(l.line, 'document-form', 'between the identity line and the first section only fields stand, one per line as "Name: value"'); continue; }
+    const [, name, value] = f;
+    if (name === 'Status' && !Object.hasOwn(kind.fields, 'Status')) { at(l.line, 'written-status', 'status is not written'); continue; }
+    if (!Object.hasOwn(kind.fields, name) && !Object.hasOwn(COMMON, name)) {
+      at(l.line, 'document-form', `a ${kind.name} has no field "${name}"; its fields are ${Object.keys(kind.fields).join(', ')}`); continue;
+    }
+    if (doc.fields[name]) { at(l.line, 'document-form', `the field "${name}" is repeated`); continue; }
+    doc.fields[name] = { value: value.trim(), line: l.line };
+  }
+  return doc;
+}
+
+// ---- the rules -------------------------------------------------------------
+
+const content = (s) => s.lines.filter((l) => l.structural).map((l) => l.raw).join('\n').trim();
+const items = (s) => s.lines.filter((l) => l.structural && /^\s*[-*+]\s+\S/.test(l.raw));
+
+function inspect(doc, finding, ctx) {
+  const { kind, path } = doc;
+  const at = (line, rule, what) => finding(rule, path, line, what);
+  const rules = { ...kind.fields, ...COMMON };
+  for (const [name, rule] of Object.entries(rules)) {
+    const f = doc.fields[name];
+    if (!f || !f.value) {
+      if (!rule.optional) at(f ? f.line : doc.line, 'document-form', `a ${kind.name} needs the field "${name}:"`);
+      continue;
+    }
+    if (PLACEHOLDER.test(f.value)) { at(f.line, 'unfinished-content', `the field "${name}" is a placeholder`); continue; }
+    if (rule.list && !rule.list.includes(f.value)) at(f.line, 'document-form', `"${name}" is one of ${rule.list.join(', ')}`);
+    if (rule.date && !/^\d{4}-\d{2}-\d{2}$/.test(f.value)) at(f.line, 'document-form', `"${name}" is a date, YYYY-MM-DD`);
+    if (rule.links || rule.supersedes) {
+      const named = f.value.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const n of named) {
+        if (n !== 'VISION' && !ID.test(n)) { at(f.line, 'document-form', `"${n}" is not an id`); continue; }
+        const of = n === 'VISION' ? 'VISION' : n.split('-')[0];
+        if (rule.links && !rule.links.includes(of)) at(f.line, 'wrong-link', `"${name}" of a ${kind.name} links ${rule.links.join(', ')}, not ${n}`);
+        if (rule.supersedes && of !== doc.prefix) at(f.line, 'wrong-link', `a ${kind.name} supersedes another ${kind.name}, not ${n}`);
+      }
+    }
+    if (rule.path) {
+      const folder = f.value.replace(/^\.\//, '').replace(/\/+$/, '');
+      if (!folder.startsWith('prototypes/') || !ctx.files.some((p) => p.startsWith(`${folder}/`)))
+        at(f.line, 'dangling-reference', `"${name}" names ${f.value}, and prototypes/ holds no such folder with files in it`);
+    }
+  }
+  if (doc.prefix === 'S') {
+    const outside = doc.fields.Kind?.value === 'outside';
+    if (outside && !doc.fields.Reference?.value) at(doc.fields.Kind.line, 'document-form', 'an outside source says where it is kept, in "Reference:"');
+    if (!outside && doc.fields.Reference) at(doc.fields.Reference.line, 'document-form', 'only an outside source has a "Reference:"; a kept one holds its record');
+    if (outside && doc.sections.Record) at(doc.sections.Record.line, 'document-form', 'an outside source holds no record');
+    if (!outside && !doc.sections.Record) at(doc.line, 'document-form', 'a kept source needs the section "Record"');
+  }
+  for (const [name, rule] of Object.entries(kind.sections)) {
+    const s = doc.sections[name];
+    if (!s) { if (!rule.optional && doc.prefix !== 'S') at(doc.line, 'document-form', `a ${kind.name} needs the section "## ${name}"`); continue; }
+    const body = content(s);
+    if (!body) { if (!rule.mayBeEmpty) at(s.line, 'document-form', `the section "${name}" is empty`); continue; }
+    for (const l of s.lines) if (l.structural && PLACEHOLDER.test(l.raw.replace(/`[^`]*`/g, ''))) at(l.line, 'unfinished-content', `a placeholder in "${name}"`);
+    if (rule.story) {
+      const parts = Object.fromEntries(items(s).map((l) => l.raw.match(/^\s*[-*+]\s+(As|I want|So that):\s*(.*)$/)).filter(Boolean).map((m) => [m[1], m[2].trim()]));
+      for (const p of ['As', 'I want', 'So that']) if (!parts[p]) at(s.line, 'document-form', `a story is three items, "- As:", "- I want:" and "- So that:"; "${p}" is missing`);
+    }
+    if (rule.items && !items(s).length) at(s.line, 'document-form', `"${name}" is a list`);
+    if (rule.steps) {
+      const steps = s.lines.filter((l) => l.structural).map((l) => l.raw.match(/^(\d+)\.\s+\S/)).filter(Boolean).map((m) => Number(m[1]));
+      if (!steps.length) at(s.line, 'document-form', 'the main success scenario is a numbered list of steps');
+      else doc.steps = new Set(steps);
+    }
+    if (rule.extensions) for (const l of items(s)) {
+      const m = l.raw.match(/^\s*[-*+]\s+(\d+)([a-z])\s+(.+?):\s*\S/);
+      if (!m) { at(l.line, 'document-form', 'an extension is "- 3a <condition>: <what happens>"'); continue; }
+      if (doc.steps && !doc.steps.has(Number(m[1]))) at(l.line, 'unknown-step', `the main success scenario has no step ${m[1]}`);
+    }
+    if (rule.verdict && !/^(confirmed|refuted|unclear)\b/i.test(body)) at(s.line, 'document-form', 'a verdict starts with confirmed, refuted or unclear');
+    if (rule.noCode) for (const l of s.lines) if (l.structural && /`[^`]+`/.test(l.raw)) at(l.line, 'system-part-in-requirement', 'it names code');
+    if (rule.sources) for (const l of items(s)) cite(l, doc, finding, ctx);
+  }
+}
+
+const words = (s) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+const seconds = (t) => t.split(':').reduce((a, b) => a * 60 + Number(b), 0);
+
+// A citation: S-001 L12-18 "quote", or S-001 00:12:30-00:13:05 "quote".
+function cite(l, doc, finding, ctx) {
+  const at = (rule, what) => finding(rule, doc.path, l.line, what);
+  const m = l.raw.match(/^\s*[-*+]\s+(S-\d{3,})\s+(?:L(\d+)(?:-(\d+))?|(\d{1,2}:\d{2}:\d{2})-(\d{1,2}:\d{2}:\d{2}))\s+"(.+)"\s*$/)
+    || l.raw.match(/^\s*[-*+]\s+(S-\d{3,})\s+()()()()"(.+)"\s*$/);
+  if (!m) { at('document-form', 'a citation is "- S-001 L12-18 "the quote"" or "- S-001 00:12:30-00:13:05 "the quote""'); return; }
+  const [, sid, from, to, start, end, quote] = m;
+  const source = ctx.byId.get(sid);
+  if (!source) return; // the reference rule names it
+  if (source.prefix !== 'S') { at('wrong-link', `${sid} is not a source`); return; }
+  if (source.fields.Kind?.value === 'outside') { at('outside-quote', `${sid} is kept outside the repository`); return; }
+  if (!from && !start) { at('document-form', `a quote from a kept source names its place, as ${sid} L12-18`); return; }
+  let place;
+  if (from) {
+    const a = Number(from), b = Number(to || from);
+    place = source.lines.filter((x) => x.line >= a && x.line <= b);
+    if (!place.length || b < a) { at('unverified-quote', `${sid} has no lines ${from}${to ? `-${to}` : ''}`); return; }
+  } else {
+    const a = seconds(start), b = seconds(end);
+    let inside = false;
+    place = [];
+    for (const x of source.lines) {
+      const t = x.raw.match(/^\s*\[(\d{1,2}:\d{2}:\d{2})\]/);
+      if (t) inside = seconds(t[1]) >= a && seconds(t[1]) <= b;
+      if (inside) place.push(x);
+    }
+    if (!place.length) { at('unverified-quote', `${sid} marks no time between ${start} and ${end}`); return; }
+  }
+  if (!words(place.map((x) => x.raw).join(' ')).includes(words(quote))) at('unverified-quote', `the quote is not at ${from ? `L${from}${to ? `-${to}` : ''}` : `${start}-${end}`} of ${sid}`);
+}
+
+/**
+ * Every finding in a repository's product documents: { rule, file, line,
+ * what, why, note }. A finding marked note is reported and refuses nothing.
+ */
+export function checkProduct(source) {
+  const found = [];
+  const finding = (rule, file, line, what) => found.push({ rule, file, line, what, why: WHY[rule] ?? null, note: NOTES.has(rule) });
+  const markdown = source.files.filter((p) => p.startsWith('docs/') && p.endsWith('.md')).sort();
+  const docs = [];
+  const bodies = new Map();
+  const broken = new Map();
+  const folders = kindFolders(source, finding);
+  for (const path of markdown) {
+    const body = source.read(path);
+    bodies.set(path, body);
+    const doc = parse(path, body, finding, folders);
+    if (doc?.broken) broken.set(path, doc.broken);
+    else if (doc) docs.push(doc);
+  }
+  const byId = new Map();
+  for (const d of docs) {
+    if (byId.has(d.id)) finding('duplicate-id', d.path, d.line, `${d.id} is also ${byId.get(d.id).path}`);
+    else byId.set(d.id, d);
+    // A practice record has one folder, and it is the one the agent doc and
+    // the retrospective read: the product documents' folders are defaults,
+    // this one is a rule.
+    if (d.prefix === PRACTICE && !/^docs\/practices\/[^/]+\.md$/.test(d.path))
+      finding('wrong-folder', d.path, d.line, 'a practice record stands under docs/practices/, one file per practice');
+  }
+  if (!docs.length) return found.sort(order);
+  const hasVision = source.files.includes('docs/vision.md');
+  const ctx = { files: source.files, byId };
+  for (const d of docs) inspect(d, finding, ctx);
+  // Every id a document the set writes names resolves, the specs' included; in
+  // prose the set does not write, a reference is a link to a document's file.
+  const files = new Set(source.files);
+  for (const [path, body] of bodies) {
+    const all = lines(body);
+    const { written } = ownership(path, all, folders);
+    for (const l of all) {
+      if (!l.structural || broken.get(path) === l.line) continue;
+      if (written) {
+        for (const n of new Set(mentions(l.raw))) if (!byId.has(n)) finding('dangling-reference', path, l.line, `no document is ${n}`);
+        if (/(?<![\w-])VISION(?![\w-])/.test(l.raw.replace(/`[^`]*`/g, '')) && !hasVision)
+          finding('dangling-reference', path, l.line, 'VISION is docs/vision.md, which does not exist');
+      }
+      // A link is a reference wherever it stands, and a link to a document that
+      // is not there is refused. In prose the set does not write it is the only
+      // reference: a bare token there is a word.
+      for (const target of linkTargets(l.raw, path)) if (!files.has(target))
+        finding('dangling-reference', path, l.line, `the link names ${target}, which does not exist`);
+    }
+  }
+  return found.sort(order);
+}
+const order = (a, b) => a.file.localeCompare(b.file) || a.line - b.line || a.rule.localeCompare(b.rule);
+
+// ---- the fixtures: one complete product, and one break per rule -------------
+
+export function fixtureRepository() {
+  const root = join(HERE, 'fixtures', 'product', 'good');
+  return tree(root);
+}
+
+// A case edits the complete product in memory: replace text in a file, add a
+// file or remove one; expected is every finding as "rule file:line".
+export function fixtureCases() {
+  const { cases } = JSON.parse(readFileSync(join(HERE, 'fixtures', 'product', 'cases.json'), 'utf8'));
+  return cases.map((c) => {
+    const base = fixtureRepository();
+    const files = new Map(base.files.map((p) => [p, null]));
+    const read = (p) => (files.get(p) ?? base.read(p));
+    const irregular = [];
+    for (const e of c.edits) {
+      if (e.irregular) { irregular.push(...e.irregular); continue; }
+      if (e.remove) { files.delete(e.remove); continue; }
+      if (e.add) { files.set(e.add, e.text); continue; }
+      const now = read(e.file);
+      if (!now.includes(e.replace)) throw new Error(`fixture ${c.name}: ${e.file} has no "${e.replace}"`);
+      files.set(e.file, now.replace(e.replace, e.with));
+    }
+    return { ...c, source: { files: [...files.keys()], irregular, read } };
+  });
+}
+
+export function selftest() {
+  let failures = 0;
+  const show = (ok, label) => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}`); if (!ok) failures++; };
+  const clean = checkProduct(fixtureRepository());
+  show(clean.length === 0, `product/the complete example is clean${clean.length ? `: ${clean.map((f) => `${f.rule} ${f.file}:${f.line} ${f.what}`).join('; ')}` : ''}`);
+  const fired = new Set();
+  for (const c of fixtureCases()) {
+    const got = checkProduct(c.source).map((f) => `${f.rule} ${f.file}:${f.line}`).sort();
+    for (const g of got) fired.add(g.split(' ')[0]);
+    const ok = JSON.stringify(got) === JSON.stringify([...c.expected].sort());
+    show(ok, `product/${c.name}${ok ? '' : `: got ${JSON.stringify(got)}`}`);
+  }
+  const silent = Object.keys(WHY).filter((r) => !fired.has(r));
+  show(!silent.length, `product/every rule has a case that fires it${silent.length ? `: ${silent.join(', ')}` : ''}`);
+  // The registry is asked, never opened, when it is not a regular file:
+  // open() on a named pipe with no writer blocks for ever. The check runs as
+  // a child process under a hard timeout, so this selftest cannot hang on it.
+  const fifoRoot = mkdtempSync(join(tmpdir(), 'check-product-fifo-'));
+  mkdirSync(join(fifoRoot, 'docs'), { recursive: true });
+  const fifoPath = join(fifoRoot, 'docs', 'kinds.yaml');
+  const made = spawnSync('mkfifo', [fifoPath]);
+  if (made.error || made.status !== 0) {
+    console.log(`SKIP  product/a registry that is a named pipe is refused, not opened: mkfifo is not available here (${`${made.error?.message ?? ''}${made.stderr ?? ''}`.trim()})`);
+  } else {
+    const run = spawnSync(process.execPath, [join(HERE, 'check-product.mjs'), '--root', fifoRoot, '--json'], { encoding: 'utf8', timeout: 5000 });
+    let findings = [];
+    if (!run.error) { try { findings = JSON.parse(run.stdout).findings; } catch { /* the child said nothing JSON */ } }
+    const hit = findings.find((f) => f.rule === 'irregular-registry' && f.file === 'docs/kinds.yaml');
+    const ok = Boolean(hit) && run.status === 1
+      && hit.what.includes('is not a regular file (it is a named pipe)') && hit.what.includes(fifoPath);
+    show(ok, `product/a registry that is a named pipe is refused, not opened${ok ? '' : run.error ? ': the child never exited within its timeout' : `: got ${JSON.stringify(findings)}`}`);
+  }
+  rmSync(fifoRoot, { recursive: true, force: true });
+  show(checkProduct({ files: ['docs/notes.md'], read: () => '# Notes\n\nUS-East is a region, FR-12 a form.\n' }).length === 0,
+    'product/a repository with no product document passes, whatever its text says');
+  // Each template names exactly its kind's fields and sections, so a document
+  // written from one is never refused for its shape. A practice's template
+  // stands beside its kind at templates/practice.md, not among the product's.
+  const sameSet = (a, b) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
+  const templateOk = (file, kind, label) => {
+    const t = readFileSync(file, 'utf8').split('\n');
+    const firstSection = t.findIndex((l) => l.startsWith('## '));
+    const fields = t.slice(1, firstSection < 0 ? t.length : firstSection).map((l) => l.match(/^([A-Z][A-Za-z ]*?):/)?.[1]).filter(Boolean);
+    const sections = t.map((l) => l.match(/^## (.+)$/)?.[1]).filter(Boolean);
+    const ok = sameSet(fields, Object.keys(kind.fields)) && sameSet(sections, Object.keys(kind.sections));
+    show(ok, `${label} has the ${kind.name}'s fields and sections${ok ? '' : `: ${JSON.stringify({ fields, sections })}`}`);
+    return ok;
+  };
+  const folder = join(HERE, 'templates', 'product');
+  const templates = readdirSync(folder).filter((f) => f.endsWith('.md'));
+  const covered = new Set();
+  for (const name of templates) {
+    const prefix = readFileSync(join(folder, name), 'utf8').split('\n')[0].match(/^# ([A-Z]+)-<NNN> — /)?.[1];
+    const kind = kindFor(prefix);
+    if (!kind || prefix === PRACTICE) { show(false, `product/template ${name} opens with a kind's identity line`); continue; }
+    covered.add(prefix);
+    templateOk(join(folder, name), kind, `product/template ${name}`);
+  }
+  const practiceTemplate = templateOk(join(HERE, 'templates', 'practice.md'), PRACTICES, 'practice/template practice.md');
+  show(Object.keys(KINDS).every((k) => covered.has(k)) && practiceTemplate, 'every kind has its template');
+  // The command line reads every option's value through argv.mjs: an empty,
+  // blank, missing or option-shaped word is misuse that names the option, where
+  // `--root ''` once checked the current folder and --root with no value was
+  // only "incomplete".
+  for (const [name, argv, option] of [
+    ['an empty --root', ['--root', ''], '--root'],
+    ['a missing --rev', ['--rev'], '--rev'],
+    ['an option instead of the --root value', ['--root', '--json'], '--root'],
+  ]) {
+    let said = '';
+    try { main(argv); } catch (error) { said = error.message; }
+    show(said.includes(`"${option}"`), `cli: ${name}${said.includes(`"${option}"`) ? '' : ` (said ${said.slice(0, 90)})`}`);
+  }
+  return failures ? 1 : 0;
+}
+
+// ---- the command line ------------------------------------------------------
+
+function main(args) {
+  if (args.length === 1 && args[0] === '--version') { console.log(RULES_VERSION); return 0; }
+  if (args.length === 1 && args[0] === '--selftest') return selftest();
+  if (args.length === 1 && args[0] === '--help') {
+    console.log('check-product.mjs [--root <repository>] [--staged | --rev <revision>] [--json]\n'
+      + 'Checks the product documents under docs/. Exit: 0 clean, 1 findings that refuse, 2 misuse or unreadable input.');
+    return 0;
+  }
+  const opts = { root: '.', staged: false, rev: null, json: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--json' && !opts.jsonSeen) { opts.json = true; opts.jsonSeen = true; }
+    else if (a === '--staged' && !opts.staged) opts.staged = true;
+    else if (a === '--root' || a === '--rev') {
+      // One reader for every option that takes a value: a missing, empty, blank
+      // or option-shaped word is misuse, and the refusal names the option.
+      const key = a.slice(2);
+      if (opts[`${key}Seen`]) throw new Misuse(`${a} is given twice`);
+      try { opts[key] = valueOf(args, i, a, key === 'root' ? 'the repository to check' : 'the revision to check'); } catch (e) {
+        if (e instanceof ValueNeeded) throw new Misuse(e.message);
+        throw e;
+      }
+      i++;
+      opts[`${key}Seen`] = true;
+    } else throw new Misuse(`unknown, repeated or incomplete option: ${a}`);
+  }
+  if (opts.staged && opts.rev) throw new Misuse('--staged and --rev read different trees: give one');
+  const found = checkProduct(tree(resolve(opts.root), { staged: opts.staged, rev: opts.rev }));
+  const refusing = found.filter((f) => !f.note);
+  if (opts.json) console.log(JSON.stringify({ version: RULES_VERSION, findings: found }));
+  else if (!found.length) console.log('Product documents: clean');
+  else {
+    for (const f of found) console.log(`${f.file}:${f.line}: ${f.note ? 'note' : 'error'} ${f.rule}: ${f.what}${f.why ? ` — ${f.why}` : ''}`);
+    console.log(`${refusing.length} error(s), ${found.length - refusing.length} note(s)`);
+  }
+  return refusing.length ? 1 : 0;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { process.exitCode = main(process.argv.slice(2)); }
+  catch (error) { console.error(`check-product: ${error.message}`); process.exitCode = 2; }
+}

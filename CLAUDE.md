@@ -12,9 +12,9 @@ before writes. When a skill reports the installation is out of date, run
 
 ## The tracker
 
-The backlog lives in **`br`** (beads_rust). How it works here — the export on
-`main` only, claims with `--actor`, the `br sync --merge` trap, session
-completion — is in `AGENTS.md`, **The tracker: `br`**, and the lessons earlier
+The backlog lives in **`br`** (beads_rust). How it works here — the store off
+every branch and its background sync, claims through the sync, never running
+`br sync`, session completion — is in `AGENTS.md`, **The tracker: `br`**, and the lessons earlier
 sessions paid for are in `AGENTS.md`, **Lessons**. Read both before tracker
 writes. `bd` is not used any more.
 

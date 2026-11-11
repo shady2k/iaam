@@ -1,0 +1,35 @@
+# The off-branch tracker's supervisor, for systemd --user.
+#
+# Setup copies this file into the project's own installed folder, replaces the
+# two placeholders below with the project's own copy of the mechanism and its
+# recipe, and — only with the owner's agreement, because it changes what runs on
+# the machine — links it into ~/.config/systemd/user/ and runs
+#   systemctl --user enable --now tracker-sync.service
+#
+# A user service stops at logout unless the user's linger is on:
+#   loginctl enable-linger <user>
+# which may need a privileged command. Nothing else is needed to keep the store
+# in step: the unit runs the same mechanism a person can run by hand.
+#
+# macOS is described in setup's text and nothing is shipped for it: a LaunchAgent
+# starts at the user's login, not at machine boot, so it is not the same promise.
+
+[Unit]
+Description=<project>: keep the tracker's store one state across machines
+Documentation=<the project's integration, the Tracker synchronization field>
+
+[Service]
+Type=simple
+# <mechanism> is the project's own copy of tracker-sync.mjs; <recipe> is the
+# recipe that names this project's tracker; <repo> is a checkout of the project's
+# repository and <state> the machine's state directory, both named so that the
+# unit does not depend on the directory it happens to be started in.
+WorkingDirectory=<repo>
+ExecStart=/usr/bin/env node <mechanism> watch --interval 10 --debounce 2 --max-age 5 --recipe <recipe> --repo <repo> --state <state>
+Restart=always
+RestartSec=2
+# The mechanism holds a lock and keeps an unpublished write locally, so a
+# restart loses nothing; a stopped unit only stops publishing.
+
+[Install]
+WantedBy=default.target

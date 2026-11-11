@@ -1,0 +1,4 @@
+# br (beads_rust) configuration of this repository. See AGENTS.md, "The tracker: br".
+issue_prefix: iaam
+# A claim is refused while another actor holds the item.
+claim_exclusive: true

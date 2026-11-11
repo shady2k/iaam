@@ -1203,26 +1203,35 @@ mod tests {
     /// returns how many `SQLITE_TRACE_STMT` events it produced — one per
     /// prepared statement actually run, so this counts statements, not
     /// rows, and is oblivious to how large `ids` is.
-    fn hydrate_and_count(store: &SqliteStore, ids: &[EventId]) -> (usize, usize) {
-        store
-            .connection()
+    fn hydrate_and_count(store: &mut SqliteStore, ids: &[EventId]) -> (usize, usize) {
+        let armed = store
+            .connection_mut()
             .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement));
+        assert!(
+            armed.is_ok(),
+            "the statement tracer could not be set: {armed:?}"
+        );
         TRACE_COUNT.store(0, Ordering::SeqCst);
         let events = hydrate(store.connection(), ids).expect("hydrate");
         let statements = TRACE_COUNT.load(Ordering::SeqCst);
-        store
-            .connection()
-            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, None);
+        let disarmed = store.connection_mut().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            None::<fn(TraceEvent<'_>)>,
+        );
+        assert!(
+            disarmed.is_ok(),
+            "the statement tracer could not be cleared: {disarmed:?}"
+        );
         (statements, events.len())
     }
 
     #[test]
     fn hydrating_a_page_costs_a_fixed_number_of_statements() {
-        let (store50, ids50) = store_with_events(50);
-        let (store5, ids5) = store_with_events(5);
+        let (mut store50, ids50) = store_with_events(50);
+        let (mut store5, ids5) = store_with_events(5);
 
-        let (counted50, found50) = hydrate_and_count(&store50, &ids50);
-        let (counted5, found5) = hydrate_and_count(&store5, &ids5);
+        let (counted50, found50) = hydrate_and_count(&mut store50, &ids50);
+        let (counted5, found5) = hydrate_and_count(&mut store5, &ids5);
 
         assert_eq!(found50, 50, "every id in the 50-event page resolves");
         assert_eq!(found5, 5, "every id in the 5-event page resolves");

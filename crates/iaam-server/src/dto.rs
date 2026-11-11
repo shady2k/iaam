@@ -206,6 +206,7 @@ pub enum IncomeKindDto {
     Coupon,
     Dividend,
     DepositInterest,
+    SecuritiesLendingIncome,
 }
 
 impl IncomeKindDto {
@@ -215,6 +216,16 @@ impl IncomeKindDto {
             Self::Coupon => IncomeKind::Coupon,
             Self::Dividend => IncomeKind::Dividend,
             Self::DepositInterest => IncomeKind::DepositInterest,
+            Self::SecuritiesLendingIncome => IncomeKind::SecuritiesLendingIncome,
+        }
+    }
+    #[must_use]
+    pub const fn from_domain(value: IncomeKind) -> Self {
+        match value {
+            IncomeKind::Coupon => Self::Coupon,
+            IncomeKind::Dividend => Self::Dividend,
+            IncomeKind::DepositInterest => Self::DepositInterest,
+            IncomeKind::SecuritiesLendingIncome => Self::SecuritiesLendingIncome,
         }
     }
 }
@@ -3635,6 +3646,10 @@ pub struct EarningSourceAmountDto {
     /// earning is its own line, never folded into a bucket.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<Uuid>,
+    /// Which kind of income produced this earning, when stated. Kept apart
+    /// even when no security or owner category names the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub income_kind: Option<IncomeKindDto>,
     pub amount: String,
 }
 
@@ -3714,6 +3729,7 @@ impl MoneyFlowReportDto {
                         account: source.account.inner(),
                         instrument: source.instrument.map(|id| id.inner()),
                         category: source.category.map(|category| category.inner()),
+                        income_kind: source.income_kind.map(IncomeKindDto::from_domain),
                         amount: amount.to_calc_dec().inner().to_string(),
                     })
                     .collect();
@@ -4683,6 +4699,52 @@ impl ReconciliationStatusDto {
     }
 }
 
+/// Recorded income grouped by economic kind and native currency.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct IncomeByKindDto {
+    /// Absent means the recorded income did not state a kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<IncomeKindDto>,
+    /// Native-currency sum. No conversion or cross-currency sum is implied.
+    pub amount: AmountDto,
+}
+
+/// Native-currency income totals, or the reason they cannot be computed.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComputedIncomeByKindDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Vec<IncomeByKindDto>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_computable: Option<NotComputableCodeDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ComputedIncomeByKindDto {
+    fn from_domain(value: &Computed<Vec<(Option<IncomeKind>, Money)>>) -> Self {
+        match value {
+            Computed::Value(totals) => Self {
+                value: Some(
+                    totals
+                        .iter()
+                        .map(|(kind, amount)| IncomeByKindDto {
+                            kind: kind.map(IncomeKindDto::from_domain),
+                            amount: AmountDto::from_money(*amount),
+                        })
+                        .collect(),
+                ),
+                not_computable: None,
+                detail: None,
+            },
+            Computed::NotComputable { reason } => Self {
+                value: None,
+                not_computable: Some(NotComputableCodeDto::from_domain(reason)),
+                detail: Some(describe(reason)),
+            },
+        }
+    }
+}
+
 /// Return report.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReturnsReportDto {
@@ -4710,6 +4772,9 @@ pub struct ReturnsReportDto {
     pub contributed: ComputedDto,
     pub withdrawn: ComputedDto,
     pub terminal_value: ComputedDto,
+    /// Recorded income grouped by kind and native currency over the history
+    /// through `as_of`. These sums are not converted to `report_currency`.
+    pub income_by_kind: ComputedIncomeByKindDto,
     /// Valuation before hypothetical exit costs and before tax.
     pub liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto,
     /// Bond position attributes (§5.1).
@@ -4808,6 +4873,7 @@ impl ReturnsReportDto {
             contributed: ComputedDto::from_dec(&report.contributed),
             withdrawn: ComputedDto::from_dec(&report.withdrawn),
             terminal_value: ComputedDto::from_dec(&report.terminal_value),
+            income_by_kind: ComputedIncomeByKindDto::from_domain(&report.income_by_kind),
             liquidation_value_before_exit_costs_and_tax: LiquidationEstimateDto::from_domain(
                 &report.liquidation_value_before_exit_costs_and_tax,
             ),
@@ -7247,6 +7313,35 @@ mod tests {
             income_operation(None).to_domain(&directory()).unwrap().kind,
             OperationKind::Income { kind: None, .. }
         ));
+    }
+
+    #[test]
+    fn securities_lending_income_survives_the_api_and_report_dtos() {
+        let dto = income_operation(Some(IncomeKindDto::SecuritiesLendingIncome));
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["kind"], "securities_lending_income");
+        let restored: OperationDto = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            restored.to_domain(&directory()).unwrap().kind,
+            OperationKind::Income {
+                kind: Some(IncomeKind::SecuritiesLendingIncome),
+                ..
+            }
+        ));
+
+        let earning = EarningSourceAmountDto {
+            account: Uuid::from_u128(3),
+            instrument: None,
+            category: None,
+            income_kind: Some(IncomeKindDto::from_domain(
+                IncomeKind::SecuritiesLendingIncome,
+            )),
+            amount: "12.00".to_owned(),
+        };
+        let value = serde_json::to_value(earning).unwrap();
+        assert_eq!(value["income_kind"], "securities_lending_income");
+        assert!(value.get("instrument").is_none());
+        assert!(value.get("category").is_none());
     }
 
     #[test]

@@ -121,6 +121,44 @@ fn a_bundle_restores_a_complete_working_state() {
 }
 
 #[test]
+fn securities_lending_income_and_its_classification_rule_survive_a_bundle() {
+    let (mut source, owner, account, _) = populated();
+    let mut event = deposit(owner, account, 3, 700);
+    event.kind = EventKind::Income {
+        instrument: None,
+        gross: Money::new(PostedMinor::new(700), CurrencyCode::Rub),
+        kind: Some(IncomeKind::SecuritiesLendingIncome),
+    };
+    source.append_event(&event, IdentityScope::Source).unwrap();
+    let rule = source
+        .insert_rule(
+            owner,
+            NewRule {
+                counterparty_account: None,
+                description_contains: Some("Securities lending".into()),
+                source_kind: None,
+                source_category: None,
+                owner_category: None,
+                source_code: None,
+                movement: None,
+                outcome_kind: "income".into(),
+                to_account: None,
+                fee_origin: None,
+                income_kind: Some("securities_lending_income".into()),
+            },
+        )
+        .unwrap();
+    let bundle = source.export_bundle(owner).unwrap();
+    let mut restored = SqliteStore::open_in_memory().unwrap();
+    restored.import_bundle(&bundle).unwrap();
+    assert_eq!(
+        restored.load_events(owner).unwrap(),
+        source.load_events(owner).unwrap()
+    );
+    assert_eq!(restored.list_active_rules(owner).unwrap(), vec![rule]);
+}
+
+#[test]
 fn importing_the_same_bundle_twice_changes_nothing() {
     let (source, owner, _, _) = populated();
     let bundle = source.export_bundle(owner).unwrap();

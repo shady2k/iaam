@@ -2276,6 +2276,128 @@ async fn append_checked_rejects_a_batch_before_any_event_is_written() {
     assert!(load_all(&services, owner).await.is_empty());
 }
 
+struct LendingIncomeFinam;
+
+impl Transport for LendingIncomeFinam {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        let body = if request.path().ends_with("/v1/sessions") {
+            r#"{"token":"invented-finam-session"}"#
+        } else if request.path().contains("/transactions") {
+            r#"{"transactions":[{"id":"invented-lending-income",
+                "timestamp":"2026-03-15T10:00:00Z", "category":"INCOME",
+                "transaction_name":"Доход по предоставлениям займа",
+                "change":{"units":"23","nanos":0,"currency_code":"RUB"}}]}"#
+        } else if request.path().ends_with("/v1/accounts/invented-account") {
+            r#"{"cash":[{"units":"23","nanos":0,"currency_code":"RUB"}],"positions":[]}"#
+        } else {
+            panic!(
+                "unexpected Finam lending income request: {}",
+                request.path()
+            );
+        };
+        Ok(HttpResponse {
+            status: 200,
+            body: body.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn finam_securities_lending_income_without_symbol_is_persisted_as_gross_cash() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let code = iaam_store::documents::BrokerCode::parse("finam").expect("Finam code");
+    services
+        .store
+        .record_broker_account_binding(owner, account, &code, "invented-account".to_owned())
+        .await
+        .expect("Finam account binding");
+    let time = Arc::new(FakeTime {
+        now: Mutex::new(Instant::now()),
+        wall: Mutex::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1_774_958_400)),
+    });
+    let gateway = Gateway::with_parts_for_database(
+        LendingIncomeFinam,
+        BUDGETS,
+        Arc::clone(&time) as Arc<dyn GatewayClock>,
+        time as Arc<dyn Sleeper>,
+        iaam_http::BrokerEgress::On,
+        &broker_egress_database(),
+    )
+    .expect("gateway");
+    let key = Key::from_bytes([5; 32]);
+    let token = open(&key, &seal(&key, "invented-finam-token")).expect("token");
+    let (_, seed) = seed_for("finam").expect("Finam dictionary");
+    let (dictionary, unreadable) = OperationKindDictionary::build(seed.iter().copied());
+    assert!(unreadable.is_empty());
+    let source = SourceId::new_random();
+    let channel = iaam_app::adapters::finam::FinamChannel::new(
+        iaam_broker::finam::FinamClient::new(token, Arc::new(gateway)),
+        source,
+        dictionary,
+        Arc::clone(&services.directory),
+    );
+    let outcome = iaam_app::sync::sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        iaam_app::sync::BrokerSyncRequest {
+            broker_code: code,
+            account,
+            from: date!(2026 - 03 - 01),
+            to: date!(2026 - 03 - 31),
+        },
+    )
+    .await
+    .expect("Finam lending income sync");
+
+    assert_eq!(outcome.set_aside, 0, "{:?}", outcome.recorded);
+    let events = load_all(&services, owner).await;
+    let incomes: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Income { .. }))
+        .collect();
+    assert_eq!(incomes.len(), 1, "{events:?}");
+    let event = incomes[0];
+    let EventKind::Income {
+        instrument,
+        gross,
+        kind,
+    } = &event.kind
+    else {
+        panic!("persisted income");
+    };
+    assert_eq!(*instrument, None);
+    assert_eq!(
+        *kind,
+        Some(iaam_core::event::kind::IncomeKind::SecuritiesLendingIncome)
+    );
+    assert_eq!(gross.amount().raw(), 2_300);
+    assert_eq!(gross.currency(), CurrencyCode::Rub);
+    assert_eq!(event.account, account);
+    assert_eq!(
+        event.provenance.source_operation_id(),
+        Some("invented-lending-income")
+    );
+    assert_eq!(event.legs.len(), 1);
+    assert_eq!(
+        event.legs[0],
+        iaam_core::event::leg::Leg::cash(account, *gross)
+    );
+    assert!(
+        services
+            .directory
+            .list_instruments()
+            .await
+            .expect("catalogue")
+            .is_empty()
+    );
+}
+
 struct CatalogueFinam;
 
 impl Transport for CatalogueFinam {

@@ -1221,11 +1221,9 @@ async fn health_is_public_and_reports_the_projection_version() {
     let (status, body) = call(&harness.router, get("/v1/health", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    // Version 8: version 7 removed the face value from the lot and made the
-    // prefix fingerprint cover the event contents; version 8 orders events
-    // within a day by the source's time. Snapshots from either earlier version
-    // are incompatible and trigger a full recalculation.
-    assert_eq!(body["projection_version"], 8);
+    // Version 9 retains income totals by account, kind and currency.
+    // Earlier snapshots must rebuild rather than omit historical income.
+    assert_eq!(body["projection_version"], 9);
 }
 
 #[tokio::test]
@@ -2260,6 +2258,78 @@ async fn the_openapi_document_declares_bearer_security() {
         .expect("security scheme description");
     assert!(description.contains("iaam claim --label <label>"));
     assert!(description.contains("no API route issues one"));
+}
+
+#[tokio::test]
+async fn securities_lending_income_is_published_in_openapi_and_accepted_by_ingest() {
+    let harness = harness().await;
+    let (status, spec) = call(&harness.router, get("/v1/openapi.json", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        spec["components"]["schemas"]["IncomeKindDto"]["enum"],
+        json!([
+            "coupon",
+            "dividend",
+            "deposit_interest",
+            "securities_lending_income"
+        ])
+    );
+    assert!(
+        spec["components"]["schemas"]["EarningSourceAmountDto"]["properties"]
+            .get("income_kind")
+            .is_some()
+    );
+
+    let (status, verdicts) = call(
+        &harness.router,
+        post(
+            "/v1/ingest/operations",
+            &harness.owner_token,
+            &json!({
+                "source_label": "manual entry",
+                "operations": [{
+                    "account": harness.account.inner(),
+                    "type": "income",
+                    "kind": "securities_lending_income",
+                    "amount": "12.00",
+                    "currency": "RUB",
+                    "dates": { "cash_posted": "2026-08-20" }
+                }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{verdicts}");
+    assert_eq!(verdicts[0]["verdict"], "provisional", "{verdicts}");
+
+    let (status, contour) = call(
+        &harness.router,
+        post(
+            "/v1/contours",
+            &harness.owner_token,
+            &json!({ "title": "Lending income", "accounts": [harness.account.inner()] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{contour}");
+    let contour = contour["contour"].as_str().expect("contour");
+    let (status, report) = call(
+        &harness.router,
+        get(
+            &format!("/v1/reports/returns?contour={contour}&currency=RUB&as_of=2026-08-26"),
+            Some(&harness.owner_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(
+        report["income_by_kind"]["value"],
+        json!([{
+            "kind": "securities_lending_income",
+            "amount": { "amount": "12.00", "currency": "RUB" }
+        }]),
+        "{report}"
+    );
 }
 
 #[tokio::test]

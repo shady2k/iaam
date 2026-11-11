@@ -41,8 +41,9 @@ use state::{LedgerState, StateHash};
 ///
 /// Version 7: face value was removed from the lot, and the prefix fingerprint covers
 /// the event contents (`prefix_digest/v2`). Version 8 incorporates source-time
-/// ordering; older snapshots are incompatible and trigger a full recomputation.
-pub const PROJECTION_VERSION: u32 = 8;
+/// ordering. Version 9 retains received income totals by account and kind.
+/// Older snapshots are incompatible and trigger a full recomputation.
+pub const PROJECTION_VERSION: u32 = 9;
 
 /// Immutable projection input: scope boundaries and rule versions.
 ///

@@ -15,7 +15,7 @@ use time::format_description::well_known::Rfc3339;
 use time::{Date, OffsetDateTime};
 
 /// Finam Trade API response parser version.
-pub const FINAM_PARSER_VERSION: &str = "finam-api/2";
+pub const FINAM_PARSER_VERSION: &str = "finam-api/3";
 
 /// Error while parsing a Finam response.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

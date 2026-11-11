@@ -28,6 +28,7 @@ is how you match a term in them to the code.
 | денежный поток | cashflow | |
 | НКД | accrued interest | |
 | купон | coupon | |
+| доход по займу ценных бумаг | securities lending income | `IncomeKind::SecuritiesLendingIncome` |
 | выплата (плановая) | posting | `ExpectedPosting`, `PostingKind` |
 | компенсация | compensation | |
 | минимальная единица валюты | minor unit | |

@@ -1561,6 +1561,7 @@ fn income_kind_code(value: IncomeKind) -> &'static str {
         IncomeKind::Coupon => "coupon",
         IncomeKind::Dividend => "dividend",
         IncomeKind::DepositInterest => "deposit_interest",
+        IncomeKind::SecuritiesLendingIncome => "securities_lending_income",
     }
 }
 
@@ -1569,6 +1570,7 @@ fn parse_income_kind(text: &str) -> Result<IncomeKind, StoreError> {
         "coupon" => Ok(IncomeKind::Coupon),
         "dividend" => Ok(IncomeKind::Dividend),
         "deposit_interest" => Ok(IncomeKind::DepositInterest),
+        "securities_lending_income" => Ok(IncomeKind::SecuritiesLendingIncome),
         other => Err(StoreError::InvalidValue {
             field: "income_kind",
             value: other.to_owned(),
@@ -2227,6 +2229,14 @@ mod tests {
                 kind: Some(IncomeKind::DepositInterest),
             },
             vec![Leg::cash(f.account, rub(9))],
+        ));
+        events.push(f.event(
+            EventKind::Income {
+                instrument: Some(f.instrument),
+                gross: rub(7),
+                kind: Some(IncomeKind::SecuritiesLendingIncome),
+            },
+            vec![Leg::cash(f.account, rub(7))],
         ));
 
         // --- Fee: every origin ----------------------------------------------

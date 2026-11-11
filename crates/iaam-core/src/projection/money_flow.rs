@@ -21,7 +21,7 @@ use time::Date;
 use crate::category::CategoryAssignment;
 use crate::contour::{ContourDefinition, FlowClass, classify};
 use crate::event::Event;
-use crate::event::kind::EventKind;
+use crate::event::kind::{EventKind, IncomeKind};
 use crate::event::leg::LegKind;
 use crate::ids::CategoryId;
 use crate::ids::{AccountId, EventId, InstrumentId};
@@ -119,22 +119,22 @@ pub enum UndecomposedCause {
 /// What produced an earning.
 ///
 /// The account answers "which deposit or which card", the instrument "which
-/// security", and the category "what sort of income" — cashback, interest, a
-/// coupon. Three axes rather than one, because no single label answers "which
-/// asset brought what" for both a savings account and a bond: for cash-like
-/// assets the account **is** the asset, and for securities the instrument is.
+/// security", and the category gives the owner's vocabulary — cashback or
+/// interest on a balance. For cash-like assets the account is the asset;
+/// for securities the instrument is.
 ///
-/// The sort is a **category**, not an enum in the code. Cashback and interest
-/// on a balance are the owner's vocabulary, they change over the years, and the
-/// design already decided that a category is derived from versioned rules
-/// rather than written onto an event. Putting them in `IncomeKind` would freeze
-/// the owner's list into the schema and make renaming one a journal migration.
-/// `IncomeKind` stays what it is for: whether a payment is a bond coupon, which
-/// the schedule reconciliation needs.
+/// The economic income kind is a separate axis. Securities lending income must
+/// not merge with issuer payments even when a category rule assigns both to the
+/// same category. Categories remain derived from versioned rules rather than
+/// frozen into the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EarningSource {
     pub account: AccountId,
     pub instrument: Option<InstrumentId>,
+    /// The economic kind stays separate even when category rules assign two
+    /// different kinds to the same category. `None` retains unknown income.
+    #[serde(default)]
+    pub income_kind: Option<IncomeKind>,
     /// `None` where no rule covers the row. Not a bucket: an undecomposed
     /// earning is shown as its own line, exactly as an undecomposed outflow is.
     pub category: Option<CategoryId>,
@@ -268,7 +268,9 @@ impl MoneyFlow {
                             event.id,
                         )?;
                     }
-                    EventKind::Income { instrument, .. } => {
+                    EventKind::Income {
+                        instrument, kind, ..
+                    } => {
                         add(
                             &mut self.earned_by_capital,
                             leg.account,
@@ -283,6 +285,7 @@ impl MoneyFlow {
                         let source = EarningSource {
                             account: leg.account,
                             instrument: *instrument,
+                            income_kind: *kind,
                             category: match category_assignment {
                                 Some(CategoryAssignment::Assigned { category, .. }) => {
                                     Some(category)
@@ -1543,6 +1546,60 @@ mod tests {
         assert_eq!(split.len(), 1);
         assert_eq!(split[0].0.category, Some(category));
         assert_eq!(split[0].1, rub(1_200));
+    }
+
+    #[test]
+    fn securities_lending_income_has_its_own_earning_line_even_in_the_same_category() {
+        let account = AccountId::new_random();
+        let instrument = InstrumentId::new_random();
+        let category = CategoryId::new_random();
+        let contour =
+            ContourDefinition::new(ContourId::new_random(), ContourVersion(1), vec![account]);
+        let mut flow = MoneyFlow::new();
+        for (kind, amount) in [
+            (IncomeKind::Coupon, 100),
+            (IncomeKind::Dividend, 200),
+            (IncomeKind::DepositInterest, 300),
+            (IncomeKind::SecuritiesLendingIncome, 400),
+            (IncomeKind::SecuritiesLendingIncome, 50),
+        ] {
+            flow.apply(
+                &event(
+                    EventKind::Income {
+                        instrument: Some(instrument),
+                        gross: rub(amount),
+                        kind: Some(kind),
+                    },
+                    vec![Leg::cash(account, rub(amount))],
+                    date!(2026 - 08 - 07),
+                ),
+                &contour,
+                august(),
+                &AlwaysCategory(category),
+            )
+            .expect("income applies");
+        }
+
+        let split = flow
+            .earned_by_capital_by_source(CurrencyCode::Rub)
+            .expect("split");
+        assert_eq!(split.len(), 4);
+        for (kind, expected) in [
+            (IncomeKind::Coupon, 100),
+            (IncomeKind::Dividend, 200),
+            (IncomeKind::DepositInterest, 300),
+            (IncomeKind::SecuritiesLendingIncome, 450),
+        ] {
+            assert!(split.iter().any(|(source, amount)| {
+                source.account == account
+                    && source.instrument == Some(instrument)
+                    && source.category == Some(category)
+                    && source.income_kind == Some(kind)
+                    && *amount == rub(expected)
+            }));
+        }
+        assert_eq!(value(flow.earned_by_capital(CurrencyCode::Rub)), rub(1_050));
+        assert_eq!(value(flow.residual(CurrencyCode::Rub)), rub(0));
     }
 
     #[test]

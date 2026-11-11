@@ -12,7 +12,7 @@
 
 use iaam_core::category::CategoryMatcher;
 use iaam_core::event::corporate_action::CorporateAction;
-use iaam_core::event::kind::{EventKind, FeeOrigin, TaxOrigin};
+use iaam_core::event::kind::{EventKind, FeeOrigin, IncomeKind, TaxOrigin};
 use iaam_core::event::leg::LegKind;
 use iaam_core::event::offer::{OfferExerciseAction, OfferSubmissionId, OfferWindowId};
 use iaam_core::event::{Confidence, Relation};
@@ -152,6 +152,29 @@ fn the_fee_origin_check_matches_fee_origin() {
     let ddl = table_ddl(&store, "event_fee");
     let values: Vec<&str> = all.iter().copied().map(code).collect();
     assert_ddl_lists(&ddl, "event_fee", &values);
+}
+
+#[test]
+fn the_income_kind_checks_match_income_kind() {
+    fn code(value: IncomeKind) -> &'static str {
+        match value {
+            IncomeKind::Coupon => "coupon",
+            IncomeKind::Dividend => "dividend",
+            IncomeKind::DepositInterest => "deposit_interest",
+            IncomeKind::SecuritiesLendingIncome => "securities_lending_income",
+        }
+    }
+    let all = [
+        IncomeKind::Coupon,
+        IncomeKind::Dividend,
+        IncomeKind::DepositInterest,
+        IncomeKind::SecuritiesLendingIncome,
+    ];
+    let store = SqliteStore::open_in_memory().expect("open");
+    let values: Vec<&str> = all.iter().copied().map(code).collect();
+    for table in ["event_income", "classification_rules"] {
+        assert_ddl_lists(&table_ddl(&store, table), table, &values);
+    }
 }
 
 #[test]

@@ -127,6 +127,8 @@ pub enum IncomeKind {
     Dividend,
     /// Deposit interest paid (E3.5 will build on this).
     DepositInterest,
+    /// Payment for lending securities, distinct from income paid by the issuer.
+    SecuritiesLendingIncome,
 }
 
 /// Storage discriminants used by SQL projections as well as the event API.
@@ -643,6 +645,7 @@ mod tests {
             IncomeKind::Coupon,
             IncomeKind::Dividend,
             IncomeKind::DepositInterest,
+            IncomeKind::SecuritiesLendingIncome,
         ] {
             let text = serde_json::to_string(&kind).unwrap();
             assert_eq!(serde_json::from_str::<IncomeKind>(&text).unwrap(), kind);

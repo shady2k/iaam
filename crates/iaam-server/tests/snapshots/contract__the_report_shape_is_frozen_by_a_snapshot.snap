@@ -57,6 +57,9 @@ expression: report
     "sessions": []
   },
   "history_starts": "2025-01-01",
+  "income_by_kind": {
+    "value": []
+  },
   "liquidation_value_before_exit_costs_and_tax": {
     "accrued_interest_payable_on_termination": {
       "value": "0"

@@ -492,9 +492,9 @@ async fn adapt_operations(
         }
         // INCOME is a source category, not one economic kind. Only its
         // exact transaction name establishes which fact can be recorded.
-        let kind = if operation.source_kind == "INCOME" {
+        let named_income = if operation.source_kind == "INCOME" {
             match income_kind(&operation) {
-                Ok(kind) => kind,
+                Ok(kind) => Some(kind),
                 Err(reason) => {
                     quarantined.push(Quarantined {
                         raw,
@@ -505,7 +505,7 @@ async fn adapt_operations(
                 }
             }
         } else {
-            kind
+            None
         };
         if let Some(reason) = securities_transfer_reason(&kind) {
             quarantined.push(Quarantined {
@@ -515,11 +515,17 @@ async fn adapt_operations(
             });
             continue;
         }
-        let dimensions = dimensions_for_kind(&kind);
-        let converted = if matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell) {
+        let dimensions = if named_income.is_some() {
+            [Dimension::Cash, Dimension::Income].into_iter().collect()
+        } else {
+            dimensions_for_kind(&kind)
+        };
+        let converted = if named_income.is_none()
+            && matches!(kind, ChannelOperationKind::Buy | ChannelOperationKind::Sell)
+        {
             trade_operation(account, operation, kind, symbols).await
         } else {
-            operation_to_submitted(account, operation, kind, symbols).await
+            operation_to_submitted(account, operation, kind, named_income, symbols).await
         };
         match converted.map_err(|error| error.with_dimensions(dimensions)) {
             Ok(operation) => accepted.push(operation),
@@ -549,15 +555,12 @@ async fn adapt_operations(
 }
 
 /// Finam's generic income category needs the source's exact economic name.
-fn income_kind(operation: &ChannelOperation) -> Result<ChannelOperationKind, String> {
+fn income_kind(operation: &ChannelOperation) -> Result<IncomeKind, String> {
     match operation.transaction_name.as_deref() {
-        Some("Купонный доход") => Ok(ChannelOperationKind::Coupon),
-        Some("Доход по предоставлениям займа") => Err(concat!(
-            "unsupported Finam INCOME transaction_name: Доход по предоставлениям займа — ",
-            "core IncomeKind has no loan-provision income kind; DepositInterest describes ",
-            "deposit interest, and an absent kind would discard the source's stated meaning"
-        )
-        .to_owned()),
+        Some("Купонный доход") => Ok(IncomeKind::Coupon),
+        Some("Доход по предоставлениям займа") => {
+            Ok(IncomeKind::SecuritiesLendingIncome)
+        }
         Some(name) => Err(format!("unsupported Finam INCOME transaction_name: {name}")),
         None => Err("Finam INCOME does not contain transaction_name".to_owned()),
     }
@@ -907,99 +910,112 @@ async fn operation_to_submitted(
     account: AccountId,
     operation: ChannelOperation,
     kind: ChannelOperationKind,
+    named_income: Option<IncomeKind>,
     symbols: &Symbols<'_>,
 ) -> Result<SubmittedOperation, RowRefusal> {
-    let kind = match kind {
-        ChannelOperationKind::Buy | ChannelOperationKind::Sell => {
-            return Err(RowRefusal::Adapter(
-                "trading operations are converted from their trade fields".to_owned(),
-            ));
+    let kind = if let Some(income_kind) = named_income {
+        let (gross_minor, currency) = required_money(operation.payment, "change")?;
+        if gross_minor <= 0 {
+            return Err(row_unparsable("income requires positive change"));
         }
-        // A coupon and a dividend must not be collapsed into a single receipt: the
-        // journal stores the kind, and losing it here means losing it forever —
-        // the event is immutable.
-        kind @ (ChannelOperationKind::Dividend | ChannelOperationKind::Coupon) => {
-            let (gross_minor, currency) = required_money(operation.payment, "change")?;
-            let income_kind = match kind {
-                ChannelOperationKind::Coupon => IncomeKind::Coupon,
-                ChannelOperationKind::Dividend => IncomeKind::Dividend,
-                // The outer pattern has already narrowed the possibilities. This
-                // branch is unreachable and must fail loudly, rather than
-                // substitute a dividend.
-                other => {
-                    return Err(RowRefusal::Adapter(format!(
-                        "income kind mismatch: {other:?}"
-                    )));
+        OperationKind::Income {
+            instrument: match income_kind {
+                IncomeKind::SecuritiesLendingIncome => None,
+                _ => Some(symbols.required(&operation).await?),
+            },
+            gross_minor,
+            currency,
+            kind: Some(income_kind),
+        }
+    } else {
+        match kind {
+            ChannelOperationKind::Buy | ChannelOperationKind::Sell => {
+                return Err(RowRefusal::Adapter(
+                    "trading operations are converted from their trade fields".to_owned(),
+                ));
+            }
+            // A coupon and a dividend must not be collapsed into a single receipt: the
+            // journal stores the kind, and losing it here means losing it forever —
+            // the event is immutable.
+            kind @ (ChannelOperationKind::Dividend | ChannelOperationKind::Coupon) => {
+                let (gross_minor, currency) = required_money(operation.payment, "change")?;
+                let income_kind = match kind {
+                    ChannelOperationKind::Coupon => IncomeKind::Coupon,
+                    ChannelOperationKind::Dividend => IncomeKind::Dividend,
+                    // The outer pattern has already narrowed the possibilities. This
+                    // branch is unreachable and must fail loudly, rather than
+                    // substitute a dividend.
+                    other => {
+                        return Err(RowRefusal::Adapter(format!(
+                            "income kind mismatch: {other:?}"
+                        )));
+                    }
+                };
+                OperationKind::Income {
+                    instrument: symbols.optional(&operation).await?,
+                    gross_minor,
+                    currency,
+                    kind: Some(income_kind),
                 }
-            };
-            OperationKind::Income {
-                instrument: if operation.source_kind == "INCOME" {
-                    Some(symbols.required(&operation).await?)
-                } else {
-                    symbols.optional(&operation).await?
-                },
-                gross_minor,
-                currency,
-                kind: Some(income_kind),
             }
-        }
-        ChannelOperationKind::Commission => {
-            let (amount_minor, currency) = required_money(operation.payment, "change")?;
-            OperationKind::Fee {
-                amount_minor,
-                currency,
-                origin: FeeOrigin::Brokerage,
+            ChannelOperationKind::Commission => {
+                let (amount_minor, currency) = required_money(operation.payment, "change")?;
+                OperationKind::Fee {
+                    amount_minor,
+                    currency,
+                    origin: FeeOrigin::Brokerage,
+                }
             }
-        }
-        ChannelOperationKind::Deposit => {
-            let (amount_minor, currency) = required_money(operation.payment, "change")?;
-            OperationKind::Deposit {
-                amount_minor,
-                currency,
+            ChannelOperationKind::Deposit => {
+                let (amount_minor, currency) = required_money(operation.payment, "change")?;
+                OperationKind::Deposit {
+                    amount_minor,
+                    currency,
+                }
             }
-        }
-        ChannelOperationKind::Withdrawal => {
-            let (amount_minor, currency) = required_money(operation.payment, "change")?;
-            OperationKind::Withdrawal {
-                amount_minor,
-                currency,
+            ChannelOperationKind::Withdrawal => {
+                let (amount_minor, currency) = required_money(operation.payment, "change")?;
+                OperationKind::Withdrawal {
+                    amount_minor,
+                    currency,
+                }
             }
-        }
-        ChannelOperationKind::SecuritiesTransferIn
-        | ChannelOperationKind::SecuritiesTransferOut => {
-            return Err(row_unparsable(
-                "securities moved without a cash movement: the transfer is not a cash fact",
-            ));
-        }
-        ChannelOperationKind::Transfer => {
-            return Err(RowRefusal::Row {
-                reason: "transfer does not contain a recipient account".to_owned(),
-                dimensions: BTreeSet::new(),
-            });
-        }
-        // Amortisation and redemption are corporate actions, not
-        // owner operations: they have their own representation and endpoint
-        // (POST /v1/ingest/journal-events). The channel reports the payment
-        // amount, but not the returned face value per unit or the custody
-        // location; without them the fact cannot be constructed, and
-        // substituting a guess would record something that never happened in
-        // the append-only journal.
-        ChannelOperationKind::BondAmortisation => {
-            return Err(row_unparsable(
-                "bond amortisation: the channel does not report the returned face value per unit \
+            ChannelOperationKind::SecuritiesTransferIn
+            | ChannelOperationKind::SecuritiesTransferOut => {
+                return Err(row_unparsable(
+                    "securities moved without a cash movement: the transfer is not a cash fact",
+                ));
+            }
+            ChannelOperationKind::Transfer => {
+                return Err(RowRefusal::Row {
+                    reason: "transfer does not contain a recipient account".to_owned(),
+                    dimensions: BTreeSet::new(),
+                });
+            }
+            // Amortisation and redemption are corporate actions, not
+            // owner operations: they have their own representation and endpoint
+            // (POST /v1/ingest/journal-events). The channel reports the payment
+            // amount, but not the returned face value per unit or the custody
+            // location; without them the fact cannot be constructed, and
+            // substituting a guess would record something that never happened in
+            // the append-only journal.
+            ChannelOperationKind::BondAmortisation => {
+                return Err(row_unparsable(
+                    "bond amortisation: the channel does not report the returned face value per unit \
                  or custody location — the fact is entered via the journal endpoint",
-            ));
-        }
-        ChannelOperationKind::BondRedemption => {
-            return Err(row_unparsable(
-                "bond redemption: the channel does not report the returned face value per unit \
+                ));
+            }
+            ChannelOperationKind::BondRedemption => {
+                return Err(row_unparsable(
+                    "bond redemption: the channel does not report the returned face value per unit \
                  or custody location — the fact is entered via the journal endpoint",
-            ));
-        }
-        ChannelOperationKind::Other(kind) => {
-            return Err(row_unparsable(format!(
-                "unsupported operation kind: {kind}"
-            )));
+                ));
+            }
+            ChannelOperationKind::Other(kind) => {
+                return Err(row_unparsable(format!(
+                    "unsupported operation kind: {kind}"
+                )));
+            }
         }
     };
 
@@ -1439,9 +1455,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_securities_lending_income_needs_no_symbol() {
+        let row = json!({
+            "id": "invented-lending-income",
+            "timestamp": "2025-06-10T10:00:00Z", "category": "INCOME",
+            "change": {"currency_code": "RUB", "units": "23", "nanos": 0},
+            "transaction_name": "Доход по предоставлениям займа"
+        });
+        let body = json!({"transactions": [row]}).to_string();
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body)], None).0,
+            directory(&[]).await.0,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("lending income parses without a catalogue request");
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.accepted.len(), 1);
+        assert!(matches!(
+            parsed.accepted[0].kind,
+            OperationKind::Income {
+                instrument: None,
+                gross_minor: 2300,
+                currency: CurrencyCode::Rub,
+                kind: Some(IncomeKind::SecuritiesLendingIncome),
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn unsupported_income_names_and_coupon_without_symbol_stay_refused() {
         let names = [
-            Some("Доход по предоставлениям займа"),
+            Some("Доход по предоставлениям займа "),
             Some("Invented income"),
             Some("Купонный доход "),
             Some("Купонный доход"),
@@ -1490,11 +1542,6 @@ mod tests {
             parsed.quarantined[0]
                 .reason
                 .contains("Доход по предоставлениям займа")
-        );
-        assert!(
-            parsed.quarantined[0]
-                .reason
-                .contains("core IncomeKind has no loan-provision income kind")
         );
         for index in [1, 2] {
             assert!(

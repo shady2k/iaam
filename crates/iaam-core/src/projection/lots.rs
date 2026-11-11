@@ -747,7 +747,11 @@ impl LotBook {
         let entry = self.entries.entry(key).or_default();
         match kind {
             Some(IncomeKind::Coupon) => entry.add_received(amount),
-            Some(IncomeKind::Dividend | IncomeKind::DepositInterest) => Ok(()),
+            Some(
+                IncomeKind::Dividend
+                | IncomeKind::DepositInterest
+                | IncomeKind::SecuritiesLendingIncome,
+            ) => Ok(()),
             None => {
                 entry.income_kind_unknown = true;
                 Ok(())
@@ -2547,6 +2551,33 @@ mod tests {
         let entry = book.entry(&key(&trade)).unwrap();
         assert!(!entry.income_kind_unknown());
         assert_eq!(entry.cohorts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn securities_lending_income_is_not_reinvested_coupon_cash() {
+        let trade = sample_trade();
+        let rules = RuleRegistry::with_defaults();
+        let mut book = LotBook::new(LotRuleVersion(1));
+        book.apply(&dated_buy(&trade, 1), &rules).unwrap();
+        book.apply(
+            &event_with(
+                trade.account,
+                date!(2025 - 04 - 01),
+                2,
+                EventKind::Income {
+                    instrument: Some(trade.instrument),
+                    gross: rub(100),
+                    kind: Some(IncomeKind::SecuritiesLendingIncome),
+                },
+                vec![Leg::cash(trade.account, rub(100))],
+            ),
+            &rules,
+        )
+        .unwrap();
+        let entry = book.entry(&key(&trade)).unwrap();
+        assert!(!entry.income_kind_unknown());
+        assert_eq!(entry.cohorts().unwrap().len(), 1);
+        assert_eq!(entry.lots()[0].received_to_date, None);
     }
 
     #[test]

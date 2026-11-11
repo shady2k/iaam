@@ -554,6 +554,9 @@ fn describe_outcome(outcome: Classification) -> &'static str {
         Classification::Income {
             kind: Some(IncomeKind::DepositInterest),
         } => "this is income: interest on a balance",
+        Classification::Income {
+            kind: Some(IncomeKind::SecuritiesLendingIncome),
+        } => "this is income: securities lending income",
     }
 }
 

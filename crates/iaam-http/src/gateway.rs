@@ -38,6 +38,7 @@ use tokio::sync::Mutex;
 use crate::cache::{CacheKey, ResponseCache};
 use crate::client::HttpClient;
 use crate::destination::Destination;
+use crate::diagnostics::log_broker_refusal;
 use crate::egress::{BROKER_EGRESS_ENV, BrokerEgress, egress_directory_for};
 use crate::request::{HttpRequest, Secret};
 use crate::resilience::{MAX_NAMED_WAIT, Outcome, Retry, RetryPolicy, is_transient};
@@ -1023,10 +1024,11 @@ fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static st
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum TallyLatch {
     Unknown,
     Response {
+        path: String,
         status: u16,
         retry_after: Option<Duration>,
     },
@@ -1801,7 +1803,7 @@ impl<T: Transport + 'static> Gateway<T> {
                         })?;
                     lane.detached_attempt_failed.store(false, Ordering::SeqCst);
                 }
-                if broker && let Some(latch) = lane.tally_latched {
+                if broker && let Some(latch) = lane.tally_latched.clone() {
                     let directory = self
                         .egress_directory
                         .as_ref()
@@ -1812,12 +1814,14 @@ impl<T: Transport + 'static> Gateway<T> {
                     })?;
                     match latch {
                         TallyLatch::Response {
+                            path: latched_path,
                             status: latched_status,
                             retry_after: latched_retry_after,
                         } => {
                             let recorded = tally
-                                .record_response(
+                                .record_response_for_request(
                                     destination.base_url(),
+                                    &latched_path,
                                     latched_status,
                                     latched_retry_after,
                                     self.clock.as_ref(),
@@ -2089,7 +2093,11 @@ impl<T: Transport + 'static> Gateway<T> {
                                 rate_reset = observed.rate_reset,
                                 "outbound broker response"
                             );
-                            if observed.rate_remaining == Some(0)
+                            if !crate::tally::is_instrument_lookup_miss(
+                                destination.base_url(),
+                                observed_request.path(),
+                                observed.status,
+                            ) && observed.rate_remaining == Some(0)
                                 && let Some(seconds) = observed.rate_reset
                             {
                                 *callback_reset
@@ -2100,8 +2108,9 @@ impl<T: Transport + 'static> Gateway<T> {
                             let retry_after =
                                 observed.retry_after.map(|delay| delay.min(TALLY_RETENTION));
                             let recorded = callback_tally
-                                .record_response(
+                                .record_response_for_request(
                                     destination.base_url(),
+                                    observed_request.path(),
                                     observed.status,
                                     retry_after,
                                     callback_clock.as_ref(),
@@ -2169,11 +2178,19 @@ impl<T: Transport + 'static> Gateway<T> {
                         } else {
                             None
                         };
+                        if let Some((line, _)) = observed.as_ref() {
+                            let response = match &answer {
+                                Ok(response) => response,
+                                Err(_) => line,
+                            };
+                            log_broker_refusal(&request, response, attempts);
+                        }
                         if let Some((line, Err(_))) = observed.as_ref() {
                             lane.tally_latched = Some(if (200..300).contains(&line.status) {
                                 TallyLatch::Unknown
                             } else {
                                 TallyLatch::Response {
+                                    path: request.path().to_owned(),
                                     status: line.status,
                                     retry_after: line.retry_after,
                                 }
@@ -2235,17 +2252,41 @@ impl<T: Transport + 'static> Gateway<T> {
                         response
                     })
                 });
-                if let Some((observed_line, recorded)) = observed {
+                if let Some((mut observed_line, recorded)) = observed {
+                    let response = match &answer {
+                        Some(Ok(response)) => response,
+                        _ => &observed_line,
+                    };
                     match recorded {
                         Ok(TallyResponseDecision::Recorded) => {}
                         Ok(TallyResponseDecision::Paused { retry_after }) => {
-                            return Err(GatewayError::BrokerHostPaused {
-                                destination,
-                                host: destination.base_url(),
-                                reopens_at: format!("{retry_after:?} on the boot clock"),
-                                retry_after,
-                                attempts,
-                            });
+                            // The durable pause remains the authority: a short
+                            // Retry-After cannot bypass its one-minute floor.
+                            // Only an explicit header on a retryable read may
+                            // keep this call alive to retry within its deadline.
+                            let may_retry = observed_line.status == 429
+                                && response.retry_after_header.is_some()
+                                && request.is_idempotent()
+                                && matches!(
+                                    retry.decide(attempts, &Outcome::status(429)),
+                                    Retry::After(_)
+                                )
+                                && retry_after <= MAX_NAMED_WAIT
+                                && !crosses(self.clock.now() + retry_after);
+                            if !may_retry {
+                                return Err(GatewayError::BrokerHostPaused {
+                                    destination,
+                                    host: destination.base_url(),
+                                    reopens_at: format!("{retry_after:?} on the boot clock"),
+                                    retry_after,
+                                    attempts,
+                                });
+                            }
+                            lane.hold_until(self.clock.now() + retry_after);
+                            observed_line.retry_after = Some(retry_after);
+                            if let Some(Ok(response)) = &mut answer {
+                                response.retry_after = Some(retry_after);
+                            }
                         }
                         Err(error) => return Err(error),
                     }
@@ -3412,6 +3453,122 @@ mod tests {
         ));
         assert_eq!(gateway.transport.sent_count(), 1);
         assert!(time.slept().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_explicit_broker_retry_after_waits_for_the_durable_floor() {
+        let time = FakeTime::new();
+        let response = HttpResponse {
+            retry_after_header: Some(Duration::from_secs(2)),
+            ..with_retry_after(429, Duration::from_secs(2))
+        };
+        let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(response)));
+        let deadline = time.now() + Duration::from_secs(120);
+
+        let answer = gateway
+            .send(&operations(), Some(deadline))
+            .await
+            .expect("retry succeeds");
+
+        assert_eq!(answer.status, 200);
+        assert_eq!(gateway.transport.sent_count(), 2);
+        assert_eq!(time.slept(), vec![MINUTE]);
+        let sent = gateway.transport.sent_at();
+        assert_eq!(sent[1].duration_since(sent[0]), MINUTE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_broker_retry_after_that_cannot_fit_does_not_wait_or_send() {
+        let time = FakeTime::new();
+        let response = HttpResponse {
+            retry_after_header: Some(Duration::from_secs(2)),
+            ..with_retry_after(429, Duration::from_secs(2))
+        };
+        let gateway = gateway(&time, Scripted::answering(&time, 200).then(Ok(response)));
+        let deadline = time.now() + MINUTE;
+
+        assert!(matches!(
+            gateway.send(&operations(), Some(deadline)).await,
+            Err(GatewayError::BrokerHostPaused { attempts: 1, retry_after, .. })
+                if retry_after == MINUTE
+        ));
+        assert_eq!(gateway.transport.sent_count(), 1);
+        assert!(time.slept().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_waited_429_still_closes_the_broker_host() {
+        let time = FakeTime::new();
+        let response = HttpResponse {
+            retry_after_header: Some(Duration::from_secs(2)),
+            ..with_retry_after(429, Duration::from_secs(2))
+        };
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200)
+                .then(Ok(response.clone()))
+                .then(Ok(response)),
+        );
+        let deadline = time.now() + Duration::from_secs(15 * 60);
+
+        assert!(matches!(
+            gateway.send(&operations(), Some(deadline)).await,
+            Err(GatewayError::BrokerHostPaused { attempts: 2, retry_after, .. })
+                if retry_after == Duration::from_secs(30 * 60)
+        ));
+        assert_eq!(gateway.transport.sent_count(), 2);
+        assert_eq!(time.slept(), vec![MINUTE]);
+        assert!(matches!(
+            gateway.send(&operations(), Some(deadline)).await,
+            Err(GatewayError::BrokerHostClosed { attempts: 0, .. })
+        ));
+        assert_eq!(gateway.transport.sent_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn instrument_lookup_misses_do_not_pause_or_close_tinkoff_hosts() {
+        for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+            let time = FakeTime::new();
+            let response = HttpResponse {
+                body: br#"{"code":50002,"message":"instrument not found"}"#.to_vec(),
+                retry_after: Some(Duration::from_secs(2)),
+                rate_remaining: Some(0),
+                rate_reset: Some(2),
+                ..status(404)
+            };
+            let gateway = gateway(
+                &time,
+                Scripted::answering(&time, 200)
+                    .then(Ok(response.clone()))
+                    .then(Ok(response.clone()))
+                    .then(Ok(response.clone())),
+            );
+            let request = HttpRequest::post(
+                destination,
+                "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
+                crate::RequestBody::Json("{}".to_owned()),
+            )
+            .with_request_allowance(RequestAllowance::new(10))
+            .idempotent();
+            for _ in 0..3 {
+                assert!(matches!(
+                    gateway.send(&request, None).await,
+                    Err(GatewayError::Rejected { status: 404, body, .. })
+                        if body.as_bytes() == response.body.as_slice()
+                ));
+                time.advance(Duration::from_secs(1));
+            }
+            assert_eq!(
+                gateway
+                    .send(&request, None)
+                    .await
+                    .expect("host remains open")
+                    .status,
+                200
+            );
+            assert_eq!(gateway.transport.sent_count(), 4);
+            assert!(time.slept().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -37,6 +37,7 @@ use tokio::sync::Notify;
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const UNRESOLVED_CLOSURE: Duration = Duration::from_secs(60 * 60);
 const MINUTE: Duration = Duration::from_secs(60);
+const SHORT_CALL_WINDOW: Duration = Duration::from_secs(5);
 const CLOSURE: Duration = Duration::from_secs(30 * 60);
 const REFUSAL_WINDOW: Duration = Duration::from_secs(10 * 60);
 const DAILY_CEILING: usize = 1_000;
@@ -76,6 +77,7 @@ struct SendRecord {
     sync: u64,
     call: u64,
     status: u16,
+    instrument_not_found: bool,
     pause_for: Option<Duration>,
 }
 
@@ -210,7 +212,7 @@ fn measure(
         for (index, record) in host_records.iter().enumerate() {
             let queue = if record.status == 429 {
                 &mut rate_limits
-            } else if (400..=499).contains(&record.status) {
+            } else if (400..=499).contains(&record.status) && !record.instrument_not_found {
                 &mut refusals
             } else {
                 continue;
@@ -335,6 +337,7 @@ fn planted_record(
         sync,
         call,
         status: 200,
+        instrument_not_found: false,
         pause_for: None,
     }
 }
@@ -600,6 +603,7 @@ enum SleepMode {
     Wire,
     Deadline,
     ControlledDeadline,
+    ShortDeadline,
 }
 
 struct WireSleeper {
@@ -613,6 +617,25 @@ impl Sleeper for WireSleeper {
                 tokio::time::sleep(delay).await;
             }
             self.clock.advance(delay);
+        })
+    }
+}
+
+struct ShortDeadlineSleeper {
+    clock: Arc<FakeTime>,
+}
+
+impl Sleeper for ShortDeadlineSleeper {
+    fn sleep(&self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            // These fixtures set a minute of quarantine plus this caller
+            // window. Only its deadline timer uses real time; governance
+            // waits still advance the logical clock.
+            if delay == SHORT_CALL_WINDOW || delay == MINUTE + SHORT_CALL_WINDOW {
+                tokio::time::sleep(delay).await;
+            } else {
+                self.clock.advance(delay);
+            }
         })
     }
 }
@@ -886,6 +909,27 @@ impl Scenario {
         scenario
     }
 
+    fn new_short_deadline(
+        label: &str,
+        destination: Destination,
+        replies: impl IntoIterator<Item = LoopbackReply>,
+        timeout: Duration,
+    ) -> Self {
+        Self::build(
+            label,
+            destination,
+            replies,
+            timeout,
+            true,
+            ScenarioTiming {
+                sleep_mode: SleepMode::ShortDeadline,
+                advance_before_handoff: Duration::ZERO,
+                advance_after_handoff: Duration::ZERO,
+                short_deadline_calls: 0,
+            },
+        )
+    }
+
     fn new_deadline(
         label: &str,
         destination: Destination,
@@ -996,6 +1040,9 @@ impl Scenario {
                     sync: observed_context.active_sync.load(Ordering::SeqCst),
                     call: observed_context.active_call.load(Ordering::SeqCst),
                     status,
+                    instrument_not_found: status == 404
+                        && matches!(destination, Destination::TinkoffProd | Destination::TinkoffSandbox)
+                        && target == "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy",
                     pause_for,
                 });
             observed_context.arrivals.fetch_add(1, Ordering::SeqCst);
@@ -1027,6 +1074,9 @@ impl Scenario {
             SleepMode::ControlledDeadline => Arc::new(ControlledDeadlineSleeper {
                 clock: Arc::clone(&clock),
                 control: Arc::clone(&deadline_control),
+            }),
+            SleepMode::ShortDeadline => Arc::new(ShortDeadlineSleeper {
+                clock: Arc::clone(&clock),
             }),
             SleepMode::Logical => Arc::clone(&clock) as Arc<dyn Sleeper>,
         };
@@ -1318,16 +1368,21 @@ async fn exercise_rate_limit(
     reply: LoopbackReply,
     expected_pause: Duration,
 ) -> Scenario {
-    let scenario = Scenario::new(
+    let scenario = Scenario::new_short_deadline(
         label,
         destination,
         [reply, LoopbackReply::complete(200, "{}")],
         Duration::from_millis(40),
-        true,
     );
-    let refused = direct_send(&scenario, destination)
+    let request = direct_request(destination, direct_path(destination));
+    let refused = scenario
+        .outbound
+        .send(
+            &request,
+            Some(scenario.clock.now() + MINUTE + SHORT_CALL_WINDOW),
+        )
         .await
-        .expect_err("429 pauses the endpoint");
+        .expect_err("429 pause cannot fit the caller's remaining five seconds");
     let pause = scenario.remember_last_pause(&refused);
     assert_eq!(pause, expected_pause, "{label}: parsed pause");
     assert_refused_until_boundary(&scenario, destination, pause, label).await;
@@ -1337,16 +1392,21 @@ async fn exercise_rate_limit(
 }
 
 async fn exercise_body_rate_limit(label: &str, reply: LoopbackReply) -> Scenario {
-    let scenario = Scenario::new(
+    let scenario = Scenario::new_short_deadline(
         label,
         Destination::FinamApi,
         [reply, LoopbackReply::complete(200, "{}")],
         Duration::from_millis(40),
-        true,
     );
-    let refused = direct_send(&scenario, Destination::FinamApi)
+    let request = direct_request(Destination::FinamApi, direct_path(Destination::FinamApi));
+    let refused = scenario
+        .outbound
+        .send(
+            &request,
+            Some(scenario.clock.now() + MINUTE + SHORT_CALL_WINDOW),
+        )
         .await
-        .expect_err("429 status survives the body failure");
+        .expect_err("429 status survives the body failure and cannot fit the deadline");
     let pause = scenario.remember_last_pause(&refused);
     assert_eq!(pause, MINUTE, "{label}: parsed pause");
     assert_refused_until_boundary(&scenario, Destination::FinamApi, pause, label).await;
@@ -1516,6 +1576,88 @@ async fn exercise_daily_ceiling() -> Scenario {
     )
     .await;
     assert_eq!(scenario.records().len(), DAILY_CEILING + 1);
+    scenario
+}
+
+async fn exercise_instrument_not_found(destination: Destination) -> Scenario {
+    let scenario = Scenario::new(
+        "instrument-not-found",
+        destination,
+        (0..4)
+            .map(|_| {
+                LoopbackReply::complete(404, r#"{"message":"invented UID not found"}"#)
+                    .with_header("x-ratelimit-reset", "2")
+                    .with_header("x-ratelimit-remaining", "199")
+            })
+            .chain([LoopbackReply::complete(200, "{}")]),
+        Duration::from_secs(2),
+        true,
+    );
+    let path = "/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy";
+    for _ in 0..4 {
+        let refusal = scenario
+            .outbound
+            .send(&direct_request(destination, path), None)
+            .await
+            .expect_err("unknown instrument remains a row refusal");
+        assert!(matches!(
+            refusal,
+            GatewayError::Rejected { status: 404, .. }
+        ));
+    }
+    direct_send(&scenario, destination)
+        .await
+        .expect("instrument misses do not close the host");
+    assert_eq!(scenario.server.requests_received(), 5);
+    assert_eq!(scenario.locally_refused(), 0);
+    scenario
+}
+
+async fn exercise_tinkoff_retry_sync() -> Scenario {
+    let scenario = Scenario::new_sync(
+        "tinkoff-retry-sync",
+        Destination::TinkoffProd,
+        [
+            LoopbackReply::complete(200, r#"{"accounts":[{"id":"account"}]}"#),
+            LoopbackReply::complete(429, r#"{"message":"invented short pause"}"#)
+                .with_header("Retry-After", "2"),
+            LoopbackReply::complete(200, r#"{"hasNext":false,"items":[]}"#),
+            LoopbackReply::complete(200, r#"{"positions":[]}"#),
+        ],
+    );
+    let (services, principal, account) = services().await;
+    let channel = TinkoffChannel::new(
+        TinkoffClient::new(Environment::Prod, token(), Arc::clone(&scenario.outbound)),
+        SourceId::new_random(),
+        dictionary("tinkoff"),
+        Arc::clone(&services.directory),
+    );
+    let outcome = iaam_app::sync::sync_broker(
+        &services,
+        &principal,
+        &channel,
+        BrokerSyncRequest {
+            broker_code: iaam_store::documents::BrokerCode::parse("tinkoff").expect("broker code"),
+            account,
+            from: date!(2026 - 01 - 01),
+            to: date!(2026 - 12 - 31),
+        },
+    )
+    .await
+    .expect("one short broker pause fits the sync deadline");
+    assert_eq!(outcome.set_aside, 0);
+    let records = scenario.records();
+    assert_eq!(records.len(), 4, "one retry only: {records:?}");
+    assert_eq!(records[1].status, 429);
+    assert_eq!(
+        records[1].call, records[2].call,
+        "same logical request retries"
+    );
+    assert!(
+        records[2].logical_at.saturating_sub(records[1].logical_at) >= MINUTE,
+        "Retry-After 2 cannot shorten the durable sixty-second floor: {records:?}"
+    );
+    assert_eq!(scenario.locally_refused(), 0);
     scenario
 }
 
@@ -1968,7 +2110,7 @@ async fn exercise_record_failure_latch() -> Scenario {
 
 async fn exercise_lost_second_429() -> Scenario {
     let destination = Destination::TinkoffProd;
-    let scenario = Scenario::new(
+    let scenario = Scenario::new_short_deadline(
         "lost-second-429",
         destination,
         [
@@ -1976,11 +2118,16 @@ async fn exercise_lost_second_429() -> Scenario {
             LoopbackReply::held(429, "limited").with_header("Retry-After", "600"),
         ],
         Duration::from_secs(5),
-        true,
     );
-    direct_send(&scenario, destination)
+    let request = direct_request(destination, direct_path(destination));
+    scenario
+        .outbound
+        .send(
+            &request,
+            Some(scenario.clock.now() + MINUTE + SHORT_CALL_WINDOW),
+        )
         .await
-        .expect_err("the first 429 pauses the endpoint");
+        .expect_err("the first 429 pause cannot fit the caller's deadline");
     scenario.clock.advance(Duration::from_secs(60));
 
     let outbound = Arc::clone(&scenario.outbound);
@@ -2606,6 +2753,7 @@ fn parse_process_records(text: &str) -> (Vec<SendRecord>, usize) {
                     sync: 1,
                     call: index as u64 + 1,
                     status,
+                    instrument_not_found: false,
                     pause_for: None,
                 });
             }
@@ -2672,6 +2820,7 @@ async fn process_child() {
                     sync: 1,
                     call: 1,
                     status,
+                    instrument_not_found: false,
                     pause_for: None,
                 });
         },
@@ -2988,6 +3137,13 @@ async fn executable_ceiling_proof() {
         scenario.verify_and_print("always-400", destination, None);
     }
 
+    for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
+        let scenario = exercise_instrument_not_found(destination).await;
+        scenario.verify_and_print("instrument-404", destination, None);
+    }
+    let retried_sync = exercise_tinkoff_retry_sync().await;
+    retried_sync.verify_and_print("sync-429-retry", Destination::TinkoffProd, None);
+
     let finam_renewal = exercise_finam_renewal().await;
     finam_renewal.verify_and_print("always-401-renewal", Destination::FinamApi, None);
 
@@ -3252,6 +3408,7 @@ async fn first_enabling_sends_at_once_and_a_deleted_tally_restores_nothing() {
                     sync: 1,
                     call: observed_calls.load(Ordering::SeqCst),
                     status,
+                    instrument_not_found: false,
                     pause_for: None,
                 });
         },

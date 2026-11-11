@@ -54,6 +54,7 @@ compile_error!(
 mod cache;
 pub mod client;
 pub mod destination;
+mod diagnostics;
 mod egress;
 pub mod gateway;
 pub mod request;

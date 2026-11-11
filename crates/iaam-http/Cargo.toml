@@ -16,6 +16,8 @@ test-support = []
 # публичный. Выбор делает таблица назначений, а не клиент.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 thiserror = "2"
+# Parse only allowlisted broker error fields for bounded, redacted diagnostics.
+serde_json = "1"
 # Экранирование значений строки запроса. Своя реализация процентного
 # кодирования — лишнее место для ошибки в том, что уже решено.
 percent-encoding = "2"

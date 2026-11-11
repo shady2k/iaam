@@ -18,6 +18,8 @@ pub struct HttpResponse {
     /// parsed (see `resilience::parse_retry_after`). `None` when it named
     /// none, or in a form that does not parse.
     pub retry_after: Option<Duration>,
+    /// Parsed `Retry-After` alone, without a declared reset-header fallback.
+    pub retry_after_header: Option<Duration>,
     /// Numeric `x-ratelimit-limit` reported by the broker, never a local budget.
     pub rate_limit: Option<u64>,
     /// Numeric `x-ratelimit-remaining` reported by the broker.
@@ -35,7 +37,8 @@ pub struct HttpResponse {
     /// parse before anyone opens it.
     pub content_type: Option<String>,
     /// The request id the source answered with: the first present of
-    /// `x-request-id`, `x-trace-id`, `traceparent`, `x-correlation-id`. It
+    /// `x-tracking-id`, `x-request-id`, `x-trace-id`, `traceparent`,
+    /// `x-correlation-id`. It
     /// is the handle a destination's own support asks for when a call went
     /// wrong, so the gateway logs it with the answer.
     pub request_id: Option<String>,

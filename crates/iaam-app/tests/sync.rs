@@ -2474,6 +2474,135 @@ async fn record_finam_description(services: &AppServices, account: AccountId) ->
         .expect("Finam registered ISIN")
 }
 
+struct MissingInstrumentTinvest;
+
+impl Transport for MissingInstrumentTinvest {
+    async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if request
+            .path()
+            .ends_with("InstrumentsService/GetInstrumentBy")
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.body().expect("description body").payload())
+                    .expect("description JSON");
+            if body["id"]
+                .as_str()
+                .expect("UID")
+                .eq_ignore_ascii_case("bbbbbbbb-0000-0000-0000-000000000001")
+            {
+                return Ok(HttpResponse {
+                    status: 404,
+                    body:
+                        br#"{"code":5,"message":"invented broker: instrument UID is unavailable"}"#
+                            .to_vec(),
+                    ..Default::default()
+                });
+            }
+        }
+        ScriptedTinvest {
+            accounts: r#"{"accounts":[{"id":"solo"}]}"#,
+            operations: r#"{"hasNext":false,"items":[
+                {"cursor":"missing","brokerAccountId":"solo","id":"missing-coupon","date":"2026-03-15T10:00:00Z",
+                 "type":"OPERATION_TYPE_COUPON","state":"OPERATION_STATE_EXECUTED",
+                 "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000001",
+                 "payment":{"units":"25","nano":0,"currency":"rub"}},
+                {"cursor":"good","brokerAccountId":"solo","id":"good-coupon","date":"2026-03-15T10:01:00Z",
+                 "type":"OPERATION_TYPE_COUPON","state":"OPERATION_STATE_EXECUTED",
+                 "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000002",
+                 "payment":{"units":"15","nano":0,"currency":"rub"}},
+                {"cursor":"cash","brokerAccountId":"solo","id":"good-deposit","date":"2026-03-15T11:00:00Z",
+                 "type":"OPERATION_TYPE_INPUT","state":"OPERATION_STATE_EXECUTED",
+                 "payment":{"units":"100","nano":0,"currency":"rub"}}
+            ]}"#,
+            portfolio: r#"{"positions":[
+                {"instrumentType":"bond","quantity":{"units":"1","nano":0},
+                 "positionUid":"aaaaaaaa-0000-0000-0000-000000000001",
+                 "instrumentUid":"BBBBBBBB-0000-0000-0000-000000000001","blocked":false},
+                {"instrumentType":"share","quantity":{"units":"1","nano":0},
+                 "positionUid":"aaaaaaaa-0000-0000-0000-000000000002",
+                 "instrumentUid":"bbbbbbbb-0000-0000-0000-000000000002","blocked":false}
+            ]}"#
+            .to_owned(),
+        }
+        .send(request)
+        .await
+    }
+}
+
+#[tokio::test]
+async fn an_instrument_404_holds_only_its_rows_and_keeps_the_brokers_message() {
+    let owner = OwnerId::new_random();
+    let account = AccountId::new_random();
+    let services = services_with(date!(2026 - 03 - 31), |store| {
+        seed_account(store, owner, account, "Main");
+    });
+    let source = SourceId::new_random();
+    let channel = channel_over_with(MissingInstrumentTinvest, source, &services);
+    let outcome = sync_broker(
+        &services,
+        &principal(owner),
+        &channel,
+        account,
+        date!(2026 - 03 - 01),
+        date!(2026 - 03 - 31),
+    )
+    .await
+    .expect("a missing instrument does not abort other rows");
+    assert_eq!(outcome.set_aside, 2, "{:?}", outcome.recorded);
+    let refusals = services
+        .store
+        .list_open_sync_refusals(
+            owner,
+            account,
+            &source.inner().to_string(),
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .await
+        .expect("stored refusals");
+    assert_eq!(refusals.len(), 2);
+    for refusal in &refusals {
+        assert!(
+            refusal
+                .reason
+                .contains("invented broker: instrument UID is unavailable"),
+            "{}",
+            refusal.reason
+        );
+        assert!(
+            refusal
+                .payload
+                .to_lowercase()
+                .contains("bbbbbbbb-0000-0000-0000-000000000001")
+        );
+        assert!(!refusal.payload.contains("good-coupon"));
+        assert!(!refusal.payload.contains("good-deposit"));
+    }
+    let events = load_all(&services, owner).await;
+    for operation in ["good-coupon", "good-deposit"] {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.provenance.source_operation_id() == Some(operation)),
+            "readable operation {operation} was not imported: {events:?}"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.provenance.source_operation_id() == Some("missing-coupon"))
+    );
+    assert_eq!(
+        services
+            .directory
+            .list_instruments()
+            .await
+            .expect("catalogue")
+            .len(),
+        1
+    );
+}
+
 struct CatalogueTinvest {
     inner: ScriptedTinvest,
     description: String,

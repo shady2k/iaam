@@ -1143,6 +1143,12 @@ Every broker status line logs the numeric `x-ratelimit-limit`,
 `x-ratelimit-remaining` and `x-ratelimit-reset` fields at `info`, including
 `429` answers and answers whose body subsequently fails. Missing or malformed
 fields carry no numeric value; no arbitrary response header or body is logged.
+Non-2xx broker answers also log a `warn` event with status, numeric rate-limit
+fields, the parsed `Retry-After`, tracking/request id, and bounded error
+`code`, `message` and `description` fields (at most 128 UTF-8 bytes each).
+Only these error fields are read; credentials are redacted, and neither request bodies nor arbitrary error
+payloads are logged. T-Invest's `x-tracking-id` takes precedence over the
+other request-id headers.
 When remaining is zero, the next call sharing that budget waits the reset
 seconds from the status-line observation. T-Invest's
 [header documentation](https://github.com/RussianInvestments/investAPI/blob/main/src/docs/grpc.md)
@@ -1151,10 +1157,19 @@ T-Invest and per method for Finam. The same selected headers are read when
 Finam supplies them; no undocumented Finam-specific header is assumed.
 A wait beyond the call's deadline refuses the call before sending. As with
 other server-named waits, waits over fifteen minutes are refused for later
-retry, not shortened. Header pacing is in-process; the existing host-wide `429` pauses remain durable in
-the outbound tally. Cached responses do not restart a header wait. Headers
+retry, not shortened. Header pacing is in-process; the existing host-wide `429`
+pauses remain durable in the outbound tally. Cached responses do not restart a header wait. Headers
 can delay a call, never raise a budget, shorten another pause, or bypass the
 one-second spacing, request allowance or rolling-day ceiling.
+
+A T-Invest `GetInstrumentBy` 404 is an instrument-level refusal. It does not
+pause the host through a named delay or a reset header, or count toward the
+three-4xx host closure; other broker 4xx rules remain unchanged. Its broker message is retained with the affected rows.
+A broker 429 with a named `Retry-After` can be waited out and retried within
+the call's deadline. The effective wait still includes the durable minimum
+60-second host pause: a two-second header does not bypass that minimum.
+A second 429 within ten minutes still closes the host for thirty minutes,
+including when the first 429 was waited out successfully.
 
 A description that names no ISIN, is refused, or cannot be read still sets
 aside the affected rows with their original payload and a reason, including

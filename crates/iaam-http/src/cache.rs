@@ -520,6 +520,12 @@ impl Entry {
                 None => "retry-after-ms -".to_owned(),
             },
         );
+        if let Some(delay) = response.retry_after_header {
+            line(
+                &mut bytes,
+                &format!("retry-after-header-ms {}", delay.as_millis()),
+            );
+        }
         line(
             &mut bytes,
             &named(
@@ -601,6 +607,16 @@ impl Entry {
             "-" => None,
             millis => Some(Duration::from_millis(millis.parse().map_err(|_| ())?)),
         };
+        let retry_after_header =
+            if peek_line(rest).is_some_and(|line| line.starts_with(b"retry-after-header-ms ")) {
+                Some(Duration::from_millis(
+                    header_field(line_of(&mut rest)?, "retry-after-header-ms")?
+                        .parse()
+                        .map_err(|_| ())?,
+                ))
+            } else {
+                None
+            };
         let location = value(line_of(&mut rest)?, "location")?;
         let content_type = value(line_of(&mut rest)?, "content-type")?;
         let request_id = value(line_of(&mut rest)?, "request-id")?;
@@ -608,6 +624,7 @@ impl Entry {
             status,
             body: rest.to_vec(),
             retry_after,
+            retry_after_header,
             location,
             content_type,
             request_id,
@@ -963,6 +980,7 @@ mod tests {
             status: 200,
             body: b"<history>pages</history>".to_vec(),
             retry_after: Some(Duration::from_secs(30)),
+            retry_after_header: Some(Duration::from_secs(30)),
             location: Some("https://iss.moex.com/elsewhere".to_owned()),
             content_type: Some("application/json; charset=utf-8".to_owned()),
             request_id: Some("moex-req-7".to_owned()),

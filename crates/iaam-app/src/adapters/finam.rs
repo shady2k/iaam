@@ -558,6 +558,7 @@ async fn adapt_operations(
 fn income_kind(operation: &ChannelOperation) -> Result<IncomeKind, String> {
     match operation.transaction_name.as_deref() {
         Some("Купонный доход") => Ok(IncomeKind::Coupon),
+        Some("Дивиденды") => Ok(IncomeKind::Dividend),
         Some("Доход по предоставлениям займа") => {
             Ok(IncomeKind::SecuritiesLendingIncome)
         }
@@ -1452,6 +1453,116 @@ mod tests {
             Some("invented-income-coupon")
         );
         assert_eq!(operation.dates.trade, Some(date!(2025 - 06 - 10)));
+    }
+
+    #[tokio::test]
+    async fn named_income_dividend_resolves_through_the_catalogue() {
+        let body = json!({"transactions": [{
+            "id": "invented-income-dividend",
+            "timestamp": "2025-06-10T10:00:00Z",
+            "category": "INCOME",
+            "symbol": SYMBOL,
+            "change": {"currency_code": "RUB", "units": "17", "nanos": 250_000_000},
+            "transaction_category": "ACCRUALS",
+            "transaction_name": "Дивиденды"
+        }]})
+        .to_string();
+        let (instruments, expected) = directory(&[ISIN]).await;
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body), asset_answer()], None).0,
+            instruments,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("income page parsed");
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.accepted.len(), 1);
+        let operation = &parsed.accepted[0];
+        assert!(matches!(operation.kind, OperationKind::Income {
+            instrument: Some(instrument), gross_minor: 1_725, currency: CurrencyCode::Rub,
+            kind: Some(IncomeKind::Dividend),
+        } if instrument == expected[0]));
+        assert_eq!(operation.source_kind.as_deref(), Some("INCOME"));
+        assert_eq!(operation.source_category.as_deref(), Some("ACCRUALS"));
+        assert_eq!(operation.description.as_deref(), Some("Дивиденды"));
+        assert_eq!(
+            operation.source_operation_id.as_deref(),
+            Some("invented-income-dividend")
+        );
+        assert_eq!(operation.dates.trade, Some(date!(2025 - 06 - 10)));
+    }
+
+    #[tokio::test]
+    async fn named_dividend_requires_exact_name_and_a_resolved_symbol() {
+        let rows = [
+            json!({
+                "id": "invented-dividend-spaced", "transaction_name": "Дивиденды ",
+                "symbol": SYMBOL,
+            }),
+            json!({
+                "id": "invented-dividend-case", "transaction_name": "дивиденды",
+                "symbol": SYMBOL,
+            }),
+            json!({
+                "id": "invented-dividend-no-symbol", "transaction_name": "Дивиденды",
+            }),
+            json!({
+                "id": "invented-dividend-unresolved", "transaction_name": "Дивиденды",
+                "symbol": SYMBOL,
+            }),
+        ]
+        .map(|mut row| {
+            row["timestamp"] = json!("2025-06-10T10:00:00Z");
+            row["category"] = json!("INCOME");
+            row["change"] = json!({"currency_code": "RUB", "units": "17", "nanos": 0});
+            row
+        });
+        let body = json!({"transactions": rows}).to_string();
+        // Only the exact name with a symbol reaches the catalogue, whose
+        // invented description cannot establish the instrument's identity.
+        let channel = channel(
+            fake::gateway(
+                vec![session_answer(), page(&body), asset_with_isin("")],
+                None,
+            )
+            .0,
+            directory(&[]).await.0,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("dividend refusals are row-local");
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(parsed.quarantined.len(), rows.len());
+        for (refused, row) in parsed.quarantined.iter().zip(&rows) {
+            assert_eq!(refused.raw, *row);
+            assert_eq!(
+                refused.dimensions,
+                [Dimension::Cash, Dimension::Income].into_iter().collect()
+            );
+        }
+        for index in [0, 1] {
+            assert!(
+                parsed.quarantined[index]
+                    .reason
+                    .contains("unsupported Finam INCOME")
+            );
+        }
+        assert!(parsed.quarantined[2].reason.contains("symbol"));
+        assert!(parsed.quarantined[3].reason.contains("no ISIN"));
     }
 
     #[tokio::test]

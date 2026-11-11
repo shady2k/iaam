@@ -490,6 +490,23 @@ async fn adapt_operations(
             });
             continue;
         }
+        // INCOME is a source category, not one economic kind. Only its
+        // exact transaction name establishes which fact can be recorded.
+        let kind = if operation.source_kind == "INCOME" {
+            match income_kind(&operation) {
+                Ok(kind) => kind,
+                Err(reason) => {
+                    quarantined.push(Quarantined {
+                        raw,
+                        reason,
+                        dimensions: [Dimension::Cash, Dimension::Income].into_iter().collect(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            kind
+        };
         if let Some(reason) = securities_transfer_reason(&kind) {
             quarantined.push(Quarantined {
                 raw,
@@ -527,6 +544,21 @@ async fn adapt_operations(
         accepted,
         quarantined,
     })
+}
+
+/// Finam's generic income category needs the source's exact economic name.
+fn income_kind(operation: &ChannelOperation) -> Result<ChannelOperationKind, String> {
+    match operation.transaction_name.as_deref() {
+        Some("Купонный доход") => Ok(ChannelOperationKind::Coupon),
+        Some("Доход по предоставлениям займа") => Err(
+            concat!("unsupported Finam INCOME transaction_name: Доход по предоставлениям займа — ",
+                "core IncomeKind has no loan-provision income kind; DepositInterest describes ",
+                "deposit interest, and an absent kind would discard the source's stated meaning")
+                .to_owned(),
+        ),
+        Some(name) => Err(format!("unsupported Finam INCOME transaction_name: {name}")),
+        None => Err("Finam INCOME does not contain transaction_name".to_owned()),
+    }
 }
 
 /// Turns the channel's portfolio answer into a snapshot.
@@ -899,7 +931,11 @@ async fn operation_to_submitted(
                 }
             };
             OperationKind::Income {
-                instrument: symbols.optional(&operation).await?,
+                instrument: if operation.source_kind == "INCOME" {
+                    Some(symbols.required(&operation).await?)
+                } else {
+                    symbols.optional(&operation).await?
+                },
                 gross_minor,
                 currency,
                 kind: Some(income_kind),
@@ -1354,6 +1390,119 @@ mod tests {
         // The fee row printed no grouping of its own: absence stays absent.
         assert_eq!(parsed.accepted[2].source_category, None);
         assert_eq!(parsed.accepted[2].source_kind.as_deref(), Some("FEE"));
+    }
+
+    #[tokio::test]
+    async fn named_income_coupon_resolves_through_the_catalogue() {
+        let body = json!({"transactions": [{
+            "id": "invented-income-coupon",
+            "timestamp": "2025-06-10T10:00:00Z",
+            "category": "INCOME",
+            "symbol": SYMBOL,
+            "change": {"currency_code": "RUB", "units": "17", "nanos": 250_000_000},
+            "transaction_category": "ACCRUALS",
+            "transaction_name": "Купонный доход"
+        }]})
+        .to_string();
+        let (instruments, expected) = directory(&[ISIN]).await;
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body), asset_answer()], None).0,
+            instruments,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("income page parsed");
+        assert!(parsed.quarantined.is_empty(), "{:?}", parsed.quarantined);
+        assert_eq!(parsed.accepted.len(), 1);
+        let operation = &parsed.accepted[0];
+        assert!(matches!(operation.kind, OperationKind::Income {
+            instrument: Some(instrument), gross_minor: 1_725, currency: CurrencyCode::Rub,
+            kind: Some(IncomeKind::Coupon),
+        } if instrument == expected[0]));
+        assert_eq!(operation.source_kind.as_deref(), Some("INCOME"));
+        assert_eq!(operation.source_category.as_deref(), Some("ACCRUALS"));
+        assert_eq!(operation.description.as_deref(), Some("Купонный доход"));
+        assert_eq!(
+            operation.source_operation_id.as_deref(),
+            Some("invented-income-coupon")
+        );
+        assert_eq!(operation.dates.trade, Some(date!(2025 - 06 - 10)));
+    }
+
+    #[tokio::test]
+    async fn unsupported_income_names_and_coupon_without_symbol_stay_refused() {
+        let names = [
+            Some("Доход по предоставлениям займа"),
+            Some("Invented income"),
+            Some("Купонный доход "),
+            Some("Купонный доход"),
+            None,
+        ];
+        let rows: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                json!({
+                    "id": format!("invented-income-{index}"),
+                    "timestamp": "2025-06-10T10:00:00Z",
+                    "category": "INCOME",
+                    "change": {"currency_code": "RUB", "units": "17", "nanos": 0},
+                    "transaction_name": name,
+                })
+            })
+            .collect();
+        let body = json!({"transactions": rows}).to_string();
+        // No asset answer: refused names and absent symbols need no catalogue read.
+        let channel = channel(
+            fake::gateway(vec![session_answer(), page(&body)], None).0,
+            directory(&[]).await.0,
+        );
+        let parsed = channel
+            .fetch_operations(
+                account(),
+                "invented-account",
+                date!(2025 - 06 - 01),
+                date!(2025 - 06 - 30),
+                broker_context(None),
+            )
+            .await
+            .expect("income refusals are row-local");
+        assert!(parsed.accepted.is_empty());
+        assert_eq!(parsed.quarantined.len(), names.len());
+        for (index, refused) in parsed.quarantined.iter().enumerate() {
+            assert_eq!(refused.raw["id"], json!(format!("invented-income-{index}")));
+            assert_eq!(refused.raw["transaction_name"], json!(names[index]));
+            assert_eq!(
+                refused.dimensions,
+                [Dimension::Cash, Dimension::Income].into_iter().collect()
+            );
+        }
+        assert!(
+            parsed.quarantined[0]
+                .reason
+                .contains("Доход по предоставлениям займа")
+        );
+        assert!(
+            parsed.quarantined[0]
+                .reason
+                .contains("core IncomeKind has no loan-provision income kind")
+        );
+        for index in [1, 2] {
+            assert!(
+                parsed.quarantined[index]
+                    .reason
+                    .contains(names[index].expect("named row"))
+            );
+        }
+        assert!(parsed.quarantined[3].reason.contains("symbol"));
+        assert!(parsed.quarantined[4].reason.contains("transaction_name"));
     }
 
     #[tokio::test]

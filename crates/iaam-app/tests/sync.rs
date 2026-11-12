@@ -2536,6 +2536,25 @@ impl Transport for MissingInstrumentTinvest {
     async fn send(&self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         if request
             .path()
+            .ends_with("InstrumentsService/FindInstrument")
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.body().expect("search body").payload())
+                    .expect("search JSON");
+            assert!(
+                body["query"]
+                    .as_str()
+                    .expect("search UID")
+                    .eq_ignore_ascii_case("bbbbbbbb-0000-0000-0000-000000000001")
+            );
+            return Ok(HttpResponse {
+                status: 200,
+                body: br#"{"instruments":[]}"#.to_vec(),
+                ..Default::default()
+            });
+        }
+        if request
+            .path()
             .ends_with("InstrumentsService/GetInstrumentBy")
         {
             let body: serde_json::Value =
@@ -2545,6 +2564,7 @@ impl Transport for MissingInstrumentTinvest {
                 .as_str()
                 .expect("UID")
                 .eq_ignore_ascii_case("bbbbbbbb-0000-0000-0000-000000000001")
+                || body["id"] == "aaaaaaaa-0000-0000-0000-000000000001"
             {
                 return Ok(HttpResponse {
                     status: 404,

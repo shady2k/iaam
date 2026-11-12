@@ -47,7 +47,9 @@ const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 struct CachedDescription {
     read_at: Instant,
     description: Result<BrokerInstrumentDescription, String>,
-    figi_probe: Option<&'static str>,
+    uid_not_found: bool,
+    probes: HashSet<String>,
+    broker_instrument_type: Option<String>,
 }
 
 /// Broker channel implementation for T-Invest.
@@ -81,31 +83,27 @@ impl TinkoffChannel {
             descriptions: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
-    // Diagnostic only: never use this answer to replace the UID miss.
-    async fn probe_figi(&self, figi: &str, context: BrokerRequestContext<'_>) -> &'static str {
-        match self
-            .client
-            .get_instrument(
-                figi,
-                InstrumentIdType::Figi,
-                context.deadline,
-                context.allowance,
-            )
-            .await
-        {
-            Ok(body) => match iaam_broker::tinkoff::parse_instrument(&body) {
-                Ok(description) if description.isin.is_some() => "described",
-                Ok(_) => "no_isin",
-                Err(_) => "unreadable",
-            },
-            Err(TinkoffError::UnexpectedStatus { status: 404, .. }) => "not_found",
-            Err(error) => match tinkoff_error(error) {
-                BrokerError::Refused { .. } => "refused",
-                BrokerError::Unparsable { .. } => "unreadable",
-                BrokerError::RequestCeiling { .. } => "request_ceiling",
-                _ => "unavailable",
-            },
-        }
+    // Diagnostic only: never use these answers to replace the UID miss.
+    async fn probe_instrument(
+        &self,
+        identifier: &str,
+        id_type: Option<InstrumentIdType>,
+        raw: &serde_json::Value,
+        context: BrokerRequestContext<'_>,
+    ) {
+        let response = match id_type {
+            Some(id_type) => {
+                self.client
+                    .get_instrument(identifier, id_type, context.deadline, context.allowance)
+                    .await
+            }
+            None => {
+                self.client
+                    .find_instrument(identifier, context.deadline, context.allowance)
+                    .await
+            }
+        };
+        trace_instrument_lookup(raw, identifier, id_type, &response);
     }
 
     async fn resolve_instrument(
@@ -128,6 +126,7 @@ impl TinkoffChannel {
                 Uuid::parse_str(id).map_or_else(|_| id.to_owned(), |uid| uid.to_string())
             ),
             InstrumentIdType::Figi => format!("figi:{id}"),
+            InstrumentIdType::PositionUid => format!("position_uid:{id}"),
         };
         let mut descriptions = self.descriptions.lock().await;
         if descriptions
@@ -144,6 +143,15 @@ impl TinkoffChannel {
                 .client
                 .get_instrument(id, id_type, context.deadline, context.allowance)
                 .await;
+            trace_instrument_lookup(raw, id, Some(id_type), &response);
+            let broker_instrument_type = response.as_ref().ok().and_then(|body| {
+                let value: serde_json::Value = serde_json::from_str(body).ok()?;
+                value
+                    .get("instrument")?
+                    .get("instrumentType")?
+                    .as_str()
+                    .map(str::to_owned)
+            });
             let uid_not_found = id_type == InstrumentIdType::Uid
                 && matches!(
                     &response,
@@ -158,7 +166,6 @@ impl TinkoffChannel {
                 ) => Err(detail),
                 Err(error) => return Err(error),
             };
-            let figi_probe = uid_not_found.then_some("not_supplied");
             tracing::info!(
                 phase = "describe_instruments",
                 status = "complete",
@@ -171,28 +178,43 @@ impl TinkoffChannel {
                 CachedDescription {
                     read_at: Instant::now(),
                     description,
-                    figi_probe,
+                    uid_not_found,
+                    probes: HashSet::new(),
+                    broker_instrument_type,
                 },
             );
         }
         let cached = descriptions.get_mut(&key).expect("description inserted");
-        if cached.figi_probe == Some("not_supplied") {
-            if let Some(figi) = raw
-                .get("figi")
-                .and_then(serde_json::Value::as_str)
-                .filter(|figi| !figi.is_empty())
-            {
-                cached.figi_probe = Some(self.probe_figi(figi, context).await);
+        if cached.uid_not_found {
+            let field = |name: &str| {
+                raw.get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+            };
+            for (identifier, id_type) in [
+                (field("positionUid"), Some(InstrumentIdType::PositionUid)),
+                (Some(id), None),
+                (field("figi"), None),
+                (field("figi"), Some(InstrumentIdType::Figi)),
+            ] {
+                if let Some(identifier) = identifier {
+                    let probe_key = format!("{id_type:?}:{identifier}");
+                    if cached.probes.insert(probe_key) {
+                        self.probe_instrument(identifier, id_type, raw, context)
+                            .await;
+                    }
+                }
             }
         }
         let description = cached.description.clone();
-        let figi_probe = cached.figi_probe;
+        let uid_not_found = cached.uid_not_found;
+        let broker_instrument_type = cached.broker_instrument_type.clone();
         drop(descriptions);
         let description = match description {
             Ok(description) => description,
             Err(reason) => {
-                if let Some(probe) = figi_probe {
-                    trace_instrument_miss(raw, id, id_type, "uid_not_found", probe, None);
+                if uid_not_found {
+                    trace_instrument_miss(raw, id, id_type, "uid_not_found", None, None);
                 }
                 return Ok(Err(format!(
                     "instrument {id} description refused or unreadable: {reason}"
@@ -209,7 +231,7 @@ impl TinkoffChannel {
                 id,
                 id_type,
                 "no_isin",
-                "not_requested",
+                broker_instrument_type.as_deref(),
                 Some(&description),
             );
             return Ok(Err(format!("instrument {id} description names no ISIN")));
@@ -229,12 +251,51 @@ impl TinkoffChannel {
     }
 }
 
+fn trace_instrument_lookup(
+    raw: &serde_json::Value,
+    identifier: &str,
+    id_type: Option<InstrumentIdType>,
+    response: &Result<String, TinkoffError>,
+) {
+    let field = |name: &str| raw.get(name).and_then(serde_json::Value::as_str);
+    let status = match response {
+        Ok(_) => "200",
+        Err(TinkoffError::UnexpectedStatus { status: 404, .. }) => "404",
+        Err(_) => "other",
+    };
+    let broker_instrument_type = response.as_ref().ok().and_then(|body| {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        value
+            .get("instrument")?
+            .get("instrumentType")?
+            .as_str()
+            .map(str::to_owned)
+    });
+    tracing::warn!(
+        phase = "describe_instruments",
+        broker_instrument_type = broker_instrument_type.as_deref(),
+        operation_id = field("id").or_else(|| field("operationId")),
+        instrument_type = field("instrumentType"),
+        instrument_kind = field("instrumentKind"),
+        instrument_uid = field("instrumentUid"),
+        position_uid = field("positionUid"),
+        figi = field("figi"),
+        isin = field("isin"),
+        ticker = field("ticker"),
+        lookup_method = if id_type.is_some() { "GetInstrumentBy" } else { "FindInstrument" },
+        lookup_identifier = identifier,
+        lookup_type = ?id_type,
+        lookup_status = status,
+        "broker instrument lookup"
+    );
+}
+
 fn trace_instrument_miss(
     raw: &serde_json::Value,
     lookup_identifier: &str,
     lookup_type: InstrumentIdType,
     reason: &str,
-    figi_probe_result: &str,
+    broker_instrument_type: Option<&str>,
     description: Option<&BrokerInstrumentDescription>,
 ) {
     let field = |name: &str| raw.get(name).and_then(serde_json::Value::as_str);
@@ -245,6 +306,7 @@ fn trace_instrument_miss(
         parent_operation_id = field("parentOperationId"),
         operation_type = field("type").or_else(|| field("operationType")),
         instrument_type = field("instrumentType"),
+        instrument_kind = field("instrumentKind"),
         figi = field("figi"),
         instrument_uid = field("instrumentUid"),
         position_uid = field("positionUid"),
@@ -252,8 +314,7 @@ fn trace_instrument_miss(
         name = field("name").or_else(|| description.map(|description| description.name.as_str())),
         lookup_identifier,
         lookup_type = ?lookup_type,
-        figi_probe_identifier = field("figi"),
-        figi_probe_result,
+        broker_instrument_type,
         "broker instrument resolution miss"
     );
 }
@@ -2037,17 +2098,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uid_404_figi_probe_is_diagnostic_only_and_cached_for_success_and_miss() {
+    async fn uid_404_probes_are_ordered_diagnostic_only_and_cached() {
         for (status, body, outcome) in [
             (
                 200,
                 r#"{"instrument":{"isin":"XX0000000042","ticker":"PROBE","name":"Invented probe","instrumentType":"share","currency":"rub"}}"#,
-                "described",
+                "200",
             ),
-            (404, "{}", "not_found"),
+            (404, "{}", "404"),
         ] {
             let (gateway, requests, _) = fake::gateway_with_instruments(
-                vec![Answer::status(404, "{}"), Answer::status(status, body)],
+                vec![
+                    Answer::status(404, "{}"),
+                    Answer::status(status, body),
+                    Answer::status(status, body),
+                    Answer::status(status, body),
+                    Answer::status(status, body),
+                ],
                 None,
                 true,
             );
@@ -2085,14 +2152,20 @@ mod tests {
                 let requests = requests.lock().expect("requests");
                 assert_eq!(
                     requests.len(),
-                    2,
-                    "one UID call and one FIGI probe, cached across rows"
+                    5,
+                    "one UID call and four diagnostic probes, cached across rows"
                 );
                 let first: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
                 let second: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
                 assert_eq!(first["idType"], "INSTRUMENT_ID_TYPE_UID");
-                assert_eq!(second["idType"], "INSTRUMENT_ID_TYPE_FIGI");
-                assert_eq!(second["id"], "TESTFIGI");
+                assert_eq!(second["idType"], "INSTRUMENT_ID_TYPE_POSITION_UID");
+                assert_eq!(second["id"], "invented-position");
+                let uid_search: serde_json::Value = serde_json::from_str(&requests[2]).unwrap();
+                let figi_search: serde_json::Value = serde_json::from_str(&requests[3]).unwrap();
+                let figi: serde_json::Value = serde_json::from_str(&requests[4]).unwrap();
+                assert_eq!(uid_search["query"], "invented-uid");
+                assert_eq!(figi_search["query"], "TESTFIGI");
+                assert_eq!(figi["idType"], "INSTRUMENT_ID_TYPE_FIGI");
             }
             let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
             for expected in [
@@ -2126,7 +2199,12 @@ mod tests {
     #[tokio::test]
     async fn cached_uid_miss_probes_once_when_a_later_row_supplies_figi() {
         let (gateway, requests, _) = fake::gateway_with_instruments(
-            vec![Answer::status(404, "{}"), Answer::status(404, "{}")],
+            vec![
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+                Answer::status(404, "{}"),
+            ],
             None,
             true,
         );
@@ -2148,9 +2226,13 @@ mod tests {
             assert!(result.unwrap_err().contains("404"));
         }
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2, "one UID lookup and one later FIGI probe");
+        assert_eq!(
+            requests.len(),
+            4,
+            "UID lookup, UID search and later FIGI search and lookup"
+        );
         let uid: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
-        let figi: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        let figi: serde_json::Value = serde_json::from_str(&requests[3]).unwrap();
         assert_eq!(uid["idType"], "INSTRUMENT_ID_TYPE_UID");
         assert_eq!(figi["idType"], "INSTRUMENT_ID_TYPE_FIGI");
     }
@@ -2241,6 +2323,7 @@ mod tests {
             "Invented derivative",
             "no-isin-operation",
             "no-isin-uid",
+            "futures",
         ] {
             assert!(log.contains(expected), "missing {expected}: {log}");
         }

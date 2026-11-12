@@ -62,6 +62,8 @@ pub(crate) fn is_instrument_lookup_miss(host: &str, path: &str, status: u16) -> 
             path.trim_start_matches('/'),
             "tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
                 | "InstrumentsService/GetInstrumentBy"
+                | "tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument"
+                | "InstrumentsService/FindInstrument"
         )
 }
 
@@ -1691,6 +1693,16 @@ mod tests {
             Destination::TinkoffSandbox.base_url(),
         ] {
             assert!(is_instrument_lookup_miss(host, path, 404));
+            assert!(is_instrument_lookup_miss(
+                host,
+                "/InstrumentsService/FindInstrument",
+                404
+            ));
+            assert!(is_instrument_lookup_miss(
+                host,
+                "/tinkoff.public.invest.api.contract.v1.InstrumentsService/FindInstrument",
+                404
+            ));
             assert!(!is_instrument_lookup_miss(host, path, 403));
             assert!(!is_instrument_lookup_miss(
                 host,

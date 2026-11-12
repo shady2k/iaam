@@ -50,7 +50,7 @@ impl TinkoffChannel {
         Ok(())
     }
 
-    async fn read_settlement_report(
+    pub(super) async fn read_settlement_report(
         &self,
         account: &str,
         from: Date,

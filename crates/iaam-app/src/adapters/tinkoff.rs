@@ -44,6 +44,9 @@ use crate::ports::{
 #[path = "tinkoff_report.rs"]
 mod report;
 
+#[path = "tinkoff_diagnostics.rs"]
+mod diagnostics;
+
 const BROKER: &str = "tinkoff";
 const OPERATIONS_PAGE_LIMIT: i32 = 1_000;
 
@@ -75,6 +78,7 @@ pub struct TinkoffChannel {
     dictionary: OperationKindDictionary,
     instruments: Arc<dyn InstrumentDirectory>,
     descriptions: tokio::sync::Mutex<HashMap<String, CachedDescription>>,
+    diagnostic_operations: tokio::sync::Mutex<Vec<diagnostics::ReceivedOperation>>,
 }
 
 impl TinkoffChannel {
@@ -93,6 +97,7 @@ impl TinkoffChannel {
             dictionary,
             instruments,
             descriptions: tokio::sync::Mutex::new(HashMap::new()),
+            diagnostic_operations: tokio::sync::Mutex::new(Vec::new()),
         }
     }
     // FindInstrument results are diagnostic only; typed lookups resolve identity.
@@ -453,6 +458,17 @@ fn trace_instrument_miss(
 
 #[async_trait]
 impl BrokerChannel for TinkoffChannel {
+    async fn diagnose_instruments(
+        &self,
+        instruments: &[InstrumentId],
+        broker_account: &str,
+        period: (Date, Date),
+        context: BrokerRequestContext<'_>,
+    ) {
+        self.trace_instrument_history(instruments, broker_account, period, context)
+            .await;
+    }
+
     async fn fetch_account_numbers(
         &self,
         context: BrokerRequestContext<'_>,
@@ -492,6 +508,7 @@ impl BrokerChannel for TinkoffChannel {
                 .await
         })
         .await?;
+        let mut diagnostic_operations = diagnostics::capture(&operations);
         self.resolve_report_payments(&mut operations, broker_account, from, to, context)
             .await?;
         let received = operations.len();
@@ -506,7 +523,7 @@ impl BrokerChannel for TinkoffChannel {
         let mut refused = Vec::new();
         let mut currency_cache = HashMap::new();
         let mut currency_rows = HashMap::new();
-        for mut operation in operations {
+        for (operation_index, mut operation) in operations.into_iter().enumerate() {
             let has_identity = operation.instrument_uid.is_some()
                 || ["figi", "ticker", "isin"].into_iter().any(|key| {
                     operation
@@ -585,6 +602,9 @@ impl BrokerChannel for TinkoffChannel {
                     .await?
                 {
                     Ok(instrument) => {
+                        if let Some(row) = diagnostic_operations.get_mut(operation_index) {
+                            row.instrument = Some(instrument);
+                        }
                         operation.instrument_uid = Some(instrument.inner().to_string())
                     }
                     Err(reason) => {
@@ -619,6 +639,7 @@ impl BrokerChannel for TinkoffChannel {
             strategy = "broker_description_isin",
             "broker sync phase complete"
         );
+        *self.diagnostic_operations.lock().await = diagnostic_operations;
         let (mut parsed, accounting) =
             adapt_operations_with_currencies(account, checked, &self.dictionary, &currency_rows)?;
         let quarantined_instrument_resolution = refused.len();
@@ -2688,6 +2709,62 @@ mod tests {
                 "price":{"currency":"rub", "units":"1", "nano":890500000}}]}
         }]});
         parse_operations(&body.to_string()).unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn position_refusal_diagnostics_read_report_and_log_only_related_selected_rows() {
+        let affected = InstrumentId::new_random();
+        let page = serde_json::json!({"getBrokerReportResponse":{"brokerReport":[
+            {"figi":"FIGI1", "ticker":"INVENTED", "direction":"Buy", "quantity":"7", "tradeDatetime":"2026-08-20T10:00:00Z", "party":"hidden-report-party"},
+            {"figi":"UNRELATED", "ticker":"OTHER", "direction":"hidden-direction"}
+        ], "itemsCount":2,"pagesCount":1,"page":0}});
+        let (gateway, requests, _) = fake::gateway(
+            vec![
+                Answer::status(
+                    200,
+                    r#"{"generateBrokerReportResponse":{"taskId":"diagnostic-task"}}"#,
+                ),
+                Answer::status(200, &page.to_string()),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let mut operation = report_operation();
+        operation.raw = serde_json::json!({"id":"source-proof", "figi":"FIGI1", "description":"invented-history", "payment":{"units":"-1","nano":0}, "brokerAccountId":"hidden-account"});
+        let mut rows = super::diagnostics::capture(&[operation]);
+        rows[0].instrument = Some(affected);
+        *channel.diagnostic_operations.lock().await = rows;
+        channel
+            .trace_instrument_history(
+                &[affected],
+                "account",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(None),
+            )
+            .await;
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("invented-history"));
+        assert!(log.contains("FIGI1"));
+        assert!(log.contains("matching_rows=1"));
+        for excluded in ["hidden-report-party", "hidden-direction", "hidden-account"] {
+            assert!(
+                !log.contains(excluded),
+                "unselected evidence leaked: {excluded}"
+            );
+        }
     }
 
     #[tokio::test]

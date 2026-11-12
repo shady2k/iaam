@@ -2301,6 +2301,17 @@ pub trait BrokerChannel: Send + Sync {
         context: BrokerRequestContext<'_>,
     ) -> Result<ParsedOperations, BrokerError>;
 
+    /// Best-effort diagnostics after a position refusal. No journal or parsing
+    /// decision may depend on this hook; adapters without diagnostics do nothing.
+    async fn diagnose_instruments(
+        &self,
+        _instruments: &[InstrumentId],
+        _broker_account: &str,
+        _period: (Date, Date),
+        _context: BrokerRequestContext<'_>,
+    ) {
+    }
+
     /// Portfolio claims for the requested account and their date semantics.
     ///
     /// Returns the source's assertions, not a calculation: the values calculated

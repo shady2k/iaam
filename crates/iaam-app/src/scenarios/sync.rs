@@ -626,6 +626,7 @@ pub async fn sync_broker(
                 match resolve_full_redemption(services, principal.owner, &pending).await? {
                     Ok(submitted) => submitted,
                     Err(reason) => {
+                        diagnostic_instruments.insert(pending.instrument);
                         tracing::debug!(phase = "map", row_index, reason = %reason, "broker full redemption set aside");
                         let key = SourceRowKey {
                             source: channel.source,
@@ -768,6 +769,16 @@ pub async fn sync_broker(
         recorded.push(verdict);
     }
 
+    if !diagnostic_instruments.is_empty() {
+        broker
+            .diagnose_instruments(
+                &diagnostic_instruments.into_iter().collect::<Vec<_>>(),
+                &broker_account,
+                (from, to),
+                broker_context,
+            )
+            .await;
+    }
 
     tracing::info!(
         phase = "map",

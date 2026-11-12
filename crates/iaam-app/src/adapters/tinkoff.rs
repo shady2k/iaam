@@ -2711,6 +2711,90 @@ mod tests {
         parse_operations(&body.to_string()).unwrap().remove(0)
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn position_refusal_diagnostics_skip_near_and_elapsed_deadlines_without_requests() {
+        let (gateway, requests, _) = fake::gateway(Vec::new(), None);
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let started = tokio::time::Instant::now();
+        for deadline in [
+            started.into_std() - std::time::Duration::from_secs(1),
+            started.into_std(),
+            started.into_std() + crate::ports::BROKER_DIAGNOSTIC_RESERVE,
+        ] {
+            channel
+                .trace_instrument_history(
+                    &[InstrumentId::new_random()],
+                    "account",
+                    (
+                        time::macros::date!(2026 - 08 - 01),
+                        time::macros::date!(2026 - 08 - 31),
+                    ),
+                    broker_context(Some(deadline)),
+                )
+                .await;
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(tokio::time::Instant::now(), started);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(log.matches("status=\"skipped\"").count(), 3, "{log}");
+        assert!(log.contains("phase=\"position_refusal_history\""), "{log}");
+        assert!(
+            log.contains("reason=\"sync_deadline_near_or_elapsed\""),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn position_refusal_diagnostics_cancel_a_local_mutex_wait_at_the_sync_deadline() {
+        let (gateway, requests, _) = fake::gateway(Vec::new(), None);
+        let channel = channel(gateway);
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let _held = channel.diagnostic_operations.lock().await;
+        let started = tokio::time::Instant::now();
+        let bound = std::time::Duration::from_secs(5);
+        channel
+            .trace_instrument_history(
+                &[InstrumentId::new_random()],
+                "account",
+                (
+                    time::macros::date!(2026 - 08 - 01),
+                    time::macros::date!(2026 - 08 - 31),
+                ),
+                broker_context(Some((started + bound).into_std())),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= bound,
+            "diagnostic did not wait for its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed <= bound + std::time::Duration::from_millis(1),
+            "diagnostic outlived its deadline: {elapsed:?}"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("phase=\"position_refusal_history\""), "{log}");
+        assert!(log.contains("status=\"deadline_elapsed\""), "{log}");
+    }
+
     #[tokio::test]
     async fn position_refusal_diagnostics_read_report_and_log_only_related_selected_rows() {
         let affected = InstrumentId::new_random();

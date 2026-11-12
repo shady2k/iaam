@@ -2245,6 +2245,9 @@ pub struct PortfolioSnapshot {
     pub observed_on: Option<Date>,
 }
 
+/// Leave the last second of a sync to its result, not optional diagnostics.
+pub(crate) const BROKER_DIAGNOSTIC_RESERVE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Limits shared by every broker request made for one synchronization.
 ///
 /// A sync constructs this once: discovery, retries, operation pages and the

@@ -150,6 +150,44 @@ impl TinkoffChannel {
         if instruments.is_empty() || !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
+        let Some(deadline) = context.deadline else {
+            self.run_instrument_history(instruments, account, (from, to), context)
+                .await;
+            return;
+        };
+        if deadline.saturating_duration_since(tokio::time::Instant::now().into_std())
+            <= crate::ports::BROKER_DIAGNOSTIC_RESERVE
+        {
+            tracing::debug!(
+                phase = "position_refusal_history",
+                status = "skipped",
+                reason = "sync_deadline_near_or_elapsed",
+                "instrument diagnostic skipped at sync deadline"
+            );
+            return;
+        }
+        if tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.run_instrument_history(instruments, account, (from, to), context),
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!(
+                phase = "position_refusal_history",
+                status = "deadline_elapsed",
+                "instrument diagnostic stopped at sync deadline"
+            );
+        }
+    }
+
+    async fn run_instrument_history(
+        &self,
+        instruments: &[InstrumentId],
+        account: &str,
+        (from, to): (Date, Date),
+        context: BrokerRequestContext<'_>,
+    ) {
         let rows = self.diagnostic_operations.lock().await;
         let selected = related_rows(&rows, instruments);
         let mut figis = HashSet::new();

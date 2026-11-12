@@ -35,7 +35,7 @@ use iaam_store::sync_refusals::SyncRefusalRecord;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use time::Date;
 use time::OffsetDateTime;
 use tracing::Instrument;
@@ -191,7 +191,9 @@ pub async fn sync_broker(
 
     tracing::info!(phase = "start", "broker sync started");
     let _claim = services.running_syncs.claim(principal.owner, account)?;
-    let deadline = Some(Instant::now() + SYNC_DEADLINE);
+    // Gateway timers and this deadline must share Tokio's clock, including
+    // when the runtime clock is paused independently of real setup time.
+    let deadline = Some(tokio::time::Instant::now().into_std() + SYNC_DEADLINE);
     let allowance = RequestAllowance::new(BROKER_SYNC_REQUEST_CEILING);
     let broker_context = BrokerRequestContext {
         deadline,
@@ -321,7 +323,8 @@ pub async fn sync_broker(
         accepted = parsed.accepted.len() + parsed.journal.len() + parsed.pending_redemptions.len(),
         "broker sync phase start"
     );
-    let mut diagnostic_instruments = audit_outbound_transfers(&bounded_events, account)?;
+    let mut diagnostic_instruments =
+        audit_outbound_transfers(&bounded_events, account, broker_context.deadline)?;
     let mut known = known_records(&bounded_events);
     let mut recorded = Vec::new();
     let mut duplicates = 0;
@@ -1315,15 +1318,37 @@ fn coverage_gap_event(
 fn audit_outbound_transfers(
     events: &[Event],
     account: AccountId,
+    deadline: Option<std::time::Instant>,
 ) -> Result<BTreeSet<InstrumentId>, AppError> {
     use iaam_core::event::kind::EventKind;
     use iaam_core::money::Quantity;
     use iaam_core::projection::balances::{Balances, PositionKey};
 
+    let deadline_reached = || {
+        let reached = deadline.is_some_and(|deadline| {
+            deadline.saturating_duration_since(tokio::time::Instant::now().into_std())
+                <= crate::ports::BROKER_DIAGNOSTIC_RESERVE
+        });
+        if reached {
+            tracing::debug!(
+                phase = "audit_outbound_transfers",
+                status = "skipped",
+                reason = "sync_deadline_near_or_elapsed",
+                "outbound transfer audit stopped at sync deadline"
+            );
+        }
+        reached
+    };
+    if deadline_reached() {
+        return Ok(BTreeSet::new());
+    }
     let effective = iaam_core::event::correction::resolve(events).map_err(AppError::Correction)?;
     let mut balances = Balances::new();
     let mut affected = BTreeSet::new();
     for event in effective {
+        if deadline_reached() {
+            break;
+        }
         if event.account == account
             && let EventKind::SecuritiesTransferOut {
                 instrument,

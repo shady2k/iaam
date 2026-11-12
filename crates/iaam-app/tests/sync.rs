@@ -4444,6 +4444,9 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
         seed_account(store, owner, account, "Main");
     });
     let asked = Arc::new(AtomicUsize::new(0));
+    // Keep the runtime clock distinct from real setup time. The sync and
+    // gateway must still use one clock for the same fifteen-minute deadline.
+    tokio::time::advance(Duration::from_secs(60)).await;
     // Four minutes a page: pages are asked for at 0, 4, 8 and 12 minutes;
     // the fourth would answer at 16, past the sync's fifteen.
     let time = Arc::new(PausedTime {
@@ -4488,16 +4491,14 @@ async fn a_sync_that_outlasts_its_deadline_is_refused_by_it_naming_the_pages_and
     .await
     .expect_err("the deadline cuts the sync");
 
-    // The sync takes its deadline from the wall clock while the pages run on
-    // the paused one, which the wall clock leads by the real time the test has
-    // taken; a second covers that and is still minutes short of the overrun a
-    // fourth page waited out to its end would show.
+    // Tokio's timer rounds to milliseconds; the deadline itself must not
+    // move with the real time spent preparing this paused-clock fixture.
     let took = started.elapsed();
     assert!(
         took <= SYNC_DEADLINE + Duration::from_secs(1),
         "the sync returned {took:?} after it started, past its deadline"
     );
-    assert!(took >= Duration::from_secs(12 * 60), "{took:?}");
+    assert!(took >= SYNC_DEADLINE, "deadline expired early: {took:?}");
     assert_eq!(asked.load(Ordering::SeqCst), 4, "the fourth page was asked");
     assert!(
         matches!(

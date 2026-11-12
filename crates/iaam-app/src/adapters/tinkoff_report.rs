@@ -160,7 +160,7 @@ impl TinkoffChannel {
         let (from, to) = period;
         if diagnostic
             && (context.allowance.remaining() <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
-                || !self.client.diagnostic_report_allowed().await)
+                || !self.client.wait_diagnostic_report(context.deadline).await)
         {
             tracing::debug!(
                 phase = "broker_report", account, from = %from, to = %to,
@@ -207,7 +207,7 @@ impl TinkoffChannel {
                 if diagnostic
                     && (context.allowance.remaining()
                         <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
-                        || !self.client.diagnostic_report_allowed().await)
+                        || !self.client.wait_diagnostic_report(context.deadline).await)
                 {
                     tracing::debug!(
                         phase = "broker_report", account, from = %from, to = %to,

@@ -2992,7 +2992,7 @@ mod tests {
                 status: 200,
                 body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
                 reset: Some(Duration::from_secs(30)),
-                remaining: Some(5),
+                remaining: Some(0),
             }],
             None,
         );
@@ -3136,7 +3136,7 @@ mod tests {
                 status: 200,
                 body: "{\"hasNext\":false,\"items\":[]}".to_owned(),
                 reset: Some(Duration::from_secs(30)),
-                remaining: Some(5),
+                remaining: Some(0),
             }],
             None,
         );
@@ -3474,6 +3474,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn commission_candidates_in_one_window_share_one_report() {
+        use tracing::instrument::WithSubscriber;
+        let money = |units: &str| serde_json::json!({"units":units,"nano":0,"currency":"rub"});
+        let orders: Vec<_> = ["order-a", "order-b"].into_iter().map(|id| {
+            serde_json::json!({
+                "cursor":id, "brokerAccountId":"account", "id":id, "figi":"FIGI1",
+                "date":"2026-08-20T10:00:00Z", "type":"OPERATION_TYPE_BUY",
+                "state":"OPERATION_STATE_EXECUTED", "quantity":"2", "quantityDone":"2",
+                "payment":money("-30"), "commission":money("6"),
+                "tradesInfo":{"trades":[
+                    {"num":format!("{id}-1"),"date":"2026-08-20T10:00:00Z","quantity":"1","price":money("10")},
+                    {"num":format!("{id}-2"),"date":"2026-08-20T10:01:00Z","quantity":"1","price":money("20")}
+                ]}
+            })
+        }).collect();
+        let body = serde_json::json!({"hasNext":false,"items":orders});
+        let operations = parse_operations(&body.to_string()).unwrap();
+        assert_eq!(operations.len(), 2);
+        let rows: Vec<_> = ["order-a-1", "order-a-2", "order-b-1", "order-b-2"]
+            .into_iter()
+            .map(
+                |id| serde_json::json!({"tradeId":id,"figi":"FIGI1","brokerCommission":money("3")}),
+            )
+            .collect();
+        let page = serde_json::json!({"getBrokerReportResponse":{"brokerReport":rows,"itemsCount":4,"pagesCount":1,"page":0}}).to_string();
+        let (gateway, requests, _) = fake::gateway(
+            vec![
+                Answer::status(200, "{}"),
+                Answer::status(
+                    200,
+                    r#"{"generateBrokerReportResponse":{"taskId":"shared-task"}}"#,
+                ),
+                Answer::status(200, &page),
+            ],
+            None,
+        );
+        let channel = channel(gateway);
+        // Required sync reads establish the tally before optional diagnostics.
+        channel
+            .client
+            .get_accounts(broker_context(None).allowance)
+            .await
+            .unwrap();
+        requests.lock().unwrap().clear();
+        let writer = InstrumentLog::default();
+        let captured = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        channel
+            .trace_question_reports(
+                &operations,
+                "account",
+                time::macros::date!(2026 - 08 - 01),
+                time::macros::date!(2026 - 08 - 31),
+                broker_context(None),
+            )
+            .with_subscriber(subscriber)
+            .await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "{}",
+            String::from_utf8_lossy(&captured.0.lock().unwrap())
+        );
+        let generate: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let get: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        assert!(generate.get("generateBrokerReportRequest").is_some());
+        assert_eq!(get["getBrokerReportRequest"]["taskId"], "shared-task");
+        assert_eq!(get["getBrokerReportRequest"]["page"], 0);
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("question=\"commission_allocation\""),
+            "{logs}"
+        );
+        assert!(logs.contains("orders=2"), "{logs}");
+        assert!(logs.contains("matched=2"), "{logs}");
+        assert_eq!(
+            logs.matches("commission allocation fill evidence").count(),
+            4,
+            "{logs}"
+        );
     }
 
     #[tokio::test]

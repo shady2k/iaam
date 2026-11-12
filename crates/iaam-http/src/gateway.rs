@@ -412,6 +412,16 @@ pub trait Outbound: Send + Sync {
         Box::pin(async { true })
     }
 
+    /// Wait for a report method's known server window without sending a probe.
+    fn wait_diagnostic_report<'a>(
+        &'a self,
+        destination: Destination,
+        path: &'a str,
+        _deadline: Option<Instant>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        self.diagnostic_allowed(destination, path)
+    }
+
     /// `Gateway::send`, boxed.
     fn send<'a>(
         &'a self,
@@ -427,6 +437,15 @@ impl<T: Transport + 'static> Outbound for Gateway<T> {
         path: &'a str,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(self.diagnostic_allowed(destination, path))
+    }
+
+    fn wait_diagnostic_report<'a>(
+        &'a self,
+        destination: Destination,
+        path: &'a str,
+        deadline: Option<Instant>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(self.wait_diagnostic_report(destination, path, deadline))
     }
 
     fn send<'a>(
@@ -1026,6 +1045,23 @@ fn is_tinkoff_report_pending(
             .is_some_and(|code| code.as_str() == Some("30058") || code.as_u64() == Some(30058))
 }
 
+fn native_rate_key(destination: Destination, path: &str) -> &str {
+    match destination {
+        Destination::TinkoffProd | Destination::TinkoffSandbox => path
+            .trim_start_matches('/')
+            .trim_start_matches("tinkoff.public.invest.api.contract.v1."),
+        _ => broker_budget_key(destination, path).unwrap_or(path),
+    }
+}
+
+fn diagnostic_method_reserve(destination: Destination, path: &str) -> u32 {
+    if is_tinkoff_report_400(destination, path, 400) {
+        0
+    } else {
+        DIAGNOSTIC_REQUEST_RESERVE
+    }
+}
+
 fn broker_budget_key(destination: Destination, path: &str) -> Option<&'static str> {
     match destination {
         Destination::TinkoffProd | Destination::TinkoffSandbox => {
@@ -1100,10 +1136,10 @@ struct Lane {
     /// Start instants of the most recent requests, per budget key: at most
     /// `used` of them, the oldest first.
     sent: HashMap<Option<&'static str>, VecDeque<Instant>>,
-    /// Exhausted server windows, scoped to the same service/method as BUDGETS.
-    server_not_before: HashMap<Option<&'static str>, (Instant, Duration)>,
-    /// Last low-capacity server window, scoped to the service budget.
-    diagnostic_low_capacity: HashMap<Option<&'static str>, (Instant, Duration)>,
+    /// Native server windows belong to the wire method, not its local service budget.
+    server_not_before: HashMap<String, (Instant, Duration)>,
+    /// Last reported remaining capacity and reset for each wire method.
+    diagnostic_capacity: HashMap<String, (u64, Instant, Duration)>,
     /// Calls in a row that failed transiently after all their attempts.
     failures: u32,
     /// Until when the breaker refuses calls, once it has opened.
@@ -1368,8 +1404,9 @@ pub fn initialize_fresh_tally(database: &Path, clock: &dyn Clock) -> Result<bool
 }
 
 impl<T: Transport + 'static> Gateway<T> {
-    /// Optional reads leave five requests for necessary sync work. Unknown
-    /// server capacity uses the existing local tally, not an HTTP probe.
+    /// Optional reads leave five local requests for necessary sync work.
+    /// Native report capacity needs one remaining request; other diagnostics
+    /// retain the five-request reserve. No HTTP probe is sent.
     pub async fn diagnostic_allowed(&self, destination: Destination, path: &str) -> bool {
         let request = HttpRequest::get(destination, path);
         let Ok((budget, key)) = self.budgets.lookup(&request) else {
@@ -1388,9 +1425,12 @@ impl<T: Transport + 'static> Gateway<T> {
         if lane.refusing(now).is_some()
             || !lane.named_wait(now).is_zero()
             || lane
-                .diagnostic_low_capacity
-                .get(&key)
-                .is_some_and(|(at, window)| now.saturating_duration_since(*at) < *window)
+                .diagnostic_capacity
+                .get(native_rate_key(destination, path))
+                .is_some_and(|(remaining, at, window)| {
+                    *remaining <= u64::from(diagnostic_method_reserve(destination, path))
+                        && now.saturating_duration_since(*at) < *window
+                })
         {
             return false;
         }
@@ -1408,6 +1448,113 @@ impl<T: Transport + 'static> Gateway<T> {
                 self.clock.as_ref(),
             )
             .unwrap_or(false)
+    }
+
+    /// Wait only for a report's native exhausted window. Host stops and the
+    /// shared local budget still refuse optional work without a probe.
+    pub async fn wait_diagnostic_report(
+        &self,
+        destination: Destination,
+        path: &str,
+        deadline: Option<Instant>,
+    ) -> bool {
+        if !is_tinkoff_report_400(destination, path, 400) {
+            return self.diagnostic_allowed(destination, path).await;
+        }
+        loop {
+            let now = self.clock.now();
+            if deadline.is_some_and(|end| now >= end) {
+                return false;
+            }
+            let Some(lane) = self.lanes.get(destination.base_url()) else {
+                return false;
+            };
+            let Ok(lane) = lane.try_lock() else {
+                return false;
+            };
+            if lane.refusing(now).is_some() || !lane.named_wait(now).is_zero() {
+                return false;
+            }
+            let wait = lane
+                .diagnostic_capacity
+                .get(native_rate_key(destination, path))
+                .map_or(Duration::ZERO, |(remaining, at, window)| {
+                    if *remaining == 0 {
+                        window.saturating_sub(now.saturating_duration_since(*at))
+                    } else {
+                        Duration::ZERO
+                    }
+                });
+            drop(lane);
+            if wait.is_zero() {
+                return self.diagnostic_allowed(destination, path).await;
+            }
+            if wait > MAX_NAMED_WAIT {
+                tracing::debug!(
+                    destination = ?destination,
+                    method = native_rate_key(destination, path),
+                    wait_ms = millis(wait),
+                    reason = "method_reset_exceeds_maximum_wait",
+                    "diagnostic report omitted"
+                );
+                return false;
+            }
+            if deadline.is_some_and(|end| end.saturating_duration_since(now) <= wait) {
+                tracing::debug!(
+                    destination = ?destination,
+                    method = native_rate_key(destination, path),
+                    wait_ms = millis(wait),
+                    reason = "sync_deadline_before_method_reset",
+                    "diagnostic report omitted"
+                );
+                return false;
+            }
+            // A persisted host stop must not turn into an optional method wait.
+            let request = HttpRequest::get(destination, path);
+            let Ok((budget, key)) = self.budgets.lookup(&request) else {
+                return false;
+            };
+            let Some(directory) = &self.egress_directory else {
+                return false;
+            };
+            let Ok(tally) = OutboundTally::new(directory.clone()) else {
+                return false;
+            };
+            if !tally
+                .diagnostic_allowed(
+                    destination.base_url(),
+                    key.unwrap_or("*"),
+                    &budget,
+                    self.clock.as_ref(),
+                )
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            tracing::debug!(
+                destination = ?destination,
+                method = native_rate_key(destination, path),
+                wait_ms = millis(wait),
+                reason = "diagnostic report method reset",
+                "outbound call waits"
+            );
+            if wait > LOGGED_WAIT {
+                tracing::info!(
+                    destination = ?destination,
+                    method = native_rate_key(destination, path),
+                    wait_ms = millis(wait),
+                    reason = "diagnostic report method reset",
+                    "outbound call waits"
+                );
+            }
+            if self
+                .by_deadline(self.sleeper.sleep(wait), deadline)
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
     }
 
     /// A gateway with the documented budgets, system clock and tokio timer
@@ -1747,6 +1894,7 @@ impl<T: Transport + 'static> Gateway<T> {
             &self.non_broker_retry
         };
         let (budget, key) = self.budgets.lookup(request)?;
+        let rate_key = native_rate_key(destination, request.path()).to_owned();
         if broker && self.broker_egress == BrokerEgress::Off {
             return Err(GatewayError::BrokerEgressOff);
         }
@@ -1976,12 +2124,12 @@ impl<T: Transport + 'static> Gateway<T> {
                     });
                 }
                 let now = self.clock.now();
-                let server_wait =
-                    lane.server_not_before
-                        .get(&key)
-                        .map_or(Duration::ZERO, |(observed, delay)| {
-                            delay.saturating_sub(now.saturating_duration_since(*observed))
-                        });
+                let server_wait = lane.server_not_before.get(&rate_key).map_or(
+                    Duration::ZERO,
+                    |(observed, delay)| {
+                        delay.saturating_sub(now.saturating_duration_since(*observed))
+                    },
+                );
                 let named = lane.named_wait(now).max(server_wait);
                 if named > MAX_NAMED_WAIT {
                     return Err(GatewayError::Deferred {
@@ -2142,6 +2290,7 @@ impl<T: Transport + 'static> Gateway<T> {
                     let request = request.clone();
                     let clock = Arc::clone(&self.clock);
                     let tally_path = directory.tally_path();
+                    let rate_key = rate_key.clone();
                     let task = tokio::spawn(async move {
                         let mut lane = lane;
                         // This guard is created after the lane, so panic
@@ -2238,7 +2387,7 @@ impl<T: Transport + 'static> Gateway<T> {
                             // Keep the full named duration without adding it to an
                             // Instant: even u64::MAX seconds stays representable
                             // and is refused by MAX_NAMED_WAIT, never shortened.
-                            lane.server_not_before.insert(key, until);
+                            lane.server_not_before.insert(rate_key.clone(), until);
                         }
                         let handoff = handoff
                             .lock()
@@ -2285,17 +2434,14 @@ impl<T: Transport + 'static> Gateway<T> {
                         };
                         if let Some((line, _)) = observed.as_ref() {
                             if let Some(remaining) = line.rate_remaining {
-                                if remaining <= u64::from(DIAGNOSTIC_REQUEST_RESERVE) {
-                                    lane.diagnostic_low_capacity.insert(
-                                        key,
-                                        (
-                                            clock.now(),
-                                            line.rate_reset.map_or(MINUTE, Duration::from_secs),
-                                        ),
-                                    );
-                                } else {
-                                    lane.diagnostic_low_capacity.remove(&key);
-                                }
+                                lane.diagnostic_capacity.insert(
+                                    rate_key.clone(),
+                                    (
+                                        remaining,
+                                        clock.now(),
+                                        line.rate_reset.map_or(MINUTE, Duration::from_secs),
+                                    ),
+                                );
                             }
                             let response = match &answer {
                                 Ok(response) => response,
@@ -3373,6 +3519,28 @@ mod tests {
     }
 
     #[test]
+    fn native_rate_keys_preserve_finam_methods_and_separate_tinkoff_methods() {
+        assert_eq!(
+            native_rate_key(Destination::FinamApi, "/v1/assets/first"),
+            native_rate_key(Destination::FinamApi, "/v1/assets/second")
+        );
+        assert_eq!(
+            native_rate_key(Destination::FinamApi, "/v1/accounts/first"),
+            native_rate_key(Destination::FinamApi, "/v1/accounts/second")
+        );
+        assert_ne!(
+            native_rate_key(
+                Destination::TinkoffProd,
+                "/OperationsService/GetBrokerReport"
+            ),
+            native_rate_key(
+                Destination::TinkoffProd,
+                "/OperationsService/GetOperationsByCursor"
+            )
+        );
+    }
+
+    #[test]
     fn legacy_operations_uses_the_existing_operations_service_budget() {
         for destination in [Destination::TinkoffProd, Destination::TinkoffSandbox] {
             for path in [
@@ -3390,7 +3558,91 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn optional_reports_skip_low_capacity_until_its_service_reset() {
+    async fn report_diagnostics_use_native_method_capacity_without_reserving_five() {
+        for remaining in [4, 1] {
+            let time = FakeTime::new();
+            let gateway = gateway(
+                &time,
+                Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                    rate_remaining: Some(remaining),
+                    rate_reset: Some(17),
+                    ..status(200)
+                })),
+            );
+            let report = "/OperationsService/GetBrokerReport";
+            let request = HttpRequest::post(
+                Destination::TinkoffProd,
+                report,
+                crate::RequestBody::Json("{}".to_owned()),
+            )
+            .with_request_allowance(RequestAllowance::new(10))
+            .idempotent();
+            gateway.send(&request, None).await.expect("report answer");
+            assert!(
+                gateway
+                    .wait_diagnostic_report(Destination::TinkoffProd, report, None)
+                    .await
+            );
+            assert!(
+                gateway
+                    .diagnostic_allowed(Destination::TinkoffProd, operations().path())
+                    .await
+            );
+            assert_eq!(gateway.transport.sent_at().len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_report_waits_only_for_its_method_within_deadline() {
+        let time = FakeTime::new();
+        let gateway = gateway(
+            &time,
+            Scripted::answering(&time, 200).then(Ok(HttpResponse {
+                rate_remaining: Some(0),
+                rate_reset: Some(17),
+                ..status(200)
+            })),
+        );
+        let report = "/OperationsService/GetBrokerReport";
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            report,
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(10))
+        .idempotent();
+        gateway.send(&request, None).await.expect("report answer");
+        assert!(
+            gateway
+                .diagnostic_allowed(Destination::TinkoffProd, operations().path())
+                .await
+        );
+        let before = time.now();
+        assert!(
+            !gateway
+                .wait_diagnostic_report(
+                    Destination::TinkoffProd,
+                    report,
+                    Some(before + Duration::from_secs(10)),
+                )
+                .await
+        );
+        assert_eq!(time.now(), before);
+        assert!(
+            gateway
+                .wait_diagnostic_report(
+                    Destination::TinkoffProd,
+                    report,
+                    Some(before + Duration::from_secs(30)),
+                )
+                .await
+        );
+        assert_eq!(time.now() - before, Duration::from_secs(17));
+        assert_eq!(gateway.transport.sent_at().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_instrument_diagnostics_still_reserve_five() {
         let time = FakeTime::new();
         let gateway = gateway(
             &time,
@@ -3400,37 +3652,31 @@ mod tests {
                 ..status(200)
             })),
         );
+        let path = "/InstrumentsService/GetInstrumentBy";
+        let request = HttpRequest::post(
+            Destination::TinkoffProd,
+            path,
+            crate::RequestBody::Json("{}".to_owned()),
+        )
+        .with_request_allowance(RequestAllowance::new(10))
+        .idempotent();
+        gateway
+            .send(&request, None)
+            .await
+            .expect("instrument answer");
+        assert!(
+            !gateway
+                .diagnostic_allowed(Destination::TinkoffProd, path)
+                .await
+        );
         assert!(
             gateway
                 .diagnostic_allowed(
                     Destination::TinkoffProd,
-                    "/OperationsService/GetBrokerReport"
+                    "/OperationsService/GetBrokerReport",
                 )
                 .await
         );
-        gateway
-            .send(&operations(), None)
-            .await
-            .expect("operation answer");
-        let report = "/OperationsService/GetBrokerReport";
-        assert!(
-            !gateway
-                .diagnostic_allowed(Destination::TinkoffProd, report)
-                .await
-        );
-        assert!(
-            gateway
-                .diagnostic_allowed(Destination::TinkoffProd, "/UsersService/GetAccounts")
-                .await
-        );
-        assert_eq!(gateway.transport.sent_at().len(), 1);
-        time.advance(Duration::from_secs(17));
-        assert!(
-            gateway
-                .diagnostic_allowed(Destination::TinkoffProd, report)
-                .await
-        );
-        assert_eq!(gateway.transport.sent_at().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3507,7 +3753,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_exhausted_server_window_delays_the_next_service_call() {
+    async fn an_exhausted_native_window_does_not_delay_another_method() {
         let time = FakeTime::new();
         let gateway = gateway(
             &time,
@@ -3534,7 +3780,7 @@ mod tests {
             .await
             .expect("after reset");
         let sent = gateway.transport.sent_at();
-        assert_eq!(sent[1] - sent[0], Duration::from_secs(17));
+        assert_eq!(sent[1] - sent[0], Duration::from_secs(1));
     }
 
     #[tokio::test(start_paused = true)]

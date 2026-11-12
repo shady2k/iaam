@@ -15,7 +15,10 @@ impl TinkoffChannel {
         dates.extend(questions_zone::affected_dates(operations));
         let mut rows = Vec::new();
         if !dates.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
-            for (from, to) in report::report_windows(&dates, from, to) {
+            let windows = report::report_windows(&dates, from, to);
+            tracing::debug!(window_count = windows.len(), windows = ?windows,
+                "planned shared question report windows");
+            for (from, to) in windows {
                 if context.deadline.is_some_and(|deadline| {
                     deadline.saturating_duration_since(tokio::time::Instant::now().into_std())
                         <= crate::ports::BROKER_DIAGNOSTIC_RESERVE
@@ -24,9 +27,7 @@ impl TinkoffChannel {
                         "T-Invest question report skipped");
                     break;
                 }
-                if context.allowance.remaining() <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE
-                    || !self.client.diagnostic_report_allowed().await
-                {
+                if context.allowance.remaining() <= iaam_http::gateway::DIAGNOSTIC_REQUEST_RESERVE {
                     tracing::debug!(from = %from, to = %to, reason = "low_rate_capacity_or_host_pause",
                         "T-Invest question report skipped");
                     break;

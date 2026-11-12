@@ -190,6 +190,17 @@ impl TinkoffClient {
             .await
     }
 
+    /// Wait only on the report method's bucket, within the caller's deadline.
+    pub async fn wait_diagnostic_report(&self, deadline: Option<Instant>) -> bool {
+        self.gateway
+            .wait_diagnostic_report(
+                destination_for(self.environment),
+                "tinkoff.public.invest.api.contract.v1.OperationsService/GetBrokerReport",
+                deadline,
+            )
+            .await
+    }
+
     /// Return the raw response body from `UsersService/GetAccounts`.
     pub async fn get_accounts(&self, allowance: &RequestAllowance) -> Result<String, TinkoffError> {
         self.post(ACCOUNTS, json!({}), None, allowance)
